@@ -1713,21 +1713,13 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub tags: Option<&'a str>,
     pub checksum: Option<MultipartChecksumConfig>,
     pub requester: Requester,
-    #[cfg(test)]
-    pub acl: PutObjectAcl<'a>,
-    #[cfg(not(test))]
     pub acl: PutObjectWriteAcl<'a>,
     pub object_lock: ObjectLockState,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    #[cfg(not(test))]
     pub grant_read: Option<&'a str>,
-    #[cfg(not(test))]
     pub grant_write: Option<&'a str>,
-    #[cfg(not(test))]
     pub grant_read_acp: Option<&'a str>,
-    #[cfg(not(test))]
     pub grant_write_acp: Option<&'a str>,
-    #[cfg(not(test))]
     pub grant_full_control: Option<&'a str>,
     pub expected_bucket_owner: Option<&'a str>,
 }
@@ -1841,81 +1833,19 @@ impl_expected_bucket_owner_accessor!(UploadPartRequest);
 
 impl<'a> CreateMultipartUploadRequest<'a> {
     fn write_acl(&self) -> PutObjectWriteAcl<'a> {
-        #[cfg(test)]
-        {
-            self.acl.into()
-        }
-        #[cfg(not(test))]
-        {
-            self.acl.clone()
-        }
+        self.acl.clone()
     }
 
     fn policy_context(&self) -> PutObjectPolicyContext<'a> {
         PutObjectPolicyContext::new(None, None, self.write_acl().policy_condition_value())
             .with_request_object_tags_xml(self.tags)
             .with_acl_grant_headers(
-                self.grant_read(),
-                self.grant_write(),
-                self.grant_read_acp(),
-                self.grant_write_acp(),
-                self.grant_full_control(),
+                self.grant_read,
+                self.grant_write,
+                self.grant_read_acp,
+                self.grant_write_acp,
+                self.grant_full_control,
             )
-    }
-
-    fn grant_read(&self) -> Option<&'a str> {
-        #[cfg(test)]
-        {
-            None
-        }
-        #[cfg(not(test))]
-        {
-            self.grant_read
-        }
-    }
-
-    fn grant_write(&self) -> Option<&'a str> {
-        #[cfg(test)]
-        {
-            None
-        }
-        #[cfg(not(test))]
-        {
-            self.grant_write
-        }
-    }
-
-    fn grant_read_acp(&self) -> Option<&'a str> {
-        #[cfg(test)]
-        {
-            None
-        }
-        #[cfg(not(test))]
-        {
-            self.grant_read_acp
-        }
-    }
-
-    fn grant_write_acp(&self) -> Option<&'a str> {
-        #[cfg(test)]
-        {
-            None
-        }
-        #[cfg(not(test))]
-        {
-            self.grant_write_acp
-        }
-    }
-
-    fn grant_full_control(&self) -> Option<&'a str> {
-        #[cfg(test)]
-        {
-            None
-        }
-        #[cfg(not(test))]
-        {
-            self.grant_full_control
-        }
     }
 }
 
@@ -12977,6 +12907,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -13087,6 +13022,11 @@ mod tests {
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -13415,6 +13355,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -13608,6 +13553,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             });
             tx.send(res).unwrap();
@@ -16190,6 +16140,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -17879,6 +17834,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap_err();
@@ -17898,6 +17858,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -17932,6 +17897,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap_err();
@@ -17991,6 +17961,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -19209,6 +19184,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap_err();
@@ -19235,6 +19215,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -19282,6 +19267,11 @@ mod tests {
                 acl: PutObjectAcl::PublicRead.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap_err();
@@ -19308,6 +19298,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -19348,6 +19343,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -19407,6 +19407,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -23145,6 +23150,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: Some(&sse_customer),
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -23698,6 +23708,11 @@ mod tests {
                     acl: NO_PUT_OBJECT_ACL.into(),
                     sse_customer: None,
                     object_lock: ObjectLockState::default(),
+                    grant_read: None,
+                    grant_write: None,
+                    grant_read_acp: None,
+                    grant_write_acp: None,
+                    grant_full_control: None,
                     expected_bucket_owner: None,
                 })
                 .unwrap();
@@ -24216,6 +24231,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -24434,6 +24454,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -24465,6 +24490,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -24481,6 +24511,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -24506,6 +24541,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap_err();
@@ -24557,6 +24597,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -24573,6 +24618,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -24648,6 +24698,11 @@ mod tests {
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -24734,6 +24789,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -24838,6 +24898,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap_err();
@@ -24896,6 +24961,11 @@ mod tests {
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -24992,6 +25062,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25008,6 +25083,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25060,6 +25140,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25076,6 +25161,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25092,6 +25182,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25154,6 +25249,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25170,6 +25270,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25186,6 +25291,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25227,6 +25337,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25292,6 +25407,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25334,6 +25454,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25534,6 +25659,11 @@ mod tests {
                     acl: NO_PUT_OBJECT_ACL.into(),
                     sse_customer: None,
                     object_lock: ObjectLockState::default(),
+                    grant_read: None,
+                    grant_write: None,
+                    grant_read_acp: None,
+                    grant_write_acp: None,
+                    grant_full_control: None,
                     expected_bucket_owner: None,
                 })
                 .unwrap();
@@ -25612,6 +25742,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25678,6 +25813,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25751,6 +25891,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25796,6 +25941,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25868,6 +26018,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -25960,6 +26115,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -26013,6 +26173,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -26080,6 +26245,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -26148,6 +26318,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -26242,6 +26417,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -26574,6 +26754,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -26970,6 +27155,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -27028,6 +27218,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -27128,6 +27323,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -27321,6 +27521,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -27389,6 +27594,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -27465,6 +27675,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -27531,6 +27746,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -27589,6 +27809,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -27651,6 +27876,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -28360,6 +28590,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -28945,6 +29180,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: Some(&sse_customer),
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -30501,6 +30741,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -30586,6 +30831,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -30711,6 +30961,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -30900,6 +31155,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -30965,6 +31225,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -31030,6 +31295,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -31077,6 +31347,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -31093,6 +31368,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
@@ -31232,6 +31512,11 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
                 expected_bucket_owner: None,
             })
             .unwrap();
