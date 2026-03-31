@@ -100,6 +100,22 @@ pub fn list_buckets_xml(
     xml
 }
 
+/// Format a `GetBucketLocation` XML response.
+#[must_use]
+pub fn get_bucket_location_xml(location_constraint: Option<&str>) -> String {
+    match location_constraint {
+        Some(location_constraint) => format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}</LocationConstraint>",
+            xml_escape(location_constraint)
+        ),
+        None => String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>",
+        ),
+    }
+}
+
 /// Format a `GetBucketAcl` XML response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedAclGrant {

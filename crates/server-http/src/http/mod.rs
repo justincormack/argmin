@@ -759,6 +759,17 @@ impl HttpFrontend {
                     })?;
                 Ok(S3Response::head_bucket(&info))
             }
+            S3Operation::GetBucketLocation { bucket } => {
+                let requester = Self::requester_from_auth(auth);
+                let _info = self
+                    .coordinator
+                    .head_bucket(&crate::coordinator::BucketRequest {
+                        name: &bucket,
+                        requester,
+                        expected_bucket_owner,
+                    })?;
+                Ok(S3Response::get_bucket_location(self.coordinator.region()))
+            }
             S3Operation::ListObjectsV1 { bucket } => {
                 let prefix = req.query_param_lossy("prefix");
                 let delimiter = req.query_param_lossy("delimiter").filter(|d| !d.is_empty());
@@ -4730,6 +4741,28 @@ mod tests {
         assert!(body.contains(owner_canonical_id.as_str()));
         assert!(body.contains("<DisplayName>User A</DisplayName>"));
         assert!(!body.contains("<DisplayName>testuser</DisplayName>"));
+    }
+
+    #[test]
+    fn get_bucket_location_dispatches_through_head_bucket_checks() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = new_req(http::Method::GET, "/mybucket", "location", vec![], vec![]);
+        let resp = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::GetBucketLocation {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.status_code, 200);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("<LocationConstraint"));
+        assert!(!body.contains(">us-east-1<"));
     }
 
     fn make_req(query: &str) -> S3Request {

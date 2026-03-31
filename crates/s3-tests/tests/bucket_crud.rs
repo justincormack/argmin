@@ -1,7 +1,10 @@
 use std::time::{Duration, Instant};
 
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{ObjectOwnership, Permission, VersioningConfiguration};
+use aws_sdk_s3::types::{
+    BucketLocationConstraint, CreateBucketConfiguration, ObjectOwnership, Permission,
+    VersioningConfiguration,
+};
 use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 
 fn assert_canonical_owner_id(id: &str) {
@@ -34,6 +37,26 @@ async fn recreate_bucket_after_delete(client: &aws_sdk_s3::Client, bucket: &str)
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
         }
+    }
+}
+
+async fn create_bucket_in_test_region(client: &aws_sdk_s3::Client, bucket: &str) {
+    let mut request = client.create_bucket().bucket(bucket);
+    if CTX.region() != "us-east-1" {
+        let config = CreateBucketConfiguration::builder()
+            .location_constraint(BucketLocationConstraint::from(CTX.region()))
+            .build();
+        request = request.create_bucket_configuration(config);
+    }
+    request.send().await.unwrap();
+}
+
+fn expected_bucket_location_constraint_for_sdk(region: &str) -> Option<&str> {
+    match region {
+        // The SDK models the legacy us-east-1 null as an empty string.
+        "us-east-1" => Some(""),
+        "eu-west-1" => Some("EU"),
+        other => Some(other),
     }
 }
 
@@ -228,6 +251,28 @@ fn test_bucket_head() {
         client.create_bucket().bucket(&bucket).send().await.unwrap();
 
         client.head_bucket().bucket(&bucket).send().await.unwrap();
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_get_location() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        create_bucket_in_test_region(client, &bucket).await;
+
+        let output = client
+            .get_bucket_location()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            output.location_constraint().map(|value| value.as_str()),
+            expected_bucket_location_constraint_for_sdk(CTX.region())
+        );
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });

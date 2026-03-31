@@ -19,6 +19,14 @@ use storage::BucketEncryptionConfig;
 
 use super::xml;
 
+fn legacy_bucket_location_constraint(region: &str) -> Option<&str> {
+    match region {
+        "us-east-1" => None,
+        "eu-west-1" => Some("EU"),
+        other => Some(other),
+    }
+}
+
 /// Format a `version_id` for S3 API responses.
 /// Null version is displayed as "null".
 /// Versioned IDs are displayed as decimal strings.
@@ -506,6 +514,13 @@ impl S3Response {
     pub fn head_bucket(info: &BucketSummary) -> Self {
         let _ = info; // We could add x-amz-bucket-region etc.
         Self::new(200)
+    }
+
+    /// Build a response for `GetBucketLocation`.
+    #[must_use]
+    pub fn get_bucket_location(region: &str) -> Self {
+        let body = xml::get_bucket_location_xml(legacy_bucket_location_constraint(region));
+        Self::new(200).xml_body(body)
     }
 
     /// Build a response for `PutBucketVersioning`.
@@ -1789,6 +1804,26 @@ mod tests {
         };
         let resp = S3Response::head_bucket(&info);
         assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn get_bucket_location_response_uses_legacy_us_east_1_null() {
+        let resp = S3Response::get_bucket_location("us-east-1");
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("<LocationConstraint"));
+        assert!(body.contains("/>"));
+        assert!(!body.contains(">us-east-1<"));
+    }
+
+    #[test]
+    fn get_bucket_location_response_maps_eu_west_1_to_legacy_eu() {
+        let resp = S3Response::get_bucket_location("eu-west-1");
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains(">EU</LocationConstraint>"));
     }
 
     // ── list_buckets ──────────────────────────────────────────────────

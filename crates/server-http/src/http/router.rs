@@ -8,6 +8,7 @@ pub enum S3Operation {
     CreateBucket { bucket: String },
     DeleteBucket { bucket: String },
     HeadBucket { bucket: String },
+    GetBucketLocation { bucket: String },
     ListObjectsV1 { bucket: String },
     ListObjectsV2 { bucket: String },
     PutObject { bucket: String, key: String },
@@ -266,6 +267,11 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             bucket: bucket.to_string(),
         }),
         ("GET", None) => {
+            if has_query_key(query, "location") {
+                return Ok(S3Operation::GetBucketLocation {
+                    bucket: bucket.to_string(),
+                });
+            }
             // Check for ?uploads → ListMultipartUploads
             if has_query_key(query, "uploads") {
                 return Ok(S3Operation::ListMultipartUploads {
@@ -511,6 +517,16 @@ mod tests {
         assert_eq!(
             route("HEAD", "/mybucket", "").unwrap(),
             S3Operation::HeadBucket {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_location() {
+        assert_eq!(
+            route("GET", "/mybucket", "location").unwrap(),
+            S3Operation::GetBucketLocation {
                 bucket: "mybucket".to_string()
             }
         );
