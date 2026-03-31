@@ -10,6 +10,11 @@ pub struct UploadPartRequest<'a> {
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
+#[must_use]
+pub fn requester(principal: &str) -> Requester {
+    Requester::authenticated(AccountIdentity::from_principal(principal))
+}
+
 /// Put an object via the streaming path (begin -> append -> finalize).
 ///
 /// Available in-crate during `#[cfg(test)]` and cross-crate via the

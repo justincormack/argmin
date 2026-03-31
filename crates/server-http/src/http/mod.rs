@@ -4627,7 +4627,7 @@ mod tests {
         coord
             .create_bucket(&crate::coordinator::CreateBucketRequest {
                 name,
-                requester: crate::coordinator::Requester::principal("testuser"),
+                requester: crate::coordinator::test_helpers::requester("testuser"),
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
                 ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -4638,7 +4638,7 @@ mod tests {
     fn test_bucket_request(name: &str) -> crate::coordinator::BucketRequest<'_> {
         crate::coordinator::BucketRequest::new(
             name,
-            crate::coordinator::Requester::principal("testuser"),
+            crate::coordinator::test_helpers::requester("testuser"),
             None,
         )
     }
@@ -4650,7 +4650,7 @@ mod tests {
         crate::coordinator::ObjectRequest::new(
             bucket,
             key,
-            crate::coordinator::Requester::principal("testuser"),
+            crate::coordinator::test_helpers::requester("testuser"),
             None,
         )
     }
@@ -5085,7 +5085,7 @@ mod tests {
         fe.coordinator
             .create_bucket(&crate::coordinator::CreateBucketRequest {
                 name: "mybucket",
-                requester: crate::coordinator::Requester::principal("testuser"),
+                requester: crate::coordinator::test_helpers::requester("testuser"),
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
                 ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,

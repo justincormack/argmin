@@ -3728,7 +3728,7 @@ mod tests {
     const NO_PUT_OBJECT_ACL: PutObjectAcl<'static> = PutObjectAcl::None;
 
     fn test_requester() -> Requester {
-        Requester::principal("default-owner")
+        test_helpers::requester("default-owner")
     }
 
     fn test_bucket_request(name: &str) -> crate::coordinator::BucketRequest<'_> {
