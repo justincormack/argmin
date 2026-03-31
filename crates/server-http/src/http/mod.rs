@@ -2011,6 +2011,13 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 let acl = parse_put_object_write_acl(req)?;
                 let object_lock = parse_object_lock_headers(req)?;
+                let policy_context = put_object_policy_context_from_request(
+                    req,
+                    inline_tags_xml.as_deref(),
+                    None,
+                    None,
+                    acl.policy_condition_value(),
+                );
 
                 let result = self.coordinator.create_multipart_upload(
                     &crate::coordinator::CreateMultipartUploadRequest {
@@ -2020,13 +2027,9 @@ impl HttpFrontend {
                         tags: inline_tags_xml.as_deref(),
                         checksum,
                         acl,
+                        policy_context,
                         object_lock,
                         sse_customer: sse_customer.as_ref(),
-                        grant_read: req.header("x-amz-grant-read"),
-                        grant_write: req.header("x-amz-grant-write"),
-                        grant_read_acp: req.header("x-amz-grant-read-acp"),
-                        grant_write_acp: req.header("x-amz-grant-write-acp"),
-                        grant_full_control: req.header("x-amz-grant-full-control"),
                     },
                 )?;
                 Ok(S3Response::create_multipart_upload(

@@ -1645,13 +1645,9 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub tags: Option<&'a str>,
     pub checksum: Option<MultipartChecksumConfig>,
     pub acl: PutObjectWriteAcl<'a>,
+    pub policy_context: PutObjectPolicyContext<'a>,
     pub object_lock: ObjectLockState,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    pub grant_read: Option<&'a str>,
-    pub grant_write: Option<&'a str>,
-    pub grant_read_acp: Option<&'a str>,
-    pub grant_write_acp: Option<&'a str>,
-    pub grant_full_control: Option<&'a str>,
 }
 
 /// Request for an UploadPart operation (test-only convenience wrapper).
@@ -1969,25 +1965,20 @@ impl<'a> BeginStreamPartRequest<'a> {
     }
 }
 
-impl<'a> CreateMultipartUploadRequest<'a> {
-    fn write_acl(&self) -> PutObjectWriteAcl<'a> {
-        self.acl.clone()
-    }
-
-    fn policy_context(&self) -> PutObjectPolicyContext<'a> {
-        PutObjectPolicyContext::new(None, None, self.write_acl().policy_condition_value())
-            .with_request_object_tags_xml(self.tags)
-            .with_acl_grant_headers(
-                self.grant_read,
-                self.grant_write,
-                self.grant_read_acp,
-                self.grant_write_acp,
-                self.grant_full_control,
-            )
+impl<'a> PutObjectRequest<'a> {
+    fn effective_policy_context(&self) -> PutObjectPolicyContext<'a> {
+        let policy_context = self
+            .policy_context
+            .with_default_canned_acl(self.acl.policy_condition_value());
+        if policy_context.request_object_tags_xml.is_some() {
+            policy_context
+        } else {
+            policy_context.with_request_object_tags_xml(self.tags)
+        }
     }
 }
 
-impl<'a> PutObjectRequest<'a> {
+impl<'a> CreateMultipartUploadRequest<'a> {
     fn effective_policy_context(&self) -> PutObjectPolicyContext<'a> {
         let policy_context = self
             .policy_context
@@ -10164,8 +10155,7 @@ impl Coordinator {
         );
         let bucket = req.object.bucket_name();
         let key = req.object.key;
-        let policy_context = req.policy_context();
-        let acl = req.write_acl();
+        let policy_context = req.effective_policy_context();
         self.with_bucket_write_reservation(bucket, |bucket_info| {
             Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
             if req.object.requester().is_anonymous() {
@@ -10204,11 +10194,11 @@ impl Coordinator {
                 .as_ref()
                 .map(|ctx| ctx.encryption().clone())
                 .unwrap_or_default();
-            Self::ensure_put_object_write_acl_supported(&bucket_info, &acl)?;
+            Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
             let initiator = Self::requester_owner_identity(req.object.requester());
             let owner =
-                Self::effective_put_object_owner(&bucket_info, req.object.requester(), &acl);
-            let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &acl);
+                Self::effective_put_object_owner(&bucket_info, req.object.requester(), &req.acl);
+            let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
             let public_read = Self::acl_grants_public_read(&acl_grants);
             Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
 
@@ -13164,11 +13154,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -13287,11 +13273,7 @@ mod tests {
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -13611,11 +13593,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -13806,11 +13784,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             });
             tx.send(res).unwrap();
         });
@@ -16477,11 +16451,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -18207,11 +18177,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap_err();
         assert!(matches!(denied, ServerError::AccessDenied));
@@ -18229,11 +18195,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
                 })
             .unwrap();
         assert!(!upload.upload_id.is_empty());
@@ -18266,11 +18228,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
                 })
             .unwrap_err();
         assert!(matches!(denied, ServerError::AccessDenied));
@@ -18336,11 +18294,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -19628,11 +19582,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19662,11 +19612,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -19719,11 +19665,7 @@ mod tests {
                 acl: PutObjectAcl::PublicRead.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
@@ -19753,11 +19695,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -19803,11 +19741,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -19873,11 +19807,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -23654,11 +23584,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: Some(&sse_customer),
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -24226,11 +24152,7 @@ mod tests {
                     acl: NO_PUT_OBJECT_ACL.into(),
                     sse_customer: None,
                     object_lock: ObjectLockState::default(),
-                    grant_read: None,
-                    grant_write: None,
-                    grant_read_acp: None,
-                    grant_write_acp: None,
-                    grant_full_control: None,
+                    policy_context: PutObjectPolicyContext::default(),
                 })
                 .unwrap();
             let dst_key_for_copy = dst_key.clone();
@@ -24768,11 +24690,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -24982,11 +24900,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -25015,11 +24929,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         let r2 = coord
@@ -25033,11 +24943,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         assert_ne!(r1.upload_id, r2.upload_id);
@@ -25065,11 +24971,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -25121,11 +25023,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         let r2 = coord
@@ -25144,11 +25042,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -25225,11 +25119,7 @@ mod tests {
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -25321,11 +25211,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -25443,11 +25329,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -25509,11 +25391,7 @@ mod tests {
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -25614,11 +25492,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         let r2 = coord
@@ -25632,11 +25506,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -25684,11 +25554,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         coord
@@ -25702,11 +25568,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         coord
@@ -25720,11 +25582,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -25785,11 +25643,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         coord
@@ -25808,11 +25662,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         coord
@@ -25831,11 +25681,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -25872,11 +25718,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -25944,11 +25786,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -25988,11 +25826,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -26194,11 +26028,7 @@ mod tests {
                     acl: NO_PUT_OBJECT_ACL.into(),
                     sse_customer: None,
                     object_lock: ObjectLockState::default(),
-                    grant_read: None,
-                    grant_write: None,
-                    grant_read_acp: None,
-                    grant_write_acp: None,
-                    grant_full_control: None,
+                    policy_context: PutObjectPolicyContext::default(),
                 })
                 .unwrap();
             upload_ids.push(r.upload_id);
@@ -26270,11 +26100,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -26340,11 +26166,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -26419,11 +26241,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -26468,11 +26286,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -26546,11 +26360,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -26646,11 +26456,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -26704,11 +26510,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -26777,11 +26579,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -26851,11 +26649,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -26952,11 +26746,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -27293,11 +27083,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -27695,11 +27481,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -27753,11 +27535,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -27852,11 +27630,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         test_helpers::upload_part(
@@ -28058,11 +27832,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -28132,11 +27902,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -28216,11 +27982,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         test_helpers::upload_part(
@@ -28288,11 +28050,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -28346,11 +28104,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -28403,11 +28157,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -29131,11 +28881,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -29730,11 +29476,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: Some(&sse_customer),
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -31278,11 +31020,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -31359,11 +31097,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -31485,11 +31219,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -31667,11 +31397,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -31732,11 +31458,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -31799,11 +31521,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -31846,11 +31564,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
         let mpu_b = coord
@@ -31864,11 +31578,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
@@ -32009,11 +31719,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
-                grant_read: None,
-                grant_write: None,
-                grant_read_acp: None,
-                grant_write_acp: None,
-                grant_full_control: None,
+                policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
 
