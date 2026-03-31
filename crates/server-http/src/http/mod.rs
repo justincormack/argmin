@@ -20,6 +20,7 @@ use hyper::body::{Body, Frame, SizeHint};
 
 use crate::coordinator::BeginStreamPartRequest;
 use crate::coordinator::BeginStreamPutRequest;
+use crate::coordinator::BucketRequest;
 use crate::coordinator::ChecksumClaim;
 use crate::coordinator::Coordinator;
 use crate::coordinator::CopyObjectRequest;
@@ -28,6 +29,9 @@ use crate::coordinator::EncodedChecksumClaim;
 use crate::coordinator::FinalizeStreamPartRequest;
 use crate::coordinator::FinalizeStreamPutRequest;
 use crate::coordinator::MetadataDirective;
+use crate::coordinator::MultipartObjectRequest;
+use crate::coordinator::ObjectRequest;
+use crate::coordinator::ObjectVersionRequest;
 use crate::coordinator::TaggingDirective;
 use crate::coordinator::UploadPartCopyRequest;
 use crate::error::ServerError;
@@ -771,13 +775,11 @@ impl HttpFrontend {
 
                 let result = self.coordinator.list_objects_v2(
                     &crate::coordinator::ListObjectsV2Request {
-                        bucket: &bucket,
+                        bucket: BucketRequest::new(&bucket, requester, expected_bucket_owner),
                         prefix: prefix.as_deref(),
                         delimiter: delimiter.as_deref(),
                         continuation_token: marker.as_deref(),
                         max_keys,
-                        requester,
-                        expected_bucket_owner,
                     },
                 )?;
                 Ok(S3Response::list_objects_v1(
@@ -823,13 +825,11 @@ impl HttpFrontend {
 
                 let result = self.coordinator.list_objects_v2(
                     &crate::coordinator::ListObjectsV2Request {
-                        bucket: &bucket,
+                        bucket: BucketRequest::new(&bucket, requester, expected_bucket_owner),
                         prefix: prefix.as_deref(),
                         delimiter: delimiter.as_deref(),
                         continuation_token,
                         max_keys,
-                        requester,
-                        expected_bucket_owner,
                     },
                 )?;
                 Ok(S3Response::list_objects_v2(
@@ -938,17 +938,19 @@ impl HttpFrontend {
                             condition: &src_cond,
                             expected_bucket_owner: expected_source_bucket_owner(req),
                         },
-                        dst_bucket: &bucket,
-                        dst_key: &key,
+                        destination: ObjectRequest::new(
+                            &bucket,
+                            &key,
+                            requester,
+                            expected_bucket_owner,
+                        ),
                         dst_condition: &dst_cond,
                         directive,
                         tagging,
-                        requester,
                         acl,
                         source_sse_customer: source_sse_customer.as_ref(),
                         dst_sse_customer: dst_sse_customer.as_ref(),
                         object_lock,
-                        expected_bucket_owner,
                     })?;
                     Ok(S3Response::copy_object(&result))
                 } else {
@@ -983,19 +985,21 @@ impl HttpFrontend {
                     let result =
                         self.coordinator
                             .put_object(&crate::coordinator::PutObjectRequest {
-                                bucket: &bucket,
-                                key: &key,
+                                object: ObjectRequest::new(
+                                    &bucket,
+                                    &key,
+                                    requester,
+                                    expected_bucket_owner,
+                                ),
                                 data: &req.body,
                                 metadata: &metadata_blob,
                                 system_metadata: &system_metadata,
                                 tags: inline_tags_xml.as_deref(),
                                 cond: &cond,
-                                requester,
                                 acl,
                                 policy_context,
                                 object_lock,
                                 sse_customer: sse_customer.as_ref(),
-                                expected_bucket_owner,
                             })?;
                     let mut resp = S3Response::put_object(&result);
                     apply_sse_customer_write_response_headers(&mut resp, sse_customer.as_ref());
@@ -1036,14 +1040,16 @@ impl HttpFrontend {
                     let result = self
                         .coordinator
                         .get_object_part(&crate::coordinator::GetObjectPartRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            version_id: vid,
+                            object: ObjectVersionRequest::new(
+                                &bucket,
+                                &key,
+                                vid,
+                                requester,
+                                expected_bucket_owner,
+                            ),
                             part_number,
                             cond: &cond,
-                            requester,
                             sse_customer: sse_customer.as_ref(),
-                            expected_bucket_owner,
                         })
                         .map_err(|e| match e {
                             ServerError::InvalidPart { .. } => {
@@ -1072,14 +1078,16 @@ impl HttpFrontend {
                             );
                             match self.coordinator.get_object_range(
                                 &crate::coordinator::GetObjectRangeRequest {
-                                    bucket: &bucket,
-                                    key: &key,
-                                    version_id: vid,
+                                    object: ObjectVersionRequest::new(
+                                        &bucket,
+                                        &key,
+                                        vid,
+                                        requester,
+                                        expected_bucket_owner,
+                                    ),
                                     range: byte_range,
                                     cond: &cond,
-                                    requester,
                                     sse_customer: sse_customer.as_ref(),
-                                    expected_bucket_owner,
                                 },
                             ) {
                                 Ok(result) => {
@@ -1111,13 +1119,15 @@ impl HttpFrontend {
                             );
                             let result = self.coordinator.get_object(
                                 &crate::coordinator::GetObjectRequest {
-                                    bucket: &bucket,
-                                    key: &key,
-                                    version_id: vid,
+                                    object: ObjectVersionRequest::new(
+                                        &bucket,
+                                        &key,
+                                        vid,
+                                        requester,
+                                        expected_bucket_owner,
+                                    ),
                                     cond: &cond,
-                                    requester,
                                     sse_customer: sse_customer.as_ref(),
-                                    expected_bucket_owner,
                                 },
                             )?;
                             let checksum_mode = req.header("x-amz-checksum-mode");
@@ -1134,13 +1144,15 @@ impl HttpFrontend {
                     let result =
                         self.coordinator
                             .get_object(&crate::coordinator::GetObjectRequest {
-                                bucket: &bucket,
-                                key: &key,
-                                version_id: vid,
+                                object: ObjectVersionRequest::new(
+                                    &bucket,
+                                    &key,
+                                    vid,
+                                    requester,
+                                    expected_bucket_owner,
+                                ),
                                 cond: &cond,
-                                requester,
                                 sse_customer: sse_customer.as_ref(),
-                                expected_bucket_owner,
                             })?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     let tags = result.tags.clone();
@@ -1168,13 +1180,15 @@ impl HttpFrontend {
                 let result =
                     self.coordinator
                         .delete_object(&crate::coordinator::DeleteObjectRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            version_id: vid,
+                            object: ObjectVersionRequest::new(
+                                &bucket,
+                                &key,
+                                vid,
+                                requester,
+                                expected_bucket_owner,
+                            ),
                             bypass_governance,
                             cond: &cond,
-                            requester,
-                            expected_bucket_owner,
                         })?;
                 Ok(S3Response::delete_object(&result))
             }
@@ -1206,14 +1220,16 @@ impl HttpFrontend {
                     let result = self
                         .coordinator
                         .head_object_part(&crate::coordinator::GetObjectPartRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            version_id: vid,
+                            object: ObjectVersionRequest::new(
+                                &bucket,
+                                &key,
+                                vid,
+                                requester,
+                                expected_bucket_owner,
+                            ),
                             part_number,
                             cond: &cond,
-                            requester,
                             sse_customer: sse_customer.as_ref(),
-                            expected_bucket_owner,
                         })
                         .map_err(|e| match e {
                             ServerError::InvalidPart { .. } => {
@@ -1230,13 +1246,15 @@ impl HttpFrontend {
                     let result =
                         self.coordinator
                             .head_object(&crate::coordinator::GetObjectRequest {
-                                bucket: &bucket,
-                                key: &key,
-                                version_id: vid,
+                                object: ObjectVersionRequest::new(
+                                    &bucket,
+                                    &key,
+                                    vid,
+                                    requester,
+                                    expected_bucket_owner,
+                                ),
                                 cond: &cond,
-                                requester,
                                 sse_customer: sse_customer.as_ref(),
-                                expected_bucket_owner,
                             })?;
                     let checksum_mode = req.header("x-amz-checksum-mode");
                     let mut resp = S3Response::head_object(&result, checksum_mode);
@@ -1304,16 +1322,18 @@ impl HttpFrontend {
                 let requester_ctx = Self::requester_from_auth(auth);
                 let result = self.coordinator.get_object_attributes(
                     &crate::coordinator::GetObjectAttributesRequest {
-                        bucket: &bucket,
-                        key: &key,
-                        version_id: vid,
+                        object: ObjectVersionRequest::new(
+                            &bucket,
+                            &key,
+                            vid,
+                            requester_ctx,
+                            expected_bucket_owner,
+                        ),
                         cond: &cond,
                         want_parts,
                         part_number_marker,
                         max_parts,
-                        requester: requester_ctx,
                         sse_customer: sse_customer.as_ref(),
-                        expected_bucket_owner,
                     },
                 )?;
                 let checksum_entries = result.system_metadata.checksum_header_pairs();
@@ -1382,11 +1402,9 @@ impl HttpFrontend {
                 } else {
                     self.coordinator
                         .delete_objects(&crate::coordinator::DeleteObjectsRequest {
-                            bucket: &bucket,
+                            bucket: BucketRequest::new(&bucket, requester, expected_bucket_owner),
                             entries: &entries,
                             bypass_governance,
-                            requester,
-                            expected_bucket_owner,
                         })?
                 };
                 result.errors.extend(validation_errors);
@@ -1567,13 +1585,13 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_object_retention(
                     &crate::coordinator::PutObjectRetentionRequest {
-                        object: crate::coordinator::ObjectVersionRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            version_id: vid,
+                        object: ObjectVersionRequest::new(
+                            &bucket,
+                            &key,
+                            vid,
                             requester,
                             expected_bucket_owner,
-                        },
+                        ),
                         retention,
                         bypass_governance,
                     },
@@ -1583,15 +1601,15 @@ impl HttpFrontend {
             S3Operation::GetObjectRetention { bucket, key } => {
                 let vid = parse_version_id(req)?;
                 let requester = Self::requester_from_auth(auth);
-                let retention = self.coordinator.get_object_retention(
-                    &crate::coordinator::ObjectVersionRequest {
-                        bucket: &bucket,
-                        key: &key,
-                        version_id: vid,
-                        requester,
-                        expected_bucket_owner,
-                    },
-                )?;
+                let retention =
+                    self.coordinator
+                        .get_object_retention(&ObjectVersionRequest::new(
+                            &bucket,
+                            &key,
+                            vid,
+                            requester,
+                            expected_bucket_owner,
+                        ))?;
                 Ok(S3Response::get_object_retention(retention))
             }
             S3Operation::PutObjectLegalHold { bucket, key } => {
@@ -1601,13 +1619,13 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_object_legal_hold(
                     &crate::coordinator::PutObjectLegalHoldRequest {
-                        object: crate::coordinator::ObjectVersionRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            version_id: vid,
+                        object: ObjectVersionRequest::new(
+                            &bucket,
+                            &key,
+                            vid,
                             requester,
                             expected_bucket_owner,
-                        },
+                        ),
                         legal_hold,
                     },
                 )?;
@@ -1616,15 +1634,15 @@ impl HttpFrontend {
             S3Operation::GetObjectLegalHold { bucket, key } => {
                 let vid = parse_version_id(req)?;
                 let requester = Self::requester_from_auth(auth);
-                let legal_hold = self.coordinator.get_object_legal_hold(
-                    &crate::coordinator::ObjectVersionRequest {
-                        bucket: &bucket,
-                        key: &key,
-                        version_id: vid,
-                        requester,
-                        expected_bucket_owner,
-                    },
-                )?;
+                let legal_hold =
+                    self.coordinator
+                        .get_object_legal_hold(&ObjectVersionRequest::new(
+                            &bucket,
+                            &key,
+                            vid,
+                            requester,
+                            expected_bucket_owner,
+                        ))?;
                 Ok(S3Response::get_object_legal_hold(legal_hold))
             }
             S3Operation::PutObjectTagging { bucket, key } => {
@@ -1634,13 +1652,13 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .put_object_tags(&crate::coordinator::PutObjectTagsRequest {
-                        object: crate::coordinator::ObjectVersionRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            version_id: vid,
+                        object: ObjectVersionRequest::new(
+                            &bucket,
+                            &key,
+                            vid,
                             requester,
                             expected_bucket_owner,
-                        },
+                        ),
                         tags: &tags_xml,
                     })?;
                 Ok(S3Response::put_object_tagging())
@@ -1650,13 +1668,13 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 if let Some(tags_xml) =
                     self.coordinator
-                        .get_object_tags(&crate::coordinator::ObjectVersionRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            version_id: vid,
+                        .get_object_tags(&ObjectVersionRequest::new(
+                            &bucket,
+                            &key,
+                            vid,
                             requester,
                             expected_bucket_owner,
-                        })?
+                        ))?
                 {
                     Ok(S3Response::get_object_tagging(&tags_xml))
                 } else {
@@ -1669,27 +1687,25 @@ impl HttpFrontend {
                 let vid = parse_version_id(req)?;
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
-                    .delete_object_tags(&crate::coordinator::ObjectVersionRequest {
-                        bucket: &bucket,
-                        key: &key,
-                        version_id: vid,
+                    .delete_object_tags(&ObjectVersionRequest::new(
+                        &bucket,
+                        &key,
+                        vid,
                         requester,
                         expected_bucket_owner,
-                    })?;
+                    ))?;
                 Ok(S3Response::delete_object_tagging())
             }
             S3Operation::GetObjectAcl { bucket, key } => {
                 let version_id = parse_version_id(req)?;
                 let requester = Self::requester_from_auth(auth);
-                let result =
-                    self.coordinator
-                        .get_object_acl(&crate::coordinator::ObjectVersionRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            version_id,
-                            requester,
-                            expected_bucket_owner,
-                        })?;
+                let result = self.coordinator.get_object_acl(&ObjectVersionRequest::new(
+                    &bucket,
+                    &key,
+                    version_id,
+                    requester,
+                    expected_bucket_owner,
+                ))?;
                 let (owner_display_name, grants) = self.render_acl_grants(
                     &result.owner_principal,
                     &result.owner_canonical_id,
@@ -1719,26 +1735,26 @@ impl HttpFrontend {
                     let acl = parse_put_object_acl(req.header("x-amz-acl"));
                     self.coordinator
                         .put_object_acl(&crate::coordinator::PutObjectAclRequest {
-                            object: crate::coordinator::ObjectVersionRequest {
-                                bucket: &bucket,
-                                key: &key,
+                            object: ObjectVersionRequest::new(
+                                &bucket,
+                                &key,
                                 version_id,
                                 requester,
                                 expected_bucket_owner,
-                            },
+                            ),
                             acl: crate::coordinator::PutObjectAclInput::Canned(acl),
                         })?
                 } else {
                     let acl_grants = parse_acl_grants(req)?;
                     self.coordinator
                         .put_object_acl(&crate::coordinator::PutObjectAclRequest {
-                            object: crate::coordinator::ObjectVersionRequest {
-                                bucket: &bucket,
-                                key: &key,
+                            object: ObjectVersionRequest::new(
+                                &bucket,
+                                &key,
                                 version_id,
                                 requester,
                                 expected_bucket_owner,
-                            },
+                            ),
                             acl: crate::coordinator::PutObjectAclInput::Grants(acl_grants),
                         })?
                 };
@@ -1998,13 +2014,11 @@ impl HttpFrontend {
 
                 let result = self.coordinator.create_multipart_upload(
                     &crate::coordinator::CreateMultipartUploadRequest {
-                        bucket: &bucket,
-                        key: &key,
+                        object: ObjectRequest::new(&bucket, &key, requester, expected_bucket_owner),
                         metadata: &metadata,
                         system_metadata: &system_metadata,
                         tags: inline_tags_xml.as_deref(),
                         checksum,
-                        requester,
                         acl,
                         object_lock,
                         sse_customer: sse_customer.as_ref(),
@@ -2013,7 +2027,6 @@ impl HttpFrontend {
                         grant_read_acp: req.header("x-amz-grant-read-acp"),
                         grant_write_acp: req.header("x-amz-grant-write-acp"),
                         grant_full_control: req.header("x-amz-grant-full-control"),
-                        expected_bucket_owner,
                     },
                 )?;
                 Ok(S3Response::create_multipart_upload(
@@ -2072,15 +2085,17 @@ impl HttpFrontend {
                             condition: &src_cond,
                             expected_bucket_owner: expected_source_bucket_owner(req),
                         },
-                        dst_bucket: &bucket,
-                        dst_key: &key,
-                        upload_id: &upload_id,
+                        upload: MultipartObjectRequest::new(
+                            &bucket,
+                            &key,
+                            &upload_id,
+                            requester,
+                            expected_bucket_owner,
+                        ),
                         part_number,
                         copy_source_range,
-                        requester,
                         source_sse_customer: source_sse_customer.as_ref(),
                         sse_customer: sse_customer.as_ref(),
-                        expected_bucket_owner,
                     })?;
                     Ok(S3Response::upload_part_copy(
                         &result.etag,
@@ -2095,13 +2110,15 @@ impl HttpFrontend {
                     let requester = Self::requester_from_auth(auth);
                     let session = self.coordinator.begin_stream_part(
                         &crate::coordinator::BeginStreamPartRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            upload_id: &upload_id,
+                            upload: MultipartObjectRequest::new(
+                                &bucket,
+                                &key,
+                                &upload_id,
+                                requester.clone(),
+                                expected_bucket_owner,
+                            ),
                             part_number,
-                            requester,
                             sse_customer: sse_customer_request.as_ref(),
-                            expected_bucket_owner,
                         },
                     )?;
                     let session_id = session.session_id;
@@ -2134,10 +2151,14 @@ impl HttpFrontend {
                         };
                         self.coordinator.finalize_stream_part(
                             crate::coordinator::FinalizeStreamPartRequest {
-                                bucket: &bucket,
-                                key: &key,
+                                upload: MultipartObjectRequest::new(
+                                    &bucket,
+                                    &key,
+                                    &upload_id,
+                                    requester,
+                                    expected_bucket_owner,
+                                ),
                                 session_id: &session_id,
-                                upload_id: &upload_id,
                                 part_number,
                                 crc64: crc,
                                 total_size: req.body.len() as u64,
@@ -2178,14 +2199,16 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 let result = self.coordinator.complete_multipart_upload(
                     &crate::coordinator::CompleteMultipartUploadRequest {
-                        bucket: &bucket,
-                        key: &key,
-                        upload_id: &upload_id,
+                        upload: MultipartObjectRequest::new(
+                            &bucket,
+                            &key,
+                            &upload_id,
+                            requester,
+                            expected_bucket_owner,
+                        ),
                         parts: &parts,
                         claimed_checksum: claimed_checksum.as_ref(),
-                        requester,
                         sse_customer: sse_customer.as_ref(),
-                        expected_bucket_owner,
                     },
                 )?;
                 Ok(S3Response::complete_multipart_upload(
@@ -2205,15 +2228,14 @@ impl HttpFrontend {
                     }
                 })?;
                 let requester = Self::requester_from_auth(auth);
-                self.coordinator.abort_multipart_upload(
-                    &crate::coordinator::AbortMultipartUploadRequest {
-                        bucket: &bucket,
-                        key: &key,
-                        upload_id: &upload_id,
+                self.coordinator
+                    .abort_multipart_upload(&MultipartObjectRequest::new(
+                        &bucket,
+                        &key,
+                        &upload_id,
                         requester,
                         expected_bucket_owner,
-                    },
-                )?;
+                    ))?;
                 Ok(S3Response::abort_multipart_upload())
             }
             S3Operation::ListMultipartUploads { bucket } => {
@@ -2229,13 +2251,11 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 let result = self.coordinator.list_multipart_uploads(
                     &crate::coordinator::ListMultipartUploadsRequest {
-                        bucket: &bucket,
+                        bucket: BucketRequest::new(&bucket, requester, expected_bucket_owner),
                         prefix: prefix.as_deref(),
                         key_marker: key_marker.as_deref(),
                         upload_id_marker: upload_id_marker.as_deref(),
                         max_uploads,
-                        requester,
-                        expected_bucket_owner,
                     },
                 )?;
                 let rendered = self.render_multipart_uploads(result);
@@ -2272,13 +2292,15 @@ impl HttpFrontend {
                 let result =
                     self.coordinator
                         .list_parts(&crate::coordinator::ListPartsRequest {
-                            bucket: &bucket,
-                            key: &key,
-                            upload_id: &upload_id,
+                            upload: MultipartObjectRequest::new(
+                                &bucket,
+                                &key,
+                                &upload_id,
+                                requester,
+                                expected_bucket_owner,
+                            ),
                             part_number_marker,
                             max_parts,
-                            requester,
-                            expected_bucket_owner,
                         })?;
                 Ok(S3Response::list_parts(
                     &bucket,
@@ -2313,13 +2335,11 @@ impl HttpFrontend {
 
                 let result = self.coordinator.list_object_versions(
                     &crate::coordinator::ListObjectVersionsRequest {
-                        bucket: &bucket,
+                        bucket: BucketRequest::new(&bucket, requester, expected_bucket_owner),
                         prefix: prefix.as_deref(),
                         key_marker: key_marker.as_deref(),
                         version_id_marker,
                         max_keys,
-                        requester,
-                        expected_bucket_owner,
                     },
                 )?;
                 Ok(S3Response::list_object_versions(
@@ -2731,9 +2751,7 @@ impl HttpFrontend {
         let requester = Self::requester_from_auth(effective_auth);
         let acl = parse_put_object_acl(field("acl"));
         let session_id = self.coordinator.begin_stream_put(&BeginStreamPutRequest {
-            bucket,
-            key: &key,
-            requester: requester.clone(),
+            object: ObjectRequest::new(bucket, &key, requester.clone(), None),
             acl: acl.into(),
             policy: crate::coordinator::PutObjectPolicyContext::new(
                 None,
@@ -2747,8 +2765,6 @@ impl HttpFrontend {
                     ctx.encryption().clone()
                 }),
             object_lock: ObjectLockState::default(),
-            // AWS ignores x-amz-expected-bucket-owner for browser-based POST uploads.
-            expected_bucket_owner: None,
         })?;
 
         let success_status = field("success_action_status")
@@ -2862,8 +2878,12 @@ impl HttpFrontend {
         let result = self
             .coordinator
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: &ctx.binding.bucket,
-                key: &ctx.binding.key,
+                object: ObjectRequest::new(
+                    &ctx.binding.bucket,
+                    &ctx.binding.key,
+                    ctx.requester.clone(),
+                    None,
+                ),
                 session_id: &ctx.binding.session_id,
                 crc64,
                 total_size,
@@ -2872,7 +2892,6 @@ impl HttpFrontend {
                 sse_customer: ctx.sse_customer.as_ref(),
                 tags: ctx.tags_xml.as_deref(),
                 cond: &crate::conditional::WriteCondition::default(),
-                requester: ctx.requester.clone(),
                 acl: acl.into(),
                 policy_context,
                 requested_object_lock: ObjectLockState::default(),
@@ -3120,9 +3139,12 @@ impl HttpFrontend {
             ctx.key
         );
         self.coordinator.begin_stream_put(&BeginStreamPutRequest {
-            bucket: &ctx.bucket,
-            key: &ctx.key,
-            requester: ctx.requester.clone(),
+            object: ObjectRequest::new(
+                &ctx.bucket,
+                &ctx.key,
+                ctx.requester.clone(),
+                ctx.expected_bucket_owner.as_deref(),
+            ),
             acl: put_object_write_acl_from_components(
                 ctx.acl_header.as_deref(),
                 ctx.acl_grants.as_ref(),
@@ -3135,7 +3157,6 @@ impl HttpFrontend {
                     ctx.encryption().clone()
                 }),
             object_lock: ctx.object_lock,
-            expected_bucket_owner: ctx.expected_bucket_owner.as_deref(),
         })
     }
 
@@ -3192,14 +3213,17 @@ impl HttpFrontend {
         let result = self
             .coordinator
             .put_object(&crate::coordinator::PutObjectRequest {
-                bucket: &ctx.bucket,
-                key: &ctx.key,
+                object: ObjectRequest::new(
+                    &ctx.bucket,
+                    &ctx.key,
+                    ctx.requester.clone(),
+                    ctx.expected_bucket_owner.as_deref(),
+                ),
                 data,
                 metadata: &metadata_blob,
                 system_metadata: &system_metadata,
                 tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
-                requester: ctx.requester.clone(),
                 acl: put_object_write_acl_from_components(
                     ctx.acl_header.as_deref(),
                     ctx.acl_grants.as_ref(),
@@ -3210,7 +3234,6 @@ impl HttpFrontend {
                     .sse_customer
                     .as_ref()
                     .map(SseCustomerWriteContext::request),
-                expected_bucket_owner: ctx.expected_bucket_owner.as_deref(),
             })?;
 
         let mut resp = S3Response::put_object(&result);
@@ -3253,8 +3276,12 @@ impl HttpFrontend {
         let result = self
             .coordinator
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: &ctx.bucket,
-                key: &ctx.key,
+                object: ObjectRequest::new(
+                    &ctx.bucket,
+                    &ctx.key,
+                    ctx.requester.clone(),
+                    ctx.expected_bucket_owner.as_deref(),
+                ),
                 session_id,
                 crc64,
                 total_size,
@@ -3263,7 +3290,6 @@ impl HttpFrontend {
                 sse_customer: ctx.sse_customer.as_ref(),
                 tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
-                requester: ctx.requester.clone(),
                 acl: put_object_write_acl_from_components(
                     ctx.acl_header.as_deref(),
                     ctx.acl_grants.as_ref(),
@@ -3321,6 +3347,8 @@ impl HttpFrontend {
         let content_md5 = ContentMd5Claim::from_request(req)?;
         let claimed_checksum = extract_checksum_header(req)?;
         let sse_customer_request = parse_sse_customer_request(req)?;
+        let requester = Self::requester_from_auth(&auth);
+        let expected_bucket_owner = expected_bucket_owner(req).map(str::to_string);
 
         let mut checksum_response: Vec<(String, String)> = Vec::new();
         for &(_, header) in CHECKSUM_HEADERS {
@@ -3332,13 +3360,15 @@ impl HttpFrontend {
         let begin = self
             .coordinator
             .begin_stream_part(&BeginStreamPartRequest {
-                bucket,
-                key,
-                upload_id,
+                upload: MultipartObjectRequest::new(
+                    bucket,
+                    key,
+                    upload_id,
+                    requester.clone(),
+                    expected_bucket_owner.as_deref(),
+                ),
                 part_number,
-                requester: Self::requester_from_auth(&auth),
                 sse_customer: sse_customer_request.as_ref(),
-                expected_bucket_owner: expected_bucket_owner(req),
             })?;
 
         Ok(StreamingPartContext {
@@ -3352,6 +3382,8 @@ impl HttpFrontend {
                 upload_id: upload_id.to_string(),
                 part_number,
             },
+            requester,
+            expected_bucket_owner,
             checksum: StreamingPartChecksumContract {
                 content_md5,
                 upload_checksum_algorithm: begin.checksum_algorithm,
@@ -3437,10 +3469,14 @@ impl HttpFrontend {
         let result = self
             .coordinator
             .finalize_stream_part(FinalizeStreamPartRequest {
-                bucket: &ctx.binding.object.bucket,
-                key: &ctx.binding.object.key,
+                upload: MultipartObjectRequest::new(
+                    &ctx.binding.object.bucket,
+                    &ctx.binding.object.key,
+                    &ctx.binding.upload_id,
+                    ctx.requester.clone(),
+                    ctx.expected_bucket_owner.as_deref(),
+                ),
                 session_id: &ctx.binding.object.session_id,
-                upload_id: &ctx.binding.upload_id,
                 part_number: ctx.binding.part_number,
                 crc64,
                 total_size,
@@ -3610,6 +3646,8 @@ pub struct StreamingPostContext {
 pub struct StreamingPartContext {
     pub trace: observability::TraceContext,
     pub binding: StreamPartBinding,
+    pub requester: crate::coordinator::Requester,
+    pub expected_bucket_owner: Option<String>,
     pub checksum: StreamingPartChecksumContract,
     pub sse_customer: Option<SseCustomerWriteContext>,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
@@ -4595,11 +4633,23 @@ mod tests {
     }
 
     fn test_bucket_request(name: &str) -> crate::coordinator::BucketRequest<'_> {
-        crate::coordinator::BucketRequest {
+        crate::coordinator::BucketRequest::new(
             name,
-            requester: crate::coordinator::Requester::principal("testuser"),
-            expected_bucket_owner: None,
-        }
+            crate::coordinator::Requester::principal("testuser"),
+            None,
+        )
+    }
+
+    fn test_object_request<'a>(
+        bucket: &'a str,
+        key: &'a str,
+    ) -> crate::coordinator::ObjectRequest<'a> {
+        crate::coordinator::ObjectRequest::new(
+            bucket,
+            key,
+            crate::coordinator::Requester::principal("testuser"),
+            None,
+        )
     }
 
     #[test]
@@ -5232,19 +5282,16 @@ mod tests {
         let system_metadata = server_core::system_metadata::SystemMetadata::default();
         fe.coordinator
             .put_object(&crate::coordinator::PutObjectRequest {
-                bucket: "mybucket",
-                key: "mykey",
+                object: test_object_request("mybucket", "mykey"),
                 data: b"data",
                 metadata: &metadata,
                 system_metadata: &system_metadata,
                 tags: None,
                 cond: &crate::conditional::WriteCondition::default(),
-                requester: crate::coordinator::Requester::principal("testuser"),
                 acl: crate::coordinator::PutObjectAcl::None.into(),
                 policy_context: crate::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 

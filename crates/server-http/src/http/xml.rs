@@ -3731,6 +3731,17 @@ mod tests {
         Requester::principal("default-owner")
     }
 
+    fn test_bucket_request(name: &str) -> crate::coordinator::BucketRequest<'_> {
+        crate::coordinator::BucketRequest::new(name, test_requester(), None)
+    }
+
+    fn test_object_request<'a>(
+        bucket: &'a str,
+        key: &'a str,
+    ) -> crate::coordinator::ObjectRequest<'a> {
+        crate::coordinator::ObjectRequest::new(bucket, key, test_requester(), None)
+    }
+
     fn create_test_bucket(coord: &Coordinator, name: &str) {
         coord
             .create_bucket(&crate::coordinator::CreateBucketRequest {
@@ -5965,16 +5976,13 @@ mod tests {
                 sse_customer: None,
                 policy_context: server_core::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
-                bucket: "test-bucket",
-                key: "dir/file1.txt",
+                object: test_object_request("test-bucket", "dir/file1.txt"),
                 data: b"hello",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -5984,16 +5992,13 @@ mod tests {
                 sse_customer: None,
                 policy_context: server_core::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
-                bucket: "test-bucket",
-                key: "dir/file2.txt",
+                object: test_object_request("test-bucket", "dir/file2.txt"),
                 data: b"world",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -6003,29 +6008,24 @@ mod tests {
                 sse_customer: None,
                 policy_context: server_core::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
-                bucket: "test-bucket",
-                key: "root.txt",
+                object: test_object_request("test-bucket", "root.txt"),
                 data: b"root",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let versions_result = coord
             .list_object_versions(&ListObjectVersionsRequest {
-                bucket: "test-bucket",
+                bucket: test_bucket_request("test-bucket"),
                 prefix: None,
                 key_marker: None,
                 version_id_marker: None,
                 max_keys: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(versions_result.versions.len(), 3);
@@ -6041,13 +6041,11 @@ mod tests {
 
         let list_result = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "test-bucket",
+                bucket: test_bucket_request("test-bucket"),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(list_result.objects.len(), 3);
@@ -6072,11 +6070,9 @@ mod tests {
 
         let delete_result = coord
             .delete_objects(&DeleteObjectsRequest {
-                bucket: "test-bucket",
+                bucket: test_bucket_request("test-bucket"),
                 entries: &entries,
                 bypass_governance: false,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(delete_result.deleted.len(), 3);
@@ -6084,13 +6080,11 @@ mod tests {
 
         let list_after = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "test-bucket",
+                bucket: test_bucket_request("test-bucket"),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(list_after.objects.is_empty());
@@ -6117,16 +6111,13 @@ mod tests {
                     sse_customer: None,
                     policy_context: server_core::coordinator::PutObjectPolicyContext::default(),
                     object_lock: Default::default(),
-                    bucket: "bucket",
-                    key: &key,
+                    object: test_object_request("bucket", &key),
                     data: b"data",
                     metadata: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     cond: NO_WRITE,
-                    requester: test_requester(),
                     acl: NO_PUT_OBJECT_ACL.into(),
-                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -6134,13 +6125,11 @@ mod tests {
 
         let page1 = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: test_bucket_request("bucket"),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page1.objects.len(), 2);
@@ -6149,13 +6138,11 @@ mod tests {
 
         let page2 = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: test_bucket_request("bucket"),
                 prefix: None,
                 delimiter: None,
                 continuation_token: Some(&token),
                 max_keys: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page2.objects.len(), 2);
@@ -6163,13 +6150,11 @@ mod tests {
 
         let page3 = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: test_bucket_request("bucket"),
                 prefix: None,
                 delimiter: None,
                 continuation_token: Some(&token2),
                 max_keys: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page3.objects.len(), 1);
@@ -6204,11 +6189,9 @@ mod tests {
 
         let delete_result = coord
             .delete_objects(&DeleteObjectsRequest {
-                bucket: "bucket",
+                bucket: test_bucket_request("bucket"),
                 entries: &entries,
                 bypass_governance: false,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(delete_result.deleted.len(), 5);

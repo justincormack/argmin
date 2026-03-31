@@ -1171,50 +1171,40 @@ pub struct CopySource<'a> {
 #[derive(Debug)]
 pub struct CopyObjectRequest<'a> {
     pub source: CopySource<'a>,
-    pub dst_bucket: &'a str,
-    pub dst_key: &'a str,
+    pub destination: ObjectRequest<'a>,
     pub dst_condition: &'a WriteCondition,
     pub directive: MetadataDirective<'a>,
     pub tagging: TaggingDirective<'a>,
-    pub requester: Requester,
     pub acl: PutObjectAcl<'a>,
     pub source_sse_customer: Option<&'a SseCustomerRequest>,
     pub dst_sse_customer: Option<&'a SseCustomerRequest>,
     pub object_lock: ObjectLockState,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Parsed UploadPartCopy request from the HTTP layer.
 #[derive(Debug)]
 pub struct UploadPartCopyRequest<'a> {
     pub source: CopySource<'a>,
-    pub dst_bucket: &'a str,
-    pub dst_key: &'a str,
-    pub upload_id: &'a str,
+    pub upload: MultipartObjectRequest<'a>,
     pub part_number: u32,
     pub copy_source_range: Option<(u64, u64)>,
-    pub requester: Requester,
     pub source_sse_customer: Option<&'a SseCustomerRequest>,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a PutObject operation.
 #[derive(Debug)]
 pub struct PutObjectRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
+    pub object: ObjectRequest<'a>,
     pub data: &'a [u8],
     pub metadata: &'a MetadataBlob,
     pub system_metadata: &'a SystemMetadata,
     pub tags: Option<&'a str>,
     pub cond: &'a WriteCondition,
-    pub requester: Requester,
     pub acl: PutObjectWriteAcl<'a>,
     pub policy_context: PutObjectPolicyContext<'a>,
     pub object_lock: ObjectLockState,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 struct PreparedPutCommit {
@@ -1451,6 +1441,13 @@ pub struct BucketRequest<'a> {
     pub expected_bucket_owner: Option<&'a str>,
 }
 
+/// Request for an object-scoped operation.
+#[derive(Debug)]
+pub struct ObjectRequest<'a> {
+    pub bucket: BucketRequest<'a>,
+    pub key: &'a str,
+}
+
 /// Request for a bucket-scoped string configuration operation.
 #[derive(Debug)]
 pub struct PutBucketConfigRequest<'a> {
@@ -1503,11 +1500,15 @@ pub struct PutBucketAclRequest<'a> {
 /// Request for an object or object-version-scoped operation.
 #[derive(Debug)]
 pub struct ObjectVersionRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
+    pub object: ObjectRequest<'a>,
     pub version_id: Option<VersionId>,
-    pub requester: Requester,
-    pub expected_bucket_owner: Option<&'a str>,
+}
+
+/// Request for a multipart upload-scoped operation.
+#[derive(Debug)]
+pub struct MultipartObjectRequest<'a> {
+    pub object: ObjectRequest<'a>,
+    pub upload_id: &'a str,
 }
 
 /// Request for a PutObjectTagging operation.
@@ -1549,99 +1550,73 @@ pub struct PutObjectAclRequest<'a> {
 /// Request for a GetObject or HeadObject operation.
 #[derive(Debug)]
 pub struct GetObjectRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
-    pub version_id: Option<VersionId>,
+    pub object: ObjectVersionRequest<'a>,
     pub cond: &'a ReadCondition,
-    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a GetObjectPart or HeadObjectPart operation.
 #[derive(Debug)]
 pub struct GetObjectPartRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
-    pub version_id: Option<VersionId>,
+    pub object: ObjectVersionRequest<'a>,
     pub part_number: u32,
     pub cond: &'a ReadCondition,
-    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a GetObjectRange operation.
 #[derive(Debug)]
 pub struct GetObjectRangeRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
-    pub version_id: Option<VersionId>,
+    pub object: ObjectVersionRequest<'a>,
     pub range: ByteRange,
     pub cond: &'a ReadCondition,
-    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a DeleteObject operation.
 #[derive(Debug)]
 pub struct DeleteObjectRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
-    pub version_id: Option<VersionId>,
+    pub object: ObjectVersionRequest<'a>,
     pub bypass_governance: bool,
     pub cond: &'a DeleteCondition,
-    pub requester: Requester,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a ListObjectsV2 operation.
 #[derive(Debug)]
 pub struct ListObjectsV2Request<'a> {
-    pub bucket: &'a str,
+    pub bucket: BucketRequest<'a>,
     pub prefix: Option<&'a str>,
     pub delimiter: Option<&'a str>,
     pub continuation_token: Option<&'a str>,
     pub max_keys: u32,
-    pub requester: Requester,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a ListObjectVersions operation.
 #[derive(Debug)]
 pub struct ListObjectVersionsRequest<'a> {
-    pub bucket: &'a str,
+    pub bucket: BucketRequest<'a>,
     pub prefix: Option<&'a str>,
     pub key_marker: Option<&'a str>,
     pub version_id_marker: Option<VersionId>,
     pub max_keys: u32,
-    pub requester: Requester,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a ListParts operation.
 #[derive(Debug)]
 pub struct ListPartsRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
-    pub upload_id: &'a str,
+    pub upload: MultipartObjectRequest<'a>,
     pub part_number_marker: Option<u32>,
     pub max_parts: u32,
-    pub requester: Requester,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a ListMultipartUploads operation.
 #[derive(Debug)]
 pub struct ListMultipartUploadsRequest<'a> {
-    pub bucket: &'a str,
+    pub bucket: BucketRequest<'a>,
     pub prefix: Option<&'a str>,
     pub key_marker: Option<&'a str>,
     pub upload_id_marker: Option<&'a str>,
     pub max_uploads: u32,
-    pub requester: Requester,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// A single entry in a batch-delete request, with an already-parsed version ID
@@ -1656,33 +1631,19 @@ pub struct DeleteEntry<'a> {
 /// Request for a DeleteObjects (multi-delete) operation.
 #[derive(Debug)]
 pub struct DeleteObjectsRequest<'a> {
-    pub bucket: &'a str,
+    pub bucket: BucketRequest<'a>,
     pub entries: &'a [DeleteEntry<'a>],
     pub bypass_governance: bool,
-    pub requester: Requester,
-    pub expected_bucket_owner: Option<&'a str>,
-}
-
-/// Request for an AbortMultipartUpload operation.
-#[derive(Debug)]
-pub struct AbortMultipartUploadRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
-    pub upload_id: &'a str,
-    pub requester: Requester,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a CreateMultipartUpload operation.
 #[derive(Debug)]
 pub struct CreateMultipartUploadRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
+    pub object: ObjectRequest<'a>,
     pub metadata: &'a MetadataBlob,
     pub system_metadata: &'a SystemMetadata,
     pub tags: Option<&'a str>,
     pub checksum: Option<MultipartChecksumConfig>,
-    pub requester: Requester,
     pub acl: PutObjectWriteAcl<'a>,
     pub object_lock: ObjectLockState,
     pub sse_customer: Option<&'a SseCustomerRequest>,
@@ -1691,115 +1652,322 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub grant_read_acp: Option<&'a str>,
     pub grant_write_acp: Option<&'a str>,
     pub grant_full_control: Option<&'a str>,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for an UploadPart operation (test-only convenience wrapper).
 #[cfg(any(test, feature = "test-utils"))]
 #[derive(Debug)]
 pub struct UploadPartRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
-    pub upload_id: &'a str,
+    pub upload: MultipartObjectRequest<'a>,
     pub part_number: u32,
     pub data: &'a [u8],
     pub claimed_checksum: Option<&'a ChecksumClaim>,
-    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a GetObjectAttributes operation.
 #[derive(Debug)]
 pub struct GetObjectAttributesRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
-    pub version_id: Option<VersionId>,
+    pub object: ObjectVersionRequest<'a>,
     pub cond: &'a ReadCondition,
     pub want_parts: bool,
     pub part_number_marker: Option<u32>,
     pub max_parts: u32,
-    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for a CompleteMultipartUpload operation.
 #[derive(Debug)]
 pub struct CompleteMultipartUploadRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
-    pub upload_id: &'a str,
+    pub upload: MultipartObjectRequest<'a>,
     pub parts: &'a [CompletePart],
     pub claimed_checksum: Option<&'a EncodedChecksumClaim>,
-    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for beginning a streaming PutObject session.
 #[derive(Debug)]
 pub struct BeginStreamPutRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
-    pub requester: Requester,
+    pub object: ObjectRequest<'a>,
     pub acl: PutObjectWriteAcl<'a>,
     pub policy: PutObjectPolicyContext<'a>,
     pub encryption: ObjectEncryption,
     pub object_lock: ObjectLockState,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for beginning a streaming UploadPart session.
 #[derive(Debug)]
 pub struct BeginStreamPartRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
-    pub upload_id: &'a str,
+    pub upload: MultipartObjectRequest<'a>,
     pub part_number: u32,
-    pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    pub expected_bucket_owner: Option<&'a str>,
 }
 
-macro_rules! impl_expected_bucket_owner_accessor {
-    ($($name:ident),+ $(,)?) => {
-        $(
-            impl<'a> $name<'a> {
-                fn expected_bucket_owner(&self) -> Option<&str> {
-                    self.expected_bucket_owner
-                }
-            }
-        )+
-    };
+impl<'a> BucketRequest<'a> {
+    pub fn new(
+        name: &'a str,
+        requester: Requester,
+        expected_bucket_owner: Option<&'a str>,
+    ) -> Self {
+        Self {
+            name,
+            requester,
+            expected_bucket_owner,
+        }
+    }
+
+    pub fn name(&self) -> &'a str {
+        self.name
+    }
+
+    pub fn requester(&self) -> &Requester {
+        &self.requester
+    }
+
+    pub fn expected_bucket_owner(&self) -> Option<&str> {
+        self.expected_bucket_owner
+    }
 }
 
-impl_expected_bucket_owner_accessor!(
-    CopySource,
-    CopyObjectRequest,
-    UploadPartCopyRequest,
-    PutObjectRequest,
-    BucketRequest,
-    ObjectVersionRequest,
-    GetObjectRequest,
-    GetObjectPartRequest,
-    GetObjectRangeRequest,
-    DeleteObjectRequest,
-    ListObjectsV2Request,
-    ListObjectVersionsRequest,
-    ListPartsRequest,
-    ListMultipartUploadsRequest,
-    DeleteObjectsRequest,
-    AbortMultipartUploadRequest,
-    CreateMultipartUploadRequest,
-    GetObjectAttributesRequest,
-    CompleteMultipartUploadRequest,
-    BeginStreamPutRequest,
-    BeginStreamPartRequest,
-);
+impl<'a> ObjectRequest<'a> {
+    pub fn new(
+        bucket: &'a str,
+        key: &'a str,
+        requester: Requester,
+        expected_bucket_owner: Option<&'a str>,
+    ) -> Self {
+        Self {
+            bucket: BucketRequest::new(bucket, requester, expected_bucket_owner),
+            key,
+        }
+    }
 
-#[cfg(any(test, feature = "test-utils"))]
-impl_expected_bucket_owner_accessor!(UploadPartRequest);
+    pub fn from_bucket(bucket: BucketRequest<'a>, key: &'a str) -> Self {
+        Self { bucket, key }
+    }
+
+    pub fn bucket(&self) -> &BucketRequest<'a> {
+        &self.bucket
+    }
+
+    pub fn bucket_name(&self) -> &'a str {
+        self.bucket.name()
+    }
+
+    pub fn key(&self) -> &'a str {
+        self.key
+    }
+
+    pub fn requester(&self) -> &Requester {
+        self.bucket.requester()
+    }
+
+    pub fn expected_bucket_owner(&self) -> Option<&str> {
+        self.bucket.expected_bucket_owner()
+    }
+}
+
+impl<'a> ObjectVersionRequest<'a> {
+    pub fn new(
+        bucket: &'a str,
+        key: &'a str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+        expected_bucket_owner: Option<&'a str>,
+    ) -> Self {
+        Self {
+            object: ObjectRequest::new(bucket, key, requester, expected_bucket_owner),
+            version_id,
+        }
+    }
+
+    pub fn from_object(object: ObjectRequest<'a>, version_id: Option<VersionId>) -> Self {
+        Self { object, version_id }
+    }
+
+    pub fn object(&self) -> &ObjectRequest<'a> {
+        &self.object
+    }
+
+    pub fn bucket(&self) -> &BucketRequest<'a> {
+        self.object.bucket()
+    }
+
+    pub fn bucket_name(&self) -> &'a str {
+        self.object.bucket_name()
+    }
+
+    pub fn key(&self) -> &'a str {
+        self.object.key()
+    }
+
+    pub fn version_id(&self) -> Option<VersionId> {
+        self.version_id
+    }
+
+    pub fn requester(&self) -> &Requester {
+        self.object.requester()
+    }
+
+    pub fn expected_bucket_owner(&self) -> Option<&str> {
+        self.object.expected_bucket_owner()
+    }
+}
+
+impl<'a> MultipartObjectRequest<'a> {
+    pub fn new(
+        bucket: &'a str,
+        key: &'a str,
+        upload_id: &'a str,
+        requester: Requester,
+        expected_bucket_owner: Option<&'a str>,
+    ) -> Self {
+        Self {
+            object: ObjectRequest::new(bucket, key, requester, expected_bucket_owner),
+            upload_id,
+        }
+    }
+
+    pub fn from_object(object: ObjectRequest<'a>, upload_id: &'a str) -> Self {
+        Self { object, upload_id }
+    }
+
+    pub fn object(&self) -> &ObjectRequest<'a> {
+        &self.object
+    }
+
+    pub fn bucket(&self) -> &BucketRequest<'a> {
+        self.object.bucket()
+    }
+
+    pub fn bucket_name(&self) -> &'a str {
+        self.object.bucket_name()
+    }
+
+    pub fn key(&self) -> &'a str {
+        self.object.key()
+    }
+
+    pub fn upload_id(&self) -> &'a str {
+        self.upload_id
+    }
+
+    pub fn requester(&self) -> &Requester {
+        self.object.requester()
+    }
+
+    pub fn expected_bucket_owner(&self) -> Option<&str> {
+        self.object.expected_bucket_owner()
+    }
+}
+
+impl<'a> CopySource<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.expected_bucket_owner
+    }
+}
+
+impl<'a> CopyObjectRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.destination.expected_bucket_owner()
+    }
+}
+
+impl<'a> UploadPartCopyRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.upload.expected_bucket_owner()
+    }
+}
+
+impl<'a> PutObjectRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.object.expected_bucket_owner()
+    }
+}
+
+impl<'a> GetObjectRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.object.expected_bucket_owner()
+    }
+}
+
+impl<'a> GetObjectPartRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.object.expected_bucket_owner()
+    }
+}
+
+impl<'a> GetObjectRangeRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.object.expected_bucket_owner()
+    }
+}
+
+impl<'a> DeleteObjectRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.object.expected_bucket_owner()
+    }
+}
+
+impl<'a> ListObjectsV2Request<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.bucket.expected_bucket_owner()
+    }
+}
+
+impl<'a> ListObjectVersionsRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.bucket.expected_bucket_owner()
+    }
+}
+
+impl<'a> ListPartsRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.upload.expected_bucket_owner()
+    }
+}
+
+impl<'a> ListMultipartUploadsRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.bucket.expected_bucket_owner()
+    }
+}
+
+impl<'a> DeleteObjectsRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.bucket.expected_bucket_owner()
+    }
+}
+
+impl<'a> CreateMultipartUploadRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.object.expected_bucket_owner()
+    }
+}
+
+impl<'a> GetObjectAttributesRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.object.expected_bucket_owner()
+    }
+}
+
+impl<'a> CompleteMultipartUploadRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.upload.expected_bucket_owner()
+    }
+}
+
+impl<'a> BeginStreamPutRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.object.expected_bucket_owner()
+    }
+}
+
+impl<'a> BeginStreamPartRequest<'a> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.upload.expected_bucket_owner()
+    }
+}
 
 impl<'a> CreateMultipartUploadRequest<'a> {
     fn write_acl(&self) -> PutObjectWriteAcl<'a> {
@@ -1835,8 +2003,7 @@ impl<'a> PutObjectRequest<'a> {
 /// Parsed request for finalizing a streaming PutObject.
 #[derive(Debug)]
 pub struct FinalizeStreamPutRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
+    pub object: ObjectRequest<'a>,
     pub session_id: &'a str,
     pub crc64: u64,
     pub total_size: u64,
@@ -1845,7 +2012,6 @@ pub struct FinalizeStreamPutRequest<'a> {
     pub sse_customer: Option<&'a SseCustomerWriteContext>,
     pub tags: Option<&'a str>,
     pub cond: &'a WriteCondition,
-    pub requester: Requester,
     pub acl: PutObjectWriteAcl<'a>,
     pub policy_context: PutObjectPolicyContext<'a>,
     pub requested_object_lock: ObjectLockState,
@@ -1854,10 +2020,8 @@ pub struct FinalizeStreamPutRequest<'a> {
 /// Parsed request for finalizing a streaming UploadPart.
 #[derive(Debug)]
 pub struct FinalizeStreamPartRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
+    pub upload: MultipartObjectRequest<'a>,
     pub session_id: &'a str,
-    pub upload_id: &'a str,
     pub part_number: u32,
     pub crc64: u64,
     pub total_size: u64,
@@ -5859,17 +6023,17 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::put_object_tags",
             "bucket={} key={} bytes={}",
-            req.object.bucket,
-            req.object.key,
+            req.object.bucket_name(),
+            req.object.key(),
             req.tags.len()
         );
         let LockedReadObject {
             record: stored,
             pgs,
         } = self.lock_object_for_authorized_tagging(
-            &req.object.requester,
-            req.object.bucket,
-            req.object.key,
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key(),
             req.object.version_id,
             Self::put_object_tagging_policy_action(req.object.version_id),
             req.object.expected_bucket_owner(),
@@ -5879,8 +6043,8 @@ impl Coordinator {
         }
         pgs.meta()
             .put_object_tags(
-                req.object.bucket,
-                req.object.key,
+                req.object.bucket_name(),
+                req.object.key(),
                 stored.version_id(),
                 req.tags,
             )
@@ -5895,8 +6059,8 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::put_object_retention",
             "bucket={} key={} version_id={:?} mode={:?} bypass={}",
-            req.object.bucket,
-            req.object.key,
+            req.object.bucket_name(),
+            req.object.key(),
             req.object.version_id,
             req.retention.mode,
             req.bypass_governance
@@ -5909,9 +6073,9 @@ impl Coordinator {
                 pgs,
             },
         ) = self.lock_object_for_authorized_object_lock(
-            &req.object.requester,
-            req.object.bucket,
-            req.object.key,
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key(),
             req.object.version_id,
             auth::PolicyAction::PutObjectRetention,
             req.object.expected_bucket_owner(),
@@ -5919,7 +6083,7 @@ impl Coordinator {
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         let can_bypass_governance =
             Self::requester_can_bypass_governance_retention_with_bucket_policy(
-                &req.object.requester,
+                req.object.requester(),
                 &bucket_info,
                 &stored,
                 bucket_policy.as_deref(),
@@ -5932,8 +6096,8 @@ impl Coordinator {
         )?;
         pgs.meta()
             .put_object_retention(
-                req.object.bucket,
-                req.object.key,
+                req.object.bucket_name(),
+                req.object.key(),
                 live.version_id,
                 req.retention,
             )
@@ -5953,15 +6117,15 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::get_object_retention",
             "bucket={} key={} version_id={:?}",
-            req.bucket,
-            req.key,
+            req.object.bucket_name(),
+            req.object.key,
             req.version_id
         );
         let (_bucket_info, _bucket_policy, LockedReadObject { record: stored, .. }) = self
             .lock_object_for_authorized_object_lock(
-                &req.requester,
-                req.bucket,
-                req.key,
+                req.object.requester(),
+                req.object.bucket_name(),
+                req.object.key,
                 req.version_id,
                 auth::PolicyAction::GetObjectRetention,
                 req.expected_bucket_owner(),
@@ -5978,8 +6142,8 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::put_object_legal_hold",
             "bucket={} key={} version_id={:?} status={:?}",
-            req.object.bucket,
-            req.object.key,
+            req.object.bucket_name(),
+            req.object.key(),
             req.object.version_id,
             req.legal_hold
         );
@@ -5991,9 +6155,9 @@ impl Coordinator {
                 pgs,
             },
         ) = self.lock_object_for_authorized_object_lock(
-            &req.object.requester,
-            req.object.bucket,
-            req.object.key,
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key(),
             req.object.version_id,
             auth::PolicyAction::PutObjectLegalHold,
             req.object.expected_bucket_owner(),
@@ -6001,8 +6165,8 @@ impl Coordinator {
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         pgs.meta()
             .put_object_legal_hold(
-                req.object.bucket,
-                req.object.key,
+                req.object.bucket_name(),
+                req.object.key(),
                 live.version_id,
                 StoredLegalHoldStatus::from_legal_hold_status(Some(req.legal_hold)),
             )
@@ -6022,15 +6186,15 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::get_object_legal_hold",
             "bucket={} key={} version_id={:?}",
-            req.bucket,
-            req.key,
+            req.object.bucket_name(),
+            req.object.key,
             req.version_id
         );
         let (_bucket_info, _bucket_policy, LockedReadObject { record: stored, .. }) = self
             .lock_object_for_authorized_object_lock(
-                &req.requester,
-                req.bucket,
-                req.key,
+                req.object.requester(),
+                req.object.bucket_name(),
+                req.object.key,
                 req.version_id,
                 auth::PolicyAction::GetObjectLegalHold,
                 req.expected_bucket_owner(),
@@ -6047,16 +6211,16 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::get_object_tags",
             "bucket={} key={}",
-            req.bucket,
-            req.key
+            req.object.bucket_name(),
+            req.object.key
         );
         let LockedReadObject {
             record: stored,
             pgs,
         } = self.lock_object_for_authorized_tagging(
-            &req.requester,
-            req.bucket,
-            req.key,
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key,
             req.version_id,
             Self::get_object_tagging_policy_action(req.version_id),
             req.expected_bucket_owner(),
@@ -6065,7 +6229,11 @@ impl Coordinator {
             return Err(ServerError::MethodNotAllowed);
         }
         pgs.meta()
-            .get_object_tags(req.bucket, req.key, stored.version_id())
+            .get_object_tags(
+                req.object.bucket_name(),
+                req.object.key,
+                stored.version_id(),
+            )
             .map_err(ServerError::Metadata)
     }
 
@@ -6074,16 +6242,16 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::delete_object_tags",
             "bucket={} key={}",
-            req.bucket,
-            req.key
+            req.object.bucket_name(),
+            req.object.key
         );
         let LockedReadObject {
             record: stored,
             pgs,
         } = self.lock_object_for_authorized_tagging(
-            &req.requester,
-            req.bucket,
-            req.key,
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key,
             req.version_id,
             Self::delete_object_tagging_policy_action(req.version_id),
             req.expected_bucket_owner(),
@@ -6092,7 +6260,11 @@ impl Coordinator {
             return Err(ServerError::MethodNotAllowed);
         }
         pgs.meta()
-            .delete_object_tags(req.bucket, req.key, stored.version_id())
+            .delete_object_tags(
+                req.object.bucket_name(),
+                req.object.key,
+                stored.version_id(),
+            )
             .map_err(ServerError::Metadata)
     }
 
@@ -6104,14 +6276,14 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::get_object_acl",
             "bucket={} key={} version_id={:?}",
-            req.bucket,
-            req.key,
+            req.object.bucket_name(),
+            req.object.key,
             req.version_id
         );
         let (_bucket_info, locked) = self.lock_object_for_authorized_acl(
-            &req.requester,
-            req.bucket,
-            req.key,
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key,
             req.version_id,
             ObjectAclAuthorization::ReadWithPolicy(Self::get_object_acl_policy_action(
                 req.version_id,
@@ -6133,8 +6305,8 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::put_object_acl",
             "bucket={} key={} version_id={:?} acl_kind={}",
-            req.object.bucket,
-            req.object.key,
+            req.object.bucket_name(),
+            req.object.key(),
             req.object.version_id,
             match &req.acl {
                 PutObjectAclInput::Canned(_) => "canned",
@@ -6142,9 +6314,9 @@ impl Coordinator {
             }
         );
         let (bucket_info, locked) = self.lock_object_for_authorized_acl(
-            &req.object.requester,
-            req.object.bucket,
-            req.object.key,
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key(),
             req.object.version_id,
             ObjectAclAuthorization::Write,
             req.object.expected_bucket_owner(),
@@ -6168,8 +6340,8 @@ impl Coordinator {
             }
         };
         Self::persist_locked_object_acl(
-            req.object.bucket,
-            req.object.key,
+            req.object.bucket_name(),
+            req.object.key(),
             &bucket_info,
             &stored,
             pgs.meta(),
@@ -6360,24 +6532,27 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::put_object",
             "bucket={} key={} bytes={}",
-            req.bucket,
-            req.key,
+            req.object.bucket_name(),
+            req.object.key,
             req.data.len()
         );
         let write_encryption = self.prepare_sse_customer_write_context(req.sse_customer)?;
 
         if req.data.len() > INTERNAL_SEGMENT_SIZE {
             self.authorize_put_object_requester(
-                &req.requester,
-                req.bucket,
-                req.key,
+                req.object.requester(),
+                req.object.bucket_name(),
+                req.object.key,
                 policy_context,
                 req.expected_bucket_owner(),
             )?;
             let session_id = self.begin_stream_put(&BeginStreamPutRequest {
-                bucket: req.bucket,
-                key: req.key,
-                requester: req.requester.clone(),
+                object: ObjectRequest::new(
+                    req.object.bucket_name(),
+                    req.object.key(),
+                    req.object.requester().clone(),
+                    req.expected_bucket_owner(),
+                ),
                 acl: req.acl.clone(),
                 policy: policy_context,
                 encryption: write_encryption
@@ -6385,7 +6560,6 @@ impl Coordinator {
                     .map(|ctx| ctx.encryption().clone())
                     .unwrap_or_default(),
                 object_lock: req.object_lock,
-                expected_bucket_owner: req.expected_bucket_owner(),
             })?;
             let result = (|| {
                 for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
@@ -6395,16 +6569,20 @@ impl Coordinator {
                         chunk.to_vec()
                     };
                     self.append_stream_segment(
-                        req.bucket,
-                        req.key,
+                        req.object.bucket_name(),
+                        req.object.key,
                         &session_id,
                         idx as u32,
                         &chunk_storage,
                     )?;
                 }
                 self.finalize_stream_put(&FinalizeStreamPutRequest {
-                    bucket: req.bucket,
-                    key: req.key,
+                    object: ObjectRequest::new(
+                        req.object.bucket_name(),
+                        req.object.key(),
+                        req.object.requester().clone(),
+                        req.expected_bucket_owner(),
+                    ),
                     session_id: &session_id,
                     crc64: checksum::crc64::checksum(req.data),
                     total_size: req.data.len() as u64,
@@ -6413,25 +6591,25 @@ impl Coordinator {
                     sse_customer: write_encryption.as_ref(),
                     tags: req.tags,
                     cond: req.cond,
-                    requester: req.requester.clone(),
                     acl: req.acl.clone(),
                     policy_context,
                     requested_object_lock: req.object_lock,
                 })
             })();
             if result.is_err() {
-                let _ = self.abort_stream_put(req.bucket, req.key, &session_id);
+                let _ =
+                    self.abort_stream_put(req.object.bucket_name(), req.object.key, &session_id);
             }
             return result;
         }
 
-        self.with_bucket_write_reservation(req.bucket, |bucket_info| {
+        self.with_bucket_write_reservation(req.object.bucket_name(), |bucket_info| {
             Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             if !Self::requester_can_put_object_with_bucket_policy(
-                &req.requester,
+                req.object.requester(),
                 &bucket_info,
-                req.key,
+                req.object.key,
                 policy_context,
                 bucket_policy.as_deref(),
             )? {
@@ -6474,7 +6652,7 @@ impl Coordinator {
             let written_shards =
                 self.write_segment_shards(shard_pg_id, &segment_okh, segment_vid, &storage_bytes)?;
 
-            let meta_pg_id = self.object_pg_id(req.bucket, req.key);
+            let meta_pg_id = self.object_pg_id(req.object.bucket_name(), req.object.key);
             let (meta_pg, shard_pg_opt) =
                 match self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id) {
                     Ok(guards) => guards,
@@ -6496,8 +6674,8 @@ impl Coordinator {
                 &meta_pg,
                 &bucket_info,
                 &PutCommitRequest {
-                    bucket: req.bucket,
-                    key: req.key,
+                    bucket: req.object.bucket_name(),
+                    key: req.object.key,
                     metadata_blob: req.metadata,
                     system_metadata: req.system_metadata,
                     encryption: write_encryption
@@ -6515,12 +6693,13 @@ impl Coordinator {
                     return Err(err);
                 }
             };
-            let owner = Self::effective_put_object_owner(&bucket_info, &req.requester, &req.acl);
+            let owner =
+                Self::effective_put_object_owner(&bucket_info, req.object.requester(), &req.acl);
             let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
 
             let segment_record = ObjectSegmentRecord {
-                bucket: BucketName::from(req.bucket),
-                key: ObjectKey::from(req.key),
+                bucket: BucketName::from(req.object.bucket_name()),
+                key: ObjectKey::from(req.object.key),
                 version_id: prepared.version_id,
                 segment_index,
                 size: req.data.len() as u64,
@@ -6532,8 +6711,8 @@ impl Coordinator {
                 ec_m: self.ec_config.parity_shards,
             };
             let live_req = PutLiveObjectReq {
-                bucket: BucketName::from(req.bucket),
-                key: ObjectKey::from(req.key),
+                bucket: BucketName::from(req.object.bucket_name()),
+                key: ObjectKey::from(req.object.key),
                 version_id: prepared.version_id,
                 owner,
                 acl_grants: acl_grants.clone(),
@@ -6563,15 +6742,15 @@ impl Coordinator {
             }
             Self::finalize_put_commit_metadata_locked(
                 &meta_pg,
-                req.bucket,
-                req.key,
+                req.object.bucket_name(),
+                req.object.key,
                 prepared.version_id,
                 prepared.stale_payload.as_ref(),
             )?;
 
             drop(meta_pg);
             if let Some(ref payload) = prepared.stale_payload {
-                self.delete_stale_object_payload(req.bucket, req.key, payload);
+                self.delete_stale_object_payload(req.object.bucket_name(), req.object.key, payload);
             }
 
             Ok(PutObjectResult {
@@ -6593,16 +6772,16 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::begin_stream_put",
             "bucket={} key={}",
-            req.bucket,
-            req.key
+            req.object.bucket_name(),
+            req.object.key
         );
-        let bucket = req.bucket;
-        let key = req.key;
+        let bucket = req.object.bucket_name();
+        let key = req.object.key;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
             Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             if !Self::requester_can_put_object_with_bucket_policy(
-                &req.requester,
+                req.object.requester(),
                 &bucket_info,
                 key,
                 req.policy
@@ -6657,14 +6836,14 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::begin_stream_part",
             "bucket={} key={} upload_id={} part_number={}",
-            req.bucket,
-            req.key,
-            req.upload_id,
+            req.upload.bucket_name(),
+            req.upload.key(),
+            req.upload.upload_id,
             req.part_number
         );
-        let bucket = req.bucket;
-        let key = req.key;
-        let upload_id = req.upload_id;
+        let bucket = req.upload.bucket_name();
+        let key = req.upload.key();
+        let upload_id = req.upload.upload_id;
         let part_number = req.part_number;
 
         // Validate part number range.
@@ -6691,7 +6870,11 @@ impl Coordinator {
                 upload_id: upload_id.to_string(),
             });
         }
-        if !Self::requester_can_write_multipart_upload(&req.requester, &bucket_info, &upload) {
+        if !Self::requester_can_write_multipart_upload(
+            req.upload.requester(),
+            &bucket_info,
+            &upload,
+        ) {
             return Err(ServerError::AccessDenied);
         }
         Self::ensure_sse_c_allowed(
@@ -7084,13 +7267,13 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::finalize_stream_put",
             "bucket={} key={} session_id={} bytes={}",
-            req.bucket,
-            req.key,
+            req.object.bucket_name(),
+            req.object.key(),
             req.session_id,
             req.total_size
         );
-        let bucket = req.bucket;
-        let key = req.key;
+        let bucket = req.object.bucket_name();
+        let key = req.object.key();
         let session_id = req.session_id;
         let crc64 = req.crc64;
         let total_size = req.total_size;
@@ -7100,7 +7283,7 @@ impl Coordinator {
         self.with_bucket_write_reservation(bucket, |bucket_info| {
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             if !Self::requester_can_put_object_with_bucket_policy(
-                &req.requester,
+                req.object.requester(),
                 &bucket_info,
                 key,
                 req.policy_context
@@ -7150,7 +7333,8 @@ impl Coordinator {
                     cond,
                 },
             )?;
-            let owner = Self::effective_put_object_owner(&bucket_info, &req.requester, &req.acl);
+            let owner =
+                Self::effective_put_object_owner(&bucket_info, req.object.requester(), &req.acl);
             let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
 
             let staging_segments = meta_guard
@@ -7241,17 +7425,17 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::finalize_stream_part",
             "bucket={} key={} upload_id={} part_number={} session_id={} bytes={}",
-            req.bucket,
-            req.key,
-            req.upload_id,
+            req.upload.bucket_name(),
+            req.upload.key(),
+            req.upload.upload_id(),
             req.part_number,
             req.session_id,
             req.total_size
         );
-        let bucket = req.bucket;
-        let key = req.key;
+        let bucket = req.upload.bucket_name();
+        let key = req.upload.key();
         let session_id = req.session_id;
-        let upload_id = req.upload_id;
+        let upload_id = req.upload.upload_id();
         let part_number = req.part_number;
         let crc64 = req.crc64;
         let total_size = req.total_size;
@@ -7590,18 +7774,18 @@ impl Coordinator {
             "src_bucket={} src_key={} dst_bucket={} dst_key={}",
             req.source.bucket,
             req.source.key,
-            req.dst_bucket,
-            req.dst_key
+            req.destination.bucket.name,
+            req.destination.key
         );
         let src_bucket = req.source.bucket;
         let src_key = req.source.key;
         let src_version_id = req.source.version_id;
-        let dst_bucket = req.dst_bucket;
-        let dst_key = req.dst_key;
+        let dst_bucket = req.destination.bucket.name;
+        let dst_key = req.destination.key;
         let src_cond = req.source.condition;
         let dst_cond = req.dst_condition;
         let directive = &req.directive;
-        let requester = &req.requester;
+        let requester = &req.destination.bucket.requester;
         let acl = req.acl;
         let source_sse_customer = req.source_sse_customer;
         let dst_write_sse_customer =
@@ -7817,9 +8001,12 @@ impl Coordinator {
             _ => None,
         };
         let session_id = self.begin_stream_put(&BeginStreamPutRequest {
-            bucket: dst_bucket,
-            key: dst_key,
-            requester: requester.clone(),
+            object: ObjectRequest::new(
+                dst_bucket,
+                dst_key,
+                requester.clone(),
+                req.expected_bucket_owner(),
+            ),
             acl: acl.into(),
             policy: PutObjectPolicyContext::new(
                 Some(copy_source_policy_value.as_str()),
@@ -7831,7 +8018,6 @@ impl Coordinator {
                 .map(|ctx| ctx.encryption().clone())
                 .unwrap_or_default(),
             object_lock: req.object_lock,
-            expected_bucket_owner: req.expected_bucket_owner(),
         })?;
         let not_found = |e: ServerError| match e {
             ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
@@ -7888,8 +8074,12 @@ impl Coordinator {
             }
 
             let put_result = self.finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: dst_bucket,
-                key: dst_key,
+                object: ObjectRequest::new(
+                    dst_bucket,
+                    dst_key,
+                    requester.clone(),
+                    req.expected_bucket_owner(),
+                ),
                 session_id: &session_id,
                 crc64: crc64.finalize(),
                 total_size,
@@ -7898,7 +8088,6 @@ impl Coordinator {
                 sse_customer: dst_write_sse_customer.as_ref(),
                 tags: tags.as_deref(),
                 cond: dst_cond,
-                requester: requester.clone(),
                 acl: acl.into(),
                 policy_context: PutObjectPolicyContext::new(
                     Some(copy_source_policy_value.as_str()),
@@ -8390,15 +8579,15 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::get_object",
             "bucket={} key={} version_id={:?}",
-            req.bucket,
-            req.key,
-            req.version_id
+            req.object.bucket_name(),
+            req.object.key(),
+            req.object.version_id
         );
-        let bucket = req.bucket;
-        let key = req.key;
-        let version_id = req.version_id;
+        let bucket = req.object.bucket_name();
+        let key = req.object.key();
+        let version_id = req.object.version_id;
         let cond = req.cond;
-        let requester = &req.requester;
+        let requester = req.object.requester();
         let LockedReadObject {
             record: stored,
             pgs,
@@ -8536,17 +8725,17 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::get_object_part",
             "bucket={} key={} part_number={} version_id={:?}",
-            req.bucket,
-            req.key,
+            req.object.bucket_name(),
+            req.object.key(),
             req.part_number,
-            req.version_id
+            req.object.version_id
         );
-        let bucket = req.bucket;
-        let key = req.key;
-        let version_id = req.version_id;
+        let bucket = req.object.bucket_name();
+        let key = req.object.key();
+        let version_id = req.object.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
-        let requester = &req.requester;
+        let requester = req.object.requester();
         let LockedReadObject {
             record: stored,
             pgs,
@@ -8723,17 +8912,17 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::head_object_part",
             "bucket={} key={} part_number={} version_id={:?}",
-            req.bucket,
-            req.key,
+            req.object.bucket_name(),
+            req.object.key(),
             req.part_number,
-            req.version_id
+            req.object.version_id
         );
-        let bucket = req.bucket;
-        let key = req.key;
-        let version_id = req.version_id;
+        let bucket = req.object.bucket_name();
+        let key = req.object.key();
+        let version_id = req.object.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
-        let requester = &req.requester;
+        let requester = req.object.requester();
         let LockedReadObject {
             record: stored,
             pgs,
@@ -8849,15 +9038,15 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::head_object",
             "bucket={} key={} version_id={:?}",
-            req.bucket,
-            req.key,
-            req.version_id
+            req.object.bucket_name(),
+            req.object.key(),
+            req.object.version_id
         );
-        let bucket = req.bucket;
-        let key = req.key;
-        let version_id = req.version_id;
+        let bucket = req.object.bucket_name();
+        let key = req.object.key();
+        let version_id = req.object.version_id;
         let cond = req.cond;
-        let requester = &req.requester;
+        let requester = req.object.requester();
         let LockedReadObject { record: stored, .. } = self
             .lock_object_for_authorized_read_with_policy(
                 requester,
@@ -8915,19 +9104,19 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::get_object_attributes",
             "bucket={} key={} want_parts={} version_id={:?}",
-            req.bucket,
-            req.key,
+            req.object.bucket_name(),
+            req.object.key(),
             req.want_parts,
-            req.version_id
+            req.object.version_id
         );
-        let bucket = req.bucket;
-        let key = req.key;
-        let version_id = req.version_id;
+        let bucket = req.object.bucket_name();
+        let key = req.object.key();
+        let version_id = req.object.version_id;
         let cond = req.cond;
         let want_parts = req.want_parts;
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
-        let requester = &req.requester;
+        let requester = req.object.requester();
         let LockedReadObject {
             record: stored,
             pgs,
@@ -9056,17 +9245,17 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::get_object_range",
             "bucket={} key={} version_id={:?} requested_range={}",
-            req.bucket,
-            req.key,
-            req.version_id,
+            req.object.bucket_name(),
+            req.object.key(),
+            req.object.version_id,
             req.range
         );
-        let bucket = req.bucket;
-        let key = req.key;
-        let version_id = req.version_id;
+        let bucket = req.object.bucket_name();
+        let key = req.object.key();
+        let version_id = req.object.version_id;
         let range = req.range;
         let cond = req.cond;
-        let requester = &req.requester;
+        let requester = req.object.requester();
         let LockedReadObject {
             record: stored,
             pgs,
@@ -9233,16 +9422,16 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::delete_object",
             "bucket={} key={} version_id={:?} bypass={}",
-            req.bucket,
-            req.key,
-            req.version_id,
+            req.object.bucket_name(),
+            req.object.key(),
+            req.object.version_id,
             req.bypass_governance
         );
-        let bucket = req.bucket;
-        let key = req.key;
-        let request_version_id = req.version_id;
+        let bucket = req.object.bucket_name();
+        let key = req.object.key();
+        let request_version_id = req.object.version_id;
         let cond = req.cond;
-        let requester = &req.requester;
+        let requester = req.object.requester();
         let bucket_info = self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
 
@@ -9567,7 +9756,7 @@ impl Coordinator {
                         version_id: marker_vid,
                         owner: Self::effective_object_owner(
                             &bucket_info,
-                            &req.requester,
+                            req.object.requester(),
                             PutObjectAcl::None,
                         ),
                     }))?;
@@ -9601,7 +9790,7 @@ impl Coordinator {
                         version_id: marker_vid,
                         owner: Self::effective_object_owner(
                             &bucket_info,
-                            &req.requester,
+                            req.object.requester(),
                             PutObjectAcl::None,
                         ),
                     }))?;
@@ -9625,10 +9814,10 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::list_objects_v2",
             "bucket={} max_keys={}",
-            req.bucket,
+            req.bucket.name,
             req.max_keys
         );
-        let bucket = req.bucket;
+        let bucket = req.bucket.name;
         let prefix = req.prefix;
         let delimiter = req.delimiter;
         let continuation_token = req.continuation_token;
@@ -9636,7 +9825,7 @@ impl Coordinator {
         let bucket_info = self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_list_bucket_with_bucket_policy(
-            &req.requester,
+            &req.bucket.requester,
             &bucket_info,
             bucket_policy.as_deref(),
         ) {
@@ -9801,16 +9990,16 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::list_object_versions",
             "bucket={} max_keys={}",
-            req.bucket,
+            req.bucket.name,
             req.max_keys
         );
-        let bucket = req.bucket;
+        let bucket = req.bucket.name;
         let prefix = req.prefix;
         let key_marker = req.key_marker;
         let version_id_marker = req.version_id_marker;
         let max_keys = req.max_keys;
         let bucket_info = self.authorize_bucket_read_requester(
-            &req.requester,
+            &req.bucket.requester,
             bucket,
             req.expected_bucket_owner(),
         )?;
@@ -9909,13 +10098,13 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::delete_objects",
             "bucket={} objects={} bypass={}",
-            req.bucket,
+            req.bucket.name,
             req.entries.len(),
             req.bypass_governance
         );
-        let bucket = req.bucket;
+        let bucket = req.bucket.name;
         let entries = req.entries;
-        let requester = &req.requester;
+        let requester = &req.bucket.requester;
         self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
 
         let mut deleted = Vec::new();
@@ -9923,13 +10112,17 @@ impl Coordinator {
 
         for entry in entries {
             match self.delete_object(&DeleteObjectRequest {
-                bucket,
-                key: entry.key,
-                version_id: entry.version_id,
+                object: ObjectVersionRequest::from_object(
+                    ObjectRequest::new(
+                        bucket,
+                        entry.key,
+                        requester.clone(),
+                        req.expected_bucket_owner(),
+                    ),
+                    entry.version_id,
+                ),
                 bypass_governance: req.bypass_governance,
                 cond: &entry.cond,
-                requester: requester.clone(),
-                expected_bucket_owner: req.expected_bucket_owner(),
             }) {
                 Ok(result) => {
                     deleted.push(DeletedObject {
@@ -9966,21 +10159,21 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::create_multipart_upload",
             "bucket={} key={}",
-            req.bucket,
-            req.key
+            req.object.bucket_name(),
+            req.object.key
         );
-        let bucket = req.bucket;
-        let key = req.key;
+        let bucket = req.object.bucket_name();
+        let key = req.object.key;
         let policy_context = req.policy_context();
         let acl = req.write_acl();
         self.with_bucket_write_reservation(bucket, |bucket_info| {
             Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
-            if req.requester.is_anonymous() {
+            if req.object.requester().is_anonymous() {
                 return Err(ServerError::AccessDenied);
             }
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             if !Self::requester_can_put_object_with_bucket_policy(
-                &req.requester,
+                req.object.requester(),
                 &bucket_info,
                 key,
                 policy_context,
@@ -10012,8 +10205,9 @@ impl Coordinator {
                 .map(|ctx| ctx.encryption().clone())
                 .unwrap_or_default();
             Self::ensure_put_object_write_acl_supported(&bucket_info, &acl)?;
-            let initiator = Self::requester_owner_identity(&req.requester);
-            let owner = Self::effective_put_object_owner(&bucket_info, &req.requester, &acl);
+            let initiator = Self::requester_owner_identity(req.object.requester());
+            let owner =
+                Self::effective_put_object_owner(&bucket_info, req.object.requester(), &acl);
             let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &acl);
             let public_read = Self::acl_grants_public_read(&acl_grants);
             Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
@@ -10062,21 +10256,21 @@ impl Coordinator {
             "src_bucket={} src_key={} dst_bucket={} dst_key={} upload_id={} part_number={}",
             req.source.bucket,
             req.source.key,
-            req.dst_bucket,
-            req.dst_key,
-            req.upload_id,
+            req.upload.bucket_name(),
+            req.upload.key(),
+            req.upload.upload_id,
             req.part_number
         );
         let src_bucket = req.source.bucket;
         let src_key = req.source.key;
         let src_version_id = req.source.version_id;
-        let dst_bucket = req.dst_bucket;
-        let dst_key = req.dst_key;
-        let upload_id = req.upload_id;
+        let dst_bucket = req.upload.bucket_name();
+        let dst_key = req.upload.key();
+        let upload_id = req.upload.upload_id;
         let part_number = req.part_number;
         let src_cond = req.source.condition;
         let copy_source_range = req.copy_source_range;
-        let requester = &req.requester;
+        let requester = req.upload.requester();
         let source_sse_customer = req.source_sse_customer;
 
         let _dst_bucket_info = self.authorize_put_object_requester(
@@ -10209,13 +10403,15 @@ impl Coordinator {
 
         // Phase 2: Stream into the destination multipart part session.
         let session = self.begin_stream_part(&BeginStreamPartRequest {
-            bucket: dst_bucket,
-            key: dst_key,
-            upload_id,
+            upload: MultipartObjectRequest::new(
+                dst_bucket,
+                dst_key,
+                upload_id,
+                requester.clone(),
+                req.expected_bucket_owner(),
+            ),
             part_number,
-            requester: requester.clone(),
             sse_customer: req.sse_customer,
-            expected_bucket_owner: req.expected_bucket_owner(),
         })?;
         let session_id = &session.session_id;
         let sse_customer_headers = session
@@ -10272,10 +10468,14 @@ impl Coordinator {
             });
 
             self.finalize_stream_part(FinalizeStreamPartRequest {
-                bucket: dst_bucket,
-                key: dst_key,
+                upload: MultipartObjectRequest::new(
+                    dst_bucket,
+                    dst_key,
+                    upload_id,
+                    requester.clone(),
+                    req.expected_bucket_owner(),
+                ),
                 session_id,
-                upload_id,
                 part_number,
                 crc64: crc64.finalize(),
                 total_size,
@@ -10314,14 +10514,14 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::complete_multipart_upload",
             "bucket={} key={} upload_id={} parts={}",
-            req.bucket,
-            req.key,
-            req.upload_id,
+            req.upload.bucket_name(),
+            req.upload.key(),
+            req.upload.upload_id,
             req.parts.len()
         );
-        let bucket = req.bucket;
-        let key = req.key;
-        let upload_id = req.upload_id;
+        let bucket = req.upload.bucket_name();
+        let key = req.upload.key();
+        let upload_id = req.upload.upload_id;
         let parts = req.parts;
         let claimed_checksum = req.claimed_checksum;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
@@ -10340,8 +10540,11 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
-            if !Self::requester_can_write_multipart_upload(&req.requester, &bucket_info, &upload)
-            {
+            if !Self::requester_can_write_multipart_upload(
+                req.upload.requester(),
+                &bucket_info,
+                &upload,
+            ) {
                 return Err(ServerError::AccessDenied);
             }
             if parts.is_empty() {
@@ -10724,20 +10927,17 @@ impl Coordinator {
     ///
     /// Transitions to Aborting, best-effort deletes all part shard sets,
     /// then deletes the upload and part metadata rows.
-    pub fn abort_multipart_upload(
-        &self,
-        req: &AbortMultipartUploadRequest,
-    ) -> Result<(), ServerError> {
+    pub fn abort_multipart_upload(&self, req: &MultipartObjectRequest) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::abort_multipart_upload",
             "bucket={} key={} upload_id={}",
-            req.bucket,
-            req.key,
+            req.object.bucket_name(),
+            req.object.key,
             req.upload_id
         );
-        let bucket = req.bucket;
-        let key = req.key;
+        let bucket = req.object.bucket_name();
+        let key = req.object.key;
         let upload_id = req.upload_id;
         let bucket_info = self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
         // 1. Lock meta PG and validate upload.
@@ -10750,7 +10950,11 @@ impl Coordinator {
                 upload_id: upload_id.to_string(),
             });
         }
-        if !Self::requester_can_manage_multipart_upload(&req.requester, &bucket_info, &upload) {
+        if !Self::requester_can_manage_multipart_upload(
+            req.object.requester(),
+            &bucket_info,
+            &upload,
+        ) {
             return Err(ServerError::AccessDenied);
         }
 
@@ -10836,14 +11040,14 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::list_parts",
             "bucket={} key={} upload_id={} max_parts={}",
-            req.bucket,
-            req.key,
-            req.upload_id,
+            req.upload.bucket_name(),
+            req.upload.key(),
+            req.upload.upload_id,
             req.max_parts
         );
-        let bucket = req.bucket;
-        let key = req.key;
-        let upload_id = req.upload_id;
+        let bucket = req.upload.bucket_name();
+        let key = req.upload.key();
+        let upload_id = req.upload.upload_id;
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
         let bucket_info = self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
@@ -10862,7 +11066,11 @@ impl Coordinator {
                 upload_id: upload_id.to_string(),
             });
         }
-        if !Self::requester_can_manage_multipart_upload(&req.requester, &bucket_info, &upload) {
+        if !Self::requester_can_manage_multipart_upload(
+            req.upload.requester(),
+            &bucket_info,
+            &upload,
+        ) {
             return Err(ServerError::AccessDenied);
         }
 
@@ -10917,16 +11125,16 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::list_multipart_uploads",
             "bucket={} max_uploads={}",
-            req.bucket,
+            req.bucket.name,
             req.max_uploads
         );
-        let bucket = req.bucket;
+        let bucket = req.bucket.name;
         let prefix = req.prefix;
         let key_marker = req.key_marker;
         let upload_id_marker = req.upload_id_marker;
         let max_uploads = req.max_uploads;
         let _bucket_info = self.authorize_bucket_read_requester(
-            &req.requester,
+            &req.bucket.requester,
             bucket,
             req.expected_bucket_owner(),
         )?;
@@ -11127,13 +11335,15 @@ pub mod test_helpers {
         req: &UploadPartRequest<'_>,
     ) -> Result<UploadPartResult, ServerError> {
         let session = coord.begin_stream_part(&BeginStreamPartRequest {
-            bucket: req.bucket,
-            key: req.key,
-            upload_id: req.upload_id,
+            upload: MultipartObjectRequest::new(
+                req.upload.bucket_name(),
+                req.upload.key(),
+                req.upload.upload_id(),
+                req.upload.requester().clone(),
+                req.upload.expected_bucket_owner(),
+            ),
             part_number: req.part_number,
-            requester: req.requester.clone(),
             sse_customer: req.sse_customer,
-            expected_bucket_owner: req.expected_bucket_owner(),
         })?;
         let session_id = &session.session_id;
         let result = (|| {
@@ -11143,7 +11353,13 @@ pub mod test_helpers {
                 } else {
                     chunk.to_vec()
                 };
-                coord.append_stream_segment(req.bucket, req.key, session_id, idx as u32, &data)?;
+                coord.append_stream_segment(
+                    req.upload.bucket_name(),
+                    req.upload.key(),
+                    session_id,
+                    idx as u32,
+                    &data,
+                )?;
             }
             let crc = checksum::crc64::checksum(req.data);
             let computed_checksum = {
@@ -11154,10 +11370,14 @@ pub mod test_helpers {
                 algo.map(|a| compute_checksum(a, req.data))
             };
             coord.finalize_stream_part(FinalizeStreamPartRequest {
-                bucket: req.bucket,
-                key: req.key,
+                upload: MultipartObjectRequest::new(
+                    req.upload.bucket_name(),
+                    req.upload.key(),
+                    req.upload.upload_id(),
+                    req.upload.requester().clone(),
+                    req.upload.expected_bucket_owner(),
+                ),
                 session_id,
-                upload_id: req.upload_id,
                 part_number: req.part_number,
                 crc64: crc,
                 total_size: req.data.len() as u64,
@@ -11166,7 +11386,7 @@ pub mod test_helpers {
             })
         })();
         if result.is_err() {
-            let _ = coord.abort_stream_put(req.bucket, req.key, session_id);
+            let _ = coord.abort_stream_put(req.upload.bucket_name(), req.upload.key(), session_id);
         }
         result
     }
@@ -11298,11 +11518,7 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&'a str>,
     ) -> BucketRequest<'a> {
-        BucketRequest {
-            name,
-            requester,
-            expected_bucket_owner,
-        }
+        BucketRequest::new(name, requester, expected_bucket_owner)
     }
 
     fn put_bucket_config_request_with_expected_owner<'a>(
@@ -11315,6 +11531,23 @@ mod tests {
             bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
             config,
         }
+    }
+
+    fn object_request<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        requester: Requester,
+    ) -> ObjectRequest<'a> {
+        object_request_with_expected_owner(bucket, key, requester, None)
+    }
+
+    fn object_request_with_expected_owner<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        requester: Requester,
+        expected_bucket_owner: Option<&'a str>,
+    ) -> ObjectRequest<'a> {
+        ObjectRequest::new(bucket, key, requester, expected_bucket_owner)
     }
 
     fn object_version_request<'a>(
@@ -11333,12 +11566,89 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&'a str>,
     ) -> ObjectVersionRequest<'a> {
-        ObjectVersionRequest {
+        ObjectVersionRequest::new(bucket, key, version_id, requester, expected_bucket_owner)
+    }
+
+    fn multipart_object_request<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        upload_id: &'a str,
+        requester: Requester,
+    ) -> MultipartObjectRequest<'a> {
+        multipart_object_request_with_expected_owner(bucket, key, upload_id, requester, None)
+    }
+
+    fn multipart_object_request_with_expected_owner<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        upload_id: &'a str,
+        requester: Requester,
+        expected_bucket_owner: Option<&'a str>,
+    ) -> MultipartObjectRequest<'a> {
+        MultipartObjectRequest::new(bucket, key, upload_id, requester, expected_bucket_owner)
+    }
+
+    fn copy_source<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        version_id: Option<VersionId>,
+    ) -> CopySource<'a> {
+        copy_source_with_expected_owner(bucket, key, version_id, None)
+    }
+
+    fn copy_source_with_expected_owner<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        version_id: Option<VersionId>,
+        expected_bucket_owner: Option<&'a str>,
+    ) -> CopySource<'a> {
+        CopySource {
+            bucket,
+            key,
+            version_id,
+            condition: NO_READ,
+            expected_bucket_owner,
+        }
+    }
+
+    fn delete_object_request<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+        bypass_governance: bool,
+        cond: &'a DeleteCondition,
+    ) -> DeleteObjectRequest<'a> {
+        delete_object_request_with_expected_owner(
             bucket,
             key,
             version_id,
             requester,
-            expected_bucket_owner,
+            None,
+            bypass_governance,
+            cond,
+        )
+    }
+
+    fn delete_object_request_with_expected_owner<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+        expected_bucket_owner: Option<&'a str>,
+        bypass_governance: bool,
+        cond: &'a DeleteCondition,
+    ) -> DeleteObjectRequest<'a> {
+        DeleteObjectRequest {
+            object: object_version_request_with_expected_owner(
+                bucket,
+                key,
+                version_id,
+                requester,
+                expected_bucket_owner,
+            ),
+            bypass_governance,
+            cond,
         }
     }
 
@@ -11754,14 +12064,11 @@ mod tests {
         key: &str,
     ) -> Result<String, ServerError> {
         coord.begin_stream_put(&BeginStreamPutRequest {
-            bucket,
-            key,
-            requester: test_requester(),
+            object: object_request(bucket, key, test_requester()),
             acl: NO_PUT_OBJECT_ACL.into(),
             policy: PutObjectPolicyContext::default(),
             encryption: ObjectEncryption::None,
             object_lock: ObjectLockState::default(),
-            expected_bucket_owner: None,
         })
     }
 
@@ -11773,13 +12080,9 @@ mod tests {
         part_number: u32,
     ) -> Result<BeginStreamPartResult, ServerError> {
         coord.begin_stream_part(&BeginStreamPartRequest {
-            bucket,
-            key,
-            upload_id,
+            upload: multipart_object_request(bucket, key, upload_id, test_requester()),
             part_number,
-            requester: test_requester(),
             sse_customer: None,
-            expected_bucket_owner: None,
         })
     }
 
@@ -11948,7 +12251,7 @@ mod tests {
         // List
         let buckets = coord
             .list_buckets(&ListBucketsRequest {
-                requester: Requester::principal("default-owner"),
+                requester: test_requester(),
             })
             .unwrap();
         assert_eq!(buckets.len(), 1);
@@ -12326,16 +12629,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "foo",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "foo",
+                    Requester::principal("111122223333"),
+                    None,
+                ),
                 data: b"bar",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("111122223333"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -12353,12 +12659,14 @@ mod tests {
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "foo",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "foo",
+                    None,
+                    Requester::anonymous(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::anonymous(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -12366,12 +12674,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "foo",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "foo",
+                    None,
+                    Requester::principal("111122223333"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("111122223333"),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"bar");
@@ -12390,16 +12700,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "foo",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "foo",
+                    Requester::principal("111122223333"),
+                    None,
+                ),
                 data: b"bar",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("111122223333"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -12417,12 +12730,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "foo",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "foo",
+                    None,
+                    Requester::principal("arn:aws:iam::111122223333:user/reader"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("arn:aws:iam::111122223333:user/reader"),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"bar");
@@ -12441,16 +12756,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "foo",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "foo",
+                    Requester::principal("111122223333"),
+                    None,
+                ),
                 data: b"bar",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("111122223333"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -12468,12 +12786,14 @@ mod tests {
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "foo",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "foo",
+                    None,
+                    Requester::principal("444455556666"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("444455556666"),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -12492,16 +12812,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "foo",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "foo",
+                    Requester::principal("111122223333"),
+                    None,
+                ),
                 data: b"bar",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("111122223333"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -12519,12 +12842,14 @@ mod tests {
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "foo",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "foo",
+                    None,
+                    Requester::principal("evil.amazonaws.com"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("evil.amazonaws.com"),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -12702,19 +13027,22 @@ mod tests {
 
         coord
             .put_object(&PutObjectRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    requester.clone(),
+                    None,
+                ),
                 data: b"hello",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -12758,32 +13086,34 @@ mod tests {
         .unwrap();
         coord
             .put_object(&PutObjectRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    requester.clone(),
+                    None,
+                ),
                 data: b"hello",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester,
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                None,
+                requester.clone(),
+                false,
+                NO_DELETE,
+            ))
             .unwrap();
 
         let meta_pg = coord
@@ -12820,13 +13150,17 @@ mod tests {
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    requester.clone(),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -12835,7 +13169,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -12851,33 +13184,38 @@ mod tests {
         test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    requester.clone(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"multipart-data",
                 claimed_checksum: None,
-                requester: requester.clone(),
+
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    requester.clone(),
+                    None,
+                ),
                 parts: &[CompletePart {
                     part_number: 1,
                     etag: format_etag(checksum::crc64::checksum(b"multipart-data")),
                     checksum: None,
                 }],
                 claimed_checksum: None,
-                requester,
                 sse_customer: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -12935,13 +13273,17 @@ mod tests {
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::authenticated(writer.clone()),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: Requester::authenticated(writer.clone()),
+
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -12950,7 +13292,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -13164,16 +13505,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", writer_requester, None),
                 data: b"granted-write",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: writer_requester,
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13216,13 +13555,11 @@ mod tests {
 
         let resp = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket,
+                bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(resp.objects.is_empty());
@@ -13242,13 +13579,11 @@ mod tests {
 
         let resp = coord
             .list_object_versions(&ListObjectVersionsRequest {
-                bucket,
+                bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
                 prefix: None,
                 key_marker: None,
                 version_id_marker: None,
                 max_keys: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(resp.versions.is_empty());
@@ -13268,13 +13603,11 @@ mod tests {
             .unwrap();
         coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket,
-                key,
+                object: object_request_with_expected_owner(bucket, key, test_requester(), None),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -13283,19 +13616,16 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let resp = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
-                bucket,
+                bucket: bucket_request_with_expected_owner(bucket, test_requester(), None),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(resp.uploads.len(), 1);
@@ -13316,16 +13646,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13350,16 +13678,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: Some(tags_xml),
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13367,12 +13693,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.tags.as_deref(), Some(tags_xml));
@@ -13412,16 +13740,19 @@ mod tests {
                     sse_customer: None,
                     policy_context: PutObjectPolicyContext::default(),
                     object_lock: ObjectLockState::default(),
-                    bucket: "bucket",
-                    key: "key",
+                    object: object_request_with_expected_owner(
+                        "bucket",
+                        "key",
+                        test_requester(),
+                        None,
+                    ),
                     data: b"data",
                     metadata: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     cond: NO_WRITE,
-                    requester: test_requester(),
+
                     acl: NO_PUT_OBJECT_ACL.into(),
-                    expected_bucket_owner: None,
                 },
             );
             tx.send(res).unwrap();
@@ -13466,13 +13797,12 @@ mod tests {
         let handle = thread::spawn(move || {
             let metadata = MetadataBlob::new();
             let res = creator.create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -13481,7 +13811,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             });
             tx.send(res).unwrap();
         });
@@ -13550,16 +13879,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: &key,
+                object: object_request_with_expected_owner("bucket", &key, test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13570,12 +13897,14 @@ mod tests {
         let head = coord
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: &key,
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    &key,
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, 4);
@@ -13620,16 +13949,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: &key,
+                object: object_request_with_expected_owner("bucket", &key, test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13638,12 +13965,14 @@ mod tests {
         reader
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: &key,
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    &key,
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -13652,12 +13981,14 @@ mod tests {
         let handle = thread::spawn(move || {
             let res = reader.head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: &key,
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    &key,
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             });
             tx.send(res).unwrap();
         });
@@ -13703,16 +14034,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: &key,
+                object: object_request_with_expected_owner("bucket", &key, test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13721,12 +14050,14 @@ mod tests {
         admin
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: &key,
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    &key,
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -13734,15 +14065,14 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let key_for_delete = key.clone();
         let handle = thread::spawn(move || {
-            let res = deleter.delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: &key_for_delete,
-                version_id: None,
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            });
+            let res = deleter.delete_object(&delete_object_request(
+                "bucket",
+                &key_for_delete,
+                None,
+                test_requester(),
+                false,
+                NO_DELETE,
+            ));
             tx.send(res).unwrap();
         });
 
@@ -13755,12 +14085,14 @@ mod tests {
         assert!(matches!(
             admin.get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: &key,
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    &key,
+                    None,
+                    test_requester(),
+                    None
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             }),
             Err(ServerError::ObjectNotFound { .. })
         ));
@@ -13798,14 +14130,17 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let res = completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
-                requester: test_requester(),
+
                 sse_customer: None,
-                expected_bucket_owner: None,
             });
             tx.send(res).unwrap();
         });
@@ -13861,16 +14196,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "hello.txt",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "hello.txt",
+                    test_requester(),
+                    None,
+                ),
                 data: b"Hello, world!",
                 metadata: &metadata,
                 system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13879,12 +14217,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "hello.txt",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "hello.txt",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"Hello, world!");
@@ -13914,16 +14254,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "obj",
+                object: object_request_with_expected_owner("bucket", "obj", test_requester(), None),
                 data: b"{}",
                 metadata: &metadata,
                 system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13931,12 +14269,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "obj",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"{}");
@@ -13962,16 +14302,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &metadata,
                 system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13979,12 +14317,14 @@ mod tests {
         let head = coord
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, 4);
@@ -14005,16 +14345,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14024,16 +14362,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14041,12 +14377,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"v2");
@@ -14066,16 +14404,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "empty",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "empty",
+                    test_requester(),
+                    None,
+                ),
                 data: b"",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14083,12 +14424,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "empty",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "empty",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"");
@@ -14109,40 +14452,39 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
         coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                false,
+                NO_DELETE,
+            ))
             .unwrap();
 
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -14162,16 +14504,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"simple-data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14190,15 +14530,14 @@ mod tests {
         let okh = object_key_hash("bucket", "key");
 
         coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                false,
+                NO_DELETE,
+            ))
             .unwrap();
 
         wait_for_shard_set_deletion(&coord, shard_pg_id, &okh, generation_id, ec);
@@ -14214,15 +14553,14 @@ mod tests {
             .unwrap();
         // Should not error
         coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "no-such-key",
-                version_id: None,
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "no-such-key",
+                None,
+                test_requester(),
+                false,
+                NO_DELETE,
+            ))
             .unwrap();
     }
 
@@ -14240,16 +14578,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "a/1",
+                object: object_request_with_expected_owner("bucket", "a/1", test_requester(), None),
                 data: b"1",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14259,16 +14595,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "a/2",
+                object: object_request_with_expected_owner("bucket", "a/2", test_requester(), None),
                 data: b"2",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14278,29 +14612,25 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "b/1",
+                object: object_request_with_expected_owner("bucket", "b/1", test_requester(), None),
                 data: b"3",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 3);
@@ -14324,16 +14654,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "photos/cat.jpg",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "photos/cat.jpg",
+                    test_requester(),
+                    None,
+                ),
                 data: b"cat",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14343,16 +14676,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "photos/dog.jpg",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "photos/dog.jpg",
+                    test_requester(),
+                    None,
+                ),
                 data: b"dog",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14362,29 +14698,30 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "docs/readme.md",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "docs/readme.md",
+                    test_requester(),
+                    None,
+                ),
                 data: b"md",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: Some("photos/"),
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 2);
@@ -14404,16 +14741,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "photos/cat.jpg",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "photos/cat.jpg",
+                    test_requester(),
+                    None,
+                ),
                 data: b"cat",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14423,16 +14763,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "photos/dog.jpg",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "photos/dog.jpg",
+                    test_requester(),
+                    None,
+                ),
                 data: b"dog",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14442,16 +14785,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "docs/readme.md",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "docs/readme.md",
+                    test_requester(),
+                    None,
+                ),
                 data: b"md",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14461,29 +14807,30 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "root.txt",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "root.txt",
+                    test_requester(),
+                    None,
+                ),
                 data: b"root",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: Some("/"),
                 continuation_token: None,
                 max_keys: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 1);
@@ -14506,16 +14853,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "folder/",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "folder/",
+                    test_requester(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14523,12 +14873,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "folder/",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "folder/",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"data");
@@ -14663,16 +15015,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "resilient",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "resilient",
+                    test_requester(),
+                    None,
+                ),
                 data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14684,12 +15039,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "resilient",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "resilient",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -14710,16 +15067,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "obj1",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "obj1",
+                    test_requester(),
+                    None,
+                ),
                 data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14729,12 +15089,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "obj1",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj1",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -14755,16 +15117,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "obj-reconstruct",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "obj-reconstruct",
+                    test_requester(),
+                    None,
+                ),
                 data: &data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14776,12 +15141,14 @@ mod tests {
         let first = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "obj-reconstruct",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj-reconstruct",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(first.body.read_all().unwrap(), data);
@@ -14790,12 +15157,14 @@ mod tests {
         let second = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "obj-reconstruct",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj-reconstruct",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(second.body.read_all().unwrap(), data);
@@ -14818,16 +15187,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "obj2",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "obj2",
+                    test_requester(),
+                    None,
+                ),
                 data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14839,12 +15211,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "obj2",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj2",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -14866,16 +15240,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "obj3",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "obj3",
+                    test_requester(),
+                    None,
+                ),
                 data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14888,12 +15265,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "obj3",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj3",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         let err = obj.body.read_all().unwrap_err();
@@ -14916,16 +15295,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "obj4",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "obj4",
+                    test_requester(),
+                    None,
+                ),
                 data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14935,12 +15317,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "obj4",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj4",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -14961,16 +15345,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "obj5",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "obj5",
+                    test_requester(),
+                    None,
+                ),
                 data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14982,13 +15369,15 @@ mod tests {
         let result = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "obj5",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj5",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::Range { start: 0, end: 4 },
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"Hello");
@@ -15010,16 +15399,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "obj6",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "obj6",
+                    test_requester(),
+                    None,
+                ),
                 data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15030,12 +15422,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "obj6",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj6",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -15056,16 +15450,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "obj7",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "obj7",
+                    test_requester(),
+                    None,
+                ),
                 data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15085,12 +15482,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "obj7",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj7",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -15118,16 +15517,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "obj8",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "obj8",
+                    test_requester(),
+                    None,
+                ),
                 data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15148,12 +15550,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "obj8",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj8",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -15177,16 +15581,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "no-such-bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "no-such-bucket",
+                    "key",
+                    test_requester(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -15204,12 +15611,14 @@ mod tests {
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "no-such-key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "no-such-key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -15229,16 +15638,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15246,12 +15653,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.etag, obj.etag);
@@ -15259,12 +15668,14 @@ mod tests {
         let head = coord
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.etag, head.etag);
@@ -15284,16 +15695,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "a/1",
+                object: object_request_with_expected_owner("bucket", "a/1", test_requester(), None),
                 data: b"1",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15303,16 +15712,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "a/2",
+                object: object_request_with_expected_owner("bucket", "a/2", test_requester(), None),
                 data: b"2",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15322,16 +15729,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "b/1",
+                object: object_request_with_expected_owner("bucket", "b/1", test_requester(), None),
                 data: b"3",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15341,16 +15746,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "c/1",
+                object: object_request_with_expected_owner("bucket", "c/1", test_requester(), None),
                 data: b"4",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15360,16 +15763,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "root.txt",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "root.txt",
+                    test_requester(),
+                    None,
+                ),
                 data: b"5",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15377,13 +15783,11 @@ mod tests {
         // First page: max_keys=2 with delimiter
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: Some("/"),
                 continuation_token: None,
                 max_keys: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(
@@ -15398,13 +15802,11 @@ mod tests {
         let token = result.next_continuation_token.unwrap();
         let result2 = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: Some("/"),
                 continuation_token: Some(&token),
                 max_keys: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(
@@ -15430,16 +15832,19 @@ mod tests {
                     sse_customer: None,
                     policy_context: PutObjectPolicyContext::default(),
                     object_lock: ObjectLockState::default(),
-                    bucket: "bucket",
-                    key: &key,
+                    object: object_request_with_expected_owner(
+                        "bucket",
+                        &key,
+                        test_requester(),
+                        None,
+                    ),
                     data: b"data",
                     metadata: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     cond: NO_WRITE,
-                    requester: test_requester(),
+
                     acl: NO_PUT_OBJECT_ACL.into(),
-                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -15447,13 +15852,11 @@ mod tests {
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: Some("/"),
                 continuation_token: None,
                 max_keys: 3,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         // With delimiter "/", all entries become common prefixes
@@ -15473,16 +15876,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "no-bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "no-bucket",
+                    "key",
+                    test_requester(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -15514,16 +15920,19 @@ mod tests {
                     sse_customer: None,
                     policy_context: PutObjectPolicyContext::default(),
                     object_lock: ObjectLockState::default(),
-                    bucket: "bucket",
-                    key: &key,
+                    object: object_request_with_expected_owner(
+                        "bucket",
+                        &key,
+                        test_requester(),
+                        None,
+                    ),
                     data: b"data",
                     metadata: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     cond: NO_WRITE,
-                    requester: test_requester(),
+
                     acl: NO_PUT_OBJECT_ACL.into(),
-                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -15532,13 +15941,11 @@ mod tests {
         // Request fewer than available
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 3,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 3);
@@ -15562,16 +15969,19 @@ mod tests {
                     sse_customer: None,
                     policy_context: PutObjectPolicyContext::default(),
                     object_lock: ObjectLockState::default(),
-                    bucket: "bucket",
-                    key: &key,
+                    object: object_request_with_expected_owner(
+                        "bucket",
+                        &key,
+                        test_requester(),
+                        None,
+                    ),
                     data: b"data",
                     metadata: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     cond: NO_WRITE,
-                    requester: test_requester(),
+
                     acl: NO_PUT_OBJECT_ACL.into(),
-                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -15580,13 +15990,11 @@ mod tests {
         // First page
         let page1 = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page1.objects.len(), 2);
@@ -15596,13 +16004,11 @@ mod tests {
         // Second page using continuation token
         let page2 = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: None,
                 continuation_token: Some(token),
                 max_keys: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page2.objects.len(), 2);
@@ -15612,13 +16018,11 @@ mod tests {
         // Third page — should get remainder
         let page3 = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: None,
                 continuation_token: Some(token2),
                 max_keys: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page3.objects.len(), 1);
@@ -15640,16 +16044,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "photos/2024/jan.jpg",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "photos/2024/jan.jpg",
+                    test_requester(),
+                    None,
+                ),
                 data: b"j",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15659,16 +16066,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "photos/2024/feb.jpg",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "photos/2024/feb.jpg",
+                    test_requester(),
+                    None,
+                ),
                 data: b"f",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15678,16 +16088,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "photos/2025/mar.jpg",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "photos/2025/mar.jpg",
+                    test_requester(),
+                    None,
+                ),
                 data: b"m",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15697,16 +16110,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "photos/top.jpg",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "photos/top.jpg",
+                    test_requester(),
+                    None,
+                ),
                 data: b"t",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15714,13 +16130,11 @@ mod tests {
         // List with prefix "photos/" and delimiter "/"
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: Some("photos/"),
                 delimiter: Some("/"),
                 continuation_token: None,
                 max_keys: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         // top.jpg is a direct child, 2024/ and 2025/ are common prefixes
@@ -15746,29 +16160,30 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "only-one",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "only-one",
+                    test_requester(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 1);
@@ -15790,29 +16205,30 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key1",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key1",
+                    test_requester(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 0,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.objects.is_empty());
@@ -15835,29 +16251,25 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "a/1",
+                object: object_request_with_expected_owner("bucket", "a/1", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: Some("/"),
                 continuation_token: None,
                 max_keys: 0,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.objects.is_empty());
@@ -15872,13 +16284,11 @@ mod tests {
 
         let err = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "no-bucket",
+                bucket: bucket_request_with_expected_owner("no-bucket", test_requester(), None),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -15891,13 +16301,15 @@ mod tests {
 
         let err = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "no-bucket",
+                bucket: bucket_request_with_expected_owner(
+                    "no-bucket",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -15917,16 +16329,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key1",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key1",
+                    test_requester(),
+                    None,
+                ),
                 data: b"data1",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15936,16 +16351,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key2",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key2",
+                    test_requester(),
+                    None,
+                ),
                 data: b"data2",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15971,12 +16389,9 @@ mod tests {
 
         let result = coord
             .delete_objects(&DeleteObjectsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 entries: &entries,
                 bypass_governance: false,
-                requester: test_requester(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.deleted.len(), 3);
@@ -15986,23 +16401,27 @@ mod tests {
         assert!(coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key1",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key1",
+                    None,
+                    test_requester(),
+                    None
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .is_err());
         assert!(coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key2",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key2",
+                    None,
+                    test_requester(),
+                    None
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .is_err());
     }
@@ -16020,12 +16439,9 @@ mod tests {
 
         let err = coord
             .delete_objects(&DeleteObjectsRequest {
-                bucket: "no-bucket",
+                bucket: bucket_request_with_expected_owner("no-bucket", test_requester(), None),
                 entries: &entries,
                 bypass_governance: false,
-                requester: test_requester(),
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -16052,14 +16468,12 @@ mod tests {
 
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -16068,7 +16482,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -16083,16 +16496,17 @@ mod tests {
 
         let err = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
@@ -16176,16 +16590,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16194,13 +16606,15 @@ mod tests {
         let result = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::Range { start: 0, end: 4 },
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"Hello");
@@ -16223,16 +16637,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16241,13 +16653,15 @@ mod tests {
         let result = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::Suffix { length: 6 },
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"World!");
@@ -16269,16 +16683,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16287,13 +16699,15 @@ mod tests {
         let result = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::FromStart { start: 7 },
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"World!");
@@ -16313,16 +16727,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"Hello",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16331,13 +16743,15 @@ mod tests {
         let err = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::FromStart { start: 100 },
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRange { total_size: 5 }));
@@ -16357,16 +16771,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"Hello",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16375,17 +16787,18 @@ mod tests {
         let result = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::Range {
                     start: 0,
                     end: 99999,
                 },
                 cond: NO_READ,
-                requester: test_requester(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"Hello");
@@ -16410,16 +16823,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "new-key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "new-key",
+                    test_requester(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &cond,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16439,16 +16855,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16460,16 +16874,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &cond,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16490,16 +16902,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16510,16 +16920,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &cond,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16528,12 +16936,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"v2");
@@ -16553,16 +16963,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16573,16 +16981,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16594,16 +17000,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"v3",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &cond,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16624,16 +17028,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("other-user"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16659,16 +17066,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: PutObjectAcl::PublicRead.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16747,16 +17152,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: PutObjectAcl::PublicRead.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16777,16 +17180,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: PutObjectAcl::BucketOwnerRead.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16811,16 +17217,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: PutObjectAcl::Invalid("definitely-not-a-real-acl").into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16860,14 +17269,18 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
                 data: b"granted-read",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: owner_requester.clone(),
+
                 acl: PutObjectWriteAcl::Grants(AclGrants::new(vec![
                     AclGrant::new(
                         AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
@@ -16878,7 +17291,6 @@ mod tests {
                         AclPermission::ReadAcp,
                     ),
                 ])),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16886,18 +17298,27 @@ mod tests {
         let object = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    grantee_requester.clone(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: grantee_requester.clone(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(object.body.read_all().unwrap(), b"granted-read");
 
-        let acl =
-            get_object_acl_test(&coord, "bucket", "key", None, grantee_requester, None).unwrap();
+        let acl = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            grantee_requester.clone(),
+            None,
+        )
+        .unwrap();
         assert!(grants_contain(
             &acl.acl_grants,
             &AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
@@ -16951,16 +17372,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    writer_requester.clone(),
+                    None,
+                ),
                 data: b"owned-by-writer",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: writer_requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16975,13 +17399,21 @@ mod tests {
             "key",
             None,
             AclGrants::new(vec![]),
-            owner_requester,
+            owner_requester.clone(),
             None,
         )
         .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
 
-        get_object_acl_test(&coord, "bucket", "key", None, writer_requester, None).unwrap();
+        get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            writer_requester.clone(),
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -17016,19 +17448,22 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: owner_requester,
+
                 acl: PutObjectWriteAcl::Grants(AclGrants::new(vec![AclGrant::new(
                     AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
                     AclPermission::Write,
                 )])),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -17069,19 +17504,22 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: owner_requester,
+
                 acl: PutObjectWriteAcl::Grants(AclGrants::new(vec![AclGrant::new(
                     AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
                     AclPermission::Read,
                 )])),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -17101,16 +17539,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -17157,16 +17598,18 @@ mod tests {
                     sse_customer: None,
                     policy_context: PutObjectPolicyContext::default(),
                     object_lock: ObjectLockState::default(),
-                    bucket: "bucket",
-                    key,
+                    object: object_request_with_expected_owner(
+                        "bucket",
+                        key,
+                        Requester::principal("owner-a"),
+                        None,
+                    ),
                     data: body,
                     metadata: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
                     tags,
                     cond: NO_WRITE,
-                    requester: Requester::principal("owner-a"),
                     acl: NO_PUT_OBJECT_ACL.into(),
-                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -17175,12 +17618,14 @@ mod tests {
         let object = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "publictag",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "publictag",
+                    None,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(object.body.read_all().unwrap(), b"public");
@@ -17189,12 +17634,14 @@ mod tests {
             let err = coord
                 .get_object(&GetObjectRequest {
                     sse_customer: None,
-                    bucket: "bucket",
-                    key,
-                    version_id: None,
+                    object: object_version_request_with_expected_owner(
+                        "bucket",
+                        key,
+                        None,
+                        Requester::principal("other-user"),
+                        None,
+                    ),
                     cond: NO_READ,
-                    requester: Requester::principal("other-user"),
-                    expected_bucket_owner: None,
                 })
                 .unwrap_err();
             assert!(matches!(err, ServerError::AccessDenied));
@@ -17225,16 +17672,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: Some(public_tags),
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -17307,16 +17757,18 @@ mod tests {
                     sse_customer: None,
                     policy_context: PutObjectPolicyContext::default(),
                     object_lock: ObjectLockState::default(),
-                    bucket: "src",
-                    key,
+                    object: object_request_with_expected_owner(
+                        "src",
+                        key,
+                        Requester::principal("owner-a"),
+                        None,
+                    ),
                     data: body,
                     metadata: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     cond: NO_WRITE,
-                    requester: Requester::principal("owner-a"),
                     acl: NO_PUT_OBJECT_ACL.into(),
-                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -17325,12 +17777,14 @@ mod tests {
         let source = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "src",
-                key: "public/foo",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "src",
+                    "public/foo",
+                    None,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(source.body.read_all().unwrap(), b"public-foo");
@@ -17346,26 +17800,21 @@ mod tests {
 
         let copied = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "src",
-                    key: "public/foo",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "dst",
-                dst_key: "copied",
+                source: copy_source("src", "public/foo", None),
+                destination: object_request_with_expected_owner(
+                    "dst",
+                    "copied",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: Requester::principal("other-user"),
+
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(copied.version_id, VersionId::Null);
@@ -17373,38 +17822,35 @@ mod tests {
         let copied_body = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "dst",
-                key: "copied",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "dst",
+                    "copied",
+                    None,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(copied_body.body.read_all().unwrap(), b"public-foo");
 
         let err = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "src",
-                    key: "private/foo",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "dst",
-                dst_key: "denied",
+                source: copy_source("src", "private/foo", None),
+                destination: object_request_with_expected_owner(
+                    "dst",
+                    "denied",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: Requester::principal("other-user"),
+
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -17436,28 +17882,33 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "src",
-                key: "public/foo",
+                object: object_request_with_expected_owner(
+                    "src",
+                    "public/foo",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"public-foo",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
         let source = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "src",
-                key: "public/foo",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "src",
+                    "public/foo",
+                    None,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(source.body.read_all().unwrap(), b"public-foo");
@@ -17473,51 +17924,41 @@ mod tests {
 
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "src",
-                    key: "public/foo",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "dst",
-                dst_key: "copied",
+                source: copy_source("src", "public/foo", None),
+                destination: object_request_with_expected_owner(
+                    "dst",
+                    "copied",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::CopyExplicit,
                 tagging: TaggingDirective::Copy,
-                requester: Requester::principal("other-user"),
+
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let err = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "src",
-                    key: "public/foo",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "dst",
-                dst_key: "denied",
+                source: copy_source("src", "public/foo", None),
+                destination: object_request_with_expected_owner(
+                    "dst",
+                    "denied",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: Requester::principal("other-user"),
+
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -17542,16 +17983,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "private-key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "private-key",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 data: b"private",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("other-user"),
+
                 acl: PutObjectAcl::None.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -17562,16 +18006,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "public-key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "public-key",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 data: b"public",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("other-user"),
+
                 acl: PutObjectAcl::PublicRead.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -17597,16 +18044,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "private-key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "private-key",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 data: b"private",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("other-user"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -17618,8 +18068,7 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "public-key",
+                object: object_request_with_expected_owner("bucket", "public-key", Requester::principal("other-user"), None),
                 data: b"public",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
@@ -17627,10 +18076,9 @@ mod tests {
                     "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
                 ),
                 cond: NO_WRITE,
-                requester: Requester::principal("other-user"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
-            },
+                },
         )
         .unwrap();
     }
@@ -17714,8 +18162,7 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "public-key",
+                object: object_request_with_expected_owner("bucket", "public-key", Requester::principal("other-user"), None),
                 data: b"public",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
@@ -17723,10 +18170,9 @@ mod tests {
                     "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
                 ),
                 cond: NO_WRITE,
-                requester: Requester::principal("other-user"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
-            },
+                },
         )
         .unwrap_err();
         assert!(matches!(denied, ServerError::AccessDenied));
@@ -17747,13 +18193,17 @@ mod tests {
 
         let denied = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "private-key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "private-key",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: Requester::principal("other-user"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -17762,22 +18212,20 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(denied, ServerError::AccessDenied));
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "public-key",
+                object: object_request_with_expected_owner("bucket", "public-key", Requester::principal("other-user"), None),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: Some(
                     "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
                 ),
                 checksum: None,
-                requester: Requester::principal("other-user"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -17786,8 +18234,7 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
-            })
+                })
             .unwrap();
         assert!(!upload.upload_id.is_empty());
     }
@@ -17808,15 +18255,14 @@ mod tests {
 
         let denied = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "public-key",
+                object: object_request_with_expected_owner("bucket", "public-key", Requester::principal("other-user"), None),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: Some(
                     "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
                 ),
                 checksum: None,
-                requester: Requester::principal("other-user"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -17825,8 +18271,7 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
-            })
+                })
             .unwrap_err();
         assert!(matches!(denied, ServerError::AccessDenied));
     }
@@ -17857,16 +18302,19 @@ mod tests {
                     sse_customer: None,
                     policy_context: PutObjectPolicyContext::default(),
                     object_lock: ObjectLockState::default(),
-                    bucket: "src",
-                    key,
+                    object: object_request_with_expected_owner(
+                        "src",
+                        key,
+                        Requester::principal("owner-a"),
+                        None,
+                    ),
                     data: body,
                     metadata: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     cond: NO_WRITE,
-                    requester: Requester::principal("owner-a"),
+
                     acl: NO_PUT_OBJECT_ACL.into(),
-                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -17874,13 +18322,17 @@ mod tests {
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "dst",
-                key: "copied",
+                object: object_request_with_expected_owner(
+                    "dst",
+                    "copied",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: Requester::principal("other-user"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -17889,54 +18341,43 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let copied_part = coord
             .upload_part_copy(&UploadPartCopyRequest {
-                source: CopySource {
-                    bucket: "src",
-                    key: "public/foo",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "dst",
-                dst_key: "copied",
-                upload_id: &upload.upload_id,
+                source: copy_source("src", "public/foo", None),
+                upload: multipart_object_request_with_expected_owner(
+                    "dst",
+                    "copied",
+                    &upload.upload_id,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 part_number: 1,
                 copy_source_range: None,
-                requester: Requester::principal("other-user"),
+
                 source_sse_customer: None,
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(!copied_part.etag.is_empty());
 
         let denied = coord
             .upload_part_copy(&UploadPartCopyRequest {
-                source: CopySource {
-                    bucket: "src",
-                    key: "private/foo",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "dst",
-                dst_key: "copied",
-                upload_id: &upload.upload_id,
+                source: copy_source("src", "private/foo", None),
+                upload: multipart_object_request_with_expected_owner(
+                    "dst",
+                    "copied",
+                    &upload.upload_id,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 part_number: 2,
                 copy_source_range: None,
-                requester: Requester::principal("other-user"),
+
                 source_sse_customer: None,
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(denied, ServerError::AccessDenied));
@@ -17957,14 +18398,17 @@ mod tests {
 
         let private_session = coord
             .begin_stream_put(&BeginStreamPutRequest {
-                bucket: "bucket",
-                key: "private-key",
-                requester: Requester::principal("other-user"),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "private-key",
+                    Requester::principal("other-user"),
+                    None,
+                ),
+
                 acl: PutObjectAcl::None.into(),
                 policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
                 object_lock: ObjectLockState::default(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         coord
@@ -17973,14 +18417,17 @@ mod tests {
 
         let err = coord
             .begin_stream_put(&BeginStreamPutRequest {
-                bucket: "bucket",
-                key: "public-key",
-                requester: Requester::principal("other-user"),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "public-key",
+                    Requester::principal("other-user"),
+                    None,
+                ),
+
                 acl: PutObjectAcl::PublicRead.into(),
                 policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
                 object_lock: ObjectLockState::default(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18020,18 +18467,21 @@ mod tests {
                 &coord,
                 &PutObjectRequest {
                     sse_customer: None,
-                policy_context: PutObjectPolicyContext::default(),
-                object_lock: ObjectLockState::default(),
-                    bucket: "bucket",
-                    key,
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: object_request_with_expected_owner(
+                        "bucket",
+                        key,
+                        Requester::principal("owner-a"),
+                        None,
+                    ),
                     data: body,
                     metadata: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
                     tags,
                     cond: NO_WRITE,
-                    requester: Requester::principal("owner-a"),
+
                     acl: NO_PUT_OBJECT_ACL.into(),
-                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -18051,12 +18501,14 @@ mod tests {
         let denied_object = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "publictag",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "publictag",
+                    None,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(denied_object, ServerError::AccessDenied));
@@ -18090,16 +18542,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: Some(tags_xml),
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18113,12 +18568,14 @@ mod tests {
         let first = reader
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(first.body.read_all().unwrap(), b"data");
@@ -18132,12 +18589,14 @@ mod tests {
         let err = reader
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18161,8 +18620,7 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", Requester::principal("owner-a"), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
@@ -18170,10 +18628,9 @@ mod tests {
                     "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
                 ),
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
-            },
+                },
         )
         .unwrap();
 
@@ -18181,12 +18638,14 @@ mod tests {
         let handle = thread::spawn(move || {
             let res = reader.get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
             });
             tx.send(res.map(|result| result.body.read_all())).unwrap();
         });
@@ -18220,16 +18679,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: Some(tags_xml),
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18261,13 +18723,12 @@ mod tests {
     fn delete_object_object_lock_bucket_policy_same_pg_completes_without_deadlock() {
         let tmp = test_util::tempdir();
         let (admin, deleter) = setup_coordinators_with_single_pg(tmp.path());
-        let owner = AccountIdentity::from_principal("owner-a");
         let owner_requester = Requester::principal("owner-a");
 
         admin
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
-                requester: Requester::authenticated(owner),
+                requester: owner_requester.clone(),
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,
@@ -18279,16 +18740,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: owner_requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18314,13 +18778,15 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let res = deleter.delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: Some(put.version_id),
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(put.version_id),
+                    owner_requester.clone(),
+                    None,
+                ),
+                bypass_governance: false,
                 cond: NO_DELETE,
-                requester: owner_requester,
-                bypass_governance: true,
-                expected_bucket_owner: None,
             });
             tx.send(res).unwrap();
         });
@@ -18395,16 +18861,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18442,16 +18911,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18484,16 +18956,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"public",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: Some(tags_xml),
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: PutObjectAcl::PublicRead.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18526,16 +19001,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("writer-a"),
+                    None,
+                ),
                 data: b"writer-owned",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("writer-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18577,30 +19055,32 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let err = coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                None,
+                Requester::principal("other-user"),
+                false,
+                NO_DELETE,
+            ))
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
@@ -18620,12 +19100,13 @@ mod tests {
         }];
         let result = coord
             .delete_objects(&DeleteObjectsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 entries: &entries,
                 bypass_governance: false,
-                requester: Requester::principal("other-user"),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.deleted.is_empty());
@@ -18647,16 +19128,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"secret",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18664,12 +19148,14 @@ mod tests {
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18696,16 +19182,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("writer-a"),
+                    None,
+                ),
                 data: b"writer-owned",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("writer-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18713,12 +19202,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    Requester::principal("writer-a"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("writer-a"),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"writer-owned");
@@ -18745,16 +19236,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("writer-a"),
+                    None,
+                ),
                 data: b"writer-owned",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("writer-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18762,12 +19256,14 @@ mod tests {
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::principal("owner-a"),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18786,16 +19282,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"public",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: PutObjectAcl::PublicRead.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18803,12 +19302,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    Requester::anonymous(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::anonymous(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"public");
@@ -18827,16 +19328,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"public",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: PutObjectAcl::PublicRead.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18849,12 +19353,14 @@ mod tests {
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    Requester::anonymous(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: Requester::anonymous(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18948,29 +19454,34 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let err = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18989,16 +19500,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19010,13 +19524,15 @@ mod tests {
 
         let result = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 1);
@@ -19036,16 +19552,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19057,13 +19576,11 @@ mod tests {
 
         let err = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", Requester::anonymous(), None),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 1000,
-                requester: Requester::anonymous(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19097,13 +19614,17 @@ mod tests {
 
         let err = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: Requester::principal("other-user"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -19112,7 +19633,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19128,13 +19648,17 @@ mod tests {
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -19143,22 +19667,23 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let err = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 part_number: 1,
                 data: b"data",
                 claimed_checksum: None,
-                requester: Requester::principal("other-user"),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -19180,13 +19705,17 @@ mod tests {
 
         let err = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: Requester::principal("owner-a"),
+
                 acl: PutObjectAcl::PublicRead.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -19195,7 +19724,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
@@ -19211,13 +19739,17 @@ mod tests {
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -19226,21 +19758,22 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let err = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 parts: &[],
                 claimed_checksum: None,
-                requester: Requester::principal("other-user"),
-                sse_customer: None,
 
-                expected_bucket_owner: None,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19256,13 +19789,17 @@ mod tests {
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -19271,18 +19808,17 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let err = coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
-                requester: Requester::principal("other-user"),
-                expected_bucket_owner: None,
-            })
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload.upload_id,
+                Requester::principal("other-user"),
+                None,
+            ))
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
@@ -19297,14 +19833,17 @@ mod tests {
 
         let err = coord
             .begin_stream_put(&BeginStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
-                requester: Requester::principal("other-user"),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("other-user"),
+                    None,
+                ),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
                 object_lock: ObjectLockState::default(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19320,13 +19859,17 @@ mod tests {
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -19335,19 +19878,21 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let err = coord
             .begin_stream_part(&BeginStreamPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 part_number: 1,
-                requester: Requester::principal("other-user"),
+
                 sse_customer: None,
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19368,14 +19913,17 @@ mod tests {
 
         let err = coord
             .begin_stream_put(&BeginStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
-                requester: Requester::principal("owner-a"),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
+
                 acl: PutObjectAcl::PublicRead.into(),
                 policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
                 object_lock: ObjectLockState::default(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
@@ -19391,9 +19939,8 @@ mod tests {
 
         let err = coord
             .begin_stream_put(&BeginStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
-                requester: test_requester(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
@@ -19401,8 +19948,6 @@ mod tests {
                     retention: None,
                     legal_hold: StoredLegalHoldStatus::On,
                 },
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
@@ -19422,16 +19967,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19442,12 +19985,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: &cond,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"data");
@@ -19466,16 +20011,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19487,12 +20030,14 @@ mod tests {
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: &cond,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -19512,16 +20057,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19532,12 +20075,14 @@ mod tests {
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: &cond,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::NotModified { .. }));
@@ -19557,16 +20102,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19577,12 +20120,14 @@ mod tests {
         let err = coord
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: &cond,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::NotModified { .. }));
@@ -19602,40 +20147,42 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
         let cond = DeleteCondition::IfMatch(put.etag.into());
         coord
             .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 bypass_governance: false,
                 cond: &cond,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .is_err());
     }
@@ -19653,16 +20200,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19670,13 +20215,15 @@ mod tests {
         let cond = DeleteCondition::IfMatch("\"0000000000000000\"".into());
         let err = coord
             .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 bypass_governance: false,
                 cond: &cond,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -19704,16 +20251,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19724,16 +20269,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19741,13 +20284,15 @@ mod tests {
         let cond = DeleteCondition::IfMatch("\"0000000000000000\"".into());
         let err = coord
             .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: Some(v1.version_id),
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(v1.version_id),
+                    test_requester(),
+                    None,
+                ),
                 bypass_governance: false,
                 cond: &cond,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(
@@ -19759,12 +20304,14 @@ mod tests {
         let v1_obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: Some(v1.version_id),
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(v1.version_id),
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(v1_obj.body.read_all().unwrap(), b"v1");
@@ -19784,16 +20331,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key1",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key1",
+                    test_requester(),
+                    None,
+                ),
                 data: b"data1",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19803,16 +20353,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key2",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key2",
+                    test_requester(),
+                    None,
+                ),
                 data: b"data2",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19832,12 +20385,9 @@ mod tests {
         ];
         let result = coord
             .delete_objects(&DeleteObjectsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 entries: &entries,
                 bypass_governance: false,
-                requester: test_requester(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.deleted.len(), 1);
@@ -19860,16 +20410,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"Hello, World!",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19880,13 +20428,15 @@ mod tests {
         let result = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::Range { start: 0, end: 4 },
                 cond: &cond,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"Hello");
@@ -19911,42 +20461,35 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data: b"hello copy",
                 metadata: &metadata,
                 system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let result = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                source: copy_source("bucket", "src", None),
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -19954,12 +20497,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "dst",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"hello copy");
@@ -19982,42 +20527,40 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "src-bucket",
-                key: "src",
+                object: object_request_with_expected_owner(
+                    "src-bucket",
+                    "src",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"private",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let err = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "src-bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "dst-bucket",
-                dst_key: "dst",
+                source: copy_source("src-bucket", "src", None),
+                destination: object_request_with_expected_owner(
+                    "dst-bucket",
+                    "dst",
+                    Requester::principal("owner-b"),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: Requester::principal("owner-b"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -20045,16 +20588,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "src",
+                    Requester::principal("writer-a"),
+                    None,
+                ),
                 data: b"private",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("writer-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20069,18 +20615,20 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -20118,16 +20666,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "src",
+                    owner_requester.clone(),
+                    None,
+                ),
                 data: b"granted-copy",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: owner_requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20151,51 +20702,55 @@ mod tests {
                 AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
                 AclPermission::FullControl,
             )]),
-            owner_requester,
+            owner_requester.clone(),
             None,
         )
         .unwrap();
 
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                source: copy_source("bucket", "src", None),
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    writer_requester.clone(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: writer_requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let copied = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "dst",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    None,
+                    writer_requester.clone(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: writer_requester.clone(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(copied.body.read_all().unwrap(), b"granted-copy");
 
-        let dst_acl =
-            get_object_acl_test(&coord, "bucket", "dst", None, writer_requester, None).unwrap();
+        let dst_acl = get_object_acl_test(
+            &coord,
+            "bucket",
+            "dst",
+            None,
+            writer_requester.clone(),
+            None,
+        )
+        .unwrap();
         assert_eq!(dst_acl.owner_principal, writer.principal());
         assert_eq!(
             dst_acl.owner_canonical_id,
@@ -20226,42 +20781,35 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let err = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                source: copy_source("bucket", "src", None),
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: PutObjectAcl::PublicRead.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
@@ -20280,16 +20828,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "src",
+                    Requester::principal("owner-a"),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: Requester::principal("owner-a"),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20301,26 +20852,21 @@ mod tests {
 
         let err = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                source: copy_source("bucket", "src", None),
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: Requester::principal("owner-a"),
+
                 acl: PutObjectAcl::PublicRead.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -20346,54 +20892,49 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data: b"data",
                 metadata: &metadata,
                 system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                source: copy_source("bucket", "src", None),
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "dst",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.system_metadata.content_type(), Some("image/png"));
@@ -20420,16 +20961,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data: b"data",
                 metadata: &metadata,
                 system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20439,16 +20978,13 @@ mod tests {
         let new_system_metadata = SystemMetadata::from_headers(&new_headers).unwrap();
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                source: copy_source("bucket", "src", None),
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Replace {
                     metadata: &new_metadata,
@@ -20456,25 +20992,25 @@ mod tests {
                     checksum_algorithm: None,
                 },
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "dst",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"data");
@@ -20501,16 +21037,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &metadata,
                 system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20528,8 +21062,12 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "bucket",
-                dst_key: "key",
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Replace {
                     metadata: &new_metadata,
@@ -20537,25 +21075,25 @@ mod tests {
                     checksum_algorithm: None,
                 },
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"data");
@@ -20578,16 +21116,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: Some(tags_xml),
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20602,30 +21138,34 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "dst",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.tags.as_deref(), Some(tags_xml));
@@ -20649,16 +21189,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: Some(src_tags),
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20673,30 +21211,34 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Replace(Some(dst_tags)),
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "dst",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.tags.as_deref(), Some(dst_tags));
@@ -20718,16 +21260,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data: b"hello",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20747,8 +21287,12 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Replace {
                     metadata: &new_metadata,
@@ -20756,25 +21300,25 @@ mod tests {
                     checksum_algorithm: None,
                 },
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "dst",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"hello");
@@ -20800,16 +21344,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20827,8 +21369,12 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Replace {
                     metadata: &new_metadata,
@@ -20836,25 +21382,25 @@ mod tests {
                     checksum_algorithm: Some(ChecksumAlgorithm::Crc32c),
                 },
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "dst",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -20898,18 +21444,20 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -20928,16 +21476,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20952,18 +21498,20 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "no-bucket",
-                dst_key: "dst",
+                destination: object_request_with_expected_owner(
+                    "no-bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -20982,16 +21530,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21010,18 +21556,20 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -21041,16 +21589,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21060,16 +21606,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "dst",
+                object: object_request_with_expected_owner("bucket", "dst", test_requester(), None),
                 data: b"existing",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21085,18 +21629,20 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: &dst_cond,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -21116,16 +21662,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data: b"new data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21135,16 +21679,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "dst",
+                object: object_request_with_expected_owner("bucket", "dst", test_requester(), None),
                 data: b"old data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21160,18 +21702,20 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: &dst_cond,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -21179,12 +21723,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "dst",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"new data");
@@ -21210,16 +21756,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "src-bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "src-bucket",
+                    "key",
+                    test_requester(),
+                    None,
+                ),
                 data: b"cross bucket data",
                 metadata: &metadata,
                 system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21234,30 +21783,34 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "dst-bucket",
-                dst_key: "key",
+                destination: object_request_with_expected_owner(
+                    "dst-bucket",
+                    "key",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "dst-bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "dst-bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"cross bucket data");
@@ -21267,12 +21820,14 @@ mod tests {
         let src = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "src-bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "src-bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(src.body.read_all().unwrap(), b"cross bucket data");
@@ -21349,16 +21904,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    requester.clone(),
+                    None,
+                ),
                 data: b"v1",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21368,16 +21926,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    requester.clone(),
+                    None,
+                ),
                 data: b"v2",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21407,7 +21968,7 @@ mod tests {
             "bucket",
             "key",
             Some(v2.version_id),
-            requester,
+            requester.clone(),
             None,
         )
         .unwrap();
@@ -21458,16 +22019,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    requester.clone(),
+                    None,
+                ),
                 data: b"old",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21477,16 +22041,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    requester.clone(),
+                    None,
+                ),
                 data: b"current",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21516,7 +22083,7 @@ mod tests {
             "bucket",
             "key",
             Some(old.version_id),
-            requester,
+            requester.clone(),
             None,
         )
         .unwrap();
@@ -21873,16 +22440,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: owner_requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21903,7 +22473,7 @@ mod tests {
         put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
-                owner_requester, None)
+                owner_requester.clone(), None)
             .unwrap();
 
         let fetched = get_object_retention_test(
@@ -21941,16 +22511,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: owner_requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22032,16 +22605,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: owner_requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22102,16 +22678,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: owner_requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22271,16 +22850,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "src",
-                key: "source",
+                object: object_request_with_expected_owner("src", "source", test_requester(), None),
                 data: &source_body,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22301,20 +22878,17 @@ mod tests {
 
         let err = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "src",
-                    key: "source",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "dst",
-                dst_key: "copied",
+                source: copy_source("src", "source", None),
+                destination: object_request_with_expected_owner(
+                    "dst",
+                    "copied",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
                 dst_sse_customer: None,
@@ -22322,8 +22896,6 @@ mod tests {
                     retention: None,
                     legal_hold: StoredLegalHoldStatus::On,
                 },
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
@@ -22434,16 +23006,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: owner_requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22467,15 +23042,14 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: Some(put.version_id),
-                cond: NO_DELETE,
-                requester: owner_requester,
-                bypass_governance: true,
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                owner_requester.clone(),
+                true,
+                NO_DELETE,
+            ))
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
@@ -22503,16 +23077,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: owner_requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22536,15 +23113,14 @@ mod tests {
             .unwrap();
 
         coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: Some(put.version_id),
-                cond: NO_DELETE,
-                requester: other_requester,
-                bypass_governance: true,
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                other_requester,
+                true,
+                NO_DELETE,
+            ))
             .unwrap();
     }
 
@@ -22599,16 +23175,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    requester.clone(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22628,13 +23207,15 @@ mod tests {
 
         let delete_marker = coord
             .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    requester.clone(),
+                    None,
+                ),
                 bypass_governance: false,
                 cond: NO_DELETE,
-                requester: requester.clone(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(delete_marker.delete_marker);
@@ -22642,38 +23223,38 @@ mod tests {
 
         let err = coord
             .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: Some(put.version_id),
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(put.version_id),
+                    requester.clone(),
+                    None,
+                ),
                 bypass_governance: false,
                 cond: NO_DELETE,
-                requester: requester.clone(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
 
         coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: Some(delete_marker.version_id),
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester: requester.clone(),
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                Some(delete_marker.version_id),
+                requester.clone(),
+                false,
+                NO_DELETE,
+            ))
             .unwrap();
         coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: Some(put.version_id),
-                bypass_governance: true,
-                cond: NO_DELETE,
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                Some(put.version_id),
                 requester,
-                expected_bucket_owner: None,
-            })
+                true,
+                NO_DELETE,
+            ))
             .unwrap();
     }
 
@@ -22700,16 +23281,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    requester.clone(),
+                    None,
+                ),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22724,15 +23308,14 @@ mod tests {
         .unwrap();
 
         let err = coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: Some(put.version_id),
-                bypass_governance: true,
-                cond: NO_DELETE,
-                requester: requester.clone(),
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                requester.clone(),
+                true,
+                NO_DELETE,
+            ))
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
 
@@ -22747,13 +23330,15 @@ mod tests {
         .unwrap();
         coord
             .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: Some(put.version_id),
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(put.version_id),
+                    requester,
+                    None,
+                ),
                 bypass_governance: true,
                 cond: NO_DELETE,
-                requester,
-                expected_bucket_owner: None,
             })
             .unwrap();
     }
@@ -22783,30 +23368,32 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "plain",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "plain",
+                    owner_requester.clone(),
+                    None,
+                ),
                 data: b"plain",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: owner_requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "plain",
-                version_id: Some(plain.version_id),
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester: writer_requester.clone(),
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "plain",
+                Some(plain.version_id),
+                writer_requester.clone(),
+                false,
+                NO_DELETE,
+            ))
             .unwrap();
 
         let locked = test_helpers::put_object(
@@ -22815,16 +23402,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "locked",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "locked",
+                    owner_requester.clone(),
+                    None,
+                ),
                 data: b"locked",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: owner_requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22839,20 +23429,19 @@ mod tests {
                 retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
             },
             false,
-            owner_requester,
+            owner_requester.clone(),
         )
         .unwrap();
 
         let err = coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "locked",
-                version_id: Some(locked.version_id),
-                bypass_governance: true,
-                cond: NO_DELETE,
-                requester: writer_requester,
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "locked",
+                Some(locked.version_id),
+                writer_requester.clone(),
+                true,
+                NO_DELETE,
+            ))
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
@@ -22956,16 +23545,14 @@ mod tests {
                 sse_customer: Some(&sse_customer),
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -22996,16 +23583,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -23039,14 +23624,11 @@ mod tests {
 
         let err = coord
             .begin_stream_put(&BeginStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
-                requester: test_requester(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy: PutObjectPolicyContext::default(),
                 encryption,
                 object_lock: ObjectLockState::default(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -23063,13 +23645,12 @@ mod tests {
         let sse_customer = test_sse_customer_request();
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: Some(&sse_customer),
                 object_lock: ObjectLockState::default(),
@@ -23078,7 +23659,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -23095,13 +23675,16 @@ mod tests {
 
         let err = coord
             .begin_stream_part(&BeginStreamPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
-                requester: test_requester(),
+
                 sse_customer: Some(&sse_customer),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -23121,16 +23704,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -23151,28 +23732,28 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.version_id, VersionId::Null);
@@ -23192,28 +23773,28 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
         let head = coord
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.version_id, VersionId::Null);
@@ -23269,16 +23850,19 @@ mod tests {
                         sse_customer: None,
                         policy_context: PutObjectPolicyContext::default(),
                         object_lock: ObjectLockState::default(),
-                        bucket: "bucket",
-                        key: &key_a,
+                        object: object_request_with_expected_owner(
+                            "bucket",
+                            &key_a,
+                            test_requester(),
+                            None,
+                        ),
                         data: b"v1",
                         metadata: &MetadataBlob::new(),
                         system_metadata: &SystemMetadata::EMPTY,
                         tags: None,
                         cond: NO_WRITE,
-                        requester: test_requester(),
+
                         acl: NO_PUT_OBJECT_ACL.into(),
-                        expected_bucket_owner: None,
                     },
                 )
             });
@@ -23290,16 +23874,19 @@ mod tests {
                         sse_customer: None,
                         policy_context: PutObjectPolicyContext::default(),
                         object_lock: ObjectLockState::default(),
-                        bucket: "bucket",
-                        key: &key_b,
+                        object: object_request_with_expected_owner(
+                            "bucket",
+                            &key_b,
+                            test_requester(),
+                            None,
+                        ),
                         data: b"v2",
                         metadata: &MetadataBlob::new(),
                         system_metadata: &SystemMetadata::EMPTY,
                         tags: None,
                         cond: NO_WRITE,
-                        requester: test_requester(),
+
                         acl: NO_PUT_OBJECT_ACL.into(),
-                        expected_bucket_owner: None,
                     },
                 )
             });
@@ -23347,16 +23934,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: &vec![b'A'; object_size],
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -23380,16 +23965,19 @@ mod tests {
                         sse_customer: None,
                         policy_context: PutObjectPolicyContext::default(),
                         object_lock: ObjectLockState::default(),
-                        bucket: "bucket",
-                        key: "key",
+                        object: object_request_with_expected_owner(
+                            "bucket",
+                            "key",
+                            test_requester(),
+                            None,
+                        ),
                         data: &new_payload,
                         metadata: &MetadataBlob::new(),
                         system_metadata: &SystemMetadata::EMPTY,
                         tags: None,
                         cond: NO_WRITE,
-                        requester: test_requester(),
+
                         acl: NO_PUT_OBJECT_ACL.into(),
-                        expected_bucket_owner: None,
                     },
                 )
             });
@@ -23397,12 +23985,14 @@ mod tests {
                 b2.wait();
                 reader.get_object(&GetObjectRequest {
                     sse_customer: None,
-                    bucket: "bucket",
-                    key: "key",
-                    version_id: None,
+                    object: object_version_request_with_expected_owner(
+                        "bucket",
+                        "key",
+                        None,
+                        test_requester(),
+                        None,
+                    ),
                     cond: NO_READ,
-                    requester: test_requester(),
-                    expected_bucket_owner: None,
                 })
             });
 
@@ -23460,16 +24050,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "src-bucket",
-                key: "src",
+                object: object_request_with_expected_owner(
+                    "src-bucket",
+                    "src",
+                    test_requester(),
+                    None,
+                ),
                 data: &vec![b'A'; object_size],
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -23495,42 +24088,40 @@ mod tests {
                         sse_customer: None,
                         policy_context: PutObjectPolicyContext::default(),
                         object_lock: ObjectLockState::default(),
-                        bucket: "src-bucket",
-                        key: "src",
+                        object: object_request_with_expected_owner(
+                            "src-bucket",
+                            "src",
+                            test_requester(),
+                            None,
+                        ),
                         data: &new_payload,
                         metadata: &MetadataBlob::new(),
                         system_metadata: &SystemMetadata::EMPTY,
                         tags: None,
                         cond: NO_WRITE,
-                        requester: test_requester(),
+
                         acl: NO_PUT_OBJECT_ACL.into(),
-                        expected_bucket_owner: None,
                     },
                 )
             });
             let t_copy = thread::spawn(move || {
                 b2.wait();
                 copier.copy_object(&CopyObjectRequest {
-                    source: CopySource {
-                        bucket: "src-bucket",
-                        key: "src",
-                        version_id: None,
-                        condition: NO_READ,
-
-                        expected_bucket_owner: None,
-                    },
-                    dst_bucket: "dst-bucket",
-                    dst_key: &dst_key_for_copy,
+                    source: copy_source("src-bucket", "src", None),
+                    destination: object_request_with_expected_owner(
+                        "dst-bucket",
+                        &dst_key_for_copy,
+                        test_requester(),
+                        None,
+                    ),
                     dst_condition: NO_WRITE,
                     directive: MetadataDirective::Copy,
                     tagging: TaggingDirective::Copy,
-                    requester: test_requester(),
+
                     acl: NO_PUT_OBJECT_ACL.into(),
                     source_sse_customer: None,
                     dst_sse_customer: None,
                     object_lock: ObjectLockState::default(),
-
-                    expected_bucket_owner: None,
                 })
             });
 
@@ -23551,12 +24142,14 @@ mod tests {
             let copied_obj = admin
                 .get_object(&GetObjectRequest {
                     sse_customer: None,
-                    bucket: "dst-bucket",
-                    key: &dst_key,
-                    version_id: None,
+                    object: object_version_request_with_expected_owner(
+                        "dst-bucket",
+                        &dst_key,
+                        None,
+                        test_requester(),
+                        None,
+                    ),
                     cond: NO_READ,
-                    requester: test_requester(),
-                    expected_bucket_owner: None,
                 })
                 .unwrap();
             let data = copied_obj.body.read_all().unwrap();
@@ -23600,16 +24193,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data: &vec![b'A'; object_size],
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -23621,13 +24212,17 @@ mod tests {
             let dst_key = format!("dst-{i}");
             let upload = admin
                 .create_multipart_upload(&CreateMultipartUploadRequest {
-                    bucket: "bucket",
-                    key: &dst_key,
+                    object: object_request_with_expected_owner(
+                        "bucket",
+                        &dst_key,
+                        test_requester(),
+                        None,
+                    ),
                     metadata: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     checksum: None,
-                    requester: test_requester(),
+
                     acl: NO_PUT_OBJECT_ACL.into(),
                     sse_customer: None,
                     object_lock: ObjectLockState::default(),
@@ -23636,7 +24231,6 @@ mod tests {
                     grant_read_acp: None,
                     grant_write_acp: None,
                     grant_full_control: None,
-                    expected_bucket_owner: None,
                 })
                 .unwrap();
             let dst_key_for_copy = dst_key.clone();
@@ -23656,40 +24250,38 @@ mod tests {
                         sse_customer: None,
                         policy_context: PutObjectPolicyContext::default(),
                         object_lock: ObjectLockState::default(),
-                        bucket: "bucket",
-                        key: "src",
+                        object: object_request_with_expected_owner(
+                            "bucket",
+                            "src",
+                            test_requester(),
+                            None,
+                        ),
                         data: &new_payload,
                         metadata: &MetadataBlob::new(),
                         system_metadata: &SystemMetadata::EMPTY,
                         tags: None,
                         cond: NO_WRITE,
-                        requester: test_requester(),
+
                         acl: NO_PUT_OBJECT_ACL.into(),
-                        expected_bucket_owner: None,
                     },
                 )
             });
             let t_copy = thread::spawn(move || {
                 b2.wait();
                 copier.upload_part_copy(&UploadPartCopyRequest {
-                    source: CopySource {
-                        bucket: "bucket",
-                        key: "src",
-                        version_id: None,
-                        condition: NO_READ,
-
-                        expected_bucket_owner: None,
-                    },
-                    dst_bucket: "bucket",
-                    dst_key: &dst_key_for_copy,
-                    upload_id: &upload_id_for_copy,
+                    source: copy_source("bucket", "src", None),
+                    upload: multipart_object_request_with_expected_owner(
+                        "bucket",
+                        &dst_key_for_copy,
+                        &upload_id_for_copy,
+                        test_requester(),
+                        None,
+                    ),
                     part_number: 1,
                     copy_source_range: None,
-                    requester: test_requester(),
+
                     source_sse_customer: None,
                     sse_customer: None,
-
-                    expected_bucket_owner: None,
                 })
             });
 
@@ -23706,9 +24298,13 @@ mod tests {
 
             admin
                 .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                    bucket: "bucket",
-                    key: &dst_key,
-                    upload_id: &upload.upload_id,
+                    upload: multipart_object_request_with_expected_owner(
+                        "bucket",
+                        &dst_key,
+                        &upload.upload_id,
+                        test_requester(),
+                        None,
+                    ),
                     parts: &[CompletePart {
                         part_number: 1,
                         etag: copy_res.etag,
@@ -23716,21 +24312,20 @@ mod tests {
                     }],
                     sse_customer: None,
                     claimed_checksum: None,
-                    requester: test_requester(),
-
-                    expected_bucket_owner: None,
                 })
                 .unwrap();
 
             let copied_obj = admin
                 .get_object(&GetObjectRequest {
                     sse_customer: None,
-                    bucket: "bucket",
-                    key: &dst_key,
-                    version_id: None,
+                    object: object_version_request_with_expected_owner(
+                        "bucket",
+                        &dst_key,
+                        None,
+                        test_requester(),
+                        None,
+                    ),
                     cond: NO_READ,
-                    requester: test_requester(),
-                    expected_bucket_owner: None,
                 })
                 .unwrap();
             let data = copied_obj.body.read_all().unwrap();
@@ -23774,16 +24369,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: &vec![b'A'; object_size],
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -23806,29 +24399,34 @@ mod tests {
                         sse_customer: None,
                         policy_context: PutObjectPolicyContext::default(),
                         object_lock: ObjectLockState::default(),
-                        bucket: "bucket",
-                        key: "key",
+                        object: object_request_with_expected_owner(
+                            "bucket",
+                            "key",
+                            test_requester(),
+                            None,
+                        ),
                         data: &payload,
                         metadata: &MetadataBlob::new(),
                         system_metadata: &SystemMetadata::EMPTY,
                         tags: None,
                         cond: NO_WRITE,
-                        requester: test_requester(),
+
                         acl: NO_PUT_OBJECT_ACL.into(),
-                        expected_bucket_owner: None,
                     },
                 )
             });
             let t_delete = thread::spawn(move || {
                 b2.wait();
                 deleter.delete_object(&DeleteObjectRequest {
-                    bucket: "bucket",
-                    key: "key",
-                    version_id: None,
+                    object: object_version_request_with_expected_owner(
+                        "bucket",
+                        "key",
+                        None,
+                        test_requester(),
+                        None,
+                    ),
                     bypass_governance: false,
                     cond: NO_DELETE,
-                    requester: test_requester(),
-                    expected_bucket_owner: None,
                 })
             });
 
@@ -23848,12 +24446,14 @@ mod tests {
 
             let check = make_coord().get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             });
             match check {
                 Ok(obj) => {
@@ -23906,12 +24506,14 @@ mod tests {
             reader
                 .get_object(&GetObjectRequest {
                     sse_customer: None,
-                    bucket: "race-bucket",
-                    key: &read_key,
-                    version_id: None,
+                    object: object_version_request_with_expected_owner(
+                        "race-bucket",
+                        &read_key,
+                        None,
+                        test_requester(),
+                        None,
+                    ),
                     cond: NO_READ,
-                    requester: test_requester(),
-                    expected_bucket_owner: None,
                 })
                 .and_then(|result| result.body.read_all())
         });
@@ -23919,13 +24521,15 @@ mod tests {
 
         let t_delete = thread::spawn(move || {
             deleter.delete_object(&DeleteObjectRequest {
-                bucket: "race-bucket",
-                key: &delete_key,
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "race-bucket",
+                    &delete_key,
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 bypass_governance: false,
                 cond: NO_DELETE,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
         });
         sync.delete_reached.wait();
@@ -23981,13 +24585,15 @@ mod tests {
             reader
                 .get_object_part(&GetObjectPartRequest {
                     sse_customer: None,
-                    bucket: "race-bucket",
-                    key: &read_key,
-                    version_id: None,
+                    object: object_version_request_with_expected_owner(
+                        "race-bucket",
+                        &read_key,
+                        None,
+                        test_requester(),
+                        None,
+                    ),
                     part_number: 2,
                     cond: NO_READ,
-                    requester: test_requester(),
-                    expected_bucket_owner: None,
                 })
                 .and_then(|res| {
                     let part_start = res.part_start;
@@ -23999,13 +24605,15 @@ mod tests {
 
         let t_delete = thread::spawn(move || {
             deleter.delete_object(&DeleteObjectRequest {
-                bucket: "race-bucket",
-                key: &delete_key,
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "race-bucket",
+                    &delete_key,
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 bypass_governance: false,
                 cond: NO_DELETE,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
         });
         sync.delete_reached.wait();
@@ -24056,8 +24664,7 @@ mod tests {
         let expected = b"segment-zero-segment-one".to_vec();
         admin
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "race-bucket",
-                key: &key,
+                object: object_request("race-bucket", &key, test_requester()),
                 session_id: &session_id,
                 crc64: checksum::crc64::checksum(&expected),
                 total_size: expected.len() as u64,
@@ -24066,7 +24673,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -24084,12 +24690,14 @@ mod tests {
             reader
                 .get_object(&GetObjectRequest {
                     sse_customer: None,
-                    bucket: "race-bucket",
-                    key: &read_key,
-                    version_id: None,
+                    object: object_version_request_with_expected_owner(
+                        "race-bucket",
+                        &read_key,
+                        None,
+                        test_requester(),
+                        None,
+                    ),
                     cond: NO_READ,
-                    requester: test_requester(),
-                    expected_bucket_owner: None,
                 })
                 .and_then(|result| result.body.read_all())
         });
@@ -24097,13 +24705,15 @@ mod tests {
 
         let t_delete = thread::spawn(move || {
             deleter.delete_object(&DeleteObjectRequest {
-                bucket: "race-bucket",
-                key: &delete_key,
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "race-bucket",
+                    &delete_key,
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 bypass_governance: false,
                 cond: NO_DELETE,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
         });
         sync.delete_reached.wait();
@@ -24144,13 +24754,17 @@ mod tests {
         assert_object_maps_meta_pg_gt_shard_pg(&admin, "race-bucket", &source_key);
         let upload = admin
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "race-bucket",
-                key: "dst",
+                object: object_request_with_expected_owner(
+                    "race-bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -24159,7 +24773,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24171,38 +24784,32 @@ mod tests {
 
         let t_copy = thread::spawn(move || {
             copier.upload_part_copy(&UploadPartCopyRequest {
-                source: CopySource {
-                    bucket: "race-bucket",
-                    key: &copy_key,
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "race-bucket",
-                dst_key: "dst",
-                upload_id: &upload.upload_id,
+                source: copy_source("race-bucket", &copy_key, None),
+                upload: multipart_object_request_with_expected_owner(
+                    "race-bucket",
+                    "dst",
+                    &upload.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 copy_source_range: None,
-                requester: test_requester(),
+
                 source_sse_customer: None,
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
         });
         sync.snapshot_reached.wait();
 
         let t_delete = thread::spawn(move || {
-            deleter.delete_object(&DeleteObjectRequest {
-                bucket: "race-bucket",
-                key: &delete_key,
-                version_id: None,
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            deleter.delete_object(&delete_object_request(
+                "race-bucket",
+                &delete_key,
+                None,
+                test_requester(),
+                false,
+                NO_DELETE,
+            ))
         });
         sync.delete_reached.wait();
 
@@ -24258,32 +24865,33 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "dst-bucket",
-                dst_key: "copied",
+                destination: object_request_with_expected_owner(
+                    "dst-bucket",
+                    "copied",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
         });
         sync.snapshot_reached.wait();
 
         let t_delete = thread::spawn(move || {
-            deleter.delete_object(&DeleteObjectRequest {
-                bucket: "src-bucket",
-                key: "race-key-copy",
-                version_id: None,
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            deleter.delete_object(&delete_object_request(
+                "src-bucket",
+                "race-key-copy",
+                None,
+                test_requester(),
+                false,
+                NO_DELETE,
+            ))
         });
         sync.delete_reached.wait();
 
@@ -24300,12 +24908,14 @@ mod tests {
         let dst = admin
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "dst-bucket",
-                key: "copied",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "dst-bucket",
+                    "copied",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(dst.body.read_all().unwrap(), expected);
@@ -24325,29 +24935,26 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
         let result = coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                false,
+                NO_DELETE,
+            ))
             .unwrap();
         assert_eq!(result.version_id, VersionId::Null);
         assert!(!result.delete_marker);
@@ -24366,14 +24973,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let result = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -24382,7 +24987,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24402,14 +25006,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let r1 = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -24418,19 +25020,16 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         let r2 = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -24439,7 +25038,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_ne!(r1.upload_id, r2.upload_id);
@@ -24453,14 +25051,17 @@ mod tests {
         let metadata = MetadataBlob::new();
         let err = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "no-such-bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "no-such-bucket",
+                    "key",
+                    test_requester(),
+                    None,
+                ),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -24469,7 +25070,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -24485,13 +25085,11 @@ mod tests {
 
         let result = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.uploads.is_empty());
@@ -24509,14 +25107,17 @@ mod tests {
         let metadata = MetadataBlob::new();
         let r1 = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "alpha",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "alpha",
+                    test_requester(),
+                    None,
+                ),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -24525,19 +25126,21 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         let r2 = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "beta",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "beta",
+                    test_requester(),
+                    None,
+                ),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -24546,19 +25149,16 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let result = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
@@ -24611,13 +25211,17 @@ mod tests {
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::authenticated(writer.clone()),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: Requester::authenticated(writer.clone()),
+
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -24626,19 +25230,20 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let result = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    Requester::authenticated(writer.clone()),
+                    None,
+                ),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 1000,
-                requester: Requester::authenticated(writer.clone()),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.uploads.len(), 1);
@@ -24695,20 +25300,24 @@ mod tests {
             &coord,
             "bucket",
             BucketAcl::PublicReadWrite,
-            owner_requester,
+            owner_requester.clone(),
             None,
         )
         .unwrap();
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    writer_requester.clone(),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: writer_requester.clone(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -24717,22 +25326,24 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let err = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    other_requester.clone(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"not-allowed",
                 claimed_checksum: None,
-                requester: other_requester.clone(),
+
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -24741,54 +25352,61 @@ mod tests {
         let uploaded = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    writer_requester.clone(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"allowed",
                 claimed_checksum: None,
-                requester: writer_requester.clone(),
+
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let err = coord
             .list_parts(&ListPartsRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    other_requester.clone(),
+                    None,
+                ),
                 part_number_marker: None,
                 max_parts: 100,
-                requester: other_requester.clone(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
 
         let parts = coord
             .list_parts(&ListPartsRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    writer_requester.clone(),
+                    None,
+                ),
                 part_number_marker: None,
                 max_parts: 100,
-                requester: writer_requester.clone(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(parts.parts.len(), 1);
         assert_eq!(parts.parts[0].etag, uploaded.etag);
 
         let err = coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
-                requester: other_requester,
-                expected_bucket_owner: None,
-            })
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload.upload_id,
+                other_requester.clone(),
+                None,
+            ))
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
@@ -24811,13 +25429,17 @@ mod tests {
 
         let err = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::anonymous(),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: Requester::anonymous(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -24826,7 +25448,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -24874,13 +25495,17 @@ mod tests {
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    writer_requester.clone(),
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: writer_requester.clone(),
+
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -24889,7 +25514,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24904,19 +25528,21 @@ mod tests {
 
         let completed = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    writer_requester.clone(),
+                    None,
+                ),
                 parts: &[CompletePart {
                     part_number: 1,
                     etag: "\"etag\"".to_string(),
                     checksum: None,
                 }],
                 claimed_checksum: None,
-                requester: writer_requester.clone(),
-                sse_customer: None,
 
-                expected_bucket_owner: None,
+                sse_customer: None,
             })
             .unwrap_err();
         assert!(matches!(completed, ServerError::AccessDenied));
@@ -24924,15 +25550,18 @@ mod tests {
         let upload_part = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    writer_requester.clone(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"denied-after-acl-change",
                 claimed_checksum: None,
-                requester: writer_requester.clone(),
+
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -24940,25 +25569,27 @@ mod tests {
 
         let list_parts = coord
             .list_parts(&ListPartsRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    writer_requester.clone(),
+                    None,
+                ),
                 part_number_marker: None,
                 max_parts: 100,
-                requester: writer_requester.clone(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(list_parts.parts.is_empty());
 
         coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload.upload_id,
-                requester: writer_requester,
-                expected_bucket_owner: None,
-            })
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload.upload_id,
+                writer_requester.clone(),
+                None,
+            ))
             .unwrap();
     }
 
@@ -24974,14 +25605,12 @@ mod tests {
         // Create two uploads for the same key.
         let r1 = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -24990,19 +25619,16 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         let r2 = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25011,19 +25637,16 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let result = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
@@ -25052,14 +25675,12 @@ mod tests {
         // Create 3 uploads for distinct keys so ordering is deterministic.
         coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "a",
+                object: object_request_with_expected_owner("bucket", "a", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25068,19 +25689,16 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "b",
+                object: object_request_with_expected_owner("bucket", "b", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25089,19 +25707,16 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "c",
+                object: object_request_with_expected_owner("bucket", "c", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25110,20 +25725,17 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         // Page 1: max_uploads=2.
         let page1 = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page1.uploads.len(), 2);
@@ -25136,13 +25748,11 @@ mod tests {
         // Page 2: use markers from page 1.
         let page2 = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 key_marker: page1.next_key_marker.as_deref(),
                 upload_id_marker: page1.next_upload_id_marker.as_deref(),
                 max_uploads: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page2.uploads.len(), 1);
@@ -25161,14 +25771,17 @@ mod tests {
         let metadata = MetadataBlob::new();
         coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "photos/a.jpg",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "photos/a.jpg",
+                    test_requester(),
+                    None,
+                ),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25177,19 +25790,21 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "photos/b.jpg",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "photos/b.jpg",
+                    test_requester(),
+                    None,
+                ),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25198,19 +25813,21 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "docs/readme.md",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "docs/readme.md",
+                    test_requester(),
+                    None,
+                ),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25219,19 +25836,16 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let result = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: Some("photos/"),
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
@@ -25249,14 +25863,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25265,19 +25877,16 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let result = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 0,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.uploads.is_empty());
@@ -25291,13 +25900,15 @@ mod tests {
 
         let err = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
-                bucket: "no-such-bucket",
+                bucket: bucket_request_with_expected_owner(
+                    "no-such-bucket",
+                    test_requester(),
+                    None,
+                ),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -25319,14 +25930,17 @@ mod tests {
 
         let result = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "photo.png",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "photo.png",
+                    test_requester(),
+                    None,
+                ),
                 metadata: &metadata,
                 system_metadata: &system_metadata,
                 tags: Some(tags_xml),
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25335,7 +25949,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25366,14 +25979,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25382,7 +25993,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25460,16 +26070,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"hello world",
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -25477,12 +26085,14 @@ mod tests {
         let held_read = admin
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25498,15 +26108,14 @@ mod tests {
         };
 
         admin
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                false,
+                NO_DELETE,
+            ))
             .unwrap();
 
         let meta_pg_id = admin.object_pg_id("bucket", "key");
@@ -25571,14 +26180,17 @@ mod tests {
         for _ in 0..3 {
             let r = coord
                 .create_multipart_upload(&CreateMultipartUploadRequest {
-                    bucket: "bucket",
-                    key: "key",
+                    object: object_request_with_expected_owner(
+                        "bucket",
+                        "key",
+                        test_requester(),
+                        None,
+                    ),
                     metadata: &metadata,
                     system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
                     checksum: None,
 
-                    requester: test_requester(),
                     acl: NO_PUT_OBJECT_ACL.into(),
                     sse_customer: None,
                     object_lock: ObjectLockState::default(),
@@ -25587,7 +26199,6 @@ mod tests {
                     grant_read_acp: None,
                     grant_write_acp: None,
                     grant_full_control: None,
-                    expected_bucket_owner: None,
                 })
                 .unwrap();
             upload_ids.push(r.upload_id);
@@ -25596,13 +26207,11 @@ mod tests {
         // Page 1: max_uploads=2 — should get first 2 by initiation time.
         let page1 = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page1.uploads.len(), 2);
@@ -25615,13 +26224,11 @@ mod tests {
         // Page 2: use markers from page 1 — should get remaining upload.
         let page2 = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 key_marker: page1.next_key_marker.as_deref(),
                 upload_id_marker: page1.next_upload_id_marker.as_deref(),
                 max_uploads: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page2.uploads.len(), 1);
@@ -25654,14 +26261,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25670,23 +26275,24 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let result = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"hello world",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -25725,14 +26331,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25741,7 +26345,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25749,16 +26352,18 @@ mod tests {
         test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"first",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -25767,16 +26372,18 @@ mod tests {
         let result = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"second",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -25803,14 +26410,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25819,23 +26424,24 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let err = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 0,
                 data: b"data",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -25853,14 +26459,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25869,23 +26473,24 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let err = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 10_001,
                 data: b"data",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -25903,16 +26508,18 @@ mod tests {
         let err = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: "bogus-upload-id",
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    "bogus-upload-id",
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"data",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -25930,14 +26537,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -25946,55 +26551,60 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"part-one",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
         test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 2,
                 data: b"part-two",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
         test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 3,
                 data: b"part-three",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -26027,14 +26637,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -26043,7 +26651,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26053,15 +26660,18 @@ mod tests {
             test_helpers::upload_part(
                 &coord,
                 &UploadPartRequest {
-                    bucket: "bucket",
-                    key: "key",
-                    upload_id: &create.upload_id,
+                    upload: multipart_object_request_with_expected_owner(
+                        "bucket",
+                        "key",
+                        &create.upload_id,
+                        test_requester(),
+                        None,
+                    ),
                     part_number: 1,
                     data: data.as_bytes(),
                     claimed_checksum: None,
-                    requester: test_requester(),
+
                     sse_customer: None,
-                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -26085,14 +26695,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -26101,7 +26709,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26109,16 +26716,18 @@ mod tests {
         test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"a",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -26126,16 +26735,18 @@ mod tests {
         test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 10_000,
                 data: b"z",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -26157,14 +26768,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -26173,7 +26782,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26181,16 +26789,18 @@ mod tests {
         let err = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "wrong-key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "wrong-key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"data",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -26203,16 +26813,18 @@ mod tests {
         let err = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "other-bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "other-bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"data",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -26230,14 +26842,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -26246,7 +26856,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26255,16 +26864,18 @@ mod tests {
         let etag1 = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"writer-A",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap()
@@ -26272,16 +26883,18 @@ mod tests {
         let etag2 = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"writer-B",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap()
@@ -26289,16 +26902,18 @@ mod tests {
         let etag3 = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"writer-C",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap()
@@ -26329,14 +26944,11 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket,
-                key,
+                object: object_request(bucket, key, test_requester()),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -26345,7 +26957,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -26353,15 +26964,16 @@ mod tests {
             let result = test_helpers::upload_part(
                 coord,
                 &UploadPartRequest {
-                    bucket,
-                    key,
-                    upload_id: &create.upload_id,
+                    upload: multipart_object_request(
+                        bucket,
+                        key,
+                        &create.upload_id,
+                        test_requester(),
+                    ),
                     part_number,
                     data,
                     claimed_checksum: None,
-                    requester: test_requester(),
                     sse_customer: None,
-                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -26391,16 +27003,17 @@ mod tests {
 
         let result = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26446,16 +27059,17 @@ mod tests {
         let (upload_id, parts) = create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part")]);
         let result = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26467,15 +27081,14 @@ mod tests {
         };
 
         coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                false,
+                NO_DELETE,
+            ))
             .unwrap();
 
         for part in parts_to_reclaim {
@@ -26515,16 +27128,17 @@ mod tests {
 
         let err = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
@@ -26546,16 +27160,17 @@ mod tests {
 
         let err = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 1 }));
@@ -26576,16 +27191,17 @@ mod tests {
         let reversed = vec![parts[1].clone(), parts[0].clone()];
         let err = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &reversed,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPartOrder));
@@ -26609,16 +27225,17 @@ mod tests {
 
         let err = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(
@@ -26640,16 +27257,17 @@ mod tests {
 
         let result = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.etag.ends_with("-1\""));
@@ -26666,14 +27284,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -26682,22 +27298,22 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let err = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &[],
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
@@ -26718,16 +27334,17 @@ mod tests {
         // First attempt fails because part 1 is too small.
         let err = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::EntityTooSmall { .. }));
@@ -26737,16 +27354,18 @@ mod tests {
         let new_part1 = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: &big_data,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -26761,16 +27380,17 @@ mod tests {
         ];
         let result = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &retry_parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.etag.ends_with("-2\""));
@@ -26791,16 +27411,17 @@ mod tests {
         let duped = vec![parts[0].clone(), parts[0].clone()];
         let err = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &duped,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPartOrder));
@@ -26819,16 +27440,17 @@ mod tests {
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"first-upload")]);
         let result1 = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id1,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id1,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts1,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result1.etag.ends_with("-1\""));
@@ -26843,16 +27465,17 @@ mod tests {
         );
         let result2 = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id2,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id2,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts2,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result2.etag.ends_with("-2\""));
@@ -26884,29 +27507,28 @@ mod tests {
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
         let result = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         // list_objects_v2 should return the composite ETag with -N suffix.
         let list = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 100,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(list.objects.len(), 1);
@@ -26938,28 +27560,27 @@ mod tests {
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
         let result = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let versions = coord
             .list_object_versions(&ListObjectVersionsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 key_marker: None,
                 version_id_marker: None,
                 max_keys: 100,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(versions.versions.len(), 1);
@@ -26985,30 +27606,31 @@ mod tests {
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"part1"), (2, b"part2")]);
 
         coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
-
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ))
             .unwrap();
 
         // Upload should no longer exist.
         let err = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"nope",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -27020,13 +27642,11 @@ mod tests {
         // ListMultipartUploads should be empty.
         let uploads = coord
             .list_multipart_uploads(&ListMultipartUploadsRequest {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
                 max_uploads: 100,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(uploads.uploads.is_empty());
@@ -27041,14 +27661,13 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: "no-such-upload",
-
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                "no-such-upload",
+                test_requester(),
+                None,
+            ))
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -27067,14 +27686,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -27083,32 +27700,29 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         // First abort succeeds.
         coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
-
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &create.upload_id,
+                test_requester(),
+                None,
+            ))
             .unwrap();
 
         // Second abort: upload is already deleted, returns UploadNotFound.
         let err = coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
-
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &create.upload_id,
+                test_requester(),
+                None,
+            ))
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -27130,14 +27744,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -27146,19 +27758,17 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let err = coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest {
-                bucket: "other",
-                key: "key",
-                upload_id: &create.upload_id,
-
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "other",
+                "key",
+                &create.upload_id,
+                test_requester(),
+                None,
+            ))
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -27179,29 +27789,29 @@ mod tests {
             create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
         coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         // Abort the same upload_id should fail (already deleted by complete).
         let err = coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
-
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ))
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -27211,13 +27821,11 @@ mod tests {
         // Object should still exist (visible in listing).
         let list = coord
             .list_objects_v2(&ListObjectsV2Request {
-                bucket: "bucket",
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 delimiter: None,
                 continuation_token: None,
                 max_keys: 100,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(list.objects.len(), 1);
@@ -27235,14 +27843,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -27251,50 +27857,52 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"data",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
-
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &create.upload_id,
+                test_requester(),
+                None,
+            ))
             .unwrap();
 
         let err = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 2,
                 data: b"more",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -27323,13 +27931,15 @@ mod tests {
 
         let result = coord
             .list_parts(&ListPartsRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number_marker: None,
                 max_parts: 100,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.parts.len(), 3);
@@ -27359,13 +27969,15 @@ mod tests {
         // Page 1: max_parts=2
         let page1 = coord
             .list_parts(&ListPartsRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number_marker: None,
                 max_parts: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page1.parts.len(), 2);
@@ -27377,13 +27989,15 @@ mod tests {
         // Page 2: continue from marker
         let page2 = coord
             .list_parts(&ListPartsRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number_marker: page1.next_part_number_marker,
                 max_parts: 2,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page2.parts.len(), 2);
@@ -27405,13 +28019,15 @@ mod tests {
 
         let result = coord
             .list_parts(&ListPartsRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number_marker: None,
                 max_parts: 100,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.parts.len(), 1);
@@ -27433,14 +28049,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -27449,19 +28063,20 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let err = coord
             .list_parts(&ListPartsRequest {
-                bucket: "other",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "other",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number_marker: None,
                 max_parts: 100,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -27480,13 +28095,15 @@ mod tests {
 
         let err = coord
             .list_parts(&ListPartsRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: "no-such-upload",
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    "no-such-upload",
+                    test_requester(),
+                    None,
+                ),
                 part_number_marker: None,
                 max_parts: 100,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -27506,14 +28123,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -27522,7 +28137,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -27530,45 +28144,51 @@ mod tests {
         test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"original",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
         let reupload = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"replaced",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let result = coord
             .list_parts(&ListPartsRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number_marker: None,
                 max_parts: 100,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.parts.len(), 1);
@@ -27587,14 +28207,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -27603,22 +28221,23 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 data: b"data",
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -27632,13 +28251,15 @@ mod tests {
 
         let err = coord
             .list_parts(&ListPartsRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number_marker: None,
                 max_parts: 100,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -27658,14 +28279,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -27674,7 +28293,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -27686,14 +28304,13 @@ mod tests {
         drop(pg);
 
         let err = coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &create.upload_id,
-
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &create.upload_id,
+                test_requester(),
+                None,
+            ))
             .unwrap_err();
         assert!(
             matches!(err, ServerError::NoSuchUpload { .. }),
@@ -27721,14 +28338,11 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket,
-                key,
+                object: object_request(bucket, key, test_requester()),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -27737,7 +28351,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -27745,16 +28358,16 @@ mod tests {
             let result = test_helpers::upload_part(
                 coord,
                 &UploadPartRequest {
-                    bucket,
-                    key,
-                    upload_id: &create.upload_id,
+                    upload: multipart_object_request(
+                        bucket,
+                        key,
+                        &create.upload_id,
+                        test_requester(),
+                    ),
                     part_number: *part_number,
                     data,
                     claimed_checksum: None,
-
-                    requester: test_requester(),
                     sse_customer: None,
-                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -27766,16 +28379,10 @@ mod tests {
         }
         coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket,
-                key,
-                upload_id: &create.upload_id,
+                upload: multipart_object_request(bucket, key, &create.upload_id, test_requester()),
                 parts: &complete_parts,
                 claimed_checksum: None,
-
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap()
     }
@@ -27788,14 +28395,11 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket,
-                key,
+                object: object_request(bucket, key, test_requester()),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -27804,7 +28408,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -27812,16 +28415,11 @@ mod tests {
         let part1_result = test_helpers::upload_part(
             coord,
             &UploadPartRequest {
-                bucket,
-                key,
-                upload_id: &create.upload_id,
+                upload: multipart_object_request(bucket, key, &create.upload_id, test_requester()),
                 part_number: 1,
                 data: &part1,
                 claimed_checksum: None,
-
-                requester: test_requester(),
                 sse_customer: None,
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -27834,10 +28432,8 @@ mod tests {
         let part2_crc = checksum::crc64::checksum(&part2);
         let part2_result = coord
             .finalize_stream_part(FinalizeStreamPartRequest {
-                bucket,
-                key,
+                upload: multipart_object_request(bucket, key, &create.upload_id, test_requester()),
                 session_id: &session.session_id,
-                upload_id: &create.upload_id,
                 part_number: 2,
                 crc64: part2_crc,
                 total_size: part2.len() as u64,
@@ -27848,9 +28444,7 @@ mod tests {
 
         let complete = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket,
-                key,
-                upload_id: &create.upload_id,
+                upload: multipart_object_request(bucket, key, &create.upload_id, test_requester()),
                 parts: &[
                     CompletePart {
                         part_number: 1,
@@ -27865,10 +28459,6 @@ mod tests {
                 ],
                 sse_customer: None,
                 claimed_checksum: None,
-
-                requester: test_requester(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -27894,12 +28484,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), expected);
@@ -27921,12 +28513,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"only-part");
@@ -27950,12 +28544,14 @@ mod tests {
         let head = coord
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, total_size as u64);
@@ -27980,13 +28576,15 @@ mod tests {
         let range = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::Range { start: 10, end: 19 },
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(range.body.read_all().unwrap(), vec![0xAA; 10]);
@@ -28018,16 +28616,18 @@ mod tests {
         let range = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::Range {
                     start: boundary - 4,
                     end: boundary + 3,
                 },
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         let mut expected = vec![0xAA; 4];
@@ -28052,13 +28652,15 @@ mod tests {
         let range = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::Suffix { length: 50 },
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(range.body.read_all().unwrap(), vec![0xBB; 50]);
@@ -28084,26 +28686,21 @@ mod tests {
         // Copy multipart source to destination (creates inline object).
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "src-bucket",
-                    key: "src-key",
-                    version_id: None,
-                    condition: &ReadCondition::default(),
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "dst-bucket",
-                dst_key: "dst-key",
+                source: copy_source("src-bucket", "src-key", None),
+                destination: object_request_with_expected_owner(
+                    "dst-bucket",
+                    "dst-key",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: &WriteCondition::default(),
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -28111,12 +28708,14 @@ mod tests {
         let dst = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "dst-bucket",
-                key: "dst-key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "dst-bucket",
+                    "dst-key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(dst.body.read_all().unwrap(), expected);
@@ -28135,12 +28734,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(obj.body.read_all().unwrap().is_empty());
@@ -28163,12 +28764,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), expected);
@@ -28188,13 +28791,15 @@ mod tests {
         let result = coord
             .get_object_part(&GetObjectPartRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.body.read_all().unwrap().is_empty());
@@ -28220,13 +28825,15 @@ mod tests {
         let result = coord
             .get_object_part(&GetObjectPartRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), part1);
@@ -28238,13 +28845,15 @@ mod tests {
         let result = coord
             .get_object_part(&GetObjectPartRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 2,
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.body.read_all().unwrap().is_empty());
@@ -28268,16 +28877,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"hello world",
                 metadata: &MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -28286,13 +28893,15 @@ mod tests {
         let result = coord
             .head_object_part(&GetObjectPartRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.part_size, 11);
@@ -28304,13 +28913,15 @@ mod tests {
         let err = coord
             .head_object_part(&GetObjectPartRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 2,
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
@@ -28330,16 +28941,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -28347,13 +28956,15 @@ mod tests {
         let result = coord
             .head_object_part(&GetObjectPartRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.part_size, 0);
@@ -28374,12 +28985,14 @@ mod tests {
         let head = coord
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, 0);
@@ -28408,30 +29021,34 @@ mod tests {
 
                     expected_bucket_owner: None,
                 },
-                dst_bucket: "dst",
-                dst_key: "key",
+                destination: object_request_with_expected_owner(
+                    "dst",
+                    "key",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: &WriteCondition::default(),
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let dst = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "dst",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "dst",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(dst.body.read_all().unwrap().is_empty());
@@ -28468,12 +29085,14 @@ mod tests {
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap()
             .body
@@ -28503,13 +29122,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let create = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket,
-                key,
+                object: object_request(bucket, key, test_requester()),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: Some(MultipartChecksumConfig::new(algo, ctype).unwrap()),
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -28518,7 +29136,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -28529,15 +29146,16 @@ mod tests {
             let result = test_helpers::upload_part(
                 coord,
                 &UploadPartRequest {
-                    bucket,
-                    key,
-                    upload_id: &create.upload_id,
+                    upload: multipart_object_request(
+                        bucket,
+                        key,
+                        &create.upload_id,
+                        test_requester(),
+                    ),
                     part_number,
                     data,
                     claimed_checksum: Some(&claim),
-                    requester: test_requester(),
                     sse_customer: None,
-                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -28573,16 +29191,17 @@ mod tests {
 
         let result = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -28626,16 +29245,17 @@ mod tests {
 
         let result = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -28673,16 +29293,17 @@ mod tests {
 
         let result = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -28719,16 +29340,17 @@ mod tests {
 
         let result = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -28769,16 +29391,17 @@ mod tests {
 
         let result = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -28823,16 +29446,17 @@ mod tests {
 
         let err = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -28856,16 +29480,17 @@ mod tests {
 
         let result = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -28904,16 +29529,17 @@ mod tests {
 
         let err = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &parts,
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -28954,8 +29580,7 @@ mod tests {
         let metadata = MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap();
         let result = coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "mykey",
+                object: object_request("bucket", "mykey", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: full_data.len() as u64,
@@ -28964,7 +29589,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -28978,12 +29602,14 @@ mod tests {
         let head = coord
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "mykey",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "mykey",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, full_data.len() as u64);
@@ -29014,16 +29640,14 @@ mod tests {
                 sse_customer: Some(&sse_customer),
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "obj",
+                object: object_request_with_expected_owner("bucket", "obj", test_requester(), None),
                 data: b"checksum-body",
                 metadata: &metadata,
                 system_metadata: &system_metadata,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -29051,12 +29675,14 @@ mod tests {
         let head = coord
             .head_object(&GetObjectRequest {
                 sse_customer: Some(&sse_customer),
-                bucket: "bucket",
-                key: "obj",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         let checksum = head.system_metadata.checksum().unwrap();
@@ -29071,12 +29697,14 @@ mod tests {
         let err = coord
             .head_object(&GetObjectRequest {
                 sse_customer: Some(&wrong),
-                bucket: "bucket",
-                key: "obj",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -29093,13 +29721,12 @@ mod tests {
         let sse_customer = test_sse_customer_request();
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: Some(&sse_customer),
                 object_lock: ObjectLockState::default(),
@@ -29108,7 +29735,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -29116,15 +29742,18 @@ mod tests {
             test_helpers::upload_part(
                 &coord,
                 &UploadPartRequest {
-                    bucket: "bucket",
-                    key: "key",
-                    upload_id: &upload.upload_id,
+                    upload: multipart_object_request_with_expected_owner(
+                        "bucket",
+                        "key",
+                        &upload.upload_id,
+                        test_requester(),
+                        None,
+                    ),
                     part_number,
                     data: b"identical-multipart-segment",
                     claimed_checksum: None,
-                    requester: test_requester(),
+
                     sse_customer: Some(&sse_customer),
-                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -29168,8 +29797,7 @@ mod tests {
         let metadata = MetadataBlob::new();
         let result = coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "mykey",
+                object: object_request("bucket", "mykey", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 0,
@@ -29178,7 +29806,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -29190,12 +29817,14 @@ mod tests {
         let head = coord
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "mykey",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "mykey",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, 0);
@@ -29218,8 +29847,7 @@ mod tests {
             "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
         let result = coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "mykey",
+                object: object_request("bucket", "mykey", test_requester()),
                 session_id: &session_id,
                 crc64: checksum::crc64::checksum(b"hello"),
                 total_size: 5,
@@ -29228,7 +29856,6 @@ mod tests {
                 sse_customer: None,
                 tags: Some(tags_xml),
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -29239,12 +29866,14 @@ mod tests {
         let obj = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "mykey",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "mykey",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.tags.as_deref(), Some(tags_xml));
@@ -29272,12 +29901,14 @@ mod tests {
         let err = coord
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "mykey",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "mykey",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -29296,8 +29927,7 @@ mod tests {
         let metadata = MetadataBlob::new();
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "mykey",
+                object: object_request("bucket", "mykey", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 0,
@@ -29306,7 +29936,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -29343,8 +29972,7 @@ mod tests {
         let metadata = MetadataBlob::new();
         let err = coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "mykey",
+                object: object_request("bucket", "mykey", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 0,
@@ -29353,7 +29981,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -29408,8 +30035,7 @@ mod tests {
         let metadata = MetadataBlob::new();
         let err = coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key2",
+                object: object_request("bucket", "key2", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 0,
@@ -29418,7 +30044,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -29458,16 +30083,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"old-data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -29483,8 +30106,7 @@ mod tests {
         let metadata = MetadataBlob::new();
         let result = coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: new_data.len() as u64,
@@ -29493,7 +30115,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -29505,12 +30126,14 @@ mod tests {
         let head = coord
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, new_data.len() as u64);
@@ -29531,16 +30154,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"initial",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -29555,8 +30176,7 @@ mod tests {
         let cond = WriteCondition::IfMatch(SpecificEtag::new(initial.etag.clone()).unwrap());
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 7,
@@ -29565,7 +30185,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &cond,
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -29581,8 +30200,7 @@ mod tests {
             WriteCondition::IfMatch(SpecificEtag::new("\"0000000000000000\"".to_string()).unwrap());
         let err = coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id2,
                 crc64: checksum::crc64::checksum(b"third"),
                 total_size: 5,
@@ -29591,7 +30209,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &bad_cond,
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -29629,8 +30246,7 @@ mod tests {
         let metadata = MetadataBlob::new();
         let result = coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: full_data.len() as u64,
@@ -29639,7 +30255,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -29710,8 +30325,7 @@ mod tests {
         let metadata = MetadataBlob::new();
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 5,
@@ -29720,7 +30334,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -29731,12 +30344,14 @@ mod tests {
         let head = coord
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, 5);
@@ -29745,12 +30360,14 @@ mod tests {
         let result = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"hello");
@@ -29781,8 +30398,7 @@ mod tests {
         let crc = checksum::crc64::checksum(full_data);
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 10,
@@ -29791,7 +30407,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -29801,12 +30416,14 @@ mod tests {
         let result = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), full_data);
@@ -29861,8 +30478,7 @@ mod tests {
             .unwrap();
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: checksum::crc64::checksum(&data),
                 total_size: data.len() as u64,
@@ -29871,7 +30487,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -29883,12 +30498,14 @@ mod tests {
         let first = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(first.body.read_all().unwrap(), data);
@@ -29897,12 +30514,14 @@ mod tests {
         let second = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(second.body.read_all().unwrap(), data);
@@ -29930,8 +30549,7 @@ mod tests {
         let crc = checksum::crc64::checksum(full_data);
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 8,
@@ -29940,7 +30558,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -29951,13 +30568,15 @@ mod tests {
         let r1 = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::Range { start: 0, end: 3 },
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(r1.body.read_all().unwrap(), b"AAAA");
@@ -29966,13 +30585,15 @@ mod tests {
         let r2 = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::Range { start: 2, end: 5 },
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(r2.body.read_all().unwrap(), b"AABB");
@@ -29981,13 +30602,15 @@ mod tests {
         let r3 = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::Range { start: 4, end: 7 },
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(r3.body.read_all().unwrap(), b"BBBB");
@@ -29996,13 +30619,15 @@ mod tests {
         let r4 = coord
             .get_object_range(&GetObjectRangeRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 range: ByteRange::Suffix { length: 3 },
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(r4.body.read_all().unwrap(), b"BBB");
@@ -30024,8 +30649,7 @@ mod tests {
         let crc = checksum::crc64::checksum(b"copy-me");
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "src",
+                object: object_request("bucket", "src", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 7,
@@ -30034,7 +30658,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -30044,26 +30667,21 @@ mod tests {
         // Copy to destination.
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "bucket",
-                dst_key: "dst",
+                source: copy_source("bucket", "src", None),
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
                 dst_condition: &WriteCondition::default(),
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -30082,12 +30700,14 @@ mod tests {
         let result = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "dst",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"copy-me");
@@ -30107,16 +30727,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"tiny-data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -30133,12 +30751,14 @@ mod tests {
         let get = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(get.body.read_all().unwrap(), b"tiny-data");
@@ -30159,16 +30779,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "exact",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "exact",
+                    test_requester(),
+                    None,
+                ),
                 data: &data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -30198,16 +30821,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: &data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -30230,12 +30851,14 @@ mod tests {
         let get = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(get.body.read_all().unwrap(), data);
@@ -30256,16 +30879,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: &old_data,
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -30284,16 +30905,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"new-data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -30325,8 +30944,7 @@ mod tests {
         let crc = checksum::crc64::checksum(b"");
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "empty",
+                object: object_request("bucket", "empty", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 0,
@@ -30335,7 +30953,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -30345,12 +30962,14 @@ mod tests {
         let result = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "empty",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "empty",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"");
@@ -30373,8 +30992,7 @@ mod tests {
         let crc = checksum::crc64::checksum(b"partdata");
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 8,
@@ -30383,7 +31001,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -30393,13 +31010,15 @@ mod tests {
         let result = coord
             .get_object_part(&GetObjectPartRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"partdata");
@@ -30423,8 +31042,7 @@ mod tests {
         let crc = checksum::crc64::checksum(b"stream-data");
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 11,
@@ -30433,7 +31051,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -30444,12 +31061,14 @@ mod tests {
         let r1 = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(r1.body.read_all().unwrap(), b"stream-data");
@@ -30461,16 +31080,14 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 data: b"normal-data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -30479,12 +31096,14 @@ mod tests {
         let r2 = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(r2.body.read_all().unwrap(), b"normal-data");
@@ -30506,8 +31125,7 @@ mod tests {
         let crc = checksum::crc64::checksum(b"delete-me");
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 9,
@@ -30516,7 +31134,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -30526,13 +31143,15 @@ mod tests {
         // Delete the object.
         coord
             .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 bypass_governance: false,
                 cond: &crate::conditional::DeleteCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -30540,12 +31159,14 @@ mod tests {
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -30566,8 +31187,7 @@ mod tests {
         let crc = checksum::crc64::checksum(b"delete-me");
         let result = coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 9,
@@ -30576,7 +31196,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -30591,15 +31210,14 @@ mod tests {
         };
 
         coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
-                bypass_governance: false,
-                cond: NO_DELETE,
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                false,
+                NO_DELETE,
+            ))
             .unwrap();
 
         for segment in segments {
@@ -30633,8 +31251,7 @@ mod tests {
         let crc = checksum::crc64::checksum(b"source-data");
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "src",
+                object: object_request("bucket", "src", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 11,
@@ -30643,7 +31260,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -30653,14 +31269,12 @@ mod tests {
         // Create a multipart upload for the destination.
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "dst",
+                object: object_request_with_expected_owner("bucket", "dst", test_requester(), None),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -30669,31 +31283,25 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         // UploadPartCopy from the stream-written source.
         let result = coord
             .upload_part_copy(&UploadPartCopyRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "bucket",
-                dst_key: "dst",
-                upload_id: &upload.upload_id,
+                source: copy_source("bucket", "src", None),
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    &upload.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 copy_source_range: None,
-                requester: test_requester(),
+
                 source_sse_customer: None,
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -30723,8 +31331,7 @@ mod tests {
         }
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "src",
+                object: object_request("bucket", "src", test_requester()),
                 session_id: &session_id,
                 crc64: crc64.finalize(),
                 total_size: data.len() as u64,
@@ -30733,7 +31340,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -30742,15 +31348,14 @@ mod tests {
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "dst",
+                object: object_request_with_expected_owner("bucket", "dst", test_requester(), None),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: Some(
                     MultipartChecksumConfig::new(ChecksumAlgorithm::Crc32c, None).unwrap(),
                 ),
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -30759,42 +31364,38 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let part = coord
             .upload_part_copy(&UploadPartCopyRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "bucket",
-                dst_key: "dst",
-                upload_id: &upload.upload_id,
+                source: copy_source("bucket", "src", None),
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    &upload.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 copy_source_range: None,
-                requester: test_requester(),
+
                 source_sse_customer: None,
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let parts = coord
             .list_parts(&ListPartsRequest {
-                bucket: "bucket",
-                key: "dst",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    &upload.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 part_number_marker: None,
                 max_parts: 1000,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(parts.checksum_algorithm, Some(ChecksumAlgorithm::Crc32c));
@@ -30808,9 +31409,13 @@ mod tests {
 
         coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "dst",
-                upload_id: &upload.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    &upload.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &[CompletePart {
                     part_number: 1,
                     etag: part.etag,
@@ -30824,21 +31429,20 @@ mod tests {
                 }],
                 sse_customer: None,
                 claimed_checksum: None,
-                requester: test_requester(),
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let copied = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "dst",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(copied.body.read_all().unwrap(), data);
@@ -30858,29 +31462,26 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "src",
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
                 data: b"source-data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
 
         let upload = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "dst",
+                object: object_request_with_expected_owner("bucket", "dst", test_requester(), None),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -30889,30 +31490,24 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let err = coord
             .upload_part_copy(&UploadPartCopyRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
-                dst_bucket: "bucket",
-                dst_key: "dst",
-                upload_id: &upload.upload_id,
+                source: copy_source("bucket", "src", None),
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    &upload.upload_id,
+                    Requester::principal("other-user"),
+                    None,
+                ),
                 part_number: 1,
                 copy_source_range: None,
-                requester: Requester::principal("other-user"),
+
                 source_sse_customer: None,
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -30945,8 +31540,7 @@ mod tests {
         let metadata = MetadataBlob::new();
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 5,
@@ -30955,7 +31549,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -30981,8 +31574,7 @@ mod tests {
         let metadata = MetadataBlob::new();
         let err = coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 999, // wrong — actual is 5
@@ -30991,7 +31583,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -31067,14 +31658,12 @@ mod tests {
         // Create a multipart upload first.
         let mpu = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -31083,7 +31672,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -31101,10 +31689,8 @@ mod tests {
         let crc = checksum::crc64::checksum(data);
         let result = coord
             .finalize_stream_part(FinalizeStreamPartRequest {
-                bucket: "bucket",
-                key: "key",
+                upload: multipart_object_request("bucket", "key", &mpu.upload_id, test_requester()),
                 session_id: &session_id,
-                upload_id: &mpu.upload_id,
                 part_number: 1,
                 crc64: crc,
                 total_size: data.len() as u64,
@@ -31137,14 +31723,12 @@ mod tests {
 
         let mpu = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -31153,7 +31737,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -31207,14 +31790,12 @@ mod tests {
 
         let mpu = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -31223,16 +31804,13 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
         let err = coord
             .finalize_stream_part(FinalizeStreamPartRequest {
-                bucket: "bucket",
-                key: "key",
+                upload: multipart_object_request("bucket", "key", &mpu.upload_id, test_requester()),
                 session_id: &session_id,
-                upload_id: &mpu.upload_id,
                 part_number: 1,
                 crc64: checksum::crc64::checksum(b"data"),
                 total_size: 4,
@@ -31259,14 +31837,12 @@ mod tests {
         // Create two MPUs for the same key.
         let mpu_a = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -31275,19 +31851,16 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
         let mpu_b = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -31296,7 +31869,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -31311,10 +31883,8 @@ mod tests {
             let crc = checksum::crc64::checksum(data);
             let result = coord
                 .finalize_stream_part(FinalizeStreamPartRequest {
-                    bucket: "bucket",
-                    key: "key",
+                    upload: multipart_object_request("bucket", "key", upload_id, test_requester()),
                     session_id: &sess,
-                    upload_id,
                     part_number: 1,
                     crc64: crc,
                     total_size: data.len() as u64,
@@ -31339,16 +31909,17 @@ mod tests {
         // Complete A first.
         let result_a = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &mpu_a.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &mpu_a.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &[part_a],
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -31356,13 +31927,15 @@ mod tests {
         let obj_a = coord
             .get_object_part(&GetObjectPartRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(
@@ -31374,16 +31947,17 @@ mod tests {
         // Complete B — overwrites A on unversioned bucket.
         let result_b = coord
             .complete_multipart_upload(&CompleteMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &mpu_b.upload_id,
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &mpu_b.upload_id,
+                    test_requester(),
+                    None,
+                ),
                 parts: &[part_b],
                 claimed_checksum: None,
 
-                requester: test_requester(),
                 sse_customer: None,
-
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -31391,13 +31965,15 @@ mod tests {
         let obj_b = coord
             .get_object_part(&GetObjectPartRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 part_number: 1,
                 cond: &ReadCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(
@@ -31424,14 +32000,12 @@ mod tests {
         let metadata = MetadataBlob::new();
         let mpu = coord
             .create_multipart_upload(&CreateMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
                 metadata: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 checksum: None,
 
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
@@ -31440,7 +32014,6 @@ mod tests {
                 grant_read_acp: None,
                 grant_write_acp: None,
                 grant_full_control: None,
-                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -31455,10 +32028,8 @@ mod tests {
         let crc = checksum::crc64::checksum(data);
         coord
             .finalize_stream_part(FinalizeStreamPartRequest {
-                bucket: "bucket",
-                key: "key",
+                upload: multipart_object_request("bucket", "key", &mpu.upload_id, test_requester()),
                 session_id: &sess,
-                upload_id: &mpu.upload_id,
                 part_number: 1,
                 crc64: crc,
                 total_size: data.len() as u64,
@@ -31494,14 +32065,13 @@ mod tests {
 
         // Abort the MPU.
         coord
-            .abort_multipart_upload(&AbortMultipartUploadRequest {
-                bucket: "bucket",
-                key: "key",
-                upload_id: &mpu.upload_id,
-
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &mpu.upload_id,
+                test_requester(),
+                None,
+            ))
             .unwrap();
 
         // Verify object segments rows are gone.
@@ -31585,8 +32155,7 @@ mod tests {
         let crc = checksum::crc64::checksum(b"safe-data");
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 9,
@@ -31595,7 +32164,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -31610,12 +32178,14 @@ mod tests {
         let result = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"safe-data");
@@ -31639,12 +32209,14 @@ mod tests {
         let err = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "new-key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "new-key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -31653,12 +32225,14 @@ mod tests {
         let err = coord
             .head_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "new-key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "new-key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -31685,8 +32259,7 @@ mod tests {
         let crc = checksum::crc64::checksum(full);
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "verify",
+                object: object_request("bucket", "verify", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 16,
@@ -31695,7 +32268,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -31730,12 +32302,14 @@ mod tests {
         let result = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "verify",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "verify",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         let data = result.body.read_all().unwrap();
@@ -31759,16 +32333,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "bad-segment-crc",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "bad-segment-crc",
+                    test_requester(),
+                    None,
+                ),
                 data: b"segment-data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -31814,12 +32391,14 @@ mod tests {
         let result = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "bad-segment-crc",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "bad-segment-crc",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         let err = result.body.read_all().unwrap_err();
@@ -31846,8 +32425,7 @@ mod tests {
         let crc = checksum::crc64::checksum(b"v1");
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "cycle",
+                object: object_request("bucket", "cycle", test_requester()),
                 session_id: &session_id,
                 crc64: crc,
                 total_size: 2,
@@ -31856,7 +32434,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -31865,15 +32442,14 @@ mod tests {
 
         // 2. Delete.
         coord
-            .delete_object(&DeleteObjectRequest {
-                bucket: "bucket",
-                key: "cycle",
-                version_id: None,
-                bypass_governance: false,
-                cond: &crate::conditional::DeleteCondition::default(),
-                requester: test_requester(),
-                expected_bucket_owner: None,
-            })
+            .delete_object(&delete_object_request(
+                "bucket",
+                "cycle",
+                None,
+                test_requester(),
+                false,
+                &crate::conditional::DeleteCondition::default(),
+            ))
             .unwrap();
 
         // 3. Normal put.
@@ -31883,16 +32459,19 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                bucket: "bucket",
-                key: "cycle",
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "cycle",
+                    test_requester(),
+                    None,
+                ),
                 data: b"v2-normal",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
+
                 acl: NO_PUT_OBJECT_ACL.into(),
-                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -31901,12 +32480,14 @@ mod tests {
         let result = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "cycle",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "cycle",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"v2-normal");
@@ -31928,8 +32509,7 @@ mod tests {
             .unwrap();
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &s1,
                 crc64: checksum::crc64::checksum(b"old-data"),
                 total_size: 8,
@@ -31938,7 +32518,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -31952,8 +32531,7 @@ mod tests {
             .unwrap();
         coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
-                bucket: "bucket",
-                key: "key",
+                object: object_request("bucket", "key", test_requester()),
                 session_id: &s2,
                 crc64: checksum::crc64::checksum(b"new-data"),
                 total_size: 8,
@@ -31962,7 +32540,6 @@ mod tests {
                 sse_customer: None,
                 tags: None,
                 cond: &WriteCondition::default(),
-                requester: test_requester(),
                 acl: NO_PUT_OBJECT_ACL.into(),
                 policy_context: PutObjectPolicyContext::default(),
                 requested_object_lock: ObjectLockState::default(),
@@ -31972,12 +32549,14 @@ mod tests {
         let result = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                bucket: "bucket",
-                key: "key",
-                version_id: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
                 cond: NO_READ,
-                requester: test_requester(),
-                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"new-data");
