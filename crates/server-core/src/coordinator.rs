@@ -5187,7 +5187,7 @@ impl Coordinator {
             req.name,
             req.expected_bucket_owner(),
         )?;
-        self.get_bucket_cors_unchecked(req.name)
+        self.load_bucket_cors_config(req.name)
     }
 
     pub fn delete_bucket_cors(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
@@ -5682,10 +5682,16 @@ impl Coordinator {
         Ok(())
     }
 
-    pub fn get_bucket_cors_unchecked(&self, name: &str) -> Result<Option<String>, ServerError> {
+    /// Loads the raw bucket CORS configuration for HTTP CORS evaluation.
+    ///
+    /// This intentionally bypasses normal bucket-config authorization because
+    /// CORS preflight handling and actual-response header decoration need the
+    /// stored CORS rules without turning those paths into authenticated bucket
+    /// config reads.
+    pub fn load_bucket_cors_config(&self, name: &str) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
-            "Coordinator::get_bucket_cors_unchecked",
+            "Coordinator::load_bucket_cors_config",
             "bucket={}",
             name
         );

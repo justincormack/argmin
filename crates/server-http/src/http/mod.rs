@@ -540,7 +540,7 @@ impl HttpFrontend {
             .unwrap_or_default();
 
         // Load CORS config
-        let cors_config_xml = match self.coordinator.get_bucket_cors_unchecked(bucket) {
+        let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket) {
             Ok(Some(xml)) => xml,
             _ => return S3Response::forbidden(),
         };
@@ -570,7 +570,7 @@ impl HttpFrontend {
     /// Apply CORS headers to an actual (non-preflight) response if the request
     /// has an Origin header and a matching CORS rule exists.
     fn apply_cors_headers(&self, resp: &mut S3Response, bucket: &str, origin: &str, method: &str) {
-        let cors_config_xml = match self.coordinator.get_bucket_cors_unchecked(bucket) {
+        let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket) {
             Ok(Some(xml)) => xml,
             _ => return,
         };
