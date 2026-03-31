@@ -737,7 +737,7 @@ impl HttpFrontend {
             S3Operation::DeleteBucket { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
-                    .delete_bucket(&crate::coordinator::DeleteBucketRequest {
+                    .delete_bucket(&crate::coordinator::BucketRequest {
                         name: &bucket,
                         requester,
                         expected_bucket_owner,
@@ -746,13 +746,13 @@ impl HttpFrontend {
             }
             S3Operation::HeadBucket { bucket } => {
                 let requester = Self::requester_from_auth(auth);
-                let info =
-                    self.coordinator
-                        .head_bucket(&crate::coordinator::HeadBucketRequest {
-                            bucket: &bucket,
-                            requester,
-                            expected_bucket_owner,
-                        })?;
+                let info = self
+                    .coordinator
+                    .head_bucket(&crate::coordinator::BucketRequest {
+                        name: &bucket,
+                        requester,
+                        expected_bucket_owner,
+                    })?;
                 Ok(S3Response::head_bucket(&info))
             }
             S3Operation::ListObjectsV1 { bucket } => {
@@ -4621,8 +4621,8 @@ mod tests {
 
         let bucket = fe
             .coordinator
-            .head_bucket(&crate::coordinator::HeadBucketRequest {
-                bucket: "mybucket",
+            .head_bucket(&crate::coordinator::BucketRequest {
+                name: "mybucket",
                 requester: crate::coordinator::Requester::authenticated(account.clone()),
                 expected_bucket_owner: None,
             })

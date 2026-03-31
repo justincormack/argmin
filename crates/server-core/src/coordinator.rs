@@ -1588,14 +1588,6 @@ pub struct GetObjectRequest<'a> {
     pub expected_bucket_owner: Option<&'a str>,
 }
 
-/// Request for a HeadBucket operation.
-#[derive(Debug)]
-pub struct HeadBucketRequest<'a> {
-    pub bucket: &'a str,
-    pub requester: Requester,
-    pub expected_bucket_owner: Option<&'a str>,
-}
-
 /// Request for a GetObjectPart or HeadObjectPart operation.
 #[derive(Debug)]
 pub struct GetObjectPartRequest<'a> {
@@ -1697,14 +1689,6 @@ pub struct DeleteObjectsRequest<'a> {
     pub bucket: &'a str,
     pub entries: &'a [DeleteEntry<'a>],
     pub bypass_governance: bool,
-    pub requester: Requester,
-    pub expected_bucket_owner: Option<&'a str>,
-}
-
-/// Request for a DeleteBucket operation.
-#[derive(Debug)]
-pub struct DeleteBucketRequest<'a> {
-    pub name: &'a str,
     pub requester: Requester,
     pub expected_bucket_owner: Option<&'a str>,
 }
@@ -1836,7 +1820,6 @@ impl_expected_bucket_owner_accessor!(
     BucketRequest,
     ObjectVersionRequest,
     GetObjectRequest,
-    HeadBucketRequest,
     GetObjectPartRequest,
     GetObjectRangeRequest,
     DeleteObjectRequest,
@@ -1845,7 +1828,6 @@ impl_expected_bucket_owner_accessor!(
     ListPartsRequest,
     ListMultipartUploadsRequest,
     DeleteObjectsRequest,
-    DeleteBucketRequest,
     AbortMultipartUploadRequest,
     CreateMultipartUploadRequest,
     GetObjectAttributesRequest,
@@ -4970,7 +4952,7 @@ impl Coordinator {
         }
     }
 
-    pub fn delete_bucket(&self, req: &DeleteBucketRequest<'_>) -> Result<(), ServerError> {
+    pub fn delete_bucket(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket",
@@ -5044,18 +5026,14 @@ impl Coordinator {
         result
     }
 
-    pub fn head_bucket(&self, req: &HeadBucketRequest<'_>) -> Result<BucketSummary, ServerError> {
+    pub fn head_bucket(&self, req: &BucketRequest<'_>) -> Result<BucketSummary, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::head_bucket",
             "bucket={}",
-            req.bucket
+            req.name
         );
-        self.authorize_bucket_read_requester(
-            &req.requester,
-            req.bucket,
-            req.expected_bucket_owner(),
-        )
+        self.authorize_bucket_read_requester(&req.requester, req.name, req.expected_bucket_owner())
     }
 
     pub fn list_buckets(
@@ -11524,11 +11502,11 @@ mod tests {
     }
 
     fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), ServerError> {
-        coord.delete_bucket(&DeleteBucketRequest {
+        coord.delete_bucket(&bucket_request_with_expected_owner(
             name,
-            requester: TEST_REQUESTER,
-            expected_bucket_owner: None,
-        })
+            TEST_REQUESTER,
+            None,
+        ))
     }
 
     fn bucket_request_with_expected_owner<'a>(
@@ -19062,8 +19040,8 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .head_bucket(&HeadBucketRequest {
-                bucket: "bucket",
+            .head_bucket(&BucketRequest {
+                name: "bucket",
                 requester: Requester::principal("other-user"),
                 expected_bucket_owner: None,
             })
@@ -19080,8 +19058,8 @@ mod tests {
             .unwrap();
 
         let info = coord
-            .head_bucket(&HeadBucketRequest {
-                bucket: "bucket",
+            .head_bucket(&BucketRequest {
+                name: "bucket",
                 requester: Requester::principal("111122223333"),
                 expected_bucket_owner: None,
             })
@@ -19099,8 +19077,8 @@ mod tests {
             .unwrap();
 
         let info = coord
-            .head_bucket(&HeadBucketRequest {
-                bucket: "bucket",
+            .head_bucket(&BucketRequest {
+                name: "bucket",
                 requester: Requester::principal("111122223333"),
                 expected_bucket_owner: None,
             })
@@ -19119,8 +19097,8 @@ mod tests {
             .unwrap();
 
         let info = coord
-            .head_bucket(&HeadBucketRequest {
-                bucket: "bucket",
+            .head_bucket(&BucketRequest {
+                name: "bucket",
                 requester: Requester::anonymous(),
                 expected_bucket_owner: None,
             })
@@ -19271,10 +19249,9 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .delete_bucket(&DeleteBucketRequest {
+            .delete_bucket(&BucketRequest {
                 name: "bucket",
                 requester: Requester::principal("other-user"),
-
                 expected_bucket_owner: None,
             })
             .unwrap_err();
