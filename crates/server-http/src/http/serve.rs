@@ -2686,6 +2686,31 @@ fn internal_error_response() -> S3Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream as StdTcpStream};
+    use std::sync::{atomic::AtomicUsize, Arc};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use auth::canonical::{
+        canonical_headers, canonical_query_string, canonical_request, sha256_hex, string_to_sign,
+    };
+    use auth::sigv4::derive_signing_key;
+    use hyper_util::rt::TokioIo;
+    use ring::hmac;
+    use storage::SharedStorageNode;
+
+    use crate::metadata_blob::MetadataBlob;
+
+    const TEST_ACCESS_KEY: &str = "AKID";
+    const TEST_SECRET_KEY: &str = "test-secret";
+
+    struct ServerGuard(tokio::task::JoinHandle<()>);
+
+    impl Drop for ServerGuard {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
 
     /// Build a minimal `http::request::Parts` for testing `is_streaming_write`.
     fn make_parts(method: &str, uri: &str, headers: &[(&str, &str)]) -> http::request::Parts {
@@ -2700,6 +2725,229 @@ mod tests {
     fn make_s3req(method: &str, uri: &str, headers: &[(&str, &str)]) -> S3Request {
         S3Request::from_hyper_headers(make_parts(method, uri, headers), TransportSecurity::Tls)
             .unwrap()
+    }
+
+    fn setup_frontend(dir: &std::path::Path) -> Arc<HttpFrontend> {
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
+        let ec_config = ec::EcConfig::new(4, 2).unwrap();
+        let coordinator = server_core::coordinator::Coordinator::new(
+            storage_node,
+            ec_config,
+            "us-east-1".to_string(),
+            None,
+        )
+        .unwrap();
+        let mut credentials = auth::CredentialStore::new();
+        credentials.add(
+            TEST_ACCESS_KEY.to_string(),
+            auth::SecretKey::new(TEST_SECRET_KEY.to_string()),
+        );
+        Arc::new(HttpFrontend {
+            coordinator,
+            credentials,
+        })
+    }
+
+    fn create_test_bucket_and_upload(frontend: &HttpFrontend, bucket: &str, key: &str) -> String {
+        let requester = server_core::coordinator::test_helpers::requester(TEST_ACCESS_KEY);
+        frontend
+            .coordinator
+            .create_bucket(&crate::coordinator::CreateBucketRequest {
+                name: bucket,
+                requester: requester.clone(),
+                acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
+                ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+        frontend
+            .coordinator
+            .create_multipart_upload(&crate::coordinator::CreateMultipartUploadRequest {
+                object: crate::coordinator::ObjectRequest::new(bucket, key, requester, None),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &server_core::system_metadata::SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                acl: crate::coordinator::PutObjectAcl::None.into(),
+                policy_context: crate::coordinator::PutObjectPolicyContext::default(),
+                object_lock: s3_types::ObjectLockState::default(),
+                sse_customer: None,
+            })
+            .unwrap()
+            .upload_id
+    }
+
+    async fn start_test_server(frontend: Arc<HttpFrontend>) -> (String, ServerGuard) {
+        let std_listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = std_listener.local_addr().unwrap().to_string();
+        std_listener.set_nonblocking(true).unwrap();
+        let listener = tokio::net::TcpListener::from_std(std_listener).unwrap();
+
+        let config = ServeConfig::default();
+        let header_read_timeout = config.header_read_timeout;
+        let state = Arc::new(ServerState {
+            pool: vec![frontend],
+            counter: AtomicUsize::new(0),
+            request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
+            segment_buffer_pool: SegmentBufferPool::new(8),
+            config,
+        });
+
+        let handle = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    serve_connection(
+                        state,
+                        TokioIo::new(stream),
+                        header_read_timeout,
+                        TransportSecurity::InsecureHttp,
+                    )
+                    .await;
+                });
+            }
+        });
+
+        (addr, ServerGuard(handle))
+    }
+
+    fn read_http_response(stream: &mut StdTcpStream, timeout: Duration) -> String {
+        let mut buf = Vec::with_capacity(8192);
+        let mut tmp = [0u8; 4096];
+        stream
+            .set_read_timeout(Some(timeout))
+            .expect("set read timeout");
+
+        loop {
+            match stream.read(&mut tmp) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+                Err(_) => break,
+            }
+
+            let text = String::from_utf8_lossy(&buf);
+            if let Some(header_end) = text.find("\r\n\r\n") {
+                let headers = &text[..header_end];
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let lower = line.to_lowercase();
+                        lower
+                            .strip_prefix("content-length: ")
+                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                    })
+                    .unwrap_or(0);
+                let body_start = header_end + 4;
+                if buf.len() >= body_start + content_length {
+                    break;
+                }
+            }
+        }
+
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
+        hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data)
+    }
+
+    fn hex_encode(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{:02x}", b)).collect()
+    }
+
+    fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+        let z = days + 719468;
+        let era = z / 146097;
+        let doe = z - era * 146097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = if m <= 2 { y + 1 } else { y };
+        (y, m, d)
+    }
+
+    struct SignedHeaders {
+        authorization: String,
+        amz_date: String,
+        amz_content_sha256: String,
+    }
+
+    fn sign_headers(
+        method: &str,
+        uri: &str,
+        host: &str,
+        body: &[u8],
+        extra_headers: &[(&str, &str)],
+    ) -> SignedHeaders {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let days = secs / 86400;
+        let (year, month, day) = days_to_ymd(days);
+        let time_of_day = secs % 86400;
+        let hour = time_of_day / 3600;
+        let minute = (time_of_day % 3600) / 60;
+        let second = time_of_day % 60;
+        let date_long = format!(
+            "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+            year, month, day, hour, minute, second
+        );
+        let date_short = &date_long[..8];
+        let content_sha256 = sha256_hex(body);
+        let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+        let mut signed_header_pairs = vec![
+            ("host", host),
+            ("x-amz-content-sha256", content_sha256.as_str()),
+            ("x-amz-date", date_long.as_str()),
+        ];
+        signed_header_pairs.extend_from_slice(extra_headers);
+        signed_header_pairs.sort_by_key(|(name, _)| *name);
+
+        let signed_headers = signed_header_pairs
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(";");
+        let canonical_headers = canonical_headers(&signed_header_pairs);
+        let canonical_request = canonical_request(
+            method,
+            path,
+            &canonical_query_string(query),
+            &canonical_headers,
+            &signed_headers,
+            &content_sha256,
+        );
+        let canonical_hash = sha256_hex(canonical_request.as_bytes());
+        let scope = format!("{}/us-east-1/s3/aws4_request", date_short);
+        let string_to_sign = string_to_sign(&date_long, &scope, &canonical_hash);
+        let signing_key = derive_signing_key(
+            &auth::SecretKey::new(TEST_SECRET_KEY.to_string()),
+            date_short,
+            "us-east-1",
+            "s3",
+        );
+        let signature = hmac_sha256(signing_key.as_ref(), string_to_sign.as_bytes());
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+            TEST_ACCESS_KEY,
+            scope,
+            signed_headers,
+            hex_encode(signature.as_ref())
+        );
+
+        SignedHeaders {
+            authorization,
+            amz_date: date_long,
+            amz_content_sha256: content_sha256,
+        }
     }
 
     #[test]
@@ -2950,6 +3198,26 @@ mod tests {
                 part_number: 3,
             }) if bucket == "mybucket" && key == "mykey" && upload_id == "abc123"
         ));
+    }
+
+    #[test]
+    fn streaming_upload_part_missing_upload_id_falls_back() {
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/mykey?partNumber=3",
+            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+        );
+        assert_eq!(is_streaming_write(&parts), None);
+    }
+
+    #[test]
+    fn streaming_upload_part_invalid_part_number_falls_back() {
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/mykey?partNumber=abc&uploadId=abc123",
+            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+        );
+        assert_eq!(is_streaming_write(&parts), None);
     }
 
     #[test]
@@ -3343,5 +3611,59 @@ mod tests {
             &[("x-amz-checksum-algorithm", "CRC32")],
         );
         assert!(inline_checksum_hasher_from_request(&req).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn streaming_upload_part_bad_checksum_aborts_session() {
+        let tmp = test_util::tempdir();
+        let frontend = setup_frontend(tmp.path());
+        let upload_id = create_test_bucket_and_upload(&frontend, "mybucket", "mykey");
+        let (addr, _guard) = start_test_server(Arc::clone(&frontend)).await;
+
+        let body = b"part-data";
+        let uri = format!("/mybucket/mykey?partNumber=1&uploadId={upload_id}");
+        let checksum = "AAAAAA==";
+        let signed = sign_headers(
+            "PUT",
+            &uri,
+            &addr,
+            body,
+            &[("x-amz-checksum-crc32", checksum)],
+        );
+
+        let mut stream = StdTcpStream::connect(&addr).unwrap();
+        let request = format!(
+            "PUT {uri} HTTP/1.1\r\n\
+Host: {addr}\r\n\
+Authorization: {}\r\n\
+x-amz-date: {}\r\n\
+x-amz-content-sha256: {}\r\n\
+x-amz-checksum-crc32: {}\r\n\
+Content-Length: {}\r\n\
+Connection: close\r\n\r\n",
+            signed.authorization,
+            signed.amz_date,
+            signed.amz_content_sha256,
+            checksum,
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+
+        let response = read_http_response(&mut stream, Duration::from_secs(5));
+        assert!(
+            response.starts_with("HTTP/1.1 400"),
+            "expected 400 status, got: {}",
+            response.lines().next().unwrap_or("")
+        );
+        assert!(
+            response.contains("<Code>BadDigest</Code>"),
+            "expected BadDigest body, got: {response}"
+        );
+        assert_eq!(
+            frontend.coordinator.scavenge_stale_sessions(0),
+            0,
+            "streaming session leaked after UploadPart bad checksum"
+        );
     }
 }

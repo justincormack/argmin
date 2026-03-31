@@ -2067,142 +2067,61 @@ impl HttpFrontend {
                     .map_err(|_| ServerError::InvalidArgument {
                         reason: "partNumber must be a positive integer".to_string(),
                     })?;
+                // Normal UploadPart requests are intercepted in serve.rs and
+                // streamed before they reach dispatch_routed(). Only copy-source
+                // variants should remain on this buffered path.
+                let Some(copy_source) = req.header("x-amz-copy-source") else {
+                    return Err(ServerError::InternalError {
+                        reason: "buffered dispatcher reached non-copy UploadPart".to_string(),
+                    });
+                };
 
-                if let Some(copy_source) = req.header("x-amz-copy-source") {
-                    // UploadPartCopy path
-                    let (src_bucket, src_key, src_version_id_str) =
-                        request::parse_copy_source(copy_source)?;
-                    let src_version_id = match src_version_id_str {
-                        None => None,
-                        Some(v) if v == "null" => Some(VersionId::Null),
-                        Some(v) => Some(VersionId::from_u64(v.parse::<u64>().map_err(|_| {
-                            ServerError::InvalidArgument {
-                                reason: format!("invalid versionId in copy source: {v}"),
-                            }
-                        })?)),
-                    };
-                    let requester = Self::requester_from_auth(auth);
-                    let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
-                    let sse_customer = parse_sse_customer_request(req)?;
-                    let src_cond = copy_source_condition_from_headers(req);
-                    let copy_source_range =
-                        if let Some(range_header) = req.header("x-amz-copy-source-range") {
-                            Some(crate::range::parse_copy_source_range(range_header)?)
-                        } else {
-                            None
-                        };
-                    let result = self.coordinator.upload_part_copy(&UploadPartCopyRequest {
-                        source: CopySource {
-                            bucket: &src_bucket,
-                            key: &src_key,
-                            version_id: src_version_id,
-                            condition: &src_cond,
-                            expected_bucket_owner: expected_source_bucket_owner(req),
-                        },
-                        upload: MultipartObjectRequest::new(
-                            &bucket,
-                            &key,
-                            &upload_id,
-                            requester,
-                            expected_bucket_owner,
-                        ),
-                        part_number,
-                        copy_source_range,
-                        source_sse_customer: source_sse_customer.as_ref(),
-                        sse_customer: sse_customer.as_ref(),
-                    })?;
-                    Ok(S3Response::upload_part_copy(
-                        &result.etag,
-                        result.last_modified,
-                        result.sse_customer.as_ref(),
-                    ))
-                } else {
-                    // Normal UploadPart — use streaming upload path directly.
-                    validate_content_md5(req)?;
-                    let claimed_checksum = extract_checksum_header(req)?;
-                    let sse_customer_request = parse_sse_customer_request(req)?;
-                    let requester = Self::requester_from_auth(auth);
-                    let session = self.coordinator.begin_stream_part(
-                        &crate::coordinator::BeginStreamPartRequest {
-                            upload: MultipartObjectRequest::new(
-                                &bucket,
-                                &key,
-                                &upload_id,
-                                requester.clone(),
-                                expected_bucket_owner,
-                            ),
-                            part_number,
-                            policy_context: crate::coordinator::PutObjectPolicyContext::default()
-                                .with_sse_customer_algorithm(
-                                    sse_customer_request
-                                        .as_ref()
-                                        .map(SseCustomerRequest::algorithm),
-                                ),
-                            sse_customer: sse_customer_request.as_ref(),
-                        },
-                    )?;
-                    let session_id = session.session_id;
-                    let result = (|| {
-                        for (idx, chunk) in req
-                            .body
-                            .chunks(crate::coordinator::INTERNAL_SEGMENT_SIZE)
-                            .enumerate()
-                        {
-                            let data = if let Some(sse_customer) = session.sse_customer.as_ref() {
-                                sse_customer.encrypt_segment(idx as u32, chunk)?
-                            } else {
-                                chunk.to_vec()
-                            };
-                            self.coordinator.append_stream_segment(
-                                &bucket,
-                                &key,
-                                &session_id,
-                                idx as u32,
-                                &data,
-                            )?;
+                let (src_bucket, src_key, src_version_id_str) =
+                    request::parse_copy_source(copy_source)?;
+                let src_version_id = match src_version_id_str {
+                    None => None,
+                    Some(v) if v == "null" => Some(VersionId::Null),
+                    Some(v) => Some(VersionId::from_u64(v.parse::<u64>().map_err(|_| {
+                        ServerError::InvalidArgument {
+                            reason: format!("invalid versionId in copy source: {v}"),
                         }
-                        let crc = checksum::crc64::checksum(&req.body);
-                        let computed_checksum = {
-                            let algo = claimed_checksum
-                                .as_ref()
-                                .map(|c| c.algorithm())
-                                .or(session.checksum_algorithm);
-                            algo.map(|a| compute_checksum(a, &req.body))
-                        };
-                        self.coordinator.finalize_stream_part(
-                            crate::coordinator::FinalizeStreamPartRequest {
-                                upload: MultipartObjectRequest::new(
-                                    &bucket,
-                                    &key,
-                                    &upload_id,
-                                    requester,
-                                    expected_bucket_owner,
-                                ),
-                                session_id: &session_id,
-                                part_number,
-                                crc64: crc,
-                                total_size: req.body.len() as u64,
-                                claimed_checksum: claimed_checksum.as_ref(),
-                                computed_checksum,
-                            },
-                        )
-                    })();
-                    if result.is_err() {
-                        let _ = self
-                            .coordinator
-                            .abort_stream_put(&bucket, &key, &session_id);
-                    }
-                    let result = result?;
-                    let sse_customer_headers = session
-                        .sse_customer
-                        .as_ref()
-                        .map(|ctx| ctx.request().response_headers());
-                    Ok(S3Response::upload_part(
-                        &result.etag,
-                        result.checksum.as_ref(),
-                        sse_customer_headers.as_ref(),
-                    ))
-                }
+                    })?)),
+                };
+                let requester = Self::requester_from_auth(auth);
+                let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
+                let sse_customer = parse_sse_customer_request(req)?;
+                let src_cond = copy_source_condition_from_headers(req);
+                let copy_source_range =
+                    if let Some(range_header) = req.header("x-amz-copy-source-range") {
+                        Some(crate::range::parse_copy_source_range(range_header)?)
+                    } else {
+                        None
+                    };
+                let result = self.coordinator.upload_part_copy(&UploadPartCopyRequest {
+                    source: CopySource {
+                        bucket: &src_bucket,
+                        key: &src_key,
+                        version_id: src_version_id,
+                        condition: &src_cond,
+                        expected_bucket_owner: expected_source_bucket_owner(req),
+                    },
+                    upload: MultipartObjectRequest::new(
+                        &bucket,
+                        &key,
+                        &upload_id,
+                        requester,
+                        expected_bucket_owner,
+                    ),
+                    part_number,
+                    copy_source_range,
+                    source_sse_customer: source_sse_customer.as_ref(),
+                    sse_customer: sse_customer.as_ref(),
+                })?;
+                Ok(S3Response::upload_part_copy(
+                    &result.etag,
+                    result.last_modified,
+                    result.sse_customer.as_ref(),
+                ))
             }
             S3Operation::CompleteMultipartUpload { bucket, key } => {
                 let upload_id = req.query_param_lossy("uploadId").ok_or_else(|| {
@@ -4220,30 +4139,6 @@ fn extract_checksum_header(req: &S3Request) -> Result<Option<ChecksumClaim>, Ser
     }
 }
 
-/// Compute an inline checksum value for the given algorithm and data.
-fn compute_checksum(algo: checksum::ChecksumAlgorithm, data: &[u8]) -> checksum::RawChecksum {
-    match algo {
-        checksum::ChecksumAlgorithm::Crc32 => {
-            checksum::RawChecksum::new(algo, checksum::crc32::checksum(data).to_be_bytes())
-        }
-        checksum::ChecksumAlgorithm::Crc32c => {
-            checksum::RawChecksum::new(algo, checksum::crc32c::checksum(data).to_be_bytes())
-        }
-        checksum::ChecksumAlgorithm::Crc64nvme => {
-            checksum::RawChecksum::new(algo, checksum::crc64::checksum(data).to_be_bytes())
-        }
-        checksum::ChecksumAlgorithm::Sha256 => checksum::RawChecksum::new(
-            algo,
-            ring::digest::digest(&ring::digest::SHA256, data).as_ref(),
-        ),
-        checksum::ChecksumAlgorithm::Sha1 => checksum::RawChecksum::new(
-            algo,
-            ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data).as_ref(),
-        ),
-    }
-    .expect("checksum helper produces bytes matching the requested algorithm")
-}
-
 fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
     let overrides: &[(&str, &str)] = &[
         ("response-content-type", "Content-Type"),
@@ -5621,59 +5516,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn upload_part_invalid_content_md5_rejected() {
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-        create_test_bucket(&fe.coordinator, "mybucket");
-        let upload_id = create_upload_with_checksum(&fe, "mybucket", "mykey", None);
-
-        let req = new_req(
-            http::Method::PUT,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![("Content-MD5".to_string(), "not-base64".to_string())],
-            b"part data".to_vec(),
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "mykey".to_string(),
-        };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidDigest) => {}
-            Err(e) => panic!("expected InvalidDigest, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
-    }
-
-    #[test]
-    fn upload_part_bad_content_md5_rejected() {
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-        create_test_bucket(&fe.coordinator, "mybucket");
-        let upload_id = create_upload_with_checksum(&fe, "mybucket", "mykey", None);
-
-        let req = new_req(
-            http::Method::PUT,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![(
-                "Content-MD5".to_string(),
-                "AAAAAAAAAAAAAAAAAAAAAA==".to_string(),
-            )],
-            b"part data".to_vec(),
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "mykey".to_string(),
-        };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::BadDigest) => {}
-            Err(e) => panic!("expected BadDigest, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
-    }
-
     // ── CompleteMultipartUpload validation ────────────────────────────
 
     #[test]
@@ -5833,28 +5675,17 @@ mod tests {
 
         let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
         // Upload a part so complete has something to work with.
-        use base64::Engine;
         let part_data = vec![0u8; 1024];
-        let part_crc = checksum::crc32::checksum(&part_data);
-        let part_crc_b64 = base64::engine::general_purpose::STANDARD.encode(part_crc.to_be_bytes());
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![("x-amz-checksum-crc32".to_string(), part_crc_b64)],
-            part_data,
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "k".to_string(),
-        };
-        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
-        let etag = resp
-            .headers
-            .iter()
-            .find(|(k, _)| k == "ETag")
-            .map(|(_, v)| v.clone())
-            .unwrap();
+        let etag = stream_upload_part(
+            &fe,
+            "mybucket",
+            "k",
+            &upload_id,
+            1,
+            &part_data,
+            Some(ChecksumAlgorithm::Crc32),
+        )
+        .etag;
 
         let xml = format!(
             "<CompleteMultipartUpload>\
@@ -6042,25 +5873,8 @@ mod tests {
 
         // 2. UploadPart — single part (last part is exempt from min-size)
         let part_body = vec![0u8; 1024];
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![],
-            part_body,
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "mykey".to_string(),
-        };
-        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
-        assert_eq!(resp.status_code, 200);
-        let etag = resp
-            .headers
-            .iter()
-            .find(|(k, _)| k == "ETag")
-            .map(|(_, v)| v.clone())
-            .expect("UploadPart response must have ETag header");
+        let etag =
+            stream_upload_part(&fe, "mybucket", "mykey", upload_id, 1, &part_body, None).etag;
         // ETag must be quoted
         assert!(
             etag.starts_with('"') && etag.ends_with('"'),
@@ -6372,335 +6186,98 @@ mod tests {
         body[start..end].to_string()
     }
 
-    #[test]
-    fn upload_part_bad_digest() {
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-        create_test_bucket(&fe.coordinator, "mybucket");
-
-        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![(
-                "x-amz-checksum-crc32".to_string(),
-                "AAAAAAAA".to_string(), // wrong checksum
-            )],
-            vec![1, 2, 3, 4],
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "k".to_string(),
-        };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { .. }) => {}
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
-    }
-
-    #[test]
-    fn upload_part_multiple_checksum_headers_rejected() {
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-        create_test_bucket(&fe.coordinator, "mybucket");
-
-        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![
-                ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
-                ("x-amz-checksum-sha256".to_string(), "BBBBBB==".to_string()),
-            ],
-            vec![1, 2, 3, 4],
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "k".to_string(),
-        };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { .. }) => {}
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
-    }
-
-    #[test]
-    fn upload_part_algorithm_mismatch_rejected() {
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-        create_test_bucket(&fe.coordinator, "mybucket");
-
-        // Upload configured with CRC32 but part sends SHA256 checksum.
-        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![("x-amz-checksum-sha256".to_string(), "AAAA".to_string())],
-            vec![1, 2, 3, 4],
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "k".to_string(),
-        };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { .. }) => {}
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
-    }
-
-    #[test]
-    fn upload_part_correct_checksum_returns_header() {
-        use base64::Engine;
-
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-        create_test_bucket(&fe.coordinator, "mybucket");
-
-        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let data = b"hello world";
-        let crc = checksum::crc32::checksum(data);
-        let crc_b64 = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
-
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![("x-amz-checksum-crc32".to_string(), crc_b64.clone())],
-            data.to_vec(),
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "k".to_string(),
-        };
-        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
-        assert_eq!(resp.status_code, 200);
-
-        // Response should include the checksum header.
-        let resp_crc = resp
-            .headers
-            .iter()
-            .find(|(k, _)| k == "x-amz-checksum-crc32")
-            .map(|(_, v)| v.clone());
-        assert_eq!(resp_crc.as_deref(), Some(crc_b64.as_str()));
-    }
-
-    #[test]
-    fn upload_part_no_header_upload_algo_rejected() {
-        // Upload has checksum algorithm but part doesn't send a checksum header.
-        // AWS rejects this with "Checksum Type mismatch".
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-        create_test_bucket(&fe.coordinator, "mybucket");
-
-        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let data = b"test data";
-
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![],
-            data.to_vec(),
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "k".to_string(),
-        };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { reason }) => {
-                assert!(
-                    reason.contains("Checksum Type mismatch"),
-                    "unexpected reason: {reason}"
-                );
+    fn compute_checksum_for_test(algo: ChecksumAlgorithm, data: &[u8]) -> RawChecksum {
+        match algo {
+            ChecksumAlgorithm::Crc32 => {
+                RawChecksum::new(algo, checksum::crc32::checksum(data).to_be_bytes())
             }
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
-    }
-
-    #[test]
-    fn upload_part_reupload_preserves_latest_checksum() {
-        use base64::Engine;
-
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-        create_test_bucket(&fe.coordinator, "mybucket");
-
-        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-
-        // Upload part 1 with data "aaa".
-        let data1 = b"aaa";
-        let crc1 = checksum::crc32::checksum(data1);
-        let crc1_b64 = base64::engine::general_purpose::STANDARD.encode(crc1.to_be_bytes());
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![("x-amz-checksum-crc32".to_string(), crc1_b64)],
-            data1.to_vec(),
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "k".to_string(),
-        };
-        fe.dispatch_routed(&req, &test_auth(), op).unwrap();
-
-        // Re-upload part 1 with different data "bbb".
-        let data2 = b"bbb";
-        let crc2 = checksum::crc32::checksum(data2);
-        let crc2_b64 = base64::engine::general_purpose::STANDARD.encode(crc2.to_be_bytes());
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![("x-amz-checksum-crc32".to_string(), crc2_b64.clone())],
-            data2.to_vec(),
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "k".to_string(),
-        };
-        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
-        assert_eq!(resp.status_code, 200);
-
-        // Response should have the NEW checksum, not the old one.
-        let resp_crc = resp
-            .headers
-            .iter()
-            .find(|(k, _)| k == "x-amz-checksum-crc32")
-            .map(|(_, v)| v.clone())
-            .expect("missing checksum header");
-        assert_eq!(resp_crc, crc2_b64);
-    }
-
-    #[test]
-    fn upload_part_checksum_accepted_when_upload_has_no_algorithm() {
-        use base64::Engine;
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-        create_test_bucket(&fe.coordinator, "mybucket");
-
-        // Upload created without checksum algorithm.
-        // AWS SDK v2+ sends CRC32 by default — it should be accepted and verified.
-        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", None);
-        let data = vec![1u8, 2, 3, 4];
-        let correct_crc = base64::engine::general_purpose::STANDARD
-            .encode(checksum::crc32::checksum(&data).to_be_bytes());
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![("x-amz-checksum-crc32".to_string(), correct_crc)],
-            data,
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "k".to_string(),
-        };
-        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
-        assert_eq!(resp.status_code, 200);
-    }
-
-    #[test]
-    fn upload_part_algorithm_header_contradicts_value_header() {
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-        create_test_bucket(&fe.coordinator, "mybucket");
-
-        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![
-                // Algorithm header says SHA256 but value header is CRC32.
-                ("x-amz-checksum-algorithm".to_string(), "SHA256".to_string()),
-                ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
-            ],
-            vec![1, 2, 3, 4],
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "k".to_string(),
-        };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { .. }) => {}
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
-        }
-    }
-
-    #[test]
-    fn upload_part_algorithm_header_only_no_value_header_rejected() {
-        // x-amz-checksum-algorithm without a value header is treated as no
-        // claimed checksum. AWS rejects this when the upload requires a checksum.
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-        create_test_bucket(&fe.coordinator, "mybucket");
-
-        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![("x-amz-checksum-algorithm".to_string(), "CRC32".to_string())],
-            vec![1, 2, 3, 4],
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "k".to_string(),
-        };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { reason }) => {
-                assert!(
-                    reason.contains("Checksum Type mismatch"),
-                    "unexpected reason: {reason}"
-                );
+            ChecksumAlgorithm::Crc32c => {
+                RawChecksum::new(algo, checksum::crc32c::checksum(data).to_be_bytes())
             }
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
+            ChecksumAlgorithm::Crc64nvme => {
+                RawChecksum::new(algo, checksum::crc64::checksum(data).to_be_bytes())
+            }
+            ChecksumAlgorithm::Sha256 => RawChecksum::new(
+                algo,
+                ring::digest::digest(&ring::digest::SHA256, data).as_ref(),
+            ),
+            ChecksumAlgorithm::Sha1 => RawChecksum::new(
+                algo,
+                ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data).as_ref(),
+            ),
         }
+        .expect("checksum helper produces bytes matching the requested algorithm")
     }
 
-    #[test]
-    fn upload_part_duplicate_checksum_algorithm_header_rejected() {
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-        create_test_bucket(&fe.coordinator, "mybucket");
+    fn stream_upload_part(
+        fe: &HttpFrontend,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        data: &[u8],
+        checksum_algorithm: Option<ChecksumAlgorithm>,
+    ) -> crate::coordinator::UploadPartResult {
+        let requester = HttpFrontend::requester_from_auth(&test_auth());
+        let session = fe
+            .coordinator
+            .begin_stream_part(&BeginStreamPartRequest {
+                upload: MultipartObjectRequest::new(
+                    bucket,
+                    key,
+                    upload_id,
+                    requester.clone(),
+                    None,
+                ),
+                part_number,
+                policy_context: crate::coordinator::PutObjectPolicyContext::default(),
+                sse_customer: None,
+            })
+            .unwrap();
+        let result = (|| {
+            use base64::Engine;
 
-        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", Some("CRC32"));
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![
-                ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
-                ("x-amz-checksum-algorithm".to_string(), "SHA256".to_string()),
-                ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
-            ],
-            vec![1, 2, 3, 4],
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "k".to_string(),
-        };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { .. }) => {}
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
-            Ok(_) => panic!("expected error, got Ok"),
+            for (segment_index, chunk) in data
+                .chunks(crate::coordinator::INTERNAL_SEGMENT_SIZE)
+                .enumerate()
+            {
+                fe.coordinator.append_stream_segment(
+                    bucket,
+                    key,
+                    &session.session_id,
+                    segment_index as u32,
+                    chunk,
+                )?;
+            }
+            let computed_checksum =
+                checksum_algorithm.map(|algo| compute_checksum_for_test(algo, data));
+            let claimed_checksum = computed_checksum.as_ref().map(|expected| {
+                let encoded = base64::engine::general_purpose::STANDARD.encode(expected.bytes());
+                ChecksumClaim::from_base64(expected.algorithm(), &encoded)
+                    .expect("checksum helper must round-trip through base64")
+            });
+            fe.coordinator
+                .finalize_stream_part(FinalizeStreamPartRequest {
+                    upload: MultipartObjectRequest::new(bucket, key, upload_id, requester, None),
+                    session_id: &session.session_id,
+                    part_number,
+                    crc64: checksum::crc64::checksum(data),
+                    total_size: data.len() as u64,
+                    claimed_checksum: claimed_checksum.as_ref(),
+                    computed_checksum,
+                })
+        })();
+        if result.is_err() {
+            let _ = fe
+                .coordinator
+                .abort_stream_put(bucket, key, &session.session_id);
         }
+        result.unwrap()
     }
 
     // ── GET ?partNumber=N tests ─────────────────────────────────────
 
-    /// Helper: do a full multipart upload through the HTTP frontend.
-    /// When `algo` is set, computes and includes per-part checksums.
+    /// Helper: do a full multipart upload through the live streaming coordinator path.
     fn do_multipart_upload(
         fe: &HttpFrontend,
         bucket: &str,
@@ -6711,44 +6288,23 @@ mod tests {
         use base64::Engine;
         let b64 = base64::engine::general_purpose::STANDARD;
         let upload_id = create_upload_with_checksum(fe, bucket, key, algo);
+        let checksum_algorithm = algo.map(|name| ChecksumAlgorithm::parse(name).unwrap());
         let mut part_info: Vec<(u32, String, Option<String>)> = Vec::new();
         for (part_number, data) in parts {
-            let mut headers = Vec::new();
-            let mut checksum_b64 = None;
-            if let Some(a) = algo {
-                let algo_enum = ChecksumAlgorithm::parse(a).unwrap();
-                let raw: Vec<u8> = match algo_enum {
-                    ChecksumAlgorithm::Crc32 => {
-                        checksum::crc32::checksum(data).to_be_bytes().to_vec()
-                    }
-                    ChecksumAlgorithm::Crc32c => {
-                        checksum::crc32c::checksum(data).to_be_bytes().to_vec()
-                    }
-                    _ => unimplemented!("test only supports CRC32/CRC32C"),
-                };
-                let encoded = b64.encode(&raw);
-                headers.push((algo_enum.header_name().to_string(), encoded.clone()));
-                checksum_b64 = Some(encoded);
-            }
-            let req = new_req(
-                http::Method::GET,
-                "",
-                &format!("partNumber={part_number}&uploadId={upload_id}"),
-                headers,
-                data.clone(),
+            let result = stream_upload_part(
+                fe,
+                bucket,
+                key,
+                &upload_id,
+                *part_number,
+                data,
+                checksum_algorithm,
             );
-            let op = S3Operation::UploadPart {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
-            };
-            let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
-            let etag = resp
-                .headers
-                .iter()
-                .find(|(k, _)| k == "ETag")
-                .map(|(_, v)| v.clone())
-                .unwrap();
-            part_info.push((*part_number, etag, checksum_b64));
+            let checksum_b64 = result
+                .checksum
+                .as_ref()
+                .map(|checksum| b64.encode(checksum.bytes()));
+            part_info.push((*part_number, result.etag, checksum_b64));
         }
         let mut xml_parts = String::new();
         for (pn, etag, cksum) in &part_info {
@@ -7277,66 +6833,6 @@ mod tests {
             fe.coordinator.scavenge_stale_sessions(0),
             0,
             "streaming session leaked after PutObject precondition failure"
-        );
-    }
-
-    #[test]
-    fn upload_part_abort_cleans_up_session_on_bad_checksum() {
-        // UploadPart with a wrong checksum header so finalize_stream_part
-        // fails with BadDigest.  The handler's abort path must clean up.
-        let tmp = test_util::tempdir();
-        let fe = setup_frontend(tmp.path());
-        create_test_bucket(&fe.coordinator, "mybucket");
-
-        // Create a multipart upload.
-        let create_req = new_req(
-            http::Method::POST,
-            "/mybucket/mykey",
-            "uploads",
-            vec![],
-            vec![],
-        );
-        let create_op = S3Operation::CreateMultipartUpload {
-            bucket: "mybucket".to_string(),
-            key: "mykey".to_string(),
-        };
-        let resp = fe
-            .dispatch_routed(&create_req, &test_auth(), create_op)
-            .unwrap();
-        let upload_id = {
-            let body = String::from_utf8(resp.body).unwrap();
-            // Extract <UploadId>...</UploadId> from XML.
-            let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
-            let end = body[start..].find("</UploadId>").unwrap() + start;
-            body[start..end].to_string()
-        };
-
-        // UploadPart with deliberately wrong CRC32 checksum.
-        let req = new_req(
-            http::Method::GET,
-            "",
-            &format!("partNumber=1&uploadId={upload_id}"),
-            vec![(
-                "x-amz-checksum-crc32".to_string(),
-                "AAAAAA==".to_string(), // wrong CRC32 (valid 4-byte base64)
-            )],
-            b"part-data".to_vec(),
-        );
-        let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
-            key: "mykey".to_string(),
-        };
-        match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::BadDigest) => {}
-            Err(e) => panic!("expected BadDigest, got {e:?}"),
-            Ok(_) => panic!("expected BadDigest, got Ok"),
-        }
-
-        // No leaked streaming sessions.
-        assert_eq!(
-            fe.coordinator.scavenge_stale_sessions(0),
-            0,
-            "streaming session leaked after UploadPart bad checksum"
         );
     }
 }
