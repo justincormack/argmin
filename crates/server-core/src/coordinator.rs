@@ -1839,53 +1839,6 @@ impl_expected_bucket_owner_accessor!(
 #[cfg(any(test, feature = "test-utils"))]
 impl_expected_bucket_owner_accessor!(UploadPartRequest);
 
-impl<'a> BeginStreamPutRequest<'a> {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        bucket: &'a str,
-        key: &'a str,
-        requester: Requester,
-        acl: impl Into<PutObjectWriteAcl<'a>>,
-        policy: PutObjectPolicyContext<'a>,
-        encryption: ObjectEncryption,
-        object_lock: ObjectLockState,
-        _expected_bucket_owner: Option<&'a str>,
-    ) -> Self {
-        Self {
-            bucket,
-            key,
-            requester,
-            acl: acl.into(),
-            policy,
-            encryption,
-            object_lock,
-            expected_bucket_owner: _expected_bucket_owner,
-        }
-    }
-}
-
-impl<'a> BeginStreamPartRequest<'a> {
-    fn new(
-        bucket: &'a str,
-        key: &'a str,
-        upload_id: &'a str,
-        part_number: u32,
-        requester: Requester,
-        sse_customer: Option<&'a SseCustomerRequest>,
-        _expected_bucket_owner: Option<&'a str>,
-    ) -> Self {
-        Self {
-            bucket,
-            key,
-            upload_id,
-            part_number,
-            requester,
-            sse_customer,
-            expected_bucket_owner: _expected_bucket_owner,
-        }
-    }
-}
-
 impl<'a> CreateMultipartUploadRequest<'a> {
     fn write_acl(&self) -> PutObjectWriteAcl<'a> {
         #[cfg(test)]
@@ -1975,28 +1928,6 @@ impl<'a> PutObjectRequest<'a> {
             policy_context
         } else {
             policy_context.with_request_object_tags_xml(self.tags)
-        }
-    }
-}
-
-impl<'a> DeleteObjectRequest<'a> {
-    fn new(
-        bucket: &'a str,
-        key: &'a str,
-        version_id: Option<VersionId>,
-        bypass_governance: bool,
-        cond: &'a DeleteCondition,
-        requester: Requester,
-        _expected_bucket_owner: Option<&'a str>,
-    ) -> Self {
-        Self {
-            bucket,
-            key,
-            version_id,
-            bypass_governance,
-            cond,
-            requester,
-            expected_bucket_owner: _expected_bucket_owner,
         }
     }
 }
@@ -6593,19 +6524,19 @@ impl Coordinator {
                 policy_context,
                 req.expected_bucket_owner(),
             )?;
-            let session_id = self.begin_stream_put(&BeginStreamPutRequest::new(
-                req.bucket,
-                req.key,
-                req.requester.clone(),
-                req.acl.clone(),
-                policy_context,
-                write_encryption
+            let session_id = self.begin_stream_put(&BeginStreamPutRequest {
+                bucket: req.bucket,
+                key: req.key,
+                requester: req.requester.clone(),
+                acl: req.acl.clone(),
+                policy: policy_context,
+                encryption: write_encryption
                     .as_ref()
                     .map(|ctx| ctx.encryption().clone())
                     .unwrap_or_default(),
-                req.object_lock,
-                req.expected_bucket_owner(),
-            ))?;
+                object_lock: req.object_lock,
+                expected_bucket_owner: req.expected_bucket_owner(),
+            })?;
             let result = (|| {
                 for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
                     let chunk_storage = if let Some(ctx) = &write_encryption {
@@ -8035,23 +7966,23 @@ impl Coordinator {
             } => Some(StreamingChecksumAccumulator::new(*algo)),
             _ => None,
         };
-        let session_id = self.begin_stream_put(&BeginStreamPutRequest::new(
-            dst_bucket,
-            dst_key,
-            requester.clone(),
-            acl,
-            PutObjectPolicyContext::new(
+        let session_id = self.begin_stream_put(&BeginStreamPutRequest {
+            bucket: dst_bucket,
+            key: dst_key,
+            requester: requester.clone(),
+            acl: acl.into(),
+            policy: PutObjectPolicyContext::new(
                 Some(copy_source_policy_value.as_str()),
                 metadata_directive,
                 canned_acl,
             ),
-            dst_write_sse_customer
+            encryption: dst_write_sse_customer
                 .as_ref()
                 .map(|ctx| ctx.encryption().clone())
                 .unwrap_or_default(),
-            req.object_lock,
-            req.expected_bucket_owner(),
-        ))?;
+            object_lock: req.object_lock,
+            expected_bucket_owner: req.expected_bucket_owner(),
+        })?;
         let not_found = |e: ServerError| match e {
             ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
                 bucket: src_bucket.to_string(),
@@ -10141,15 +10072,15 @@ impl Coordinator {
         let mut errors = Vec::new();
 
         for entry in entries {
-            match self.delete_object(&DeleteObjectRequest::new(
+            match self.delete_object(&DeleteObjectRequest {
                 bucket,
-                entry.key,
-                entry.version_id,
-                req.bypass_governance,
-                &entry.cond,
-                requester.clone(),
-                req.expected_bucket_owner(),
-            )) {
+                key: entry.key,
+                version_id: entry.version_id,
+                bypass_governance: req.bypass_governance,
+                cond: &entry.cond,
+                requester: requester.clone(),
+                expected_bucket_owner: req.expected_bucket_owner(),
+            }) {
                 Ok(result) => {
                     deleted.push(DeletedObject {
                         key: entry.key.to_string(),
@@ -10427,15 +10358,15 @@ impl Coordinator {
         }; // source locks dropped here
 
         // Phase 2: Stream into the destination multipart part session.
-        let session = self.begin_stream_part(&BeginStreamPartRequest::new(
-            dst_bucket,
-            dst_key,
+        let session = self.begin_stream_part(&BeginStreamPartRequest {
+            bucket: dst_bucket,
+            key: dst_key,
             upload_id,
             part_number,
-            requester.clone(),
-            req.sse_customer,
-            req.expected_bucket_owner(),
-        ))?;
+            requester: requester.clone(),
+            sse_customer: req.sse_customer,
+            expected_bucket_owner: req.expected_bucket_owner(),
+        })?;
         let session_id = &session.session_id;
         let sse_customer_headers = session
             .sse_customer
@@ -11345,15 +11276,15 @@ pub mod test_helpers {
         coord: &Coordinator,
         req: &UploadPartRequest<'_>,
     ) -> Result<UploadPartResult, ServerError> {
-        let session = coord.begin_stream_part(&BeginStreamPartRequest::new(
-            req.bucket,
-            req.key,
-            req.upload_id,
-            req.part_number,
-            req.requester.clone(),
-            req.sse_customer,
-            req.expected_bucket_owner(),
-        ))?;
+        let session = coord.begin_stream_part(&BeginStreamPartRequest {
+            bucket: req.bucket,
+            key: req.key,
+            upload_id: req.upload_id,
+            part_number: req.part_number,
+            requester: req.requester.clone(),
+            sse_customer: req.sse_customer,
+            expected_bucket_owner: req.expected_bucket_owner(),
+        })?;
         let session_id = &session.session_id;
         let result = (|| {
             for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
