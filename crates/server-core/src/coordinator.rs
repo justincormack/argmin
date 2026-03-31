@@ -1164,7 +1164,6 @@ pub struct CopySource<'a> {
     pub key: &'a str,
     pub version_id: Option<VersionId>,
     pub condition: &'a ReadCondition,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1182,7 +1181,6 @@ pub struct CopyObjectRequest<'a> {
     pub source_sse_customer: Option<&'a SseCustomerRequest>,
     pub dst_sse_customer: Option<&'a SseCustomerRequest>,
     pub object_lock: ObjectLockState,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1198,7 +1196,6 @@ pub struct UploadPartCopyRequest<'a> {
     pub requester: Requester,
     pub source_sse_customer: Option<&'a SseCustomerRequest>,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1217,7 +1214,6 @@ pub struct PutObjectRequest<'a> {
     pub policy_context: PutObjectPolicyContext<'a>,
     pub object_lock: ObjectLockState,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1482,7 +1478,6 @@ pub struct ListBucketsRequest {
 pub struct BucketRequest<'a> {
     pub name: &'a str,
     pub requester: Requester,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1542,7 +1537,6 @@ pub struct ObjectVersionRequest<'a> {
     pub key: &'a str,
     pub version_id: Option<VersionId>,
     pub requester: Requester,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1591,7 +1585,6 @@ pub struct GetObjectRequest<'a> {
     pub cond: &'a ReadCondition,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1600,7 +1593,6 @@ pub struct GetObjectRequest<'a> {
 pub struct HeadBucketRequest<'a> {
     pub bucket: &'a str,
     pub requester: Requester,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1614,7 +1606,6 @@ pub struct GetObjectPartRequest<'a> {
     pub cond: &'a ReadCondition,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1628,7 +1619,6 @@ pub struct GetObjectRangeRequest<'a> {
     pub cond: &'a ReadCondition,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1641,7 +1631,6 @@ pub struct DeleteObjectRequest<'a> {
     pub bypass_governance: bool,
     pub cond: &'a DeleteCondition,
     pub requester: Requester,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1654,7 +1643,6 @@ pub struct ListObjectsV2Request<'a> {
     pub continuation_token: Option<&'a str>,
     pub max_keys: u32,
     pub requester: Requester,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1667,7 +1655,6 @@ pub struct ListObjectVersionsRequest<'a> {
     pub version_id_marker: Option<VersionId>,
     pub max_keys: u32,
     pub requester: Requester,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1680,7 +1667,6 @@ pub struct ListPartsRequest<'a> {
     pub part_number_marker: Option<u32>,
     pub max_parts: u32,
     pub requester: Requester,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1693,7 +1679,6 @@ pub struct ListMultipartUploadsRequest<'a> {
     pub upload_id_marker: Option<&'a str>,
     pub max_uploads: u32,
     pub requester: Requester,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1713,7 +1698,6 @@ pub struct DeleteObjectsRequest<'a> {
     pub entries: &'a [DeleteEntry<'a>],
     pub bypass_governance: bool,
     pub requester: Requester,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1722,7 +1706,6 @@ pub struct DeleteObjectsRequest<'a> {
 pub struct DeleteBucketRequest<'a> {
     pub name: &'a str,
     pub requester: Requester,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1733,7 +1716,6 @@ pub struct AbortMultipartUploadRequest<'a> {
     pub key: &'a str,
     pub upload_id: &'a str,
     pub requester: Requester,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1763,7 +1745,6 @@ pub struct CreateMultipartUploadRequest<'a> {
     pub grant_write_acp: Option<&'a str>,
     #[cfg(not(test))]
     pub grant_full_control: Option<&'a str>,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1779,7 +1760,6 @@ pub struct UploadPartRequest<'a> {
     pub claimed_checksum: Option<&'a ChecksumClaim>,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1795,7 +1775,6 @@ pub struct GetObjectAttributesRequest<'a> {
     pub max_parts: u32,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1809,7 +1788,6 @@ pub struct CompleteMultipartUploadRequest<'a> {
     pub claimed_checksum: Option<&'a EncodedChecksumClaim>,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1823,7 +1801,6 @@ pub struct BeginStreamPutRequest<'a> {
     pub policy: PutObjectPolicyContext<'a>,
     pub encryption: ObjectEncryption,
     pub object_lock: ObjectLockState,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1836,7 +1813,6 @@ pub struct BeginStreamPartRequest<'a> {
     pub part_number: u32,
     pub requester: Requester,
     pub sse_customer: Option<&'a SseCustomerRequest>,
-    #[cfg(not(test))]
     pub expected_bucket_owner: Option<&'a str>,
 }
 
@@ -1845,14 +1821,7 @@ macro_rules! impl_expected_bucket_owner_accessor {
         $(
             impl<'a> $name<'a> {
                 fn expected_bucket_owner(&self) -> Option<&str> {
-                    #[cfg(test)]
-                    {
-                        None
-                    }
-                    #[cfg(not(test))]
-                    {
-                        self.expected_bucket_owner
-                    }
+                    self.expected_bucket_owner
                 }
             }
         )+
@@ -1908,7 +1877,6 @@ impl<'a> BeginStreamPutRequest<'a> {
             policy,
             encryption,
             object_lock,
-            #[cfg(not(test))]
             expected_bucket_owner: _expected_bucket_owner,
         }
     }
@@ -1931,7 +1899,6 @@ impl<'a> BeginStreamPartRequest<'a> {
             part_number,
             requester,
             sse_customer,
-            #[cfg(not(test))]
             expected_bucket_owner: _expected_bucket_owner,
         }
     }
@@ -2047,7 +2014,6 @@ impl<'a> DeleteObjectRequest<'a> {
             bypass_governance,
             cond,
             requester,
-            #[cfg(not(test))]
             expected_bucket_owner: _expected_bucket_owner,
         }
     }
@@ -4918,7 +4884,6 @@ impl Coordinator {
                     bucket: BucketRequest {
                         name: req.name,
                         requester: req.requester.clone(),
-                        #[cfg(not(test))]
                         expected_bucket_owner: None,
                     },
                     config: &Self::ownership_controls_xml(req.ownership),
@@ -11562,20 +11527,30 @@ mod tests {
         coord.delete_bucket(&DeleteBucketRequest {
             name,
             requester: TEST_REQUESTER,
+            expected_bucket_owner: None,
         })
     }
 
-    fn bucket_request<'a>(name: &'a str, requester: Requester) -> BucketRequest<'a> {
-        BucketRequest { name, requester }
+    fn bucket_request_with_expected_owner<'a>(
+        name: &'a str,
+        requester: Requester,
+        expected_bucket_owner: Option<&'a str>,
+    ) -> BucketRequest<'a> {
+        BucketRequest {
+            name,
+            requester,
+            expected_bucket_owner,
+        }
     }
 
-    fn put_bucket_config_request<'a>(
+    fn put_bucket_config_request_with_expected_owner<'a>(
         name: &'a str,
         config: &'a str,
         requester: Requester,
+        expected_bucket_owner: Option<&'a str>,
     ) -> PutBucketConfigRequest<'a> {
         PutBucketConfigRequest {
-            bucket: bucket_request(name, requester),
+            bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
             config,
         }
     }
@@ -11586,11 +11561,22 @@ mod tests {
         version_id: Option<VersionId>,
         requester: Requester,
     ) -> ObjectVersionRequest<'a> {
+        object_version_request_with_expected_owner(bucket, key, version_id, requester, None)
+    }
+
+    fn object_version_request_with_expected_owner<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+        expected_bucket_owner: Option<&'a str>,
+    ) -> ObjectVersionRequest<'a> {
         ObjectVersionRequest {
             bucket,
             key,
             version_id,
             requester,
+            expected_bucket_owner,
         }
     }
 
@@ -11601,9 +11587,8 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
-        assert!(expected_bucket_owner.is_none());
         coord.put_bucket_versioning(&PutBucketVersioningRequest {
-            bucket: bucket_request(name, requester),
+            bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
             state,
         })
     }
@@ -11614,8 +11599,11 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<BucketVersioningState, ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_versioning(&bucket_request(name, requester))
+        coord.get_bucket_versioning(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn put_bucket_object_lock_configuration_test(
@@ -11625,9 +11613,8 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
-        assert!(expected_bucket_owner.is_none());
         coord.put_bucket_object_lock_configuration(&PutBucketObjectLockConfigurationRequest {
-            bucket: bucket_request(name, requester),
+            bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
             config,
         })
     }
@@ -11638,8 +11625,11 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<BucketObjectLockConfig, ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_object_lock_configuration(&bucket_request(name, requester))
+        coord.get_bucket_object_lock_configuration(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn put_bucket_encryption_test(
@@ -11649,9 +11639,8 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
-        assert!(expected_bucket_owner.is_none());
         coord.put_bucket_encryption(&PutBucketEncryptionRequest {
-            bucket: bucket_request(name, requester),
+            bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
             config,
         })
     }
@@ -11662,8 +11651,11 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<BucketEncryptionConfig, ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_encryption(&bucket_request(name, requester))
+        coord.get_bucket_encryption(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn put_bucket_policy_test(
@@ -11673,8 +11665,12 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.put_bucket_policy(&put_bucket_config_request(name, policy, requester))
+        coord.put_bucket_policy(&put_bucket_config_request_with_expected_owner(
+            name,
+            policy,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn get_bucket_policy_test(
@@ -11683,8 +11679,11 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<Option<String>, ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_policy(&bucket_request(name, requester))
+        coord.get_bucket_policy(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn delete_bucket_policy_test(
@@ -11693,8 +11692,11 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.delete_bucket_policy(&bucket_request(name, requester))
+        coord.delete_bucket_policy(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn get_bucket_policy_status_test(
@@ -11703,8 +11705,11 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<bool, ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_policy_status(&bucket_request(name, requester))
+        coord.get_bucket_policy_status(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn put_bucket_public_access_block_test(
@@ -11714,8 +11719,12 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.put_bucket_public_access_block(&put_bucket_config_request(name, config, requester))
+        coord.put_bucket_public_access_block(&put_bucket_config_request_with_expected_owner(
+            name,
+            config,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn get_bucket_public_access_block_test(
@@ -11724,8 +11733,11 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<Option<String>, ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_public_access_block(&bucket_request(name, requester))
+        coord.get_bucket_public_access_block(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn put_bucket_ownership_controls_test(
@@ -11735,8 +11747,12 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.put_bucket_ownership_controls(&put_bucket_config_request(name, config, requester))
+        coord.put_bucket_ownership_controls(&put_bucket_config_request_with_expected_owner(
+            name,
+            config,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn get_bucket_ownership_controls_test(
@@ -11745,8 +11761,11 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<Option<String>, ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_ownership_controls(&bucket_request(name, requester))
+        coord.get_bucket_ownership_controls(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn put_bucket_acl_test(
@@ -11756,9 +11775,8 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
-        assert!(expected_bucket_owner.is_none());
         coord.put_bucket_acl(&PutBucketAclRequest {
-            bucket: bucket_request(name, requester),
+            bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
             acl: PutBucketAclInput::Grants(acl_grants),
         })
     }
@@ -11770,9 +11788,8 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
-        assert!(expected_bucket_owner.is_none());
         coord.put_bucket_acl(&PutBucketAclRequest {
-            bucket: bucket_request(name, requester),
+            bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
             acl: PutBucketAclInput::Canned(acl),
         })
     }
@@ -11783,8 +11800,11 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<GetBucketAclResult, ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.get_bucket_acl(&bucket_request(name, requester))
+        coord.get_bucket_acl(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn put_object_tags_test(
@@ -11796,9 +11816,14 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
-        assert!(expected_bucket_owner.is_none());
         coord.put_object_tags(&PutObjectTagsRequest {
-            object: object_version_request(bucket, key, version_id, requester),
+            object: object_version_request_with_expected_owner(
+                bucket,
+                key,
+                version_id,
+                requester,
+                expected_bucket_owner,
+            ),
             tags,
         })
     }
@@ -11811,8 +11836,13 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<Option<String>, ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.get_object_tags(&object_version_request(bucket, key, version_id, requester))
+        coord.get_object_tags(&object_version_request_with_expected_owner(
+            bucket,
+            key,
+            version_id,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn put_object_retention_test(
@@ -11874,9 +11904,14 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<VersionId, ServerError> {
-        assert!(expected_bucket_owner.is_none());
         coord.put_object_acl(&PutObjectAclRequest {
-            object: object_version_request(bucket, key, version_id, requester),
+            object: object_version_request_with_expected_owner(
+                bucket,
+                key,
+                version_id,
+                requester,
+                expected_bucket_owner,
+            ),
             acl: PutObjectAclInput::Grants(acl_grants),
         })
     }
@@ -11890,9 +11925,14 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<VersionId, ServerError> {
-        assert!(expected_bucket_owner.is_none());
         coord.put_object_acl(&PutObjectAclRequest {
-            object: object_version_request(bucket, key, version_id, requester),
+            object: object_version_request_with_expected_owner(
+                bucket,
+                key,
+                version_id,
+                requester,
+                expected_bucket_owner,
+            ),
             acl: PutObjectAclInput::Canned(acl),
         })
     }
@@ -11905,8 +11945,13 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<GetObjectAclResult, ServerError> {
-        assert!(expected_bucket_owner.is_none());
-        coord.get_object_acl(&object_version_request(bucket, key, version_id, requester))
+        coord.get_object_acl(&object_version_request_with_expected_owner(
+            bucket,
+            key,
+            version_id,
+            requester,
+            expected_bucket_owner,
+        ))
     }
 
     fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
@@ -11954,6 +11999,7 @@ mod tests {
             policy: PutObjectPolicyContext::default(),
             encryption: ObjectEncryption::None,
             object_lock: ObjectLockState::default(),
+            expected_bucket_owner: None,
         })
     }
 
@@ -11971,6 +12017,7 @@ mod tests {
             part_number,
             requester: TEST_REQUESTER,
             sse_customer: None,
+            expected_bucket_owner: None,
         })
     }
 
@@ -12526,6 +12573,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("111122223333"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -12548,6 +12596,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::anonymous(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -12560,6 +12609,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("111122223333"),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"bar");
@@ -12587,6 +12637,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("111122223333"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -12609,6 +12660,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("arn:aws:iam::111122223333:user/reader"),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"bar");
@@ -12636,6 +12688,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("111122223333"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -12658,6 +12711,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("444455556666"),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -12685,6 +12739,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("111122223333"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -12707,6 +12762,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("evil.amazonaws.com"),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -12896,6 +12952,7 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -12951,6 +13008,7 @@ mod tests {
                 sse_customer: None,
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -12962,6 +13020,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -13009,6 +13068,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -13032,6 +13092,7 @@ mod tests {
                 claimed_checksum: None,
                 requester: requester.clone(),
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13049,6 +13110,7 @@ mod tests {
                 claimed_checksum: None,
                 requester,
                 sse_customer: None,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -13116,6 +13178,7 @@ mod tests {
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -13338,6 +13401,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: writer_requester,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13386,6 +13450,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(resp.objects.is_empty());
@@ -13411,6 +13476,7 @@ mod tests {
                 version_id_marker: None,
                 max_keys: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(resp.versions.is_empty());
@@ -13440,6 +13506,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -13451,6 +13518,7 @@ mod tests {
                 upload_id_marker: None,
                 max_uploads: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(resp.uploads.len(), 1);
@@ -13480,6 +13548,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13513,6 +13582,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13525,6 +13595,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.tags.as_deref(), Some(tags_xml));
@@ -13573,6 +13644,7 @@ mod tests {
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL.into(),
+                    expected_bucket_owner: None,
                 },
             );
             tx.send(res).unwrap();
@@ -13627,6 +13699,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             });
             tx.send(res).unwrap();
         });
@@ -13704,6 +13777,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13719,6 +13793,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, 4);
@@ -13772,6 +13847,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13785,6 +13861,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -13798,6 +13875,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             });
             tx.send(res).unwrap();
         });
@@ -13852,6 +13930,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -13865,6 +13944,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -13879,6 +13959,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             });
             tx.send(res).unwrap();
         });
@@ -13897,6 +13978,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             }),
             Err(ServerError::ObjectNotFound { .. })
         ));
@@ -13941,6 +14023,7 @@ mod tests {
                 claimed_checksum: None,
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             });
             tx.send(res).unwrap();
         });
@@ -14005,6 +14088,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14018,6 +14102,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"Hello, world!");
@@ -14056,6 +14141,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14068,6 +14154,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"{}");
@@ -14102,6 +14189,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14114,6 +14202,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, 4);
@@ -14143,6 +14232,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14161,6 +14251,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14173,6 +14264,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"v2");
@@ -14201,6 +14293,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14213,6 +14306,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"");
@@ -14242,6 +14336,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14253,6 +14348,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -14264,6 +14360,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -14292,6 +14389,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14317,6 +14415,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -14340,6 +14439,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
     }
@@ -14367,6 +14467,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14385,6 +14486,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14403,6 +14505,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14415,6 +14518,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 3);
@@ -14447,6 +14551,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14465,6 +14570,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14483,6 +14589,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14495,6 +14602,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 2);
@@ -14523,6 +14631,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14541,6 +14650,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14559,6 +14669,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14577,6 +14688,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14589,6 +14701,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 1);
@@ -14620,6 +14733,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14632,6 +14746,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"data");
@@ -14775,6 +14890,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14791,6 +14907,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -14820,6 +14937,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14834,6 +14952,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -14863,6 +14982,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14879,6 +14999,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(first.body.read_all().unwrap(), data);
@@ -14892,6 +15013,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(second.body.read_all().unwrap(), data);
@@ -14923,6 +15045,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14939,6 +15062,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -14969,6 +15093,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -14986,6 +15111,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         let err = obj.body.read_all().unwrap_err();
@@ -15017,6 +15143,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15031,6 +15158,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -15060,6 +15188,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15077,6 +15206,7 @@ mod tests {
                 range: ByteRange::Range { start: 0, end: 4 },
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"Hello");
@@ -15107,6 +15237,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15122,6 +15253,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -15151,6 +15283,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15175,6 +15308,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -15211,6 +15345,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15236,6 +15371,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -15268,6 +15404,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -15290,6 +15427,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -15318,6 +15456,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15330,6 +15469,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.etag, obj.etag);
@@ -15342,6 +15482,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.etag, head.etag);
@@ -15370,6 +15511,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15388,6 +15530,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15406,6 +15549,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15424,6 +15568,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15442,6 +15587,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15455,6 +15601,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 2,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(
@@ -15475,6 +15622,7 @@ mod tests {
                 continuation_token: Some(&token),
                 max_keys: 2,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(
@@ -15509,6 +15657,7 @@ mod tests {
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL.into(),
+                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -15522,6 +15671,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 3,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         // With delimiter "/", all entries become common prefixes
@@ -15550,6 +15700,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -15590,6 +15741,7 @@ mod tests {
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL.into(),
+                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -15604,6 +15756,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 3,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 3);
@@ -15636,6 +15789,7 @@ mod tests {
                     cond: NO_WRITE,
                     requester: TEST_REQUESTER,
                     acl: NO_PUT_OBJECT_ACL.into(),
+                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -15650,6 +15804,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 2,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page1.objects.len(), 2);
@@ -15665,6 +15820,7 @@ mod tests {
                 continuation_token: Some(token),
                 max_keys: 2,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page2.objects.len(), 2);
@@ -15680,6 +15836,7 @@ mod tests {
                 continuation_token: Some(token2),
                 max_keys: 2,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page3.objects.len(), 1);
@@ -15710,6 +15867,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15728,6 +15886,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15746,6 +15905,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15764,6 +15924,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15777,6 +15938,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         // top.jpg is a direct child, 2024/ and 2025/ are common prefixes
@@ -15811,6 +15973,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15823,6 +15986,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 1);
@@ -15853,6 +16017,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15865,6 +16030,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 0,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.objects.is_empty());
@@ -15896,6 +16062,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15908,6 +16075,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 0,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.objects.is_empty());
@@ -15928,6 +16096,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -15946,6 +16115,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -15974,6 +16144,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -15992,6 +16163,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16021,6 +16193,8 @@ mod tests {
                 entries: &entries,
                 bypass_governance: false,
                 requester: TEST_REQUESTER,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.deleted.len(), 3);
@@ -16035,6 +16209,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .is_err());
         assert!(coord
@@ -16045,6 +16220,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .is_err());
     }
@@ -16066,6 +16242,8 @@ mod tests {
                 entries: &entries,
                 bypass_governance: false,
                 requester: TEST_REQUESTER,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -16103,6 +16281,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -16125,6 +16304,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
@@ -16217,6 +16398,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16231,6 +16413,7 @@ mod tests {
                 range: ByteRange::Range { start: 0, end: 4 },
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"Hello");
@@ -16262,6 +16445,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16276,6 +16460,7 @@ mod tests {
                 range: ByteRange::Suffix { length: 6 },
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"World!");
@@ -16306,6 +16491,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16320,6 +16506,7 @@ mod tests {
                 range: ByteRange::FromStart { start: 7 },
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"World!");
@@ -16348,6 +16535,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16362,6 +16550,7 @@ mod tests {
                 range: ByteRange::FromStart { start: 100 },
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRange { total_size: 5 }));
@@ -16390,6 +16579,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16407,6 +16597,8 @@ mod tests {
                 },
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"Hello");
@@ -16440,6 +16632,7 @@ mod tests {
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16468,6 +16661,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16488,6 +16682,7 @@ mod tests {
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16517,6 +16712,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16536,6 +16732,7 @@ mod tests {
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16549,6 +16746,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"v2");
@@ -16577,6 +16775,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16596,6 +16795,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16616,6 +16816,7 @@ mod tests {
                 cond: &cond,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16645,6 +16846,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("other-user"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16679,6 +16881,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: PutObjectAcl::PublicRead.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16766,6 +16969,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: PutObjectAcl::PublicRead.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16795,6 +16999,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: PutObjectAcl::BucketOwnerRead.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16828,6 +17033,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: PutObjectAcl::Invalid("definitely-not-a-real-acl").into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -16885,6 +17091,7 @@ mod tests {
                         AclPermission::ReadAcp,
                     ),
                 ])),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -16897,6 +17104,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: grantee_requester.clone(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(object.body.read_all().unwrap(), b"granted-read");
@@ -16965,6 +17173,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: writer_requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -17032,6 +17241,7 @@ mod tests {
                     AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
                     AclPermission::Write,
                 )])),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -17084,6 +17294,7 @@ mod tests {
                     AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
                     AclPermission::Read,
                 )])),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -17112,6 +17323,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -17167,6 +17379,7 @@ mod tests {
                     cond: NO_WRITE,
                     requester: Requester::principal("owner-a"),
                     acl: NO_PUT_OBJECT_ACL.into(),
+                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -17180,6 +17393,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(object.body.read_all().unwrap(), b"public");
@@ -17193,6 +17407,7 @@ mod tests {
                     version_id: None,
                     cond: NO_READ,
                     requester: Requester::principal("other-user"),
+                    expected_bucket_owner: None,
                 })
                 .unwrap_err();
             assert!(matches!(err, ServerError::AccessDenied));
@@ -17232,6 +17447,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -17313,6 +17529,7 @@ mod tests {
                     cond: NO_WRITE,
                     requester: Requester::principal("owner-a"),
                     acl: NO_PUT_OBJECT_ACL.into(),
+                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -17326,6 +17543,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(source.body.read_all().unwrap(), b"public-foo");
@@ -17346,6 +17564,8 @@ mod tests {
                     key: "public/foo",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "dst",
                 dst_key: "copied",
@@ -17357,6 +17577,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(copied.version_id, VersionId::Null);
@@ -17369,6 +17591,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(copied_body.body.read_all().unwrap(), b"public-foo");
@@ -17380,6 +17603,8 @@ mod tests {
                     key: "private/foo",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "dst",
                 dst_key: "denied",
@@ -17391,6 +17616,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -17431,6 +17658,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -17442,6 +17670,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(source.body.read_all().unwrap(), b"public-foo");
@@ -17462,6 +17691,8 @@ mod tests {
                     key: "public/foo",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "dst",
                 dst_key: "copied",
@@ -17473,6 +17704,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -17483,6 +17716,8 @@ mod tests {
                     key: "public/foo",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "dst",
                 dst_key: "denied",
@@ -17494,6 +17729,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -17527,6 +17764,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("other-user"),
                 acl: PutObjectAcl::None.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -17546,6 +17784,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("other-user"),
                 acl: PutObjectAcl::PublicRead.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -17580,6 +17819,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("other-user"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -17602,6 +17842,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("other-user"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -17697,6 +17938,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("other-user"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -17728,6 +17970,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(denied, ServerError::AccessDenied));
@@ -17746,6 +17989,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(!upload.upload_id.is_empty());
@@ -17779,6 +18023,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(denied, ServerError::AccessDenied));
@@ -17819,6 +18064,7 @@ mod tests {
                     cond: NO_WRITE,
                     requester: Requester::principal("owner-a"),
                     acl: NO_PUT_OBJECT_ACL.into(),
+                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -17836,6 +18082,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -17846,6 +18093,8 @@ mod tests {
                     key: "public/foo",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "dst",
                 dst_key: "copied",
@@ -17855,6 +18104,8 @@ mod tests {
                 requester: Requester::principal("other-user"),
                 source_sse_customer: None,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(!copied_part.etag.is_empty());
@@ -17866,6 +18117,8 @@ mod tests {
                     key: "private/foo",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "dst",
                 dst_key: "copied",
@@ -17875,6 +18128,8 @@ mod tests {
                 requester: Requester::principal("other-user"),
                 source_sse_customer: None,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(denied, ServerError::AccessDenied));
@@ -17902,6 +18157,7 @@ mod tests {
                 policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         coord
@@ -17917,6 +18173,7 @@ mod tests {
                 policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -17967,6 +18224,7 @@ mod tests {
                     cond: NO_WRITE,
                     requester: Requester::principal("owner-a"),
                     acl: NO_PUT_OBJECT_ACL.into(),
+                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -17991,6 +18249,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(denied_object, ServerError::AccessDenied));
@@ -18033,6 +18292,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18051,6 +18311,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(first.body.read_all().unwrap(), b"data");
@@ -18069,6 +18330,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18103,6 +18365,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18116,6 +18379,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             });
             tx.send(res.map(|result| result.body.read_all())).unwrap();
         });
@@ -18158,6 +18422,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18216,6 +18481,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: owner_requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18247,6 +18513,7 @@ mod tests {
                 cond: NO_DELETE,
                 requester: owner_requester,
                 bypass_governance: true,
+                expected_bucket_owner: None,
             });
             tx.send(res).unwrap();
         });
@@ -18330,6 +18597,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18376,6 +18644,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18417,6 +18686,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: PutObjectAcl::PublicRead.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18458,6 +18728,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("writer-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18508,6 +18779,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18520,6 +18792,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18544,6 +18817,8 @@ mod tests {
                 entries: &entries,
                 bypass_governance: false,
                 requester: Requester::principal("other-user"),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.deleted.is_empty());
@@ -18574,6 +18849,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18586,6 +18862,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18621,6 +18898,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("writer-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18633,6 +18911,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("writer-a"),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"writer-owned");
@@ -18668,6 +18947,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("writer-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18680,6 +18960,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::principal("owner-a"),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18707,6 +18988,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: PutObjectAcl::PublicRead.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18719,6 +19001,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::anonymous(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"public");
@@ -18746,6 +19029,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: PutObjectAcl::PublicRead.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18763,6 +19047,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: Requester::anonymous(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18780,6 +19065,7 @@ mod tests {
             .head_bucket(&HeadBucketRequest {
                 bucket: "bucket",
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18797,6 +19083,7 @@ mod tests {
             .head_bucket(&HeadBucketRequest {
                 bucket: "bucket",
                 requester: Requester::principal("111122223333"),
+                expected_bucket_owner: None,
             })
             .unwrap();
         Coordinator::ensure_expected_bucket_owner(&info, Some("111122223333")).unwrap();
@@ -18815,6 +19102,7 @@ mod tests {
             .head_bucket(&HeadBucketRequest {
                 bucket: "bucket",
                 requester: Requester::principal("111122223333"),
+                expected_bucket_owner: None,
             })
             .unwrap();
         let err =
@@ -18834,6 +19122,7 @@ mod tests {
             .head_bucket(&HeadBucketRequest {
                 bucket: "bucket",
                 requester: Requester::anonymous(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(info.name, "bucket");
@@ -18861,6 +19150,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18873,6 +19163,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18900,6 +19191,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18917,6 +19209,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.objects.len(), 1);
@@ -18945,6 +19238,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -18962,6 +19256,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 1000,
                 requester: Requester::anonymous(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -18979,6 +19274,8 @@ mod tests {
             .delete_bucket(&DeleteBucketRequest {
                 name: "bucket",
                 requester: Requester::principal("other-user"),
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19004,6 +19301,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19029,6 +19327,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -19043,6 +19342,7 @@ mod tests {
                 claimed_checksum: None,
                 requester: Requester::principal("other-user"),
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -19074,6 +19374,7 @@ mod tests {
                 acl: PutObjectAcl::PublicRead.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
@@ -19099,6 +19400,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -19111,6 +19413,8 @@ mod tests {
                 claimed_checksum: None,
                 requester: Requester::principal("other-user"),
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19136,6 +19440,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -19145,6 +19450,7 @@ mod tests {
                 key: "key",
                 upload_id: &upload.upload_id,
                 requester: Requester::principal("other-user"),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19167,6 +19473,7 @@ mod tests {
                 policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19192,6 +19499,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -19203,6 +19511,7 @@ mod tests {
                 part_number: 1,
                 requester: Requester::principal("other-user"),
                 sse_customer: None,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19230,6 +19539,7 @@ mod tests {
                 policy: PutObjectPolicyContext::default(),
                 encryption: ObjectEncryption::None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
@@ -19255,6 +19565,8 @@ mod tests {
                     retention: None,
                     legal_hold: StoredLegalHoldStatus::On,
                 },
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
@@ -19283,6 +19595,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19298,6 +19611,7 @@ mod tests {
                 version_id: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"data");
@@ -19325,6 +19639,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19341,6 +19656,7 @@ mod tests {
                 version_id: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -19369,6 +19685,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19384,6 +19701,7 @@ mod tests {
                 version_id: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::NotModified { .. }));
@@ -19412,6 +19730,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19427,6 +19746,7 @@ mod tests {
                 version_id: None,
                 cond: &cond,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::NotModified { .. }));
@@ -19455,6 +19775,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19467,6 +19788,7 @@ mod tests {
                 bypass_governance: false,
                 cond: &cond,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(coord
@@ -19477,6 +19799,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .is_err());
     }
@@ -19503,6 +19826,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19516,6 +19840,7 @@ mod tests {
                 bypass_governance: false,
                 cond: &cond,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -19552,6 +19877,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19571,6 +19897,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19584,6 +19911,7 @@ mod tests {
                 bypass_governance: false,
                 cond: &cond,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(
@@ -19600,6 +19928,7 @@ mod tests {
                 version_id: Some(v1.version_id),
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(v1_obj.body.read_all().unwrap(), b"v1");
@@ -19628,6 +19957,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19646,6 +19976,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19669,6 +20000,8 @@ mod tests {
                 entries: &entries,
                 bypass_governance: false,
                 requester: TEST_REQUESTER,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.deleted.len(), 1);
@@ -19700,6 +20033,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19716,6 +20050,7 @@ mod tests {
                 range: ByteRange::Range { start: 0, end: 4 },
                 cond: &cond,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"Hello");
@@ -19749,6 +20084,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19760,6 +20096,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -19771,6 +20109,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -19783,6 +20123,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"hello copy");
@@ -19814,6 +20155,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19825,6 +20167,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "dst-bucket",
                 dst_key: "dst",
@@ -19836,6 +20180,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19872,6 +20218,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("writer-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19883,6 +20230,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -19894,6 +20243,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -19940,6 +20291,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: owner_requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -19975,6 +20327,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -19986,6 +20340,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -19997,6 +20353,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: writer_requester.clone(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(copied.body.read_all().unwrap(), b"granted-copy");
@@ -20042,6 +20399,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20053,6 +20411,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -20064,6 +20424,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
@@ -20091,6 +20453,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: Requester::principal("owner-a"),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20107,6 +20470,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -20118,6 +20483,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -20152,6 +20519,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20163,6 +20531,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -20174,6 +20544,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -20185,6 +20557,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.system_metadata.content_type(), Some("image/png"));
@@ -20220,6 +20593,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20234,6 +20608,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -20249,6 +20625,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -20260,6 +20638,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"data");
@@ -20295,6 +20674,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20309,6 +20689,8 @@ mod tests {
                     key: "key",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "key",
@@ -20324,6 +20706,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -20335,6 +20719,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"data");
@@ -20366,6 +20751,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20377,6 +20763,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -20388,6 +20776,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -20399,6 +20789,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.tags.as_deref(), Some(tags_xml));
@@ -20431,6 +20822,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20442,6 +20834,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -20453,6 +20847,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -20464,6 +20860,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.tags.as_deref(), Some(dst_tags));
@@ -20494,6 +20891,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20510,6 +20908,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -20525,6 +20925,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -20536,6 +20938,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"hello");
@@ -20570,6 +20973,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20584,6 +20988,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -20599,6 +21005,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -20610,6 +21018,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), data);
@@ -20650,6 +21059,8 @@ mod tests {
                     key: "no-such-key",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -20661,6 +21072,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -20688,6 +21101,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20699,6 +21113,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "no-bucket",
                 dst_key: "dst",
@@ -20710,6 +21126,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -20737,6 +21155,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20752,6 +21171,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: &src_cond,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -20763,6 +21184,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -20791,6 +21214,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20809,6 +21233,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20821,6 +21246,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -20832,6 +21259,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::PreconditionFailed));
@@ -20860,6 +21289,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20878,6 +21308,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20890,6 +21321,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -20901,6 +21334,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -20913,6 +21348,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"new data");
@@ -20947,6 +21383,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -20958,6 +21395,8 @@ mod tests {
                     key: "key",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "dst-bucket",
                 dst_key: "key",
@@ -20969,6 +21408,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -20980,6 +21421,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"cross bucket data");
@@ -20994,6 +21436,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(src.body.read_all().unwrap(), b"cross bucket data");
@@ -21079,6 +21522,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21097,6 +21541,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21186,6 +21631,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21204,6 +21650,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21599,6 +22046,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: owner_requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21666,6 +22114,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: owner_requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21756,6 +22205,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: owner_requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21825,6 +22275,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: owner_requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -21993,6 +22444,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22018,6 +22470,8 @@ mod tests {
                     key: "source",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "dst",
                 dst_key: "copied",
@@ -22032,6 +22486,8 @@ mod tests {
                     retention: None,
                     legal_hold: StoredLegalHoldStatus::On,
                 },
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
@@ -22151,6 +22607,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: owner_requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22181,6 +22638,7 @@ mod tests {
                 cond: NO_DELETE,
                 requester: owner_requester,
                 bypass_governance: true,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -22218,6 +22676,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: owner_requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22248,6 +22707,7 @@ mod tests {
                 cond: NO_DELETE,
                 requester: other_requester,
                 bypass_governance: true,
+                expected_bucket_owner: None,
             })
             .unwrap();
     }
@@ -22312,6 +22772,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22337,6 +22798,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: requester.clone(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(delete_marker.delete_marker);
@@ -22350,6 +22812,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: requester.clone(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -22362,6 +22825,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: requester.clone(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         coord
@@ -22372,6 +22836,7 @@ mod tests {
                 bypass_governance: true,
                 cond: NO_DELETE,
                 requester,
+                expected_bucket_owner: None,
             })
             .unwrap();
     }
@@ -22408,6 +22873,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22429,6 +22895,7 @@ mod tests {
                 bypass_governance: true,
                 cond: NO_DELETE,
                 requester: requester.clone(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -22450,6 +22917,7 @@ mod tests {
                 bypass_governance: true,
                 cond: NO_DELETE,
                 requester,
+                expected_bucket_owner: None,
             })
             .unwrap();
     }
@@ -22488,6 +22956,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: owner_requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22500,6 +22969,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: writer_requester.clone(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -22518,6 +22988,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: owner_requester.clone(),
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22544,6 +23015,7 @@ mod tests {
                 bypass_governance: true,
                 cond: NO_DELETE,
                 requester: writer_requester,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -22657,6 +23129,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -22696,6 +23169,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22736,6 +23210,7 @@ mod tests {
                 policy: PutObjectPolicyContext::default(),
                 encryption,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -22762,6 +23237,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: Some(&sse_customer),
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -22784,6 +23260,7 @@ mod tests {
                 part_number: 1,
                 requester: TEST_REQUESTER,
                 sse_customer: Some(&sse_customer),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -22812,6 +23289,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22841,6 +23319,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22852,6 +23331,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.version_id, VersionId::Null);
@@ -22880,6 +23360,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -22891,6 +23372,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.version_id, VersionId::Null);
@@ -22955,6 +23437,7 @@ mod tests {
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
                         acl: NO_PUT_OBJECT_ACL.into(),
+                        expected_bucket_owner: None,
                     },
                 )
             });
@@ -22975,6 +23458,7 @@ mod tests {
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
                         acl: NO_PUT_OBJECT_ACL.into(),
+                        expected_bucket_owner: None,
                     },
                 )
             });
@@ -23031,6 +23515,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -23063,6 +23548,7 @@ mod tests {
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
                         acl: NO_PUT_OBJECT_ACL.into(),
+                        expected_bucket_owner: None,
                     },
                 )
             });
@@ -23075,6 +23561,7 @@ mod tests {
                     version_id: None,
                     cond: NO_READ,
                     requester: TEST_REQUESTER,
+                    expected_bucket_owner: None,
                 })
             });
 
@@ -23141,6 +23628,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -23175,6 +23663,7 @@ mod tests {
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
                         acl: NO_PUT_OBJECT_ACL.into(),
+                        expected_bucket_owner: None,
                     },
                 )
             });
@@ -23186,6 +23675,8 @@ mod tests {
                         key: "src",
                         version_id: None,
                         condition: NO_READ,
+
+                        expected_bucket_owner: None,
                     },
                     dst_bucket: "dst-bucket",
                     dst_key: &dst_key_for_copy,
@@ -23197,6 +23688,8 @@ mod tests {
                     source_sse_customer: None,
                     dst_sse_customer: None,
                     object_lock: ObjectLockState::default(),
+
+                    expected_bucket_owner: None,
                 })
             });
 
@@ -23222,6 +23715,7 @@ mod tests {
                     version_id: None,
                     cond: NO_READ,
                     requester: TEST_REQUESTER,
+                    expected_bucket_owner: None,
                 })
                 .unwrap();
             let data = copied_obj.body.read_all().unwrap();
@@ -23274,6 +23768,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -23295,6 +23790,7 @@ mod tests {
                     acl: NO_PUT_OBJECT_ACL.into(),
                     sse_customer: None,
                     object_lock: ObjectLockState::default(),
+                    expected_bucket_owner: None,
                 })
                 .unwrap();
             let dst_key_for_copy = dst_key.clone();
@@ -23323,6 +23819,7 @@ mod tests {
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
                         acl: NO_PUT_OBJECT_ACL.into(),
+                        expected_bucket_owner: None,
                     },
                 )
             });
@@ -23334,6 +23831,8 @@ mod tests {
                         key: "src",
                         version_id: None,
                         condition: NO_READ,
+
+                        expected_bucket_owner: None,
                     },
                     dst_bucket: "bucket",
                     dst_key: &dst_key_for_copy,
@@ -23343,6 +23842,8 @@ mod tests {
                     requester: TEST_REQUESTER,
                     source_sse_customer: None,
                     sse_customer: None,
+
+                    expected_bucket_owner: None,
                 })
             });
 
@@ -23370,6 +23871,8 @@ mod tests {
                     sse_customer: None,
                     claimed_checksum: None,
                     requester: TEST_REQUESTER,
+
+                    expected_bucket_owner: None,
                 })
                 .unwrap();
 
@@ -23381,6 +23884,7 @@ mod tests {
                     version_id: None,
                     cond: NO_READ,
                     requester: TEST_REQUESTER,
+                    expected_bucket_owner: None,
                 })
                 .unwrap();
             let data = copied_obj.body.read_all().unwrap();
@@ -23433,6 +23937,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -23464,6 +23969,7 @@ mod tests {
                         cond: NO_WRITE,
                         requester: TEST_REQUESTER,
                         acl: NO_PUT_OBJECT_ACL.into(),
+                        expected_bucket_owner: None,
                     },
                 )
             });
@@ -23476,6 +23982,7 @@ mod tests {
                     bypass_governance: false,
                     cond: NO_DELETE,
                     requester: TEST_REQUESTER,
+                    expected_bucket_owner: None,
                 })
             });
 
@@ -23500,6 +24007,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             });
             match check {
                 Ok(obj) => {
@@ -23557,6 +24065,7 @@ mod tests {
                     version_id: None,
                     cond: NO_READ,
                     requester: TEST_REQUESTER,
+                    expected_bucket_owner: None,
                 })
                 .and_then(|result| result.body.read_all())
         });
@@ -23570,6 +24079,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
         });
         sync.delete_reached.wait();
@@ -23631,6 +24141,7 @@ mod tests {
                     part_number: 2,
                     cond: NO_READ,
                     requester: TEST_REQUESTER,
+                    expected_bucket_owner: None,
                 })
                 .and_then(|res| {
                     let part_start = res.part_start;
@@ -23648,6 +24159,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
         });
         sync.delete_reached.wait();
@@ -23731,6 +24243,7 @@ mod tests {
                     version_id: None,
                     cond: NO_READ,
                     requester: TEST_REQUESTER,
+                    expected_bucket_owner: None,
                 })
                 .and_then(|result| result.body.read_all())
         });
@@ -23744,6 +24257,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
         });
         sync.delete_reached.wait();
@@ -23794,6 +24308,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -23810,6 +24325,8 @@ mod tests {
                     key: &copy_key,
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "race-bucket",
                 dst_key: "dst",
@@ -23819,6 +24336,8 @@ mod tests {
                 requester: TEST_REQUESTER,
                 source_sse_customer: None,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
         });
         sync.snapshot_reached.wait();
@@ -23831,6 +24350,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
         });
         sync.delete_reached.wait();
@@ -23884,6 +24404,8 @@ mod tests {
                     key: "race-key-copy",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "dst-bucket",
                 dst_key: "copied",
@@ -23895,6 +24417,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
         });
         sync.snapshot_reached.wait();
@@ -23907,6 +24431,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
         });
         sync.delete_reached.wait();
@@ -23929,6 +24454,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(dst.body.read_all().unwrap(), expected);
@@ -23957,6 +24483,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -23968,6 +24495,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.version_id, VersionId::Null);
@@ -23998,6 +24526,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24028,6 +24557,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         let r2 = coord
@@ -24043,6 +24573,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_ne!(r1.upload_id, r2.upload_id);
@@ -24067,6 +24598,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -24088,6 +24620,7 @@ mod tests {
                 upload_id_marker: None,
                 max_uploads: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.uploads.is_empty());
@@ -24116,6 +24649,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         let r2 = coord
@@ -24131,6 +24665,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24142,6 +24677,7 @@ mod tests {
                 upload_id_marker: None,
                 max_uploads: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
@@ -24204,6 +24740,7 @@ mod tests {
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24215,6 +24752,7 @@ mod tests {
                 upload_id_marker: None,
                 max_uploads: 1000,
                 requester: Requester::authenticated(writer.clone()),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.uploads.len(), 1);
@@ -24288,6 +24826,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24302,6 +24841,7 @@ mod tests {
                 claimed_checksum: None,
                 requester: other_requester.clone(),
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -24318,6 +24858,7 @@ mod tests {
                 claimed_checksum: None,
                 requester: writer_requester.clone(),
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -24330,6 +24871,7 @@ mod tests {
                 part_number_marker: None,
                 max_parts: 100,
                 requester: other_requester.clone(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -24342,6 +24884,7 @@ mod tests {
                 part_number_marker: None,
                 max_parts: 100,
                 requester: writer_requester.clone(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(parts.parts.len(), 1);
@@ -24353,6 +24896,7 @@ mod tests {
                 key: "key",
                 upload_id: &upload.upload_id,
                 requester: other_requester,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -24386,6 +24930,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -24443,6 +24988,7 @@ mod tests {
                 acl: PutObjectAcl::BucketOwnerFullControl.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24468,6 +25014,8 @@ mod tests {
                 claimed_checksum: None,
                 requester: writer_requester.clone(),
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(completed, ServerError::AccessDenied));
@@ -24483,6 +25031,7 @@ mod tests {
                 claimed_checksum: None,
                 requester: writer_requester.clone(),
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -24496,6 +25045,7 @@ mod tests {
                 part_number_marker: None,
                 max_parts: 100,
                 requester: writer_requester.clone(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(list_parts.parts.is_empty());
@@ -24506,6 +25056,7 @@ mod tests {
                 key: "key",
                 upload_id: &upload.upload_id,
                 requester: writer_requester,
+                expected_bucket_owner: None,
             })
             .unwrap();
     }
@@ -24533,6 +25084,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         let r2 = coord
@@ -24548,6 +25100,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24559,6 +25112,7 @@ mod tests {
                 upload_id_marker: None,
                 max_uploads: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
@@ -24598,6 +25152,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         coord
@@ -24613,6 +25168,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         coord
@@ -24628,6 +25184,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24640,6 +25197,7 @@ mod tests {
                 upload_id_marker: None,
                 max_uploads: 2,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page1.uploads.len(), 2);
@@ -24658,6 +25216,7 @@ mod tests {
                 upload_id_marker: page1.next_upload_id_marker.as_deref(),
                 max_uploads: 2,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page2.uploads.len(), 1);
@@ -24687,6 +25246,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         coord
@@ -24702,6 +25262,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         coord
@@ -24717,6 +25278,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24728,6 +25290,7 @@ mod tests {
                 upload_id_marker: None,
                 max_uploads: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.uploads.len(), 2);
@@ -24756,6 +25319,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24767,6 +25331,7 @@ mod tests {
                 upload_id_marker: None,
                 max_uploads: 0,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.uploads.is_empty());
@@ -24786,6 +25351,7 @@ mod tests {
                 upload_id_marker: None,
                 max_uploads: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
@@ -24818,6 +25384,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24859,6 +25426,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24945,6 +25513,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -24957,6 +25526,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -24979,6 +25549,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25055,6 +25626,7 @@ mod tests {
                     acl: NO_PUT_OBJECT_ACL.into(),
                     sse_customer: None,
                     object_lock: ObjectLockState::default(),
+                    expected_bucket_owner: None,
                 })
                 .unwrap();
             upload_ids.push(r.upload_id);
@@ -25069,6 +25641,7 @@ mod tests {
                 upload_id_marker: None,
                 max_uploads: 2,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page1.uploads.len(), 2);
@@ -25087,6 +25660,7 @@ mod tests {
                 upload_id_marker: page1.next_upload_id_marker.as_deref(),
                 max_uploads: 2,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page2.uploads.len(), 1);
@@ -25130,6 +25704,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25145,6 +25720,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -25194,6 +25770,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25210,6 +25787,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -25227,6 +25805,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -25264,6 +25843,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25279,6 +25859,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -25307,6 +25888,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25322,6 +25904,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -25348,6 +25931,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -25376,6 +25960,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25391,6 +25976,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -25406,6 +25992,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -25421,6 +26008,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -25464,6 +26052,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25481,6 +26070,7 @@ mod tests {
                     claimed_checksum: None,
                     requester: TEST_REQUESTER,
                     sse_customer: None,
+                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -25515,6 +26105,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25531,6 +26122,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -25547,6 +26139,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -25579,6 +26172,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25595,6 +26189,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -25616,6 +26211,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -25644,6 +26240,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25661,6 +26258,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap()
@@ -25677,6 +26275,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap()
@@ -25693,6 +26292,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap()
@@ -25734,6 +26334,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -25749,6 +26350,7 @@ mod tests {
                     claimed_checksum: None,
                     requester: TEST_REQUESTER,
                     sse_customer: None,
+                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -25786,6 +26388,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25839,6 +26443,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25857,6 +26463,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -25905,6 +26512,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
@@ -25934,6 +26543,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 1 }));
@@ -25962,6 +26573,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPartOrder));
@@ -25993,6 +26606,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(
@@ -26022,6 +26637,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.etag.ends_with("-1\""));
@@ -26049,6 +26666,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26062,6 +26680,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
@@ -26090,6 +26710,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::EntityTooSmall { .. }));
@@ -26108,6 +26730,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -26130,6 +26753,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.etag.ends_with("-2\""));
@@ -26158,6 +26783,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPartOrder));
@@ -26184,6 +26811,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result1.etag.ends_with("-1\""));
@@ -26206,6 +26835,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result2.etag.ends_with("-2\""));
@@ -26245,6 +26876,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26257,6 +26890,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 100,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(list.objects.len(), 1);
@@ -26296,6 +26930,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26307,6 +26943,7 @@ mod tests {
                 version_id_marker: None,
                 max_keys: 100,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(versions.versions.len(), 1);
@@ -26338,6 +26975,7 @@ mod tests {
                 upload_id: &upload_id,
 
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26354,6 +26992,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -26371,6 +27010,7 @@ mod tests {
                 upload_id_marker: None,
                 max_uploads: 100,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(uploads.uploads.is_empty());
@@ -26391,6 +27031,7 @@ mod tests {
                 upload_id: "no-such-upload",
 
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -26421,6 +27062,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26432,6 +27074,7 @@ mod tests {
                 upload_id: &create.upload_id,
 
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26443,6 +27086,7 @@ mod tests {
                 upload_id: &create.upload_id,
 
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -26476,6 +27120,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26486,6 +27131,7 @@ mod tests {
                 upload_id: &create.upload_id,
 
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -26515,6 +27161,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26526,6 +27174,7 @@ mod tests {
                 upload_id: &upload_id,
 
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -26542,6 +27191,7 @@ mod tests {
                 continuation_token: None,
                 max_keys: 100,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(list.objects.len(), 1);
@@ -26570,6 +27220,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         test_helpers::upload_part(
@@ -26584,6 +27235,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -26595,6 +27247,7 @@ mod tests {
                 upload_id: &create.upload_id,
 
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26610,6 +27263,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap_err();
@@ -26644,6 +27298,7 @@ mod tests {
                 part_number_marker: None,
                 max_parts: 100,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.parts.len(), 3);
@@ -26679,6 +27334,7 @@ mod tests {
                 part_number_marker: None,
                 max_parts: 2,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page1.parts.len(), 2);
@@ -26696,6 +27352,7 @@ mod tests {
                 part_number_marker: page1.next_part_number_marker,
                 max_parts: 2,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(page2.parts.len(), 2);
@@ -26723,6 +27380,7 @@ mod tests {
                 part_number_marker: None,
                 max_parts: 100,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.parts.len(), 1);
@@ -26755,6 +27413,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26766,6 +27425,7 @@ mod tests {
                 part_number_marker: None,
                 max_parts: 100,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -26790,6 +27450,7 @@ mod tests {
                 part_number_marker: None,
                 max_parts: 100,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -26820,6 +27481,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26836,6 +27498,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -26851,6 +27514,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -26863,6 +27527,7 @@ mod tests {
                 part_number_marker: None,
                 max_parts: 100,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.parts.len(), 1);
@@ -26892,6 +27557,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         test_helpers::upload_part(
@@ -26906,6 +27572,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -26925,6 +27592,7 @@ mod tests {
                 part_number_marker: None,
                 max_parts: 100,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -26955,6 +27623,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -26972,6 +27641,7 @@ mod tests {
                 upload_id: &create.upload_id,
 
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -27011,6 +27681,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -27027,6 +27698,7 @@ mod tests {
 
                     requester: TEST_REQUESTER,
                     sse_customer: None,
+                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -27046,6 +27718,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap()
     }
@@ -27069,6 +27743,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -27085,6 +27760,7 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -27130,6 +27806,8 @@ mod tests {
                 claimed_checksum: None,
 
                 requester: TEST_REQUESTER,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -27160,6 +27838,7 @@ mod tests {
                 version_id: None,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), expected);
@@ -27186,6 +27865,7 @@ mod tests {
                 version_id: None,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"only-part");
@@ -27214,6 +27894,7 @@ mod tests {
                 version_id: None,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, total_size as u64);
@@ -27244,6 +27925,7 @@ mod tests {
                 range: ByteRange::Range { start: 10, end: 19 },
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(range.body.read_all().unwrap(), vec![0xAA; 10]);
@@ -27284,6 +27966,7 @@ mod tests {
                 },
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         let mut expected = vec![0xAA; 4];
@@ -27314,6 +27997,7 @@ mod tests {
                 range: ByteRange::Suffix { length: 50 },
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(range.body.read_all().unwrap(), vec![0xBB; 50]);
@@ -27344,6 +28028,8 @@ mod tests {
                     key: "src-key",
                     version_id: None,
                     condition: &ReadCondition::default(),
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "dst-bucket",
                 dst_key: "dst-key",
@@ -27355,6 +28041,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -27367,6 +28055,7 @@ mod tests {
                 version_id: None,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(dst.body.read_all().unwrap(), expected);
@@ -27390,6 +28079,7 @@ mod tests {
                 version_id: None,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(obj.body.read_all().unwrap().is_empty());
@@ -27417,6 +28107,7 @@ mod tests {
                 version_id: None,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), expected);
@@ -27442,6 +28133,7 @@ mod tests {
                 part_number: 1,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.body.read_all().unwrap().is_empty());
@@ -27473,6 +28165,7 @@ mod tests {
                 part_number: 1,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), part1);
@@ -27490,6 +28183,7 @@ mod tests {
                 part_number: 2,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(result.body.read_all().unwrap().is_empty());
@@ -27522,6 +28216,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -27536,6 +28231,7 @@ mod tests {
                 part_number: 1,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.part_size, 11);
@@ -27553,6 +28249,7 @@ mod tests {
                 part_number: 2,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidPart { part_number: 2 }));
@@ -27581,6 +28278,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -27594,6 +28292,7 @@ mod tests {
                 part_number: 1,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.part_size, 0);
@@ -27619,6 +28318,7 @@ mod tests {
                 version_id: None,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, 0);
@@ -27644,6 +28344,8 @@ mod tests {
                     key: "key",
                     version_id: None,
                     condition: &ReadCondition::default(),
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "dst",
                 dst_key: "key",
@@ -27655,6 +28357,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -27666,6 +28370,7 @@ mod tests {
                 version_id: None,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(dst.body.read_all().unwrap().is_empty());
@@ -27707,6 +28412,7 @@ mod tests {
                 version_id: None,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap()
             .body
@@ -27746,6 +28452,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         let mut complete_parts = Vec::new();
@@ -27764,6 +28471,7 @@ mod tests {
                     claimed_checksum: Some(&claim),
                     requester: TEST_REQUESTER,
                     sse_customer: None,
+                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -27807,6 +28515,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -27858,6 +28568,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -27903,6 +28615,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -27947,6 +28661,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -27995,6 +28711,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -28047,6 +28765,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -28078,6 +28798,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -28124,6 +28846,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(
@@ -28193,6 +28917,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, full_data.len() as u64);
@@ -28232,6 +28957,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -28264,6 +28990,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         let checksum = head.system_metadata.checksum().unwrap();
@@ -28283,6 +29010,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -28309,6 +29037,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: Some(&sse_customer),
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -28324,6 +29053,7 @@ mod tests {
                     claimed_checksum: None,
                     requester: TEST_REQUESTER,
                     sse_customer: Some(&sse_customer),
+                    expected_bucket_owner: None,
                 },
             )
             .unwrap();
@@ -28394,6 +29124,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, 0);
@@ -28442,6 +29173,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(obj.tags.as_deref(), Some(tags_xml));
@@ -28474,6 +29206,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -28663,6 +29396,7 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -28705,6 +29439,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, new_data.len() as u64);
@@ -28734,6 +29469,7 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -28929,6 +29665,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(head.size, 5);
@@ -28942,6 +29679,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"hello");
@@ -28997,6 +29735,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), full_data);
@@ -29078,6 +29817,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(first.body.read_all().unwrap(), data);
@@ -29091,6 +29831,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(second.body.read_all().unwrap(), data);
@@ -29145,6 +29886,7 @@ mod tests {
                 range: ByteRange::Range { start: 0, end: 3 },
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(r1.body.read_all().unwrap(), b"AAAA");
@@ -29159,6 +29901,7 @@ mod tests {
                 range: ByteRange::Range { start: 2, end: 5 },
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(r2.body.read_all().unwrap(), b"AABB");
@@ -29173,6 +29916,7 @@ mod tests {
                 range: ByteRange::Range { start: 4, end: 7 },
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(r3.body.read_all().unwrap(), b"BBBB");
@@ -29187,6 +29931,7 @@ mod tests {
                 range: ByteRange::Suffix { length: 3 },
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(r4.body.read_all().unwrap(), b"BBB");
@@ -29233,6 +29978,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -29244,6 +29991,8 @@ mod tests {
                 source_sse_customer: None,
                 dst_sse_customer: None,
                 object_lock: ObjectLockState::default(),
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -29267,6 +30016,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"copy-me");
@@ -29295,6 +30045,7 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -29316,6 +30067,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(get.body.read_all().unwrap(), b"tiny-data");
@@ -29345,6 +30097,7 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -29383,6 +30136,7 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -29410,6 +30164,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(get.body.read_all().unwrap(), data);
@@ -29439,6 +30194,7 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -29466,6 +30222,7 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -29522,6 +30279,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"");
@@ -29570,6 +30328,7 @@ mod tests {
                 part_number: 1,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"partdata");
@@ -29619,6 +30378,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(r1.body.read_all().unwrap(), b"stream-data");
@@ -29639,6 +30399,7 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -29652,6 +30413,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(r2.body.read_all().unwrap(), b"normal-data");
@@ -29699,6 +30461,7 @@ mod tests {
                 bypass_governance: false,
                 cond: &crate::conditional::DeleteCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -29711,6 +30474,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -29763,6 +30527,7 @@ mod tests {
                 bypass_governance: false,
                 cond: NO_DELETE,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -29828,6 +30593,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -29839,6 +30605,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -29848,6 +30616,8 @@ mod tests {
                 requester: TEST_REQUESTER,
                 source_sse_customer: None,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert!(!result.etag.is_empty());
@@ -29908,6 +30678,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -29918,6 +30689,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -29927,6 +30700,8 @@ mod tests {
                 requester: TEST_REQUESTER,
                 source_sse_customer: None,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -29938,6 +30713,7 @@ mod tests {
                 part_number_marker: None,
                 max_parts: 1000,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(parts.checksum_algorithm, Some(ChecksumAlgorithm::Crc32c));
@@ -29968,6 +30744,8 @@ mod tests {
                 sse_customer: None,
                 claimed_checksum: None,
                 requester: TEST_REQUESTER,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -29979,6 +30757,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(copied.body.read_all().unwrap(), data);
@@ -30007,6 +30786,7 @@ mod tests {
                 cond: NO_WRITE,
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -30023,6 +30803,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -30033,6 +30814,8 @@ mod tests {
                     key: "src",
                     version_id: None,
                     condition: NO_READ,
+
+                    expected_bucket_owner: None,
                 },
                 dst_bucket: "bucket",
                 dst_key: "dst",
@@ -30042,6 +30825,8 @@ mod tests {
                 requester: Requester::principal("other-user"),
                 source_sse_customer: None,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
@@ -30207,6 +30992,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -30271,6 +31057,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -30335,6 +31122,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -30381,6 +31169,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
         let mpu_b = coord
@@ -30396,6 +31185,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -30446,6 +31236,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -30459,6 +31251,7 @@ mod tests {
                 part_number: 1,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(
@@ -30478,6 +31271,8 @@ mod tests {
 
                 requester: TEST_REQUESTER,
                 sse_customer: None,
+
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -30491,6 +31286,7 @@ mod tests {
                 part_number: 1,
                 cond: &ReadCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(
@@ -30528,6 +31324,7 @@ mod tests {
                 acl: NO_PUT_OBJECT_ACL.into(),
                 sse_customer: None,
                 object_lock: ObjectLockState::default(),
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -30587,6 +31384,7 @@ mod tests {
                 upload_id: &mpu.upload_id,
 
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -30701,6 +31499,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"safe-data");
@@ -30729,6 +31528,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -30742,6 +31542,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::ObjectNotFound { .. }));
@@ -30818,6 +31619,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         let data = result.body.read_all().unwrap();
@@ -30850,6 +31652,7 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -30900,6 +31703,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         let err = result.body.read_all().unwrap_err();
@@ -30952,6 +31756,7 @@ mod tests {
                 bypass_governance: false,
                 cond: &crate::conditional::DeleteCondition::default(),
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
 
@@ -30971,6 +31776,7 @@ mod tests {
                 cond: &WriteCondition::default(),
                 requester: TEST_REQUESTER,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                expected_bucket_owner: None,
             },
         )
         .unwrap();
@@ -30984,6 +31790,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"v2-normal");
@@ -31054,6 +31861,7 @@ mod tests {
                 version_id: None,
                 cond: NO_READ,
                 requester: TEST_REQUESTER,
+                expected_bucket_owner: None,
             })
             .unwrap();
         assert_eq!(result.body.read_all().unwrap(), b"new-data");
