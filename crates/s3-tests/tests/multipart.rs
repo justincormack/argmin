@@ -2700,6 +2700,103 @@ fn test_anon_create_multipart_upload_public_write_bucket_fail() {
 }
 
 #[test]
+fn test_signed_create_multipart_upload_public_write_bucket_rejects_existing_owner_key() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_public_write_bucket(client).await;
+        let key = "multipart-existing-owner-key";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"owner-body"))
+            .send()
+            .await
+            .unwrap();
+
+        let create = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+        assert_eq!(err_status(&create), 403);
+        assert_s3_err_code(&create, "AccessDenied");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_upload_allows_owner_key_created_after_public_write_initiation() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_public_write_bucket(client).await;
+        let key = "multipart-public-write-race";
+
+        let create = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"owner-body"))
+            .send()
+            .await
+            .unwrap();
+
+        let data = vec![b'x'; 1024];
+        let upload_part = alt_client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(data.clone()))
+            .send()
+            .await
+            .unwrap();
+
+        let complete = alt_client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(upload_part.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            complete.e_tag().is_some(),
+            "expected CompleteMultipartUpload to return an ETag"
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_multipart_initiator_cannot_continue_after_bucket_acl_change() {
     s3_tests::run(async {
         let client = CTX.client();

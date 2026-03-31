@@ -3671,7 +3671,25 @@ impl Coordinator {
         key: &str,
         policy_context: PutObjectPolicyContext<'_>,
         policy: Option<&auth::BucketPolicy>,
+        existing_object: Option<&StoredObject>,
     ) -> Result<bool, ServerError> {
+        let default_allowed = if let Some(object) = existing_object {
+            requester.principal_opt() == Some(bucket.owner_principal.as_str())
+                || Self::requester_has_acl_permission(
+                    requester,
+                    &bucket.acl_grants,
+                    AclPermission::Write,
+                )
+                || (Self::effective_public_write(bucket)
+                    && Self::requester_matches_owner_identity(requester, object.owner()))
+        } else {
+            Self::requester_can_object_write(
+                requester,
+                &bucket.owner_principal,
+                &bucket.acl_grants,
+                Self::effective_public_write(bucket),
+            )
+        };
         let can_put_object = Self::requester_can_put_object_action_with_bucket_policy(
             requester,
             bucket,
@@ -3679,12 +3697,7 @@ impl Coordinator {
             auth::PolicyAction::PutObject,
             policy_context,
             policy,
-            Self::requester_can_object_write(
-                requester,
-                &bucket.owner_principal,
-                &bucket.acl_grants,
-                Self::effective_public_write(bucket),
-            ),
+            default_allowed,
         )?;
         if !can_put_object {
             return Ok(false);
@@ -4414,6 +4427,7 @@ impl Coordinator {
         expected_bucket_owner: Option<&str>,
     ) -> Result<BucketSummary, ServerError> {
         let info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
+        let existing_object = self.put_target_existing_live_object(bucket, key)?;
         let bucket_policy = self.cached_bucket_policy(&info)?;
         if Self::requester_can_put_object_with_bucket_policy(
             requester,
@@ -4421,6 +4435,7 @@ impl Coordinator {
             key,
             policy_context,
             bucket_policy.as_deref(),
+            existing_object.as_ref(),
         )? {
             Ok(info)
         } else {
@@ -6516,6 +6531,22 @@ impl Coordinator {
         }
     }
 
+    fn put_target_existing_live_object(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<StoredObject>, ServerError> {
+        let meta_pg_id = self.object_pg_id(bucket, key);
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+        match meta_pg.get_object_meta(bucket, key) {
+            Ok(object @ StoredObject::Live(_)) => Ok(Some(object)),
+            Ok(StoredObject::DeleteMarker(_)) | Err(storage::MetadataError::ObjectNotFound) => {
+                Ok(None)
+            }
+            Err(err) => Err(ServerError::Metadata(err)),
+        }
+    }
+
     /// Put an object, using a direct single-segment commit when possible.
     pub fn put_object(&self, req: &PutObjectRequest<'_>) -> Result<PutObjectResult, ServerError> {
         let policy_context = req.effective_policy_context();
@@ -6596,6 +6627,8 @@ impl Coordinator {
 
         self.with_bucket_write_reservation(req.object.bucket_name(), |bucket_info| {
             Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
+            let existing_object =
+                self.put_target_existing_live_object(req.object.bucket_name(), req.object.key)?;
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             if !Self::requester_can_put_object_with_bucket_policy(
                 req.object.requester(),
@@ -6603,6 +6636,7 @@ impl Coordinator {
                 req.object.key,
                 policy_context,
                 bucket_policy.as_deref(),
+                existing_object.as_ref(),
             )? {
                 return Err(ServerError::AccessDenied);
             }
@@ -6770,6 +6804,7 @@ impl Coordinator {
         let key = req.object.key;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
             Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
+            let existing_object = self.put_target_existing_live_object(bucket, key)?;
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             if !Self::requester_can_put_object_with_bucket_policy(
                 req.object.requester(),
@@ -6778,6 +6813,7 @@ impl Coordinator {
                 req.policy
                     .with_default_canned_acl(req.acl.policy_condition_value()),
                 bucket_policy.as_deref(),
+                existing_object.as_ref(),
             )? {
                 return Err(ServerError::AccessDenied);
             }
@@ -7272,6 +7308,7 @@ impl Coordinator {
         let tags = req.tags;
         let cond = req.cond;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
+            let existing_object = self.put_target_existing_live_object(bucket, key)?;
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             if !Self::requester_can_put_object_with_bucket_policy(
                 req.object.requester(),
@@ -7283,6 +7320,7 @@ impl Coordinator {
                         req.policy_context.request_object_tags_xml.or(req.tags),
                     ),
                 bucket_policy.as_deref(),
+                existing_object.as_ref(),
             )? {
                 return Err(ServerError::AccessDenied);
             }
@@ -10166,6 +10204,7 @@ impl Coordinator {
             if req.object.requester().is_anonymous() {
                 return Err(ServerError::AccessDenied);
             }
+            let existing_object = self.put_target_existing_live_object(bucket, key)?;
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             if !Self::requester_can_put_object_with_bucket_policy(
                 req.object.requester(),
@@ -10173,6 +10212,7 @@ impl Coordinator {
                 key,
                 policy_context,
                 bucket_policy.as_deref(),
+                existing_object.as_ref(),
             )? {
                 return Err(ServerError::AccessDenied);
             }
@@ -11970,6 +12010,24 @@ mod tests {
             Coordinator::bucket_acl_grants_from_flags(&owner, public_read, public_write);
         coord.create_bucket_with_acl_grants(&owner, name, acl_grants, object_lock_enabled)?;
         Ok(())
+    }
+
+    fn create_bucket_with_explicit_writer_grant(
+        coord: &Coordinator,
+        name: &str,
+        owner_requester: Requester,
+        writer: &AccountIdentity,
+    ) -> Result<(), ServerError> {
+        coord.create_bucket(&CreateBucketRequest {
+            name,
+            requester: owner_requester,
+            acl: CreateBucketAcl::Grants(AclGrants::new(vec![AclGrant::new(
+                AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
+                AclPermission::Write,
+            )])),
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: false,
+        })
     }
 
     fn begin_stream_put_test(
@@ -25011,21 +25069,11 @@ mod tests {
             "Writer",
         );
 
-        coord
-            .create_bucket(&CreateBucketRequest {
-                name: "bucket",
-                requester: Requester::authenticated(bucket_owner.clone()),
-                acl: CreateBucketAcl::DefaultPrivate,
-                ownership: BucketObjectOwnership::ObjectWriter,
-                object_lock_enabled: false,
-            })
-            .unwrap();
-        put_bucket_canned_acl_test(
+        create_bucket_with_explicit_writer_grant(
             &coord,
             "bucket",
-            BucketAcl::PublicReadWrite,
             Requester::authenticated(bucket_owner.clone()),
-            None,
+            &writer,
         )
         .unwrap();
         put_bucket_ownership_controls_test(&coord,
@@ -25058,7 +25106,7 @@ mod tests {
             .list_multipart_uploads(&ListMultipartUploadsRequest {
                 bucket: bucket_request_with_expected_owner(
                     "bucket",
-                    Requester::authenticated(writer.clone()),
+                    Requester::authenticated(bucket_owner.clone()),
                     None,
                 ),
                 prefix: None,
@@ -25086,7 +25134,7 @@ mod tests {
     }
 
     #[test]
-    fn multipart_operations_reject_non_initiator_on_public_write_bucket() {
+    fn multipart_operations_reject_non_initiator_with_explicit_bucket_write_grant() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         let bucket_owner = AccountIdentity::new(
@@ -25108,21 +25156,11 @@ mod tests {
         let writer_requester = Requester::authenticated(writer.clone());
         let other_requester = Requester::authenticated(other);
 
-        coord
-            .create_bucket(&CreateBucketRequest {
-                name: "bucket",
-                requester: owner_requester.clone(),
-                acl: CreateBucketAcl::DefaultPrivate,
-                ownership: BucketObjectOwnership::ObjectWriter,
-                object_lock_enabled: false,
-            })
-            .unwrap();
-        put_bucket_canned_acl_test(
+        create_bucket_with_explicit_writer_grant(
             &coord,
             "bucket",
-            BucketAcl::PublicReadWrite,
             owner_requester.clone(),
-            None,
+            &writer,
         )
         .unwrap();
 
@@ -25267,7 +25305,7 @@ mod tests {
     }
 
     #[test]
-    fn multipart_initiator_cannot_continue_after_bucket_acl_becomes_private() {
+    fn create_multipart_upload_rejects_cross_account_overwrite_on_public_write_bucket() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         let bucket_owner = AccountIdentity::new(
@@ -25283,21 +25321,220 @@ mod tests {
         let owner_requester = Requester::authenticated(bucket_owner.clone());
         let writer_requester = Requester::authenticated(writer.clone());
 
-        coord
-            .create_bucket(&CreateBucketRequest {
-                name: "bucket",
-                requester: owner_requester.clone(),
-                acl: CreateBucketAcl::DefaultPrivate,
-                ownership: BucketObjectOwnership::ObjectWriter,
-                object_lock_enabled: false,
-            })
-            .unwrap();
-        put_bucket_canned_acl_test(
+        create_bucket_for_owner_with_flags(
+            &coord,
+            bucket_owner.principal(),
+            bucket_owner.canonical_user_id(),
+            "bucket",
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        put_bucket_ownership_controls_test(
             &coord,
             "bucket",
-            BucketAcl::PublicReadWrite,
+            "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>",
             owner_requester.clone(),
             None,
+        )
+        .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
+                data: b"owner-data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let err = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner("bucket", "key", writer_requester, None),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+                sse_customer: None,
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn complete_multipart_upload_allows_owner_object_created_after_public_write_initiation() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let bucket_owner = AccountIdentity::new(
+            "owner-a",
+            CanonicalUserId::from_principal("bucket-owner-canonical"),
+            "Bucket Owner",
+        );
+        let writer = AccountIdentity::new(
+            "writer-a",
+            CanonicalUserId::from_principal("writer-canonical"),
+            "Writer",
+        );
+        let owner_requester = Requester::authenticated(bucket_owner.clone());
+        let writer_requester = Requester::authenticated(writer.clone());
+
+        create_bucket_for_owner_with_flags(
+            &coord,
+            bucket_owner.principal(),
+            bucket_owner.canonical_user_id(),
+            "bucket",
+            false,
+            true,
+            false,
+        )
+        .unwrap();
+        put_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>",
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    writer_requester.clone(),
+                    None,
+                ),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+                sse_customer: None,
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
+                data: b"owner-data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let uploaded = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    writer_requester.clone(),
+                    None,
+                ),
+                part_number: 1,
+                data: b"multipart-data",
+                claimed_checksum: None,
+
+                sse_customer: None,
+            },
+        )
+        .unwrap();
+
+        coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    writer_requester.clone(),
+                    None,
+                ),
+                parts: &[CompletePart {
+                    part_number: 1,
+                    etag: uploaded.etag.clone(),
+                    checksum: None,
+                }],
+                claimed_checksum: None,
+                sse_customer: None,
+            })
+            .unwrap();
+
+        let object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    writer_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(object.body.read_all().unwrap(), b"multipart-data");
+    }
+
+    #[test]
+    fn multipart_initiator_cannot_continue_after_explicit_bucket_write_grant_becomes_private() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let bucket_owner = AccountIdentity::new(
+            "owner-a",
+            CanonicalUserId::from_principal("bucket-owner-canonical"),
+            "Bucket Owner",
+        );
+        let writer = AccountIdentity::new(
+            "writer-a",
+            CanonicalUserId::from_principal("writer-canonical"),
+            "Writer",
+        );
+        let owner_requester = Requester::authenticated(bucket_owner.clone());
+        let writer_requester = Requester::authenticated(writer.clone());
+
+        create_bucket_with_explicit_writer_grant(
+            &coord,
+            "bucket",
+            owner_requester.clone(),
+            &writer,
         )
         .unwrap();
         put_bucket_ownership_controls_test(&coord,
