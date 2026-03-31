@@ -23,6 +23,7 @@ const SSE_C_CHECKSUM_METADATA_VERSION: u8 = 1;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SseCustomerRequest {
+    algorithm: String,
     customer_key: [u8; SSE_C_CUSTOMER_KEY_LEN],
     customer_key_md5_b64: String,
 }
@@ -31,9 +32,21 @@ impl SseCustomerRequest {
     #[must_use]
     pub fn new(customer_key: [u8; SSE_C_CUSTOMER_KEY_LEN], customer_key_md5_b64: String) -> Self {
         Self {
+            algorithm: SSE_CUSTOMER_ALGORITHM.to_string(),
             customer_key,
             customer_key_md5_b64,
         }
+    }
+
+    #[must_use]
+    pub fn with_algorithm(mut self, algorithm: String) -> Self {
+        self.algorithm = algorithm;
+        self
+    }
+
+    #[must_use]
+    pub fn algorithm(&self) -> &str {
+        &self.algorithm
     }
 
     #[must_use]
@@ -52,7 +65,7 @@ impl SseCustomerRequest {
 impl fmt::Debug for SseCustomerRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SseCustomerRequest")
-            .field("algorithm", &SSE_CUSTOMER_ALGORITHM)
+            .field("algorithm", &self.algorithm)
             .field("customer_key_md5_b64", &self.customer_key_md5_b64)
             .finish()
     }

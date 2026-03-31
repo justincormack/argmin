@@ -459,14 +459,19 @@ impl Drop for EncodeScratch<'_> {
 fn encode_parity_scratch_len(ec_config: EcConfig) -> usize {
     let k = ec_config.data_shards as usize;
     let m = ec_config.parity_shards as usize;
-    let padded = INTERNAL_SEGMENT_SIZE.div_ceil(k) * k;
+    let padded = max_stored_segment_size().div_ceil(k) * k;
     let shard_size = padded / k;
     shard_size.saturating_mul(m)
 }
 
 fn segment_payload_buffer_capacity(ec_config: EcConfig) -> usize {
     let k = ec_config.data_shards as usize;
-    INTERNAL_SEGMENT_SIZE.div_ceil(k) * k
+    max_stored_segment_size().div_ceil(k) * k
+}
+
+fn max_stored_segment_size() -> usize {
+    // SSE-C stores an authentication tag alongside the largest logical segment.
+    INTERNAL_SEGMENT_SIZE.saturating_add(SSE_C_SEGMENT_TAG_LEN)
 }
 
 #[derive(Clone)]
@@ -1094,6 +1099,7 @@ pub struct PutObjectPolicyContext<'a> {
     pub copy_source: Option<&'a str>,
     pub metadata_directive: Option<&'a str>,
     pub canned_acl: Option<&'a str>,
+    pub sse_customer_algorithm: Option<&'a str>,
     pub grant_read: Option<&'a str>,
     pub grant_write: Option<&'a str>,
     pub grant_read_acp: Option<&'a str>,
@@ -1113,6 +1119,7 @@ impl<'a> PutObjectPolicyContext<'a> {
             copy_source,
             metadata_directive,
             canned_acl,
+            sse_customer_algorithm: None,
             grant_read: None,
             grant_write: None,
             grant_read_acp: None,
@@ -1120,6 +1127,15 @@ impl<'a> PutObjectPolicyContext<'a> {
             grant_full_control: None,
             request_object_tags_xml: None,
         }
+    }
+
+    #[must_use]
+    pub const fn with_sse_customer_algorithm(
+        mut self,
+        sse_customer_algorithm: Option<&'a str>,
+    ) -> Self {
+        self.sse_customer_algorithm = sse_customer_algorithm;
+        self
     }
 
     #[must_use]
@@ -3468,6 +3484,7 @@ impl Coordinator {
         .with_copy_source(policy_context.copy_source)
         .with_metadata_directive(policy_context.metadata_directive)
         .with_canned_acl(policy_context.canned_acl)
+        .with_sse_customer_algorithm(policy_context.sse_customer_algorithm)
         .with_grant_read(policy_context.grant_read)
         .with_grant_write(policy_context.grant_write)
         .with_grant_read_acp(policy_context.grant_read_acp)
@@ -7787,7 +7804,8 @@ impl Coordinator {
                 Some(copy_source_policy_value.as_str()),
                 metadata_directive,
                 canned_acl,
-            ),
+            )
+            .with_sse_customer_algorithm(req.dst_sse_customer.map(SseCustomerRequest::algorithm)),
             req.expected_bucket_owner(),
         )?;
 
@@ -7986,7 +8004,8 @@ impl Coordinator {
                 Some(copy_source_policy_value.as_str()),
                 metadata_directive,
                 canned_acl,
-            ),
+            )
+            .with_sse_customer_algorithm(req.dst_sse_customer.map(SseCustomerRequest::algorithm)),
             encryption: dst_write_sse_customer
                 .as_ref()
                 .map(|ctx| ctx.encryption().clone())
@@ -8067,6 +8086,9 @@ impl Coordinator {
                     Some(copy_source_policy_value.as_str()),
                     metadata_directive,
                     acl.policy_condition_value(),
+                )
+                .with_sse_customer_algorithm(
+                    req.dst_sse_customer.map(SseCustomerRequest::algorithm),
                 )
                 .with_request_object_tags_xml(tags.as_deref()),
                 requested_object_lock: req.object_lock,
@@ -10222,7 +10244,8 @@ impl Coordinator {
             },
         );
         let policy_context =
-            PutObjectPolicyContext::new(Some(copy_source_policy_value.as_str()), None, None);
+            PutObjectPolicyContext::new(Some(copy_source_policy_value.as_str()), None, None)
+                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm));
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::upload_part_copy",
@@ -30454,6 +30477,17 @@ mod tests {
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].size, INTERNAL_SEGMENT_SIZE as u64);
         assert!(pg.list_all_stream_uploads().unwrap().is_empty());
+    }
+
+    #[test]
+    fn encode_parity_scratch_covers_max_sse_c_segment() {
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        let k = ec_config.data_shards as usize;
+        let m = ec_config.parity_shards as usize;
+        let padded = (INTERNAL_SEGMENT_SIZE + SSE_C_SEGMENT_TAG_LEN).div_ceil(k) * k;
+        let expected = (padded / k) * m;
+
+        assert_eq!(encode_parity_scratch_len(ec_config), expected);
     }
 
     #[test]

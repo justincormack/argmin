@@ -5,12 +5,46 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, create_public_bucket, disable_bucket_public_access_block, err_status,
-    unique_bucket, CTX,
+    sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
 };
 use serde_json::json;
 
 fn agent() -> ureq::Agent {
     s3_tests::test_agent()
+}
+
+fn endpoint_is_https() -> bool {
+    CTX.endpoint().starts_with("https://")
+}
+
+fn require_https_endpoint() {
+    assert!(
+        endpoint_is_https(),
+        "bucket policy SSE-C coverage requires an https:// endpoint; got {}",
+        CTX.endpoint()
+    );
+}
+
+macro_rules! with_sse_c_headers {
+    ($op:expr, $algorithm:expr, $key_b64:expr, $key_md5_b64:expr) => {{
+        $op.customize().mutate_request({
+            let algorithm = $algorithm.to_string();
+            let key_b64 = $key_b64.clone();
+            let key_md5_b64 = $key_md5_b64.clone();
+            move |req| {
+                req.headers_mut().insert(
+                    "x-amz-server-side-encryption-customer-algorithm",
+                    algorithm.clone(),
+                );
+                req.headers_mut()
+                    .insert("x-amz-server-side-encryption-customer-key", key_b64.clone());
+                req.headers_mut().insert(
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.clone(),
+                );
+            }
+        })
+    }};
 }
 
 async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[&str]) {
@@ -843,6 +877,374 @@ fn test_bucket_policy_put_obj_grant_full_control() {
 
         cleanup(&bucket, &["allowed", "denied"]).await;
         cleanup(&control_bucket, &["control"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_obj_requires_sse_c_algorithm_header() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "Null": {
+                        "s3:x-amz-server-side-encryption-customer-algorithm": "true"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = client
+            .put_object()
+            .bucket(&bucket)
+            .key("denied")
+            .body(ByteStream::from_static(b"plain"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("allowed")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64.clone())
+            .sse_customer_key_md5(key_md5_b64.clone())
+            .body(ByteStream::from_static(b"secret"))
+            .send()
+            .await
+            .unwrap();
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("allowed")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64)
+            .sse_customer_key_md5(key_md5_b64)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            get.body.collect().await.unwrap().into_bytes().as_ref(),
+            b"secret"
+        );
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_obj_sse_c_algorithm_string_not_equals() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringNotEquals": {
+                        "s3:x-amz-server-side-encryption-customer-algorithm": "AES256"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = client
+            .put_object()
+            .bucket(&bucket)
+            .key("denied")
+            .body(ByteStream::from_static(b"plain"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("allowed")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64)
+            .sse_customer_key_md5(key_md5_b64)
+            .body(ByteStream::from_static(b"secret"))
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_copy_object_recognizes_destination_sse_c_header() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("src")
+            .body(ByteStream::from_static(b"copy-source"))
+            .send()
+            .await
+            .unwrap();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "Null": {
+                        "s3:x-amz-server-side-encryption-customer-algorithm": "true"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+        with_sse_c_headers!(
+            client
+                .copy_object()
+                .bucket(&bucket)
+                .key("dst")
+                .copy_source(format!("{bucket}/src")),
+            "AES256",
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let get = with_sse_c_headers!(
+            client.get_object().bucket(&bucket).key("dst"),
+            "AES256",
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            get.body.collect().await.unwrap().into_bytes().as_ref(),
+            b"copy-source"
+        );
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_upload_part_copy_recognizes_destination_sse_c_header() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("src")
+            .body(ByteStream::from_static(b"copy-source"))
+            .send()
+            .await
+            .unwrap();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "Null": {
+                        "s3:x-amz-server-side-encryption-customer-algorithm": "true"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+        let create = with_sse_c_headers!(
+            client.create_multipart_upload().bucket(&bucket).key("dst"),
+            "AES256",
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let copied_part = with_sse_c_headers!(
+            client
+                .upload_part_copy()
+                .bucket(&bucket)
+                .key("dst")
+                .upload_id(&upload_id)
+                .part_number(1)
+                .copy_source(format!("{bucket}/src")),
+            "AES256",
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        complete_single_part_upload(
+            client,
+            &bucket,
+            "dst",
+            &upload_id,
+            copied_part.copy_part_result().unwrap().e_tag().unwrap(),
+        )
+        .await;
+
+        let get = with_sse_c_headers!(
+            client.get_object().bucket(&bucket).key("dst"),
+            "AES256",
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            get.body.collect().await.unwrap().into_bytes().as_ref(),
+            b"copy-source"
+        );
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_streaming_put_preserves_sse_c_algorithm_casing() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringNotEquals": {
+                        "s3:x-amz-server-side-encryption-customer-algorithm": "aes256"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+        let body = vec![0x5Au8; (9 * 1024 * 1024) + 17];
+        with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .body(ByteStream::from(body.clone())),
+            "aes256",
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let get = with_sse_c_headers!(
+            client.get_object().bucket(&bucket).key("obj"),
+            "aes256",
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(
+            get.body.collect().await.unwrap().into_bytes().as_ref(),
+            body.as_slice()
+        );
+
+        cleanup(&bucket, &["obj"]).await;
     });
 }
 

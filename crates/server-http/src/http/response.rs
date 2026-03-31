@@ -1045,6 +1045,20 @@ impl S3Response {
                 let body = xml::header_not_implemented_xml("Authorization", resource, "request-id");
                 return Self::new(501).xml_body(body);
             }
+            ServerError::InvalidSseCustomerKeyMd5 => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>InvalidArgument</Code>\
+                     <Message>The calculated MD5 hash of the key did not match the hash that was provided.</Message>\
+                     <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
+                     <Resource>{}</Resource>\
+                     <RequestId>request-id</RequestId>\
+                     </Error>",
+                    xml::xml_escape(resource),
+                );
+                return Self::new(400).xml_body(body);
+            }
             _ => {}
         }
 

@@ -171,6 +171,7 @@ pub struct PolicyRequest<'a> {
     copy_source: Option<&'a str>,
     metadata_directive: Option<&'a str>,
     canned_acl: Option<&'a str>,
+    sse_customer_algorithm: Option<&'a str>,
     grant_read: Option<&'a str>,
     grant_write: Option<&'a str>,
     grant_read_acp: Option<&'a str>,
@@ -199,6 +200,7 @@ impl<'a> PolicyRequest<'a> {
             copy_source: None,
             metadata_directive: None,
             canned_acl: None,
+            sse_customer_algorithm: None,
             grant_read: None,
             grant_write: None,
             grant_read_acp: None,
@@ -226,6 +228,7 @@ impl<'a> PolicyRequest<'a> {
             copy_source: None,
             metadata_directive: None,
             canned_acl: None,
+            sse_customer_algorithm: None,
             grant_read: None,
             grant_write: None,
             grant_read_acp: None,
@@ -302,6 +305,12 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
+    pub fn with_sse_customer_algorithm(mut self, sse_customer_algorithm: Option<&'a str>) -> Self {
+        self.sse_customer_algorithm = sse_customer_algorithm;
+        self
+    }
+
+    #[must_use]
     pub fn with_grant_read(mut self, grant_read: Option<&'a str>) -> Self {
         self.grant_read = grant_read;
         self
@@ -344,6 +353,11 @@ impl<'a> PolicyRequest<'a> {
     #[must_use]
     fn canned_acl(&self) -> Option<&'a str> {
         self.canned_acl
+    }
+
+    #[must_use]
+    fn sse_customer_algorithm(&self) -> Option<&'a str> {
+        self.sse_customer_algorithm
     }
 
     #[must_use]
@@ -1017,6 +1031,9 @@ fn condition_clause_matches_request(
             string_condition_matches(clause, request.metadata_directive())
         }
         "s3:x-amz-acl" => string_condition_matches(clause, request.canned_acl()),
+        "s3:x-amz-server-side-encryption-customer-algorithm" => {
+            string_condition_matches(clause, request.sse_customer_algorithm())
+        }
         "s3:x-amz-grant-read" => string_condition_matches(clause, request.grant_read()),
         "s3:x-amz-grant-write" => string_condition_matches(clause, request.grant_write()),
         "s3:x-amz-grant-read-acp" => string_condition_matches(clause, request.grant_read_acp()),
@@ -1038,6 +1055,7 @@ fn condition_clause_supported_for_evaluable_object_actions(clause: &PolicyCondit
             "s3:x-amz-copy-source"
                 | "s3:x-amz-metadata-directive"
                 | "s3:x-amz-acl"
+                | "s3:x-amz-server-side-encryption-customer-algorithm"
                 | "s3:x-amz-grant-read"
                 | "s3:x-amz-grant-write"
                 | "s3:x-amz-grant-read-acp"
@@ -1603,6 +1621,59 @@ mod tests {
             None,
         )
         .with_grant_full_control(Some("id=someone-else"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
+    fn sse_customer_algorithm_condition_matches() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-server-side-encryption-customer-algorithm":"AES256"}}}]}"#,
+        )
+        .unwrap();
+        let request = PolicyRequest::new(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+        )
+        .with_sse_customer_algorithm(Some("AES256"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn sse_customer_algorithm_null_condition_matches_missing_header() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-server-side-encryption-customer-algorithm":"true"}}}]}"#,
+        )
+        .unwrap();
+        let request = PolicyRequest::new(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
+    fn sse_customer_algorithm_string_not_equals_matches_mismatched_header() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"s3:x-amz-server-side-encryption-customer-algorithm":"AES256"}}}]}"#,
+        )
+        .unwrap();
+        let request = PolicyRequest::new(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+        )
+        .with_sse_customer_algorithm(Some("AES192"));
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
     }

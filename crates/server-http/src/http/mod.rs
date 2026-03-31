@@ -2761,6 +2761,7 @@ impl HttpFrontend {
                 None,
                 acl.policy_condition_value(),
             )
+            .with_sse_customer_algorithm(sse_customer.as_ref().map(|ctx| ctx.request().algorithm()))
             .with_request_object_tags_xml(tags_xml.as_deref()),
             encryption: sse_customer
                 .as_ref()
@@ -2876,6 +2877,11 @@ impl HttpFrontend {
             None,
             None,
             acl.policy_condition_value(),
+        )
+        .with_sse_customer_algorithm(
+            ctx.sse_customer
+                .as_ref()
+                .map(|ctx| ctx.request().algorithm()),
         )
         .with_request_object_tags_xml(ctx.tags_xml.as_deref());
         let result = self
@@ -3615,6 +3621,9 @@ impl StreamingPutContext {
             None,
             None,
             parse_put_object_acl(self.acl_header.as_deref()).policy_condition_value(),
+            self.sse_customer
+                .as_ref()
+                .map(|ctx| ctx.request().algorithm()),
             PutObjectGrantHeaders {
                 grant_read: self.grant_read_header.as_deref(),
                 grant_write: self.grant_write_header.as_deref(),
@@ -3729,6 +3738,10 @@ const SSE_C_COPY_SOURCE_KEY_HEADER: &str = "x-amz-copy-source-server-side-encryp
 const SSE_C_COPY_SOURCE_KEY_MD5_HEADER: &str =
     "x-amz-copy-source-server-side-encryption-customer-key-md5";
 
+fn sse_customer_key_md5_mismatch_error() -> ServerError {
+    ServerError::InvalidSseCustomerKeyMd5
+}
+
 fn parse_sse_customer_request_with_names(
     req: &S3Request,
     algorithm_header: &str,
@@ -3790,13 +3803,16 @@ fn parse_sse_customer_request_with_names(
     let mut actual_md5_bytes = [0u8; 16];
     actual_md5_bytes.copy_from_slice(actual_md5.as_ref());
     if claimed_md5 != actual_md5_bytes {
-        return Err(ServerError::BadDigest);
+        return Err(sse_customer_key_md5_mismatch_error());
     }
 
-    Ok(Some(SseCustomerRequest::new(
-        customer_key_bytes,
-        base64::engine::general_purpose::STANDARD.encode(actual_md5_bytes),
-    )))
+    Ok(Some(
+        SseCustomerRequest::new(
+            customer_key_bytes,
+            base64::engine::general_purpose::STANDARD.encode(actual_md5_bytes),
+        )
+        .with_algorithm(algorithm.to_string()),
+    ))
 }
 
 fn parse_sse_customer_request(req: &S3Request) -> Result<Option<SseCustomerRequest>, ServerError> {
@@ -3872,13 +3888,16 @@ fn parse_sse_customer_form_fields(
     let mut actual_md5_bytes = [0u8; 16];
     actual_md5_bytes.copy_from_slice(actual_md5.as_ref());
     if claimed_md5 != actual_md5_bytes {
-        return Err(ServerError::BadDigest);
+        return Err(sse_customer_key_md5_mismatch_error());
     }
 
-    Ok(Some(SseCustomerRequest::new(
-        customer_key_bytes,
-        base64::engine::general_purpose::STANDARD.encode(actual_md5_bytes),
-    )))
+    Ok(Some(
+        SseCustomerRequest::new(
+            customer_key_bytes,
+            base64::engine::general_purpose::STANDARD.encode(actual_md5_bytes),
+        )
+        .with_algorithm(algorithm.to_string()),
+    ))
 }
 
 fn parse_sse_customer_copy_source_request(
@@ -4448,6 +4467,7 @@ fn put_object_policy_context_from_request<'a>(
         copy_source,
         metadata_directive,
         canned_acl,
+        req.header(SSE_C_ALGORITHM_HEADER),
         PutObjectGrantHeaders {
             grant_read: req.header("x-amz-grant-read"),
             grant_write: req.header("x-amz-grant-write"),
@@ -4472,9 +4492,11 @@ fn put_object_policy_context_from_request_fields<'a>(
     copy_source: Option<&'a str>,
     metadata_directive: Option<&'a str>,
     canned_acl: Option<&'a str>,
+    sse_customer_algorithm: Option<&'a str>,
     grants: PutObjectGrantHeaders<'a>,
 ) -> crate::coordinator::PutObjectPolicyContext<'a> {
     crate::coordinator::PutObjectPolicyContext::new(copy_source, metadata_directive, canned_acl)
+        .with_sse_customer_algorithm(sse_customer_algorithm)
         .with_request_object_tags_xml(tags_xml)
         .with_acl_grant_headers(
             grants.grant_read,
@@ -4714,6 +4736,58 @@ mod tests {
 
     fn test_headers(headers: Vec<(String, String)>) -> http::HeaderMap {
         request::header_map_from_owned(headers)
+    }
+
+    #[test]
+    fn parse_sse_customer_request_mismatched_key_md5_is_invalid_argument() {
+        use base64::Engine;
+
+        let key_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let req = new_req(
+            http::Method::PUT,
+            "/",
+            "",
+            vec![
+                (
+                    SSE_C_ALGORITHM_HEADER.to_string(),
+                    SSE_CUSTOMER_ALGORITHM.to_string(),
+                ),
+                (SSE_C_KEY_HEADER.to_string(), key_b64),
+                (
+                    SSE_C_KEY_MD5_HEADER.to_string(),
+                    "AAAAAAAAAAAAAAAAAAAAAA==".to_string(),
+                ),
+            ],
+            vec![],
+        );
+
+        match parse_sse_customer_request(&req) {
+            Err(ServerError::InvalidSseCustomerKeyMd5) => {}
+            other => panic!("expected InvalidSseCustomerKeyMd5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_customer_form_fields_mismatched_key_md5_is_invalid_argument() {
+        use base64::Engine;
+
+        let key_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let form_fields = vec![
+            (
+                SSE_C_ALGORITHM_HEADER.to_string(),
+                SSE_CUSTOMER_ALGORITHM.to_string(),
+            ),
+            (SSE_C_KEY_HEADER.to_string(), key_b64),
+            (
+                SSE_C_KEY_MD5_HEADER.to_string(),
+                "AAAAAAAAAAAAAAAAAAAAAA==".to_string(),
+            ),
+        ];
+
+        match parse_sse_customer_form_fields(TransportSecurity::Tls, &form_fields) {
+            Err(ServerError::InvalidSseCustomerKeyMd5) => {}
+            other => panic!("expected InvalidSseCustomerKeyMd5, got {other:?}"),
+        }
     }
 
     #[test]

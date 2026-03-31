@@ -390,6 +390,142 @@ fn test_sse_c_head_requires_headers() {
 }
 
 #[test]
+fn test_sse_c_put_rejects_invalid_key_md5() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, _) = sse_c_header_values(&key);
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64)
+            .sse_customer_key_md5("AAAAAAAAAAAAAAAAAAAAAA==")
+            .body(ByteStream::from_static(b"secret"))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_sse_c_put_invalid_key_md5_argument_name_matches_aws() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, _) = sse_c_header_values(&key);
+        let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
+        let headers = [
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            (
+                "x-amz-server-side-encryption-customer-key",
+                key_b64.as_str(),
+            ),
+            (
+                "x-amz-server-side-encryption-customer-key-md5",
+                "AAAAAAAAAAAAAAAAAAAAAA==",
+            ),
+        ];
+        let (status, body_text) = signed_put(&url, b"secret", &headers);
+        assert_eq!(status, 400, "body: {body_text}");
+        assert_eq!(xml_tag(&body_text, "Code"), Some("InvalidArgument"));
+        assert_eq!(
+            xml_tag(&body_text, "ArgumentName"),
+            Some("x-amz-server-side-encryption")
+        );
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_sse_c_put_requires_key_md5_header() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, _) = sse_c_header_values(&key);
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64)
+            .body(ByteStream::from_static(b"secret"))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_sse_c_put_requires_key_header() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .sse_customer_algorithm("AES256")
+            .body(ByteStream::from_static(b"secret"))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_sse_c_put_rejects_key_without_algorithm() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .sse_customer_key(key_b64)
+            .sse_customer_key_md5(key_md5_b64)
+            .body(ByteStream::from_static(b"secret"))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
 fn test_sse_c_put_requires_https() {
     s3_tests::run(async {
         let (_server, client) = insecure_local_client().await;
@@ -1114,6 +1250,45 @@ fn test_sse_c_upload_part_rejects_wrong_key() {
 }
 
 #[test]
+fn test_sse_c_upload_part_rejects_invalid_key_md5() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let create = with_sse_c_headers!(
+            client.create_multipart_upload().bucket(&bucket).key("obj"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let result = client
+            .upload_part()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .part_number(1)
+            .sse_customer_algorithm("AES256")
+            .sse_customer_key(key_b64)
+            .sse_customer_key_md5("AAAAAAAAAAAAAAAAAAAAAA==")
+            .body(ByteStream::from_static(b"secret"))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        cleanup_multipart(&bucket, "obj", &upload_id).await;
+    });
+}
+
+#[test]
 fn test_sse_c_complete_multipart_allows_missing_headers() {
     require_https_endpoint();
     s3_tests::run(async {
@@ -1537,6 +1712,59 @@ fn test_sse_c_copy_object_requires_source_headers() {
             .send()
             .await;
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_sse_c_copy_object_invalid_source_key_md5_argument_name_matches_aws() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+
+        with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("src")
+                .body(ByteStream::from_static(b"secret-copy")),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let url = format!("{}/{}/dst", CTX.endpoint(), bucket);
+        let copy_source = format!("{}/src", bucket);
+        let headers = [
+            ("x-amz-copy-source", copy_source.as_str()),
+            (
+                "x-amz-copy-source-server-side-encryption-customer-algorithm",
+                "AES256",
+            ),
+            (
+                "x-amz-copy-source-server-side-encryption-customer-key",
+                key_b64.as_str(),
+            ),
+            (
+                "x-amz-copy-source-server-side-encryption-customer-key-md5",
+                "AAAAAAAAAAAAAAAAAAAAAA==",
+            ),
+        ];
+        let (status, body_text) = signed_put(&url, &[], &headers);
+        assert_eq!(status, 400, "body: {body_text}");
+        assert_eq!(xml_tag(&body_text, "Code"), Some("InvalidArgument"));
+        assert_eq!(
+            xml_tag(&body_text, "ArgumentName"),
+            Some("x-amz-server-side-encryption")
+        );
+
+        cleanup(&bucket, "src").await;
     });
 }
 
