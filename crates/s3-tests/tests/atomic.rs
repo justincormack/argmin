@@ -7,7 +7,10 @@
 use aws_sdk_s3::primitives::ByteStream;
 use s3_tests::{err_status, unique_bucket, CTX};
 
-const SIZE: usize = 1024 * 1024; // 1 MB
+const ONE_MIB: usize = 1024 * 1024;
+const FOUR_MIB: usize = 4 * ONE_MIB;
+const EIGHT_MIB: usize = 8 * ONE_MIB;
+const TEN_MIB: usize = 10 * ONE_MIB;
 
 async fn setup_bucket() -> String {
     let client = CTX.client();
@@ -52,159 +55,168 @@ fn assert_uniform(data: &[u8], expected_len: usize) {
     );
 }
 
-/// Concurrent read during write sees either the old or new object, never mixed.
-///
-/// Matches Ceph: test_atomic_read_1mb / test_atomic_read_4mb / test_atomic_read_8mb
-#[test]
-fn test_atomic_read() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_bucket().await;
-        let key = "atomic-read";
+async fn atomic_read_case(size: usize) {
+    let client = CTX.client();
+    let bucket = setup_bucket().await;
+    let key = "atomic-read";
 
-        // Initial write: 1 MB of 'A'
-        client
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(make_body(b'A', size)))
+        .send()
+        .await
+        .unwrap();
+
+    let bucket2 = bucket.clone();
+    let write_task = tokio::spawn(async move {
+        CTX.client()
             .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from(make_body(b'A', SIZE)))
+            .bucket(&bucket2)
+            .key("atomic-read")
+            .body(ByteStream::from(make_body(b'B', size)))
             .send()
             .await
             .unwrap();
-
-        // Concurrent overwrite + read
-        let bucket2 = bucket.clone();
-        let write_task = tokio::spawn(async move {
-            CTX.client()
-                .put_object()
-                .bucket(&bucket2)
-                .key("atomic-read")
-                .body(ByteStream::from(make_body(b'B', SIZE)))
-                .send()
-                .await
-                .unwrap();
-        });
-
-        let bucket3 = bucket.clone();
-        let read_task = tokio::spawn(async move { get_body(&bucket3, "atomic-read").await });
-
-        let (write_result, read_result) = tokio::join!(write_task, read_task);
-        write_result.unwrap();
-        let body = read_result.unwrap();
-
-        // The read must see either all 'A' or all 'B', never a mix
-        assert_uniform(&body, SIZE);
-
-        // After the write completes, the object must be all 'B'
-        let final_body = get_body(&bucket, key).await;
-        assert_uniform(&final_body, SIZE);
-        assert_eq!(final_body[0], b'B');
-
-        cleanup(&bucket, &[key]).await;
     });
+
+    let bucket3 = bucket.clone();
+    let read_task = tokio::spawn(async move { get_body(&bucket3, "atomic-read").await });
+
+    let (write_result, read_result) = tokio::join!(write_task, read_task);
+    write_result.unwrap();
+    let body = read_result.unwrap();
+
+    assert_uniform(&body, size);
+
+    let final_body = get_body(&bucket, key).await;
+    assert_uniform(&final_body, size);
+    assert_eq!(final_body[0], b'B');
+
+    cleanup(&bucket, &[key]).await;
 }
 
-/// Sequential overwrite produces a clean, complete replacement.
-///
-/// Matches Ceph: test_atomic_write_1mb / test_atomic_write_4mb / test_atomic_write_8mb
-#[test]
-fn test_atomic_write() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_bucket().await;
-        let key = "atomic-write";
+async fn atomic_write_case(size: usize) {
+    let client = CTX.client();
+    let bucket = setup_bucket().await;
+    let key = "atomic-write";
 
-        // Write 'A', read back
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from(make_body(b'A', SIZE)))
-            .send()
-            .await
-            .unwrap();
-        let body = get_body(&bucket, key).await;
-        assert_uniform(&body, SIZE);
-        assert_eq!(body[0], b'A');
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(make_body(b'A', size)))
+        .send()
+        .await
+        .unwrap();
+    let body = get_body(&bucket, key).await;
+    assert_uniform(&body, size);
+    assert_eq!(body[0], b'A');
 
-        // Overwrite with 'B', read back
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from(make_body(b'B', SIZE)))
-            .send()
-            .await
-            .unwrap();
-        let body = get_body(&bucket, key).await;
-        assert_uniform(&body, SIZE);
-        assert_eq!(body[0], b'B');
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(make_body(b'B', size)))
+        .send()
+        .await
+        .unwrap();
+    let body = get_body(&bucket, key).await;
+    assert_uniform(&body, size);
+    assert_eq!(body[0], b'B');
 
-        cleanup(&bucket, &[key]).await;
-    });
+    cleanup(&bucket, &[key]).await;
 }
 
-/// Two concurrent writes — final object is entirely one or the other.
-///
-/// Matches Ceph: test_atomic_dual_write_1mb / test_atomic_dual_write_4mb / test_atomic_dual_write_8mb
-#[test]
-fn test_atomic_dual_write() {
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = setup_bucket().await;
-        let key = "atomic-dual-write";
+async fn atomic_dual_write_case(size: usize) {
+    let client = CTX.client();
+    let bucket = setup_bucket().await;
+    let key = "atomic-dual-write";
 
-        // Seed the object
-        client
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from(make_body(b'X', size)))
+        .send()
+        .await
+        .unwrap();
+
+    let bucket2 = bucket.clone();
+    let write_a = tokio::spawn(async move {
+        CTX.client()
             .put_object()
-            .bucket(&bucket)
-            .key(key)
-            .body(ByteStream::from(make_body(b'X', SIZE)))
+            .bucket(&bucket2)
+            .key("atomic-dual-write")
+            .body(ByteStream::from(make_body(b'A', size)))
             .send()
             .await
             .unwrap();
-
-        // Two concurrent overwrites
-        let bucket2 = bucket.clone();
-        let write_a = tokio::spawn(async move {
-            CTX.client()
-                .put_object()
-                .bucket(&bucket2)
-                .key("atomic-dual-write")
-                .body(ByteStream::from(make_body(b'A', SIZE)))
-                .send()
-                .await
-                .unwrap();
-        });
-
-        let bucket3 = bucket.clone();
-        let write_b = tokio::spawn(async move {
-            CTX.client()
-                .put_object()
-                .bucket(&bucket3)
-                .key("atomic-dual-write")
-                .body(ByteStream::from(make_body(b'B', SIZE)))
-                .send()
-                .await
-                .unwrap();
-        });
-
-        let (a, b) = tokio::join!(write_a, write_b);
-        a.unwrap();
-        b.unwrap();
-
-        // Must be entirely 'A' or entirely 'B'
-        let body = get_body(&bucket, key).await;
-        assert_uniform(&body, SIZE);
-        assert!(
-            body[0] == b'A' || body[0] == b'B',
-            "expected all 'A' or all 'B', got 0x{:02x}",
-            body[0],
-        );
-
-        cleanup(&bucket, &[key]).await;
     });
+
+    let bucket3 = bucket.clone();
+    let write_b = tokio::spawn(async move {
+        CTX.client()
+            .put_object()
+            .bucket(&bucket3)
+            .key("atomic-dual-write")
+            .body(ByteStream::from(make_body(b'B', size)))
+            .send()
+            .await
+            .unwrap();
+    });
+
+    let (a, b) = tokio::join!(write_a, write_b);
+    a.unwrap();
+    b.unwrap();
+
+    let body = get_body(&bucket, key).await;
+    assert_uniform(&body, size);
+    assert!(
+        body[0] == b'A' || body[0] == b'B',
+        "expected all 'A' or all 'B', got 0x{:02x}",
+        body[0],
+    );
+
+    cleanup(&bucket, &[key]).await;
 }
+
+macro_rules! atomic_size_test {
+    ($name:ident, $helper:ident, $size:expr) => {
+        #[test]
+        fn $name() {
+            s3_tests::run(async {
+                $helper($size).await;
+            });
+        }
+    };
+}
+
+// Concurrent read during write sees either the old or new object, never mixed.
+// Matches Ceph: `*_1mb`, `*_4mb`, `*_8mb`; extends coverage with `*_10mb`.
+atomic_size_test!(test_atomic_read_1mb, atomic_read_case, ONE_MIB);
+atomic_size_test!(test_atomic_read_4mb, atomic_read_case, FOUR_MIB);
+atomic_size_test!(test_atomic_read_8mb, atomic_read_case, EIGHT_MIB);
+atomic_size_test!(test_atomic_read_10mb, atomic_read_case, TEN_MIB);
+
+// Sequential overwrite produces a clean, complete replacement.
+// Matches Ceph: `*_1mb`, `*_4mb`, `*_8mb`; extends coverage with `*_10mb`.
+atomic_size_test!(test_atomic_write_1mb, atomic_write_case, ONE_MIB);
+atomic_size_test!(test_atomic_write_4mb, atomic_write_case, FOUR_MIB);
+atomic_size_test!(test_atomic_write_8mb, atomic_write_case, EIGHT_MIB);
+atomic_size_test!(test_atomic_write_10mb, atomic_write_case, TEN_MIB);
+
+// Two concurrent writes: final object is entirely one or the other.
+// Matches Ceph: `*_1mb`, `*_4mb`, `*_8mb`; extends coverage with `*_10mb`.
+atomic_size_test!(test_atomic_dual_write_1mb, atomic_dual_write_case, ONE_MIB);
+atomic_size_test!(test_atomic_dual_write_4mb, atomic_dual_write_case, FOUR_MIB);
+atomic_size_test!(
+    test_atomic_dual_write_8mb,
+    atomic_dual_write_case,
+    EIGHT_MIB
+);
+atomic_size_test!(test_atomic_dual_write_10mb, atomic_dual_write_case, TEN_MIB);
 
 /// Conditional overwrite with if_match(<etag>) succeeds atomically.
 ///
@@ -221,7 +233,7 @@ fn test_atomic_conditional_write() {
             .put_object()
             .bucket(&bucket)
             .key(key)
-            .body(ByteStream::from(make_body(b'A', SIZE)))
+            .body(ByteStream::from(make_body(b'A', ONE_MIB)))
             .send()
             .await
             .unwrap();
@@ -233,13 +245,13 @@ fn test_atomic_conditional_write() {
             .bucket(&bucket)
             .key(key)
             .if_match(&etag_a)
-            .body(ByteStream::from(make_body(b'B', SIZE)))
+            .body(ByteStream::from(make_body(b'B', ONE_MIB)))
             .send()
             .await
             .unwrap();
 
         let body = get_body(&bucket, key).await;
-        assert_uniform(&body, SIZE);
+        assert_uniform(&body, ONE_MIB);
         assert_eq!(body[0], b'B');
 
         cleanup(&bucket, &[key]).await;
@@ -261,7 +273,7 @@ fn test_atomic_dual_conditional_write() {
             .put_object()
             .bucket(&bucket)
             .key(key)
-            .body(ByteStream::from(make_body(b'A', SIZE)))
+            .body(ByteStream::from(make_body(b'A', ONE_MIB)))
             .send()
             .await
             .unwrap();
@@ -272,7 +284,7 @@ fn test_atomic_dual_conditional_write() {
             .put_object()
             .bucket(&bucket)
             .key(key)
-            .body(ByteStream::from(make_body(b'B', SIZE)))
+            .body(ByteStream::from(make_body(b'B', ONE_MIB)))
             .send()
             .await
             .unwrap();
@@ -283,14 +295,14 @@ fn test_atomic_dual_conditional_write() {
             .bucket(&bucket)
             .key(key)
             .if_match(&etag_a)
-            .body(ByteStream::from(make_body(b'C', SIZE)))
+            .body(ByteStream::from(make_body(b'C', ONE_MIB)))
             .send()
             .await;
         assert_eq!(err_status(&result), 412);
 
         // Object must still be all 'B'
         let body = get_body(&bucket, key).await;
-        assert_uniform(&body, SIZE);
+        assert_uniform(&body, ONE_MIB);
         assert_eq!(body[0], b'B');
 
         cleanup(&bucket, &[key]).await;
@@ -315,7 +327,7 @@ fn test_atomic_write_bucket_gone() {
             .put_object()
             .bucket(&bucket)
             .key("obj")
-            .body(ByteStream::from(make_body(b'A', SIZE)))
+            .body(ByteStream::from(make_body(b'A', ONE_MIB)))
             .send()
             .await;
         assert_eq!(err_status(&result), 404);
