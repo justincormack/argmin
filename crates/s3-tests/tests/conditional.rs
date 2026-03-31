@@ -1,6 +1,8 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::primitives::DateTime;
-use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+use aws_sdk_s3::types::{
+    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration,
+};
 use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 
 /// Create a bucket, returning its name.
@@ -23,6 +25,34 @@ async fn put_object(bucket: &str, key: &str, body: &'static [u8]) -> String {
         .await
         .unwrap();
     resp.e_tag().unwrap().to_string()
+}
+
+/// Create a single-part multipart upload and return `(upload_id, part_etag)`.
+async fn prepare_single_part_multipart_upload(
+    bucket: &str,
+    key: &str,
+    body: &'static [u8],
+) -> (String, String) {
+    let client = CTX.client();
+    let create = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let upload_id = create.upload_id().unwrap().to_string();
+    let part = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await
+        .unwrap();
+    (upload_id, part.e_tag().unwrap().to_string())
 }
 
 /// Cleanup helper: delete object + bucket.
@@ -533,6 +563,413 @@ fn test_put_object_ifmatch_nonexisted_failed() {
         assert_eq!(err_status(&result), 404);
 
         cleanup(&bucket, &[]).await;
+    });
+}
+
+// ── CompleteMultipartUpload write conditions ─────────────────────────────
+
+#[test]
+fn test_complete_multipart_ifnonmatch_nonexisted_good() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let (upload_id, part_etag) =
+            prepare_single_part_multipart_upload(&bucket, "obj", b"created").await;
+
+        CTX.client()
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .if_none_match("*")
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&part_etag)
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let resp = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"created");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_ifnonmatch_overwrite_existed_failed() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "obj", b"original").await;
+        let (upload_id, part_etag) =
+            prepare_single_part_multipart_upload(&bucket, "obj", b"overwrite").await;
+
+        let result = CTX
+            .client()
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .if_none_match("*")
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&part_etag)
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 412);
+        CTX.client()
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"original");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_ifmatch_good() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let etag = put_object(&bucket, "obj", b"v1").await;
+        let (upload_id, part_etag) =
+            prepare_single_part_multipart_upload(&bucket, "obj", b"v2").await;
+
+        CTX.client()
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .if_match(&etag)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&part_etag)
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let resp = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"v2");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_ifmatch_failed() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "obj", b"v1").await;
+        let (upload_id, part_etag) =
+            prepare_single_part_multipart_upload(&bucket, "obj", b"v2").await;
+
+        let result = CTX
+            .client()
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .if_match("\"0000000000000000\"")
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&part_etag)
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 412);
+        CTX.client()
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"v1");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_ifmatch_nonexisted_failed() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let (upload_id, part_etag) =
+            prepare_single_part_multipart_upload(&bucket, "obj", b"created").await;
+
+        let result = CTX
+            .client()
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .if_match("\"0000000000000000\"")
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&part_etag)
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 404);
+        CTX.client()
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_ifnonmatch_current_object_in_versioned_bucket() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let first = client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await
+            .unwrap();
+        assert!(first.version_id().is_some());
+
+        let second = client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"v2"))
+            .send()
+            .await
+            .unwrap();
+        assert!(second.version_id().is_some());
+
+        let (upload_id, part_etag) =
+            prepare_single_part_multipart_upload(&bucket, "obj", b"v3").await;
+        let result = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .if_none_match("*")
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&part_etag)
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 412);
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_ifmatch_current_object_in_versioned_bucket() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let first = client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await
+            .unwrap();
+        let first_etag = first.e_tag().unwrap().to_string();
+
+        let second = client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"v2"))
+            .send()
+            .await
+            .unwrap();
+        let second_etag = second.e_tag().unwrap().to_string();
+
+        let (stale_upload_id, stale_part_etag) =
+            prepare_single_part_multipart_upload(&bucket, "obj", b"stale").await;
+        let stale = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&stale_upload_id)
+            .if_match(&first_etag)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&stale_part_etag)
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&stale), 412);
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&stale_upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        let (upload_id, part_etag) =
+            prepare_single_part_multipart_upload(&bucket, "obj", b"v3").await;
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("obj")
+            .upload_id(&upload_id)
+            .if_match(&second_etag)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(&part_etag)
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"v3");
+
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 

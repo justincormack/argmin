@@ -2121,6 +2121,12 @@ impl HttpFrontend {
                                 expected_bucket_owner,
                             ),
                             part_number,
+                            policy_context: crate::coordinator::PutObjectPolicyContext::default()
+                                .with_sse_customer_algorithm(
+                                    sse_customer_request
+                                        .as_ref()
+                                        .map(SseCustomerRequest::algorithm),
+                                ),
                             sse_customer: sse_customer_request.as_ref(),
                         },
                     )?;
@@ -2194,6 +2200,7 @@ impl HttpFrontend {
                     }
                 })?;
                 let parts = xml::parse_complete_multipart_upload_xml(&req.body)?;
+                let cond = write_condition_from_headers(req)?;
                 // Extract object-level checksum claim from request headers as a raw
                 // string. CompleteMultipartUpload checksums may be composite ("base64-N"),
                 // so we cannot decode them as plain base64.
@@ -2211,6 +2218,7 @@ impl HttpFrontend {
                         ),
                         parts: &parts,
                         claimed_checksum: claimed_checksum.as_ref(),
+                        cond: &cond,
                         sse_customer: sse_customer.as_ref(),
                     },
                 )?;
@@ -3377,6 +3385,12 @@ impl HttpFrontend {
                     expected_bucket_owner.as_deref(),
                 ),
                 part_number,
+                policy_context: crate::coordinator::PutObjectPolicyContext::default()
+                    .with_sse_customer_algorithm(
+                        sse_customer_request
+                            .as_ref()
+                            .map(SseCustomerRequest::algorithm),
+                    ),
                 sse_customer: sse_customer_request.as_ref(),
             })?;
 
@@ -3742,6 +3756,12 @@ fn sse_customer_key_md5_mismatch_error() -> ServerError {
     ServerError::InvalidSseCustomerKeyMd5
 }
 
+fn invalid_sse_customer_algorithm_error(value: &str) -> ServerError {
+    ServerError::InvalidEncryptionAlgorithmError {
+        value: value.to_string(),
+    }
+}
+
 fn parse_sse_customer_request_with_names(
     req: &S3Request,
     algorithm_header: &str,
@@ -3772,12 +3792,8 @@ fn parse_sse_customer_request_with_names(
         return Ok(None);
     };
     require_secure_transport_for_sse_c(req.transport_security)?;
-    if !algorithm.eq_ignore_ascii_case(SSE_CUSTOMER_ALGORITHM) {
-        return Err(ServerError::InvalidArgument {
-            reason: format!(
-                "unsupported SSE-C algorithm {algorithm}; expected {SSE_CUSTOMER_ALGORITHM}"
-            ),
-        });
+    if algorithm != SSE_CUSTOMER_ALGORITHM {
+        return Err(invalid_sse_customer_algorithm_error(algorithm));
     }
 
     let decoded_key = base64::engine::general_purpose::STANDARD
@@ -3857,12 +3873,8 @@ fn parse_sse_customer_form_fields(
         return Ok(None);
     };
     require_secure_transport_for_sse_c(transport_security)?;
-    if !algorithm.eq_ignore_ascii_case(SSE_CUSTOMER_ALGORITHM) {
-        return Err(ServerError::InvalidArgument {
-            reason: format!(
-                "unsupported SSE-C algorithm {algorithm}; expected {SSE_CUSTOMER_ALGORITHM}"
-            ),
-        });
+    if algorithm != SSE_CUSTOMER_ALGORITHM {
+        return Err(invalid_sse_customer_algorithm_error(algorithm));
     }
 
     let decoded_key = base64::engine::general_purpose::STANDARD
@@ -4787,6 +4799,60 @@ mod tests {
         match parse_sse_customer_form_fields(TransportSecurity::Tls, &form_fields) {
             Err(ServerError::InvalidSseCustomerKeyMd5) => {}
             other => panic!("expected InvalidSseCustomerKeyMd5, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_customer_request_rejects_lowercase_algorithm() {
+        use base64::Engine;
+
+        let key_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let req = new_req(
+            http::Method::PUT,
+            "/",
+            "",
+            vec![
+                (SSE_C_ALGORITHM_HEADER.to_string(), "aes256".to_string()),
+                (SSE_C_KEY_HEADER.to_string(), key_b64),
+                (
+                    SSE_C_KEY_MD5_HEADER.to_string(),
+                    "cLyPS3KoaSFGi/joRB3OUQ==".to_string(),
+                ),
+            ],
+            vec![],
+        );
+
+        match parse_sse_customer_request(&req) {
+            Err(ServerError::InvalidEncryptionAlgorithmError { value }) => {
+                assert_eq!(value, "aes256");
+            }
+            other => panic!(
+                "expected InvalidEncryptionAlgorithmError for lowercase SSE-C algorithm, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn parse_sse_customer_form_fields_rejects_lowercase_algorithm() {
+        use base64::Engine;
+
+        let key_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let form_fields = vec![
+            (SSE_C_ALGORITHM_HEADER.to_string(), "aes256".to_string()),
+            (SSE_C_KEY_HEADER.to_string(), key_b64),
+            (
+                SSE_C_KEY_MD5_HEADER.to_string(),
+                "cLyPS3KoaSFGi/joRB3OUQ==".to_string(),
+            ),
+        ];
+
+        match parse_sse_customer_form_fields(TransportSecurity::Tls, &form_fields) {
+            Err(ServerError::InvalidEncryptionAlgorithmError { value }) => {
+                assert_eq!(value, "aes256");
+            }
+            other => panic!(
+                "expected InvalidEncryptionAlgorithmError for lowercase POST SSE-C algorithm, got {other:?}"
+            ),
         }
     }
 

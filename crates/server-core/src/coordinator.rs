@@ -1671,6 +1671,7 @@ pub struct CompleteMultipartUploadRequest<'a> {
     pub upload: MultipartObjectRequest<'a>,
     pub parts: &'a [CompletePart],
     pub claimed_checksum: Option<&'a EncodedChecksumClaim>,
+    pub cond: &'a WriteCondition,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
@@ -1689,6 +1690,7 @@ pub struct BeginStreamPutRequest<'a> {
 pub struct BeginStreamPartRequest<'a> {
     pub upload: MultipartObjectRequest<'a>,
     pub part_number: u32,
+    pub policy_context: PutObjectPolicyContext<'a>,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
@@ -1955,6 +1957,10 @@ impl<'a> BeginStreamPutRequest<'a> {
 impl<'a> BeginStreamPartRequest<'a> {
     fn expected_bucket_owner(&self) -> Option<&str> {
         self.upload.expected_bucket_owner()
+    }
+
+    fn effective_policy_context(&self) -> PutObjectPolicyContext<'a> {
+        self.policy_context
     }
 }
 
@@ -3199,6 +3205,24 @@ impl Coordinator {
             &bucket.acl_grants,
             Self::effective_public_write(bucket),
         ) && Self::requester_can_manage_multipart_upload(requester, bucket, upload)
+    }
+
+    fn requester_can_write_multipart_upload_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        upload: &MultipartUploadRecord,
+        policy_context: PutObjectPolicyContext<'_>,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        Self::requester_can_put_object_action_with_bucket_policy(
+            requester,
+            bucket,
+            upload.key.as_str(),
+            auth::PolicyAction::PutObject,
+            policy_context,
+            policy,
+            Self::requester_can_write_multipart_upload(requester, bucket, upload),
+        )
     }
 
     fn requester_can_manage_object_tags(
@@ -6872,6 +6896,7 @@ impl Coordinator {
         let key = req.upload.key();
         let upload_id = req.upload.upload_id;
         let part_number = req.part_number;
+        let policy_context = req.effective_policy_context();
 
         // Validate part number range.
         if part_number == 0 || part_number > 10_000 {
@@ -6881,6 +6906,7 @@ impl Coordinator {
         }
 
         let bucket_info = self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
 
         // Lock metadata PG and validate upload exists.
         let meta_pg_id = self.object_pg_id(bucket, key);
@@ -6897,11 +6923,13 @@ impl Coordinator {
                 upload_id: upload_id.to_string(),
             });
         }
-        if !Self::requester_can_write_multipart_upload(
+        if !Self::requester_can_write_multipart_upload_with_bucket_policy(
             req.upload.requester(),
             &bucket_info,
             &upload,
-        ) {
+            policy_context,
+            bucket_policy.as_deref(),
+        )? {
             return Err(ServerError::AccessDenied);
         }
         Self::ensure_sse_c_allowed(
@@ -10447,6 +10475,7 @@ impl Coordinator {
                 req.expected_bucket_owner(),
             ),
             part_number,
+            policy_context,
             sse_customer: req.sse_customer,
         })?;
         let session_id = &session.session_id;
@@ -10562,8 +10591,11 @@ impl Coordinator {
         let claimed_checksum = req.claimed_checksum;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
             Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
+            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             let meta_pg_id = self.object_pg_id(bucket, key);
             let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+            let policy_context = PutObjectPolicyContext::default()
+                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm));
 
             let upload = meta_pg.get_multipart_upload(upload_id)?;
             if upload.bucket != bucket || upload.key != key {
@@ -10576,12 +10608,28 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
-            if !Self::requester_can_write_multipart_upload(
+            if !Self::requester_can_write_multipart_upload_with_bucket_policy(
                 req.upload.requester(),
                 &bucket_info,
                 &upload,
-            ) {
+                policy_context,
+                bucket_policy.as_deref(),
+            )? {
                 return Err(ServerError::AccessDenied);
+            }
+            if !req.cond.is_empty() {
+                let existing_etag = match meta_pg.get_object_meta(bucket, key) {
+                    Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+                    Err(storage::MetadataError::ObjectNotFound) => None,
+                    Err(e) => return Err(ServerError::Metadata(e)),
+                };
+                if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
+                    return Err(ServerError::ObjectNotFound {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    });
+                }
+                check_write_conditions(req.cond, existing_etag.as_deref())?;
             }
             if parts.is_empty() {
                 return Err(ServerError::InvalidRequest {
@@ -12054,6 +12102,7 @@ mod tests {
         coord.begin_stream_part(&BeginStreamPartRequest {
             upload: multipart_object_request(bucket, key, upload_id, test_requester()),
             part_number,
+            policy_context: PutObjectPolicyContext::default(),
             sse_customer: None,
         })
     }
@@ -13190,6 +13239,7 @@ mod tests {
                     checksum: None,
                 }],
                 claimed_checksum: None,
+                cond: &WriteCondition::default(),
                 sse_customer: None,
             })
             .unwrap();
@@ -14103,6 +14153,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             });
             tx.send(res).unwrap();
@@ -14113,6 +14165,77 @@ mod tests {
         assert!(
             res.is_ok(),
             "complete_multipart_upload should succeed without waiting on bucket lock: {res:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn complete_multipart_upload_does_not_deadlock_when_bucket_policy_shares_pg() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+
+        let admin = Coordinator::new(
+            Arc::clone(&storage_node),
+            ec_config,
+            "us-east-1".to_string(),
+            None,
+        )
+        .unwrap();
+        let completer = Coordinator::new(
+            Arc::clone(&storage_node),
+            ec_config,
+            "us-east-1".to_string(),
+            None,
+        )
+        .unwrap();
+
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(
+            &admin,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"default-owner"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let bucket_pg_id = admin.bucket_pg_id("bucket");
+        let key = (0..1024)
+            .map(|i| format!("same-pg-{i}"))
+            .find(|candidate| admin.object_pg_id("bucket", candidate) == bucket_pg_id)
+            .expect("expected to find a key whose object PG matches the bucket PG");
+
+        let (upload_id, parts) = create_upload_with_parts(&admin, "bucket", &key, &[(1, b"part")]);
+
+        let (tx, rx) = mpsc::channel();
+        let key_for_complete = key.clone();
+        let handle = thread::spawn(move || {
+            let res = completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    &key_for_complete,
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &parts,
+                claimed_checksum: None,
+                cond: &WriteCondition::default(),
+                sse_customer: None,
+            });
+            tx.send(res).unwrap();
+        });
+
+        let res = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("complete_multipart_upload should not deadlock on bucket policy lookup");
+        assert!(
+            res.is_ok(),
+            "complete_multipart_upload should succeed when bucket policy shares the metadata PG: {res:?}"
         );
         handle.join().unwrap();
     }
@@ -16464,6 +16587,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -19700,6 +19825,8 @@ mod tests {
                 parts: &[],
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap_err();
@@ -19810,7 +19937,7 @@ mod tests {
                     None,
                 ),
                 part_number: 1,
-
+                policy_context: PutObjectPolicyContext::default(),
                 sse_customer: None,
             })
             .unwrap_err();
@@ -23598,7 +23725,7 @@ mod tests {
                     None,
                 ),
                 part_number: 1,
-
+                policy_context: PutObjectPolicyContext::default(),
                 sse_customer: Some(&sse_customer),
             })
             .unwrap_err();
@@ -24223,6 +24350,7 @@ mod tests {
                     }],
                     sse_customer: None,
                     claimed_checksum: None,
+                    cond: &WriteCondition::default(),
                 })
                 .unwrap();
 
@@ -25493,6 +25621,7 @@ mod tests {
                     checksum: None,
                 }],
                 claimed_checksum: None,
+                cond: &WriteCondition::default(),
                 sse_customer: None,
             })
             .unwrap();
@@ -25587,6 +25716,8 @@ mod tests {
                     checksum: None,
                 }],
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -26971,6 +27102,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap();
@@ -27026,6 +27159,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -27096,6 +27231,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap_err();
@@ -27128,6 +27265,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap_err();
@@ -27158,6 +27297,8 @@ mod tests {
                 ),
                 parts: &reversed,
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -27193,6 +27334,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap_err();
@@ -27224,6 +27367,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -27267,6 +27412,8 @@ mod tests {
                 parts: &[],
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap_err();
@@ -27297,6 +27444,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -27344,6 +27493,8 @@ mod tests {
                 parts: &retry_parts,
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap();
@@ -27375,6 +27526,8 @@ mod tests {
                 parts: &duped,
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap_err();
@@ -27404,6 +27557,8 @@ mod tests {
                 parts: &parts1,
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap();
@@ -27428,6 +27583,8 @@ mod tests {
                 ),
                 parts: &parts2,
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -27470,6 +27627,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -27523,6 +27682,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -27744,6 +27905,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -28304,6 +28467,7 @@ mod tests {
                 upload: multipart_object_request(bucket, key, &create.upload_id, test_requester()),
                 parts: &complete_parts,
                 claimed_checksum: None,
+                cond: &WriteCondition::default(),
                 sse_customer: None,
             })
             .unwrap()
@@ -28377,6 +28541,7 @@ mod tests {
                 ],
                 sse_customer: None,
                 claimed_checksum: None,
+                cond: &WriteCondition::default(),
             })
             .unwrap();
 
@@ -29115,6 +29280,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap();
@@ -29169,6 +29336,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap();
@@ -29217,6 +29386,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap();
@@ -29263,6 +29434,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -29314,6 +29487,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -29370,6 +29545,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap_err();
@@ -29403,6 +29580,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -29452,6 +29631,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })
@@ -31342,6 +31523,7 @@ mod tests {
                 }],
                 sse_customer: None,
                 claimed_checksum: None,
+                cond: &WriteCondition::default(),
             })
             .unwrap();
 
@@ -31607,6 +31789,121 @@ mod tests {
     }
 
     #[test]
+    fn streamed_upload_part_same_part_last_finisher_wins() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let mpu = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+                sse_customer: None,
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let session_a = begin_stream_part_test(&coord, "bucket", "key", &mpu.upload_id, 1)
+            .unwrap()
+            .session_id;
+        let session_b = begin_stream_part_test(&coord, "bucket", "key", &mpu.upload_id, 1)
+            .unwrap()
+            .session_id;
+
+        let data_a = b"request-a-finishes-last";
+        let data_b = b"request-b-finishes-first";
+        coord
+            .append_stream_segment("bucket", "key", &session_a, 0, data_a)
+            .unwrap();
+        coord
+            .append_stream_segment("bucket", "key", &session_b, 0, data_b)
+            .unwrap();
+
+        let result_b = coord
+            .finalize_stream_part(FinalizeStreamPartRequest {
+                upload: multipart_object_request("bucket", "key", &mpu.upload_id, test_requester()),
+                session_id: &session_b,
+                part_number: 1,
+                crc64: checksum::crc64::checksum(data_b),
+                total_size: data_b.len() as u64,
+                claimed_checksum: None,
+                computed_checksum: None,
+            })
+            .unwrap();
+        let result_a = coord
+            .finalize_stream_part(FinalizeStreamPartRequest {
+                upload: multipart_object_request("bucket", "key", &mpu.upload_id, test_requester()),
+                session_id: &session_a,
+                part_number: 1,
+                crc64: checksum::crc64::checksum(data_a),
+                total_size: data_a.len() as u64,
+                claimed_checksum: None,
+                computed_checksum: None,
+            })
+            .unwrap();
+        assert_ne!(result_a.etag, result_b.etag);
+
+        let parts = coord
+            .list_parts(&ListPartsRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &mpu.upload_id,
+                    test_requester(),
+                    None,
+                ),
+                part_number_marker: None,
+                max_parts: 100,
+            })
+            .unwrap();
+        assert_eq!(parts.parts.len(), 1);
+        assert_eq!(parts.parts[0].etag, result_a.etag);
+
+        coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &mpu.upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &[CompletePart {
+                    part_number: 1,
+                    etag: result_a.etag.clone(),
+                    checksum: None,
+                }],
+                claimed_checksum: None,
+                cond: &WriteCondition::default(),
+                sse_customer: None,
+            })
+            .unwrap();
+
+        let object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(object.body.read_all().unwrap(), data_a);
+    }
+
+    #[test]
     fn stream_part_no_upload_rejected() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator(dir.path());
@@ -31808,6 +32105,8 @@ mod tests {
                 parts: &[part_a],
                 claimed_checksum: None,
 
+                cond: &WriteCondition::default(),
+
                 sse_customer: None,
             })
             .unwrap();
@@ -31845,6 +32144,8 @@ mod tests {
                 ),
                 parts: &[part_b],
                 claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
 
                 sse_customer: None,
             })

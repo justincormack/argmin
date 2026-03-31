@@ -1088,7 +1088,7 @@ fn test_bucket_policy_copy_object_recognizes_destination_sse_c_header() {
 }
 
 #[test]
-fn test_bucket_policy_upload_part_copy_recognizes_destination_sse_c_header() {
+fn test_bucket_policy_complete_multipart_does_not_reuse_destination_sse_c_header() {
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
@@ -1155,14 +1155,33 @@ fn test_bucket_policy_upload_part_copy_recognizes_destination_sse_c_header() {
         .send()
         .await
         .unwrap();
-        complete_single_part_upload(
-            client,
-            &bucket,
-            "dst",
-            &upload_id,
-            copied_part.copy_part_result().unwrap().e_tag().unwrap(),
-        )
-        .await;
+        let complete = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("dst")
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(copied_part.copy_part_result().unwrap().e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&complete), 403);
+        assert_s3_err_code(&complete, "AccessDenied");
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("dst")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
 
         let get = with_sse_c_headers!(
             client.get_object().bucket(&bucket).key("dst"),
@@ -1171,78 +1190,38 @@ fn test_bucket_policy_upload_part_copy_recognizes_destination_sse_c_header() {
             key_md5_b64
         )
         .send()
-        .await
-        .unwrap();
-        assert_eq!(
-            get.body.collect().await.unwrap().into_bytes().as_ref(),
-            b"copy-source"
-        );
+        .await;
+        assert_eq!(err_status(&get), 404);
+        assert_s3_err_code(&get, "NoSuchKey");
 
         cleanup(&bucket, &["src", "dst"]).await;
     });
 }
 
 #[test]
-fn test_bucket_policy_streaming_put_preserves_sse_c_algorithm_casing() {
+fn test_bucket_policy_streaming_put_rejects_lowercase_sse_c_algorithm() {
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
         client.create_bucket().bucket(&bucket).send().await.unwrap();
 
-        let policy = json!({
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Deny",
-                "Principal": "*",
-                "Action": "s3:PutObject",
-                "Resource": bucket_wildcard_resource(&bucket),
-                "Condition": {
-                    "StringNotEquals": {
-                        "s3:x-amz-server-side-encryption-customer-algorithm": "aes256"
-                    }
-                }
-            }],
-        })
-        .to_string();
-        client
-            .put_bucket_policy()
-            .bucket(&bucket)
-            .policy(policy)
-            .send()
-            .await
-            .unwrap();
-
         let customer_key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
-        let body = vec![0x5Au8; (9 * 1024 * 1024) + 17];
-        with_sse_c_headers!(
+        let put = with_sse_c_headers!(
             client
                 .put_object()
                 .bucket(&bucket)
                 .key("obj")
-                .body(ByteStream::from(body.clone())),
+                .body(ByteStream::from_static(b"body")),
             "aes256",
             key_b64,
             key_md5_b64
         )
         .send()
-        .await
-        .unwrap();
-
-        let get = with_sse_c_headers!(
-            client.get_object().bucket(&bucket).key("obj"),
-            "aes256",
-            key_b64,
-            key_md5_b64
-        )
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(
-            get.body.collect().await.unwrap().into_bytes().as_ref(),
-            body.as_slice()
-        );
+        .await;
+        assert_eq!(err_status(&put), 400);
+        assert_s3_err_code(&put, "InvalidEncryptionAlgorithmError");
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -1307,6 +1286,137 @@ fn test_bucket_policy_put_obj_request_object_tag() {
             .unwrap();
 
         cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_multipart_upload_requires_object_resource() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "mpobj";
+
+        let denied = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let bucket_only = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal.clone(),
+                "Allow",
+                "s3:PutObject",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await;
+        assert_eq!(err_status(&bucket_only), 400);
+        assert_s3_err_code(&bucket_only, "MalformedPolicy");
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutObject",
+                format!("arn:aws:s3:::{bucket}/{key}"),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let upload = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload.upload_id().unwrap())
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_multipart_upload_on_bucket_with_policy() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "foo";
+
+        let owner_principal = json!({
+            "AWS": format!("arn:aws:iam::{}:root", CTX.account_id())
+        });
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": owner_principal,
+                "Action": "*",
+                "Resource": [
+                    bucket_resource(&bucket),
+                    bucket_wildcard_resource(&bucket),
+                ],
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let upload = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = upload.upload_id().unwrap().to_string();
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from_static(b"policy-body"))
+            .send()
+            .await
+            .unwrap();
+        complete_single_part_upload(client, &bucket, key, &upload_id, part.e_tag().unwrap()).await;
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"policy-body");
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 

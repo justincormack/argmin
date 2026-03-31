@@ -208,6 +208,14 @@ async fn build_client(endpoint: &str, access_key: &str, secret_key: &str, region
     build_client_with_ca(endpoint, access_key, secret_key, region, None).await
 }
 
+fn configured_test_timeout() -> std::time::Duration {
+    let timeout_secs: u64 = std::env::var("S3_TEST_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    std::time::Duration::from_secs(timeout_secs)
+}
+
 pub async fn build_client_with_ca(
     endpoint: &str,
     access_key: &str,
@@ -215,21 +223,16 @@ pub async fn build_client_with_ca(
     region: &str,
     tls_ca_pem: Option<&[u8]>,
 ) -> Client {
-    use std::time::Duration;
-
     let creds = aws_credential_types::Credentials::new(
         access_key, secret_key, None, // session token
         None, // expiry
         "s3-tests",
     );
 
-    let timeout_secs: u64 = std::env::var("S3_TEST_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(5);
+    let timeout = configured_test_timeout();
     let timeout_config = aws_sdk_s3::config::timeout::TimeoutConfig::builder()
-        .connect_timeout(Duration::from_secs(timeout_secs))
-        .operation_attempt_timeout(Duration::from_secs(timeout_secs))
+        .connect_timeout(timeout)
+        .operation_attempt_timeout(timeout)
         .build();
 
     let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
@@ -332,7 +335,10 @@ pub fn test_agent() -> ureq::Agent {
 }
 
 pub fn build_test_agent(endpoint: &str, tls_ca_pem: Option<&[u8]>) -> ureq::Agent {
-    let mut builder = ureq::config::Config::builder().http_status_as_error(false);
+    let timeout = configured_test_timeout();
+    let mut builder = ureq::config::Config::builder()
+        .http_status_as_error(false)
+        .timeout_global(Some(timeout));
     if let Some(tls_ca_pem) = tls_ca_pem.filter(|_| endpoint.starts_with("https://")) {
         let cert = Certificate::from_pem(tls_ca_pem).expect("valid test TLS PEM");
         builder = builder.tls_config(

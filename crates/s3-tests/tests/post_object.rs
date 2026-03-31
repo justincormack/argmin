@@ -463,7 +463,7 @@ fn test_post_object_sse_c_round_trip() {
 }
 
 #[test]
-fn test_post_object_sse_c_bucket_policy_preserves_algorithm_casing() {
+fn test_post_object_sse_c_bucket_policy_rejects_lowercase_algorithm() {
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
@@ -523,20 +523,15 @@ fn test_post_object_sse_c_bucket_policy_preserves_algorithm_casing() {
             .collect();
 
         let (status, body) = post_object(&bucket, &field_refs, file_data, "test.txt");
-        assert_eq!(status, 204, "expected 204, got {} body={}", status, body);
-
-        let get = client
-            .get_object()
-            .bucket(&bucket)
-            .key(key)
-            .sse_customer_algorithm("aes256")
-            .sse_customer_key(key_b64.clone())
-            .sse_customer_key_md5(key_md5_b64.clone())
-            .send()
-            .await
-            .unwrap();
-        let data = get.body.collect().await.unwrap().into_bytes();
-        assert_eq!(&data[..], file_data);
+        assert_eq!(status, 400, "expected 400, got {} body={}", status, body);
+        assert!(
+            body.contains("<Code>InvalidEncryptionAlgorithmError</Code>"),
+            "expected InvalidEncryptionAlgorithmError body, got {body}"
+        );
+        assert!(
+            body.contains("<ArgumentValue>aes256</ArgumentValue>"),
+            "expected lowercase algorithm to be echoed in body, got {body}"
+        );
 
         client
             .delete_object()

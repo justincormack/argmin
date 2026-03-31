@@ -78,6 +78,9 @@ pub enum ServerError {
     #[error("The calculated MD5 hash of the key did not match the hash that was provided.")]
     InvalidSseCustomerKeyMd5,
 
+    #[error("invalid encryption algorithm: {value}")]
+    InvalidEncryptionAlgorithmError { value: String },
+
     #[error("invalid chunk size: only the last chunk may be smaller than {min_size} bytes (chunk {chunk} was {chunk_size} bytes)")]
     InvalidChunkSize {
         chunk: usize,
@@ -219,6 +222,7 @@ impl ServerError {
             Self::BadDigest => "BadDigest",
             Self::InvalidDigest => "InvalidDigest",
             Self::InvalidSseCustomerKeyMd5 => "InvalidArgument",
+            Self::InvalidEncryptionAlgorithmError { .. } => "InvalidEncryptionAlgorithmError",
             Self::InvalidChunkSize { .. } => "InvalidChunkSizeError",
             Self::NoSuchCorsConfiguration { .. } => "NoSuchCORSConfiguration",
             Self::NoSuchTagSet { .. } => "NoSuchTagSet",
@@ -280,7 +284,8 @@ impl ServerError {
             | Self::InvalidBucketName { .. }
             | Self::BadDigest
             | Self::InvalidDigest
-            | Self::InvalidSseCustomerKeyMd5 => 400,
+            | Self::InvalidSseCustomerKeyMd5
+            | Self::InvalidEncryptionAlgorithmError { .. } => 400,
             Self::InvalidChunkSize { .. } => 403,
             Self::NoSuchCorsConfiguration { .. } => 404,
             Self::NoSuchTagSet { .. } => 404,

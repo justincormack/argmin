@@ -43,6 +43,8 @@ pub fn upload_part(
             req.upload.expected_bucket_owner(),
         ),
         part_number: req.part_number,
+        policy_context: PutObjectPolicyContext::default()
+            .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm)),
         sse_customer: req.sse_customer,
     })?;
     let session_id = &session.session_id;

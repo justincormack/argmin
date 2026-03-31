@@ -1059,6 +1059,22 @@ impl S3Response {
                 );
                 return Self::new(400).xml_body(body);
             }
+            ServerError::InvalidEncryptionAlgorithmError { value } => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>InvalidEncryptionAlgorithmError</Code>\
+                     <Message>The Encryption request you specified is not valid. Supported value: AES256.</Message>\
+                     <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
+                     <ArgumentValue>{}</ArgumentValue>\
+                     <Resource>{}</Resource>\
+                     <RequestId>request-id</RequestId>\
+                     </Error>",
+                    xml::xml_escape(value),
+                    xml::xml_escape(resource),
+                );
+                return Self::new(400).xml_body(body);
+            }
             _ => {}
         }
 
