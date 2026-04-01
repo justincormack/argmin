@@ -6,7 +6,7 @@ pub use helpers::{
     assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, copy_source_with_version,
     create_objects, create_objects_with_keys, create_public_bucket, create_public_write_bucket,
     delete_all_and_bucket, delete_objects_with_md5, disable_bucket_public_access_block, err_status,
-    sse_c_header_values, test_sse_c_key, unique_bucket,
+    put_bucket_lifecycle_with_md5, sse_c_header_values, test_sse_c_key, unique_bucket,
 };
 pub use post_form::{
     post_object_to_test_endpoint, post_object_to_test_endpoint_with_headers,

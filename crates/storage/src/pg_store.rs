@@ -13,7 +13,6 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -119,18 +118,12 @@ impl PgStore {
 
     /// Get the current unix timestamp in seconds.
     fn now_secs() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
+        crate::clock::current_time_secs()
     }
 
     /// Get the current unix timestamp in milliseconds.
     fn now_millis() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
+        crate::clock::current_time_millis()
     }
 
     pub(crate) fn write_shard_file_durable(

@@ -4,8 +4,12 @@ use std::sync::LazyLock;
 use aws_sdk_s3::client::customize::CustomizableOperation;
 use aws_sdk_s3::operation::delete_objects::builders::DeleteObjectsFluentBuilder;
 use aws_sdk_s3::operation::delete_objects::{DeleteObjectsError, DeleteObjectsOutput};
+use aws_sdk_s3::operation::put_bucket_lifecycle_configuration::builders::PutBucketLifecycleConfigurationFluentBuilder;
+use aws_sdk_s3::operation::put_bucket_lifecycle_configuration::{
+    PutBucketLifecycleConfigurationError, PutBucketLifecycleConfigurationOutput,
+};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::Delete;
+use aws_sdk_s3::types::{BucketLifecycleConfiguration, Delete};
 use aws_sdk_s3::Client;
 use base64::Engine;
 use md5_legacy::Digest;
@@ -293,6 +297,33 @@ pub fn delete_objects_with_md5(
                 .body()
                 .bytes()
                 .expect("DeleteObjects body must be in-memory");
+            let digest = md5_legacy::Md5::digest(body);
+            let content_md5 = base64::engine::general_purpose::STANDARD.encode(&digest[..]);
+            req.headers_mut().insert("content-md5", content_md5);
+        })
+}
+
+/// Build a PutBucketLifecycleConfiguration request that sets the required
+/// Content-MD5 header from the serialized XML body before signing.
+pub fn put_bucket_lifecycle_with_md5(
+    client: &Client,
+    bucket: &str,
+    lifecycle_configuration: BucketLifecycleConfiguration,
+) -> CustomizableOperation<
+    PutBucketLifecycleConfigurationOutput,
+    PutBucketLifecycleConfigurationError,
+    PutBucketLifecycleConfigurationFluentBuilder,
+> {
+    client
+        .put_bucket_lifecycle_configuration()
+        .bucket(bucket)
+        .lifecycle_configuration(lifecycle_configuration)
+        .customize()
+        .mutate_request(|req| {
+            let body = req
+                .body()
+                .bytes()
+                .expect("PutBucketLifecycleConfiguration body must be in-memory");
             let digest = md5_legacy::Md5::digest(body);
             let content_md5 = base64::engine::general_purpose::STANDARD.encode(&digest[..]);
             req.headers_mut().insert("content-md5", content_md5);

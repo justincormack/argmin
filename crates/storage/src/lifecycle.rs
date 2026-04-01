@@ -778,61 +778,86 @@ fn parse_lifecycle_date(text: &str) -> Result<LifecycleDate, LifecycleConfigErro
     let date_part = if text.len() == 10 {
         text
     } else {
-        let (date_part, time_part) =
-            text.split_once('T')
-                .ok_or_else(|| LifecycleConfigError::InvalidArgument {
-                    reason: format!("invalid lifecycle date {text}"),
-                })?;
-        if !matches_lifecycle_midnight_utc(time_part) {
-            return Err(LifecycleConfigError::InvalidArgument {
-                reason: format!("invalid lifecycle date {text}"),
-            });
-        }
+        let (date_part, time_part) = text
+            .split_once('T')
+            .ok_or_else(|| malformed_lifecycle_date(text))?;
+        validate_lifecycle_midnight_utc(time_part, text)?;
         date_part
     };
     if date_part.len() != 10 || !date_part.is_ascii() {
-        return Err(LifecycleConfigError::InvalidArgument {
-            reason: format!("invalid lifecycle date {text}"),
-        });
+        return Err(malformed_lifecycle_date(text));
+    }
+    if &date_part[4..5] != "-" || &date_part[7..8] != "-" {
+        return Err(malformed_lifecycle_date(text));
     }
     let year: i32 = date_part[0..4]
         .parse()
-        .map_err(|_| LifecycleConfigError::InvalidArgument {
-            reason: format!("invalid lifecycle date {text}"),
-        })?;
+        .map_err(|_| malformed_lifecycle_date(text))?;
     let month: u8 = date_part[5..7]
         .parse()
-        .map_err(|_| LifecycleConfigError::InvalidArgument {
-            reason: format!("invalid lifecycle date {text}"),
-        })?;
+        .map_err(|_| malformed_lifecycle_date(text))?;
     let day: u8 = date_part[8..10]
         .parse()
-        .map_err(|_| LifecycleConfigError::InvalidArgument {
-            reason: format!("invalid lifecycle date {text}"),
-        })?;
-    if &date_part[4..5] != "-" || &date_part[7..8] != "-" || !valid_calendar_date(year, month, day)
-    {
-        return Err(LifecycleConfigError::InvalidArgument {
-            reason: format!("invalid lifecycle date {text}"),
-        });
+        .map_err(|_| malformed_lifecycle_date(text))?;
+    if !valid_calendar_date(year, month, day) {
+        return Err(malformed_lifecycle_date(text));
     }
     Ok(LifecycleDate { year, month, day })
 }
 
-fn matches_lifecycle_midnight_utc(time_part: &str) -> bool {
+fn validate_lifecycle_midnight_utc(
+    time_part: &str,
+    full_text: &str,
+) -> Result<(), LifecycleConfigError> {
     let Some(time_part) = time_part.strip_suffix('Z') else {
-        return false;
+        return Err(malformed_lifecycle_date(full_text));
     };
     let (base_time, fraction) = match time_part.split_once('.') {
         Some((base_time, fraction)) => (base_time, Some(fraction)),
         None => (time_part, None),
     };
-    if base_time != "00:00:00" {
-        return false;
+    if base_time.len() != 8
+        || !base_time.is_ascii()
+        || &base_time[2..3] != ":"
+        || &base_time[5..6] != ":"
+    {
+        return Err(malformed_lifecycle_date(full_text));
     }
-    match fraction {
-        Some(fraction) => !fraction.is_empty() && fraction.bytes().all(|byte| byte == b'0'),
-        None => true,
+    let hour: u8 = base_time[0..2]
+        .parse()
+        .map_err(|_| malformed_lifecycle_date(full_text))?;
+    let minute: u8 = base_time[3..5]
+        .parse()
+        .map_err(|_| malformed_lifecycle_date(full_text))?;
+    let second: u8 = base_time[6..8]
+        .parse()
+        .map_err(|_| malformed_lifecycle_date(full_text))?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err(malformed_lifecycle_date(full_text));
+    }
+    if let Some(fraction) = fraction {
+        if fraction.is_empty() || !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(malformed_lifecycle_date(full_text));
+        }
+    }
+    if hour != 0 || minute != 0 || second != 0 {
+        return Err(invalid_lifecycle_date(full_text));
+    }
+    if fraction.is_some_and(|fraction| fraction.bytes().any(|byte| byte != b'0')) {
+        return Err(invalid_lifecycle_date(full_text));
+    }
+    Ok(())
+}
+
+fn malformed_lifecycle_date(text: &str) -> LifecycleConfigError {
+    LifecycleConfigError::MalformedXml {
+        reason: format!("invalid lifecycle date {text}"),
+    }
+}
+
+fn invalid_lifecycle_date(text: &str) -> LifecycleConfigError {
+    LifecycleConfigError::InvalidArgument {
+        reason: format!("invalid lifecycle date {text}"),
     }
 }
 
@@ -1394,7 +1419,7 @@ mod tests {
             </LifecycleConfiguration>",
         )
         .unwrap_err();
-        assert!(matches!(err, LifecycleConfigError::InvalidArgument { .. }));
+        assert!(matches!(err, LifecycleConfigError::MalformedXml { .. }));
     }
 
     #[test]
@@ -1434,7 +1459,7 @@ mod tests {
             </LifecycleConfiguration>",
         )
         .unwrap_err();
-        assert!(matches!(err, LifecycleConfigError::InvalidArgument { .. }));
+        assert!(matches!(err, LifecycleConfigError::MalformedXml { .. }));
     }
 
     #[test]

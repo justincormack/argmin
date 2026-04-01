@@ -5326,6 +5326,38 @@ mod tests {
     }
 
     #[test]
+    fn put_bucket_lifecycle_rejects_invalid_date_as_malformed_xml() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let lifecycle = br#"<LifecycleConfiguration>
+  <Rule>
+    <Status>Enabled</Status>
+    <Expiration><Date>20200101</Date></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "lifecycle",
+            vec![("Content-MD5".to_string(), content_md5_value(lifecycle))],
+            lifecycle.to_vec(),
+        );
+        match fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutBucketLifecycle {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::MalformedXML { .. }) => {}
+            Err(e) => panic!("expected MalformedXML, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
     fn put_bucket_lifecycle_missing_content_md5_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());

@@ -1,9 +1,16 @@
 use base64::Engine;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{
+    AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, BucketLocationConstraint,
+    CreateBucketConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule,
+    LifecycleRuleAndOperator, LifecycleRuleFilter, NoncurrentVersionExpiration, Tag,
+};
 use ring::hmac;
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{
+    delete_all_and_bucket, err_status, put_bucket_lifecycle_with_md5, unique_bucket, CTX,
+};
 
 fn agent() -> ureq::Agent {
     s3_tests::test_agent()
@@ -25,6 +32,14 @@ async fn cleanup_bucket(bucket: &str) {
     let client = CTX.client();
     let _ = client.delete_bucket_lifecycle().bucket(bucket).send().await;
     let _ = client.delete_bucket().bucket(bucket).send().await;
+}
+
+fn assert_error_code(body: &str, code: &str) {
+    let expected = format!("<Code>{code}</Code>");
+    assert!(
+        body.contains(&expected),
+        "expected {expected} in body: {body}"
+    );
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -177,6 +192,22 @@ fn send_signed_put(url_str: &str, body: &[u8], include_content_md5: bool) -> (u1
     (status, body)
 }
 
+async fn assert_invalid_lifecycle_put_rejected(body: &str, expected_code: &str) {
+    let bucket = unique_bucket();
+    create_bucket_in_test_region(&bucket).await;
+
+    let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
+    let (status, response_body) = send_signed_put(&url, body.as_bytes(), true);
+
+    cleanup_bucket(&bucket).await;
+
+    assert_eq!(
+        status, 400,
+        "expected lifecycle PUT to fail, got status {status} body {response_body}"
+    );
+    assert_error_code(&response_body, expected_code);
+}
+
 #[test]
 fn test_put_bucket_lifecycle_accepts_midnight_utc_timestamp_without_millis() {
     s3_tests::run(async {
@@ -203,17 +234,6 @@ fn test_put_bucket_lifecycle_accepts_midnight_utc_timestamp_without_millis() {
             .await;
 
         cleanup_bucket(&bucket).await;
-
-        if std::env::var("S3_TEST_ENDPOINT").is_ok()
-            && status == 403
-            && response_body.contains("<Code>AccessDenied</Code>")
-            && response_body.contains("s3:PutLifecycleConfiguration")
-        {
-            eprintln!(
-                "skipping external lifecycle compatibility probe: missing s3:PutLifecycleConfiguration permission"
-            );
-            return;
-        }
 
         assert_eq!(
             status, 200,
@@ -244,22 +264,561 @@ fn test_put_bucket_lifecycle_requires_content_md5() {
 
         cleanup_bucket(&bucket).await;
 
-        if std::env::var("S3_TEST_ENDPOINT").is_ok()
-            && status == 403
-            && response_body.contains("<Code>AccessDenied</Code>")
-            && response_body.contains("s3:PutLifecycleConfiguration")
-        {
-            eprintln!(
-                "skipping external lifecycle compatibility probe: missing s3:PutLifecycleConfiguration permission"
-            );
-            return;
-        }
-
         assert_eq!(
             status, 400,
             "expected lifecycle PUT without Content-MD5 to fail, got status {status} body {response_body}"
         );
         assert!(response_body.contains("<Code>InvalidRequest</Code>"));
         assert!(response_body.contains("Content-MD5"));
+    });
+}
+
+#[test]
+fn test_get_bucket_lifecycle_configuration_absent_returns_no_such_lifecycle_configuration() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let get = client
+            .get_bucket_lifecycle_configuration()
+            .bucket(&bucket)
+            .send()
+            .await;
+
+        cleanup_bucket(&bucket).await;
+
+        assert_eq!(err_status(&get), 404);
+        s3_tests::assert_s3_err_code(&get, "NoSuchLifecycleConfiguration");
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_rule_id_longer_than_255_chars() {
+    s3_tests::run(async {
+        let long_id = "a".repeat(256);
+        let body = format!(
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>{long_id}</ID>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>1</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>"
+        );
+        assert_invalid_lifecycle_put_rejected(&body, "InvalidArgument").await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_duplicate_rule_ids() {
+    s3_tests::run(async {
+        let body = "<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>same</ID>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>1</Days></Expiration>\
+                </Rule>\
+                <Rule>\
+                    <ID>same</ID>\
+                    <Filter><Prefix>archive/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>2</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>";
+        assert_invalid_lifecycle_put_rejected(body, "InvalidArgument").await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_invalid_status() {
+    s3_tests::run(async {
+        let body = "<LifecycleConfiguration>\
+                <Rule>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>enabled</Status>\
+                    <Expiration><Days>1</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>";
+        assert_invalid_lifecycle_put_rejected(body, "MalformedXML").await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_invalid_date() {
+    s3_tests::run(async {
+        let body = "<LifecycleConfiguration>\
+                <Rule>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Date>20200101</Date></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>";
+        assert_invalid_lifecycle_put_rejected(body, "MalformedXML").await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_zero_days() {
+    s3_tests::run(async {
+        let body = "<LifecycleConfiguration>\
+                <Rule>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>0</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>";
+        assert_invalid_lifecycle_put_rejected(body, "InvalidArgument").await;
+    });
+}
+
+#[test]
+fn test_bucket_lifecycle_crud_round_trip() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("expire-current")
+                    .filter(LifecycleRuleFilter::builder().prefix("logs/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().days(30).build())
+                    .build()
+                    .unwrap(),
+            )
+            .rules(
+                LifecycleRule::builder()
+                    .id("expire-noncurrent")
+                    .filter(LifecycleRuleFilter::builder().prefix("versions/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .noncurrent_version_expiration(
+                        NoncurrentVersionExpiration::builder()
+                            .noncurrent_days(7)
+                            .build(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .rules(
+                LifecycleRule::builder()
+                    .id("expire-marker")
+                    .filter(LifecycleRuleFilter::builder().prefix("markers/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(
+                        LifecycleExpiration::builder()
+                            .expired_object_delete_marker(true)
+                            .build(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .rules(
+                LifecycleRule::builder()
+                    .id("abort-incomplete")
+                    .filter(LifecycleRuleFilter::builder().prefix("uploads/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .abort_incomplete_multipart_upload(
+                        AbortIncompleteMultipartUpload::builder()
+                            .days_after_initiation(7)
+                            .build(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        let put_result = put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await;
+        put_result.unwrap();
+
+        let get = client
+            .get_bucket_lifecycle_configuration()
+            .bucket(&bucket)
+            .send()
+            .await;
+        let get = get.unwrap();
+
+        assert_eq!(get.rules().len(), 4);
+        let expire_current = &get.rules()[0];
+        assert_eq!(expire_current.id(), Some("expire-current"));
+        assert_eq!(
+            expire_current
+                .expiration()
+                .and_then(LifecycleExpiration::days),
+            Some(30)
+        );
+
+        let expire_noncurrent = &get.rules()[1];
+        assert_eq!(expire_noncurrent.id(), Some("expire-noncurrent"));
+        assert_eq!(
+            expire_noncurrent
+                .noncurrent_version_expiration()
+                .and_then(NoncurrentVersionExpiration::noncurrent_days),
+            Some(7)
+        );
+
+        let expire_marker = &get.rules()[2];
+        assert_eq!(expire_marker.id(), Some("expire-marker"));
+        assert_eq!(
+            expire_marker
+                .expiration()
+                .and_then(LifecycleExpiration::expired_object_delete_marker),
+            Some(true)
+        );
+
+        let abort_incomplete = &get.rules()[3];
+        assert_eq!(abort_incomplete.id(), Some("abort-incomplete"));
+        assert_eq!(
+            abort_incomplete
+                .abort_incomplete_multipart_upload()
+                .and_then(AbortIncompleteMultipartUpload::days_after_initiation),
+            Some(7)
+        );
+
+        client
+            .delete_bucket_lifecycle()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        let get_deleted = client
+            .get_bucket_lifecycle_configuration()
+            .bucket(&bucket)
+            .send()
+            .await;
+        assert_eq!(err_status(&get_deleted), 404);
+        s3_tests::assert_s3_err_code(&get_deleted, "NoSuchLifecycleConfiguration");
+
+        cleanup_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_put_object_and_head_object_report_expiration_header_for_prefix_filter() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("expire-current")
+                    .filter(LifecycleRuleFilter::builder().prefix("logs/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().days(3).build())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let put_lifecycle = put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await;
+        put_lifecycle.unwrap();
+
+        let matching = client
+            .put_object()
+            .bucket(&bucket)
+            .key("logs/match")
+            .body(ByteStream::from_static(b"match"))
+            .send()
+            .await
+            .unwrap();
+        assert!(matching.expiration().is_some());
+
+        let nonmatching = client
+            .put_object()
+            .bucket(&bucket)
+            .key("other/skip")
+            .body(ByteStream::from_static(b"skip"))
+            .send()
+            .await
+            .unwrap();
+        assert!(nonmatching.expiration().is_none());
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("logs/match")
+            .send()
+            .await
+            .unwrap();
+        assert!(head.expiration().is_some());
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("logs/match")
+            .send()
+            .await
+            .unwrap();
+        assert!(get.expiration().is_some());
+
+        let _ = client
+            .delete_bucket_lifecycle()
+            .bucket(&bucket)
+            .send()
+            .await;
+        delete_all_and_bucket(
+            client,
+            &bucket,
+            &["logs/match".to_string(), "other/skip".to_string()],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_put_object_and_head_object_report_expiration_header_for_tag_filter() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("expire-tagged")
+                    .filter(
+                        LifecycleRuleFilter::builder()
+                            .tag(Tag::builder().key("env").value("prod").build().unwrap())
+                            .build(),
+                    )
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().days(3).build())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let put_lifecycle = put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await;
+        put_lifecycle.unwrap();
+
+        let matching = client
+            .put_object()
+            .bucket(&bucket)
+            .key("objects/match")
+            .tagging("env=prod")
+            .body(ByteStream::from_static(b"match"))
+            .send()
+            .await
+            .unwrap();
+        assert!(matching.expiration().is_some());
+
+        let nonmatching = client
+            .put_object()
+            .bucket(&bucket)
+            .key("objects/skip")
+            .tagging("env=dev")
+            .body(ByteStream::from_static(b"skip"))
+            .send()
+            .await
+            .unwrap();
+        assert!(nonmatching.expiration().is_none());
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("objects/match")
+            .send()
+            .await
+            .unwrap();
+        assert!(head.expiration().is_some());
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("objects/match")
+            .send()
+            .await
+            .unwrap();
+        assert!(get.expiration().is_some());
+
+        let _ = client
+            .delete_bucket_lifecycle()
+            .bucket(&bucket)
+            .send()
+            .await;
+        delete_all_and_bucket(
+            client,
+            &bucket,
+            &["objects/match".to_string(), "objects/skip".to_string()],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_put_object_and_head_object_report_expiration_header_for_and_filter() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("expire-and")
+                    .filter(
+                        LifecycleRuleFilter::builder()
+                            .and(
+                                LifecycleRuleAndOperator::builder()
+                                    .prefix("logs/")
+                                    .tags(Tag::builder().key("env").value("prod").build().unwrap())
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().days(3).build())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let put_lifecycle = put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await;
+        put_lifecycle.unwrap();
+
+        let matching = client
+            .put_object()
+            .bucket(&bucket)
+            .key("logs/match")
+            .tagging("env=prod")
+            .body(ByteStream::from_static(b"match"))
+            .send()
+            .await
+            .unwrap();
+        assert!(matching.expiration().is_some());
+
+        let wrong_prefix = client
+            .put_object()
+            .bucket(&bucket)
+            .key("other/skip")
+            .tagging("env=prod")
+            .body(ByteStream::from_static(b"skip"))
+            .send()
+            .await
+            .unwrap();
+        assert!(wrong_prefix.expiration().is_none());
+
+        let wrong_tag = client
+            .put_object()
+            .bucket(&bucket)
+            .key("logs/wrong-tag")
+            .tagging("env=dev")
+            .body(ByteStream::from_static(b"skip"))
+            .send()
+            .await
+            .unwrap();
+        assert!(wrong_tag.expiration().is_none());
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("logs/match")
+            .send()
+            .await
+            .unwrap();
+        assert!(head.expiration().is_some());
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("logs/match")
+            .send()
+            .await
+            .unwrap();
+        assert!(get.expiration().is_some());
+
+        let _ = client
+            .delete_bucket_lifecycle()
+            .bucket(&bucket)
+            .send()
+            .await;
+        delete_all_and_bucket(
+            client,
+            &bucket,
+            &[
+                "logs/match".to_string(),
+                "other/skip".to_string(),
+                "logs/wrong-tag".to_string(),
+            ],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_create_multipart_upload_and_list_parts_report_abort_headers() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("abort-incomplete")
+                    .filter(LifecycleRuleFilter::builder().prefix("uploads/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .abort_incomplete_multipart_upload(
+                        AbortIncompleteMultipartUpload::builder()
+                            .days_after_initiation(7)
+                            .build(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let put_lifecycle = put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await;
+        put_lifecycle.unwrap();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("uploads/incomplete")
+            .send()
+            .await
+            .unwrap();
+        assert!(create.abort_date().is_some());
+        assert_eq!(create.abort_rule_id(), Some("abort-incomplete"));
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let list_parts = client
+            .list_parts()
+            .bucket(&bucket)
+            .key("uploads/incomplete")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(list_parts.abort_date().is_some());
+        assert_eq!(list_parts.abort_rule_id(), Some("abort-incomplete"));
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("uploads/incomplete")
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup_bucket(&bucket).await;
     });
 }

@@ -343,7 +343,7 @@ Current status:
 - Phase 2 is complete.
 - Phase 3 is complete.
 - Phase 4 is complete.
-- Phase 5 remains pending.
+- Phase 5 is complete.
 
 ### Phase 1: Lifecycle config CRUD and rule model (Completed)
 
@@ -426,13 +426,51 @@ Completed in the current implementation:
 - deterministic coordinator tests covering explicit EODM, day-based
   delete-marker cleanup timing, and lifecycle multipart abort execution
 
-### Phase 5: External compatibility pass
+### Phase 5: External compatibility pass (Completed)
 
 Add or port Rust integration coverage across `s3-tests` and
 `s3-local-tests`, then run:
 - local targeted tests
 - full repo test suite
 - AWS-backed lifecycle spot checks for any behavior where docs are incomplete
+
+Completed in the current implementation:
+- `s3-local-tests` now has deterministic lifecycle integration coverage for:
+  - current expiration in nonversioned buckets
+  - current expiration in versioning-enabled buckets
+  - current expiration in versioning-suspended buckets
+  - noncurrent version expiration
+  - `NewerNoncurrentVersions`
+  - delete-marker cleanup after `Expiration.Days`
+  - abort incomplete multipart uploads
+  - Object Lock retention preventing noncurrent deletion
+- the local manual sweep hook now uses a scoped deterministic clock override so
+  lifecycle-created metadata rows and Object Lock checks see the same synthetic
+  sweep time during local integration tests
+- `s3-tests` now has AWS-portable lifecycle integration coverage for:
+  - lifecycle set / get / delete
+  - absent lifecycle get returning `NoSuchLifecycleConfiguration`
+  - invalid lifecycle XML/value rejection for:
+    - ID length > 255
+    - duplicate IDs
+    - invalid `Status`
+    - invalid `Expiration.Date`
+    - `Expiration.Days == 0`
+  - lifecycle CRUD round trip covering current expiration, noncurrent
+    expiration, expired delete marker, and abort-incomplete-multipart rule
+    shapes
+  - required `Content-MD5` on `PUT ?lifecycle`
+  - midnight-UTC `Expiration.Date` acceptance without milliseconds
+  - `x-amz-expiration` on matching prefix, tag, and `And`-filtered object
+    write/read paths
+  - `x-amz-abort-*` on multipart create/list-parts paths
+- AWS-backed lifecycle verification was used to resolve the remaining
+  compatibility mismatches in lifecycle permission handling and
+  `Expiration.Date` error classification
+- verification completed locally:
+  - targeted lifecycle suites in `s3-tests` and `s3-local-tests`
+  - full workspace test suite
+  - full `clippy` pass
 
 ## Test Plan
 

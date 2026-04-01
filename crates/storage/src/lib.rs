@@ -25,6 +25,7 @@
 /// and per-PG object/bucket metadata in SQLite.
 ///
 /// All IO is synchronous. Single-node, single-process for v1-minimal.
+pub mod clock;
 pub mod error;
 pub mod lifecycle;
 pub mod node;

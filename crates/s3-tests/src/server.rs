@@ -60,6 +60,7 @@ struct LocalTraceEnvInputs {
 pub struct TestServer {
     endpoint: String,
     tls_ca_pem: Option<&'static [u8]>,
+    control_coordinator: server_core::coordinator::Coordinator,
     _temp_dir: test_util::TempDir,
     _server_task: tokio::task::JoinHandle<()>,
 }
@@ -109,6 +110,21 @@ impl TestServer {
         let storage_node = Arc::new(
             storage::SharedStorageNode::open(&data_path, &pg_ids).expect("open storage node"),
         );
+        let control_coordinator = {
+            let ec_config = ec::EcConfig::new(4, 2).expect("EC config");
+            let sse_c_validator = server_core::sse::SseCustomerValidatorConfig::from_base64(
+                1,
+                TEST_SSE_C_VALIDATOR_KEY_B64,
+            )
+            .expect("valid test SSE-C validator key");
+            server_core::coordinator::Coordinator::new(
+                Arc::clone(&storage_node),
+                ec_config,
+                TEST_REGION.to_string(),
+                Some(sse_c_validator),
+            )
+            .expect("create control coordinator")
+        };
 
         let frontends: Vec<server_http::http::HttpFrontend> = (0..POOL_SIZE)
             .map(|_| {
@@ -184,6 +200,7 @@ impl TestServer {
         TestServer {
             endpoint,
             tls_ca_pem: (transport == TestServerTransport::Https).then_some(TEST_TLS_CA_CERT_PEM),
+            control_coordinator,
             _temp_dir: temp_dir,
             _server_task: server_task,
         }
@@ -196,6 +213,15 @@ impl TestServer {
 
     pub fn tls_ca_pem(&self) -> Option<&'static [u8]> {
         self.tls_ca_pem
+    }
+
+    /// Run one deterministic lifecycle sweep at a caller-provided timestamp.
+    pub fn run_lifecycle_sweep_at(
+        &self,
+        now_millis: u64,
+    ) -> Result<(), server_core::error::ServerError> {
+        self.control_coordinator
+            .run_lifecycle_sweep_for_test(now_millis)
     }
 }
 

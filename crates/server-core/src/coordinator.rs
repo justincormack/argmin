@@ -2313,7 +2313,7 @@ struct ReclaimSweeper {
 }
 
 struct LifecycleSweeper {
-    stop: AtomicBool,
+    stop: Arc<AtomicBool>,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -2394,18 +2394,18 @@ impl LifecycleSweeper {
     }
 
     fn spawn(runtime: ReadRuntime) -> Result<Arc<Self>, ServerError> {
+        let stop = Arc::new(AtomicBool::new(false));
         let sweeper = Arc::new(Self {
-            stop: AtomicBool::new(false),
+            stop: Arc::clone(&stop),
             handle: Mutex::new(None),
         });
-        let worker = Arc::clone(&sweeper);
         let handle = std::thread::Builder::new()
             .name("argmin-lifecycle".to_string())
             .spawn(move || {
-                while !worker.stop.load(Ordering::SeqCst) {
+                while !stop.load(Ordering::SeqCst) {
                     let _ = runtime.run_lifecycle_sweep_at(Coordinator::now_millis());
                     let mut remaining = LIFECYCLE_SWEEP_INTERVAL_MILLIS;
-                    while remaining > 0 && !worker.stop.load(Ordering::SeqCst) {
+                    while remaining > 0 && !stop.load(Ordering::SeqCst) {
                         let step = remaining.min(100);
                         std::thread::sleep(std::time::Duration::from_millis(step));
                         remaining -= step;
@@ -5604,10 +5604,7 @@ impl Coordinator {
     }
 
     fn now_millis() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64
+        storage::clock::current_time_millis()
     }
 
     fn authorize_bucket_read_requester(
@@ -6019,7 +6016,20 @@ impl Coordinator {
 
     #[cfg(test)]
     fn run_lifecycle_sweep_at(&self, now_millis: u64) -> Result<LifecycleSweepStats, ServerError> {
-        self.read_runtime().run_lifecycle_sweep_at(now_millis)
+        storage::clock::with_time_override(now_millis, || {
+            self.read_runtime().run_lifecycle_sweep_at(now_millis)
+        })
+    }
+
+    /// Run one lifecycle sweep at a caller-provided timestamp.
+    ///
+    /// This is a local integration-test hook used by `s3-local-tests` so
+    /// lifecycle execution can be driven deterministically without sleeps.
+    pub fn run_lifecycle_sweep_for_test(&self, now_millis: u64) -> Result<(), ServerError> {
+        storage::clock::with_time_override(now_millis, || {
+            self.read_runtime().run_lifecycle_sweep_at(now_millis)
+        })?;
+        Ok(())
     }
 
     pub fn region(&self) -> &str {
@@ -7220,6 +7230,9 @@ impl Coordinator {
     }
 
     fn current_unix_seconds() -> Result<u64, ServerError> {
+        if let Some(now_millis) = storage::clock::override_time_millis() {
+            return Ok(now_millis / 1000);
+        }
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs())
@@ -8174,15 +8187,19 @@ impl Coordinator {
                     req.object.key
                 ),
             })?;
+            let lifecycle_tags = live_record.tags.clone();
+            let lifecycle_size = live_record.size;
+            let lifecycle_last_modified = live_record.last_modified;
+
+            drop(shard_pg_opt);
+            drop(meta_pg);
             let lifecycle_expiration = self.current_object_lifecycle_expiration(
                 &bucket_info,
                 req.object.key,
-                live_record.tags.as_deref(),
-                live_record.size,
-                live_record.last_modified,
+                lifecycle_tags.as_deref(),
+                lifecycle_size,
+                lifecycle_last_modified,
             )?;
-
-            drop(meta_pg);
             if let Some(ref payload) = prepared.stale_payload {
                 self.delete_stale_object_payload(req.object.bucket_name(), req.object.key, payload);
             }
@@ -8850,15 +8867,18 @@ impl Coordinator {
                     bucket, key
                 ),
             })?;
+            let lifecycle_tags = live_record.tags.clone();
+            let lifecycle_size = live_record.size;
+            let lifecycle_last_modified = live_record.last_modified;
+
+            drop(meta_guard);
             let lifecycle_expiration = self.current_object_lifecycle_expiration(
                 &bucket_info,
                 key,
-                live_record.tags.as_deref(),
-                live_record.size,
-                live_record.last_modified,
+                lifecycle_tags.as_deref(),
+                lifecycle_size,
+                lifecycle_last_modified,
             )?;
-
-            drop(meta_guard);
             if let Some(ref payload) = prepared.stale_payload {
                 self.delete_stale_object_payload(bucket, key, payload);
             }
@@ -9577,17 +9597,22 @@ impl Coordinator {
                         dst_bucket, dst_key
                     ),
                 })?;
+            let lifecycle_tags = dst_live.tags.clone();
+            let lifecycle_size = dst_live.size;
+            let lifecycle_last_modified = dst_live.last_modified;
+            let result_last_modified = dst_stored.last_modified();
+            drop(dst_meta_pg);
             let lifecycle_expiration = self.current_object_lifecycle_expiration(
                 &dst_bucket_info,
                 dst_key,
-                dst_live.tags.as_deref(),
-                dst_live.size,
-                dst_live.last_modified,
+                lifecycle_tags.as_deref(),
+                lifecycle_size,
+                lifecycle_last_modified,
             )?;
 
             Ok(CopyObjectResult {
                 etag: put_result.etag,
-                last_modified: dst_stored.last_modified(),
+                last_modified: result_last_modified,
                 version_id: put_result.version_id,
                 sse_customer: dst_response_sse_customer,
                 lifecycle_expiration,
@@ -11995,8 +12020,10 @@ impl Coordinator {
                 encryption,
             })?;
             let upload = pg.get_multipart_upload(&UploadId::from(upload_id.as_str()))?;
+            let initiated_at = upload.initiated_at;
+            drop(pg);
             let lifecycle_abort =
-                self.multipart_lifecycle_abort_headers(&bucket_info, key, upload.initiated_at)?;
+                self.multipart_lifecycle_abort_headers(&bucket_info, key, initiated_at)?;
 
             Ok(CreateMultipartUploadResult {
                 upload_id,
@@ -12680,13 +12707,9 @@ impl Coordinator {
                     bucket, key
                 ),
             })?;
-            let lifecycle_expiration = self.current_object_lifecycle_expiration(
-                &bucket_info,
-                key,
-                live_record.tags.as_deref(),
-                live_record.size,
-                live_record.last_modified,
-            )?;
+            let lifecycle_tags = live_record.tags.clone();
+            let lifecycle_size = live_record.size;
+            let lifecycle_last_modified = live_record.last_modified;
 
             if let Some(ref payload) = stale_payload {
                 match payload {
@@ -12717,6 +12740,13 @@ impl Coordinator {
             }
 
             drop(meta_pg);
+            let lifecycle_expiration = self.current_object_lifecycle_expiration(
+                &bucket_info,
+                key,
+                lifecycle_tags.as_deref(),
+                lifecycle_size,
+                lifecycle_last_modified,
+            )?;
             if let Some(ref payload) = stale_payload {
                 self.delete_stale_object_payload(bucket, key, payload);
             }
@@ -12827,6 +12857,10 @@ impl Coordinator {
                 max_parts,
             })
             .map_err(ServerError::Metadata)?;
+        let upload_initiated_at = upload.initiated_at;
+        let checksum_algorithm = upload.checksum.map(MultipartChecksumConfig::algorithm);
+        let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);
+        drop(meta_pg);
 
         // 3. Convert to coordinator result types with formatted ETags.
         let parts = resp
@@ -12853,12 +12887,12 @@ impl Coordinator {
             parts,
             is_truncated: resp.is_truncated,
             next_part_number_marker: resp.next_part_number_marker,
-            checksum_algorithm: upload.checksum.map(MultipartChecksumConfig::algorithm),
-            checksum_type: upload.checksum.map(MultipartChecksumConfig::checksum_type),
+            checksum_algorithm,
+            checksum_type,
             lifecycle_abort: self.multipart_lifecycle_abort_headers(
                 &bucket_info,
                 key,
-                upload.initiated_at,
+                upload_initiated_at,
             )?,
         })
     }
@@ -14998,7 +15032,8 @@ mod tests {
             Some(older.version_id),
             ObjectRetention {
                 mode: ObjectLockMode::Governance,
-                retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
+                retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap()
+                    + 7 * 86_400,
             },
             false,
             requester.clone(),
@@ -21838,6 +21873,19 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_sweeper_drops_with_last_coordinator() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let lifecycle_sweeper = Arc::downgrade(&coord._lifecycle_sweeper);
+        let storage_node = Arc::downgrade(&coord.storage_node);
+
+        drop(coord);
+
+        assert!(lifecycle_sweeper.upgrade().is_none());
+        assert!(storage_node.upgrade().is_none());
+    }
+
+    #[test]
     fn bucket_lifecycle_cache_invalidates_across_coordinators_on_replace() {
         let tmp = test_util::tempdir();
         let (admin, reader) = setup_coordinators_with_pg_count(tmp.path(), 4);
@@ -21933,6 +21981,131 @@ mod tests {
             .unwrap();
         assert_eq!(second.rule_id.as_deref(), Some("expire-later"));
         assert!(second.expiry_time_millis > first.expiry_time_millis);
+    }
+
+    #[test]
+    fn put_object_bucket_lifecycle_same_pg_completes_without_deadlock() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Suspended,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>expire-soon</ID>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>1</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>",
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let res = test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
+                    sse_customer: None,
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: object_request_with_expected_owner(
+                        "bucket",
+                        "logs/key",
+                        test_helpers::requester("owner-a"),
+                        None,
+                    ),
+                    data: b"data",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            );
+            tx.send(res.map(|result| result.version_id)).unwrap();
+        });
+
+        let version_id = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("put_object with bucket lifecycle should not self-deadlock")
+            .unwrap();
+        assert_eq!(version_id, VersionId::Null);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn create_multipart_upload_bucket_lifecycle_same_pg_completes_without_deadlock() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>abort-mpu</ID>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload>\
+                </Rule>\
+            </LifecycleConfiguration>",
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let res = coord.create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "logs/key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                sse_customer: None,
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            });
+            tx.send(res.map(|result| result.lifecycle_abort.is_some()))
+                .unwrap();
+        });
+
+        let has_abort_header = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("create_multipart_upload with bucket lifecycle should not self-deadlock")
+            .unwrap();
+        assert!(has_abort_header);
+        handle.join().unwrap();
     }
 
     #[test]
