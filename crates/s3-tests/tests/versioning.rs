@@ -615,6 +615,66 @@ fn test_versioning_obj_suspend_versions() {
 }
 
 #[test]
+fn test_versioning_list_object_versions_suspended_null_is_latest() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "testobj";
+
+        let older = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"older"))
+            .send()
+            .await
+            .unwrap();
+        let older_version_id = older.version_id().unwrap().to_string();
+
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Suspended)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"current"))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .prefix(key)
+            .send()
+            .await
+            .unwrap();
+
+        let versions = resp.versions();
+        assert_eq!(versions.len(), 2);
+        assert_eq!(versions[0].key().unwrap(), key);
+        assert_eq!(versions[0].version_id(), Some("null"));
+        assert_eq!(versions[0].is_latest(), Some(true));
+        assert_eq!(versions[1].key().unwrap(), key);
+        assert_eq!(versions[1].version_id(), Some(older_version_id.as_str()));
+        assert_eq!(versions[1].is_latest(), Some(false));
+        assert!(resp.delete_markers().is_empty());
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
 fn test_versioning_obj_plain_null_version_overwrite_suspended() {
     s3_tests::run(async {
         let client = CTX.client();

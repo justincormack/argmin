@@ -708,6 +708,9 @@ fn file_bucket_metadata_config_roundtrip() {
         3
     );
 
+    let lifecycle_buckets = store.list_buckets_with_lifecycle().unwrap();
+    assert!(lifecycle_buckets.is_empty());
+
     store
         .put_bucket_ownership_controls("bucket", "<OwnershipControls/>")
         .unwrap();
@@ -748,6 +751,42 @@ fn file_bucket_metadata_config_roundtrip() {
         .put_bucket_acl("bucket", &AclGrants::default(), false, false)
         .unwrap();
     assert!(!store.head_bucket("bucket").unwrap().public_read);
+}
+
+#[test]
+fn list_buckets_with_lifecycle_returns_only_active_lifecycle_buckets() {
+    let (_dir, store) = make_pg_store();
+    for bucket in ["alpha", "beta", "gamma"] {
+        store
+            .create_bucket(
+                bucket,
+                "owner",
+                &CanonicalUserId::from_principal("owner"),
+                &AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+    }
+
+    store
+        .put_bucket_lifecycle("alpha", "<LifecycleConfiguration/>")
+        .unwrap();
+    store
+        .put_bucket_lifecycle(
+            "beta",
+            "<LifecycleConfiguration><Rule/></LifecycleConfiguration>",
+        )
+        .unwrap();
+    store.begin_bucket_write_drain("beta").unwrap();
+    store.mark_bucket_deleting("beta").unwrap();
+
+    let buckets = store.list_buckets_with_lifecycle().unwrap();
+    let names: Vec<String> = buckets
+        .into_iter()
+        .map(|bucket| bucket.name.to_string())
+        .collect();
+    assert_eq!(names, vec!["alpha"]);
 }
 
 #[test]
@@ -4996,6 +5035,188 @@ fn list_object_versions_includes_delete_markers() {
     let has_dm = resp.versions.iter().any(|v| v.is_delete_marker());
     assert!(has_live);
     assert!(has_dm);
+}
+
+#[test]
+fn suspended_null_live_version_stays_current_when_last_modified_ties() {
+    let (_dir, store) = make_pg_store();
+    let numbered = VersionId::Versioned(NonZeroU64::new(1).unwrap());
+
+    store
+        .create_bucket(
+            "b",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+    store
+        .put_bucket_versioning("b", BucketVersioningState::Suspended)
+        .unwrap();
+
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: numbered,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 100,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        }))
+        .unwrap();
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 200,
+            etag: ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        }))
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE objects SET last_modified = ?1 WHERE bucket = ?2 AND key = ?3",
+            rusqlite::params![1_i64, "b", "k"],
+        )
+        .unwrap();
+
+    let current = store.get_object_meta("b", "k").unwrap();
+    assert_eq!(current.version_id(), VersionId::Null);
+    assert_eq!(current.as_live().unwrap().size, 200);
+
+    let listed = store
+        .list_objects(&ListObjectsReq {
+            bucket: "b".into(),
+            prefix: None,
+            start_after: None,
+            max_keys: 10,
+        })
+        .unwrap();
+    assert_eq!(listed.objects.len(), 1);
+    assert_eq!(listed.objects[0].version_id(), VersionId::Null);
+    assert_eq!(listed.objects[0].as_live().unwrap().size, 200);
+
+    let versions = store
+        .list_object_versions(&ListObjectVersionsReq {
+            bucket: "b".into(),
+            prefix: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 10,
+        })
+        .unwrap();
+    assert_eq!(versions.versions.len(), 2);
+    assert_eq!(versions.versions[0].version_id(), VersionId::Null);
+    assert_eq!(versions.versions[1].version_id(), numbered);
+}
+
+#[test]
+fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
+    let (_dir, store) = make_pg_store();
+    let numbered = VersionId::Versioned(NonZeroU64::new(1).unwrap());
+
+    store
+        .create_bucket(
+            "b",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+    store
+        .put_bucket_versioning("b", BucketVersioningState::Suspended)
+        .unwrap();
+
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: numbered,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 100,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        }))
+        .unwrap();
+    store
+        .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            owner: test_owner(),
+        }))
+        .unwrap();
+    store
+        .connection()
+        .execute(
+            "UPDATE objects SET last_modified = ?1 WHERE bucket = ?2 AND key = ?3",
+            rusqlite::params![1_i64, "b", "k"],
+        )
+        .unwrap();
+
+    let current = store.get_object_meta("b", "k").unwrap();
+    assert_eq!(current.version_id(), VersionId::Null);
+    assert!(current.is_delete_marker());
+
+    let listed = store
+        .list_objects(&ListObjectsReq {
+            bucket: "b".into(),
+            prefix: None,
+            start_after: None,
+            max_keys: 10,
+        })
+        .unwrap();
+    assert!(listed.objects.is_empty());
+
+    let versions = store
+        .list_object_versions(&ListObjectVersionsReq {
+            bucket: "b".into(),
+            prefix: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: 10,
+        })
+        .unwrap();
+    assert_eq!(versions.versions.len(), 2);
+    assert_eq!(versions.versions[0].version_id(), VersionId::Null);
+    assert!(versions.versions[0].is_delete_marker());
+    assert_eq!(versions.versions[1].version_id(), numbered);
+    assert!(!versions.versions[1].is_delete_marker());
 }
 
 // ── next_version_id ────────────────────────────────────────────────────

@@ -275,6 +275,11 @@ We need an async lifecycle manager, but it cannot simply be "one full scanner
 per `Coordinator`". `argmin-s3` creates one `Coordinator` per frontend worker,
 so naive per-coordinator scanning would duplicate work N times.
 
+Current implementation note:
+- Phase 2 currently ships with a per-`Coordinator` background sweeper that
+  rechecks bucket/object state under lock before applying expiry actions, so
+  semantics are correct but scheduler sharing is still a follow-up item
+
 Required design property:
 - one shared scheduler domain per `SharedStorageNode`, not per frontend
 
@@ -334,7 +339,8 @@ part of the initial design.
 
 Current status:
 - Phase 1 is complete.
-- Phases 2 through 5 remain pending.
+- Phase 2 is complete.
+- Phases 3 through 5 remain pending.
 
 ### Phase 1: Lifecycle config CRUD and rule model (Completed)
 
@@ -359,7 +365,7 @@ Completed in the current implementation:
 - `x-amz-expiration` for current object versions
 - `x-amz-abort-*` for matching multipart uploads
 
-### Phase 2: Current-version expiration
+### Phase 2: Current-version expiration (Completed)
 
 Implement:
 - UTC eligibility helper
@@ -371,6 +377,13 @@ Add deterministic tests for:
 - nonversioned object removal
 - versioning-enabled delete-marker creation
 - versioning-suspended null-version delete-marker behavior
+
+Completed in the current implementation:
+- deterministic sweep path for lifecycle execution tests
+- background sweeper invoking current-version expiration
+- current-version expiration for nonversioned buckets with reclaim integration
+- current-version expiration for versioning-enabled buckets via delete marker
+- current-version expiration for versioning-suspended buckets via null delete marker
 
 ### Phase 3: Noncurrent version expiration
 

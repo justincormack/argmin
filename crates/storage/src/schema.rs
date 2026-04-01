@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS objects (
     bucket        TEXT NOT NULL,
     key           TEXT NOT NULL,
     version_id    INTEGER NOT NULL CHECK (version_id >= 0),
+    write_sequence INTEGER NOT NULL CHECK (write_sequence > 0),
     generation_id INTEGER,
     size          INTEGER NOT NULL,
     etag          BLOB NOT NULL,
@@ -320,6 +321,10 @@ CREATE INDEX IF NOT EXISTS idx_objects_list ON objects (bucket, key)";
 const CREATE_OBJECTS_VERSIONS_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_objects_versions ON objects (bucket, key, version_id DESC)";
 
+/// Index for current-object and version ordering queries.
+const CREATE_OBJECTS_WRITE_SEQUENCE_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS idx_objects_write_sequence ON objects (bucket, key, write_sequence DESC)";
+
 /// Bucket metadata table.
 const CREATE_BUCKETS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS buckets (
@@ -378,6 +383,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_OBJECTS_TABLE, [])?;
     conn.execute(CREATE_OBJECTS_LIST_INDEX, [])?;
     conn.execute(CREATE_OBJECTS_VERSIONS_INDEX, [])?;
+    conn.execute(CREATE_OBJECTS_WRITE_SEQUENCE_INDEX, [])?;
     conn.execute(CREATE_MULTIPART_UPLOADS_TABLE, [])?;
     conn.execute(CREATE_MPU_BUCKET_KEY_INDEX, [])?;
     conn.execute(CREATE_MULTIPART_PARTS_TABLE, [])?;
@@ -403,6 +409,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_bucket_write_reservation_columns(conn)?;
     migrate_bucket_policy_columns(conn)?;
     migrate_bucket_lifecycle_columns(conn)?;
+    migrate_object_write_sequence_columns(conn)?;
     migrate_multipart_upload_tag_columns(conn)?;
     create_object_lock_triggers(conn)?;
     Ok(())
@@ -495,6 +502,54 @@ fn migrate_bucket_lifecycle_columns(conn: &Connection) -> Result<(), rusqlite::E
         "bucket_lifecycle_generation",
         "ALTER TABLE buckets ADD COLUMN bucket_lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_lifecycle_generation >= 0)",
     )?;
+    Ok(())
+}
+
+fn migrate_object_write_sequence_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(
+        conn,
+        "objects",
+        "write_sequence",
+        "ALTER TABLE objects ADD COLUMN write_sequence INTEGER NOT NULL DEFAULT 0 CHECK (write_sequence >= 0)",
+    )?;
+    conn.execute(CREATE_OBJECTS_WRITE_SEQUENCE_INDEX, [])?;
+
+    let mut stmt = conn.prepare(
+        "SELECT rowid, bucket, key \
+         FROM objects \
+         ORDER BY bucket ASC, key ASC, last_modified ASC, rowid ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+
+    let mut current_bucket = String::new();
+    let mut current_key = String::new();
+    let mut sequence = 0i64;
+    let mut updates = Vec::new();
+    for row in rows {
+        let (rowid, bucket, key) = row?;
+        if bucket != current_bucket || key != current_key {
+            current_bucket = bucket;
+            current_key = key;
+            sequence = 1;
+        } else {
+            sequence += 1;
+        }
+        updates.push((rowid, sequence));
+    }
+
+    for (rowid, write_sequence) in updates {
+        conn.execute(
+            "UPDATE objects SET write_sequence = ?1 WHERE rowid = ?2 AND write_sequence = 0",
+            [write_sequence, rowid],
+        )?;
+    }
+
     Ok(())
 }
 

@@ -23,10 +23,10 @@ use storage::{
     BucketName, BucketObjectLockConfig, BucketState, CommitMultipartReq, CommitStreamPutReq,
     CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, GenerationId, LifecycleDate,
     LifecycleExpiration, LifecycleRuleStatus, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListObjectsReq, ListPartsReq, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectLockState,
-    ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    ListObjectsReq, ListPartsReq, LiveObjectRecord, MultipartPartRecord,
+    MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
+    MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout,
+    ObjectLockState, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
     ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PutDeleteMarkerReq, PutLiveObjectReq,
     PutObjectReq, ReclaimWorkItem, SerializedMetadataBlob, SerializedSystemMetadataBlob,
     SerializedTagSet, SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadRecord,
@@ -57,6 +57,8 @@ pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
 /// Fixed internal segment size for newly committed segmented payloads.
 pub const INTERNAL_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
+
+const LIFECYCLE_SWEEP_INTERVAL_MILLIS: u64 = 1000;
 
 /// A checksum claim parsed from HTTP headers or trailers.
 ///
@@ -2298,6 +2300,11 @@ struct ReclaimSweeper {
     handle: Option<JoinHandle<()>>,
 }
 
+struct LifecycleSweeper {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
 #[derive(Debug, Clone)]
 struct CachedBucketPolicy {
     generation: u64,
@@ -2310,6 +2317,24 @@ struct CachedBucketLifecycle {
     config: Arc<BucketLifecycleConfiguration>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LifecycleSweepStats {
+    scanned_buckets: u64,
+    expired_current_objects: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeletedLiveObjectKind {
+    Segments,
+    Multipart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeletedLiveObjectReclaim {
+    generation_id: GenerationId,
+    kind: DeletedLiveObjectKind,
+}
+
 enum ObjectAclAuthorization {
     ReadWithPolicy(auth::PolicyAction),
     Write,
@@ -2319,6 +2344,15 @@ impl Drop for ReclaimSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
         self.storage_node.wake_reclaim_workers();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for LifecycleSweeper {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
@@ -2337,6 +2371,7 @@ pub struct Coordinator {
     region: String,
     sse_c_validator: Option<SseCustomerValidatorConfig>,
     _reclaim_sweeper: ReclaimSweeper,
+    _lifecycle_sweeper: LifecycleSweeper,
 }
 
 #[cfg(test)]
@@ -2426,6 +2461,186 @@ impl ReadRuntime {
 
     fn enqueue_bucket_delete_finalize(&self, bucket: &str) {
         self.storage_node.enqueue_bucket_delete_finalize(bucket);
+    }
+
+    fn run_lifecycle_sweep_at(&self, now_millis: u64) -> Result<LifecycleSweepStats, ServerError> {
+        let mut stats = LifecycleSweepStats {
+            scanned_buckets: 0,
+            expired_current_objects: 0,
+        };
+
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self.storage_node.get_pg(pg_id)?;
+            let buckets = pg.list_buckets_with_lifecycle()?;
+            drop(pg);
+
+            for bucket in buckets {
+                stats.scanned_buckets += 1;
+                self.expire_due_current_objects_for_bucket(&bucket, now_millis, &mut stats)?;
+            }
+
+            Ok::<(), ServerError>(())
+        })?;
+
+        Ok(stats)
+    }
+
+    fn expire_due_current_objects_for_bucket(
+        &self,
+        bucket_info: &BucketInfo,
+        now_millis: u64,
+        stats: &mut LifecycleSweepStats,
+    ) -> Result<(), ServerError> {
+        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+            return Ok(());
+        };
+        let config =
+            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
+                ServerError::InternalError {
+                    reason: format!(
+                    "stored lifecycle configuration for {} failed to parse at sweep time: {error}",
+                    bucket_info.name
+                ),
+                }
+            })?;
+
+        let mut candidates = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self.storage_node.get_pg(pg_id)?;
+            let objects = pg.list_objects(&ListObjectsReq {
+                bucket: bucket_info.name.clone(),
+                prefix: None,
+                start_after: None,
+                max_keys: u32::MAX,
+            })?;
+            drop(pg);
+
+            for object in objects.objects {
+                let Some(record) = object.into_live() else {
+                    continue;
+                };
+                let tags = match record.tags.as_deref() {
+                    Some(tags_xml) => Coordinator::parse_serialized_tag_set(tags_xml)?,
+                    None => Vec::new(),
+                };
+                let Some(expiration) = Coordinator::evaluate_current_object_lifecycle_expiration(
+                    &config,
+                    record.key.as_str(),
+                    &tags,
+                    record.size,
+                    record.last_modified,
+                ) else {
+                    continue;
+                };
+                if expiration.expiry_time_millis <= now_millis {
+                    candidates.push((record.key.to_string(), record.version_id));
+                }
+            }
+
+            Ok::<(), ServerError>(())
+        })?;
+
+        for (key, version_id) in candidates {
+            if self.expire_current_object_if_due(
+                bucket_info.name.as_str(),
+                &key,
+                version_id,
+                now_millis,
+            )? {
+                stats.expired_current_objects += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn expire_current_object_if_due(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_version_id: VersionId,
+        now_millis: u64,
+    ) -> Result<bool, ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
+        let bucket_pg = self
+            .storage_node
+            .get_pg(self.pg_topology.bucket_pg(bucket))?;
+        let bucket_info = match bucket_pg.head_bucket(bucket) {
+            Ok(info) => info,
+            Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
+            Err(error) => return Err(ServerError::Metadata(error)),
+        };
+        drop(bucket_pg);
+
+        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+            return Ok(false);
+        };
+        let config =
+            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
+                ServerError::InternalError {
+                    reason: format!(
+                    "stored lifecycle configuration for {} failed to parse at expiry time: {error}",
+                    bucket
+                ),
+                }
+            })?;
+
+        let meta_pg = self
+            .storage_node
+            .get_pg(self.pg_topology.object_pg(bucket, key))?;
+        let stored = match meta_pg.get_object_meta(bucket, key) {
+            Ok(stored) => stored,
+            Err(storage::MetadataError::ObjectNotFound) => return Ok(false),
+            Err(error) => return Err(ServerError::Metadata(error)),
+        };
+        let record = match stored {
+            StoredObject::Live(record) => record,
+            StoredObject::DeleteMarker(_) => return Ok(false),
+        };
+        if record.version_id != expected_version_id {
+            return Ok(false);
+        }
+
+        let tags = match record.tags.as_deref() {
+            Some(tags_xml) => Coordinator::parse_serialized_tag_set(tags_xml)?,
+            None => Vec::new(),
+        };
+        let Some(expiration) = Coordinator::evaluate_current_object_lifecycle_expiration(
+            &config,
+            key,
+            &tags,
+            record.size,
+            record.last_modified,
+        ) else {
+            return Ok(false);
+        };
+        if expiration.expiry_time_millis > now_millis {
+            return Ok(false);
+        }
+
+        let owner = OwnerIdentity::new(
+            bucket_info.owner_principal.clone(),
+            bucket_info.owner_canonical_id.clone(),
+        );
+        let reclaim = match bucket_info.versioning {
+            BucketVersioningState::Disabled => {
+                Coordinator::permanently_delete_live_object_locked(&meta_pg, bucket, key, &record)?
+            }
+            BucketVersioningState::Enabled => {
+                let marker_vid = meta_pg.next_version_id(bucket, key)?;
+                Coordinator::put_delete_marker_locked(&meta_pg, bucket, key, marker_vid, owner)?;
+                None
+            }
+            BucketVersioningState::Suspended => Coordinator::expire_current_live_suspended_locked(
+                &meta_pg, bucket, key, &record, owner,
+            )?,
+        };
+
+        drop(meta_pg);
+        if let Some(reclaim) = reclaim {
+            self.enqueue_object_payload_reclaim(bucket, key, reclaim.generation_id);
+        }
+        Ok(true)
     }
 
     fn acquire_object_payload_lease(
@@ -4972,26 +5187,46 @@ impl Coordinator {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker_node = Arc::clone(&storage_node);
+        let reclaim_runtime = read_runtime.clone();
         let handle = std::thread::Builder::new()
             .name("argmin-reclaim".to_string())
             .spawn(move || {
                 while let Some(work) = worker_node.wait_for_reclaim_work(&worker_stop) {
                     match work {
                         ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)) => {
-                            let _ = read_runtime.try_reclaim_object_payload(
+                            let _ = reclaim_runtime.try_reclaim_object_payload(
                                 &bucket,
                                 &key,
                                 generation_id,
                             );
                         }
                         ReclaimWorkItem::BucketDelete(bucket) => {
-                            let _ = read_runtime.try_finalize_bucket_delete(&bucket);
+                            let _ = reclaim_runtime.try_finalize_bucket_delete(&bucket);
                         }
                     }
                 }
             })
             .map_err(|e| ServerError::InternalError {
                 reason: format!("failed to start reclaim worker: {e}"),
+            })?;
+        let lifecycle_stop = Arc::new(AtomicBool::new(false));
+        let lifecycle_worker_stop = Arc::clone(&lifecycle_stop);
+        let lifecycle_runtime = read_runtime.clone();
+        let lifecycle_handle = std::thread::Builder::new()
+            .name("argmin-lifecycle".to_string())
+            .spawn(move || {
+                while !lifecycle_worker_stop.load(Ordering::SeqCst) {
+                    let _ = lifecycle_runtime.run_lifecycle_sweep_at(Coordinator::now_millis());
+                    let mut remaining = LIFECYCLE_SWEEP_INTERVAL_MILLIS;
+                    while remaining > 0 && !lifecycle_worker_stop.load(Ordering::SeqCst) {
+                        let step = remaining.min(100);
+                        std::thread::sleep(std::time::Duration::from_millis(step));
+                        remaining -= step;
+                    }
+                }
+            })
+            .map_err(|e| ServerError::InternalError {
+                reason: format!("failed to start lifecycle worker: {e}"),
             })?;
         let sweeper_storage_node = Arc::clone(&storage_node);
         Ok(Self {
@@ -5010,6 +5245,10 @@ impl Coordinator {
                 stop,
                 handle: Some(handle),
             },
+            _lifecycle_sweeper: LifecycleSweeper {
+                stop: lifecycle_stop,
+                handle: Some(lifecycle_handle),
+            },
         })
     }
 
@@ -5022,6 +5261,11 @@ impl Coordinator {
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
             sse_c_validator: self.sse_c_validator.clone(),
         }
+    }
+
+    #[cfg(test)]
+    fn run_lifecycle_sweep_at(&self, now_millis: u64) -> Result<LifecycleSweepStats, ServerError> {
+        self.read_runtime().run_lifecycle_sweep_at(now_millis)
     }
 
     pub fn region(&self) -> &str {
@@ -8917,6 +9161,140 @@ impl Coordinator {
         }
     }
 
+    fn reclaim_info_for_stale_payload(payload: &StaleObjectPayload) -> DeletedLiveObjectReclaim {
+        match payload {
+            StaleObjectPayload::Segments { generation_id, .. } => DeletedLiveObjectReclaim {
+                generation_id: *generation_id,
+                kind: DeletedLiveObjectKind::Segments,
+            },
+            StaleObjectPayload::Multipart { generation_id, .. } => DeletedLiveObjectReclaim {
+                generation_id: *generation_id,
+                kind: DeletedLiveObjectKind::Multipart,
+            },
+        }
+    }
+
+    fn permanently_delete_live_object_locked(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        record: &LiveObjectRecord,
+    ) -> Result<Option<DeletedLiveObjectReclaim>, ServerError> {
+        let reclaim = if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
+            let obj_parts = meta_pg
+                .get_object_parts(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+            let mut streaming_segments: Vec<MultipartPartSegmentRecord> = Vec::new();
+            for part in &obj_parts {
+                if part.part_okh == [0u8; 16] {
+                    let segments = meta_pg
+                        .get_multipart_part_segments(
+                            bucket,
+                            key,
+                            record.version_id,
+                            part.part_number,
+                        )
+                        .map_err(ServerError::Metadata)?;
+                    streaming_segments.extend(segments);
+                }
+            }
+            Self::enqueue_multipart_reclaim(
+                meta_pg,
+                bucket,
+                key,
+                record.generation_id,
+                &obj_parts,
+                &streaming_segments,
+            )?;
+            if !streaming_segments.is_empty() {
+                meta_pg
+                    .delete_multipart_part_segments(bucket, key, record.version_id)
+                    .map_err(ServerError::Metadata)?;
+            }
+            meta_pg.delete_object_parts(bucket, key, record.version_id)?;
+            Some(DeletedLiveObjectReclaim {
+                generation_id: record.generation_id,
+                kind: DeletedLiveObjectKind::Multipart,
+            })
+        } else {
+            let segments = meta_pg
+                .get_object_segments(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+            Self::enqueue_object_segments_reclaim(
+                meta_pg,
+                bucket,
+                key,
+                record.generation_id,
+                &segments,
+            )?;
+            meta_pg
+                .delete_object_segments(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+            Some(DeletedLiveObjectReclaim {
+                generation_id: record.generation_id,
+                kind: DeletedLiveObjectKind::Segments,
+            })
+        };
+
+        if record.version_id.is_null() {
+            meta_pg.delete_object_meta(bucket, key)?;
+        } else {
+            meta_pg
+                .delete_object_version(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+        }
+
+        Ok(reclaim)
+    }
+
+    fn put_delete_marker_locked(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        owner: OwnerIdentity,
+    ) -> Result<(), ServerError> {
+        meta_pg
+            .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
+                bucket: BucketName::from(bucket),
+                key: ObjectKey::from(key),
+                version_id,
+                owner,
+            }))
+            .map_err(ServerError::Metadata)
+    }
+
+    fn expire_current_live_suspended_locked(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        record: &LiveObjectRecord,
+        owner: OwnerIdentity,
+    ) -> Result<Option<DeletedLiveObjectReclaim>, ServerError> {
+        let stale_payload = if record.version_id.is_null() {
+            Self::snapshot_overwritten_null_version_payload(meta_pg, bucket, key)?
+        } else {
+            None
+        };
+
+        Self::put_delete_marker_locked(meta_pg, bucket, key, VersionId::Null, owner)?;
+
+        let reclaim = stale_payload
+            .as_ref()
+            .map(Self::reclaim_info_for_stale_payload);
+        if let Some(payload) = stale_payload.as_ref() {
+            Self::delete_stale_object_payload_metadata(
+                meta_pg,
+                bucket,
+                key,
+                VersionId::Null,
+                payload,
+            )?;
+        }
+
+        Ok(reclaim)
+    }
+
     fn delete_stale_object_payload(&self, bucket: &str, key: &str, payload: &StaleObjectPayload) {
         match payload {
             StaleObjectPayload::Segments { generation_id, .. } => self
@@ -10664,12 +11042,10 @@ impl Coordinator {
             Ok::<(), ServerError>(())
         })?;
 
-        // Sort by (key ASC, version_id DESC)
-        all_versions.sort_by(|a, b| {
-            a.key()
-                .cmp(b.key())
-                .then(b.version_id().to_u64().cmp(&a.version_id().to_u64()))
-        });
+        // Sort by key only and preserve each PG's per-key version order.
+        // All versions for a given key live in the same object PG, and the
+        // storage layer already returns those versions newest-write-first.
+        all_versions.sort_by(|a, b| a.key().cmp(b.key()));
 
         // Build result entries, tracking is_latest per key
         let max = max_keys as usize;
@@ -13257,6 +13633,288 @@ mod tests {
             header.abort_time_millis,
             Coordinator::lifecycle_day_based_deadline(1_700_000_000_000, 7).unwrap()
         );
+    }
+
+    #[test]
+    fn lifecycle_sweep_expires_nonversioned_current_object() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let metadata = MetadataBlob::default();
+        let system_metadata = SystemMetadata::default();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration><Rule><ID>expire</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"hello",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let (last_modified, generation_id) = {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "key"))
+                .unwrap();
+            let stored = meta_pg.get_object_meta("bucket", "key").unwrap();
+            let live = stored.as_live().unwrap();
+            (live.last_modified, live.generation_id)
+        };
+        let lease =
+            coord
+                .read_runtime()
+                .acquire_object_payload_lease("bucket", "key", generation_id);
+        let deadline = Coordinator::lifecycle_day_based_deadline(last_modified, 1).unwrap();
+
+        let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
+        assert_eq!(stats.scanned_buckets, 1);
+        assert_eq!(stats.expired_current_objects, 1);
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        assert!(matches!(
+            meta_pg.get_object_meta("bucket", "key"),
+            Err(storage::MetadataError::ObjectNotFound)
+        ));
+        assert!(meta_pg
+            .get_object_segments_reclaim("bucket", "key", generation_id)
+            .unwrap()
+            .is_some());
+        assert!(meta_pg
+            .get_object_segments("bucket", "key", VersionId::Null)
+            .unwrap()
+            .is_empty());
+        drop(meta_pg);
+        drop(lease);
+    }
+
+    #[test]
+    fn lifecycle_sweep_expires_versioned_current_with_delete_marker() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let metadata = MetadataBlob::default();
+        let system_metadata = SystemMetadata::default();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration><Rule><ID>expire</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"hello",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let (last_modified, generation_id) = {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "key"))
+                .unwrap();
+            let stored = meta_pg
+                .get_object_version("bucket", "key", put.version_id)
+                .unwrap();
+            let live = stored.as_live().unwrap();
+            (live.last_modified, live.generation_id)
+        };
+        let deadline = Coordinator::lifecycle_day_based_deadline(last_modified, 1).unwrap();
+
+        let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
+        assert_eq!(stats.scanned_buckets, 1);
+        assert_eq!(stats.expired_current_objects, 1);
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        let current = meta_pg.get_object_meta("bucket", "key").unwrap();
+        assert!(matches!(current, StoredObject::DeleteMarker(_)));
+        let original = meta_pg
+            .get_object_version("bucket", "key", put.version_id)
+            .unwrap();
+        assert!(matches!(original, StoredObject::Live(_)));
+        assert!(meta_pg
+            .get_object_segments_reclaim("bucket", "key", generation_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn lifecycle_sweep_expires_suspended_null_current_with_null_delete_marker() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let metadata = MetadataBlob::default();
+        let system_metadata = SystemMetadata::default();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+        let older = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"older",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Suspended,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration><Rule><ID>expire</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"current",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(put.version_id, VersionId::Null);
+
+        let (last_modified, generation_id) = {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "key"))
+                .unwrap();
+            let stored = meta_pg
+                .get_object_version("bucket", "key", VersionId::Null)
+                .unwrap();
+            let live = stored.as_live().unwrap();
+            (live.last_modified, live.generation_id)
+        };
+        let lease =
+            coord
+                .read_runtime()
+                .acquire_object_payload_lease("bucket", "key", generation_id);
+        let deadline = Coordinator::lifecycle_day_based_deadline(last_modified, 1).unwrap();
+
+        let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
+        assert_eq!(stats.scanned_buckets, 1);
+        assert_eq!(stats.expired_current_objects, 1);
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        let current = meta_pg.get_object_meta("bucket", "key").unwrap();
+        match current {
+            StoredObject::DeleteMarker(marker) => assert_eq!(marker.version_id, VersionId::Null),
+            other => panic!("expected current delete marker, got {other:?}"),
+        }
+        let older_version = meta_pg
+            .get_object_version("bucket", "key", older.version_id)
+            .unwrap();
+        assert!(matches!(older_version, StoredObject::Live(_)));
+        let null_version = meta_pg
+            .get_object_version("bucket", "key", VersionId::Null)
+            .unwrap();
+        assert!(matches!(null_version, StoredObject::DeleteMarker(_)));
+        assert!(meta_pg
+            .get_object_segments_reclaim("bucket", "key", generation_id)
+            .unwrap()
+            .is_some());
+        drop(meta_pg);
+
+        let versions = coord
+            .list_object_versions(&ListObjectVersionsRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 100,
+            })
+            .unwrap();
+        assert_eq!(versions.versions.len(), 2);
+        assert_eq!(versions.versions[0].version_id, VersionId::Null);
+        assert!(versions.versions[0].is_latest);
+        assert!(versions.versions[0].is_delete_marker);
+        assert_eq!(versions.versions[1].version_id, older.version_id);
+        assert!(!versions.versions[1].is_latest);
+        assert!(!versions.versions[1].is_delete_marker);
+
+        drop(lease);
     }
 
     #[test]
@@ -23145,6 +23803,86 @@ mod tests {
             get_bucket_versioning_test(&coord, "bucket", test_requester(), None).unwrap(),
             BucketVersioningState::Enabled
         );
+    }
+
+    #[test]
+    fn list_object_versions_suspended_null_live_is_latest() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let metadata = MetadataBlob::new();
+        let system_metadata = SystemMetadata::EMPTY;
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let older = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"older",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Suspended,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let current = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"current",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(current.version_id, VersionId::Null);
+
+        let resp = coord
+            .list_object_versions(&ListObjectVersionsRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 100,
+            })
+            .unwrap();
+        assert_eq!(resp.versions.len(), 2);
+        assert_eq!(resp.versions[0].version_id, VersionId::Null);
+        assert!(resp.versions[0].is_latest);
+        assert!(!resp.versions[0].is_delete_marker);
+        assert_eq!(resp.versions[1].version_id, older.version_id);
+        assert!(!resp.versions[1].is_latest);
+        assert!(!resp.versions[1].is_delete_marker);
     }
 
     #[test]

@@ -1442,6 +1442,74 @@ impl PgStore {
             }),
         }
     }
+
+    fn next_object_write_sequence(&self, bucket: &str, key: &str) -> Result<u64, MetadataError> {
+        let max: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MAX(write_sequence) FROM objects WHERE bucket = ?1 AND key = ?2",
+                params![bucket, key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "next object write sequence",
+                source: e,
+            })?
+            .flatten();
+
+        match max {
+            None => Ok(1),
+            Some(value) => {
+                let current = u64::try_from(value).map_err(|_| MetadataError::Db {
+                    context: "negative write_sequence in database",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("negative MAX(write_sequence): {value}")),
+                    ),
+                })?;
+                current.checked_add(1).ok_or_else(|| MetadataError::Db {
+                    context: "write_sequence overflow",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from("MAX(write_sequence) overflow"),
+                    ),
+                })
+            }
+        }
+    }
+
+    fn object_write_sequence(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+    ) -> Result<Option<u64>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT write_sequence FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                params![bucket, key, version_id.to_u64() as i64],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get object write sequence",
+                source: e,
+            })?
+            .map(|value| {
+                u64::try_from(value).map_err(|_| MetadataError::Db {
+                    context: "negative write_sequence in database",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Integer,
+                        Box::from(format!("negative write_sequence: {value}")),
+                    ),
+                })
+            })
+            .transpose()
+    }
 }
 
 impl PgMetadataStore for PgStore {
@@ -1556,6 +1624,40 @@ impl PgMetadataStore for PgStore {
         for row in rows {
             buckets.push(row.map_err(|e| MetadataError::Db {
                 context: "list buckets row",
+                source: e,
+            })?);
+        }
+        Ok(buckets)
+    }
+
+    fn list_buckets_with_lifecycle(&self) -> Result<Vec<BucketInfo>, MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::list_buckets_with_lifecycle",
+            "pg_id={}",
+            self.pg_id
+        );
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, bucket_lifecycle, bucket_lifecycle_generation, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+                 FROM buckets WHERE state = ?1 AND bucket_lifecycle IS NOT NULL ORDER BY name ASC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "prepare list buckets with lifecycle",
+                source: e,
+            })?;
+        let rows = stmt
+            .query_map(params![BucketState::Active as u8], Self::row_to_bucket_info)
+            .map_err(|e| MetadataError::Db {
+                context: "list buckets with lifecycle query",
+                source: e,
+            })?;
+
+        let mut buckets = Vec::new();
+        for row in rows {
+            buckets.push(row.map_err(|e| MetadataError::Db {
+                context: "list buckets with lifecycle row",
                 source: e,
             })?);
         }
@@ -2195,6 +2297,8 @@ impl PgMetadataStore for PgStore {
         let now = PgStore::now_millis();
         match req {
             PutObjectReq::Live(req) => {
+                let write_sequence =
+                    self.next_object_write_sequence(req.bucket.as_str(), req.key.as_str())?;
                 req.validate().map_err(|msg| MetadataError::Db {
                     context: "put object meta (etag/layout mismatch)",
                     source: rusqlite::Error::FromSqlConversionFailure(
@@ -2227,14 +2331,14 @@ impl PgMetadataStore for PgStore {
                 let encryption_state = req.encryption.encode_state();
                 let sql = if req.version_id.is_null() {
                     "INSERT OR REPLACE INTO objects \
-                     (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
+                     (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
                       storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
                 } else {
                     "INSERT INTO objects \
-                     (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
+                     (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
                       storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
                 };
                 self.conn
                     .execute(
@@ -2243,6 +2347,7 @@ impl PgMetadataStore for PgStore {
                             req.bucket,
                             req.key,
                             req.version_id.to_u64() as i64,
+                            write_sequence as i64,
                             req.generation_id.get() as i64,
                             req.size as i64,
                             req.etag.as_bytes().as_slice(),
@@ -2273,16 +2378,18 @@ impl PgMetadataStore for PgStore {
                     })?;
             }
             PutObjectReq::DeleteMarker(req) => {
+                let write_sequence =
+                    self.next_object_write_sequence(req.bucket.as_str(), req.key.as_str())?;
                 let sql = if req.version_id.is_null() {
                     "INSERT OR REPLACE INTO objects \
-                     (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
+                     (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
                       storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-                     VALUES (?1, ?2, ?3, NULL, 0, zeroblob(0), 0, ?4, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?5, ?6, ?7, 0)"
+                     VALUES (?1, ?2, ?3, ?4, NULL, 0, zeroblob(0), 0, ?5, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?6, ?7, ?8, 0)"
                 } else {
                     "INSERT INTO objects \
-                     (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
+                     (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
                       storage_class, ec_k, ec_m, status, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read) \
-                     VALUES (?1, ?2, ?3, NULL, 0, zeroblob(0), 0, ?4, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?5, ?6, ?7, 0)"
+                     VALUES (?1, ?2, ?3, ?4, NULL, 0, zeroblob(0), 0, ?5, 0, 0, 0, 1, 0, NULL, NULL, NULL, 0, NULL, ?6, ?7, ?8, 0)"
                 };
                 self.conn
                     .execute(
@@ -2291,6 +2398,7 @@ impl PgMetadataStore for PgStore {
                             req.bucket,
                             req.key,
                             req.version_id.to_u64() as i64,
+                            write_sequence as i64,
                             now as i64,
                             req.owner.principal,
                             req.owner.canonical_id.as_str(),
@@ -2321,7 +2429,7 @@ impl PgMetadataStore for PgStore {
                  last_modified, storage_class, ec_k, ec_m, status, tags, \
                  data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
                  FROM objects WHERE bucket = ?1 AND key = ?2 \
-                 ORDER BY last_modified DESC, version_id DESC LIMIT 1",
+                 ORDER BY write_sequence DESC LIMIT 1",
                 params![bucket, key],
                 Self::row_to_object_record,
             )
@@ -2575,8 +2683,10 @@ impl PgMetadataStore for PgStore {
             req.bucket.as_str(),
             req.max_keys
         );
-        // Use a CTE to find the latest version per key, then filter to live objects.
-        // This correctly handles versioned buckets where delete markers hide keys.
+        // Select the current record per key using the durable per-key write
+        // sequence. Timestamp equality cannot reliably determine currentness
+        // for suspended buckets because a newer null version may share the
+        // same last_modified millisecond as an older numbered version.
         let limit = req.max_keys as i64 + 1;
 
         // Build WHERE clause fragments for key filtering
@@ -2606,21 +2716,19 @@ impl PgMetadataStore for PgStore {
         let where_str = where_clauses.join(" AND ");
 
         let sql = format!(
-            "WITH latest AS ( \
-                SELECT bucket, key, MAX(version_id) AS max_vid \
-                FROM objects \
-                WHERE bucket = ?1 \
-                GROUP BY bucket, key \
-            ) \
-            SELECT o.bucket, o.key, o.version_id, o.generation_id, o.size, o.etag, o.etag_kind, \
+            "SELECT o.bucket, o.key, o.version_id, o.generation_id, o.size, o.etag, o.etag_kind, \
                    o.last_modified, o.storage_class, o.ec_k, o.ec_m, o.status, o.tags, \
                    o.data_layout, o.parts_count, o.metadata_blob, o.system_metadata_blob, \
                    o.encryption_type, o.encryption_state, o.owner_principal, o.owner_canonical_id, \
                    o.acl_grants, o.public_read, o.object_lock_retention_mode, \
                    o.object_lock_retain_until, o.object_lock_legal_hold \
             FROM objects o \
-            INNER JOIN latest l ON o.bucket = l.bucket AND o.key = l.key AND o.version_id = l.max_vid \
             WHERE {where_str} AND o.status = 0 \
+              AND NOT EXISTS ( \
+                  SELECT 1 FROM objects newer \
+                  WHERE newer.bucket = o.bucket AND newer.key = o.key \
+                    AND newer.write_sequence > o.write_sequence \
+              ) \
             ORDER BY o.key ASC LIMIT ?{param_idx}"
         );
         params_vec.push(Box::new(limit));
@@ -2686,16 +2794,25 @@ impl PgMetadataStore for PgStore {
 
         if let Some(ref key_marker) = req.key_marker {
             if let Some(vid_marker) = req.version_id_marker {
-                // Resume after (key_marker, vid_marker)
-                where_clauses.push(format!(
-                    "(key > ?{} OR (key = ?{} AND version_id < ?{}))",
-                    param_idx,
-                    param_idx,
-                    param_idx + 1
-                ));
-                params_vec.push(Box::new(key_marker.clone()));
-                params_vec.push(Box::new(vid_marker.to_u64() as i64));
-                param_idx += 2;
+                if let Some(write_sequence) = self.object_write_sequence(
+                    req.bucket.as_str(),
+                    key_marker.as_str(),
+                    vid_marker,
+                )? {
+                    where_clauses.push(format!(
+                        "(key > ?{} OR (key = ?{} AND write_sequence < ?{}))",
+                        param_idx,
+                        param_idx,
+                        param_idx + 1
+                    ));
+                    params_vec.push(Box::new(key_marker.clone()));
+                    params_vec.push(Box::new(write_sequence as i64));
+                    param_idx += 2;
+                } else {
+                    where_clauses.push(format!("key > ?{param_idx}"));
+                    params_vec.push(Box::new(key_marker.clone()));
+                    param_idx += 1;
+                }
             } else {
                 where_clauses.push(format!("key > ?{param_idx}"));
                 params_vec.push(Box::new(key_marker.clone()));
@@ -2723,7 +2840,7 @@ impl PgMetadataStore for PgStore {
              data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
              FROM objects \
              WHERE {where_str} \
-             ORDER BY key ASC, version_id DESC LIMIT ?{param_idx}"
+             ORDER BY key ASC, write_sequence DESC LIMIT ?{param_idx}"
         );
         params_vec.push(Box::new(limit));
 
@@ -4716,18 +4833,26 @@ impl PgMetadataStore for PgStore {
             }
             let (object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) =
                 Self::object_lock_sql_values(obj.object_lock)?;
+            let write_sequence = self
+                .next_object_write_sequence(obj.bucket.as_str(), obj.key.as_str())
+                .map_err(|error| match error {
+                    MetadataError::Db { source, .. } => source,
+                    other => rusqlite::Error::ToSqlConversionFailure(Box::new(
+                        std::io::Error::other(other.to_string()),
+                    )),
+                })?;
 
             // 2. Write/overwrite object metadata row.
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
-                 (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
+                 (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
                   storage_class, ec_k, ec_m, status, tags, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
             } else {
                 "INSERT INTO objects \
-                 (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
+                 (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
                   storage_class, ec_k, ec_m, status, tags, data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
             };
             self.conn.execute(
                 obj_sql,
@@ -4735,6 +4860,7 @@ impl PgMetadataStore for PgStore {
                     obj.bucket,
                     obj.key,
                     obj.version_id.to_u64() as i64,
+                    write_sequence as i64,
                     obj.generation_id.get() as i64,
                     obj.size as i64,
                     obj.etag_crc64.as_slice(),
@@ -5223,17 +5349,19 @@ impl PgMetadataStore for PgStore {
                     context: "commit stream put (encode object lock)",
                     source: e,
                 })?;
+            let write_sequence =
+                self.next_object_write_sequence(obj.bucket.as_str(), obj.key.as_str())?;
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
-                 (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
+                 (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
                   storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
             } else {
                 "INSERT INTO objects \
-                 (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
+                 (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
                   storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
             };
             self.conn
                 .execute(
@@ -5242,6 +5370,7 @@ impl PgMetadataStore for PgStore {
                         obj.bucket,
                         obj.key,
                         obj.version_id.to_u64() as i64,
+                        write_sequence as i64,
                         obj.generation_id.get() as i64,
                         obj.size as i64,
                         obj.etag_crc64.to_be_bytes().as_slice(),
@@ -5413,17 +5542,19 @@ impl PgMetadataStore for PgStore {
                 })?;
             let encryption_type = obj.encryption.encryption_type() as u8;
             let encryption_state = obj.encryption.encode_state();
+            let write_sequence =
+                self.next_object_write_sequence(obj.bucket.as_str(), obj.key.as_str())?;
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
-                 (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
+                 (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
                   storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
             } else {
                 "INSERT INTO objects \
-                 (bucket, key, version_id, generation_id, size, etag, etag_kind, last_modified, \
+                 (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
                   storage_class, ec_k, ec_m, status, data_layout, parts_count, tags, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)"
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)"
             };
             self.conn
                 .execute(
@@ -5432,6 +5563,7 @@ impl PgMetadataStore for PgStore {
                         obj.bucket,
                         obj.key,
                         obj.version_id.to_u64() as i64,
+                        write_sequence as i64,
                         obj.generation_id.get() as i64,
                         obj.size as i64,
                         obj.etag.as_bytes().as_slice(),

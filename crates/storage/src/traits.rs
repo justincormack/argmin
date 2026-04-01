@@ -61,6 +61,9 @@ pub trait PgMetadataStore {
     /// List all buckets owned by the given owner within this PG.
     fn list_buckets(&self, owner_principal: &str) -> Result<Vec<BucketInfo>, MetadataError>;
 
+    /// List all active buckets in this PG with lifecycle configuration set.
+    fn list_buckets_with_lifecycle(&self) -> Result<Vec<BucketInfo>, MetadataError>;
+
     /// Mark a bucket as deleting so it is hidden from normal operations while
     /// background cleanup drains outstanding reclaim work.
     fn mark_bucket_deleting(&self, name: &str) -> Result<(), MetadataError>;
@@ -244,7 +247,7 @@ pub trait PgMetadataStore {
 
     /// List all object versions within this PG, including delete markers.
     ///
-    /// Returns versions ordered by (key ASC, version_id DESC).
+    /// Returns versions ordered by key, then newest write first for each key.
     fn list_object_versions(
         &self,
         req: &ListObjectVersionsReq,
