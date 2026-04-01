@@ -1,9 +1,7 @@
 /// Coordinator: orchestrates S3 operations across EC, storage, and metadata layers.
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
-use std::sync::OnceLock;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
 use std::thread::JoinHandle;
 
 use checksum::{
@@ -2292,6 +2290,8 @@ struct ReclamationTestHooks {
 static RECLAMATION_TEST_HOOKS: OnceLock<Mutex<ReclamationTestHooks>> = OnceLock::new();
 #[cfg(test)]
 static RECLAMATION_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<LifecycleSweeper>>>> =
+    OnceLock::new();
 
 #[cfg(test)]
 struct ReclamationTestHookGuard;
@@ -2313,8 +2313,8 @@ struct ReclaimSweeper {
 }
 
 struct LifecycleSweeper {
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    stop: AtomicBool,
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2368,9 +2368,55 @@ impl Drop for ReclaimSweeper {
 impl Drop for LifecycleSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.handle.lock().unwrap().take() {
             let _ = handle.join();
         }
+    }
+}
+
+impl LifecycleSweeper {
+    fn acquire_shared(
+        storage_node: &Arc<SharedStorageNode>,
+        runtime: ReadRuntime,
+    ) -> Result<Arc<Self>, ServerError> {
+        let registry = LIFECYCLE_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut registry = registry.lock().unwrap();
+        registry.retain(|_, sweeper| sweeper.upgrade().is_some());
+
+        let key = Arc::as_ptr(storage_node) as usize;
+        if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+            return Ok(existing);
+        }
+
+        let sweeper = Self::spawn(runtime)?;
+        registry.insert(key, Arc::downgrade(&sweeper));
+        Ok(sweeper)
+    }
+
+    fn spawn(runtime: ReadRuntime) -> Result<Arc<Self>, ServerError> {
+        let sweeper = Arc::new(Self {
+            stop: AtomicBool::new(false),
+            handle: Mutex::new(None),
+        });
+        let worker = Arc::clone(&sweeper);
+        let handle = std::thread::Builder::new()
+            .name("argmin-lifecycle".to_string())
+            .spawn(move || {
+                while !worker.stop.load(Ordering::SeqCst) {
+                    let _ = runtime.run_lifecycle_sweep_at(Coordinator::now_millis());
+                    let mut remaining = LIFECYCLE_SWEEP_INTERVAL_MILLIS;
+                    while remaining > 0 && !worker.stop.load(Ordering::SeqCst) {
+                        let step = remaining.min(100);
+                        std::thread::sleep(std::time::Duration::from_millis(step));
+                        remaining -= step;
+                    }
+                }
+            })
+            .map_err(|e| ServerError::InternalError {
+                reason: format!("failed to start lifecycle worker: {e}"),
+            })?;
+        *sweeper.handle.lock().unwrap() = Some(handle);
+        Ok(sweeper)
     }
 }
 
@@ -2386,7 +2432,7 @@ pub struct Coordinator {
     region: String,
     sse_c_validator: Option<SseCustomerValidatorConfig>,
     _reclaim_sweeper: ReclaimSweeper,
-    _lifecycle_sweeper: LifecycleSweeper,
+    _lifecycle_sweeper: Arc<LifecycleSweeper>,
 }
 
 #[cfg(test)]
@@ -5937,25 +5983,8 @@ impl Coordinator {
             .map_err(|e| ServerError::InternalError {
                 reason: format!("failed to start reclaim worker: {e}"),
             })?;
-        let lifecycle_stop = Arc::new(AtomicBool::new(false));
-        let lifecycle_worker_stop = Arc::clone(&lifecycle_stop);
-        let lifecycle_runtime = read_runtime.clone();
-        let lifecycle_handle = std::thread::Builder::new()
-            .name("argmin-lifecycle".to_string())
-            .spawn(move || {
-                while !lifecycle_worker_stop.load(Ordering::SeqCst) {
-                    let _ = lifecycle_runtime.run_lifecycle_sweep_at(Coordinator::now_millis());
-                    let mut remaining = LIFECYCLE_SWEEP_INTERVAL_MILLIS;
-                    while remaining > 0 && !lifecycle_worker_stop.load(Ordering::SeqCst) {
-                        let step = remaining.min(100);
-                        std::thread::sleep(std::time::Duration::from_millis(step));
-                        remaining -= step;
-                    }
-                }
-            })
-            .map_err(|e| ServerError::InternalError {
-                reason: format!("failed to start lifecycle worker: {e}"),
-            })?;
+        let lifecycle_sweeper =
+            LifecycleSweeper::acquire_shared(&storage_node, read_runtime.clone())?;
         let sweeper_storage_node = Arc::clone(&storage_node);
         Ok(Self {
             storage_node,
@@ -5973,10 +6002,7 @@ impl Coordinator {
                 stop,
                 handle: Some(handle),
             },
-            _lifecycle_sweeper: LifecycleSweeper {
-                stop: lifecycle_stop,
-                handle: Some(lifecycle_handle),
-            },
+            _lifecycle_sweeper: lifecycle_sweeper,
         })
     }
 
@@ -21798,6 +21824,17 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn lifecycle_sweeper_is_shared_per_storage_node() {
+        let tmp = test_util::tempdir();
+        let (first, second) = setup_coordinators_with_pg_count(tmp.path(), 4);
+
+        assert!(Arc::ptr_eq(
+            &first._lifecycle_sweeper,
+            &second._lifecycle_sweeper,
+        ));
     }
 
     #[test]

@@ -276,9 +276,10 @@ per `Coordinator`". `argmin-s3` creates one `Coordinator` per frontend worker,
 so naive per-coordinator scanning would duplicate work N times.
 
 Current implementation note:
-- Phase 2 currently ships with a per-`Coordinator` background sweeper that
-  rechecks bucket/object state under lock before applying expiry actions, so
-  semantics are correct but scheduler sharing is still a follow-up item
+- the background lifecycle sweeper is now shared per `SharedStorageNode`, so
+  multiple frontend `Coordinator`s do not duplicate whole-bucket scans
+- a durable lifecycle work queue / worker pool is still a possible follow-up if
+  we later need more structured scan distribution than a single shared sweeper
 
 Required design property:
 - one shared scheduler domain per `SharedStorageNode`, not per frontend
