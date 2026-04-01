@@ -966,10 +966,14 @@ impl HttpFrontend {
                     Ok(S3Response::copy_object(&result))
                 } else {
                     // Normal PutObject — use streaming upload path directly.
-                    validate_content_md5(req)?;
-                    validate_checksum_headers(req, true)?;
-                    let sse_customer = parse_sse_customer_request(req)?;
                     let object_lock = parse_object_lock_headers(req)?;
+                    let checksum_requirement = if object_lock.retention.is_some() {
+                        RequestChecksumRequirement::PutObjectWithObjectLock
+                    } else {
+                        RequestChecksumRequirement::Optional
+                    };
+                    require_request_checksum(req, checksum_requirement)?;
+                    let sse_customer = parse_sse_customer_request(req)?;
                     let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging")
                     {
                         let tags = xml::parse_url_encoded_tags(tagging_header)?;
@@ -1366,7 +1370,10 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::DeleteObjects { bucket } => {
-                require_content_md5(req)?;
+                require_request_checksum(
+                    req,
+                    RequestChecksumRequirement::ContentMd5OrChecksumHeader,
+                )?;
                 let bypass_governance = parse_bypass_governance_retention(req);
                 let (xml_entries, quiet) = xml::parse_delete_objects_xml(&req.body)?;
                 let requester = Self::requester_from_auth(auth);
@@ -1422,6 +1429,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_objects(&result, quiet))
             }
             S3Operation::PutBucketVersioning { bucket } => {
+                validate_request_checksum_headers(req, true, false)?;
                 let versioning_state = xml::parse_versioning_config_xml(&req.body)?;
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_versioning(
@@ -1448,6 +1456,10 @@ impl HttpFrontend {
                 Ok(S3Response::get_bucket_versioning(state))
             }
             S3Operation::PutBucketObjectLockConfiguration { bucket } => {
+                require_request_checksum(
+                    req,
+                    RequestChecksumRequirement::ContentMd5OrChecksumHeader,
+                )?;
                 let config = xml::parse_bucket_object_lock_configuration_xml(&req.body)?;
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_object_lock_configuration(
@@ -1474,6 +1486,7 @@ impl HttpFrontend {
                 Ok(S3Response::get_bucket_object_lock_configuration(config))
             }
             S3Operation::PutBucketEncryption { bucket } => {
+                validate_request_checksum_headers(req, true, false)?;
                 let config = xml::parse_bucket_encryption_xml(&req.body)?;
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_encryption(
@@ -1507,6 +1520,10 @@ impl HttpFrontend {
                 })
             }
             S3Operation::PutBucketCors { bucket } => {
+                require_request_checksum(
+                    req,
+                    RequestChecksumRequirement::ContentMd5OrChecksumHeader,
+                )?;
                 let config = xml::parse_cors_config_xml(&req.body)?;
                 let config_xml = xml::get_cors_config_xml(&config);
                 let requester = Self::requester_from_auth(auth);
@@ -1547,6 +1564,10 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket_cors())
             }
             S3Operation::PutBucketTagging { bucket } => {
+                require_request_checksum(
+                    req,
+                    RequestChecksumRequirement::ContentMd5OrChecksumHeader,
+                )?;
                 let tags = xml::parse_tagging_xml(&req.body, 50)?;
                 let tags_xml = xml::get_tagging_xml(&tags);
                 let requester = Self::requester_from_auth(auth);
@@ -1587,7 +1608,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket_tagging())
             }
             S3Operation::PutBucketLifecycle { bucket } => {
-                require_content_md5(req)?;
+                require_request_checksum(req, RequestChecksumRequirement::PutBucketLifecycle)?;
                 let config = xml::parse_bucket_lifecycle_configuration_xml(&req.body)?;
                 let config_xml = xml::get_bucket_lifecycle_configuration_xml(&config);
                 let requester = Self::requester_from_auth(auth);
@@ -1629,7 +1650,10 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket_lifecycle())
             }
             S3Operation::PutObjectRetention { bucket, key } => {
-                validate_content_md5(req)?;
+                require_request_checksum(
+                    req,
+                    RequestChecksumRequirement::ContentMd5OrChecksumHeader,
+                )?;
                 let vid = parse_version_id(req)?;
                 let retention = xml::parse_object_retention_xml(&req.body)?;
                 let bypass_governance = req
@@ -1666,7 +1690,10 @@ impl HttpFrontend {
                 Ok(S3Response::get_object_retention(retention))
             }
             S3Operation::PutObjectLegalHold { bucket, key } => {
-                validate_content_md5(req)?;
+                require_request_checksum(
+                    req,
+                    RequestChecksumRequirement::ContentMd5OrChecksumHeader,
+                )?;
                 let vid = parse_version_id(req)?;
                 let legal_hold = xml::parse_object_legal_hold_xml(&req.body)?;
                 let requester = Self::requester_from_auth(auth);
@@ -1699,6 +1726,7 @@ impl HttpFrontend {
                 Ok(S3Response::get_object_legal_hold(legal_hold))
             }
             S3Operation::PutObjectTagging { bucket, key } => {
+                validate_request_checksum_headers(req, true, false)?;
                 let vid = parse_version_id(req)?;
                 let tags = xml::parse_tagging_xml(&req.body, 10)?;
                 let tags_xml = xml::get_tagging_xml(&tags);
@@ -1771,6 +1799,7 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::PutObjectAcl { bucket, key } => {
+                validate_request_checksum_headers(req, true, false)?;
                 let version_id = parse_version_id(req)?;
                 let requester = Self::requester_from_auth(auth);
                 let result_version_id = if req.header("x-amz-acl").is_some() {
@@ -1814,6 +1843,7 @@ impl HttpFrontend {
                 Ok(S3Response::put_object_acl(result_version_id))
             }
             S3Operation::PutBucketPublicAccessBlock { bucket } => {
+                validate_request_checksum_headers(req, true, false)?;
                 let config = xml::parse_public_access_block_xml(&req.body)?;
                 let config_xml = xml::get_public_access_block_xml(&config);
                 let requester = Self::requester_from_auth(auth);
@@ -1856,6 +1886,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket_public_access_block())
             }
             S3Operation::PutBucketOwnershipControls { bucket } => {
+                validate_request_checksum_headers(req, true, false)?;
                 let value = xml::parse_ownership_controls_xml(&req.body)?;
                 let config_xml = xml::get_ownership_controls_xml(&value);
                 let requester = Self::requester_from_auth(auth);
@@ -1898,6 +1929,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_bucket_ownership_controls())
             }
             S3Operation::PutBucketPolicy { bucket } => {
+                validate_request_checksum_headers(req, true, false)?;
                 let policy =
                     std::str::from_utf8(&req.body).map_err(|_| ServerError::InvalidArgument {
                         reason: "invalid UTF-8 in bucket policy JSON body".to_string(),
@@ -1973,7 +2005,7 @@ impl HttpFrontend {
             }
             S3Operation::PutBucketAcl { bucket } => {
                 let requester = Self::requester_from_auth(auth);
-                if req.header("x-amz-acl").is_some() {
+                let acl = if req.header("x-amz-acl").is_some() {
                     if !req.body.is_empty() {
                         return Err(ServerError::InvalidArgument {
                             reason: "x-amz-acl cannot be combined with ACL XML body".to_string(),
@@ -1992,27 +2024,21 @@ impl HttpFrontend {
                             unreachable!("x-amz-acl header must parse to a canned ACL")
                         }
                     };
-                    self.coordinator
-                        .put_bucket_acl(&crate::coordinator::PutBucketAclRequest {
-                            bucket: crate::coordinator::BucketRequest {
-                                name: &bucket,
-                                requester,
-                                expected_bucket_owner,
-                            },
-                            acl: crate::coordinator::PutBucketAclInput::Canned(acl),
-                        })?;
+                    crate::coordinator::PutBucketAclInput::Canned(acl)
                 } else {
-                    let acl_grants = parse_acl_grants(req)?;
-                    self.coordinator
-                        .put_bucket_acl(&crate::coordinator::PutBucketAclRequest {
-                            bucket: crate::coordinator::BucketRequest {
-                                name: &bucket,
-                                requester,
-                                expected_bucket_owner,
-                            },
-                            acl: crate::coordinator::PutBucketAclInput::Grants(acl_grants),
-                        })?;
-                }
+                    crate::coordinator::PutBucketAclInput::Grants(parse_acl_grants(req)?)
+                };
+                let acl_req = crate::coordinator::PutBucketAclRequest {
+                    bucket: crate::coordinator::BucketRequest {
+                        name: &bucket,
+                        requester,
+                        expected_bucket_owner,
+                    },
+                    acl,
+                };
+                self.coordinator.validate_put_bucket_acl_request(&acl_req)?;
+                validate_request_checksum_headers(req, true, false)?;
+                self.coordinator.put_bucket_acl(&acl_req)?;
                 Ok(S3Response::put_bucket_acl())
             }
             S3Operation::CreateMultipartUpload { bucket, key } => {
@@ -3016,8 +3042,18 @@ impl HttpFrontend {
         );
         let auth = self.authenticate_with_payload_check(req, false)?;
 
+        let object_lock = parse_object_lock_headers(req)?;
+        let checksum_state = validate_request_checksum_headers(req, false, true)?;
+        if object_lock.retention.is_some()
+            && !checksum_state.has_content_md5
+            && !checksum_state.has_checksum_header
+            && !checksum_state.has_trailing_checksum
+        {
+            return Err(ServerError::InvalidRequest {
+                reason: "Content-MD5 OR x-amz-checksum- HTTP header is required for Put Object requests with Object Lock parameters".to_string(),
+            });
+        }
         let content_md5 = ContentMd5Claim::from_request(req)?;
-        validate_checksum_headers(req, false)?;
         let sse_customer_request = parse_sse_customer_request(req)?;
         let sse_customer = self
             .coordinator
@@ -3038,10 +3074,7 @@ impl HttpFrontend {
         // Reject if both a trailing checksum (via x-amz-trailer) and an inline
         // checksum value header are present. AWS returns:
         //   InvalidRequest: Expecting a single x-amz-checksum- header
-        let has_trailing_checksum = req.header("x-amz-trailer").is_some_and(|v| {
-            v.split(',')
-                .any(|name| checksum_algo_from_header(name.trim()).is_some())
-        });
+        let has_trailing_checksum = checksum_state.has_trailing_checksum;
 
         if has_trailing_checksum {
             let checksum_value_headers: &[&str] = &[
@@ -3098,7 +3131,7 @@ impl HttpFrontend {
             system_metadata,
             cond,
             inline_tags_xml,
-            object_lock: parse_object_lock_headers(req)?,
+            object_lock,
             checksum: StreamingPutChecksumContract {
                 content_md5,
                 response_headers: ChecksumResponseHeaders(checksum_response),
@@ -3328,6 +3361,7 @@ impl HttpFrontend {
         );
         let auth = self.authenticate_with_payload_check(req, false)?;
 
+        validate_request_checksum_headers(req, false, false)?;
         let content_md5 = ContentMd5Claim::from_request(req)?;
         let claimed_checksum = extract_checksum_header(req)?;
         let sse_customer_request = parse_sse_customer_request(req)?;
@@ -3995,13 +4029,87 @@ fn validate_content_md5(req: &S3Request) -> Result<(), ServerError> {
     claim.verify(&actual_bytes)
 }
 
-fn require_content_md5(req: &S3Request) -> Result<(), ServerError> {
-    if req.header("content-md5").is_none() {
-        return Err(ServerError::InvalidRequest {
-            reason: "Missing required header for this request: Content-MD5".to_string(),
-        });
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RequestChecksumRequirement {
+    Optional,
+    ContentMd5OrChecksumHeader,
+    PutBucketLifecycle,
+    PutObjectWithObjectLock,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RequestChecksumState {
+    has_content_md5: bool,
+    has_checksum_header: bool,
+    has_trailing_checksum: bool,
+}
+
+fn has_trailing_checksum(req: &S3Request) -> bool {
+    req.header("x-amz-trailer").is_some_and(|value| {
+        value
+            .split(',')
+            .any(|name| checksum_algo_from_header(name.trim()).is_some())
+    })
+}
+
+fn validate_request_checksum_headers(
+    req: &S3Request,
+    verify_body: bool,
+    allow_trailing_checksum: bool,
+) -> Result<RequestChecksumState, ServerError> {
+    let has_content_md5 = req.header("content-md5").is_some();
+    let checksum_header = extract_encoded_checksum_header(req)?;
+    let has_checksum_header = checksum_header.is_some();
+    let has_trailing_checksum = allow_trailing_checksum && has_trailing_checksum(req);
+
+    if verify_body {
+        validate_content_md5(req)?;
+    } else {
+        ContentMd5Claim::from_request(req)?;
     }
-    validate_content_md5(req)
+    validate_checksum_headers(req, verify_body)?;
+
+    Ok(RequestChecksumState {
+        has_content_md5,
+        has_checksum_header,
+        has_trailing_checksum,
+    })
+}
+
+fn require_request_checksum(
+    req: &S3Request,
+    requirement: RequestChecksumRequirement,
+) -> Result<RequestChecksumState, ServerError> {
+    let state = validate_request_checksum_headers(req, true, false)?;
+    match requirement {
+        RequestChecksumRequirement::Optional => Ok(state),
+        RequestChecksumRequirement::ContentMd5OrChecksumHeader => {
+            if !state.has_content_md5 && !state.has_checksum_header {
+                return Err(ServerError::InvalidRequest {
+                    reason:
+                        "Missing required header for this request: Content-MD5 OR x-amz-checksum-*"
+                            .to_string(),
+                });
+            }
+            Ok(state)
+        }
+        RequestChecksumRequirement::PutBucketLifecycle => {
+            if !state.has_content_md5 && !state.has_checksum_header {
+                return Err(ServerError::InvalidRequest {
+                    reason: "Missing required header for this request: Content-MD5".to_string(),
+                });
+            }
+            Ok(state)
+        }
+        RequestChecksumRequirement::PutObjectWithObjectLock => {
+            if !state.has_content_md5 && !state.has_checksum_header {
+                return Err(ServerError::InvalidRequest {
+                    reason: "Content-MD5 OR x-amz-checksum- HTTP header is required for Put Object requests with Object Lock parameters".to_string(),
+                });
+            }
+            Ok(state)
+        }
+    }
 }
 
 /// Map a checksum header name (e.g. `x-amz-checksum-crc32`) to its
@@ -5016,10 +5124,14 @@ mod tests {
             http::Method::PUT,
             "/",
             "acl",
-            vec![(
-                "x-amz-grant-read-acp".to_string(),
-                format!("id=\"{}\"", canonical_id.as_str()),
-            )],
+            {
+                let mut headers = vec![(
+                    "x-amz-grant-read-acp".to_string(),
+                    format!("id=\"{}\"", canonical_id.as_str()),
+                )];
+                headers.extend(checksum_header_pairs(&[]));
+                headers
+            },
             vec![],
         );
         fe.dispatch_routed(
@@ -5056,7 +5168,7 @@ mod tests {
             http::Method::PUT,
             "/",
             "policy",
-            vec![],
+            checksum_header_pairs(policy.as_bytes()),
             policy.as_bytes().to_vec(),
         );
         let put_resp = fe
@@ -5122,7 +5234,7 @@ mod tests {
             http::Method::PUT,
             "/",
             "policy",
-            vec![],
+            checksum_header_pairs(&[0xff, 0xfe, 0xfd]),
             vec![0xff, 0xfe, 0xfd],
         );
         match fe.dispatch_routed(
@@ -5146,7 +5258,13 @@ mod tests {
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
 
-        let put_req = new_req(http::Method::PUT, "/", "policy", vec![], b"{".to_vec());
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "policy",
+            checksum_header_pairs(b"{"),
+            b"{".to_vec(),
+        );
         match fe.dispatch_routed(
             &put_req,
             &test_auth(),
@@ -5791,13 +5909,17 @@ mod tests {
             http::Method::PUT,
             "/",
             "acl",
-            vec![(
-                "x-amz-grant-read".to_string(),
-                format!(
-                    "uri=\"{}\"",
-                    s3_types::AclGrantee::authenticated_users_uri()
-                ),
-            )],
+            {
+                let mut headers = vec![(
+                    "x-amz-grant-read".to_string(),
+                    format!(
+                        "uri=\"{}\"",
+                        s3_types::AclGrantee::authenticated_users_uri()
+                    ),
+                )];
+                headers.extend(checksum_header_pairs(&[]));
+                headers
+            },
             vec![],
         );
         match fe.dispatch_routed(
@@ -5882,7 +6004,19 @@ mod tests {
             http::Method::PUT,
             "/mybucket",
             "object-lock",
-            vec![],
+            checksum_header_pairs(
+                br#"
+                <ObjectLockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                  <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+                  <Rule>
+                    <DefaultRetention>
+                      <Mode>GOVERNANCE</Mode>
+                      <Days>1</Days>
+                    </DefaultRetention>
+                  </Rule>
+                </ObjectLockConfiguration>
+            "#,
+            ),
             br#"
                 <ObjectLockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
                   <ObjectLockEnabled>Enabled</ObjectLockEnabled>
@@ -5956,10 +6090,14 @@ mod tests {
             http::Method::PUT,
             "/",
             "acl",
-            vec![(
-                "x-amz-grant-write".to_string(),
-                format!("id=\"{}\"", canonical_id.as_str()),
-            )],
+            {
+                let mut headers = vec![(
+                    "x-amz-grant-write".to_string(),
+                    format!("id=\"{}\"", canonical_id.as_str()),
+                )];
+                headers.extend(checksum_header_pairs(&[]));
+                headers
+            },
             vec![],
         );
         match fe.dispatch_routed(
@@ -5983,6 +6121,66 @@ mod tests {
 
         let digest = md5_legacy::Md5::digest(body);
         base64::engine::general_purpose::STANDARD.encode(&digest[..])
+    }
+
+    fn checksum_crc32_value(body: &[u8]) -> String {
+        use base64::Engine;
+
+        let crc = checksum::crc32::checksum(body);
+        base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes())
+    }
+
+    fn checksum_header_pairs(body: &[u8]) -> Vec<(String, String)> {
+        vec![
+            ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
+            (
+                "x-amz-checksum-crc32".to_string(),
+                checksum_crc32_value(body),
+            ),
+        ]
+    }
+
+    fn assert_missing_request_checksum_rejected(
+        method: http::Method,
+        query: &str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        op: S3Operation,
+        expected_reason: &str,
+    ) {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = new_req(method, "", query, headers, body);
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(reason, expected_reason);
+            }
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    fn assert_sdk_checksum_request_accepted(
+        method: http::Method,
+        query: &str,
+        mut headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        op: S3Operation,
+    ) {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        headers.extend(checksum_header_pairs(&body));
+        let req = new_req(method, "", query, headers, body);
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert!(
+            matches!(resp.status_code, 200 | 204),
+            "expected success, got status {}",
+            resp.status_code
+        );
     }
 
     // ── UploadPart validation ────────────────────────────────────────
@@ -6072,6 +6270,571 @@ mod tests {
             Err(e) => panic!("expected BadDigest, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    #[test]
+    fn put_object_without_checksum_allowed_when_object_lock_not_requested() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = new_req(http::Method::PUT, "", "", vec![], b"hello world".to_vec());
+        let op = S3Operation::PutObject {
+            bucket: "mybucket".to_string(),
+            key: "mykey".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn put_bucket_versioning_missing_request_checksum_allowed() {
+        let body =
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        let req = new_req(http::Method::PUT, "", "", vec![], body);
+        let resp = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::PutBucketVersioning {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn put_bucket_object_lock_configuration_missing_request_checksum_rejected() {
+        let body = br#"<ObjectLockConfiguration>
+  <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+  <Rule>
+    <DefaultRetention>
+      <Mode>GOVERNANCE</Mode>
+      <Days>1</Days>
+    </DefaultRetention>
+  </Rule>
+</ObjectLockConfiguration>"#
+            .to_vec();
+        assert_missing_request_checksum_rejected(
+            http::Method::PUT,
+            "",
+            vec![],
+            body,
+            S3Operation::PutBucketObjectLockConfiguration {
+                bucket: "mybucket".to_string(),
+            },
+            "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
+        );
+    }
+
+    #[test]
+    fn put_bucket_encryption_missing_request_checksum_allowed() {
+        let body = br#"<ServerSideEncryptionConfiguration>
+  <Rule>
+    <ApplyServerSideEncryptionByDefault>
+      <SSEAlgorithm>AES256</SSEAlgorithm>
+    </ApplyServerSideEncryptionByDefault>
+  </Rule>
+</ServerSideEncryptionConfiguration>"#
+            .to_vec();
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        let req = new_req(http::Method::PUT, "", "", vec![], body);
+        let resp = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::PutBucketEncryption {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn put_bucket_cors_missing_request_checksum_rejected() {
+        let body = br#"<CORSConfiguration>
+  <CORSRule>
+    <AllowedMethod>GET</AllowedMethod>
+    <AllowedOrigin>https://example.com</AllowedOrigin>
+  </CORSRule>
+</CORSConfiguration>"#
+            .to_vec();
+        assert_missing_request_checksum_rejected(
+            http::Method::PUT,
+            "",
+            vec![],
+            body,
+            S3Operation::PutBucketCors {
+                bucket: "mybucket".to_string(),
+            },
+            "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
+        );
+    }
+
+    #[test]
+    fn put_bucket_tagging_missing_request_checksum_rejected() {
+        let body =
+            br#"<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>"#
+                .to_vec();
+        assert_missing_request_checksum_rejected(
+            http::Method::PUT,
+            "",
+            vec![],
+            body,
+            S3Operation::PutBucketTagging {
+                bucket: "mybucket".to_string(),
+            },
+            "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
+        );
+    }
+
+    #[test]
+    fn put_object_retention_missing_request_checksum_rejected() {
+        let body = br#"<Retention>
+  <Mode>GOVERNANCE</Mode>
+  <RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate>
+</Retention>"#
+            .to_vec();
+        assert_missing_request_checksum_rejected(
+            http::Method::PUT,
+            "",
+            vec![],
+            body,
+            S3Operation::PutObjectRetention {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string(),
+            },
+            "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
+        );
+    }
+
+    #[test]
+    fn put_object_legal_hold_missing_request_checksum_rejected() {
+        let body = br#"<LegalHold><Status>ON</Status></LegalHold>"#.to_vec();
+        assert_missing_request_checksum_rejected(
+            http::Method::PUT,
+            "",
+            vec![],
+            body,
+            S3Operation::PutObjectLegalHold {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string(),
+            },
+            "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
+        );
+    }
+
+    #[test]
+    fn put_object_tagging_missing_request_checksum_allowed() {
+        let body =
+            br#"<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>"#
+                .to_vec();
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        let metadata = crate::metadata_blob::MetadataBlob::default();
+        let system_metadata = server_core::system_metadata::SystemMetadata::default();
+        fe.coordinator
+            .put_object(&crate::coordinator::PutObjectRequest {
+                object: test_object_request("mybucket", "mykey"),
+                data: b"hello",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: &crate::conditional::WriteCondition::default(),
+                acl: crate::coordinator::PutObjectAcl::None.into(),
+                policy_context: crate::coordinator::PutObjectPolicyContext::default(),
+                object_lock: Default::default(),
+                sse_customer: None,
+            })
+            .unwrap();
+        let req = new_req(http::Method::PUT, "", "", vec![], body);
+        let resp = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::PutObjectTagging {
+                    bucket: "mybucket".to_string(),
+                    key: "mykey".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn put_object_acl_missing_request_checksum_allowed() {
+        let canonical_id = s3_types::CanonicalUserId::from_principal("testuser");
+        let body = format!(
+            "<AccessControlPolicy><AccessControlList>\
+             <Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">\
+             <ID>{}</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant>\
+             </AccessControlList></AccessControlPolicy>",
+            canonical_id.as_str()
+        )
+        .into_bytes();
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        let metadata = crate::metadata_blob::MetadataBlob::default();
+        let system_metadata = server_core::system_metadata::SystemMetadata::default();
+        fe.coordinator
+            .put_object(&crate::coordinator::PutObjectRequest {
+                object: test_object_request("mybucket", "mykey"),
+                data: b"hello",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: &crate::conditional::WriteCondition::default(),
+                acl: crate::coordinator::PutObjectAcl::None.into(),
+                policy_context: crate::coordinator::PutObjectPolicyContext::default(),
+                object_lock: Default::default(),
+                sse_customer: None,
+            })
+            .unwrap();
+        let req = new_req(http::Method::PUT, "", "", vec![], body);
+        let resp = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::PutObjectAcl {
+                    bucket: "mybucket".to_string(),
+                    key: "mykey".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn put_object_acl_header_only_without_checksum_allowed() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        let metadata = crate::metadata_blob::MetadataBlob::default();
+        let system_metadata = server_core::system_metadata::SystemMetadata::default();
+        fe.coordinator
+            .put_object(&crate::coordinator::PutObjectRequest {
+                object: test_object_request("mybucket", "mykey"),
+                data: b"hello",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: &crate::conditional::WriteCondition::default(),
+                acl: crate::coordinator::PutObjectAcl::None.into(),
+                policy_context: crate::coordinator::PutObjectPolicyContext::default(),
+                object_lock: Default::default(),
+                sse_customer: None,
+            })
+            .unwrap();
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![("x-amz-acl".to_string(), "private".to_string())],
+            vec![],
+        );
+        let resp = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::PutObjectAcl {
+                    bucket: "mybucket".to_string(),
+                    key: "mykey".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn put_bucket_public_access_block_missing_request_checksum_allowed() {
+        let body = br#"<PublicAccessBlockConfiguration>
+  <BlockPublicAcls>true</BlockPublicAcls>
+  <IgnorePublicAcls>true</IgnorePublicAcls>
+  <BlockPublicPolicy>true</BlockPublicPolicy>
+  <RestrictPublicBuckets>true</RestrictPublicBuckets>
+</PublicAccessBlockConfiguration>"#
+            .to_vec();
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        let req = new_req(http::Method::PUT, "", "", vec![], body);
+        let resp = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::PutBucketPublicAccessBlock {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn put_bucket_ownership_controls_missing_request_checksum_allowed() {
+        let body = br#"<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>"#
+            .to_vec();
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        let req = new_req(http::Method::PUT, "", "", vec![], body);
+        let resp = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::PutBucketOwnershipControls {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn put_bucket_policy_missing_request_checksum_allowed() {
+        let body = br#"{"Version":"2012-10-17","Statement":[{"Sid":"AllowOwnerList","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::test-account-id:root"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::mybucket"}]}"#.to_vec();
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        let req = new_req(http::Method::PUT, "", "", vec![], body);
+        let resp = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::PutBucketPolicy {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.status_code, 204);
+    }
+
+    #[test]
+    fn put_bucket_acl_missing_request_checksum_allowed() {
+        let canonical_id = s3_types::CanonicalUserId::from_principal("testuser");
+        let body = format!(
+            "<AccessControlPolicy><AccessControlList>\
+             <Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">\
+             <ID>{}</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant>\
+             </AccessControlList></AccessControlPolicy>",
+            canonical_id.as_str()
+        )
+        .into_bytes();
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        let req = new_req(http::Method::PUT, "", "", vec![], body);
+        let resp = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::PutBucketAcl {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn put_bucket_acl_header_only_without_checksum_allowed() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![("x-amz-acl".to_string(), "private".to_string())],
+            vec![],
+        );
+        let resp = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::PutBucketAcl {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn put_bucket_acl_anonymous_request_denied_before_checksum_validation() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![("x-amz-acl".to_string(), "private".to_string())],
+            vec![],
+        );
+        match fe.dispatch_routed(
+            &req,
+            &auth::AuthContext::anonymous(),
+            S3Operation::PutBucketAcl {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::AccessDenied) => {}
+            Err(err) => panic!("expected AccessDenied, got Err({err:?})"),
+            Ok(_) => panic!("expected AccessDenied, got Ok"),
+        }
+    }
+
+    #[test]
+    fn put_bucket_lifecycle_sdk_checksum_header_accepted() {
+        let body = br#"<LifecycleConfiguration>
+  <Rule>
+    <ID>rule1</ID>
+    <Filter><Prefix>logs/</Prefix></Filter>
+    <Status>Enabled</Status>
+    <Expiration><Days>30</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#
+            .to_vec();
+        assert_sdk_checksum_request_accepted(
+            http::Method::PUT,
+            "",
+            vec![],
+            body,
+            S3Operation::PutBucketLifecycle {
+                bucket: "mybucket".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn put_bucket_policy_sdk_checksum_header_accepted() {
+        let body = br#"{"Version":"2012-10-17","Statement":[{"Sid":"AllowOwnerList","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::test-account-id:root"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::mybucket"}]}"#.to_vec();
+        assert_sdk_checksum_request_accepted(
+            http::Method::PUT,
+            "",
+            vec![],
+            body,
+            S3Operation::PutBucketPolicy {
+                bucket: "mybucket".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn put_bucket_acl_sdk_checksum_header_accepted() {
+        assert_sdk_checksum_request_accepted(
+            http::Method::PUT,
+            "",
+            vec![("x-amz-acl".to_string(), "private".to_string())],
+            vec![],
+            S3Operation::PutBucketAcl {
+                bucket: "mybucket".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn request_checksum_algorithm_without_value_header_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "lifecycle",
+            vec![("x-amz-checksum-algorithm".to_string(), "CRC32".to_string())],
+            br#"<LifecycleConfiguration><Rule><ID>rule1</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>"#.to_vec(),
+        );
+        match fe.dispatch_routed(
+            &req,
+            &test_auth(),
+            S3Operation::PutBucketLifecycle {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(
+                    reason,
+                    "Missing required header for this request: Content-MD5"
+                );
+            }
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn prepare_streaming_put_with_object_lock_requires_checksum() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![
+                (
+                    "x-amz-object-lock-mode".to_string(),
+                    "GOVERNANCE".to_string(),
+                ),
+                (
+                    "x-amz-object-lock-retain-until-date".to_string(),
+                    "2099-01-01T00:00:00Z".to_string(),
+                ),
+            ],
+            b"hello world".to_vec(),
+        );
+        match fe.prepare_streaming_put(&req, "mybucket", "mykey", false) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(
+                    reason,
+                    "Content-MD5 OR x-amz-checksum- HTTP header is required for Put Object requests with Object Lock parameters"
+                );
+            }
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn prepare_streaming_put_with_object_lock_accepts_sdk_checksum_header() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let body = b"hello world".to_vec();
+        let mut headers = vec![
+            (
+                "x-amz-object-lock-mode".to_string(),
+                "GOVERNANCE".to_string(),
+            ),
+            (
+                "x-amz-object-lock-retain-until-date".to_string(),
+                "2099-01-01T00:00:00Z".to_string(),
+            ),
+        ];
+        headers.extend(checksum_header_pairs(&body));
+        let req = new_req(http::Method::PUT, "", "", headers, body);
+        let ctx = fe
+            .prepare_streaming_put(&req, "mybucket", "mykey", false)
+            .unwrap();
+        assert_eq!(ctx.key, "mykey");
+        assert!(ctx.object_lock.retention.is_some());
     }
 
     #[test]

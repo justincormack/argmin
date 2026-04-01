@@ -4,7 +4,7 @@
 
 This plan tracks the remaining compatibility work for request-body checksum
 requirements on S3 operations that currently use `Content-MD5` and the newer
-SDK checksum family (`x-amz-sdk-checksum-algorithm` plus a matching
+checksum family (`x-amz-checksum-algorithm` plus a matching
 `x-amz-checksum-*` header or checksum trailer).
 
 This plan covers:
@@ -26,24 +26,26 @@ The current AWS API reference and SDK model imply the following rules:
 
 1. `Content-MD5` is a complete request checksum mechanism by itself.
 
-2. `x-amz-sdk-checksum-algorithm` is not a checksum by itself.
+2. `x-amz-checksum-algorithm` is not a checksum by itself.
 - it must be accompanied by a matching `x-amz-checksum-*` header or
   `x-amz-trailer`
-- sending only `x-amz-sdk-checksum-algorithm` is invalid
+- sending only `x-amz-checksum-algorithm` is invalid on operations where AWS
+  requires a request checksum, but AWS may ignore it on allow-missing
+  operations
 
 3. Most checksum-required bucket and object subresource writes accept either:
 - `Content-MD5`
-- or the newer SDK checksum family
+- or the newer checksum family
 
-4. `DeleteObjects` is the important exception.
-- AWS documents `Content-MD5` specifically as required for general purpose
-  buckets
-- this operation should not be loosened to "any checksum family is fine"
-  without confirming that behavior against AWS
+4. `DeleteObjects` is not `Content-MD5`-only in practice.
+- AWS documents `Content-MD5` specifically for general purpose buckets
+- AWS also accepts the newer checksum family as an alternative
+- the AWS-matching missing-checksum message is:
+  `Missing required header for this request: Content-MD5 OR x-amz-checksum-*`
 
 5. `PutObject` is the important allow-missing exception.
 - checksum is generally optional
-- but AWS requires `Content-MD5` or `x-amz-sdk-checksum-algorithm` when the
+- but AWS requires `Content-MD5` or `x-amz-checksum-*` when the
   upload sets Object Lock retention
 
 6. Existing SDK-driven positive tests are not sufficient proof of enforcement.
@@ -55,23 +57,47 @@ The current AWS API reference and SDK model imply the following rules:
 ## Current Argmin Status
 
 Current server enforcement in `crates/server-http/src/http/mod.rs`:
-- `require_content_md5(req)` is used only for `DeleteObjects` and
-  `PutBucketLifecycle`
-- `validate_content_md5(req)` is used for `PutObject`,
-  `PutObjectRetention`, and `PutObjectLegalHold`
-- the newer checksum family is only parsed and validated on `PutObject` and
-  multipart object data paths
-- the remaining checksum-required metadata APIs currently do not enforce
-  request checksum requirements
+- `DeleteObjects` requires either `Content-MD5` or a checksum value header
+  from the newer checksum family
+- the implemented checksum-required bucket and object subresource writes that
+  AWS actually enforces now require either `Content-MD5` or a checksum value
+  header from the newer checksum family
+- `PutObject` remains allow-missing in the normal case, but now requires a
+  request checksum when Object Lock retention headers are present
+- bare `x-amz-checksum-algorithm` without a matching `x-amz-checksum-*`
+  header or trailer is rejected on checksum-required operations, matching AWS
+- `UploadPart` continues to allow missing checksums, and bare
+  `x-amz-checksum-algorithm` on its own remains allowed there, matching AWS
 
 Current focused `s3-tests` coverage:
 - `DeleteObjects` missing `Content-MD5` rejection:
   `crates/s3-tests/tests/checksums.rs`
 - `PutBucketLifecycle` missing `Content-MD5` rejection:
   `crates/s3-tests/tests/lifecycle.rs`
+- raw request checksum matrix coverage:
+  `crates/s3-tests/tests/request_checksums.rs`
+  - bucket and object subresource writes: per-operation allow-missing or
+    missing-checksum-negative coverage, plus `Content-MD5` and checksum-family
+    positives
+  - ACL behavior verified against AWS:
+    `PutBucketAcl` and `PutObjectAcl` allow missing checksums for both XML-body
+    ACL requests and header-only canned ACL requests
+  - object subresource writes implemented in the matrix:
+    `PutObjectAcl`, `PutObjectTagging`, `PutObjectLegalHold`,
+    `PutObjectRetention`
+  - exceptions: allow-missing `PutObject`, `UploadPart`,
+    `CompleteMultipartUpload`, and Object Lock `PutObject` missing-checksum
+    negative
+  - guardrail: bare `x-amz-checksum-algorithm` rejection
 
-That means the current integration suite does not yet protect the broader AWS
-compatibility surface.
+Remaining integration gaps:
+- no explicit raw positive for Object Lock `PutObject` with `Content-MD5`
+  or SDK checksum family
+- no explicit raw optional-checksum positive for `UploadPart` with
+  `Content-MD5` and SDK checksum family
+- the plan document should be kept in sync with AWS-confirmed allow-missing
+  exceptions, because several operations differ from the initial doc-based
+  assumptions
 
 ## Required Operation Matrix
 
@@ -82,21 +108,21 @@ requirements need to be correct.
 
 | AWS operation | Argmin operation | AWS requirement | Current Argmin behavior | Current tests | Coverage gap |
 | --- | --- | --- | --- | --- | --- |
-| `DeleteObjects` | `DeleteObjects` | `Content-MD5` required specifically | Correctly requires `Content-MD5` | Focused missing-header negative in `checksums.rs`; broad positive-path use in `object_delete.rs`, `versioning.rs`, `object_lock.rs`, `expected_bucket_owner.rs` | No explicit test that SDK checksum headers do not substitute for `Content-MD5`; no raw positive test proving the exact accepted request shape |
-| `PutBucketAcl` | `PutBucketAcl` | Request checksum required | No request checksum enforcement | Positive-path coverage in `ownership.rs`, `public_access_block.rs`, `access_matrix.rs`, `expected_bucket_owner.rs`, `multipart.rs`, `copy_object.rs`, `object_lock.rs` | No missing-checksum negative; no raw `Content-MD5` positive; no raw SDK-checksum-only positive |
-| `PutBucketCors` | `PutBucketCors` | Request checksum required | No request checksum enforcement | Positive-path coverage in `cors.rs`, `expected_bucket_owner.rs` | No missing-checksum negative; no raw `Content-MD5` positive; no raw SDK-checksum-only positive |
-| `PutBucketEncryption` | `PutBucketEncryption` | Request checksum required | No request checksum enforcement | Positive-path coverage in `bucket_encryption.rs`, `expected_bucket_owner.rs` | No missing-checksum negative; no raw `Content-MD5` positive; no raw SDK-checksum-only positive |
-| `PutBucketLifecycleConfiguration` | `PutBucketLifecycle` | Request checksum required | Requires `Content-MD5` only | Focused missing-header negative in `lifecycle.rs`; positive-path lifecycle coverage in `lifecycle.rs` | No raw SDK-checksum-only positive; no explicit test that both checksum families remain accepted if enforcement is generalized |
-| `PutBucketOwnershipControls` | `PutBucketOwnershipControls` | Request checksum required | No request checksum enforcement | Positive-path coverage in `ownership.rs`, `multipart.rs`, `presigned.rs`, `bucket_policy.rs`, `object_lock.rs`, `access_matrix.rs`, `copy_object.rs`, `object_crud.rs`, `expected_bucket_owner.rs` | No missing-checksum negative; no raw `Content-MD5` positive; no raw SDK-checksum-only positive |
-| `PutBucketPolicy` | `PutBucketPolicy` | Request checksum required | No request checksum enforcement | Positive-path coverage in `bucket_policy.rs`, `public_access_block.rs`, `post_object.rs`, `object_lock.rs`, `tagging.rs`, `expected_bucket_owner.rs` | No missing-checksum negative; no raw `Content-MD5` positive; no raw SDK-checksum-only positive |
-| `PutBucketTagging` | `PutBucketTagging` | Request checksum required | No request checksum enforcement | Positive-path coverage in `tagging.rs`, `expected_bucket_owner.rs` | No missing-checksum negative; no raw `Content-MD5` positive; no raw SDK-checksum-only positive |
-| `PutBucketVersioning` | `PutBucketVersioning` | Request checksum required | No request checksum enforcement | Positive-path coverage in `versioning.rs`, `object_delete.rs`, `multipart.rs`, `expected_bucket_owner.rs`, `object_lock.rs`, `object_attributes.rs`, `copy_object.rs`, `deep_coverage.rs`, `bucket_list.rs`, `tagging.rs`, `conditional.rs`, `bucket_crud.rs` | No missing-checksum negative; no raw `Content-MD5` positive; no raw SDK-checksum-only positive |
-| `PutObjectAcl` | `PutObjectAcl` | Request checksum required | No request checksum enforcement | Positive-path coverage in `versioning.rs`, `object_crud.rs`, `access_matrix.rs`, `copy_object.rs`, `expected_bucket_owner.rs` | No missing-checksum negative; no raw `Content-MD5` positive; no raw SDK-checksum-only positive |
-| `PutObjectLegalHold` | `PutObjectLegalHold` | Request checksum required | Only validates `Content-MD5` if present | Positive-path coverage in `object_lock.rs`, `expected_bucket_owner.rs` | No missing-checksum negative; no raw `Content-MD5` positive; no raw SDK-checksum-only positive; current behavior is too weak |
-| `PutObjectLockConfiguration` | `PutBucketObjectLockConfiguration` | Request checksum required | No request checksum enforcement | Positive-path coverage in `object_lock.rs`, `expected_bucket_owner.rs` | No missing-checksum negative; no raw `Content-MD5` positive; no raw SDK-checksum-only positive |
-| `PutObjectRetention` | `PutObjectRetention` | Request checksum required | Only validates `Content-MD5` if present | Positive-path coverage in `object_lock.rs`, `expected_bucket_owner.rs` | No missing-checksum negative; no raw `Content-MD5` positive; no raw SDK-checksum-only positive; current behavior is too weak |
-| `PutObjectTagging` | `PutObjectTagging` | Request checksum required | No request checksum enforcement | Positive-path coverage in `tagging.rs`, `deep_coverage.rs`, `expected_bucket_owner.rs` | No missing-checksum negative; no raw `Content-MD5` positive; no raw SDK-checksum-only positive |
-| `PutPublicAccessBlock` | `PutBucketPublicAccessBlock` | Request checksum required | No request checksum enforcement | Positive-path coverage in `public_access_block.rs`, `expected_bucket_owner.rs`, `multipart.rs`, `copy_object.rs` | No missing-checksum negative; no raw `Content-MD5` positive; no raw SDK-checksum-only positive |
+| `DeleteObjects` | `DeleteObjects` | Request checksum required; AWS accepts `Content-MD5` or the newer checksum family | Matches AWS: missing checksum rejected, `Content-MD5` and checksum-family requests accepted | Focused missing-header negative in `checksums.rs`; raw missing-header negative plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; broad positive-path use in `object_delete.rs`, `versioning.rs`, `object_lock.rs`, `expected_bucket_owner.rs` | No remaining focused integration gap for implemented behavior |
+| `PutBucketAcl` | `PutBucketAcl` | AWS allows missing checksum, including XML-body ACL updates confirmed by focused AWS tests | Matches AWS allow-missing behavior; checksum headers are still validated if present | Raw XML allow-missing plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; header-only allow-missing guard in `request_checksums.rs`; broader positive-path coverage in `ownership.rs`, `public_access_block.rs`, `access_matrix.rs`, `expected_bucket_owner.rs`, `multipart.rs`, `copy_object.rs`, `object_lock.rs` | No remaining focused integration gap for implemented behavior |
+| `PutBucketCors` | `PutBucketCors` | Request checksum required | Requires `Content-MD5` or checksum family | Raw missing-checksum negative plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; positive-path coverage in `cors.rs`, `expected_bucket_owner.rs` | No remaining focused integration gap for implemented behavior |
+| `PutBucketEncryption` | `PutBucketEncryption` | AWS allows missing checksum | Matches AWS allow-missing behavior; checksum headers are still validated if present | Raw allow-missing plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; positive-path coverage in `bucket_encryption.rs`, `expected_bucket_owner.rs` | No remaining focused integration gap for implemented behavior |
+| `PutBucketLifecycleConfiguration` | `PutBucketLifecycle` | Request checksum required; AWS uses the missing-header message `Missing required header for this request: Content-MD5` | Matches AWS: checksum required, `Content-MD5` or checksum-family accepted, lifecycle-specific missing-checksum message | Focused missing-header negative in `lifecycle.rs`; raw missing-header negative plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; positive-path lifecycle coverage in `lifecycle.rs` | No remaining focused integration gap for implemented behavior |
+| `PutBucketOwnershipControls` | `PutBucketOwnershipControls` | AWS allows missing checksum | Matches AWS allow-missing behavior; checksum headers are still validated if present | Raw allow-missing plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; positive-path coverage in `ownership.rs`, `multipart.rs`, `presigned.rs`, `bucket_policy.rs`, `object_lock.rs`, `access_matrix.rs`, `copy_object.rs`, `object_crud.rs`, `expected_bucket_owner.rs` | No remaining focused integration gap for implemented behavior |
+| `PutBucketPolicy` | `PutBucketPolicy` | AWS allows missing checksum | Matches AWS allow-missing behavior; checksum headers are still validated if present | Raw allow-missing plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; positive-path coverage in `bucket_policy.rs`, `public_access_block.rs`, `post_object.rs`, `object_lock.rs`, `tagging.rs`, `expected_bucket_owner.rs` | No remaining focused integration gap for implemented behavior |
+| `PutBucketTagging` | `PutBucketTagging` | Request checksum required | Requires `Content-MD5` or checksum family | Raw missing-checksum negative plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; positive-path coverage in `tagging.rs`, `expected_bucket_owner.rs` | No remaining focused integration gap for implemented behavior |
+| `PutBucketVersioning` | `PutBucketVersioning` | AWS allows missing checksum | Matches AWS allow-missing behavior; checksum headers are still validated if present | Raw allow-missing plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; positive-path coverage in `versioning.rs`, `object_delete.rs`, `multipart.rs`, `expected_bucket_owner.rs`, `object_lock.rs`, `object_attributes.rs`, `copy_object.rs`, `deep_coverage.rs`, `bucket_list.rs`, `tagging.rs`, `conditional.rs`, `bucket_crud.rs` | No remaining focused integration gap for implemented behavior |
+| `PutObjectAcl` | `PutObjectAcl` | AWS allows missing checksum, including XML-body ACL updates confirmed by focused AWS tests | Matches AWS allow-missing behavior; checksum headers are still validated if present | Raw XML allow-missing plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; header-only allow-missing guard in `request_checksums.rs`; broader positive-path coverage in `versioning.rs`, `object_crud.rs`, `access_matrix.rs`, `copy_object.rs`, `expected_bucket_owner.rs` | No remaining focused integration gap for implemented behavior |
+| `PutObjectLegalHold` | `PutObjectLegalHold` | Request checksum required | Requires `Content-MD5` or checksum family | Raw missing-checksum negative plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; positive-path coverage in `object_lock.rs`, `expected_bucket_owner.rs` | No remaining focused integration gap for implemented behavior |
+| `PutObjectLockConfiguration` | `PutBucketObjectLockConfiguration` | Request checksum required | Requires `Content-MD5` or checksum family | Raw missing-checksum negative plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; positive-path coverage in `object_lock.rs`, `expected_bucket_owner.rs` | No remaining focused integration gap for implemented behavior |
+| `PutObjectRetention` | `PutObjectRetention` | Request checksum required | Requires `Content-MD5` or checksum family | Raw missing-checksum negative plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; positive-path coverage in `object_lock.rs`, `expected_bucket_owner.rs` | No remaining focused integration gap for implemented behavior |
+| `PutObjectTagging` | `PutObjectTagging` | AWS allows missing checksum | Matches AWS allow-missing behavior; checksum headers are still validated if present | Raw allow-missing plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; positive-path coverage in `tagging.rs`, `deep_coverage.rs`, `expected_bucket_owner.rs` | No remaining focused integration gap for implemented behavior |
+| `PutPublicAccessBlock` | `PutBucketPublicAccessBlock` | AWS allows missing checksum | Matches AWS allow-missing behavior; checksum headers are still validated if present | Raw allow-missing plus `Content-MD5` and checksum-family positives in `request_checksums.rs`; positive-path coverage in `public_access_block.rs`, `expected_bucket_owner.rs`, `multipart.rs`, `copy_object.rs` | No remaining focused integration gap for implemented behavior |
 
 ### Unsupported AWS Operations With Checksum Requirement
 
@@ -117,9 +143,9 @@ missing `Content-MD5` must continue to be allowed in at least some cases.
 
 | AWS operation | AWS requirement | Current Argmin behavior | Current tests | Coverage gap |
 | --- | --- | --- | --- | --- |
-| `PutObject` | Checksum generally optional; required when Object Lock retention is set; `x-amz-sdk-checksum-algorithm` requires matching checksum value/trailer | Optional `Content-MD5` validation and checksum-family validation already exist, but there is no Object Lock-specific required-checksum enforcement | Positive `Content-MD5` and checksum-family coverage in `checksums.rs`; broad object-lock behavior coverage in `object_lock.rs` | No explicit raw allow-missing test; no Object Lock missing-checksum negative; no Object Lock SDK-checksum-only positive |
-| `UploadPart` | No general `Content-MD5` requirement for normal SigV4 uploads; optional checksum mechanisms must remain accepted when present | Optional `Content-MD5` and checksum-family support exists on multipart data paths | Positive `Content-MD5` in `checksums.rs`; broader multipart checksum coverage in `checksums.rs` and `multipart.rs` | No explicit raw allow-missing test, so a shared refactor could accidentally make UploadPart too strict |
-| `CompleteMultipartUpload` | No request checksum requirement | No request checksum enforcement | Broad positive-path multipart coverage in `checksums.rs` and `multipart.rs` | No explicit allow-missing guard test |
+| `PutObject` | Checksum generally optional; required when Object Lock retention is set; checksum-algorithm declarations require a matching checksum value/trailer when AWS is enforcing a checksum | Matches AWS behavior for allow-missing, Object Lock required-checksum, and algorithm-only rejection on required operations | Positive `Content-MD5` and checksum-family coverage in `checksums.rs`; broad object-lock behavior coverage in `object_lock.rs`; raw allow-missing and Object Lock missing-checksum negative in `request_checksums.rs` | No explicit raw positive yet for Object Lock `PutObject` with `Content-MD5` or checksum family |
+| `UploadPart` | No general `Content-MD5` requirement for normal SigV4 uploads; optional checksum mechanisms must remain accepted when present | Allow-missing remains supported; bare `x-amz-checksum-algorithm` on its own is also allowed here, matching AWS | Positive `Content-MD5` in `checksums.rs`; broader multipart checksum coverage in `checksums.rs` and `multipart.rs`; raw allow-missing guard in `request_checksums.rs` | No explicit raw positive yet for `UploadPart` with `Content-MD5` and checksum family |
+| `CompleteMultipartUpload` | No request checksum requirement | No request checksum enforcement | Broad positive-path multipart coverage in `checksums.rs` and `multipart.rs`; raw allow-missing guard in `request_checksums.rs` | No remaining focused integration gap for allow-missing behavior |
 
 ## Test Requirements
 
@@ -128,7 +154,7 @@ coverage should include:
 
 1. Missing checksum negative
 - send a raw signed request without `Content-MD5`
-- without `x-amz-sdk-checksum-algorithm`
+- without `x-amz-checksum-algorithm`
 - and without any `x-amz-checksum-*` header or trailer
 - assert AWS-matching failure
 
@@ -138,15 +164,14 @@ coverage should include:
 
 3. SDK checksum-family positive
 - send a raw signed request with:
-  `x-amz-sdk-checksum-algorithm`
+  `x-amz-checksum-algorithm`
 - and a matching `x-amz-checksum-*` header
 - assert success
 
 `DeleteObjects` needs a different matrix:
 - missing checksum must fail
 - valid `Content-MD5` must succeed
-- SDK checksum family should not be treated as a substitute unless confirmed
-  against AWS
+- SDK checksum family must also succeed, matching AWS
 
 The exception matrix needs explicit guard tests:
 
@@ -159,7 +184,7 @@ The exception matrix needs explicit guard tests:
 2. `UploadPart`
 - missing checksum succeeds
 - optional `Content-MD5` still succeeds
-- optional SDK checksum family still succeeds
+- optional checksum family still succeeds
 
 3. `CompleteMultipartUpload`
 - missing checksum succeeds
@@ -179,7 +204,7 @@ Recommended approach:
 The helper surface should support:
 - no checksum headers
 - `Content-MD5`
-- `x-amz-sdk-checksum-algorithm` plus matching `x-amz-checksum-*`
+- `x-amz-checksum-algorithm` plus matching `x-amz-checksum-*`
 - intentionally malformed checksum combinations
 
 This is preferable to trying to infer absence from SDK-driven requests, because
@@ -203,6 +228,9 @@ Deliverable:
 - a small shared helper API that lets tests express the checksum mechanism
   directly without rewriting request-signing code in each test file
 
+Status:
+- completed via shared raw request helpers in `crates/s3-tests/src/helpers.rs`
+
 ### Phase 2: Missing-Coverage Tests
 
 Add focused tests for every implemented required operation.
@@ -212,6 +240,13 @@ Deliverables:
 - one raw `Content-MD5` positive per required operation
 - one raw SDK-checksum-family positive per required operation, except
   `DeleteObjects` until AWS behavior is confirmed
+
+Status:
+- mostly completed for implemented bucket subresource writes and for
+  `PutObjectAcl`, `PutObjectTagging`, `PutObjectLegalHold`,
+  and `PutObjectRetention`
+- still missing `DeleteObjects` SDK-substitution confirmation and raw
+  integration coverage for the remaining object-lock `PutObject` boundary
 
 ### Phase 3: Exception Tests
 
@@ -223,6 +258,13 @@ Add explicit allow-missing and conditional-requirement tests for:
 Deliverables:
 - guard tests that prevent broad shared enforcement from becoming stricter than
   AWS
+
+Status:
+- partially completed
+- explicit allow-missing tests now cover `PutObject`, `UploadPart`, and
+  `CompleteMultipartUpload`
+- the remaining gap is raw positive coverage for checksum-bearing
+  Object Lock `PutObject` and optional checksum-bearing `UploadPart`
 
 ### Phase 4: Server Enforcement
 
@@ -239,9 +281,12 @@ Deliverables:
 - a single per-operation requirement table in `server-http`
 - central validation that distinguishes:
   - missing checksum
-  - bare `x-amz-sdk-checksum-algorithm`
+  - bare `x-amz-checksum-algorithm`
   - checksum algorithm/value mismatch
   - bad digest vs invalid digest
+
+Status:
+- completed for the currently implemented checksum requirement table
 
 ### Phase 5: AWS Confirmation Pass
 

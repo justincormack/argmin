@@ -268,11 +268,13 @@ pub fn parse_acl_xml(data: &[u8]) -> Result<AclGrants, ServerError> {
     let mut current_grantee: Option<AclGrantee> = None;
     let mut current_permission: Option<AclPermission> = None;
     let mut current_text_field: Option<TextField> = None;
+    let mut in_grantee = false;
 
     loop {
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => match e.local_name().as_ref() {
                 b"Grantee" => {
+                    in_grantee = true;
                     current_grantee_type = None;
                     current_grantee = None;
                     for attr in e.attributes() {
@@ -290,12 +292,13 @@ pub fn parse_acl_xml(data: &[u8]) -> Result<AclGrants, ServerError> {
                         }
                     }
                 }
-                b"ID" => current_text_field = Some(TextField::GranteeId),
-                b"URI" => current_text_field = Some(TextField::GranteeUri),
+                b"ID" if in_grantee => current_text_field = Some(TextField::GranteeId),
+                b"URI" if in_grantee => current_text_field = Some(TextField::GranteeUri),
                 b"Permission" => current_text_field = Some(TextField::Permission),
                 _ => {}
             },
             Ok(Event::Empty(e)) if e.local_name().as_ref() == b"Grantee" => {
+                in_grantee = false;
                 current_grantee_type = None;
                 current_grantee = None;
                 for attr in e.attributes() {
@@ -372,6 +375,10 @@ pub fn parse_acl_xml(data: &[u8]) -> Result<AclGrants, ServerError> {
                 }
             }
             Ok(Event::End(e)) => match e.local_name().as_ref() {
+                b"Grantee" => {
+                    in_grantee = false;
+                    current_text_field = None;
+                }
                 b"ID" | b"URI" | b"Permission" => {
                     current_text_field = None;
                 }
@@ -3916,6 +3923,28 @@ mod tests {
         assert!(grants.iter().any(|grant| {
             grant.grantee() == &AclGrantee::AuthenticatedUsers
                 && grant.permission() == AclPermission::Read
+        }));
+    }
+
+    #[test]
+    fn parse_acl_xml_ignores_owner_id() {
+        let owner_canonical_id = CanonicalUserId::from_principal("owner");
+        let grants = parse_acl_xml(
+            format!(
+                "<AccessControlPolicy><Owner><ID>{}</ID></Owner><AccessControlList>\
+                 <Grant><Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">\
+                 <ID>{}</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant>\
+                 </AccessControlList></AccessControlPolicy>",
+                owner_canonical_id.as_str(),
+                owner_canonical_id.as_str()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+
+        assert!(grants.iter().any(|grant| {
+            grant.grantee() == &AclGrantee::CanonicalUser(owner_canonical_id.clone())
+                && grant.permission() == AclPermission::FullControl
         }));
     }
 

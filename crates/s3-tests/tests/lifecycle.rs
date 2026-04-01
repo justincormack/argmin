@@ -269,7 +269,12 @@ fn test_put_bucket_lifecycle_requires_content_md5() {
             "expected lifecycle PUT without Content-MD5 to fail, got status {status} body {response_body}"
         );
         assert!(response_body.contains("<Code>InvalidRequest</Code>"));
-        assert!(response_body.contains("Content-MD5"));
+        assert!(
+            response_body.contains(
+                "<Message>Missing required header for this request: Content-MD5</Message>"
+            ),
+            "body: {response_body}"
+        );
     });
 }
 

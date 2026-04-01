@@ -217,11 +217,6 @@ fn md5_b64(data: &[u8]) -> String {
     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &digest[..])
 }
 
-/// Convenience: send signed PUT.
-fn signed_put(url: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, String) {
-    send_signed("PUT", url, body, extra)
-}
-
 /// Convenience: send signed PUT with CRC32 checksum (required by AWS for some APIs).
 fn signed_put_with_checksum(url: &str, body: &[u8], extra: &[(&str, &str)]) -> (u16, String) {
     let cksum = crc32_b64(body);
@@ -284,7 +279,7 @@ fn test_put_versioning_missing_status() {
         let bucket = setup_bucket().await;
         let url = format!("{}/{}?versioning", CTX.endpoint(), bucket);
         let body = b"<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></VersioningConfiguration>";
-        let (status, body_text) = signed_put(&url, body, &[]);
+        let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "IllegalVersioningConfigurationException");
         cleanup(&bucket).await;
@@ -298,7 +293,7 @@ fn test_put_versioning_invalid_status() {
         let bucket = setup_bucket().await;
         let url = format!("{}/{}?versioning", CTX.endpoint(), bucket);
         let body = b"<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Invalid</Status></VersioningConfiguration>";
-        let (status, body_text) = signed_put(&url, body, &[]);
+        let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "MalformedXML");
         cleanup(&bucket).await;
@@ -407,7 +402,7 @@ fn test_put_public_access_block_malformed_xml() {
         let bucket = setup_bucket().await;
         let url = format!("{}/{}?publicAccessBlock", CTX.endpoint(), bucket);
         let body = b"<BlockPublicAcls>true</BlockPublicAcls>";
-        let (status, body_text) = signed_put(&url, body, &[]);
+        let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "MalformedXML");
         cleanup(&bucket).await;
@@ -423,7 +418,7 @@ fn test_put_ownership_controls_missing_wrapper() {
         let bucket = setup_bucket().await;
         let url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
         let body = b"<Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule>";
-        let (status, body_text) = signed_put(&url, body, &[]);
+        let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "MalformedXML");
         cleanup(&bucket).await;
@@ -437,7 +432,7 @@ fn test_put_ownership_controls_missing_rule() {
         let bucket = setup_bucket().await;
         let url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
         let body = b"<OwnershipControls></OwnershipControls>";
-        let (status, body_text) = signed_put(&url, body, &[]);
+        let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "MalformedXML");
         cleanup(&bucket).await;
@@ -451,7 +446,7 @@ fn test_put_ownership_controls_missing_value() {
         let bucket = setup_bucket().await;
         let url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
         let body = b"<OwnershipControls><Rule></Rule></OwnershipControls>";
-        let (status, body_text) = signed_put(&url, body, &[]);
+        let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "MalformedXML");
         cleanup(&bucket).await;
@@ -610,7 +605,7 @@ fn test_put_versioning_non_utf8() {
         let bucket = setup_bucket().await;
         let url = format!("{}/{}?versioning", CTX.endpoint(), bucket);
         let body: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
-        let (status, body_text) = signed_put(&url, body, &[]);
+        let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "MalformedXML");
         cleanup(&bucket).await;
@@ -652,7 +647,7 @@ fn test_put_public_access_block_non_utf8() {
         let bucket = setup_bucket().await;
         let url = format!("{}/{}?publicAccessBlock", CTX.endpoint(), bucket);
         let body: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
-        let (status, body_text) = signed_put(&url, body, &[]);
+        let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "MalformedXML");
         cleanup(&bucket).await;
@@ -666,7 +661,7 @@ fn test_put_ownership_controls_non_utf8() {
         let bucket = setup_bucket().await;
         let url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
         let body: &[u8] = &[0xFF, 0xFE, 0x80, 0x81];
-        let (status, body_text) = signed_put(&url, body, &[]);
+        let (status, body_text) = signed_put_with_checksum(&url, body, &[]);
         assert_eq!(status, 400, "body: {body_text}");
         assert_error_code(&body_text, "MalformedXML");
         cleanup(&bucket).await;

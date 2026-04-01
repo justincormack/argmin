@@ -1534,6 +1534,12 @@ pub struct PutBucketAclRequest<'a> {
     pub acl: PutBucketAclInput,
 }
 
+struct ResolvedBucketAclUpdate {
+    acl_grants: AclGrants,
+    public_read: bool,
+    public_write: bool,
+}
+
 /// Request for an object or object-version-scoped operation.
 #[derive(Debug)]
 pub struct ObjectVersionRequest<'a> {
@@ -7070,6 +7076,41 @@ impl Coordinator {
                 PutBucketAclInput::Grants(_) => "grants",
             }
         );
+        let resolved = self.resolve_put_bucket_acl_update(req)?;
+        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
+        bucket_pg
+            .put_bucket_acl(
+                req.bucket.name,
+                &resolved.acl_grants,
+                resolved.public_read,
+                resolved.public_write,
+            )
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.storage_node
+            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
+                info.acl_grants = resolved.acl_grants.clone();
+                info.public_read = resolved.public_read;
+                info.public_write = resolved.public_write;
+            });
+        Ok(())
+    }
+
+    pub fn validate_put_bucket_acl_request(
+        &self,
+        req: &PutBucketAclRequest<'_>,
+    ) -> Result<(), ServerError> {
+        self.resolve_put_bucket_acl_update(req).map(|_| ())
+    }
+
+    fn resolve_put_bucket_acl_update(
+        &self,
+        req: &PutBucketAclRequest<'_>,
+    ) -> Result<ResolvedBucketAclUpdate, ServerError> {
         let bucket_info =
             self.active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
         if !Self::requester_can_write_bucket_acl(&req.bucket.requester, &bucket_info) {
@@ -7098,22 +7139,11 @@ impl Coordinator {
         {
             return Err(ServerError::AccessDenied);
         }
-        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
-        bucket_pg
-            .put_bucket_acl(req.bucket.name, &acl_grants, public_read, public_write)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
-                info.acl_grants = acl_grants.clone();
-                info.public_read = public_read;
-                info.public_write = public_write;
-            });
-        Ok(())
+        Ok(ResolvedBucketAclUpdate {
+            acl_grants,
+            public_read,
+            public_write,
+        })
     }
 
     /// Loads the raw bucket CORS configuration for HTTP CORS evaluation.
