@@ -179,6 +179,23 @@ Add test-only helpers for:
 Keep this helper code local to the crates under test unless reuse becomes
 obvious. Do not introduce a new crate for this initially.
 
+Status update (2026-04-01): completed for the storage crate.
+- Added `crates/storage/src/tests/property_test_support.rs` with a local
+  `VersionStateModel`, `ModelOp`, object/version snapshot helpers, and
+  deterministic trace rendering for shrinking and regression extraction.
+- Added separate strategy families for bounded stateful traces and for the
+  pre-existing pagination properties, so phase-2 helpers stay intentionally
+  small without reducing pagination coverage for empty buckets, duplicate
+  overwrites, or larger key sets.
+- Constrained generated stateful traces to reachable versioning behavior by
+  synthesizing operations from the current model state instead of emitting
+  state-blind raw writes/delete markers.
+- Added helper tests that pin down suspended-null precedence, restored
+  currentness after deleting the head version, snapshot `is_latest` behavior,
+  and generator bounds/reachability invariants.
+- Rewired the existing storage pagination properties to consume the shared
+  pagination strategies while preserving their broader search space.
+
 ### Phase 2: Storage stateful properties
 
 Implement the highest-value storage properties first:

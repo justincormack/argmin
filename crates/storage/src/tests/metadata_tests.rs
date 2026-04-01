@@ -2881,14 +2881,17 @@ fn mpu_threaded_upsert_same_part_stress() {
 
 #[cfg(test)]
 mod prop_tests {
+    use super::super::property_test_support::{
+        pagination_keys_strategy, pagination_page_size_strategy,
+    };
     use super::*;
     use proptest::prelude::*;
 
-    fn insert_keys(store: &dyn PgMetadataStore, bucket: &str, keys: &[String]) {
+    fn insert_keys(store: &dyn PgMetadataStore, bucket: &str, keys: &[ObjectKey]) {
         for key in keys {
             let req = PutObjectReq::Live(PutLiveObjectReq {
                 bucket: bucket.into(),
-                key: key.clone().into(),
+                key: key.clone(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -2943,7 +2946,7 @@ mod prop_tests {
     #[test]
     fn regression_empty_prefix_matches_all() {
         let (_dir, store) = super::make_pg_store();
-        insert_keys(&store, "bucket", &["O".to_string()]);
+        insert_keys(&store, "bucket", &[ObjectKey::from("O")]);
 
         let got = list_all_keys(&store, "bucket", Some(ObjectKey::from("")), 1);
         assert_eq!(got, vec![ObjectKey::from("O")]);
@@ -2952,31 +2955,24 @@ mod prop_tests {
     proptest! {
         #[test]
         fn prop_metadata_pagination_roundtrip(
-            keys in proptest::collection::vec(
-                proptest::string::string_regex(r"[A-Za-z0-9._/-]{1,16}").unwrap(),
-                0..=40
-            ),
-            max_keys in 1u32..=10,
+            keys in pagination_keys_strategy(),
+            max_keys in pagination_page_size_strategy(),
         ) {
             let (_dir, store) = super::make_pg_store();
             insert_keys(&store, "bucket", &keys);
 
-            let mut expected: Vec<ObjectKey> = keys.iter().map(|k| ObjectKey::from(k.as_str())).collect();
+            let mut expected = keys.clone();
             expected.sort();
             expected.dedup();
-
             let got = list_all_keys(&store, "bucket", None, max_keys);
             prop_assert_eq!(got, expected);
         }
 
         #[test]
         fn prop_metadata_prefix_subset(
-            keys in proptest::collection::vec(
-                proptest::string::string_regex(r"[A-Za-z0-9._/-]{1,16}").unwrap(),
-                0..=40
-            ),
+            keys in pagination_keys_strategy(),
             prefix in proptest::string::string_regex(r"[A-Za-z0-9._/-]{0,8}").unwrap(),
-            max_keys in 1u32..=10,
+            max_keys in pagination_page_size_strategy(),
         ) {
             let (_dir, store) = super::make_pg_store();
             insert_keys(&store, "bucket", &keys);
@@ -2984,7 +2980,7 @@ mod prop_tests {
             let mut expected: Vec<ObjectKey> = keys
                 .iter()
                 .filter(|k| k.starts_with(&prefix))
-                .map(|k| ObjectKey::from(k.as_str()))
+                .cloned()
                 .collect();
             expected.sort();
             expected.dedup();
