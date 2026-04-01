@@ -95,6 +95,30 @@ async fn cleanup_object_lock_bucket_with_version(bucket: &str, key: &str, versio
     cleanup_bucket(bucket).await;
 }
 
+async fn current_version_id(bucket: &str, key: &str) -> String {
+    CTX.client()
+        .head_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap()
+        .version_id()
+        .unwrap()
+        .to_string()
+}
+
+async fn abort_multipart_upload(bucket: &str, key: &str, upload_id: &str) {
+    CTX.client()
+        .abort_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .send()
+        .await
+        .unwrap();
+}
+
 async fn bucket_owner_id(bucket: &str) -> String {
     CTX.client()
         .get_bucket_acl()
@@ -658,6 +682,74 @@ fn test_allow_missing_checksum_exceptions() {
         assert_error_message(&locked_put.body, OBJECT_LOCK_PUT_REQUIRED_CHECKSUM_MESSAGE);
         cleanup_bucket(&bucket).await;
 
+        let bucket = create_bucket_in_test_region(None, true).await;
+        let key = "locked-put-md5";
+        let url = format!("{}/{}/{}", CTX.endpoint(), bucket, key);
+        let retain_until = aws_sdk_s3::primitives::DateTime::from_secs(
+            (SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 24 * 60 * 60) as i64,
+        )
+        .fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)
+        .unwrap();
+        let body = b"hello";
+        let mut headers = vec![
+            (
+                "x-amz-object-lock-mode".to_string(),
+                "GOVERNANCE".to_string(),
+            ),
+            (
+                "x-amz-object-lock-retain-until-date".to_string(),
+                retain_until.clone(),
+            ),
+        ];
+        headers.push(content_md5_header(body));
+        assert_request_succeeds(
+            "PutObject with Object Lock Content-MD5",
+            "PUT",
+            &url,
+            body,
+            &headers,
+        );
+        let version_id = current_version_id(&bucket, key).await;
+        cleanup_object_lock_bucket_with_version(&bucket, key, &version_id).await;
+
+        let bucket = create_bucket_in_test_region(None, true).await;
+        let key = "locked-put-sdk";
+        let url = format!("{}/{}/{}", CTX.endpoint(), bucket, key);
+        let retain_until = aws_sdk_s3::primitives::DateTime::from_secs(
+            (SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+                + 24 * 60 * 60) as i64,
+        )
+        .fmt(aws_sdk_s3::primitives::DateTimeFormat::DateTime)
+        .unwrap();
+        let body = b"hello";
+        let mut headers = vec![
+            (
+                "x-amz-object-lock-mode".to_string(),
+                "GOVERNANCE".to_string(),
+            ),
+            (
+                "x-amz-object-lock-retain-until-date".to_string(),
+                retain_until,
+            ),
+        ];
+        headers.extend(sdk_checksum_headers(body));
+        assert_request_succeeds(
+            "PutObject with Object Lock checksum family",
+            "PUT",
+            &url,
+            body,
+            &headers,
+        );
+        let version_id = current_version_id(&bucket, key).await;
+        cleanup_object_lock_bucket_with_version(&bucket, key, &version_id).await;
+
         let bucket = create_bucket_in_test_region(None, false).await;
         let key = "multipart";
         let upload = CTX
@@ -683,14 +775,68 @@ fn test_allow_missing_checksum_exceptions() {
             std::iter::empty::<(&str, &str)>(),
         );
         assert_eq!(upload_part.status, 200, "body: {}", upload_part.body);
-        CTX.client()
-            .abort_multipart_upload()
+        abort_multipart_upload(&bucket, key, upload_id).await;
+        cleanup_bucket(&bucket).await;
+
+        let bucket = create_bucket_in_test_region(None, false).await;
+        let key = "multipart-md5";
+        let upload = CTX
+            .client()
+            .create_multipart_upload()
             .bucket(&bucket)
             .key(key)
-            .upload_id(upload_id)
             .send()
             .await
             .unwrap();
+        let upload_id = upload.upload_id().unwrap();
+        let part_url = format!(
+            "{}/{}/{}?partNumber=1&uploadId={}",
+            CTX.endpoint(),
+            bucket,
+            key,
+            url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect::<String>()
+        );
+        let body = b"hello multipart";
+        let md5_headers = [content_md5_header(body)];
+        assert_request_succeeds(
+            "UploadPart with Content-MD5",
+            "PUT",
+            &part_url,
+            body,
+            &md5_headers,
+        );
+        abort_multipart_upload(&bucket, key, upload_id).await;
+        cleanup_bucket(&bucket).await;
+
+        let bucket = create_bucket_in_test_region(None, false).await;
+        let key = "multipart-sdk";
+        let upload = CTX
+            .client()
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_algorithm(aws_sdk_s3::types::ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = upload.upload_id().unwrap();
+        let part_url = format!(
+            "{}/{}/{}?partNumber=1&uploadId={}",
+            CTX.endpoint(),
+            bucket,
+            key,
+            url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect::<String>()
+        );
+        let body = b"hello multipart";
+        let sdk_headers = sdk_checksum_headers(body);
+        assert_request_succeeds(
+            "UploadPart with checksum family",
+            "PUT",
+            &part_url,
+            body,
+            &sdk_headers,
+        );
+        abort_multipart_upload(&bucket, key, upload_id).await;
         cleanup_bucket(&bucket).await;
 
         let bucket = create_bucket_in_test_region(None, false).await;

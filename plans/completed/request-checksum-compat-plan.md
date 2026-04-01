@@ -86,18 +86,10 @@ Current focused `s3-tests` coverage:
     `PutObjectAcl`, `PutObjectTagging`, `PutObjectLegalHold`,
     `PutObjectRetention`
   - exceptions: allow-missing `PutObject`, `UploadPart`,
-    `CompleteMultipartUpload`, and Object Lock `PutObject` missing-checksum
-    negative
+    `CompleteMultipartUpload`, Object Lock `PutObject`
+    missing-checksum-negative plus checksum-bearing positives, and optional
+    checksum-bearing `UploadPart` positives
   - guardrail: bare `x-amz-checksum-algorithm` rejection
-
-Remaining integration gaps:
-- no explicit raw positive for Object Lock `PutObject` with `Content-MD5`
-  or SDK checksum family
-- no explicit raw optional-checksum positive for `UploadPart` with
-  `Content-MD5` and SDK checksum family
-- the plan document should be kept in sync with AWS-confirmed allow-missing
-  exceptions, because several operations differ from the initial doc-based
-  assumptions
 
 ## Required Operation Matrix
 
@@ -143,8 +135,8 @@ missing `Content-MD5` must continue to be allowed in at least some cases.
 
 | AWS operation | AWS requirement | Current Argmin behavior | Current tests | Coverage gap |
 | --- | --- | --- | --- | --- |
-| `PutObject` | Checksum generally optional; required when Object Lock retention is set; checksum-algorithm declarations require a matching checksum value/trailer when AWS is enforcing a checksum | Matches AWS behavior for allow-missing, Object Lock required-checksum, and algorithm-only rejection on required operations | Positive `Content-MD5` and checksum-family coverage in `checksums.rs`; broad object-lock behavior coverage in `object_lock.rs`; raw allow-missing and Object Lock missing-checksum negative in `request_checksums.rs` | No explicit raw positive yet for Object Lock `PutObject` with `Content-MD5` or checksum family |
-| `UploadPart` | No general `Content-MD5` requirement for normal SigV4 uploads; optional checksum mechanisms must remain accepted when present | Allow-missing remains supported; bare `x-amz-checksum-algorithm` on its own is also allowed here, matching AWS | Positive `Content-MD5` in `checksums.rs`; broader multipart checksum coverage in `checksums.rs` and `multipart.rs`; raw allow-missing guard in `request_checksums.rs` | No explicit raw positive yet for `UploadPart` with `Content-MD5` and checksum family |
+| `PutObject` | Checksum generally optional; required when Object Lock retention is set; checksum-algorithm declarations require a matching checksum value/trailer when AWS is enforcing a checksum | Matches AWS behavior for allow-missing, Object Lock required-checksum, and algorithm-only rejection on required operations | Positive `Content-MD5` and checksum-family coverage in `checksums.rs`; broad object-lock behavior coverage in `object_lock.rs`; raw allow-missing, Object Lock missing-checksum negative, and Object Lock checksum-bearing positives in `request_checksums.rs` | No remaining focused integration gap for implemented behavior |
+| `UploadPart` | No general `Content-MD5` requirement for normal SigV4 uploads; optional checksum mechanisms must remain accepted when present | Allow-missing remains supported; bare `x-amz-checksum-algorithm` on its own is also allowed here, matching AWS | Positive `Content-MD5` in `checksums.rs`; broader multipart checksum coverage in `checksums.rs` and `multipart.rs`; raw allow-missing plus optional checksum-bearing positives in `request_checksums.rs` | No remaining focused integration gap for implemented behavior |
 | `CompleteMultipartUpload` | No request checksum requirement | No request checksum enforcement | Broad positive-path multipart coverage in `checksums.rs` and `multipart.rs`; raw allow-missing guard in `request_checksums.rs` | No remaining focused integration gap for allow-missing behavior |
 
 ## Test Requirements
@@ -242,11 +234,9 @@ Deliverables:
   `DeleteObjects` until AWS behavior is confirmed
 
 Status:
-- mostly completed for implemented bucket subresource writes and for
-  `PutObjectAcl`, `PutObjectTagging`, `PutObjectLegalHold`,
-  and `PutObjectRetention`
-- still missing `DeleteObjects` SDK-substitution confirmation and raw
-  integration coverage for the remaining object-lock `PutObject` boundary
+- completed for the currently implemented checksum-required operations,
+  including `DeleteObjects` checksum-family substitution and the raw
+  Object Lock `PutObject` checksum-bearing boundary coverage
 
 ### Phase 3: Exception Tests
 
@@ -260,11 +250,8 @@ Deliverables:
   AWS
 
 Status:
-- partially completed
-- explicit allow-missing tests now cover `PutObject`, `UploadPart`, and
+- completed for the current exception set: `PutObject`, `UploadPart`, and
   `CompleteMultipartUpload`
-- the remaining gap is raw positive coverage for checksum-bearing
-  Object Lock `PutObject` and optional checksum-bearing `UploadPart`
 
 ### Phase 4: Server Enforcement
 
