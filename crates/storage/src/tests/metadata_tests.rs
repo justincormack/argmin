@@ -2882,10 +2882,16 @@ fn mpu_threaded_upsert_same_part_stress() {
 #[cfg(test)]
 mod prop_tests {
     use super::super::property_test_support::{
-        pagination_keys_strategy, pagination_page_size_strategy,
+        object_snapshots_from_store, pagination_keys_strategy, pagination_page_size_strategy,
+        render_trace, stateful_trace_strategy, version_snapshots_from_store, ModelOp,
+        ObjectSnapshot, VersionSnapshot, VersionStateModel, PROP_TEST_BUCKET,
     };
     use super::*;
     use proptest::prelude::*;
+    use proptest::test_runner::{TestCaseError, TestCaseResult};
+
+    const UNPAGINATED_MAX_KEYS: u32 = 100;
+    const FORCED_TIED_LAST_MODIFIED_MILLIS: i64 = 1;
 
     fn insert_keys(store: &dyn PgMetadataStore, bucket: &str, keys: &[ObjectKey]) {
         for key in keys {
@@ -2943,6 +2949,286 @@ mod prop_tests {
         all
     }
 
+    fn make_property_store() -> (test_util::TempDir, crate::PgStore) {
+        let (dir, store) = super::make_pg_store();
+        store
+            .create_bucket(
+                PROP_TEST_BUCKET,
+                "owner",
+                &CanonicalUserId::from_principal("owner"),
+                &AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+        (dir, store)
+    }
+
+    fn live_put_req(key: &ObjectKey, version_id: VersionId, size: u64) -> PutObjectReq {
+        PutObjectReq::Live(PutLiveObjectReq {
+            bucket: PROP_TEST_BUCKET.into(),
+            key: key.clone(),
+            version_id,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size,
+            etag: ObjectEtag::SinglePart([size as u8, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        })
+    }
+
+    fn delete_marker_req(key: &ObjectKey, version_id: VersionId) -> PutObjectReq {
+        PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
+            bucket: PROP_TEST_BUCKET.into(),
+            key: key.clone(),
+            version_id,
+            owner: test_owner(),
+        })
+    }
+
+    fn apply_op_to_store(store: &crate::PgStore, op: &ModelOp) {
+        match op {
+            ModelOp::SetVersioning(state) => {
+                store
+                    .put_bucket_versioning(PROP_TEST_BUCKET, *state)
+                    .unwrap();
+            }
+            ModelOp::PutLive {
+                key,
+                version_id,
+                size,
+            } => {
+                store
+                    .put_object_meta(&live_put_req(key, *version_id, *size))
+                    .unwrap();
+            }
+            ModelOp::PutDeleteMarker { key, version_id } => {
+                store
+                    .put_object_meta(&delete_marker_req(key, *version_id))
+                    .unwrap();
+            }
+            ModelOp::DeleteVersion { key, version_id } => {
+                store
+                    .delete_object_version(PROP_TEST_BUCKET, key.as_str(), *version_id)
+                    .unwrap();
+            }
+        }
+    }
+
+    fn current_snapshot_from_store(
+        store: &crate::PgStore,
+        key: &ObjectKey,
+    ) -> Result<Option<ObjectSnapshot>, TestCaseError> {
+        match store.get_object_meta(PROP_TEST_BUCKET, key.as_str()) {
+            Ok(object) => Ok(Some(ObjectSnapshot::from(&object))),
+            Err(crate::MetadataError::ObjectNotFound) => Ok(None),
+            Err(err) => Err(TestCaseError::fail(format!(
+                "get_object_meta failed for key {key}: {err:?}"
+            ))),
+        }
+    }
+
+    fn list_live_snapshots(store: &crate::PgStore) -> Result<Vec<ObjectSnapshot>, TestCaseError> {
+        match store.list_objects(&ListObjectsReq {
+            bucket: PROP_TEST_BUCKET.into(),
+            prefix: None,
+            start_after: None,
+            max_keys: UNPAGINATED_MAX_KEYS,
+        }) {
+            Ok(resp) => {
+                if resp.is_truncated {
+                    return Err(TestCaseError::fail(format!(
+                        "list_objects unexpectedly truncated with {} keys",
+                        UNPAGINATED_MAX_KEYS
+                    )));
+                }
+                Ok(object_snapshots_from_store(&resp.objects))
+            }
+            Err(err) => Err(TestCaseError::fail(format!("list_objects failed: {err:?}"))),
+        }
+    }
+
+    fn list_version_snapshots(
+        store: &crate::PgStore,
+    ) -> Result<Vec<VersionSnapshot>, TestCaseError> {
+        match store.list_object_versions(&ListObjectVersionsReq {
+            bucket: PROP_TEST_BUCKET.into(),
+            prefix: None,
+            key_marker: None,
+            version_id_marker: None,
+            max_keys: UNPAGINATED_MAX_KEYS,
+        }) {
+            Ok(resp) => {
+                if resp.is_truncated {
+                    return Err(TestCaseError::fail(format!(
+                        "list_object_versions unexpectedly truncated with {} keys",
+                        UNPAGINATED_MAX_KEYS
+                    )));
+                }
+                Ok(version_snapshots_from_store(&resp.versions))
+            }
+            Err(err) => Err(TestCaseError::fail(format!(
+                "list_object_versions failed: {err:?}"
+            ))),
+        }
+    }
+
+    fn model_version_snapshots_for_key(
+        model: &VersionStateModel,
+        key: &ObjectKey,
+    ) -> Vec<VersionSnapshot> {
+        model
+            .versions_for_key(key)
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(index, version)| VersionSnapshot {
+                object: ObjectSnapshot {
+                    key: key.clone(),
+                    version_id: version.version_id,
+                    kind: version.kind,
+                    size: version.size,
+                },
+                is_latest: index == 0,
+            })
+            .collect()
+    }
+
+    fn assert_current_differential(
+        store: &crate::PgStore,
+        model: &VersionStateModel,
+        keys: &[ObjectKey],
+        context: &str,
+    ) -> TestCaseResult {
+        for key in keys {
+            let actual = current_snapshot_from_store(store, key)?;
+            let expected = model.current_snapshot(key);
+            prop_assert_eq!(actual, expected, "{}", context);
+        }
+        Ok(())
+    }
+
+    fn assert_live_listing_differential(
+        store: &crate::PgStore,
+        model: &VersionStateModel,
+        context: &str,
+    ) -> TestCaseResult {
+        let actual = list_live_snapshots(store)?;
+        let expected = model.live_listing();
+        prop_assert_eq!(actual, expected, "{}", context);
+        Ok(())
+    }
+
+    fn assert_version_listing_differential(
+        store: &crate::PgStore,
+        model: &VersionStateModel,
+        keys: &[ObjectKey],
+        context: &str,
+    ) -> TestCaseResult {
+        let actual = list_version_snapshots(store)?;
+        let expected = model.version_listing();
+        prop_assert_eq!(&actual, &expected, "{}", context);
+
+        for key in keys {
+            let per_key = match store.list_object_versions_for_key(PROP_TEST_BUCKET, key.as_str()) {
+                Ok(versions) => version_snapshots_from_store(&versions),
+                Err(err) => {
+                    return Err(TestCaseError::fail(format!(
+                        "{context}\nlist_object_versions_for_key failed for key {key}: {err:?}"
+                    )))
+                }
+            };
+            let expected_per_key = model_version_snapshots_for_key(model, key);
+            prop_assert_eq!(per_key, expected_per_key, "{}", context);
+        }
+
+        let latest_keys = actual
+            .iter()
+            .filter(|version| version.is_latest)
+            .map(|version| version.object.key.clone())
+            .collect::<Vec<_>>();
+        let expected_latest_keys = expected
+            .iter()
+            .filter(|version| version.is_latest)
+            .map(|version| version.object.key.clone())
+            .collect::<Vec<_>>();
+        prop_assert_eq!(latest_keys, expected_latest_keys, "{}", context);
+        Ok(())
+    }
+
+    fn run_trace_with_check<F>(keys: &[ObjectKey], ops: &[ModelOp], mut check: F) -> TestCaseResult
+    where
+        F: FnMut(&crate::PgStore, &VersionStateModel, &[ObjectKey], &str) -> TestCaseResult,
+    {
+        let (_dir, store) = make_property_store();
+        let mut model = VersionStateModel::new();
+        let trace = render_trace(ops);
+
+        let initial_context = format!("initial state\nfull trace:\n{trace}");
+        check(&store, &model, keys, &initial_context)?;
+
+        for (index, op) in ops.iter().enumerate() {
+            apply_op_to_store(&store, op);
+            prop_assert!(
+                model.apply(op).is_ok(),
+                "generated operation should satisfy model invariants at step {index}: {op}\nfull trace:\n{trace}"
+            );
+            let step_context = format!("after step {index}: {op}\nfull trace:\n{trace}");
+            check(&store, &model, keys, &step_context)?;
+        }
+
+        Ok(())
+    }
+
+    fn materialize_trace(
+        keys: &[ObjectKey],
+        ops: &[ModelOp],
+    ) -> Result<(test_util::TempDir, crate::PgStore, VersionStateModel), TestCaseError> {
+        let (dir, store) = make_property_store();
+        let mut model = VersionStateModel::new();
+        let trace = render_trace(ops);
+
+        for (index, op) in ops.iter().enumerate() {
+            apply_op_to_store(&store, op);
+            if let Err(err) = model.apply(op) {
+                return Err(TestCaseError::fail(format!(
+                    "generated operation should satisfy model invariants at step {index}: {op}\nerror: {err:?}\nfull trace:\n{trace}"
+                )));
+            }
+        }
+
+        for key in keys {
+            let versions = model.versions_for_key(key);
+            if versions.len() > 1 {
+                store
+                    .connection()
+                    .execute(
+                        "UPDATE objects SET last_modified = ?1 WHERE bucket = ?2 AND key = ?3",
+                        rusqlite::params![
+                            FORCED_TIED_LAST_MODIFIED_MILLIS,
+                            PROP_TEST_BUCKET,
+                            key.as_str()
+                        ],
+                    )
+                    .map_err(|err| {
+                        TestCaseError::fail(format!(
+                            "forcing timestamp ties failed for key {key}: {err:?}\nfull trace:\n{trace}"
+                        ))
+                    })?;
+            }
+        }
+
+        Ok((dir, store, model))
+    }
+
     #[test]
     fn regression_empty_prefix_matches_all() {
         let (_dir, store) = super::make_pg_store();
@@ -2987,6 +3273,68 @@ mod prop_tests {
 
             let got = list_all_keys(&store, "bucket", Some(ObjectKey::from(prefix)), max_keys);
             prop_assert_eq!(got, expected);
+        }
+
+        #[test]
+        fn prop_storage_current_version_selection(
+            (keys, ops) in stateful_trace_strategy(),
+        ) {
+            run_trace_with_check(&keys, &ops, assert_current_differential)?;
+        }
+
+        #[test]
+        fn prop_storage_live_listing_visibility(
+            (keys, ops) in stateful_trace_strategy(),
+        ) {
+            run_trace_with_check(&keys, &ops, |store, model, _, context| {
+                assert_live_listing_differential(store, model, context)
+            })?;
+        }
+
+        #[test]
+        fn prop_storage_version_listing_order_and_latest(
+            (keys, ops) in stateful_trace_strategy(),
+        ) {
+            run_trace_with_check(&keys, &ops, assert_version_listing_differential)?;
+        }
+
+        #[test]
+        fn prop_storage_timestamp_tie_invariance(
+            (keys, ops) in stateful_trace_strategy(),
+        ) {
+            let trace = render_trace(&ops);
+
+            let (_untied_dir, untied_store) = make_property_store();
+            let mut untied_model = VersionStateModel::new();
+            for (index, op) in ops.iter().enumerate() {
+                apply_op_to_store(&untied_store, op);
+                prop_assert!(
+                    untied_model.apply(op).is_ok(),
+                    "generated operation should satisfy model invariants at step {index}: {op}\nfull trace:\n{trace}"
+                );
+            }
+
+            let (_tied_dir, tied_store, tied_model) = materialize_trace(&keys, &ops)?;
+            prop_assert_eq!(&untied_model, &tied_model, "full trace:\n{}", trace);
+
+            let context = format!("after forcing per-key timestamp ties\nfull trace:\n{trace}");
+            assert_current_differential(&tied_store, &tied_model, &keys, &context)?;
+            assert_live_listing_differential(&tied_store, &tied_model, &context)?;
+            assert_version_listing_differential(&tied_store, &tied_model, &keys, &context)?;
+
+            for key in &keys {
+                let untied = current_snapshot_from_store(&untied_store, key)?;
+                let tied = current_snapshot_from_store(&tied_store, key)?;
+                prop_assert_eq!(tied, untied, "{}", context);
+            }
+
+            let untied_live = list_live_snapshots(&untied_store)?;
+            let tied_live = list_live_snapshots(&tied_store)?;
+            prop_assert_eq!(tied_live, untied_live, "{}", context);
+
+            let untied_versions = list_version_snapshots(&untied_store)?;
+            let tied_versions = list_version_snapshots(&tied_store)?;
+            prop_assert_eq!(tied_versions, untied_versions, "{}", context);
         }
     }
 }

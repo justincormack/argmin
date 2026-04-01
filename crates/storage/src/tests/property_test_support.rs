@@ -560,6 +560,15 @@ pub(super) fn operation_trace_strategy(keys: Vec<ObjectKey>) -> BoxedStrategy<Ve
         .boxed()
 }
 
+pub(super) fn stateful_trace_strategy() -> BoxedStrategy<(Vec<ObjectKey>, Vec<ModelOp>)> {
+    stateful_key_set_strategy()
+        .prop_flat_map(|keys| {
+            let ops = operation_trace_strategy(keys.clone());
+            (Just(keys), ops)
+        })
+        .boxed()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

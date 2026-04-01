@@ -207,6 +207,22 @@ Implement the highest-value storage properties first:
 This is the best starting point because failures shrink well and avoid HTTP or
 cross-node noise.
 
+Status update (2026-04-01): completed for the initial storage target set.
+- Added phase-2 stateful differentials in
+  `crates/storage/src/tests/metadata_tests.rs` driven by the shared phase-1
+  helpers.
+- Added a real `PgStore` trace executor that applies generated `ModelOp`
+  sequences against a created bucket while the in-memory model advances in
+  lockstep.
+- Added per-step differential checks for:
+  - `get_object_meta` current-version selection
+  - `list_objects` live-key visibility
+  - `list_object_versions` ordering and `is_latest`
+- Added a timestamp-tie invariance property that replays the same generated
+  trace into a second store, forces per-key `last_modified` ties with SQL
+  updates, and verifies currentness/listing outcomes remain unchanged and still
+  match the model.
+
 ### Phase 3: Pagination differential properties
 
 Add round-trip properties that compare:
