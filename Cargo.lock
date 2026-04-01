@@ -2100,6 +2100,7 @@ dependencies = [
  "checksum",
  "ec",
  "observability",
+ "proptest",
  "rapidhash 1.4.0",
  "ring",
  "s3-types",

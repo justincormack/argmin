@@ -255,6 +255,22 @@ properties using the deterministic sweep hook already added for lifecycle tests.
 Restrict the generated operation count and key count aggressively so failures are
 fast and shrink cleanly.
 
+Status update (2026-04-01): started with the current-version expiration slice in
+`crates/server-core/src/coordinator.rs`.
+- Added a bounded coordinator property that generates versioning transitions and
+  live writes under deterministic day-boundary timestamps, then runs
+  `run_lifecycle_sweep_at()` against a simple `Expiration.Days = 1` lifecycle
+  rule.
+- Added a small local model that records the real coordinator-assigned version
+  IDs from writes, predicts the lifecycle sweep effect for Disabled, Enabled,
+  and Suspended buckets, and compares the post-sweep namespace against:
+  - `list_objects_v2`
+  - `list_object_versions`
+  - lifecycle sweep counters for expired current objects
+- Kept the initial phase-4 surface intentionally narrow: no generated explicit
+  delete operations, no noncurrent-version expiration rules, and no multipart
+  lifecycle actions yet.
+
 ## Test Design Constraints
 
 ### Keep runtime bounded

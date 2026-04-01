@@ -20,4 +20,5 @@ thiserror = "2"
 test-utils = []
 
 [dev-dependencies]
+proptest = "1"
 test-util = { path = "../test-util" }

@@ -2424,6 +2424,14 @@ impl LifecycleSweeper {
         *sweeper.handle.lock().unwrap() = Some(handle);
         Ok(sweeper)
     }
+
+    #[cfg(test)]
+    fn disabled() -> Arc<Self> {
+        Arc::new(Self {
+            stop: Arc::new(AtomicBool::new(true)),
+            handle: Mutex::new(None),
+        })
+    }
 }
 
 pub struct Coordinator {
@@ -5946,6 +5954,32 @@ impl Coordinator {
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
     ) -> Result<Self, ServerError> {
+        let lifecycle_sweeper_factory =
+            |storage_node: &Arc<SharedStorageNode>, read_runtime: ReadRuntime| {
+                LifecycleSweeper::acquire_shared(storage_node, read_runtime)
+            };
+        Self::new_with_lifecycle_sweeper_factory(
+            storage_node,
+            ec_config,
+            region,
+            sse_c_validator,
+            lifecycle_sweeper_factory,
+        )
+    }
+
+    fn new_with_lifecycle_sweeper_factory<F>(
+        storage_node: Arc<SharedStorageNode>,
+        ec_config: EcConfig,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+        lifecycle_sweeper_factory: F,
+    ) -> Result<Self, ServerError>
+    where
+        F: FnOnce(
+            &Arc<SharedStorageNode>,
+            ReadRuntime,
+        ) -> Result<Arc<LifecycleSweeper>, ServerError>,
+    {
         let ec_codec = Arc::new(ErasureCodec::new(ec_config)?);
         let pg_topology = PgTopology::new(storage_node.pg_ids()).map_err(|reason| {
             ServerError::InternalError {
@@ -5986,8 +6020,7 @@ impl Coordinator {
             .map_err(|e| ServerError::InternalError {
                 reason: format!("failed to start reclaim worker: {e}"),
             })?;
-        let lifecycle_sweeper =
-            LifecycleSweeper::acquire_shared(&storage_node, read_runtime.clone())?;
+        let lifecycle_sweeper = lifecycle_sweeper_factory(&storage_node, read_runtime.clone())?;
         let sweeper_storage_node = Arc::clone(&storage_node);
         Ok(Self {
             storage_node,
@@ -6007,6 +6040,22 @@ impl Coordinator {
             },
             _lifecycle_sweeper: lifecycle_sweeper,
         })
+    }
+
+    #[cfg(test)]
+    fn new_without_lifecycle_sweeper(
+        storage_node: Arc<SharedStorageNode>,
+        ec_config: EcConfig,
+        region: String,
+        sse_c_validator: Option<SseCustomerValidatorConfig>,
+    ) -> Result<Self, ServerError> {
+        Self::new_with_lifecycle_sweeper_factory(
+            storage_node,
+            ec_config,
+            region,
+            sse_c_validator,
+            |_, _| Ok(LifecycleSweeper::disabled()),
+        )
     }
 
     fn read_runtime(&self) -> ReadRuntime {
@@ -13195,6 +13244,19 @@ mod tests {
         Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap()
     }
 
+    fn setup_coordinator_without_lifecycle_sweeper(dir: &Path) -> Coordinator {
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        Coordinator::new_without_lifecycle_sweeper(
+            storage_node,
+            ec_config,
+            "us-east-1".to_string(),
+            None,
+        )
+        .unwrap()
+    }
+
     fn setup_coordinator_with_shared_storage(storage_node: Arc<SharedStorageNode>) -> Coordinator {
         let ec_config = EcConfig::new(4, 2).unwrap();
         Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap()
@@ -14387,6 +14449,591 @@ mod tests {
             header.abort_time_millis,
             Coordinator::lifecycle_day_based_deadline(1_700_000_000_000, 7).unwrap()
         );
+    }
+
+    mod lifecycle_prop_tests {
+        use super::*;
+        use proptest::prelude::*;
+        use proptest::test_runner::{Config as ProptestConfig, TestCaseError, TestCaseResult};
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::fmt::Write as _;
+
+        const PROP_BUCKET: &str = "bucket";
+        const PROP_LIFECYCLE_XML: &str = "<LifecycleConfiguration><Rule><ID>expire</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>";
+        const PROP_MAX_KEYS: usize = 3;
+        const PROP_MAX_OPS: usize = 8;
+        const PROP_DAY_MILLIS: u64 = 86_400_000;
+        const UNPAGINATED_MAX_KEYS: u32 = 100;
+        const EXPIRATION_DAYS: u32 = 1;
+
+        const DISABLED_VERSIONING_TARGETS: [BucketVersioningState; 2] = [
+            BucketVersioningState::Disabled,
+            BucketVersioningState::Enabled,
+        ];
+        const ENABLED_VERSIONING_TARGETS: [BucketVersioningState; 2] = [
+            BucketVersioningState::Enabled,
+            BucketVersioningState::Suspended,
+        ];
+        const SUSPENDED_VERSIONING_TARGETS: [BucketVersioningState; 2] = [
+            BucketVersioningState::Enabled,
+            BucketVersioningState::Suspended,
+        ];
+
+        #[derive(Debug, Clone)]
+        enum LifecycleTraceSeed {
+            Transition { choice: u8 },
+            PutLive { key_index: usize, size: u8 },
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        enum LifecycleTraceOp {
+            SetVersioning(BucketVersioningState),
+            PutLive { key: String, size: u8 },
+        }
+
+        impl std::fmt::Display for LifecycleTraceOp {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    Self::SetVersioning(state) => write!(f, "set-versioning({state:?})"),
+                    Self::PutLive { key, size } => {
+                        write!(f, "put-live(key={key}, size={size})")
+                    }
+                }
+            }
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum LifecycleVersionKind {
+            Live,
+            DeleteMarker,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct LifecycleLiveSnapshot {
+            key: String,
+            size: u64,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct LifecycleVersionSnapshot {
+            key: String,
+            version_id: VersionId,
+            kind: LifecycleVersionKind,
+            size: Option<u64>,
+            is_latest: bool,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct LifecycleVersion {
+            version_id: VersionId,
+            kind: LifecycleVersionKind,
+            size: Option<u64>,
+            last_modified: u64,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        struct LifecycleModel {
+            versioning: BucketVersioningState,
+            objects: BTreeMap<String, Vec<LifecycleVersion>>,
+        }
+
+        impl LifecycleModel {
+            fn new() -> Self {
+                Self {
+                    versioning: BucketVersioningState::Disabled,
+                    objects: BTreeMap::new(),
+                }
+            }
+
+            fn versioning(&self) -> BucketVersioningState {
+                self.versioning
+            }
+
+            fn legal_versioning_targets(&self) -> &'static [BucketVersioningState] {
+                match self.versioning {
+                    BucketVersioningState::Disabled => &DISABLED_VERSIONING_TARGETS,
+                    BucketVersioningState::Enabled => &ENABLED_VERSIONING_TARGETS,
+                    BucketVersioningState::Suspended => &SUSPENDED_VERSIONING_TARGETS,
+                }
+            }
+
+            fn set_versioning(&mut self, next: BucketVersioningState) {
+                assert!(self.legal_versioning_targets().contains(&next));
+                self.versioning = next;
+            }
+
+            fn apply_put(
+                &mut self,
+                key: String,
+                version_id: VersionId,
+                size: u64,
+                last_modified: u64,
+            ) {
+                self.insert_version(
+                    key,
+                    version_id,
+                    LifecycleVersionKind::Live,
+                    Some(size),
+                    last_modified,
+                );
+            }
+
+            fn insert_version(
+                &mut self,
+                key: String,
+                version_id: VersionId,
+                kind: LifecycleVersionKind,
+                size: Option<u64>,
+                last_modified: u64,
+            ) {
+                let versions = self.objects.entry(key).or_default();
+                if version_id.is_null() {
+                    versions.retain(|version| version.version_id != VersionId::Null);
+                }
+                versions.push(LifecycleVersion {
+                    version_id,
+                    kind,
+                    size,
+                    last_modified,
+                });
+            }
+
+            fn next_numbered_version_id(&self, key: &str) -> VersionId {
+                let next = self
+                    .objects
+                    .get(key)
+                    .into_iter()
+                    .flat_map(|versions| versions.iter())
+                    .filter_map(|version| match version.version_id {
+                        VersionId::Null => None,
+                        VersionId::Versioned(value) => Some(value.get()),
+                    })
+                    .max()
+                    .unwrap_or(0)
+                    + 1;
+                VersionId::Versioned(
+                    std::num::NonZeroU64::new(next)
+                        .expect("next numbered lifecycle version id is non-zero"),
+                )
+            }
+
+            fn live_listing(&self) -> Vec<LifecycleLiveSnapshot> {
+                self.objects
+                    .iter()
+                    .filter_map(|(key, versions)| versions.last().map(|current| (key, current)))
+                    .filter(|(_, current)| current.kind == LifecycleVersionKind::Live)
+                    .map(|(key, current)| LifecycleLiveSnapshot {
+                        key: key.clone(),
+                        size: current.size.unwrap_or(0),
+                    })
+                    .collect()
+            }
+
+            fn version_listing(&self) -> Vec<LifecycleVersionSnapshot> {
+                let mut snapshots = Vec::new();
+                for (key, versions) in &self.objects {
+                    for (index, version) in versions.iter().rev().enumerate() {
+                        snapshots.push(LifecycleVersionSnapshot {
+                            key: key.clone(),
+                            version_id: version.version_id,
+                            kind: version.kind,
+                            size: version.size,
+                            is_latest: index == 0,
+                        });
+                    }
+                }
+                snapshots
+            }
+
+            fn sweep_candidates(&self) -> Vec<u64> {
+                let mut candidates = BTreeSet::from([0u64]);
+                for versions in self.objects.values() {
+                    let Some(current) = versions.last() else {
+                        continue;
+                    };
+                    if current.kind != LifecycleVersionKind::Live {
+                        continue;
+                    }
+                    let deadline = Coordinator::lifecycle_day_based_deadline(
+                        current.last_modified,
+                        EXPIRATION_DAYS,
+                    )
+                    .expect("static expiration days should produce a deadline");
+                    if deadline > 0 {
+                        candidates.insert(deadline - 1);
+                    }
+                    candidates.insert(deadline);
+                }
+                candidates.into_iter().collect()
+            }
+
+            fn apply_current_expiration_sweep(&mut self, now_millis: u64) -> u64 {
+                let eligible_keys: Vec<String> = self
+                    .objects
+                    .iter()
+                    .filter_map(|(key, versions)| {
+                        let current = versions.last()?;
+                        if current.kind != LifecycleVersionKind::Live {
+                            return None;
+                        }
+                        let deadline = Coordinator::lifecycle_day_based_deadline(
+                            current.last_modified,
+                            EXPIRATION_DAYS,
+                        )
+                        .expect("static expiration days should produce a deadline");
+                        (deadline <= now_millis).then(|| key.clone())
+                    })
+                    .collect();
+
+                for key in &eligible_keys {
+                    match self.versioning {
+                        BucketVersioningState::Disabled => {
+                            self.objects.remove(key);
+                        }
+                        BucketVersioningState::Enabled => {
+                            let next = self.next_numbered_version_id(key);
+                            self.insert_version(
+                                key.clone(),
+                                next,
+                                LifecycleVersionKind::DeleteMarker,
+                                None,
+                                now_millis,
+                            );
+                        }
+                        BucketVersioningState::Suspended => {
+                            self.insert_version(
+                                key.clone(),
+                                VersionId::Null,
+                                LifecycleVersionKind::DeleteMarker,
+                                None,
+                                now_millis,
+                            );
+                        }
+                    }
+                }
+
+                eligible_keys.len() as u64
+            }
+        }
+
+        fn render_trace(ops: &[LifecycleTraceOp]) -> String {
+            let mut rendered = String::new();
+            for (index, op) in ops.iter().enumerate() {
+                let _ = writeln!(&mut rendered, "{index}: {op}");
+            }
+            rendered
+        }
+
+        fn lifecycle_key_strategy() -> BoxedStrategy<String> {
+            proptest::string::string_regex(r"[a-z][a-z0-9/_-]{0,7}")
+                .expect("static lifecycle key regex should compile")
+                .boxed()
+        }
+
+        fn lifecycle_key_set_strategy() -> BoxedStrategy<Vec<String>> {
+            proptest::collection::btree_set(lifecycle_key_strategy(), 1..=PROP_MAX_KEYS)
+                .prop_map(|keys| keys.into_iter().collect())
+                .boxed()
+        }
+
+        fn lifecycle_trace_seed_strategy(key_count: usize) -> BoxedStrategy<LifecycleTraceSeed> {
+            prop_oneof![
+                2 => any::<u8>().prop_map(|choice| LifecycleTraceSeed::Transition { choice }),
+                5 => (0usize..key_count, 0u8..=8u8)
+                    .prop_map(|(key_index, size)| LifecycleTraceSeed::PutLive { key_index, size }),
+            ]
+            .boxed()
+        }
+
+        fn lifecycle_trace_strategy() -> BoxedStrategy<(Vec<String>, Vec<LifecycleTraceOp>, u8)> {
+            lifecycle_key_set_strategy()
+                .prop_flat_map(|keys| {
+                    let key_count = keys.len();
+                    let op_keys = keys.clone();
+                    let ops = proptest::collection::vec(
+                        lifecycle_trace_seed_strategy(key_count),
+                        0..=PROP_MAX_OPS,
+                    )
+                    .prop_map(move |seeds| {
+                        let mut versioning = BucketVersioningState::Disabled;
+                        let mut ops = Vec::with_capacity(seeds.len());
+
+                        for seed in seeds {
+                            match seed {
+                                LifecycleTraceSeed::Transition { choice } => {
+                                    let legal_targets = match versioning {
+                                        BucketVersioningState::Disabled => {
+                                            &DISABLED_VERSIONING_TARGETS
+                                        }
+                                        BucketVersioningState::Enabled => {
+                                            &ENABLED_VERSIONING_TARGETS
+                                        }
+                                        BucketVersioningState::Suspended => {
+                                            &SUSPENDED_VERSIONING_TARGETS
+                                        }
+                                    };
+                                    let next =
+                                        legal_targets[(choice as usize) % legal_targets.len()];
+                                    versioning = next;
+                                    ops.push(LifecycleTraceOp::SetVersioning(next));
+                                }
+                                LifecycleTraceSeed::PutLive { key_index, size } => {
+                                    ops.push(LifecycleTraceOp::PutLive {
+                                        key: op_keys[key_index].clone(),
+                                        size,
+                                    });
+                                }
+                            }
+                        }
+
+                        ops
+                    });
+
+                    (Just(keys), ops, any::<u8>())
+                })
+                .boxed()
+        }
+
+        fn lifecycle_write_time(write_index: usize) -> u64 {
+            (u64::try_from(write_index).expect("write index should fit in u64") + 1)
+                .checked_mul(PROP_DAY_MILLIS)
+                .and_then(|millis| millis.checked_sub(1))
+                .expect("bounded lifecycle write times should not overflow")
+        }
+
+        fn install_lifecycle_rule(coord: &Coordinator) -> Result<(), TestCaseError> {
+            put_bucket_lifecycle_test(
+                coord,
+                PROP_BUCKET,
+                PROP_LIFECYCLE_XML,
+                test_requester(),
+                None,
+            )
+            .map_err(|err| TestCaseError::fail(format!("put_bucket_lifecycle failed: {err:?}")))
+        }
+
+        fn put_live_at(
+            coord: &Coordinator,
+            key: &str,
+            size: u8,
+            now_millis: u64,
+        ) -> Result<PutObjectResult, TestCaseError> {
+            let data = vec![size; usize::from(size)];
+            let metadata = MetadataBlob::default();
+            let system_metadata = SystemMetadata::default();
+            storage::clock::with_time_override(now_millis, || {
+                test_helpers::put_object(
+                    coord,
+                    &PutObjectRequest {
+                        sse_customer: None,
+                        policy_context: PutObjectPolicyContext::default(),
+                        object_lock: ObjectLockState::default(),
+                        object: object_request_with_expected_owner(
+                            PROP_BUCKET,
+                            key,
+                            test_requester(),
+                            None,
+                        ),
+                        data: &data,
+                        metadata: &metadata,
+                        system_metadata: &system_metadata,
+                        tags: None,
+                        cond: NO_WRITE,
+                        acl: NO_PUT_OBJECT_ACL.into(),
+                    },
+                )
+            })
+            .map_err(|err| TestCaseError::fail(format!("put_object failed for key {key}: {err:?}")))
+        }
+
+        fn list_live_snapshots(
+            coord: &Coordinator,
+        ) -> Result<Vec<LifecycleLiveSnapshot>, TestCaseError> {
+            let result = coord
+                .list_objects_v2(&ListObjectsV2Request {
+                    bucket: bucket_request_with_expected_owner(PROP_BUCKET, test_requester(), None),
+                    prefix: None,
+                    delimiter: None,
+                    continuation_token: None,
+                    max_keys: UNPAGINATED_MAX_KEYS,
+                })
+                .map_err(|err| TestCaseError::fail(format!("list_objects_v2 failed: {err:?}")))?;
+
+            if result.is_truncated {
+                return Err(TestCaseError::fail(format!(
+                    "list_objects_v2 unexpectedly truncated with {} keys",
+                    UNPAGINATED_MAX_KEYS
+                )));
+            }
+            if !result.common_prefixes.is_empty() {
+                return Err(TestCaseError::fail(
+                    "list_objects_v2 unexpectedly returned common prefixes".to_string(),
+                ));
+            }
+
+            Ok(result
+                .objects
+                .into_iter()
+                .map(|entry| LifecycleLiveSnapshot {
+                    key: entry.key,
+                    size: entry.size,
+                })
+                .collect())
+        }
+
+        fn list_version_snapshots(
+            coord: &Coordinator,
+        ) -> Result<Vec<LifecycleVersionSnapshot>, TestCaseError> {
+            let result = coord
+                .list_object_versions(&ListObjectVersionsRequest {
+                    bucket: bucket_request_with_expected_owner(PROP_BUCKET, test_requester(), None),
+                    prefix: None,
+                    key_marker: None,
+                    version_id_marker: None,
+                    max_keys: UNPAGINATED_MAX_KEYS,
+                })
+                .map_err(|err| {
+                    TestCaseError::fail(format!("list_object_versions failed: {err:?}"))
+                })?;
+
+            if result.is_truncated {
+                return Err(TestCaseError::fail(format!(
+                    "list_object_versions unexpectedly truncated with {} keys",
+                    UNPAGINATED_MAX_KEYS
+                )));
+            }
+
+            Ok(result
+                .versions
+                .into_iter()
+                .map(|entry| LifecycleVersionSnapshot {
+                    key: entry.key,
+                    version_id: entry.version_id,
+                    kind: if entry.is_delete_marker {
+                        LifecycleVersionKind::DeleteMarker
+                    } else {
+                        LifecycleVersionKind::Live
+                    },
+                    size: (!entry.is_delete_marker).then_some(entry.size),
+                    is_latest: entry.is_latest,
+                })
+                .collect())
+        }
+
+        fn assert_namespace_matches(
+            coord: &Coordinator,
+            model: &LifecycleModel,
+            context: &str,
+        ) -> TestCaseResult {
+            let actual_live = list_live_snapshots(coord)?;
+            let expected_live = model.live_listing();
+            prop_assert_eq!(actual_live, expected_live, "{}", context);
+
+            let actual_versions = list_version_snapshots(coord)?;
+            let expected_versions = model.version_listing();
+            prop_assert_eq!(actual_versions, expected_versions, "{}", context);
+            Ok(())
+        }
+
+        fn apply_trace_op(
+            coord: &Coordinator,
+            model: &mut LifecycleModel,
+            op: &LifecycleTraceOp,
+            write_index: &mut usize,
+            context: &str,
+        ) -> TestCaseResult {
+            match op {
+                LifecycleTraceOp::SetVersioning(state) => {
+                    put_bucket_versioning_test(coord, PROP_BUCKET, *state, test_requester(), None)
+                        .map_err(|err| {
+                            TestCaseError::fail(format!(
+                                "{context}\nput_bucket_versioning failed: {err:?}"
+                            ))
+                        })?;
+                    model.set_versioning(*state);
+                }
+                LifecycleTraceOp::PutLive { key, size } => {
+                    let now_millis = lifecycle_write_time(*write_index);
+                    *write_index += 1;
+                    let result = put_live_at(coord, key, *size, now_millis)?;
+
+                    match model.versioning() {
+                        BucketVersioningState::Enabled => {
+                            prop_assert!(
+                                result.version_id.is_versioned(),
+                                "{context}\nexpected numbered version id for enabled bucket, got {:?}",
+                                result.version_id
+                            );
+                        }
+                        BucketVersioningState::Disabled | BucketVersioningState::Suspended => {
+                            prop_assert_eq!(result.version_id, VersionId::Null, "{}", context);
+                        }
+                    }
+
+                    model.apply_put(key.clone(), result.version_id, u64::from(*size), now_millis);
+                }
+            }
+
+            Ok(())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(24))]
+
+            #[test]
+            fn prop_lifecycle_current_expiration_matches_model(
+                (keys, ops, sweep_selector) in lifecycle_trace_strategy(),
+            ) {
+                let trace = render_trace(&ops);
+                let tmp = test_util::tempdir();
+                let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
+                coord
+                    .create_bucket_for_owner("default-owner", PROP_BUCKET, false)
+                    .unwrap();
+                let mut model = LifecycleModel::new();
+                let mut write_index = 0usize;
+
+                let initial_context = format!("initial state\nkeys={keys:?}\nfull trace:\n{trace}");
+                assert_namespace_matches(&coord, &model, &initial_context)?;
+
+                for (index, op) in ops.iter().enumerate() {
+                    let step_context = format!(
+                        "after step {index}: {op}\nkeys={keys:?}\nfull trace:\n{trace}"
+                    );
+                    apply_trace_op(&coord, &mut model, op, &mut write_index, &step_context)?;
+                    assert_namespace_matches(&coord, &model, &step_context)?;
+                }
+
+                install_lifecycle_rule(&coord)?;
+
+                let sweep_candidates = model.sweep_candidates();
+                let sweep_at = sweep_candidates[(sweep_selector as usize) % sweep_candidates.len()];
+                let mut expected_after_sweep = model.clone();
+                let expected_expired_current =
+                    expected_after_sweep.apply_current_expiration_sweep(sweep_at);
+
+                let sweep_context = format!(
+                    "after lifecycle sweep at {sweep_at}\nkeys={keys:?}\nsweep_candidates={sweep_candidates:?}\nfull trace:\n{trace}"
+                );
+                let stats = coord.run_lifecycle_sweep_at(sweep_at).map_err(|err| {
+                    TestCaseError::fail(format!(
+                        "{sweep_context}\nrun_lifecycle_sweep_at failed: {err:?}"
+                    ))
+                })?;
+
+                prop_assert_eq!(stats.scanned_buckets, 1, "{}", sweep_context);
+                prop_assert_eq!(
+                    stats.expired_current_objects,
+                    expected_expired_current,
+                    "{}",
+                    sweep_context
+                );
+                prop_assert_eq!(stats.expired_noncurrent_versions, 0, "{}", sweep_context);
+                prop_assert_eq!(stats.expired_delete_markers, 0, "{}", sweep_context);
+                prop_assert_eq!(stats.aborted_multipart_uploads, 0, "{}", sweep_context);
+                assert_namespace_matches(&coord, &expected_after_sweep, &sweep_context)?;
+            }
+        }
     }
 
     #[test]
