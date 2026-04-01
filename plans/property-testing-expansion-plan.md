@@ -232,6 +232,21 @@ Add round-trip properties that compare:
 This phase should explicitly cover marker handling for `ListObjectVersions`,
 because marker bugs tend to survive ordinary example tests.
 
+Status update (2026-04-01): storage-side pagination differentials completed;
+coordinator fan-in comparison remains for a follow-up slice.
+- Added phase-3 storage properties in
+  `crates/storage/src/tests/metadata_tests.rs` that run after every generated
+  state transition from the shared phase-1/2 trace model.
+- Added paginated-vs-unpaginated differential checks for both `list_objects`
+  and `list_object_versions`, including page-flattening equality, no-loss/no-
+  duplication coverage, and explicit marker advancement assertions.
+- Added suffix-resumption checks for:
+  - `ListObjects` `start_after`
+  - `ListObjectVersions` `(key_marker, version_id_marker)` resumption from every
+    returned version entry
+  - `ListObjectVersions` key-only `key_marker` resumption after whole per-key
+    version chains
+
 ### Phase 4: Coordinator lifecycle properties
 
 Once the storage model is stable, add coordinator-level lifecycle sweep

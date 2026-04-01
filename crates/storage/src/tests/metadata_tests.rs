@@ -2883,8 +2883,9 @@ fn mpu_threaded_upsert_same_part_stress() {
 mod prop_tests {
     use super::super::property_test_support::{
         object_snapshots_from_store, pagination_keys_strategy, pagination_page_size_strategy,
-        render_trace, stateful_trace_strategy, version_snapshots_from_store, ModelOp,
-        ObjectSnapshot, VersionSnapshot, VersionStateModel, PROP_TEST_BUCKET,
+        render_trace, stateful_page_size_strategy, stateful_trace_strategy,
+        version_snapshots_from_store, ModelOp, ObjectSnapshot, VersionSnapshot, VersionStateModel,
+        PROP_TEST_BUCKET,
     };
     use super::*;
     use proptest::prelude::*;
@@ -2892,6 +2893,13 @@ mod prop_tests {
 
     const UNPAGINATED_MAX_KEYS: u32 = 100;
     const FORCED_TIED_LAST_MODIFIED_MILLIS: i64 = 1;
+    type LivePage = (Vec<ObjectSnapshot>, bool, Option<ObjectKey>);
+    type VersionPage = (
+        Vec<ObjectSnapshot>,
+        bool,
+        Option<ObjectKey>,
+        Option<VersionId>,
+    );
 
     fn insert_keys(store: &dyn PgMetadataStore, bucket: &str, keys: &[ObjectKey]) {
         for key in keys {
@@ -3081,6 +3089,88 @@ mod prop_tests {
         }
     }
 
+    fn list_live_snapshot_page(
+        store: &crate::PgStore,
+        start_after: Option<ObjectKey>,
+        max_keys: u32,
+    ) -> Result<LivePage, TestCaseError> {
+        match store.list_objects(&ListObjectsReq {
+            bucket: PROP_TEST_BUCKET.into(),
+            prefix: None,
+            start_after,
+            max_keys,
+        }) {
+            Ok(resp) => Ok((
+                object_snapshots_from_store(&resp.objects),
+                resp.is_truncated,
+                resp.next_start_after,
+            )),
+            Err(err) => Err(TestCaseError::fail(format!(
+                "paginated list_objects failed: {err:?}"
+            ))),
+        }
+    }
+
+    fn list_version_object_page(
+        store: &crate::PgStore,
+        key_marker: Option<ObjectKey>,
+        version_id_marker: Option<VersionId>,
+        max_keys: u32,
+    ) -> Result<VersionPage, TestCaseError> {
+        match store.list_object_versions(&ListObjectVersionsReq {
+            bucket: PROP_TEST_BUCKET.into(),
+            prefix: None,
+            key_marker,
+            version_id_marker,
+            max_keys,
+        }) {
+            Ok(resp) => Ok((
+                object_snapshots_from_store(&resp.versions),
+                resp.is_truncated,
+                resp.next_key_marker,
+                resp.next_version_id_marker,
+            )),
+            Err(err) => Err(TestCaseError::fail(format!(
+                "paginated list_object_versions failed: {err:?}"
+            ))),
+        }
+    }
+
+    fn live_suffix_after_marker<'a>(
+        expected: &'a [ObjectSnapshot],
+        key: &ObjectKey,
+    ) -> &'a [ObjectSnapshot] {
+        let Some(index) = expected.iter().position(|object| object.key == *key) else {
+            return &expected[expected.len()..];
+        };
+        &expected[index + 1..]
+    }
+
+    fn version_suffix_after_marker<'a>(
+        expected: &'a [ObjectSnapshot],
+        key: &ObjectKey,
+        version_id: VersionId,
+    ) -> &'a [ObjectSnapshot] {
+        let Some(index) = expected
+            .iter()
+            .position(|version| version.key == *key && version.version_id == version_id)
+        else {
+            return &expected[expected.len()..];
+        };
+        &expected[index + 1..]
+    }
+
+    fn version_suffix_after_key<'a>(
+        expected: &'a [ObjectSnapshot],
+        key: &ObjectKey,
+    ) -> &'a [ObjectSnapshot] {
+        let mut index = 0usize;
+        while index < expected.len() && expected[index].key <= *key {
+            index += 1;
+        }
+        &expected[index..]
+    }
+
     fn model_version_snapshots_for_key(
         model: &VersionStateModel,
         key: &ObjectKey,
@@ -3127,6 +3217,85 @@ mod prop_tests {
         Ok(())
     }
 
+    fn assert_live_pagination_differential(
+        store: &crate::PgStore,
+        model: &VersionStateModel,
+        page_size: u32,
+        context: &str,
+    ) -> TestCaseResult {
+        let expected = model.live_listing();
+        let mut paginated = Vec::new();
+        let mut start_after: Option<ObjectKey> = None;
+        let mut completed = false;
+
+        for _ in 0..=expected.len() {
+            let current_marker = start_after.clone();
+            let (page, is_truncated, next_start_after) =
+                list_live_snapshot_page(store, current_marker.clone(), page_size)?;
+
+            prop_assert!(page.len() <= page_size as usize, "{}", context);
+            if let Some(marker) = &current_marker {
+                for object in &page {
+                    prop_assert!(object.key > *marker, "{}", context);
+                }
+            }
+
+            if is_truncated {
+                let next_marker = next_start_after.clone().ok_or_else(|| {
+                    TestCaseError::fail(format!(
+                        "{context}\nmissing next_start_after for truncated page"
+                    ))
+                })?;
+                let last_key = page
+                    .last()
+                    .map(|object| object.key.clone())
+                    .ok_or_else(|| {
+                        TestCaseError::fail(format!("{context}\ntruncated object page was empty"))
+                    })?;
+                prop_assert_eq!(&next_marker, &last_key, "{}", context);
+                if let Some(previous_marker) = current_marker {
+                    prop_assert!(next_marker > previous_marker, "{}", context);
+                }
+            } else {
+                prop_assert!(next_start_after.is_none(), "{}", context);
+            }
+
+            paginated.extend(page);
+            prop_assert!(paginated.len() <= expected.len(), "{}", context);
+            prop_assert_eq!(
+                paginated.as_slice(),
+                &expected[..paginated.len()],
+                "{}",
+                context
+            );
+
+            if is_truncated {
+                start_after = next_start_after;
+            } else {
+                completed = true;
+                break;
+            }
+        }
+
+        prop_assert!(completed, "{}", context);
+        prop_assert_eq!(&paginated, &expected, "{}", context);
+
+        for object in &expected {
+            let (suffix, is_truncated, next_start_after) =
+                list_live_snapshot_page(store, Some(object.key.clone()), UNPAGINATED_MAX_KEYS)?;
+            prop_assert!(!is_truncated, "{}", context);
+            prop_assert!(next_start_after.is_none(), "{}", context);
+            prop_assert_eq!(
+                suffix.as_slice(),
+                live_suffix_after_marker(&expected, &object.key),
+                "{}",
+                context
+            );
+        }
+
+        Ok(())
+    }
+
     fn assert_version_listing_differential(
         store: &crate::PgStore,
         model: &VersionStateModel,
@@ -3161,6 +3330,134 @@ mod prop_tests {
             .map(|version| version.object.key.clone())
             .collect::<Vec<_>>();
         prop_assert_eq!(latest_keys, expected_latest_keys, "{}", context);
+        Ok(())
+    }
+
+    fn assert_version_pagination_differential(
+        store: &crate::PgStore,
+        model: &VersionStateModel,
+        page_size: u32,
+        context: &str,
+    ) -> TestCaseResult {
+        let expected = model
+            .version_listing()
+            .into_iter()
+            .map(|version| version.object)
+            .collect::<Vec<_>>();
+        let mut paginated = Vec::new();
+        let mut key_marker: Option<ObjectKey> = None;
+        let mut version_id_marker: Option<VersionId> = None;
+        let mut completed = false;
+
+        for _ in 0..=expected.len() {
+            let current_key_marker = key_marker.clone();
+            let current_version_marker = version_id_marker;
+            let (page, is_truncated, next_key_marker, next_version_id_marker) =
+                list_version_object_page(
+                    store,
+                    current_key_marker.clone(),
+                    current_version_marker,
+                    page_size,
+                )?;
+
+            prop_assert!(page.len() <= page_size as usize, "{}", context);
+
+            if is_truncated {
+                let next_key = next_key_marker.clone().ok_or_else(|| {
+                    TestCaseError::fail(format!(
+                        "{context}\nmissing next_key_marker for truncated version page"
+                    ))
+                })?;
+                let next_version = next_version_id_marker.ok_or_else(|| {
+                    TestCaseError::fail(format!(
+                        "{context}\nmissing next_version_id_marker for truncated version page"
+                    ))
+                })?;
+                let last = page.last().ok_or_else(|| {
+                    TestCaseError::fail(format!("{context}\ntruncated version page was empty"))
+                })?;
+                prop_assert_eq!(&next_key, &last.key, "{}", context);
+                prop_assert_eq!(next_version, last.version_id, "{}", context);
+                if let (Some(previous_key), Some(previous_version)) =
+                    (current_key_marker, current_version_marker)
+                {
+                    prop_assert!(
+                        next_key > previous_key
+                            || (next_key == previous_key && next_version != previous_version),
+                        "{}",
+                        context
+                    );
+                }
+            } else {
+                prop_assert!(next_key_marker.is_none(), "{}", context);
+                prop_assert!(next_version_id_marker.is_none(), "{}", context);
+            }
+
+            paginated.extend(page);
+            prop_assert!(paginated.len() <= expected.len(), "{}", context);
+            prop_assert_eq!(
+                paginated.as_slice(),
+                &expected[..paginated.len()],
+                "{}",
+                context
+            );
+
+            if is_truncated {
+                key_marker = next_key_marker;
+                version_id_marker = next_version_id_marker;
+            } else {
+                completed = true;
+                break;
+            }
+        }
+
+        prop_assert!(completed, "{}", context);
+        prop_assert_eq!(&paginated, &expected, "{}", context);
+
+        for version in &expected {
+            let (suffix, is_truncated, next_key_marker, next_version_id_marker) =
+                list_version_object_page(
+                    store,
+                    Some(version.key.clone()),
+                    Some(version.version_id),
+                    UNPAGINATED_MAX_KEYS,
+                )?;
+            prop_assert!(!is_truncated, "{}", context);
+            prop_assert!(next_key_marker.is_none(), "{}", context);
+            prop_assert!(next_version_id_marker.is_none(), "{}", context);
+            prop_assert_eq!(
+                suffix.as_slice(),
+                version_suffix_after_marker(&expected, &version.key, version.version_id),
+                "{}",
+                context
+            );
+        }
+
+        let mut seen_key: Option<&ObjectKey> = None;
+        for version in &expected {
+            if seen_key == Some(&version.key) {
+                continue;
+            }
+            seen_key = Some(&version.key);
+
+            let (suffix, is_truncated, next_key_marker, next_version_id_marker) =
+                list_version_object_page(
+                    store,
+                    Some(version.key.clone()),
+                    None,
+                    UNPAGINATED_MAX_KEYS,
+                )?;
+            prop_assert!(!is_truncated, "{}", context);
+            prop_assert!(next_key_marker.is_none(), "{}", context);
+            prop_assert!(next_version_id_marker.is_none(), "{}", context);
+            prop_assert_eq!(
+                suffix.as_slice(),
+                version_suffix_after_key(&expected, &version.key),
+                "{}",
+                context
+            );
+        }
+
         Ok(())
     }
 
@@ -3335,6 +3632,26 @@ mod prop_tests {
             let untied_versions = list_version_snapshots(&untied_store)?;
             let tied_versions = list_version_snapshots(&tied_store)?;
             prop_assert_eq!(tied_versions, untied_versions, "{}", context);
+        }
+
+        #[test]
+        fn prop_storage_live_listing_pagination_roundtrip(
+            (keys, ops) in stateful_trace_strategy(),
+            page_size in stateful_page_size_strategy(),
+        ) {
+            run_trace_with_check(&keys, &ops, |store, model, _, context| {
+                assert_live_pagination_differential(store, model, page_size, context)
+            })?;
+        }
+
+        #[test]
+        fn prop_storage_version_listing_pagination_roundtrip(
+            (keys, ops) in stateful_trace_strategy(),
+            page_size in stateful_page_size_strategy(),
+        ) {
+            run_trace_with_check(&keys, &ops, |store, model, _, context| {
+                assert_version_pagination_differential(store, model, page_size, context)
+            })?;
         }
     }
 }
