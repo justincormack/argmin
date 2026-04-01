@@ -790,6 +790,61 @@ fn list_buckets_with_lifecycle_returns_only_active_lifecycle_buckets() {
 }
 
 #[test]
+fn list_buckets_with_aborting_multipart_uploads_returns_distinct_bucket_names() {
+    let (_dir, store) = make_pg_store();
+    for bucket in ["alpha", "beta"] {
+        store
+            .create_bucket(
+                bucket,
+                "owner",
+                &CanonicalUserId::from_principal("owner"),
+                &AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+    }
+
+    for (upload_id, bucket, key) in [
+        ("upload-a1", "alpha", "key-1"),
+        ("upload-a2", "alpha", "key-2"),
+        ("upload-b1", "beta", "key-1"),
+    ] {
+        store
+            .create_multipart_upload(&CreateMultipartUploadReq {
+                upload_id: upload_id.into(),
+                bucket: bucket.into(),
+                key: key.into(),
+                owner: test_owner(),
+                initiator: None,
+                tags: None,
+                metadata_blob: SerializedMetadataBlob::from(vec![]),
+                system_metadata_blob: SerializedSystemMetadataBlob::from(vec![]),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                object_lock: ObjectLockState::default(),
+                checksum: None,
+                encryption: ObjectEncryption::None,
+            })
+            .unwrap();
+    }
+    store
+        .set_upload_state("upload-a1", UploadState::Aborting)
+        .unwrap();
+    store
+        .set_upload_state("upload-a2", UploadState::Aborting)
+        .unwrap();
+    store
+        .set_upload_state("upload-b1", UploadState::Completing)
+        .unwrap();
+
+    let buckets = store
+        .list_buckets_with_aborting_multipart_uploads()
+        .unwrap();
+    assert_eq!(buckets, vec![BucketName::from("alpha")]);
+}
+
+#[test]
 fn file_bucket_metadata_config_on_nonexistent_bucket() {
     let (_dir, store) = make_pg_store();
 

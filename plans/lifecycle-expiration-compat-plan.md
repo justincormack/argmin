@@ -341,7 +341,8 @@ Current status:
 - Phase 1 is complete.
 - Phase 2 is complete.
 - Phase 3 is complete.
-- Phases 4 and 5 remain pending.
+- Phase 4 is complete.
+- Phase 5 remains pending.
 
 ### Phase 1: Lifecycle config CRUD and rule model (Completed)
 
@@ -407,13 +408,22 @@ Completed in the current implementation:
 - deterministic tests covering versioned, suspended, retention-count, and
   Object Lock noncurrent expiration behavior
 
-### Phase 4: Expired delete markers and incomplete multipart uploads
+### Phase 4: Expired delete markers and incomplete multipart uploads (Completed)
 
 Implement:
 - explicit `ExpiredObjectDeleteMarker`
 - automatic delete-marker cleanup implied by `Expiration.Days`
 - abort incomplete multipart uploads
 - multipart abort response headers
+
+Completed in the current implementation:
+- background sweeper cleanup for current delete-marker-only keys
+- explicit `ExpiredObjectDeleteMarker` handling
+- day/date-based expired delete-marker cleanup for the current sole delete marker
+- lifecycle-driven abort of incomplete multipart uploads via the shared abort
+  cleanup path
+- deterministic coordinator tests covering explicit EODM, day-based
+  delete-marker cleanup timing, and lifecycle multipart abort execution
 
 ### Phase 5: External compatibility pass
 

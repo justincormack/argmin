@@ -22,8 +22,8 @@ use storage::{
     BucketEncryptionConfig, BucketFastPathInfo, BucketInfo, BucketLifecycleConfiguration,
     BucketName, BucketObjectLockConfig, BucketState, CommitMultipartReq, CommitStreamPutReq,
     CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, GenerationId, LifecycleDate,
-    LifecycleExpiration, LifecycleRuleStatus, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListObjectsReq, ListPartsReq, LiveObjectRecord, MultipartPartRecord,
+    LifecycleExpiration, LifecycleRule, LifecycleRuleStatus, ListMultipartUploadsReq,
+    ListObjectVersionsReq, ListObjectsReq, ListPartsReq, LiveObjectRecord, MultipartPartRecord,
     MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
     MultipartReclaimRecord, MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout,
     ObjectLockState, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
@@ -170,6 +170,12 @@ pub struct LifecycleAbortHeaders {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NoncurrentLifecycleExpiration {
+    version_id: VersionId,
+    expiry_time_millis: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeleteMarkerLifecycleExpiration {
     version_id: VersionId,
     expiry_time_millis: u64,
 }
@@ -2328,6 +2334,8 @@ struct LifecycleSweepStats {
     scanned_buckets: u64,
     expired_current_objects: u64,
     expired_noncurrent_versions: u64,
+    expired_delete_markers: u64,
+    aborted_multipart_uploads: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2475,17 +2483,33 @@ impl ReadRuntime {
             scanned_buckets: 0,
             expired_current_objects: 0,
             expired_noncurrent_versions: 0,
+            expired_delete_markers: 0,
+            aborted_multipart_uploads: 0,
         };
+        let mut processed_buckets = HashSet::new();
 
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let buckets = pg.list_buckets_with_lifecycle()?;
+            let aborting_buckets = pg.list_buckets_with_aborting_multipart_uploads()?;
             drop(pg);
 
             for bucket in buckets {
-                stats.scanned_buckets += 1;
+                if processed_buckets.insert(bucket.name.to_string()) {
+                    stats.scanned_buckets += 1;
+                }
                 self.expire_due_current_objects_for_bucket(&bucket, now_millis, &mut stats)?;
                 self.expire_due_noncurrent_versions_for_bucket(&bucket, now_millis, &mut stats)?;
+                self.expire_due_delete_markers_for_bucket(&bucket, now_millis, &mut stats)?;
+                self.abort_due_multipart_uploads_for_bucket(&bucket, now_millis, &mut stats)?;
+            }
+
+            for bucket in aborting_buckets {
+                if processed_buckets.insert(bucket.to_string()) {
+                    stats.scanned_buckets += 1;
+                }
+                stats.aborted_multipart_uploads +=
+                    self.finish_aborting_multipart_uploads_for_bucket(bucket.as_str())?;
             }
 
             Ok::<(), ServerError>(())
@@ -2561,6 +2585,40 @@ impl ReadRuntime {
         }
 
         Ok(())
+    }
+
+    fn finish_aborting_multipart_uploads_for_bucket(
+        &self,
+        bucket: &str,
+    ) -> Result<u64, ServerError> {
+        let mut candidates = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self.storage_node.get_pg(pg_id)?;
+            let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
+                bucket: BucketName::from(bucket),
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: u32::MAX,
+            })?;
+            drop(pg);
+
+            for upload in uploads.uploads {
+                if upload.state == UploadState::Aborting {
+                    candidates.push((upload.key.to_string(), upload.upload_id.to_string()));
+                }
+            }
+
+            Ok::<(), ServerError>(())
+        })?;
+
+        let mut finished = 0u64;
+        for (key, upload_id) in candidates {
+            if self.abort_multipart_upload_internal(bucket, &key, &upload_id)? {
+                finished += 1;
+            }
+        }
+        Ok(finished)
     }
 
     fn expire_due_noncurrent_versions_for_bucket(
@@ -2800,6 +2858,357 @@ impl ReadRuntime {
         }
 
         Ok(deleted)
+    }
+
+    fn expire_due_delete_markers_for_bucket(
+        &self,
+        bucket_info: &BucketInfo,
+        now_millis: u64,
+        stats: &mut LifecycleSweepStats,
+    ) -> Result<(), ServerError> {
+        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+            return Ok(());
+        };
+        let config =
+            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
+                ServerError::InternalError {
+                    reason: format!(
+                    "stored lifecycle configuration for {} failed to parse at sweep time: {error}",
+                    bucket_info.name
+                ),
+                }
+            })?;
+
+        let mut candidates = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self.storage_node.get_pg(pg_id)?;
+            let versions = pg.list_object_versions(&ListObjectVersionsReq {
+                bucket: bucket_info.name.clone(),
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: u32::MAX,
+            })?;
+            drop(pg);
+
+            let mut group_start = 0usize;
+            while group_start < versions.versions.len() {
+                let key = versions.versions[group_start].key().to_string();
+                let mut group_end = group_start + 1;
+                while group_end < versions.versions.len()
+                    && versions.versions[group_end].key().as_str() == key
+                {
+                    group_end += 1;
+                }
+
+                if let Some(expiration) = Coordinator::evaluate_due_expired_delete_marker(
+                    &config,
+                    &versions.versions[group_start..group_end],
+                    now_millis,
+                ) {
+                    candidates.push((key, expiration.version_id));
+                }
+                group_start = group_end;
+            }
+
+            Ok::<(), ServerError>(())
+        })?;
+
+        for (key, version_id) in candidates {
+            if self.expire_delete_marker_if_due(
+                bucket_info.name.as_str(),
+                &key,
+                version_id,
+                now_millis,
+            )? {
+                stats.expired_delete_markers += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn expire_delete_marker_if_due(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_version_id: VersionId,
+        now_millis: u64,
+    ) -> Result<bool, ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
+        let bucket_pg = self
+            .storage_node
+            .get_pg(self.pg_topology.bucket_pg(bucket))?;
+        let bucket_info = match bucket_pg.head_bucket(bucket) {
+            Ok(info) => info,
+            Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
+            Err(error) => return Err(ServerError::Metadata(error)),
+        };
+        drop(bucket_pg);
+
+        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+            return Ok(false);
+        };
+        let config =
+            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
+                ServerError::InternalError {
+                    reason: format!(
+                    "stored lifecycle configuration for {} failed to parse at expiry time: {error}",
+                    bucket
+                ),
+                }
+            })?;
+
+        let meta_pg = self
+            .storage_node
+            .get_pg(self.pg_topology.object_pg(bucket, key))?;
+        let versions = match meta_pg.list_object_versions_for_key(bucket, key) {
+            Ok(versions) => versions,
+            Err(storage::MetadataError::ObjectNotFound) => return Ok(false),
+            Err(error) => return Err(ServerError::Metadata(error)),
+        };
+        let Some(expiration) =
+            Coordinator::evaluate_due_expired_delete_marker(&config, &versions, now_millis)
+        else {
+            return Ok(false);
+        };
+        if expiration.version_id != expected_version_id {
+            return Ok(false);
+        }
+
+        meta_pg.delete_object_version(bucket, key, expected_version_id)?;
+        Ok(true)
+    }
+
+    fn abort_due_multipart_uploads_for_bucket(
+        &self,
+        bucket_info: &BucketInfo,
+        now_millis: u64,
+        stats: &mut LifecycleSweepStats,
+    ) -> Result<(), ServerError> {
+        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+            return Ok(());
+        };
+        let config =
+            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
+                ServerError::InternalError {
+                    reason: format!(
+                    "stored lifecycle configuration for {} failed to parse at sweep time: {error}",
+                    bucket_info.name
+                ),
+                }
+            })?;
+
+        let mut candidates = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self.storage_node.get_pg(pg_id)?;
+            let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
+                bucket: bucket_info.name.clone(),
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: u32::MAX,
+            })?;
+            drop(pg);
+
+            for upload in uploads.uploads {
+                if upload.state != UploadState::InProgress && upload.state != UploadState::Aborting
+                {
+                    continue;
+                }
+                let Some(headers) = Coordinator::evaluate_multipart_lifecycle_abort_headers(
+                    &config,
+                    upload.key.as_str(),
+                    upload.initiated_at,
+                ) else {
+                    continue;
+                };
+                if headers.abort_time_millis <= now_millis {
+                    candidates.push((upload.key.to_string(), upload.upload_id.to_string()));
+                }
+            }
+
+            Ok::<(), ServerError>(())
+        })?;
+
+        for (key, upload_id) in candidates {
+            if self.abort_multipart_upload_if_due(
+                bucket_info.name.as_str(),
+                &key,
+                &upload_id,
+                now_millis,
+            )? {
+                stats.aborted_multipart_uploads += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn abort_multipart_upload_if_due(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        now_millis: u64,
+    ) -> Result<bool, ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
+        let bucket_pg = self
+            .storage_node
+            .get_pg(self.pg_topology.bucket_pg(bucket))?;
+        let bucket_info = match bucket_pg.head_bucket(bucket) {
+            Ok(info) => info,
+            Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
+            Err(error) => return Err(ServerError::Metadata(error)),
+        };
+        drop(bucket_pg);
+
+        let meta_pg_id = self.pg_topology.object_pg(bucket, key);
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+        let upload = match meta_pg.get_multipart_upload(upload_id) {
+            Ok(upload) => upload,
+            Err(storage::MetadataError::NoSuchUpload { .. }) => return Ok(false),
+            Err(error) => return Err(ServerError::Metadata(error)),
+        };
+        if upload.bucket != bucket || upload.key != key {
+            return Ok(false);
+        }
+
+        if upload.state == UploadState::Aborting {
+            drop(meta_pg);
+            return self.abort_multipart_upload_internal(bucket, key, upload_id);
+        }
+        if upload.state != UploadState::InProgress {
+            return Ok(false);
+        }
+
+        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+            return Ok(false);
+        };
+        let config =
+            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
+                ServerError::InternalError {
+                    reason: format!(
+                    "stored lifecycle configuration for {} failed to parse at abort time: {error}",
+                    bucket
+                ),
+                }
+            })?;
+
+        let Some(headers) = Coordinator::evaluate_multipart_lifecycle_abort_headers(
+            &config,
+            key,
+            upload.initiated_at,
+        ) else {
+            return Ok(false);
+        };
+        if headers.abort_time_millis > now_millis {
+            return Ok(false);
+        }
+
+        drop(meta_pg);
+        self.abort_multipart_upload_internal(bucket, key, upload_id)
+    }
+
+    fn abort_multipart_upload_internal(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<bool, ServerError> {
+        let meta_pg_id = self.pg_topology.object_pg(bucket, key);
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+
+        let upload = match meta_pg.get_multipart_upload(upload_id) {
+            Ok(upload) => upload,
+            Err(storage::MetadataError::NoSuchUpload { .. }) => return Ok(false),
+            Err(error) => return Err(ServerError::Metadata(error)),
+        };
+        if upload.bucket != bucket || upload.key != key {
+            return Ok(false);
+        }
+
+        match meta_pg.set_upload_state(upload_id, UploadState::Aborting) {
+            Ok(()) => {}
+            Err(storage::MetadataError::UploadNotInProgress { state })
+                if state == UploadState::Aborting as u8 => {}
+            Err(storage::MetadataError::UploadNotInProgress { .. }) => return Ok(false),
+            Err(error) => return Err(ServerError::Metadata(error)),
+        }
+
+        let all_parts = meta_pg.list_multipart_parts(&ListPartsReq {
+            upload_id: UploadId::from(upload_id),
+            part_number_marker: None,
+            max_parts: u32::MAX,
+        })?;
+        let streaming_segments = meta_pg.get_all_multipart_part_segments_for_upload(upload_id)?;
+
+        drop(meta_pg);
+
+        for part in &all_parts.parts {
+            if part.part_okh == [0u8; 16] {
+                continue;
+            }
+            let shard_pg_id = self.pg_topology.shard_pg(
+                &format!("mpu/{upload_id}"),
+                &format!("{}/{}", part.part_number, part.generation),
+                part.part_vid.get(),
+            );
+            if let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) {
+                let total = part.ec_k as usize + part.ec_m as usize;
+                for i in 0..total {
+                    let shard_key = ShardKey::new(&part.part_okh, part.part_vid.get(), i as u8);
+                    let _ = shard_pg.delete_shard(&shard_key);
+                }
+            }
+        }
+
+        if !streaming_segments.is_empty() {
+            self.delete_segment_shards_generic(&streaming_segments)?;
+        }
+
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+        if !streaming_segments.is_empty() {
+            meta_pg.delete_multipart_part_segments_by_upload_id(upload_id)?;
+        }
+        match meta_pg.delete_multipart_upload(upload_id) {
+            Ok(()) => Ok(true),
+            Err(storage::MetadataError::NoSuchUpload { .. }) => Ok(false),
+            Err(error) => Err(ServerError::Metadata(error)),
+        }
+    }
+
+    fn delete_segment_shards_generic(
+        &self,
+        segments: &[MultipartPartSegmentRecord],
+    ) -> Result<(), ServerError> {
+        for segment in segments {
+            self.delete_segment_shard_set(
+                segment.shard_pg_id,
+                &segment.segment_okh,
+                segment.segment_vid,
+                segment.ec_k,
+                segment.ec_m,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn delete_segment_shard_set(
+        &self,
+        shard_pg_id: u32,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        ec_k: u8,
+        ec_m: u8,
+    ) -> Result<(), ServerError> {
+        let pg = self.storage_node.get_pg(shard_pg_id)?;
+        let total = ec_k as usize + ec_m as usize;
+        for i in 0..total {
+            let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
+            pg.delete_shard(&shard_key)?;
+        }
+        Ok(())
     }
 
     fn acquire_object_payload_lease(
@@ -4076,6 +4485,58 @@ impl Coordinator {
         Ok(due)
     }
 
+    fn evaluate_due_expired_delete_marker(
+        config: &BucketLifecycleConfiguration,
+        versions: &[StoredObject],
+        now_millis: u64,
+    ) -> Option<DeleteMarkerLifecycleExpiration> {
+        let StoredObject::DeleteMarker(marker) = versions.first()? else {
+            return None;
+        };
+        if versions.len() != 1 {
+            return None;
+        }
+
+        let mut best = None;
+        for rule in &config.rules {
+            if rule.status != LifecycleRuleStatus::Enabled
+                || !Self::lifecycle_rule_matches_delete_marker(rule, marker.key.as_str())
+            {
+                continue;
+            }
+
+            let Some(expiration) = &rule.expiration else {
+                continue;
+            };
+            let expiry_time_millis = match expiration {
+                LifecycleExpiration::Days(days) => {
+                    Self::lifecycle_day_based_deadline(marker.last_modified, days.get())?
+                }
+                LifecycleExpiration::Date(date) => Self::lifecycle_date_deadline(*date)?,
+                LifecycleExpiration::ExpiredObjectDeleteMarker => 0,
+            };
+
+            if expiry_time_millis > now_millis {
+                continue;
+            }
+
+            let candidate = DeleteMarkerLifecycleExpiration {
+                version_id: marker.version_id,
+                expiry_time_millis,
+            };
+            if best
+                .as_ref()
+                .is_none_or(|current: &DeleteMarkerLifecycleExpiration| {
+                    candidate.expiry_time_millis < current.expiry_time_millis
+                })
+            {
+                best = Some(candidate);
+            }
+        }
+
+        best
+    }
+
     fn evaluate_multipart_lifecycle_abort_headers(
         config: &BucketLifecycleConfiguration,
         key: &str,
@@ -4108,6 +4569,16 @@ impl Coordinator {
         }
 
         best
+    }
+
+    fn lifecycle_rule_matches_delete_marker(rule: &LifecycleRule, key: &str) -> bool {
+        !rule.filter.has_tag_filter()
+            && !rule.filter.has_size_filter()
+            && rule
+                .filter
+                .prefix
+                .as_ref()
+                .is_none_or(|prefix| key.starts_with(prefix))
     }
 
     fn lifecycle_day_based_deadline(start_millis: u64, days: u32) -> Option<u64> {
@@ -12253,8 +12724,7 @@ impl Coordinator {
         let upload_id = req.upload_id;
         let bucket_info = self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
         // 1. Lock meta PG and validate upload.
-        let meta_pg_id = self.object_pg_id(bucket, key);
-        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+        let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
 
         let upload = meta_pg.get_multipart_upload(upload_id)?;
         if upload.bucket != bucket || upload.key != key {
@@ -12270,80 +12740,17 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
 
-        // 2. Transition to Aborting. Allow already-Aborting for idempotence.
-        //    Completing → treat as NoSuchUpload (upload is being finalized).
-        match meta_pg.set_upload_state(upload_id, UploadState::Aborting) {
-            Ok(()) => {}
-            Err(storage::MetadataError::UploadNotInProgress { state })
-                if state == UploadState::Aborting as u8 =>
-            {
-                // Already aborting — continue cleanup idempotently.
-            }
-            Err(storage::MetadataError::UploadNotInProgress { .. }) => {
-                return Err(ServerError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                });
-            }
-            Err(e) => return Err(e.into()),
-        }
-
-        // 3. Collect all parts for shard cleanup.
-        let all_parts = meta_pg
-            .list_multipart_parts(&ListPartsReq {
-                upload_id: UploadId::from(upload_id),
-                part_number_marker: None,
-                max_parts: u32::MAX,
-            })
-            .map_err(ServerError::Metadata)?;
-
-        // 3b. Collect streaming object segments for shard cleanup.
-        let streaming_segments = meta_pg
-            .get_all_multipart_part_segments_for_upload(upload_id)
-            .map_err(ServerError::Metadata)?;
-
-        // 4. Drop meta PG lock before shard cleanup to avoid deadlocks.
         drop(meta_pg);
-
-        // 5. Best-effort delete all shard sets for each non-streaming part.
-        for part in &all_parts.parts {
-            if part.part_okh == [0u8; 16] {
-                continue; // streaming part — handled below
-            }
-            let shard_pg_id = self.shard_pg_id_raw(
-                &format!("mpu/{upload_id}"),
-                &format!("{}/{}", part.part_number, part.generation),
-                part.part_vid.get(),
-            );
-            if let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) {
-                let k = part.ec_k as usize;
-                let m = part.ec_m as usize;
-                for i in 0..(k + m) {
-                    let shard_key = ShardKey::new(&part.part_okh, part.part_vid.get(), i as u8);
-                    let _ = shard_pg.delete_shard(&shard_key);
-                }
-            }
+        if self
+            .read_runtime()
+            .abort_multipart_upload_internal(bucket, key, upload_id)?
+        {
+            Ok(())
+        } else {
+            Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            })
         }
-
-        // 5b. Delete shard data for streaming part segments first, then
-        //     delete the manifest rows. This order ensures that if shard
-        //     deletion fails, the segment refs survive for retry.
-        if !streaming_segments.is_empty() {
-            self.delete_segment_shards_generic(&streaming_segments)?;
-        }
-
-        // 6. Re-acquire meta PG and delete upload + parts (CASCADE)
-        //    and object segments rows.
-        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-        if !streaming_segments.is_empty() {
-            meta_pg
-                .delete_multipart_part_segments_by_upload_id(upload_id)
-                .map_err(ServerError::Metadata)?;
-        }
-        meta_pg
-            .delete_multipart_upload(upload_id)
-            .map_err(ServerError::Metadata)?;
-
-        Ok(())
     }
 
     /// List parts of an in-progress multipart upload.
@@ -14744,6 +15151,441 @@ mod tests {
         assert!(matches!(
             meta_pg.get_object_version("bucket", "key", v1.version_id),
             Ok(StoredObject::Live(_))
+        ));
+    }
+
+    #[test]
+    fn lifecycle_sweep_expires_explicit_expired_object_delete_marker() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration><Rule><ID>expire-marker</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"v1",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        let delete = coord
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                false,
+                NO_DELETE,
+            ))
+            .unwrap();
+        assert!(delete.delete_marker);
+
+        let deadline = {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "key"))
+                .unwrap();
+            let stored = meta_pg
+                .get_object_version("bucket", "key", put.version_id)
+                .unwrap();
+            let live = stored.as_live().unwrap();
+            Coordinator::lifecycle_day_based_deadline(live.became_noncurrent_at.unwrap(), 1)
+                .unwrap()
+        };
+
+        let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
+        assert_eq!(stats.expired_current_objects, 0);
+        assert_eq!(stats.expired_noncurrent_versions, 1);
+        assert_eq!(stats.expired_delete_markers, 1);
+        assert_eq!(stats.aborted_multipart_uploads, 0);
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        assert!(matches!(
+            meta_pg.get_object_meta("bucket", "key"),
+            Err(storage::MetadataError::ObjectNotFound)
+        ));
+        drop(meta_pg);
+        let versions = coord
+            .list_object_versions(&ListObjectVersionsRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 100,
+            })
+            .unwrap();
+        assert!(versions.versions.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_sweep_expires_delete_marker_after_expiration_days_deadline() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration><Rule><ID>expire-marker-by-days</ID><Filter><Prefix/></Filter><Status>Enabled</Status><Expiration><Days>2</Days></Expiration><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"v1",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        let delete = coord
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                false,
+                NO_DELETE,
+            ))
+            .unwrap();
+        assert!(delete.delete_marker);
+
+        let (noncurrent_deadline, marker_deadline) = {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "key"))
+                .unwrap();
+            let noncurrent = meta_pg
+                .get_object_version("bucket", "key", put.version_id)
+                .unwrap();
+            let marker = meta_pg
+                .get_object_version("bucket", "key", delete.version_id)
+                .unwrap();
+            (
+                Coordinator::lifecycle_day_based_deadline(
+                    noncurrent.as_live().unwrap().became_noncurrent_at.unwrap(),
+                    1,
+                )
+                .unwrap(),
+                Coordinator::lifecycle_day_based_deadline(marker.last_modified(), 2).unwrap(),
+            )
+        };
+
+        let first_stats = coord.run_lifecycle_sweep_at(noncurrent_deadline).unwrap();
+        assert_eq!(first_stats.expired_noncurrent_versions, 1);
+        assert_eq!(first_stats.expired_delete_markers, 0);
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        let current = meta_pg.get_object_meta("bucket", "key").unwrap();
+        assert!(matches!(current, StoredObject::DeleteMarker(_)));
+        drop(meta_pg);
+
+        let second_stats = coord.run_lifecycle_sweep_at(marker_deadline).unwrap();
+        assert_eq!(second_stats.expired_noncurrent_versions, 0);
+        assert_eq!(second_stats.expired_delete_markers, 1);
+        assert_eq!(second_stats.aborted_multipart_uploads, 0);
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        assert!(matches!(
+            meta_pg.get_object_meta("bucket", "key"),
+            Err(storage::MetadataError::ObjectNotFound)
+        ));
+    }
+
+    #[test]
+    fn lifecycle_sweep_aborts_due_incomplete_multipart_upload() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration><Rule><ID>abort-mpu</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let matching = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "logs/app",
+                    test_requester(),
+                    None,
+                ),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                sse_customer: None,
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+        let retained = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "tmp/keep",
+                    test_requester(),
+                    None,
+                ),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                sse_customer: None,
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "logs/app",
+                    &matching.upload_id,
+                    test_requester(),
+                    None,
+                ),
+                part_number: 1,
+                data: b"hello multipart",
+                claimed_checksum: None,
+                sse_customer: None,
+            },
+        )
+        .unwrap();
+
+        let deadline = {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "logs/app"))
+                .unwrap();
+            let upload = meta_pg.get_multipart_upload(&matching.upload_id).unwrap();
+            Coordinator::lifecycle_day_based_deadline(upload.initiated_at, 1).unwrap()
+        };
+
+        let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
+        assert_eq!(stats.expired_current_objects, 0);
+        assert_eq!(stats.expired_noncurrent_versions, 0);
+        assert_eq!(stats.expired_delete_markers, 0);
+        assert_eq!(stats.aborted_multipart_uploads, 1);
+
+        let matching_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "logs/app"))
+            .unwrap();
+        assert!(matches!(
+            matching_pg.get_multipart_upload(&matching.upload_id),
+            Err(storage::MetadataError::NoSuchUpload { .. })
+        ));
+        assert!(matching_pg
+            .get_all_multipart_part_segments_for_upload(&matching.upload_id)
+            .unwrap()
+            .is_empty());
+
+        let retained_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "tmp/keep"))
+            .unwrap();
+        assert!(retained_pg
+            .get_multipart_upload(&retained.upload_id)
+            .is_ok());
+    }
+
+    #[test]
+    fn lifecycle_abort_rechecks_current_bucket_lifecycle_before_aborting_upload() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration><Rule><ID>abort-mpu</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "logs/app",
+                    test_requester(),
+                    None,
+                ),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                sse_customer: None,
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let deadline = {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "logs/app"))
+                .unwrap();
+            let upload = meta_pg.get_multipart_upload(&upload.upload_id).unwrap();
+            Coordinator::lifecycle_day_based_deadline(upload.initiated_at, 1).unwrap()
+        };
+
+        delete_bucket_lifecycle_test(&coord, "bucket", test_requester(), None).unwrap();
+
+        assert!(!coord
+            .read_runtime()
+            .abort_multipart_upload_if_due("bucket", "logs/app", &upload.upload_id, deadline)
+            .unwrap());
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "logs/app"))
+            .unwrap();
+        assert!(meta_pg.get_multipart_upload(&upload.upload_id).is_ok());
+    }
+
+    #[test]
+    fn lifecycle_sweep_finishes_aborting_multipart_upload_without_current_lifecycle_config() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration><Rule><ID>abort-mpu</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation></AbortIncompleteMultipartUpload></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "logs/app",
+                    test_requester(),
+                    None,
+                ),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                sse_customer: None,
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "logs/app",
+                    &upload.upload_id,
+                    test_requester(),
+                    None,
+                ),
+                part_number: 1,
+                data: b"hello multipart",
+                claimed_checksum: None,
+                sse_customer: None,
+            },
+        )
+        .unwrap();
+
+        {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "logs/app"))
+                .unwrap();
+            meta_pg
+                .set_upload_state(&upload.upload_id, UploadState::Aborting)
+                .unwrap();
+        }
+        delete_bucket_lifecycle_test(&coord, "bucket", test_requester(), None).unwrap();
+
+        let stats = coord.run_lifecycle_sweep_at(0).unwrap();
+        assert_eq!(stats.aborted_multipart_uploads, 1);
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "logs/app"))
+            .unwrap();
+        assert!(matches!(
+            meta_pg.get_multipart_upload(&upload.upload_id),
+            Err(storage::MetadataError::NoSuchUpload { .. })
         ));
     }
 

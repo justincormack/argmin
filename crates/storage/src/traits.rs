@@ -64,6 +64,12 @@ pub trait PgMetadataStore {
     /// List all active buckets in this PG with lifecycle configuration set.
     fn list_buckets_with_lifecycle(&self) -> Result<Vec<BucketInfo>, MetadataError>;
 
+    /// List bucket names in this PG that currently have at least one multipart
+    /// upload in `Aborting` state.
+    fn list_buckets_with_aborting_multipart_uploads(
+        &self,
+    ) -> Result<Vec<BucketName>, MetadataError>;
+
     /// Mark a bucket as deleting so it is hidden from normal operations while
     /// background cleanup drains outstanding reclaim work.
     fn mark_bucket_deleting(&self, name: &str) -> Result<(), MetadataError>;

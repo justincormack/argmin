@@ -1743,6 +1743,42 @@ impl PgMetadataStore for PgStore {
         Ok(buckets)
     }
 
+    fn list_buckets_with_aborting_multipart_uploads(
+        &self,
+    ) -> Result<Vec<BucketName>, MetadataError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "PgStore::list_buckets_with_aborting_multipart_uploads",
+            "pg_id={}",
+            self.pg_id
+        );
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT DISTINCT bucket FROM multipart_uploads \
+                 WHERE state = ?1 ORDER BY bucket ASC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "prepare list buckets with aborting multipart uploads",
+                source: e,
+            })?;
+        let rows = stmt
+            .query_map(params![UploadState::Aborting as u8], |row| row.get(0))
+            .map_err(|e| MetadataError::Db {
+                context: "list buckets with aborting multipart uploads query",
+                source: e,
+            })?;
+
+        let mut buckets = Vec::new();
+        for row in rows {
+            buckets.push(row.map_err(|e| MetadataError::Db {
+                context: "list buckets with aborting multipart uploads row",
+                source: e,
+            })?);
+        }
+        Ok(buckets)
+    }
+
     fn mark_bucket_deleting(&self, name: &str) -> Result<(), MetadataError> {
         let updated = self
             .conn
