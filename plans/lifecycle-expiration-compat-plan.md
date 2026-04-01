@@ -340,7 +340,8 @@ part of the initial design.
 Current status:
 - Phase 1 is complete.
 - Phase 2 is complete.
-- Phases 3 through 5 remain pending.
+- Phase 3 is complete.
+- Phases 4 and 5 remain pending.
 
 ### Phase 1: Lifecycle config CRUD and rule model (Completed)
 
@@ -385,7 +386,7 @@ Completed in the current implementation:
 - current-version expiration for versioning-enabled buckets via delete marker
 - current-version expiration for versioning-suspended buckets via null delete marker
 
-### Phase 3: Noncurrent version expiration
+### Phase 3: Noncurrent version expiration (Completed)
 
 Implement:
 - `became_noncurrent_at`
@@ -395,6 +396,16 @@ Implement:
 
 This is the point where lifecycle becomes truly AWS-correct for versioned
 buckets.
+
+Completed in the current implementation:
+- nullable `became_noncurrent_at` tracking on live object versions
+- transactional noncurrent-transition updates when a new live version or delete
+  marker supersedes the current live version
+- exact per-key noncurrent lifecycle evaluation in the background sweeper
+- `NewerNoncurrentVersions` retention during noncurrent deletion
+- Object Lock skip behavior for permanently deleting noncurrent versions
+- deterministic tests covering versioned, suspended, retention-count, and
+  Object Lock noncurrent expiration behavior
 
 ### Phase 4: Expired delete markers and incomplete multipart uploads
 

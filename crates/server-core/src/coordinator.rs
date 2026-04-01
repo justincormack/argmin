@@ -1,5 +1,5 @@
 /// Coordinator: orchestrates S3 operations across EC, storage, and metadata layers.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(test)]
 use std::sync::OnceLock;
@@ -166,6 +166,12 @@ pub struct LifecycleExpirationHeader {
 pub struct LifecycleAbortHeaders {
     pub abort_time_millis: u64,
     pub rule_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NoncurrentLifecycleExpiration {
+    version_id: VersionId,
+    expiry_time_millis: u64,
 }
 
 /// Core-owned bucket summary exposed above the storage layer.
@@ -2321,6 +2327,7 @@ struct CachedBucketLifecycle {
 struct LifecycleSweepStats {
     scanned_buckets: u64,
     expired_current_objects: u64,
+    expired_noncurrent_versions: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2467,6 +2474,7 @@ impl ReadRuntime {
         let mut stats = LifecycleSweepStats {
             scanned_buckets: 0,
             expired_current_objects: 0,
+            expired_noncurrent_versions: 0,
         };
 
         self.pg_topology.for_each_pg(|pg_id| {
@@ -2477,6 +2485,7 @@ impl ReadRuntime {
             for bucket in buckets {
                 stats.scanned_buckets += 1;
                 self.expire_due_current_objects_for_bucket(&bucket, now_millis, &mut stats)?;
+                self.expire_due_noncurrent_versions_for_bucket(&bucket, now_millis, &mut stats)?;
             }
 
             Ok::<(), ServerError>(())
@@ -2549,6 +2558,73 @@ impl ReadRuntime {
             )? {
                 stats.expired_current_objects += 1;
             }
+        }
+
+        Ok(())
+    }
+
+    fn expire_due_noncurrent_versions_for_bucket(
+        &self,
+        bucket_info: &BucketInfo,
+        now_millis: u64,
+        stats: &mut LifecycleSweepStats,
+    ) -> Result<(), ServerError> {
+        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+            return Ok(());
+        };
+        let config =
+            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
+                ServerError::InternalError {
+                    reason: format!(
+                    "stored lifecycle configuration for {} failed to parse at sweep time: {error}",
+                    bucket_info.name
+                ),
+                }
+            })?;
+
+        let mut candidate_keys = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self.storage_node.get_pg(pg_id)?;
+            let versions = pg.list_object_versions(&ListObjectVersionsReq {
+                bucket: bucket_info.name.clone(),
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: u32::MAX,
+            })?;
+            drop(pg);
+
+            let mut group_start = 0usize;
+            while group_start < versions.versions.len() {
+                let key = versions.versions[group_start].key().to_string();
+                let mut group_end = group_start + 1;
+                while group_end < versions.versions.len()
+                    && versions.versions[group_end].key().as_str() == key
+                {
+                    group_end += 1;
+                }
+
+                if !Coordinator::evaluate_due_noncurrent_version_expirations(
+                    &config,
+                    &versions.versions[group_start..group_end],
+                    now_millis,
+                )?
+                .is_empty()
+                {
+                    candidate_keys.push(key);
+                }
+                group_start = group_end;
+            }
+
+            Ok::<(), ServerError>(())
+        })?;
+
+        for key in candidate_keys {
+            stats.expired_noncurrent_versions += self.expire_noncurrent_versions_if_due(
+                bucket_info.name.as_str(),
+                &key,
+                now_millis,
+            )?;
         }
 
         Ok(())
@@ -2641,6 +2717,89 @@ impl ReadRuntime {
             self.enqueue_object_payload_reclaim(bucket, key, reclaim.generation_id);
         }
         Ok(true)
+    }
+
+    fn expire_noncurrent_versions_if_due(
+        &self,
+        bucket: &str,
+        key: &str,
+        now_millis: u64,
+    ) -> Result<u64, ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
+        let bucket_pg = self
+            .storage_node
+            .get_pg(self.pg_topology.bucket_pg(bucket))?;
+        let bucket_info = match bucket_pg.head_bucket(bucket) {
+            Ok(info) => info,
+            Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(0),
+            Err(error) => return Err(ServerError::Metadata(error)),
+        };
+        drop(bucket_pg);
+
+        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+            return Ok(0);
+        };
+        let config =
+            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
+                ServerError::InternalError {
+                    reason: format!(
+                    "stored lifecycle configuration for {} failed to parse at expiry time: {error}",
+                    bucket
+                ),
+                }
+            })?;
+
+        let meta_pg = self
+            .storage_node
+            .get_pg(self.pg_topology.object_pg(bucket, key))?;
+        let versions = meta_pg.list_object_versions_for_key(bucket, key)?;
+        let due_versions = Coordinator::evaluate_due_noncurrent_version_expirations(
+            &config, &versions, now_millis,
+        )?;
+        if due_versions.is_empty() {
+            return Ok(0);
+        }
+
+        let current_unix_seconds = Coordinator::current_unix_seconds()?;
+        let mut deleted = 0u64;
+        let mut reclaims = Vec::new();
+        let due_version_ids: HashSet<VersionId> = due_versions
+            .iter()
+            .map(|candidate| candidate.version_id)
+            .collect();
+
+        for stored in versions {
+            let Some(record) = stored.into_live() else {
+                continue;
+            };
+            if !due_version_ids.contains(&record.version_id) {
+                continue;
+            }
+            if Coordinator::validate_delete_against_object_lock(
+                record.object_lock,
+                false,
+                false,
+                current_unix_seconds,
+            )
+            .is_err()
+            {
+                continue;
+            }
+
+            if let Some(reclaim) =
+                Coordinator::permanently_delete_live_object_locked(&meta_pg, bucket, key, &record)?
+            {
+                reclaims.push(reclaim);
+            }
+            deleted += 1;
+        }
+
+        drop(meta_pg);
+        for reclaim in reclaims {
+            self.enqueue_object_payload_reclaim(bucket, key, reclaim.generation_id);
+        }
+
+        Ok(deleted)
     }
 
     fn acquire_object_payload_lease(
@@ -3817,6 +3976,104 @@ impl Coordinator {
         }
 
         best
+    }
+
+    fn evaluate_due_noncurrent_version_expirations(
+        config: &BucketLifecycleConfiguration,
+        versions: &[StoredObject],
+        now_millis: u64,
+    ) -> Result<Vec<NoncurrentLifecycleExpiration>, ServerError> {
+        #[derive(Debug)]
+        struct NoncurrentVersionCandidate {
+            version_id: VersionId,
+            tags: Vec<(String, String)>,
+            size: u64,
+            became_noncurrent_at: u64,
+        }
+
+        if versions.len() <= 1 {
+            return Ok(Vec::new());
+        }
+
+        let key = versions[0].key().as_str();
+        let mut candidates = Vec::new();
+        for stored in versions.iter().skip(1) {
+            let Some(record) = stored.as_live() else {
+                continue;
+            };
+            let Some(became_noncurrent_at) = record.became_noncurrent_at else {
+                continue;
+            };
+            let tags = match record.tags.as_deref() {
+                Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
+                None => Vec::new(),
+            };
+            candidates.push(NoncurrentVersionCandidate {
+                version_id: record.version_id,
+                tags,
+                size: record.size,
+                became_noncurrent_at,
+            });
+        }
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut due_by_version: HashMap<VersionId, u64> = HashMap::new();
+        for rule in &config.rules {
+            if rule.status != LifecycleRuleStatus::Enabled {
+                continue;
+            }
+            let Some(noncurrent) = &rule.noncurrent_version_expiration else {
+                continue;
+            };
+
+            let mut newer_matching_noncurrent_versions = 0u32;
+            for candidate in &candidates {
+                if !rule
+                    .filter
+                    .matches_object(key, &candidate.tags, candidate.size)
+                {
+                    continue;
+                }
+
+                let Some(expiry_time_millis) = Self::lifecycle_day_based_deadline(
+                    candidate.became_noncurrent_at,
+                    noncurrent.noncurrent_days.get(),
+                ) else {
+                    continue;
+                };
+                let retain_newer = noncurrent
+                    .newer_noncurrent_versions
+                    .map_or(0, std::num::NonZeroU32::get);
+
+                if newer_matching_noncurrent_versions >= retain_newer
+                    && expiry_time_millis <= now_millis
+                {
+                    due_by_version
+                        .entry(candidate.version_id)
+                        .and_modify(|current| {
+                            *current = (*current).min(expiry_time_millis);
+                        })
+                        .or_insert(expiry_time_millis);
+                }
+
+                // The retention count applies to newer noncurrent versions that
+                // are in scope for the same rule.
+                newer_matching_noncurrent_versions += 1;
+            }
+        }
+
+        let mut due = Vec::new();
+        for candidate in candidates {
+            if let Some(expiry_time_millis) = due_by_version.remove(&candidate.version_id) {
+                due.push(NoncurrentLifecycleExpiration {
+                    version_id: candidate.version_id,
+                    expiry_time_millis,
+                });
+            }
+        }
+        Ok(due)
     }
 
     fn evaluate_multipart_lifecycle_abort_headers(
@@ -13915,6 +14172,579 @@ mod tests {
         assert!(!versions.versions[1].is_delete_marker);
 
         drop(lease);
+    }
+
+    #[test]
+    fn lifecycle_sweep_expires_noncurrent_versioned_live_object() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let metadata = MetadataBlob::default();
+        let system_metadata = SystemMetadata::default();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration><Rule><ID>expire-noncurrent</ID><Filter><Prefix/></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let older = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"older",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        let current = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"current",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let (became_noncurrent_at, generation_id) = {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "key"))
+                .unwrap();
+            let stored = meta_pg
+                .get_object_version("bucket", "key", older.version_id)
+                .unwrap();
+            let live = stored.as_live().unwrap();
+            (live.became_noncurrent_at.unwrap(), live.generation_id)
+        };
+        let lease =
+            coord
+                .read_runtime()
+                .acquire_object_payload_lease("bucket", "key", generation_id);
+        let deadline = Coordinator::lifecycle_day_based_deadline(became_noncurrent_at, 1).unwrap();
+
+        let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
+        assert_eq!(stats.scanned_buckets, 1);
+        assert_eq!(stats.expired_current_objects, 0);
+        assert_eq!(stats.expired_noncurrent_versions, 1);
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        let latest = meta_pg.get_object_meta("bucket", "key").unwrap();
+        assert_eq!(latest.version_id(), current.version_id);
+        assert!(matches!(
+            meta_pg.get_object_version("bucket", "key", older.version_id),
+            Err(storage::MetadataError::ObjectNotFound)
+        ));
+        assert!(meta_pg
+            .get_object_segments_reclaim("bucket", "key", generation_id)
+            .unwrap()
+            .is_some());
+        drop(meta_pg);
+        drop(lease);
+    }
+
+    #[test]
+    fn lifecycle_sweep_expires_suspended_noncurrent_numbered_version() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let metadata = MetadataBlob::default();
+        let system_metadata = SystemMetadata::default();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+        let numbered = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"older",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Suspended,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration><Rule><ID>expire-noncurrent</ID><Filter><Prefix/></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+        let null_current = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"current",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(null_current.version_id, VersionId::Null);
+
+        let (became_noncurrent_at, generation_id) = {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "key"))
+                .unwrap();
+            let stored = meta_pg
+                .get_object_version("bucket", "key", numbered.version_id)
+                .unwrap();
+            let live = stored.as_live().unwrap();
+            (live.became_noncurrent_at.unwrap(), live.generation_id)
+        };
+        let lease =
+            coord
+                .read_runtime()
+                .acquire_object_payload_lease("bucket", "key", generation_id);
+        let deadline = Coordinator::lifecycle_day_based_deadline(became_noncurrent_at, 1).unwrap();
+
+        let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
+        assert_eq!(stats.scanned_buckets, 1);
+        assert_eq!(stats.expired_current_objects, 0);
+        assert_eq!(stats.expired_noncurrent_versions, 1);
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        let latest = meta_pg.get_object_meta("bucket", "key").unwrap();
+        assert_eq!(latest.version_id(), VersionId::Null);
+        assert!(matches!(
+            meta_pg.get_object_version("bucket", "key", numbered.version_id),
+            Err(storage::MetadataError::ObjectNotFound)
+        ));
+        assert!(meta_pg
+            .get_object_segments_reclaim("bucket", "key", generation_id)
+            .unwrap()
+            .is_some());
+        drop(meta_pg);
+        drop(lease);
+    }
+
+    #[test]
+    fn lifecycle_sweep_noncurrent_expiration_respects_newer_noncurrent_versions() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let metadata = MetadataBlob::default();
+        let system_metadata = SystemMetadata::default();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration><Rule><ID>retain-one-newer</ID><Filter><Prefix/></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays><NewerNoncurrentVersions>1</NewerNoncurrentVersions></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let oldest = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"v1",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        let middle = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"v2",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        let current = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"v3",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let (oldest_became_noncurrent_at, oldest_generation_id, middle_generation_id) = {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "key"))
+                .unwrap();
+            let oldest_record = meta_pg
+                .get_object_version("bucket", "key", oldest.version_id)
+                .unwrap();
+            let middle_record = meta_pg
+                .get_object_version("bucket", "key", middle.version_id)
+                .unwrap();
+            let oldest_live = oldest_record.as_live().unwrap();
+            let middle_live = middle_record.as_live().unwrap();
+            (
+                oldest_live.became_noncurrent_at.unwrap(),
+                oldest_live.generation_id,
+                middle_live.generation_id,
+            )
+        };
+        let lease = coord.read_runtime().acquire_object_payload_lease(
+            "bucket",
+            "key",
+            oldest_generation_id,
+        );
+        let deadline =
+            Coordinator::lifecycle_day_based_deadline(oldest_became_noncurrent_at, 1).unwrap();
+
+        let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
+        assert_eq!(stats.scanned_buckets, 1);
+        assert_eq!(stats.expired_current_objects, 0);
+        assert_eq!(stats.expired_noncurrent_versions, 1);
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        let latest = meta_pg.get_object_meta("bucket", "key").unwrap();
+        assert_eq!(latest.version_id(), current.version_id);
+        assert!(matches!(
+            meta_pg.get_object_version("bucket", "key", oldest.version_id),
+            Err(storage::MetadataError::ObjectNotFound)
+        ));
+        assert!(matches!(
+            meta_pg.get_object_version("bucket", "key", middle.version_id),
+            Ok(StoredObject::Live(_))
+        ));
+        assert!(meta_pg
+            .get_object_segments_reclaim("bucket", "key", oldest_generation_id)
+            .unwrap()
+            .is_some());
+        assert!(meta_pg
+            .get_object_segments_reclaim("bucket", "key", middle_generation_id)
+            .unwrap()
+            .is_none());
+        drop(meta_pg);
+        drop(lease);
+    }
+
+    #[test]
+    fn lifecycle_sweep_skips_object_locked_noncurrent_version() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let requester = test_helpers::requester("owner-a");
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
+            .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration><Rule><ID>expire-noncurrent</ID><Filter><Prefix/></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>",
+            requester.clone(),
+            None,
+        )
+        .unwrap();
+
+        let older = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    requester.clone(),
+                    None,
+                ),
+                data: b"older",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        put_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(older.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
+            },
+            false,
+            requester.clone(),
+        )
+        .unwrap();
+        let current = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    requester.clone(),
+                    None,
+                ),
+                data: b"current",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let became_noncurrent_at = {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "key"))
+                .unwrap();
+            let stored = meta_pg
+                .get_object_version("bucket", "key", older.version_id)
+                .unwrap();
+            stored.as_live().unwrap().became_noncurrent_at.unwrap()
+        };
+        let deadline = Coordinator::lifecycle_day_based_deadline(became_noncurrent_at, 1).unwrap();
+
+        let stats = coord.run_lifecycle_sweep_at(deadline).unwrap();
+        assert_eq!(stats.scanned_buckets, 1);
+        assert_eq!(stats.expired_current_objects, 0);
+        assert_eq!(stats.expired_noncurrent_versions, 0);
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        assert!(matches!(
+            meta_pg.get_object_version("bucket", "key", older.version_id),
+            Ok(StoredObject::Live(_))
+        ));
+        let latest = meta_pg.get_object_meta("bucket", "key").unwrap();
+        assert_eq!(latest.version_id(), current.version_id);
+    }
+
+    #[test]
+    fn deleting_current_version_clears_repromoted_version_noncurrent_timestamp_for_lifecycle() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let metadata = MetadataBlob::default();
+        let system_metadata = SystemMetadata::default();
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration><Rule><ID>expire-noncurrent</ID><Filter><Prefix/></Filter><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule></LifecycleConfiguration>",
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let v1 = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"v1",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        let v2 = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"v2",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "key"))
+                .unwrap();
+            let sql = format!(
+                "UPDATE objects SET became_noncurrent_at = 1 \
+                 WHERE bucket = 'bucket' AND key = 'key' AND version_id = {}",
+                v1.version_id.to_u64()
+            );
+            meta_pg.connection().execute(&sql, []).unwrap();
+        }
+
+        coord
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                Some(v2.version_id),
+                test_requester(),
+                false,
+                NO_DELETE,
+            ))
+            .unwrap();
+
+        {
+            let meta_pg = coord
+                .storage_node
+                .get_pg(coord.object_pg_id("bucket", "key"))
+                .unwrap();
+            let current = meta_pg.get_object_meta("bucket", "key").unwrap();
+            assert_eq!(current.version_id(), v1.version_id);
+            assert_eq!(current.as_live().unwrap().became_noncurrent_at, None);
+        }
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"v3",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let old_deadline = Coordinator::lifecycle_day_based_deadline(1, 1).unwrap();
+        let stats = coord.run_lifecycle_sweep_at(old_deadline).unwrap();
+        assert_eq!(stats.expired_current_objects, 0);
+        assert_eq!(stats.expired_noncurrent_versions, 0);
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        assert!(matches!(
+            meta_pg.get_object_version("bucket", "key", v1.version_id),
+            Ok(StoredObject::Live(_))
+        ));
     }
 
     #[test]

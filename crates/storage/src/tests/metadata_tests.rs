@@ -5219,6 +5219,244 @@ fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
     assert!(!versions.versions[1].is_delete_marker());
 }
 
+#[test]
+fn put_object_meta_marks_displaced_live_version_noncurrent() {
+    let (_dir, store) = make_pg_store();
+    let older = VersionId::Versioned(NonZeroU64::new(1).unwrap());
+    let current = VersionId::Versioned(NonZeroU64::new(2).unwrap());
+
+    for version_id in [older, current] {
+        store
+            .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id,
+                owner: test_owner(),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                generation_id: GenerationId::MIN,
+                ec: EcShape { k: 4, m: 2 },
+                size: 100,
+                etag: ObjectEtag::SinglePart([version_id.to_u64() as u8, 0, 0, 0, 0, 0, 0, 0]),
+                layout: ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: None,
+                system_metadata_blob: None,
+                object_lock: ObjectLockState::default(),
+                encryption: ObjectEncryption::None,
+            }))
+            .unwrap();
+    }
+
+    let current_record = store.get_object_version("b", "k", current).unwrap();
+    let current_live = current_record.as_live().unwrap();
+    let older_record = store.get_object_version("b", "k", older).unwrap();
+    let older_live = older_record.as_live().unwrap();
+
+    assert_eq!(current_live.became_noncurrent_at, None);
+    assert_eq!(
+        older_live.became_noncurrent_at,
+        Some(current_live.last_modified)
+    );
+}
+
+#[test]
+fn put_delete_marker_marks_displaced_live_version_noncurrent() {
+    let (_dir, store) = make_pg_store();
+    let live_version = VersionId::Versioned(NonZeroU64::new(1).unwrap());
+    let delete_marker = VersionId::Versioned(NonZeroU64::new(2).unwrap());
+
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: live_version,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 100,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        }))
+        .unwrap();
+    store
+        .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: delete_marker,
+            owner: test_owner(),
+        }))
+        .unwrap();
+
+    let current = store.get_object_meta("b", "k").unwrap();
+    assert!(current.is_delete_marker());
+
+    let older_record = store.get_object_version("b", "k", live_version).unwrap();
+    let older_live = older_record.as_live().unwrap();
+    assert_eq!(
+        older_live.became_noncurrent_at,
+        Some(current.last_modified())
+    );
+}
+
+#[test]
+fn null_live_write_marks_displaced_numbered_version_noncurrent() {
+    let (_dir, store) = make_pg_store();
+    let numbered = VersionId::Versioned(NonZeroU64::new(1).unwrap());
+
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: numbered,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 100,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        }))
+        .unwrap();
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: VersionId::Null,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 200,
+            etag: ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        }))
+        .unwrap();
+
+    let current = store.get_object_meta("b", "k").unwrap();
+    assert_eq!(current.version_id(), VersionId::Null);
+
+    let older_record = store.get_object_version("b", "k", numbered).unwrap();
+    let older_live = older_record.as_live().unwrap();
+    assert_eq!(
+        older_live.became_noncurrent_at,
+        Some(current.last_modified())
+    );
+}
+
+#[test]
+fn deleting_current_live_version_clears_revealed_live_noncurrent_timestamp() {
+    let (_dir, store) = make_pg_store();
+    let older = VersionId::Versioned(NonZeroU64::new(1).unwrap());
+    let current = VersionId::Versioned(NonZeroU64::new(2).unwrap());
+
+    for version_id in [older, current] {
+        store
+            .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+                bucket: "b".into(),
+                key: "k".into(),
+                version_id,
+                owner: test_owner(),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                generation_id: GenerationId::MIN,
+                ec: EcShape { k: 4, m: 2 },
+                size: 100,
+                etag: ObjectEtag::SinglePart([version_id.to_u64() as u8, 0, 0, 0, 0, 0, 0, 0]),
+                layout: ObjectLayout::Standard,
+                tags: None,
+                metadata_blob: None,
+                system_metadata_blob: None,
+                object_lock: ObjectLockState::default(),
+                encryption: ObjectEncryption::None,
+            }))
+            .unwrap();
+    }
+
+    let older_record = store.get_object_version("b", "k", older).unwrap();
+    assert!(older_record
+        .as_live()
+        .unwrap()
+        .became_noncurrent_at
+        .is_some());
+
+    store.delete_object_version("b", "k", current).unwrap();
+
+    let revealed = store.get_object_meta("b", "k").unwrap();
+    assert_eq!(revealed.version_id(), older);
+    assert_eq!(revealed.as_live().unwrap().became_noncurrent_at, None);
+}
+
+#[test]
+fn deleting_current_delete_marker_clears_revealed_live_noncurrent_timestamp() {
+    let (_dir, store) = make_pg_store();
+    let live_version = VersionId::Versioned(NonZeroU64::new(1).unwrap());
+    let delete_marker = VersionId::Versioned(NonZeroU64::new(2).unwrap());
+
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: live_version,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::MIN,
+            ec: EcShape { k: 4, m: 2 },
+            size: 100,
+            etag: ObjectEtag::SinglePart([1, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        }))
+        .unwrap();
+    store
+        .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
+            bucket: "b".into(),
+            key: "k".into(),
+            version_id: delete_marker,
+            owner: test_owner(),
+        }))
+        .unwrap();
+
+    let live_record = store.get_object_version("b", "k", live_version).unwrap();
+    assert!(live_record
+        .as_live()
+        .unwrap()
+        .became_noncurrent_at
+        .is_some());
+
+    store
+        .delete_object_version("b", "k", delete_marker)
+        .unwrap();
+
+    let revealed = store.get_object_meta("b", "k").unwrap();
+    assert_eq!(revealed.version_id(), live_version);
+    assert_eq!(revealed.as_live().unwrap().became_noncurrent_at, None);
+}
+
 // ── next_version_id ────────────────────────────────────────────────────
 
 #[test]

@@ -943,7 +943,7 @@ impl PgStore {
     /// tags, data_layout, parts_count, metadata_blob, system_metadata_blob,
     /// encryption_type, encryption_state, owner_principal, owner_canonical_id,
     /// acl_grants, public_read, object_lock_retention_mode,
-    /// object_lock_retain_until, object_lock_legal_hold)
+    /// object_lock_retain_until, object_lock_legal_hold, became_noncurrent_at)
     /// to a StoredObject.
     fn parse_canonical_user_id(
         raw: String,
@@ -1094,6 +1094,8 @@ impl PgStore {
             24,
             25,
         )?;
+        let became_noncurrent_at =
+            Self::parse_optional_u64(row.get::<_, Option<i64>>(26)?, 26, "became_noncurrent_at")?;
 
         match status {
             ObjectState::DeleteMarker => {
@@ -1202,6 +1204,7 @@ impl PgStore {
                     size: row.get::<_, i64>(4)? as u64,
                     etag,
                     last_modified,
+                    became_noncurrent_at,
                     storage_class,
                     ec: EcShape {
                         k: row.get::<_, u8>(9)?,
@@ -1509,6 +1512,82 @@ impl PgStore {
                 })
             })
             .transpose()
+    }
+
+    fn current_object_head(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<(VersionId, ObjectState)>, rusqlite::Error> {
+        self.conn
+            .query_row(
+                "SELECT version_id, status FROM objects \
+                 WHERE bucket = ?1 AND key = ?2 \
+                 ORDER BY write_sequence DESC LIMIT 1",
+                params![bucket, key],
+                |row| {
+                    let version_id = Self::parse_version_id(row.get::<_, i64>(0)?, 0)?;
+                    let status =
+                        Self::parse_enum(row.get::<_, u8>(1)?, 1, "status", ObjectState::from_u8)?;
+                    Ok((version_id, status))
+                },
+            )
+            .optional()
+    }
+
+    fn mark_current_live_noncurrent(
+        &self,
+        bucket: &str,
+        key: &str,
+        replacement_version_id: VersionId,
+        transition_time: u64,
+    ) -> Result<(), rusqlite::Error> {
+        let Some((current_version_id, status)) = self.current_object_head(bucket, key)? else {
+            return Ok(());
+        };
+        if status != ObjectState::Live || current_version_id == replacement_version_id {
+            return Ok(());
+        }
+
+        self.conn.execute(
+            "UPDATE objects SET became_noncurrent_at = ?1 \
+             WHERE bucket = ?2 AND key = ?3 AND version_id = ?4 AND status = ?5 \
+               AND became_noncurrent_at IS NULL",
+            params![
+                transition_time as i64,
+                bucket,
+                key,
+                current_version_id.to_u64() as i64,
+                ObjectState::Live as u8,
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn clear_current_live_noncurrent(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let Some((current_version_id, status)) = self.current_object_head(bucket, key)? else {
+            return Ok(());
+        };
+        if status != ObjectState::Live {
+            return Ok(());
+        }
+
+        self.conn.execute(
+            "UPDATE objects SET became_noncurrent_at = NULL \
+             WHERE bucket = ?1 AND key = ?2 AND version_id = ?3 AND status = ?4 \
+               AND became_noncurrent_at IS NOT NULL",
+            params![
+                bucket,
+                key,
+                current_version_id.to_u64() as i64,
+                ObjectState::Live as u8,
+            ],
+        )?;
+        Ok(())
     }
 }
 
@@ -2295,7 +2374,14 @@ impl PgMetadataStore for PgStore {
             self.pg_id
         );
         let now = PgStore::now_millis();
-        match req {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "put object meta (begin txn)",
+                source: e,
+            })?;
+
+        let result: Result<(), MetadataError> = (|| match req {
             PutObjectReq::Live(req) => {
                 let write_sequence =
                     self.next_object_write_sequence(req.bucket.as_str(), req.key.as_str())?;
@@ -2306,6 +2392,16 @@ impl PgMetadataStore for PgStore {
                         rusqlite::types::Type::Null,
                         Box::from(msg),
                     ),
+                })?;
+                self.mark_current_live_noncurrent(
+                    req.bucket.as_str(),
+                    req.key.as_str(),
+                    req.version_id,
+                    now,
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "put object meta (mark noncurrent)",
+                    source: e,
                 })?;
                 let data_layout_u8 = req.layout.data_layout() as u8;
                 let etag_kind_u8 = req.etag.etag_kind() as u8;
@@ -2376,10 +2472,21 @@ impl PgMetadataStore for PgStore {
                         context: "put object meta",
                         source: e,
                     })?;
+                Ok(())
             }
             PutObjectReq::DeleteMarker(req) => {
                 let write_sequence =
                     self.next_object_write_sequence(req.bucket.as_str(), req.key.as_str())?;
+                self.mark_current_live_noncurrent(
+                    req.bucket.as_str(),
+                    req.key.as_str(),
+                    req.version_id,
+                    now,
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "put object meta (mark noncurrent delete marker)",
+                    source: e,
+                })?;
                 let sql = if req.version_id.is_null() {
                     "INSERT OR REPLACE INTO objects \
                      (bucket, key, version_id, write_sequence, generation_id, size, etag, etag_kind, last_modified, \
@@ -2409,9 +2516,26 @@ impl PgMetadataStore for PgStore {
                         context: "put object meta (delete marker)",
                         source: e,
                     })?;
+                Ok(())
+            }
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "put object meta (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
             }
         }
-        Ok(())
     }
 
     fn get_object_meta(&self, bucket: &str, key: &str) -> Result<StoredObject, MetadataError> {
@@ -2428,6 +2552,7 @@ impl PgMetadataStore for PgStore {
                 "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
                  last_modified, storage_class, ec_k, ec_m, status, tags, \
                  data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
+                 , became_noncurrent_at \
                  FROM objects WHERE bucket = ?1 AND key = ?2 \
                  ORDER BY write_sequence DESC LIMIT 1",
                 params![bucket, key],
@@ -2461,6 +2586,7 @@ impl PgMetadataStore for PgStore {
                 "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
                  last_modified, storage_class, ec_k, ec_m, status, tags, \
                  data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
+                 , became_noncurrent_at \
                  FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
                 params![bucket, key, version_id.to_u64() as i64],
                 Self::row_to_object_record,
@@ -2663,15 +2789,57 @@ impl PgMetadataStore for PgStore {
             version_id
         );
         self.conn
-            .execute(
-                "DELETE FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
-                params![bucket, key, version_id.to_u64() as i64],
-            )
+            .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
-                context: "delete object version",
+                context: "delete object version (begin txn)",
                 source: e,
             })?;
-        Ok(())
+
+        let result: Result<(), MetadataError> = (|| {
+            let deleted_was_current = self
+                .current_object_head(bucket, key)
+                .map_err(|e| MetadataError::Db {
+                    context: "delete object version (lookup current)",
+                    source: e,
+                })?
+                .is_some_and(|(current_version_id, _)| current_version_id == version_id);
+
+            self.conn
+                .execute(
+                    "DELETE FROM objects WHERE bucket = ?1 AND key = ?2 AND version_id = ?3",
+                    params![bucket, key, version_id.to_u64() as i64],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "delete object version",
+                    source: e,
+                })?;
+
+            if deleted_was_current {
+                self.clear_current_live_noncurrent(bucket, key)
+                    .map_err(|e| MetadataError::Db {
+                        context: "delete object version (restore current)",
+                        source: e,
+                    })?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    return Err(MetadataError::Db {
+                        context: "delete object version (commit txn)",
+                        source: e,
+                    });
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
     }
 
     fn list_objects(&self, req: &ListObjectsReq) -> Result<ListObjectsResp, MetadataError> {
@@ -2721,7 +2889,8 @@ impl PgMetadataStore for PgStore {
                    o.data_layout, o.parts_count, o.metadata_blob, o.system_metadata_blob, \
                    o.encryption_type, o.encryption_state, o.owner_principal, o.owner_canonical_id, \
                    o.acl_grants, o.public_read, o.object_lock_retention_mode, \
-                   o.object_lock_retain_until, o.object_lock_legal_hold \
+                   o.object_lock_retain_until, o.object_lock_legal_hold, \
+                   o.became_noncurrent_at \
             FROM objects o \
             WHERE {where_str} AND o.status = 0 \
               AND NOT EXISTS ( \
@@ -2838,6 +3007,7 @@ impl PgMetadataStore for PgStore {
             "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
              last_modified, storage_class, ec_k, ec_m, status, tags, \
              data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
+             , became_noncurrent_at \
              FROM objects \
              WHERE {where_str} \
              ORDER BY key ASC, write_sequence DESC LIMIT ?{param_idx}"
@@ -2885,6 +3055,43 @@ impl PgMetadataStore for PgStore {
             next_key_marker,
             next_version_id_marker,
         })
+    }
+
+    fn list_object_versions_for_key(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<StoredObject>, MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT bucket, key, version_id, generation_id, size, etag, etag_kind, \
+                 last_modified, storage_class, ec_k, ec_m, status, tags, \
+                 data_layout, parts_count, metadata_blob, system_metadata_blob, encryption_type, encryption_state, owner_principal, owner_canonical_id, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold, became_noncurrent_at \
+                 FROM objects \
+                 WHERE bucket = ?1 AND key = ?2 \
+                 ORDER BY write_sequence DESC",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "prepare list object versions for key",
+                source: e,
+            })?;
+
+        let rows = stmt
+            .query_map(params![bucket, key], Self::row_to_object_record)
+            .map_err(|e| MetadataError::Db {
+                context: "list object versions for key query",
+                source: e,
+            })?;
+
+        let mut versions = Vec::new();
+        for row in rows {
+            versions.push(row.map_err(|e| MetadataError::Db {
+                context: "list object versions for key row",
+                source: e,
+            })?);
+        }
+        Ok(versions)
     }
 
     fn next_version_id(&self, bucket: &str, key: &str) -> Result<VersionId, MetadataError> {
@@ -4841,6 +5048,12 @@ impl PgMetadataStore for PgStore {
                         std::io::Error::other(other.to_string()),
                     )),
                 })?;
+            self.mark_current_live_noncurrent(
+                obj.bucket.as_str(),
+                obj.key.as_str(),
+                obj.version_id,
+                now,
+            )?;
 
             // 2. Write/overwrite object metadata row.
             let obj_sql = if obj.version_id.is_null() {
@@ -5351,6 +5564,16 @@ impl PgMetadataStore for PgStore {
                 })?;
             let write_sequence =
                 self.next_object_write_sequence(obj.bucket.as_str(), obj.key.as_str())?;
+            self.mark_current_live_noncurrent(
+                obj.bucket.as_str(),
+                obj.key.as_str(),
+                obj.version_id,
+                now,
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "commit stream put (mark noncurrent)",
+                source: e,
+            })?;
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
@@ -5544,6 +5767,16 @@ impl PgMetadataStore for PgStore {
             let encryption_state = obj.encryption.encode_state();
             let write_sequence =
                 self.next_object_write_sequence(obj.bucket.as_str(), obj.key.as_str())?;
+            self.mark_current_live_noncurrent(
+                obj.bucket.as_str(),
+                obj.key.as_str(),
+                obj.version_id,
+                now,
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put segment object (mark noncurrent)",
+                source: e,
+            })?;
 
             let obj_sql = if obj.version_id.is_null() {
                 "INSERT OR REPLACE INTO objects \
@@ -6323,7 +6556,8 @@ mod tests {
                     0 AS public_read, \
                     NULL AS object_lock_retention_mode, \
                     NULL AS object_lock_retain_until, \
-                    0 AS object_lock_legal_hold",
+                    0 AS object_lock_legal_hold, \
+                    NULL AS became_noncurrent_at",
                 params![CanonicalUserId::from_principal("owner").as_str()],
                 PgStore::row_to_object_record,
             )
@@ -6367,7 +6601,8 @@ mod tests {
                     0 AS public_read, \
                     NULL AS object_lock_retention_mode, \
                     NULL AS object_lock_retain_until, \
-                    0 AS object_lock_legal_hold",
+                    0 AS object_lock_legal_hold, \
+                    NULL AS became_noncurrent_at",
                 params![CanonicalUserId::from_principal("owner").as_str()],
                 PgStore::row_to_object_record,
             )

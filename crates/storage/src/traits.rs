@@ -253,6 +253,13 @@ pub trait PgMetadataStore {
         req: &ListObjectVersionsReq,
     ) -> Result<ListObjectVersionsResp, MetadataError>;
 
+    /// List all versions for a single key, newest write first.
+    fn list_object_versions_for_key(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<StoredObject>, MetadataError>;
+
     /// Get the next version_id for a key (MAX(version_id) + 1).
     ///
     /// Returns 1 if no versions exist.

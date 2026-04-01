@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS objects (
         object_lock_retain_until IS NULL OR object_lock_retain_until > 0
     ),
     object_lock_legal_hold INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_legal_hold IN (0, 1, 2)),
+    became_noncurrent_at INTEGER CHECK (
+        became_noncurrent_at IS NULL OR became_noncurrent_at > 0
+    ),
     CHECK (status IN (0, 1)),
     CHECK (etag_kind IN (0, 1)),
     CHECK (data_layout IN (0, 1)),
@@ -60,7 +63,7 @@ CREATE TABLE IF NOT EXISTS objects (
          AND size = 0 AND etag = X'' AND etag_kind = 0 AND storage_class = 0 AND ec_k = 0 AND ec_m = 0
          AND encryption_type = 0 AND encryption_state IS NULL AND public_read = 0
          AND object_lock_retention_mode IS NULL AND object_lock_retain_until IS NULL
-         AND object_lock_legal_hold = 0)
+         AND object_lock_legal_hold = 0 AND became_noncurrent_at IS NULL)
     ),
     PRIMARY KEY (bucket, key, version_id)
 )";
@@ -410,6 +413,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_bucket_policy_columns(conn)?;
     migrate_bucket_lifecycle_columns(conn)?;
     migrate_object_write_sequence_columns(conn)?;
+    migrate_object_became_noncurrent_columns(conn)?;
     migrate_multipart_upload_tag_columns(conn)?;
     create_object_lock_triggers(conn)?;
     Ok(())
@@ -551,6 +555,15 @@ fn migrate_object_write_sequence_columns(conn: &Connection) -> Result<(), rusqli
     }
 
     Ok(())
+}
+
+fn migrate_object_became_noncurrent_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(
+        conn,
+        "objects",
+        "became_noncurrent_at",
+        "ALTER TABLE objects ADD COLUMN became_noncurrent_at INTEGER",
+    )
 }
 
 fn migrate_segment_crc_columns(conn: &Connection) -> Result<(), rusqlite::Error> {

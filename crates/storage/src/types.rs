@@ -907,6 +907,13 @@ impl StoredObject {
         }
     }
 
+    pub fn became_noncurrent_at(&self) -> Option<u64> {
+        match self {
+            Self::Live(r) => r.became_noncurrent_at,
+            Self::DeleteMarker(_) => None,
+        }
+    }
+
     pub fn owner(&self) -> &OwnerIdentity {
         match self {
             Self::Live(r) => &r.owner,
@@ -987,6 +994,8 @@ pub struct LiveObjectRecord {
     pub etag: ObjectEtag,
     /// Last modified timestamp (unix milliseconds).
     pub last_modified: u64,
+    /// Timestamp when this version stopped being the current live version.
+    pub became_noncurrent_at: Option<u64>,
     pub storage_class: StorageClass,
     pub ec: EcShape,
     pub layout: ObjectLayout,
