@@ -30,6 +30,9 @@ pub enum S3Operation {
     PutBucketTagging { bucket: String },
     GetBucketTagging { bucket: String },
     DeleteBucketTagging { bucket: String },
+    PutBucketLifecycle { bucket: String },
+    GetBucketLifecycle { bucket: String },
+    DeleteBucketLifecycle { bucket: String },
     PutObjectTagging { bucket: String, key: String },
     GetObjectTagging { bucket: String, key: String },
     DeleteObjectTagging { bucket: String, key: String },
@@ -220,6 +223,9 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         ("PUT", None) if has_query_key(query, "tagging") => Ok(S3Operation::PutBucketTagging {
             bucket: bucket.to_string(),
         }),
+        ("PUT", None) if has_query_key(query, "lifecycle") => Ok(S3Operation::PutBucketLifecycle {
+            bucket: bucket.to_string(),
+        }),
         ("PUT", None) if has_query_key(query, "publicAccessBlock") => {
             Ok(S3Operation::PutBucketPublicAccessBlock {
                 bucket: bucket.to_string(),
@@ -254,6 +260,11 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         }
         ("DELETE", None) if has_query_key(query, "tagging") => {
             Ok(S3Operation::DeleteBucketTagging {
+                bucket: bucket.to_string(),
+            })
+        }
+        ("DELETE", None) if has_query_key(query, "lifecycle") => {
+            Ok(S3Operation::DeleteBucketLifecycle {
                 bucket: bucket.to_string(),
             })
         }
@@ -299,6 +310,11 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             // Check for ?tagging → GetBucketTagging
             if has_query_key(query, "tagging") {
                 return Ok(S3Operation::GetBucketTagging {
+                    bucket: bucket.to_string(),
+                });
+            }
+            if has_query_key(query, "lifecycle") {
+                return Ok(S3Operation::GetBucketLifecycle {
                     bucket: bucket.to_string(),
                 });
             }
@@ -883,6 +899,36 @@ mod tests {
         assert_eq!(
             route("DELETE", "/mybucket", "cors").unwrap(),
             S3Operation::DeleteBucketCors {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_lifecycle() {
+        assert_eq!(
+            route("PUT", "/mybucket", "lifecycle").unwrap(),
+            S3Operation::PutBucketLifecycle {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_lifecycle() {
+        assert_eq!(
+            route("GET", "/mybucket", "lifecycle").unwrap(),
+            S3Operation::GetBucketLifecycle {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn delete_bucket_lifecycle() {
+        assert_eq!(
+            route("DELETE", "/mybucket", "lifecycle").unwrap(),
+            S3Operation::DeleteBucketLifecycle {
                 bucket: "mybucket".to_string()
             }
         );

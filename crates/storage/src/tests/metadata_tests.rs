@@ -664,6 +664,51 @@ fn file_bucket_metadata_config_roundtrip() {
     );
 
     store
+        .put_bucket_lifecycle("bucket", "<LifecycleConfiguration/>")
+        .unwrap();
+    assert_eq!(
+        store.get_bucket_lifecycle("bucket").unwrap(),
+        Some("<LifecycleConfiguration/>".to_string())
+    );
+    assert_eq!(
+        store.head_bucket("bucket").unwrap().bucket_lifecycle,
+        Some("<LifecycleConfiguration/>".to_string())
+    );
+    assert_eq!(
+        store
+            .head_bucket("bucket")
+            .unwrap()
+            .bucket_lifecycle_generation,
+        1
+    );
+    store
+        .put_bucket_lifecycle(
+            "bucket",
+            "<LifecycleConfiguration><Rule/></LifecycleConfiguration>",
+        )
+        .unwrap();
+    assert_eq!(
+        store.get_bucket_lifecycle("bucket").unwrap(),
+        Some("<LifecycleConfiguration><Rule/></LifecycleConfiguration>".to_string())
+    );
+    assert_eq!(
+        store
+            .head_bucket("bucket")
+            .unwrap()
+            .bucket_lifecycle_generation,
+        2
+    );
+    store.delete_bucket_lifecycle("bucket").unwrap();
+    assert_eq!(store.get_bucket_lifecycle("bucket").unwrap(), None);
+    assert_eq!(
+        store
+            .head_bucket("bucket")
+            .unwrap()
+            .bucket_lifecycle_generation,
+        3
+    );
+
+    store
         .put_bucket_ownership_controls("bucket", "<OwnershipControls/>")
         .unwrap();
     assert_eq!(
@@ -728,6 +773,18 @@ fn file_bucket_metadata_config_on_nonexistent_bucket() {
     ));
 
     let err = store.delete_bucket_policy("nope").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+
+    let err = store.get_bucket_lifecycle("nope").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+
+    let err = store.delete_bucket_lifecycle("nope").unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }

@@ -26,6 +26,7 @@
 ///
 /// All IO is synchronous. Single-node, single-process for v1-minimal.
 pub mod error;
+pub mod lifecycle;
 pub mod node;
 pub mod pg_store;
 pub mod schema;
@@ -33,6 +34,7 @@ pub mod traits;
 pub mod types;
 
 pub use error::{MetadataError, StoreError};
+pub use lifecycle::*;
 pub use node::{LocalStorageNode, ReclaimWorkItem, SharedStorageNode};
 pub use pg_store::PgStore;
 pub use traits::{PgMetadataStore, ShardStore, StorageNode};

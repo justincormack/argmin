@@ -1586,6 +1586,48 @@ impl HttpFrontend {
                     })?;
                 Ok(S3Response::delete_bucket_tagging())
             }
+            S3Operation::PutBucketLifecycle { bucket } => {
+                require_content_md5(req)?;
+                let config = xml::parse_bucket_lifecycle_configuration_xml(&req.body)?;
+                let config_xml = xml::get_bucket_lifecycle_configuration_xml(&config);
+                let requester = Self::requester_from_auth(auth);
+                self.coordinator.put_bucket_lifecycle(
+                    &crate::coordinator::PutBucketConfigRequest {
+                        bucket: crate::coordinator::BucketRequest {
+                            name: &bucket,
+                            requester,
+                            expected_bucket_owner,
+                        },
+                        config: &config_xml,
+                    },
+                )?;
+                Ok(S3Response::put_bucket_lifecycle())
+            }
+            S3Operation::GetBucketLifecycle { bucket } => {
+                let requester = Self::requester_from_auth(auth);
+                match self
+                    .coordinator
+                    .get_bucket_lifecycle(&crate::coordinator::BucketRequest {
+                        name: &bucket,
+                        requester,
+                        expected_bucket_owner,
+                    })? {
+                    Some(config_xml) => Ok(S3Response::get_bucket_lifecycle(&config_xml)),
+                    None => Err(ServerError::NoSuchLifecycleConfiguration {
+                        bucket: bucket.clone(),
+                    }),
+                }
+            }
+            S3Operation::DeleteBucketLifecycle { bucket } => {
+                let requester = Self::requester_from_auth(auth);
+                self.coordinator
+                    .delete_bucket_lifecycle(&crate::coordinator::BucketRequest {
+                        name: &bucket,
+                        requester,
+                        expected_bucket_owner,
+                    })?;
+                Ok(S3Response::delete_bucket_lifecycle())
+            }
             S3Operation::PutObjectRetention { bucket, key } => {
                 validate_content_md5(req)?;
                 let vid = parse_version_id(req)?;
@@ -2049,6 +2091,7 @@ impl HttpFrontend {
                     &result.upload_id,
                     checksum_algorithm,
                     checksum_type,
+                    result.lifecycle_abort.as_ref(),
                     sse_customer_headers.as_ref(),
                 ))
             }
@@ -2153,13 +2196,7 @@ impl HttpFrontend {
                     },
                 )?;
                 Ok(S3Response::complete_multipart_upload(
-                    &bucket,
-                    &key,
-                    &result.etag,
-                    result.version_id,
-                    result.checksum_algorithm,
-                    result.checksum_type,
-                    result.checksum_value.as_deref(),
+                    &bucket, &key, &result,
                 ))
             }
             S3Operation::AbortMultipartUpload { bucket, key } => {
@@ -3961,7 +3998,7 @@ fn validate_content_md5(req: &S3Request) -> Result<(), ServerError> {
 fn require_content_md5(req: &S3Request) -> Result<(), ServerError> {
     if req.header("content-md5").is_none() {
         return Err(ServerError::InvalidRequest {
-            reason: "Content-MD5 HTTP header is required for DeleteObjects".to_string(),
+            reason: "Missing required header for this request: Content-MD5".to_string(),
         });
     }
     validate_content_md5(req)
@@ -4678,6 +4715,13 @@ mod tests {
         request::header_map_from_owned(headers)
     }
 
+    fn find_header<'a>(resp: &'a S3Response, name: &str) -> Option<&'a str> {
+        resp.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+
     #[test]
     fn parse_sse_customer_request_mismatched_key_md5_is_invalid_argument() {
         use base64::Engine;
@@ -5144,6 +5188,515 @@ mod tests {
         let body = String::from_utf8(get_resp.body).unwrap();
         assert!(body.contains("<PolicyStatus"));
         assert!(body.contains("<IsPublic>true</IsPublic>"));
+    }
+
+    #[test]
+    fn bucket_lifecycle_put_get_delete_round_trip() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let lifecycle = br#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+  <Rule>
+    <ID>expire-current</ID>
+    <Filter><Prefix>logs/</Prefix></Filter>
+    <Status>Enabled</Status>
+    <Expiration><Days>3</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let expected = xml::get_bucket_lifecycle_configuration_xml(
+            &xml::parse_bucket_lifecycle_configuration_xml(lifecycle).unwrap(),
+        );
+
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "lifecycle",
+            vec![("Content-MD5".to_string(), content_md5_value(lifecycle))],
+            lifecycle.to_vec(),
+        );
+        let put_resp = fe
+            .dispatch_routed(
+                &put_req,
+                &test_auth(),
+                S3Operation::PutBucketLifecycle {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(put_resp.status_code, 200);
+
+        let get_req = new_req(http::Method::GET, "/", "lifecycle", vec![], vec![]);
+        let get_resp = fe
+            .dispatch_routed(
+                &get_req,
+                &test_auth(),
+                S3Operation::GetBucketLifecycle {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(get_resp.status_code, 200);
+        assert_eq!(
+            find_header(&get_resp, "Content-Type"),
+            Some("application/xml")
+        );
+        assert_eq!(String::from_utf8(get_resp.body).unwrap(), expected);
+
+        let delete_req = new_req(http::Method::DELETE, "/", "lifecycle", vec![], vec![]);
+        let delete_resp = fe
+            .dispatch_routed(
+                &delete_req,
+                &test_auth(),
+                S3Operation::DeleteBucketLifecycle {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(delete_resp.status_code, 204);
+
+        match fe.dispatch_routed(
+            &get_req,
+            &test_auth(),
+            S3Operation::GetBucketLifecycle {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::NoSuchLifecycleConfiguration { bucket }) => {
+                assert_eq!(bucket, "mybucket");
+            }
+            Err(e) => panic!("expected NoSuchLifecycleConfiguration, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn get_bucket_lifecycle_absent_returns_no_such_lifecycle_configuration() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let get_req = new_req(http::Method::GET, "/", "lifecycle", vec![], vec![]);
+        match fe.dispatch_routed(
+            &get_req,
+            &test_auth(),
+            S3Operation::GetBucketLifecycle {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::NoSuchLifecycleConfiguration { bucket }) => {
+                assert_eq!(bucket, "mybucket");
+            }
+            Err(e) => panic!("expected NoSuchLifecycleConfiguration, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn put_bucket_lifecycle_rejects_invalid_status() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let lifecycle = br#"<LifecycleConfiguration>
+  <Rule>
+    <Status>enabled</Status>
+    <Expiration><Days>1</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "lifecycle",
+            vec![("Content-MD5".to_string(), content_md5_value(lifecycle))],
+            lifecycle.to_vec(),
+        );
+        match fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutBucketLifecycle {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::MalformedXML { .. }) => {}
+            Err(e) => panic!("expected MalformedXML, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn put_bucket_lifecycle_missing_content_md5_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let lifecycle = br#"<LifecycleConfiguration>
+  <Rule>
+    <Status>Enabled</Status>
+    <Expiration><Days>1</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "lifecycle",
+            vec![],
+            lifecycle.to_vec(),
+        );
+        match fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutBucketLifecycle {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(
+                    reason,
+                    "Missing required header for this request: Content-MD5"
+                );
+            }
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn put_bucket_lifecycle_invalid_content_md5_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let lifecycle = br#"<LifecycleConfiguration>
+  <Rule>
+    <Status>Enabled</Status>
+    <Expiration><Days>1</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "lifecycle",
+            vec![("Content-MD5".to_string(), "not-base64".to_string())],
+            lifecycle.to_vec(),
+        );
+        match fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutBucketLifecycle {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::InvalidDigest) => {}
+            Err(e) => panic!("expected InvalidDigest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn put_bucket_lifecycle_bad_content_md5_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let lifecycle = br#"<LifecycleConfiguration>
+  <Rule>
+    <Status>Enabled</Status>
+    <Expiration><Days>1</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "lifecycle",
+            vec![(
+                "Content-MD5".to_string(),
+                "AAAAAAAAAAAAAAAAAAAAAA==".to_string(),
+            )],
+            lifecycle.to_vec(),
+        );
+        match fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutBucketLifecycle {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::BadDigest) => {}
+            Err(e) => panic!("expected BadDigest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn put_object_emits_lifecycle_expiration_header() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let lifecycle = br#"<LifecycleConfiguration>
+  <Rule>
+    <ID>expire-current</ID>
+    <Filter><Prefix>logs/</Prefix></Filter>
+    <Status>Enabled</Status>
+    <Expiration><Days>1</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let put_lifecycle_req = new_req(
+            http::Method::PUT,
+            "/",
+            "lifecycle",
+            vec![("Content-MD5".to_string(), content_md5_value(lifecycle))],
+            lifecycle.to_vec(),
+        );
+        fe.dispatch_routed(
+            &put_lifecycle_req,
+            &test_auth(),
+            S3Operation::PutBucketLifecycle {
+                bucket: "mybucket".to_string(),
+            },
+        )
+        .unwrap();
+
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "",
+            vec![],
+            b"hello lifecycle".to_vec(),
+        );
+        let put_resp = fe
+            .dispatch_routed(
+                &put_req,
+                &test_auth(),
+                S3Operation::PutObject {
+                    bucket: "mybucket".to_string(),
+                    key: "logs/app.txt".to_string(),
+                },
+            )
+            .unwrap();
+        let expiration = find_header(&put_resp, "x-amz-expiration").unwrap();
+        assert!(expiration.contains("expiry-date=\""));
+        assert!(expiration.contains("rule-id=\"expire-current\""));
+    }
+
+    #[test]
+    fn get_object_explicit_current_version_emits_lifecycle_expiration_header() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        fe.coordinator
+            .put_bucket_versioning(&crate::coordinator::PutBucketVersioningRequest {
+                bucket: test_bucket_request("mybucket"),
+                state: s3_types::BucketVersioningState::Enabled,
+            })
+            .unwrap();
+
+        let lifecycle = br#"<LifecycleConfiguration>
+  <Rule>
+    <ID>expire-current</ID>
+    <Filter><Prefix>logs/</Prefix></Filter>
+    <Status>Enabled</Status>
+    <Expiration><Days>1</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let put_lifecycle_req = new_req(
+            http::Method::PUT,
+            "/",
+            "lifecycle",
+            vec![("Content-MD5".to_string(), content_md5_value(lifecycle))],
+            lifecycle.to_vec(),
+        );
+        fe.dispatch_routed(
+            &put_lifecycle_req,
+            &test_auth(),
+            S3Operation::PutBucketLifecycle {
+                bucket: "mybucket".to_string(),
+            },
+        )
+        .unwrap();
+
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "",
+            vec![],
+            b"hello lifecycle".to_vec(),
+        );
+        let put_resp = fe
+            .dispatch_routed(
+                &put_req,
+                &test_auth(),
+                S3Operation::PutObject {
+                    bucket: "mybucket".to_string(),
+                    key: "logs/app.txt".to_string(),
+                },
+            )
+            .unwrap();
+        let version_id = find_header(&put_resp, "x-amz-version-id")
+            .expect("versioned put should return version id")
+            .to_string();
+
+        let get_req = new_req(
+            http::Method::GET,
+            "/",
+            &format!("versionId={version_id}"),
+            vec![],
+            vec![],
+        );
+        let get_resp = fe
+            .dispatch_routed(
+                &get_req,
+                &test_auth(),
+                S3Operation::GetObject {
+                    bucket: "mybucket".to_string(),
+                    key: "logs/app.txt".to_string(),
+                },
+            )
+            .unwrap();
+        let expiration = find_header(&get_resp, "x-amz-expiration").unwrap();
+        assert!(expiration.contains("expiry-date=\""));
+        assert!(expiration.contains("rule-id=\"expire-current\""));
+    }
+
+    #[test]
+    fn head_object_explicit_null_version_emits_lifecycle_expiration_header() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let lifecycle = br#"<LifecycleConfiguration>
+  <Rule>
+    <ID>expire-current</ID>
+    <Filter><Prefix>logs/</Prefix></Filter>
+    <Status>Enabled</Status>
+    <Expiration><Days>1</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let put_lifecycle_req = new_req(
+            http::Method::PUT,
+            "/",
+            "lifecycle",
+            vec![("Content-MD5".to_string(), content_md5_value(lifecycle))],
+            lifecycle.to_vec(),
+        );
+        fe.dispatch_routed(
+            &put_lifecycle_req,
+            &test_auth(),
+            S3Operation::PutBucketLifecycle {
+                bucket: "mybucket".to_string(),
+            },
+        )
+        .unwrap();
+
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "",
+            vec![],
+            b"hello lifecycle".to_vec(),
+        );
+        fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutObject {
+                bucket: "mybucket".to_string(),
+                key: "logs/app.txt".to_string(),
+            },
+        )
+        .unwrap();
+
+        let head_req = new_req(http::Method::HEAD, "/", "versionId=null", vec![], vec![]);
+        let head_resp = fe
+            .dispatch_routed(
+                &head_req,
+                &test_auth(),
+                S3Operation::HeadObject {
+                    bucket: "mybucket".to_string(),
+                    key: "logs/app.txt".to_string(),
+                },
+            )
+            .unwrap();
+        let expiration = find_header(&head_resp, "x-amz-expiration").unwrap();
+        assert!(expiration.contains("expiry-date=\""));
+        assert!(expiration.contains("rule-id=\"expire-current\""));
+    }
+
+    #[test]
+    fn multipart_lifecycle_abort_headers_are_emitted_on_create_and_list_parts() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let lifecycle = br#"<LifecycleConfiguration>
+  <Rule>
+    <ID>abort-stale</ID>
+    <Filter><Prefix>uploads/</Prefix></Filter>
+    <Status>Enabled</Status>
+    <AbortIncompleteMultipartUpload><DaysAfterInitiation>7</DaysAfterInitiation></AbortIncompleteMultipartUpload>
+  </Rule>
+</LifecycleConfiguration>"#;
+        let put_lifecycle_req = new_req(
+            http::Method::PUT,
+            "/",
+            "lifecycle",
+            vec![("Content-MD5".to_string(), content_md5_value(lifecycle))],
+            lifecycle.to_vec(),
+        );
+        fe.dispatch_routed(
+            &put_lifecycle_req,
+            &test_auth(),
+            S3Operation::PutBucketLifecycle {
+                bucket: "mybucket".to_string(),
+            },
+        )
+        .unwrap();
+
+        let create_req = new_req(http::Method::POST, "/", "uploads", vec![], vec![]);
+        let create_resp = fe
+            .dispatch_routed(
+                &create_req,
+                &test_auth(),
+                S3Operation::CreateMultipartUpload {
+                    bucket: "mybucket".to_string(),
+                    key: "uploads/archive.bin".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(find_header(&create_resp, "x-amz-abort-date").is_some());
+        assert_eq!(
+            find_header(&create_resp, "x-amz-abort-rule-id"),
+            Some("abort-stale")
+        );
+
+        let body = std::str::from_utf8(&create_resp.body).unwrap();
+        let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
+        let end = start + body[start..].find("</UploadId>").unwrap();
+        let upload_id = &body[start..end];
+
+        let list_req = new_req(
+            http::Method::GET,
+            "/",
+            &format!("uploadId={upload_id}"),
+            vec![],
+            vec![],
+        );
+        let list_resp = fe
+            .dispatch_routed(
+                &list_req,
+                &test_auth(),
+                S3Operation::ListParts {
+                    bucket: "mybucket".to_string(),
+                    key: "uploads/archive.bin".to_string(),
+                },
+            )
+            .unwrap();
+        assert!(find_header(&list_resp, "x-amz-abort-date").is_some());
+        assert_eq!(
+            find_header(&list_resp, "x-amz-abort-rule-id"),
+            Some("abort-stale")
+        );
     }
 
     #[test]

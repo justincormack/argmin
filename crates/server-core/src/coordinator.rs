@@ -19,9 +19,10 @@ use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
 use storage::{
-    BucketEncryptionConfig, BucketFastPathInfo, BucketInfo, BucketName, BucketObjectLockConfig,
-    BucketState, CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq,
-    CreateStreamUploadReq, EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
+    BucketEncryptionConfig, BucketFastPathInfo, BucketInfo, BucketLifecycleConfiguration,
+    BucketName, BucketObjectLockConfig, BucketState, CommitMultipartReq, CommitStreamPutReq,
+    CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, GenerationId, LifecycleDate,
+    LifecycleExpiration, LifecycleRuleStatus, ListMultipartUploadsReq, ListObjectVersionsReq,
     ListObjectsReq, ListPartsReq, MultipartPartRecord, MultipartPartSegmentRecord,
     MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
     MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectLockState,
@@ -150,6 +151,19 @@ const MAX_LIST_RECORDS: usize = 100_000;
 pub struct PutObjectResult {
     pub etag: String,
     pub version_id: VersionId,
+    pub lifecycle_expiration: Option<LifecycleExpirationHeader>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleExpirationHeader {
+    pub expiry_time_millis: u64,
+    pub rule_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LifecycleAbortHeaders {
+    pub abort_time_millis: u64,
+    pub rule_id: Option<String>,
 }
 
 /// Core-owned bucket summary exposed above the storage layer.
@@ -169,6 +183,8 @@ pub struct BucketSummary {
     pub bucket_policy_present: bool,
     pub bucket_policy_public: bool,
     pub bucket_policy_generation: u64,
+    pub bucket_lifecycle_present: bool,
+    pub bucket_lifecycle_generation: u64,
     pub encryption: BucketEncryptionConfig,
 }
 
@@ -948,6 +964,7 @@ pub struct GetObjectResult {
     pub version_id: VersionId,
     pub tags: Option<String>,
     pub sse_customer: Option<SseCustomerResponseHeaders>,
+    pub lifecycle_expiration: Option<LifecycleExpirationHeader>,
 }
 
 /// Result of a HeadObject operation.
@@ -962,6 +979,7 @@ pub struct HeadObjectResult {
     pub version_id: VersionId,
     pub tags: Option<String>,
     pub sse_customer: Option<SseCustomerResponseHeaders>,
+    pub lifecycle_expiration: Option<LifecycleExpirationHeader>,
 }
 
 /// Result of a HeadObject with partNumber.
@@ -980,6 +998,7 @@ pub struct HeadObjectPartResult {
     /// Per-part checksum (algorithm + raw bytes).
     pub checksum: Option<RawChecksum>,
     pub sse_customer: Option<SseCustomerResponseHeaders>,
+    pub lifecycle_expiration: Option<LifecycleExpirationHeader>,
 }
 
 /// A single part entry for GetObjectAttributes ObjectParts response.
@@ -1033,6 +1052,7 @@ pub struct GetObjectRangeResult {
     pub version_id: VersionId,
     pub tags: Option<String>,
     pub sse_customer: Option<SseCustomerResponseHeaders>,
+    pub lifecycle_expiration: Option<LifecycleExpirationHeader>,
 }
 
 /// Result of a part-level GetObject operation (206 Partial Content).
@@ -1054,6 +1074,7 @@ pub struct GetObjectPartResult {
     /// Per-part checksum (algorithm + raw bytes).
     pub checksum: Option<RawChecksum>,
     pub sse_customer: Option<SseCustomerResponseHeaders>,
+    pub lifecycle_expiration: Option<LifecycleExpirationHeader>,
 }
 
 /// Metadata handling directive for `CopyObject`.
@@ -2026,6 +2047,7 @@ pub struct CopyObjectResult {
     pub last_modified: u64,
     pub version_id: VersionId,
     pub sse_customer: Option<SseCustomerResponseHeaders>,
+    pub lifecycle_expiration: Option<LifecycleExpirationHeader>,
 }
 
 /// Object entry for listing.
@@ -2122,6 +2144,7 @@ pub struct UploadPartCopyResult {
 #[derive(Debug)]
 pub struct CreateMultipartUploadResult {
     pub upload_id: String,
+    pub lifecycle_abort: Option<LifecycleAbortHeaders>,
 }
 
 /// A single part entry in a CompleteMultipartUpload request.
@@ -2144,6 +2167,7 @@ pub struct CompleteMultipartUploadResult {
     pub checksum_type: Option<ChecksumType>,
     /// Object-level checksum (base64-encoded).
     pub checksum_value: Option<String>,
+    pub lifecycle_expiration: Option<LifecycleExpirationHeader>,
 }
 
 /// Minimum part size for non-final parts (5 MiB).
@@ -2173,6 +2197,7 @@ pub struct ListPartsResult {
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     /// Upload-level checksum type.
     pub checksum_type: Option<ChecksumType>,
+    pub lifecycle_abort: Option<LifecycleAbortHeaders>,
 }
 
 /// Entry in a ListMultipartUploads result.
@@ -2279,6 +2304,12 @@ struct CachedBucketPolicy {
     policy: Arc<auth::BucketPolicy>,
 }
 
+#[derive(Debug, Clone)]
+struct CachedBucketLifecycle {
+    generation: u64,
+    config: Arc<BucketLifecycleConfiguration>,
+}
+
 enum ObjectAclAuthorization {
     ReadWithPolicy(auth::PolicyAction),
     Write,
@@ -2297,6 +2328,7 @@ impl Drop for ReclaimSweeper {
 pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
     bucket_policy_cache: RwLock<HashMap<String, CachedBucketPolicy>>,
+    bucket_lifecycle_cache: RwLock<HashMap<String, CachedBucketLifecycle>>,
     pg_topology: PgTopology,
     ec_codec: Arc<ErasureCodec>,
     ec_config: EcConfig,
@@ -3400,6 +3432,223 @@ impl Coordinator {
 
     fn clear_bucket_policy_cache(&self, bucket: &str) {
         self.bucket_policy_cache.write().unwrap().remove(bucket);
+    }
+
+    fn cached_bucket_lifecycle(
+        &self,
+        bucket: &BucketSummary,
+    ) -> Result<Option<Arc<BucketLifecycleConfiguration>>, ServerError> {
+        if !bucket.bucket_lifecycle_present {
+            return Ok(None);
+        }
+
+        if let Some(cached) = self
+            .bucket_lifecycle_cache
+            .read()
+            .unwrap()
+            .get(&bucket.name)
+            .cloned()
+        {
+            if cached.generation == bucket.bucket_lifecycle_generation {
+                return Ok(Some(cached.config));
+            }
+        }
+
+        let bucket_pg = self.get_bucket_pg(&bucket.name)?;
+        let raw_config = bucket_pg
+            .get_bucket_lifecycle(&bucket.name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        let parsed_config = match raw_config {
+            Some(config_xml) => Arc::new(
+                storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(
+                    |error| ServerError::InternalError {
+                        reason: format!(
+                            "stored lifecycle configuration for {} failed to parse at request time: {error}",
+                            bucket.name
+                        ),
+                    },
+                )?,
+            ),
+            None => {
+                self.clear_bucket_lifecycle_cache(&bucket.name);
+                return Ok(None);
+            }
+        };
+
+        self.cache_bucket_lifecycle(
+            &bucket.name,
+            bucket.bucket_lifecycle_generation,
+            Arc::clone(&parsed_config),
+        );
+        Ok(Some(parsed_config))
+    }
+
+    fn cache_bucket_lifecycle(
+        &self,
+        bucket: &str,
+        generation: u64,
+        config: Arc<BucketLifecycleConfiguration>,
+    ) {
+        self.bucket_lifecycle_cache.write().unwrap().insert(
+            bucket.to_string(),
+            CachedBucketLifecycle { generation, config },
+        );
+    }
+
+    fn clear_bucket_lifecycle_cache(&self, bucket: &str) {
+        self.bucket_lifecycle_cache.write().unwrap().remove(bucket);
+    }
+
+    fn current_object_lifecycle_expiration(
+        &self,
+        bucket: &BucketSummary,
+        key: &str,
+        tags_xml: Option<&str>,
+        size: u64,
+        last_modified: u64,
+    ) -> Result<Option<LifecycleExpirationHeader>, ServerError> {
+        let Some(config) = self.cached_bucket_lifecycle(bucket)? else {
+            return Ok(None);
+        };
+        let tags = match tags_xml {
+            Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
+            None => Vec::new(),
+        };
+        Ok(Self::evaluate_current_object_lifecycle_expiration(
+            config.as_ref(),
+            key,
+            &tags,
+            size,
+            last_modified,
+        ))
+    }
+
+    fn multipart_lifecycle_abort_headers(
+        &self,
+        bucket: &BucketSummary,
+        key: &str,
+        initiated_at: u64,
+    ) -> Result<Option<LifecycleAbortHeaders>, ServerError> {
+        let Some(config) = self.cached_bucket_lifecycle(bucket)? else {
+            return Ok(None);
+        };
+        Ok(Self::evaluate_multipart_lifecycle_abort_headers(
+            config.as_ref(),
+            key,
+            initiated_at,
+        ))
+    }
+
+    fn requested_version_is_current_live(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        requested_version_id: Option<VersionId>,
+        resolved_version_id: VersionId,
+    ) -> Result<bool, ServerError> {
+        if requested_version_id.is_none() {
+            return Ok(true);
+        }
+        match meta_pg.get_object_meta(bucket, key) {
+            Ok(StoredObject::Live(current)) => Ok(current.version_id == resolved_version_id),
+            Ok(StoredObject::DeleteMarker(_)) => Ok(false),
+            Err(storage::MetadataError::ObjectNotFound) => Ok(false),
+            Err(error) => Err(ServerError::Metadata(error)),
+        }
+    }
+
+    fn evaluate_current_object_lifecycle_expiration(
+        config: &BucketLifecycleConfiguration,
+        key: &str,
+        tags: &[(String, String)],
+        size: u64,
+        last_modified: u64,
+    ) -> Option<LifecycleExpirationHeader> {
+        let mut best = None;
+
+        for rule in &config.rules {
+            if rule.status != LifecycleRuleStatus::Enabled
+                || !rule.filter.matches_object(key, tags, size)
+            {
+                continue;
+            }
+            let Some(expiration) = &rule.expiration else {
+                continue;
+            };
+            let expiry_time_millis = match expiration {
+                LifecycleExpiration::Days(days) => {
+                    Self::lifecycle_day_based_deadline(last_modified, days.get())?
+                }
+                LifecycleExpiration::Date(date) => Self::lifecycle_date_deadline(*date)?,
+                LifecycleExpiration::ExpiredObjectDeleteMarker => continue,
+            };
+            let candidate = LifecycleExpirationHeader {
+                expiry_time_millis,
+                rule_id: rule.id.clone(),
+            };
+            if best
+                .as_ref()
+                .is_none_or(|current: &LifecycleExpirationHeader| {
+                    candidate.expiry_time_millis < current.expiry_time_millis
+                })
+            {
+                best = Some(candidate);
+            }
+        }
+
+        best
+    }
+
+    fn evaluate_multipart_lifecycle_abort_headers(
+        config: &BucketLifecycleConfiguration,
+        key: &str,
+        initiated_at: u64,
+    ) -> Option<LifecycleAbortHeaders> {
+        let mut best = None;
+
+        for rule in &config.rules {
+            if rule.status != LifecycleRuleStatus::Enabled
+                || !rule.filter.matches_multipart_upload(key)
+            {
+                continue;
+            }
+            let Some(abort) = &rule.abort_incomplete_multipart_upload else {
+                continue;
+            };
+            let abort_time_millis = Self::lifecycle_day_based_deadline(
+                initiated_at,
+                abort.days_after_initiation.get(),
+            )?;
+            let candidate = LifecycleAbortHeaders {
+                abort_time_millis,
+                rule_id: rule.id.clone(),
+            };
+            if best.as_ref().is_none_or(|current: &LifecycleAbortHeaders| {
+                candidate.abort_time_millis < current.abort_time_millis
+            }) {
+                best = Some(candidate);
+            }
+        }
+
+        best
+    }
+
+    fn lifecycle_day_based_deadline(start_millis: u64, days: u32) -> Option<u64> {
+        let start_day = start_millis / 86_400_000;
+        start_day
+            .checked_add(u64::from(days))?
+            .checked_add(1)?
+            .checked_mul(86_400_000)
+    }
+
+    fn lifecycle_date_deadline(date: LifecycleDate) -> Option<u64> {
+        let days = u64::try_from(date.days_since_epoch()).ok()?;
+        days.checked_mul(86_400_000)
     }
 
     fn bucket_policy_decision_for_object(
@@ -4641,6 +4890,8 @@ impl Coordinator {
             bucket_policy_present: info.bucket_policy.is_some(),
             bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
+            bucket_lifecycle_present: info.bucket_lifecycle.is_some(),
+            bucket_lifecycle_generation: info.bucket_lifecycle_generation,
             encryption: info.encryption,
         }
     }
@@ -4661,6 +4912,8 @@ impl Coordinator {
             bucket_policy_present: info.bucket_policy_present,
             bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
+            bucket_lifecycle_present: info.bucket_lifecycle_present,
+            bucket_lifecycle_generation: info.bucket_lifecycle_generation,
             encryption: info.encryption,
         }
     }
@@ -4744,6 +4997,7 @@ impl Coordinator {
         Ok(Self {
             storage_node,
             bucket_policy_cache: RwLock::new(HashMap::new()),
+            bucket_lifecycle_cache: RwLock::new(HashMap::new()),
             pg_topology,
             ec_codec,
             ec_config,
@@ -4982,6 +5236,7 @@ impl Coordinator {
             })?;
             self.storage_node.remove_bucket_fast_path(name);
             self.clear_bucket_policy_cache(name);
+            self.clear_bucket_lifecycle_cache(name);
             marked_deleting = true;
             self.read_runtime().enqueue_bucket_delete_finalize(name);
             Ok(())
@@ -5468,6 +5723,121 @@ impl Coordinator {
         })?;
         self.storage_node.upsert_bucket_fast_path((&info).into());
         self.clear_bucket_policy_cache(req.name);
+        Ok(())
+    }
+
+    pub fn put_bucket_lifecycle(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_lifecycle",
+            "bucket={} bytes={}",
+            req.bucket.name,
+            req.config.len()
+        );
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.bucket.requester,
+            req.bucket.name,
+            req.bucket.expected_bucket_owner(),
+        )?;
+        let parsed_config = Arc::new(
+            storage::parse_lifecycle_configuration_xml(req.config.as_bytes()).map_err(|error| {
+                match error {
+                    storage::LifecycleConfigError::MalformedXml { reason } => {
+                        ServerError::MalformedXML { reason }
+                    }
+                    storage::LifecycleConfigError::InvalidArgument { reason } => {
+                        ServerError::InvalidArgument { reason }
+                    }
+                    storage::LifecycleConfigError::NotImplemented { feature } => {
+                        ServerError::NotImplemented { feature }
+                    }
+                }
+            })?,
+        );
+        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
+        bucket_pg
+            .put_bucket_lifecycle(req.bucket.name, req.config)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        let info = bucket_pg
+            .head_bucket_raw(req.bucket.name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.storage_node.upsert_bucket_fast_path((&info).into());
+        self.cache_bucket_lifecycle(
+            req.bucket.name,
+            info.bucket_lifecycle_generation,
+            parsed_config,
+        );
+        Ok(())
+    }
+
+    pub fn get_bucket_lifecycle(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_lifecycle",
+            "bucket={}",
+            req.name
+        );
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.requester,
+            req.name,
+            req.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.name)?;
+        bucket_pg
+            .get_bucket_lifecycle(req.name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    pub fn delete_bucket_lifecycle(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket_lifecycle",
+            "bucket={}",
+            req.name
+        );
+        let _bucket_info = self.authorize_bucket_admin_requester(
+            &req.requester,
+            req.name,
+            req.expected_bucket_owner(),
+        )?;
+        let bucket_pg = self.get_bucket_pg(req.name)?;
+        bucket_pg
+            .delete_bucket_lifecycle(req.name)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        let info = bucket_pg.head_bucket_raw(req.name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
+        self.storage_node.upsert_bucket_fast_path((&info).into());
+        self.clear_bucket_lifecycle_cache(req.name);
         Ok(())
     }
 
@@ -6796,6 +7166,23 @@ impl Coordinator {
                 prepared.version_id,
                 prepared.stale_payload.as_ref(),
             )?;
+            let stored = meta_pg
+                .get_object_meta(req.object.bucket_name(), req.object.key)
+                .map_err(ServerError::Metadata)?;
+            let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
+                reason: format!(
+                    "stored object {} / {} is not live immediately after PutObject",
+                    req.object.bucket_name(),
+                    req.object.key
+                ),
+            })?;
+            let lifecycle_expiration = self.current_object_lifecycle_expiration(
+                &bucket_info,
+                req.object.key,
+                live_record.tags.as_deref(),
+                live_record.size,
+                live_record.last_modified,
+            )?;
 
             drop(meta_pg);
             if let Some(ref payload) = prepared.stale_payload {
@@ -6805,6 +7192,7 @@ impl Coordinator {
             Ok(PutObjectResult {
                 etag: format_etag(checksum::crc64::checksum(req.data)),
                 version_id: prepared.version_id,
+                lifecycle_expiration,
             })
         })
     }
@@ -7455,6 +7843,22 @@ impl Coordinator {
                 prepared.version_id,
                 prepared.stale_payload.as_ref(),
             )?;
+            let stored = meta_guard
+                .get_object_meta(bucket, key)
+                .map_err(ServerError::Metadata)?;
+            let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
+                reason: format!(
+                    "stored object {} / {} is not live immediately after streaming PutObject",
+                    bucket, key
+                ),
+            })?;
+            let lifecycle_expiration = self.current_object_lifecycle_expiration(
+                &bucket_info,
+                key,
+                live_record.tags.as_deref(),
+                live_record.size,
+                live_record.last_modified,
+            )?;
 
             drop(meta_guard);
             if let Some(ref payload) = prepared.stale_payload {
@@ -7464,6 +7868,7 @@ impl Coordinator {
             Ok(PutObjectResult {
                 etag: format_etag(crc64),
                 version_id: prepared.version_id,
+                lifecycle_expiration,
             })
         })
     }
@@ -8166,12 +8571,28 @@ impl Coordinator {
             let dst_stored = dst_meta_pg
                 .get_object_meta(dst_bucket, dst_key)
                 .map_err(ServerError::Metadata)?;
+            let dst_live = dst_stored
+                .as_live()
+                .ok_or_else(|| ServerError::InternalError {
+                    reason: format!(
+                        "stored object {} / {} is not live immediately after CopyObject",
+                        dst_bucket, dst_key
+                    ),
+                })?;
+            let lifecycle_expiration = self.current_object_lifecycle_expiration(
+                &dst_bucket_info,
+                dst_key,
+                dst_live.tags.as_deref(),
+                dst_live.size,
+                dst_live.last_modified,
+            )?;
 
             Ok(CopyObjectResult {
                 etag: put_result.etag,
                 last_modified: dst_stored.last_modified(),
                 version_id: put_result.version_id,
                 sse_customer: dst_response_sse_customer,
+                lifecycle_expiration,
             })
         })();
         if copy_result.is_err() {
@@ -8677,6 +9098,13 @@ impl Coordinator {
         check_read_conditions(cond, &etag_str, record.last_modified)?;
         let sse_customer =
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
+        let emit_lifecycle_expiration = Self::requested_version_is_current_live(
+            pgs.meta(),
+            bucket,
+            key,
+            version_id,
+            record.version_id,
+        )?;
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             // Multipart: metadata is in object row, data spans multiple parts.
@@ -8706,6 +9134,19 @@ impl Coordinator {
                 req.sse_customer.cloned(),
             );
             drop(pgs);
+            let lifecycle_expiration = if emit_lifecycle_expiration {
+                let lifecycle_bucket =
+                    self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                self.current_object_lifecycle_expiration(
+                    &lifecycle_bucket,
+                    key,
+                    record.tags.as_deref(),
+                    record.size,
+                    record.last_modified,
+                )?
+            } else {
+                None
+            };
             #[cfg(test)]
             maybe_run_multipart_snapshot_hook(bucket, key);
 
@@ -8720,6 +9161,7 @@ impl Coordinator {
                 version_id: record.version_id,
                 tags: record.tags.map(Into::into),
                 sse_customer,
+                lifecycle_expiration,
             })
         } else {
             // Non-multipart: metadata from DB row, user data from shards.
@@ -8758,6 +9200,19 @@ impl Coordinator {
                 drop(pgs);
                 body
             };
+            let lifecycle_expiration = if emit_lifecycle_expiration {
+                let lifecycle_bucket =
+                    self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                self.current_object_lifecycle_expiration(
+                    &lifecycle_bucket,
+                    key,
+                    record.tags.as_deref(),
+                    record.size,
+                    record.last_modified,
+                )?
+            } else {
+                None
+            };
 
             Ok(GetObjectResult {
                 body,
@@ -8770,6 +9225,7 @@ impl Coordinator {
                 version_id: record.version_id,
                 tags: record.tags.map(Into::into),
                 sse_customer,
+                lifecycle_expiration,
             })
         }
     }
@@ -8824,6 +9280,13 @@ impl Coordinator {
         check_read_conditions(cond, &etag_str, record.last_modified)?;
         let sse_customer =
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
+        let emit_lifecycle_expiration = Self::requested_version_is_current_live(
+            pgs.meta(),
+            bucket,
+            key,
+            version_id,
+            record.version_id,
+        )?;
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             let meta_pg = pgs.meta();
@@ -8883,6 +9346,19 @@ impl Coordinator {
                 req.sse_customer.cloned(),
             );
             drop(pgs);
+            let lifecycle_expiration = if emit_lifecycle_expiration {
+                let lifecycle_bucket =
+                    self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                self.current_object_lifecycle_expiration(
+                    &lifecycle_bucket,
+                    key,
+                    record.tags.as_deref(),
+                    record.size,
+                    record.last_modified,
+                )?
+            } else {
+                None
+            };
             #[cfg(test)]
             maybe_run_multipart_snapshot_hook(bucket, key);
 
@@ -8902,6 +9378,7 @@ impl Coordinator {
                 tags: record.tags.map(Into::into),
                 checksum,
                 sse_customer,
+                lifecycle_expiration,
             })
         } else {
             // Non-multipart: only partNumber=1 is valid
@@ -8937,6 +9414,19 @@ impl Coordinator {
                 drop(pgs);
                 body
             };
+            let lifecycle_expiration = if emit_lifecycle_expiration {
+                let lifecycle_bucket =
+                    self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                self.current_object_lifecycle_expiration(
+                    &lifecycle_bucket,
+                    key,
+                    record.tags.as_deref(),
+                    record.size,
+                    record.last_modified,
+                )?
+            } else {
+                None
+            };
 
             let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
             let system_metadata = self.deserialize_visible_system_metadata(
@@ -8961,6 +9451,7 @@ impl Coordinator {
                 tags: record.tags.map(Into::into),
                 checksum: None,
                 sse_customer,
+                lifecycle_expiration,
             })
         }
     }
@@ -9011,6 +9502,13 @@ impl Coordinator {
         check_read_conditions(cond, &etag_str, record.last_modified)?;
         let sse_customer =
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
+        let emit_lifecycle_expiration = Self::requested_version_is_current_live(
+            pgs.meta(),
+            bucket,
+            key,
+            version_id,
+            record.version_id,
+        )?;
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             let meta_pg = pgs.meta();
@@ -9018,6 +9516,19 @@ impl Coordinator {
                 .get_object_parts(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
             drop(pgs);
+            let lifecycle_expiration = if emit_lifecycle_expiration {
+                let lifecycle_bucket =
+                    self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                self.current_object_lifecycle_expiration(
+                    &lifecycle_bucket,
+                    key,
+                    record.tags.as_deref(),
+                    record.size,
+                    record.last_modified,
+                )?
+            } else {
+                None
+            };
 
             let part = obj_parts
                 .iter()
@@ -9062,11 +9573,26 @@ impl Coordinator {
                 tags: record.tags.map(Into::into),
                 checksum,
                 sse_customer,
+                lifecycle_expiration,
             })
         } else {
             if part_number != 1 {
                 return Err(ServerError::InvalidPart { part_number });
             }
+            drop(pgs);
+            let lifecycle_expiration = if emit_lifecycle_expiration {
+                let lifecycle_bucket =
+                    self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                self.current_object_lifecycle_expiration(
+                    &lifecycle_bucket,
+                    key,
+                    record.tags.as_deref(),
+                    record.size,
+                    record.last_modified,
+                )?
+            } else {
+                None
+            };
 
             let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
             let system_metadata = self.deserialize_visible_system_metadata(
@@ -9088,6 +9614,7 @@ impl Coordinator {
                 tags: record.tags.map(Into::into),
                 checksum: None,
                 sse_customer,
+                lifecycle_expiration,
             })
         }
     }
@@ -9109,15 +9636,17 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let cond = req.cond;
         let requester = req.object.requester();
-        let LockedReadObject { record: stored, .. } = self
-            .lock_object_for_authorized_read_with_policy(
-                requester,
-                bucket,
-                key,
-                version_id,
-                Self::get_object_policy_action(version_id),
-                req.expected_bucket_owner(),
-            )?;
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_for_authorized_read_with_policy(
+            requester,
+            bucket,
+            key,
+            version_id,
+            Self::get_object_policy_action(version_id),
+            req.expected_bucket_owner(),
+        )?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -9134,6 +9663,27 @@ impl Coordinator {
         check_read_conditions(cond, &etag_str, record.last_modified)?;
         let sse_customer =
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
+        let emit_lifecycle_expiration = Self::requested_version_is_current_live(
+            pgs.meta(),
+            bucket,
+            key,
+            version_id,
+            record.version_id,
+        )?;
+        drop(pgs);
+        let lifecycle_expiration = if emit_lifecycle_expiration {
+            let lifecycle_bucket =
+                self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+            self.current_object_lifecycle_expiration(
+                &lifecycle_bucket,
+                key,
+                record.tags.as_deref(),
+                record.size,
+                record.last_modified,
+            )?
+        } else {
+            None
+        };
 
         // Metadata always from DB row (both multipart and non-multipart).
         let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
@@ -9153,6 +9703,7 @@ impl Coordinator {
             version_id: record.version_id,
             tags: record.tags.map(Into::into),
             sse_customer,
+            lifecycle_expiration,
         })
     }
 
@@ -9344,6 +9895,13 @@ impl Coordinator {
         check_read_conditions(cond, &etag_str, record.last_modified)?;
         let sse_customer =
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
+        let emit_lifecycle_expiration = Self::requested_version_is_current_live(
+            pgs.meta(),
+            bucket,
+            key,
+            version_id,
+            record.version_id,
+        )?;
 
         // Resolve byte range against user data size
         let (user_start, user_end) = match range.resolve(record.size) {
@@ -9458,6 +10016,19 @@ impl Coordinator {
 
             (metadata, system_metadata, body)
         };
+        let lifecycle_expiration = if emit_lifecycle_expiration {
+            let lifecycle_bucket =
+                self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+            self.current_object_lifecycle_expiration(
+                &lifecycle_bucket,
+                key,
+                record.tags.as_deref(),
+                record.size,
+                record.last_modified,
+            )?
+        } else {
+            None
+        };
 
         Ok(GetObjectRangeResult {
             body,
@@ -9472,6 +10043,7 @@ impl Coordinator {
             version_id: record.version_id,
             tags: record.tags.map(Into::into),
             sse_customer,
+            lifecycle_expiration,
         })
     }
 
@@ -10292,8 +10864,14 @@ impl Coordinator {
                 checksum: req.checksum,
                 encryption,
             })?;
+            let upload = pg.get_multipart_upload(&UploadId::from(upload_id.as_str()))?;
+            let lifecycle_abort =
+                self.multipart_lifecycle_abort_headers(&bucket_info, key, upload.initiated_at)?;
 
-            Ok(CreateMultipartUploadResult { upload_id })
+            Ok(CreateMultipartUploadResult {
+                upload_id,
+                lifecycle_abort,
+            })
         })
     }
 
@@ -10963,6 +11541,22 @@ impl Coordinator {
             meta_pg
                 .complete_multipart_commit(upload_id, &obj_req, &object_parts)
                 .map_err(ServerError::Metadata)?;
+            let stored = meta_pg
+                .get_object_meta(bucket, key)
+                .map_err(ServerError::Metadata)?;
+            let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
+                reason: format!(
+                    "stored object {} / {} is not live immediately after CompleteMultipartUpload",
+                    bucket, key
+                ),
+            })?;
+            let lifecycle_expiration = self.current_object_lifecycle_expiration(
+                &bucket_info,
+                key,
+                live_record.tags.as_deref(),
+                live_record.size,
+                live_record.last_modified,
+            )?;
 
             if let Some(ref payload) = stale_payload {
                 match payload {
@@ -11003,6 +11597,7 @@ impl Coordinator {
                 checksum_algorithm: checksum_algo,
                 checksum_type,
                 checksum_value,
+                lifecycle_expiration,
             })
         })
     }
@@ -11194,6 +11789,11 @@ impl Coordinator {
             next_part_number_marker: resp.next_part_number_marker,
             checksum_algorithm: upload.checksum.map(MultipartChecksumConfig::algorithm),
             checksum_type: upload.checksum.map(MultipartChecksumConfig::checksum_type),
+            lifecycle_abort: self.multipart_lifecycle_abort_headers(
+                &bucket_info,
+                key,
+                upload.initiated_at,
+            )?,
         })
     }
 
@@ -11767,6 +12367,47 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
         coord.delete_bucket_policy(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
+    }
+
+    fn put_bucket_lifecycle_test(
+        coord: &Coordinator,
+        name: &str,
+        config: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        coord.put_bucket_lifecycle(&put_bucket_config_request_with_expected_owner(
+            name,
+            config,
+            requester,
+            expected_bucket_owner,
+        ))
+    }
+
+    fn get_bucket_lifecycle_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<Option<String>, ServerError> {
+        coord.get_bucket_lifecycle(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
+    }
+
+    fn delete_bucket_lifecycle_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        coord.delete_bucket_lifecycle(&bucket_request_with_expected_owner(
             name,
             requester,
             expected_bucket_owner,
@@ -12456,6 +13097,165 @@ mod tests {
             get_bucket_policy_test(&coord, "bucket", test_helpers::requester("owner-a"), None)
                 .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn bucket_lifecycle_round_trips() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: test_helpers::requester("owner-a"),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+
+        let lifecycle = "<LifecycleConfiguration>\
+            <Rule>\
+                <ID>expire-current</ID>\
+                <Filter><Prefix>logs/</Prefix></Filter>\
+                <Status>Enabled</Status>\
+                <Expiration><Days>3</Days></Expiration>\
+            </Rule>\
+        </LifecycleConfiguration>";
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            lifecycle,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            get_bucket_lifecycle_test(&coord, "bucket", test_helpers::requester("owner-a"), None)
+                .unwrap(),
+            Some(lifecycle.to_string())
+        );
+
+        delete_bucket_lifecycle_test(&coord, "bucket", test_helpers::requester("owner-a"), None)
+            .unwrap();
+        delete_bucket_lifecycle_test(&coord, "bucket", test_helpers::requester("owner-a"), None)
+            .unwrap();
+
+        assert_eq!(
+            get_bucket_lifecycle_test(&coord, "bucket", test_helpers::requester("owner-a"), None)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn evaluate_current_object_lifecycle_expiration_selects_earliest_matching_rule() {
+        let config = BucketLifecycleConfiguration {
+            rules: vec![
+                storage::LifecycleRule {
+                    id: Some("later".to_string()),
+                    status: LifecycleRuleStatus::Enabled,
+                    filter: storage::LifecycleRuleFilter {
+                        prefix: Some("logs/".to_string()),
+                        ..storage::LifecycleRuleFilter::default()
+                    },
+                    expiration: Some(LifecycleExpiration::Days(
+                        std::num::NonZeroU32::new(30).unwrap(),
+                    )),
+                    noncurrent_version_expiration: None,
+                    abort_incomplete_multipart_upload: None,
+                },
+                storage::LifecycleRule {
+                    id: Some("earlier".to_string()),
+                    status: LifecycleRuleStatus::Enabled,
+                    filter: storage::LifecycleRuleFilter {
+                        prefix: Some("logs/".to_string()),
+                        tags: vec![storage::LifecycleTag {
+                            key: "env".to_string(),
+                            value: "prod".to_string(),
+                        }],
+                        object_size_greater_than: Some(10),
+                        object_size_less_than: None,
+                        explicit_filter: true,
+                    },
+                    expiration: Some(LifecycleExpiration::Days(
+                        std::num::NonZeroU32::new(1).unwrap(),
+                    )),
+                    noncurrent_version_expiration: None,
+                    abort_incomplete_multipart_upload: None,
+                },
+            ],
+        };
+        let tags = vec![("env".to_string(), "prod".to_string())];
+        let header = Coordinator::evaluate_current_object_lifecycle_expiration(
+            &config,
+            "logs/app.txt",
+            &tags,
+            20,
+            1_700_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(header.rule_id.as_deref(), Some("earlier"));
+        assert_eq!(
+            header.expiry_time_millis,
+            Coordinator::lifecycle_day_based_deadline(1_700_000_000_000, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn evaluate_multipart_lifecycle_abort_headers_matches_prefix_rule() {
+        let config = BucketLifecycleConfiguration {
+            rules: vec![
+                storage::LifecycleRule {
+                    id: Some("skip-tagged".to_string()),
+                    status: LifecycleRuleStatus::Enabled,
+                    filter: storage::LifecycleRuleFilter {
+                        prefix: Some("uploads/".to_string()),
+                        tags: vec![storage::LifecycleTag {
+                            key: "env".to_string(),
+                            value: "prod".to_string(),
+                        }],
+                        object_size_greater_than: None,
+                        object_size_less_than: None,
+                        explicit_filter: true,
+                    },
+                    expiration: None,
+                    noncurrent_version_expiration: None,
+                    abort_incomplete_multipart_upload: Some(
+                        storage::AbortIncompleteMultipartUpload {
+                            days_after_initiation: std::num::NonZeroU32::new(2).unwrap(),
+                        },
+                    ),
+                },
+                storage::LifecycleRule {
+                    id: Some("abort-prefix".to_string()),
+                    status: LifecycleRuleStatus::Enabled,
+                    filter: storage::LifecycleRuleFilter {
+                        prefix: Some("uploads/".to_string()),
+                        ..storage::LifecycleRuleFilter::default()
+                    },
+                    expiration: None,
+                    noncurrent_version_expiration: None,
+                    abort_incomplete_multipart_upload: Some(
+                        storage::AbortIncompleteMultipartUpload {
+                            days_after_initiation: std::num::NonZeroU32::new(7).unwrap(),
+                        },
+                    ),
+                },
+            ],
+        };
+        let header = Coordinator::evaluate_multipart_lifecycle_abort_headers(
+            &config,
+            "uploads/archive.bin",
+            1_700_000_000_000,
+        )
+        .unwrap();
+        assert_eq!(header.rule_id.as_deref(), Some("abort-prefix"));
+        assert_eq!(
+            header.abort_time_millis,
+            Coordinator::lifecycle_day_based_deadline(1_700_000_000_000, 7).unwrap()
         );
     }
 
@@ -18668,6 +19468,104 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn bucket_lifecycle_cache_invalidates_across_coordinators_on_replace() {
+        let tmp = test_util::tempdir();
+        let (admin, reader) = setup_coordinators_with_pg_count(tmp.path(), 4);
+        admin
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        test_helpers::put_object(
+            &admin,
+            &PutObjectRequest {
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "logs/key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        put_bucket_lifecycle_test(
+            &admin,
+            "bucket",
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>expire-soon</ID>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>1</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>",
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        let first = reader
+            .head_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "logs/key",
+                    None,
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap()
+            .lifecycle_expiration
+            .unwrap();
+        assert_eq!(first.rule_id.as_deref(), Some("expire-soon"));
+
+        put_bucket_lifecycle_test(
+            &admin,
+            "bucket",
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>expire-later</ID>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>30</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>",
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        let second = reader
+            .head_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "logs/key",
+                    None,
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap()
+            .lifecycle_expiration
+            .unwrap();
+        assert_eq!(second.rule_id.as_deref(), Some("expire-later"));
+        assert!(second.expiry_time_millis > first.expiry_time_millis);
     }
 
     #[test]

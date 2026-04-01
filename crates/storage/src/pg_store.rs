@@ -890,12 +890,12 @@ impl PgStore {
             Self::parse_canonical_user_id(owner_canonical_id_raw, 2, "owner_canonical_id")?;
         let object_lock = Self::parse_bucket_object_lock(
             (
-                row.get::<_, i64>(20)?,
-                row.get::<_, Option<u8>>(21)?,
-                row.get::<_, Option<i64>>(22)?,
-                row.get::<_, Option<i64>>(23)?,
+                row.get::<_, i64>(22)?,
+                row.get::<_, Option<u8>>(23)?,
+                row.get::<_, Option<i64>>(24)?,
+                row.get::<_, Option<i64>>(25)?,
             ),
-            [20, 21, 22, 23],
+            [22, 23, 24, 25],
         )?;
         let acl_grants = Self::parse_acl_grants(row.get::<_, String>(7)?, 7, "acl_grants")?;
         Ok(BucketInfo {
@@ -930,8 +930,10 @@ impl PgStore {
             bucket_policy: row.get(16)?,
             bucket_policy_public: row.get::<_, i64>(17)? != 0,
             bucket_policy_generation: row.get::<_, i64>(18)? as u64,
+            bucket_lifecycle: row.get(19)?,
+            bucket_lifecycle_generation: row.get::<_, i64>(20)? as u64,
             encryption: BucketEncryptionConfig {
-                sse_c_blocked: row.get::<_, i64>(19)? != 0,
+                sse_c_blocked: row.get::<_, i64>(21)? != 0,
             },
         })
     }
@@ -1507,7 +1509,7 @@ impl PgMetadataStore for PgStore {
     fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, bucket_lifecycle, bucket_lifecycle_generation, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 Self::row_to_bucket_info,
@@ -1533,7 +1535,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, bucket_lifecycle, bucket_lifecycle_generation, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
                  FROM buckets WHERE owner_principal = ?1 AND state = ?2 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -1983,6 +1985,67 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete bucket policy",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(())
+    }
+
+    fn put_bucket_lifecycle(&self, name: &str, config: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets \
+                 SET bucket_lifecycle = ?1, \
+                     bucket_lifecycle_generation = bucket_lifecycle_generation + 1 \
+                 WHERE name = ?2",
+                params![config, name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket lifecycle",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_bucket_lifecycle(&self, name: &str) -> Result<Option<String>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT bucket_lifecycle FROM buckets WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket lifecycle",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            })
+    }
+
+    fn delete_bucket_lifecycle(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets \
+                 SET bucket_lifecycle = NULL, \
+                     bucket_lifecycle_generation = bucket_lifecycle_generation + 1 \
+                 WHERE name = ?1",
+                params![name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket lifecycle",
                 source: e,
             })?;
         if updated == 0 {

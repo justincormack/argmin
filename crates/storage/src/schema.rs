@@ -342,6 +342,8 @@ CREATE TABLE IF NOT EXISTS buckets (
     bucket_policy    TEXT,
     bucket_policy_public INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_public IN (0, 1)),
     bucket_policy_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_generation >= 0),
+    bucket_lifecycle TEXT,
+    bucket_lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_lifecycle_generation >= 0),
     sse_c_blocked    INTEGER NOT NULL DEFAULT 0 CHECK (sse_c_blocked IN (0, 1)),
     object_lock_enabled INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_enabled IN (0, 1)),
     object_lock_default_mode INTEGER CHECK (
@@ -400,6 +402,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     migrate_acl_grant_columns(conn)?;
     migrate_bucket_write_reservation_columns(conn)?;
     migrate_bucket_policy_columns(conn)?;
+    migrate_bucket_lifecycle_columns(conn)?;
     migrate_multipart_upload_tag_columns(conn)?;
     create_object_lock_triggers(conn)?;
     Ok(())
@@ -477,6 +480,22 @@ fn migrate_bucket_policy_columns(conn: &Connection) -> Result<(), rusqlite::Erro
         }
         Err(e) => Err(e),
     }
+}
+
+fn migrate_bucket_lifecycle_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
+    add_column_if_missing(
+        conn,
+        "buckets",
+        "bucket_lifecycle",
+        "ALTER TABLE buckets ADD COLUMN bucket_lifecycle TEXT",
+    )?;
+    add_column_if_missing(
+        conn,
+        "buckets",
+        "bucket_lifecycle_generation",
+        "ALTER TABLE buckets ADD COLUMN bucket_lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_lifecycle_generation >= 0)",
+    )?;
+    Ok(())
 }
 
 fn migrate_segment_crc_columns(conn: &Connection) -> Result<(), rusqlite::Error> {

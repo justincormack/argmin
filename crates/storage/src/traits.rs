@@ -140,6 +140,15 @@ pub trait PgMetadataStore {
     /// Delete a bucket's policy document. Idempotent.
     fn delete_bucket_policy(&self, name: &str) -> Result<(), MetadataError>;
 
+    /// Replace a bucket's lifecycle configuration XML.
+    fn put_bucket_lifecycle(&self, name: &str, config: &str) -> Result<(), MetadataError>;
+
+    /// Retrieve a bucket's lifecycle configuration XML. Returns None if not set.
+    fn get_bucket_lifecycle(&self, name: &str) -> Result<Option<String>, MetadataError>;
+
+    /// Delete a bucket's lifecycle configuration. Idempotent.
+    fn delete_bucket_lifecycle(&self, name: &str) -> Result<(), MetadataError>;
+
     /// Update a bucket's public ACL flags.
     fn put_bucket_acl(
         &self,

@@ -15,7 +15,7 @@ use s3_types::{
     CanonicalUserId, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention,
     RetentionPeriod,
 };
-use storage::BucketEncryptionConfig;
+use storage::{BucketEncryptionConfig, BucketLifecycleConfiguration};
 
 use super::response::format_version_id;
 
@@ -1847,6 +1847,27 @@ pub fn get_bucket_encryption_xml(config: BucketEncryptionConfig) -> String {
          </ServerSideEncryptionConfiguration>",
         encryption_type
     )
+}
+
+pub fn parse_bucket_lifecycle_configuration_xml(
+    data: &[u8],
+) -> Result<BucketLifecycleConfiguration, ServerError> {
+    storage::parse_lifecycle_configuration_xml(data).map_err(|error| match error {
+        storage::LifecycleConfigError::MalformedXml { reason } => {
+            ServerError::MalformedXML { reason }
+        }
+        storage::LifecycleConfigError::InvalidArgument { reason } => {
+            ServerError::InvalidArgument { reason }
+        }
+        storage::LifecycleConfigError::NotImplemented { feature } => {
+            ServerError::NotImplemented { feature }
+        }
+    })
+}
+
+#[must_use]
+pub fn get_bucket_lifecycle_configuration_xml(config: &BucketLifecycleConfiguration) -> String {
+    storage::render_lifecycle_configuration_xml(config)
 }
 
 /// Format a `ListVersionsResult` XML response.
@@ -3800,6 +3821,8 @@ mod tests {
             bucket_policy_present: false,
             bucket_policy_public: false,
             bucket_policy_generation: 0,
+            bucket_lifecycle_present: false,
+            bucket_lifecycle_generation: 0,
             encryption: BucketEncryptionConfig::default(),
         }];
         let owner_canonical_id = CanonicalUserId::from_principal("owner");
@@ -3808,6 +3831,55 @@ mod tests {
         assert!(xml.contains("ListAllMyBucketsResult"));
         assert!(xml.contains(&format!("<ID>{}</ID>", owner_canonical_id.as_str())));
         assert!(xml.contains("<DisplayName>Owner A</DisplayName>"));
+    }
+
+    #[test]
+    fn parse_bucket_lifecycle_configuration_invalid_status_maps_to_malformed_xml() {
+        let err = parse_bucket_lifecycle_configuration_xml(
+            b"<LifecycleConfiguration>\
+                <Rule>\
+                    <Status>enabled</Status>\
+                    <Expiration><Days>1</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::MalformedXML { .. }));
+    }
+
+    #[test]
+    fn parse_bucket_lifecycle_configuration_transition_maps_to_not_implemented() {
+        let err = parse_bucket_lifecycle_configuration_xml(
+            b"<LifecycleConfiguration>\
+                <Rule>\
+                    <Status>Enabled</Status>\
+                    <Transition><Days>1</Days></Transition>\
+                </Rule>\
+            </LifecycleConfiguration>",
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::NotImplemented { .. }));
+    }
+
+    #[test]
+    fn get_bucket_lifecycle_configuration_xml_renders_canonical_xml() {
+        let config = parse_bucket_lifecycle_configuration_xml(
+            b"<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>expire-current</ID>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>3</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>",
+        )
+        .unwrap();
+        let xml = get_bucket_lifecycle_configuration_xml(&config);
+        assert!(xml.contains("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+        assert!(xml.contains("<LifecycleConfiguration"));
+        assert!(xml.contains("<ID>expire-current</ID>"));
+        assert!(xml.contains("<Prefix>logs/</Prefix>"));
+        assert!(xml.contains("<Days>3</Days>"));
     }
 
     #[test]
@@ -5670,6 +5742,7 @@ mod tests {
             next_part_number_marker: None,
             checksum_algorithm: None,
             checksum_type: None,
+            lifecycle_abort: None,
         };
         let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
         assert!(xml.contains("<Bucket>mybucket</Bucket>"));
@@ -5705,6 +5778,7 @@ mod tests {
             next_part_number_marker: None,
             checksum_algorithm: None,
             checksum_type: None,
+            lifecycle_abort: None,
         };
         let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
         assert!(xml.contains("<PartNumber>1</PartNumber>"));
@@ -5730,6 +5804,7 @@ mod tests {
             next_part_number_marker: Some(3),
             checksum_algorithm: None,
             checksum_type: None,
+            lifecycle_abort: None,
         };
         let xml = list_parts_xml("mybucket", "mykey", "uid1", Some(2), 1, &result);
         assert!(xml.contains("<PartNumberMarker>2</PartNumberMarker>"));
@@ -5765,6 +5840,7 @@ mod tests {
             next_part_number_marker: None,
             checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
             checksum_type: None,
+            lifecycle_abort: None,
         };
         let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
         assert!(xml.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"));
@@ -5787,6 +5863,7 @@ mod tests {
             next_part_number_marker: None,
             checksum_algorithm: None,
             checksum_type: None,
+            lifecycle_abort: None,
         };
         let xml = list_parts_xml("mybucket", "mykey", "uid1", None, 1000, &result);
         // Without checksum_algorithm, per-part checksum elements should not be rendered

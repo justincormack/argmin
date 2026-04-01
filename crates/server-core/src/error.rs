@@ -103,6 +103,9 @@ pub enum ServerError {
     #[error("no bucket policy: {bucket}")]
     NoSuchBucketPolicy { bucket: String },
 
+    #[error("no lifecycle configuration: {bucket}")]
+    NoSuchLifecycleConfiguration { bucket: String },
+
     #[error("malformed policy: {reason}")]
     MalformedPolicy { reason: String },
 
@@ -231,6 +234,7 @@ impl ServerError {
                 "NoSuchPublicAccessBlockConfiguration"
             }
             Self::NoSuchBucketPolicy { .. } => "NoSuchBucketPolicy",
+            Self::NoSuchLifecycleConfiguration { .. } => "NoSuchLifecycleConfiguration",
             Self::MalformedPolicy { .. } => "MalformedPolicy",
             Self::OwnershipControlsNotFound { .. } => "OwnershipControlsNotFoundError",
             Self::ObjectLockConfigurationNotFound { .. } => "ObjectLockConfigurationNotFoundError",
@@ -289,9 +293,9 @@ impl ServerError {
             Self::InvalidChunkSize { .. } => 403,
             Self::NoSuchCorsConfiguration { .. } => 404,
             Self::NoSuchTagSet { .. } => 404,
-            Self::NoSuchPublicAccessBlockConfiguration { .. } | Self::NoSuchBucketPolicy { .. } => {
-                404
-            }
+            Self::NoSuchPublicAccessBlockConfiguration { .. }
+            | Self::NoSuchBucketPolicy { .. }
+            | Self::NoSuchLifecycleConfiguration { .. } => 404,
             Self::MalformedPolicy { .. } => 400,
             Self::OwnershipControlsNotFound { .. } => 404,
             Self::ObjectLockConfigurationNotFound { .. } => 404,

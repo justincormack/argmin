@@ -1,9 +1,10 @@
 //! Build HTTP responses for S3 operations.
 
 use crate::coordinator::{
-    BucketSummary, CopyObjectResult, DeleteObjectResult, DeleteObjectsResult, GetBucketAclResult,
-    GetObjectAclResult, GetObjectPartResult, GetObjectRangeResult, GetObjectResult,
-    HeadObjectPartResult, HeadObjectResult, ListObjectVersionsResult, ListObjectsResult,
+    BucketSummary, CompleteMultipartUploadResult, CopyObjectResult, DeleteObjectResult,
+    DeleteObjectsResult, GetBucketAclResult, GetObjectAclResult, GetObjectPartResult,
+    GetObjectRangeResult, GetObjectResult, HeadObjectPartResult, HeadObjectResult,
+    LifecycleAbortHeaders, LifecycleExpirationHeader, ListObjectVersionsResult, ListObjectsResult,
     ListPartsResult, PutObjectResult, ReadHandle,
 };
 use crate::error::ServerError;
@@ -239,6 +240,41 @@ impl S3Response {
         self
     }
 
+    fn apply_lifecycle_expiration_header(
+        self,
+        expiration: Option<&LifecycleExpirationHeader>,
+    ) -> Self {
+        let Some(expiration) = expiration else {
+            return self;
+        };
+        let value = match &expiration.rule_id {
+            Some(rule_id) => format!(
+                "expiry-date=\"{}\", rule-id=\"{}\"",
+                format_http_date(expiration.expiry_time_millis),
+                uri_encode(rule_id)
+            ),
+            None => format!(
+                "expiry-date=\"{}\"",
+                format_http_date(expiration.expiry_time_millis)
+            ),
+        };
+        self.header("x-amz-expiration", &value)
+    }
+
+    fn apply_lifecycle_abort_headers(mut self, abort: Option<&LifecycleAbortHeaders>) -> Self {
+        let Some(abort) = abort else {
+            return self;
+        };
+        self = self.header(
+            "x-amz-abort-date",
+            &format_http_date(abort.abort_time_millis),
+        );
+        if let Some(rule_id) = &abort.rule_id {
+            self = self.header("x-amz-abort-rule-id", &uri_encode(rule_id));
+        }
+        self
+    }
+
     /// Build a response for a successful `PutObject`.
     #[must_use]
     pub fn put_object(result: &PutObjectResult) -> Self {
@@ -247,7 +283,7 @@ impl S3Response {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
-        resp
+        resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
     }
 
     /// Build a response for a successful POST Object.
@@ -284,7 +320,7 @@ impl S3Response {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
-        resp
+        resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
     }
 
     /// Build a response for a successful `CopyObject`.
@@ -296,7 +332,8 @@ impl S3Response {
             let vid = format_version_id(result.version_id);
             resp.headers.push(("x-amz-version-id".to_string(), vid));
         }
-        resp.apply_sse_customer_headers(result.sse_customer.as_ref())
+        resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_sse_customer_headers(result.sse_customer.as_ref())
     }
 
     /// Build a response for a successful `GetObject`.
@@ -321,7 +358,8 @@ impl S3Response {
             resp = resp.apply_checksum_mode_headers(&result.system_metadata);
         }
 
-        resp.apply_sse_customer_headers(result.sse_customer.as_ref())
+        resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_sse_customer_headers(result.sse_customer.as_ref())
             .streaming_body(result.body, result.size)
     }
 
@@ -364,7 +402,8 @@ impl S3Response {
             resp = resp.apply_checksum_mode_headers(&result.system_metadata);
         }
 
-        resp.apply_sse_customer_headers(result.sse_customer.as_ref())
+        resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_sse_customer_headers(result.sse_customer.as_ref())
     }
 
     /// Build a response for `HeadObject` with partNumber.
@@ -396,7 +435,7 @@ impl S3Response {
             resp = resp.header("x-amz-checksum-type", checksum_type.as_str());
         }
 
-        resp
+        resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
     }
 
     /// Build a response for a successful range `GetObject` (206 Partial Content).
@@ -420,7 +459,8 @@ impl S3Response {
             .apply_user_metadata_headers(&result.metadata)
             .apply_object_lock_headers(result.object_lock);
 
-        resp.apply_sse_customer_headers(result.sse_customer.as_ref())
+        resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_sse_customer_headers(result.sse_customer.as_ref())
             .streaming_body(result.body, result.range_end - result.range_start + 1)
     }
 
@@ -464,7 +504,8 @@ impl S3Response {
             resp = resp.header("x-amz-checksum-type", checksum_type.as_str());
         }
 
-        resp.apply_sse_customer_headers(result.sse_customer.as_ref())
+        resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_sse_customer_headers(result.sse_customer.as_ref())
             .streaming_body(result.body, result.part_size)
     }
 
@@ -726,6 +767,24 @@ impl S3Response {
         Self::new(204)
     }
 
+    /// Build a response for `PutBucketLifecycleConfiguration` (200 OK, no body).
+    #[must_use]
+    pub fn put_bucket_lifecycle() -> Self {
+        Self::new(200)
+    }
+
+    /// Build a response for `GetBucketLifecycleConfiguration` (200 OK, XML body).
+    #[must_use]
+    pub fn get_bucket_lifecycle(xml: &str) -> Self {
+        Self::new(200).xml_body(xml.to_string())
+    }
+
+    /// Build a response for `DeleteBucketLifecycle` (204 No Content).
+    #[must_use]
+    pub fn delete_bucket_lifecycle() -> Self {
+        Self::new(204)
+    }
+
     /// Build a response for `PutObjectTagging` (200 OK, no body).
     #[must_use]
     pub fn put_object_tagging() -> Self {
@@ -880,6 +939,7 @@ impl S3Response {
         upload_id: &str,
         checksum_algorithm: Option<ChecksumAlgorithm>,
         checksum_type: Option<ChecksumType>,
+        lifecycle_abort: Option<&LifecycleAbortHeaders>,
         sse_customer: Option<&SseCustomerResponseHeaders>,
     ) -> Self {
         let body = xml::initiate_multipart_upload_xml(
@@ -891,6 +951,7 @@ impl S3Response {
         );
         Self::new(200)
             .xml_body(body)
+            .apply_lifecycle_abort_headers(lifecycle_abort)
             .apply_sse_customer_headers(sse_customer)
     }
 
@@ -928,30 +989,26 @@ impl S3Response {
     pub fn complete_multipart_upload(
         bucket: &str,
         key: &str,
-        etag: &str,
-        version_id: VersionId,
-        checksum_algorithm: Option<ChecksumAlgorithm>,
-        checksum_type: Option<ChecksumType>,
-        checksum_value: Option<&str>,
+        result: &CompleteMultipartUploadResult,
     ) -> Self {
         let body = xml::complete_multipart_upload_xml(
             bucket,
             key,
-            etag,
-            checksum_algorithm,
-            checksum_value,
+            &result.etag,
+            result.checksum_algorithm,
+            result.checksum_value.as_deref(),
         );
         let mut resp = Self::new(200).xml_body(body);
-        if version_id.is_versioned() {
-            resp = resp.header("x-amz-version-id", &format_version_id(version_id));
+        if result.version_id.is_versioned() {
+            resp = resp.header("x-amz-version-id", &format_version_id(result.version_id));
         }
-        if let Some(algo) = checksum_algorithm {
+        if let Some(algo) = result.checksum_algorithm {
             resp = resp.header("x-amz-checksum-algorithm", algo.as_str());
         }
-        if let Some(ct) = checksum_type {
+        if let Some(ct) = result.checksum_type {
             resp = resp.header("x-amz-checksum-type", ct.as_str());
         }
-        resp
+        resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
     }
 
     /// Build a response for `AbortMultipartUpload` (204 No Content).
@@ -999,7 +1056,9 @@ impl S3Response {
             max_parts,
             result,
         );
-        Self::new(200).xml_body(body)
+        Self::new(200)
+            .xml_body(body)
+            .apply_lifecycle_abort_headers(result.lifecycle_abort.as_ref())
     }
 
     /// Build a 200 response for a CORS preflight (headers added by caller).
@@ -1279,6 +1338,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::put_object(&result);
         assert_eq!(resp.status_code, 200);
@@ -1292,6 +1352,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::from_u64(42),
+            lifecycle_expiration: None,
         };
         let resp = S3Response::put_object(&result);
         assert_eq!(resp.status_code, 200);
@@ -1304,6 +1365,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::post_object(
             &result,
@@ -1328,6 +1390,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::post_object(
             &result,
@@ -1350,6 +1413,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::post_object(
             &result,
@@ -1361,6 +1425,23 @@ mod tests {
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Location"), None);
         assert_eq!(find_header(&resp, "ETag"), Some("\"abc123\""));
+    }
+
+    #[test]
+    fn put_object_response_includes_lifecycle_expiration_header() {
+        let result = PutObjectResult {
+            etag: "\"abc123\"".to_string(),
+            version_id: VersionId::Null,
+            lifecycle_expiration: Some(LifecycleExpirationHeader {
+                expiry_time_millis: 1_705_321_845_000,
+                rule_id: Some("expire current".to_string()),
+            }),
+        };
+        let resp = S3Response::put_object(&result);
+        assert_eq!(
+            find_header(&resp, "x-amz-expiration"),
+            Some("expiry-date=\"Mon, 15 Jan 2024 12:30:45 GMT\", rule-id=\"expire%20current\"")
+        );
     }
 
     // ── get_object ────────────────────────────────────────────────────
@@ -1378,6 +1459,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, None);
         assert_eq!(resp.status_code, 200);
@@ -1398,6 +1480,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, None);
         assert_eq!(
@@ -1419,6 +1502,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, None);
         assert_eq!(find_header(&resp, "x-amz-meta-author"), Some("alice"));
@@ -1444,6 +1528,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, None);
         assert_eq!(find_header(&resp, "Content-Type"), Some("text/html"));
@@ -1476,6 +1561,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, Some("ENABLED"));
         assert_eq!(find_header(&resp, "x-amz-checksum-crc32"), Some("AAAAAA=="));
@@ -1501,6 +1587,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, None);
         assert_eq!(find_header(&resp, "x-amz-checksum-crc32"), None);
@@ -1526,6 +1613,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, None);
         assert_eq!(
@@ -1539,6 +1627,31 @@ mod tests {
         assert_eq!(
             find_header(&resp, "x-amz-object-lock-legal-hold"),
             Some("ON")
+        );
+    }
+
+    #[test]
+    fn get_object_response_includes_lifecycle_expiration_without_rule_id() {
+        let result = GetObjectResult {
+            sse_customer: None,
+            body: ReadHandle::from_buffered_bytes(b"hello".to_vec()),
+            metadata: MetadataBlob::new(),
+            system_metadata: SystemMetadata::new(),
+            object_lock: s3_types::ObjectLockState::default(),
+            etag: "\"etag\"".into(),
+            size: 5,
+            last_modified: 0,
+            version_id: VersionId::Null,
+            tags: None,
+            lifecycle_expiration: Some(LifecycleExpirationHeader {
+                expiry_time_millis: 1_705_321_845_000,
+                rule_id: None,
+            }),
+        };
+        let resp = S3Response::get_object(result, None);
+        assert_eq!(
+            find_header(&resp, "x-amz-expiration"),
+            Some("expiry-date=\"Mon, 15 Jan 2024 12:30:45 GMT\"")
         );
     }
 
@@ -1556,6 +1669,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, None);
         assert_eq!(resp.status_code, 200);
@@ -1577,6 +1691,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, None);
         assert_eq!(
@@ -1600,6 +1715,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, None);
         assert_eq!(find_header(&resp, "Content-Encoding"), Some("br"));
@@ -1618,6 +1734,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, None);
         assert_eq!(find_header(&resp, "x-amz-meta-tag"), Some("value"));
@@ -1638,6 +1755,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, Some("ENABLED"));
         assert_eq!(find_header(&resp, "x-amz-checksum-crc32"), Some("AAAAAA=="));
@@ -1659,6 +1777,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, None);
         assert_eq!(find_header(&resp, "x-amz-checksum-crc32"), None);
@@ -1683,6 +1802,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, None);
         assert_eq!(
@@ -1694,6 +1814,30 @@ mod tests {
             Some("2026-04-01T00:00:00.000Z")
         );
         assert_eq!(find_header(&resp, "x-amz-object-lock-legal-hold"), None);
+    }
+
+    #[test]
+    fn head_object_response_includes_lifecycle_expiration_header() {
+        let result = HeadObjectResult {
+            sse_customer: None,
+            metadata: MetadataBlob::new(),
+            system_metadata: SystemMetadata::new(),
+            object_lock: s3_types::ObjectLockState::default(),
+            etag: "\"e\"".into(),
+            size: 0,
+            last_modified: 0,
+            version_id: VersionId::Null,
+            tags: None,
+            lifecycle_expiration: Some(LifecycleExpirationHeader {
+                expiry_time_millis: 1_705_321_845_000,
+                rule_id: Some("expire/head".to_string()),
+            }),
+        };
+        let resp = S3Response::head_object(&result, None);
+        assert_eq!(
+            find_header(&resp, "x-amz-expiration"),
+            Some("expiry-date=\"Mon, 15 Jan 2024 12:30:45 GMT\", rule-id=\"expire%2Fhead\"")
+        );
     }
 
     // ── delete_object ─────────────────────────────────────────────────
@@ -1800,6 +1944,8 @@ mod tests {
             bucket_policy_present: false,
             bucket_policy_public: false,
             bucket_policy_generation: 0,
+            bucket_lifecycle_present: false,
+            bucket_lifecycle_generation: 0,
             encryption: BucketEncryptionConfig::default(),
         };
         let resp = S3Response::head_bucket(&info);
@@ -1845,6 +1991,8 @@ mod tests {
             bucket_policy_present: false,
             bucket_policy_public: false,
             bucket_policy_generation: 0,
+            bucket_lifecycle_present: false,
+            bucket_lifecycle_generation: 0,
             encryption: BucketEncryptionConfig::default(),
         }];
         let owner_canonical_id = CanonicalUserId::from_principal("owner");
@@ -1857,6 +2005,70 @@ mod tests {
         assert!(body.contains("ListAllMyBucketsResult"));
         assert!(body.contains(owner_canonical_id.as_str()));
         assert!(body.contains("<DisplayName>Owner A</DisplayName>"));
+    }
+
+    #[test]
+    fn bucket_lifecycle_responses() {
+        let put = S3Response::put_bucket_lifecycle();
+        assert_eq!(put.status_code, 200);
+        assert!(put.body.is_empty());
+
+        let get = S3Response::get_bucket_lifecycle(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration/>",
+        );
+        assert_eq!(get.status_code, 200);
+        assert_eq!(find_header(&get, "Content-Type"), Some("application/xml"));
+
+        let delete = S3Response::delete_bucket_lifecycle();
+        assert_eq!(delete.status_code, 204);
+        assert!(delete.body.is_empty());
+    }
+
+    #[test]
+    fn create_multipart_upload_response_includes_lifecycle_abort_headers() {
+        let resp = S3Response::create_multipart_upload(
+            "bucket",
+            "key",
+            "upload-1",
+            Some(ChecksumAlgorithm::Sha256),
+            Some(ChecksumType::FullObject),
+            Some(&LifecycleAbortHeaders {
+                abort_time_millis: 1_705_321_845_000,
+                rule_id: Some("abort upload".to_string()),
+            }),
+            None,
+        );
+        assert_eq!(
+            find_header(&resp, "x-amz-abort-date"),
+            Some("Mon, 15 Jan 2024 12:30:45 GMT")
+        );
+        assert_eq!(
+            find_header(&resp, "x-amz-abort-rule-id"),
+            Some("abort%20upload")
+        );
+    }
+
+    #[test]
+    fn complete_multipart_upload_response_includes_lifecycle_expiration_header() {
+        let resp = S3Response::complete_multipart_upload(
+            "bucket",
+            "key",
+            &CompleteMultipartUploadResult {
+                etag: "\"etag\"".to_string(),
+                version_id: VersionId::Null,
+                checksum_algorithm: None,
+                checksum_type: None,
+                checksum_value: None,
+                lifecycle_expiration: Some(LifecycleExpirationHeader {
+                    expiry_time_millis: 1_705_321_845_000,
+                    rule_id: Some("complete".to_string()),
+                }),
+            },
+        );
+        assert_eq!(
+            find_header(&resp, "x-amz-expiration"),
+            Some("expiry-date=\"Mon, 15 Jan 2024 12:30:45 GMT\", rule-id=\"complete\"")
+        );
     }
 
     #[test]

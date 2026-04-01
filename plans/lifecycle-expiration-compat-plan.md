@@ -218,7 +218,7 @@ Add operations for:
 - `DELETE /bucket?lifecycle`
 
 Expected behavior:
-- `PUT` replaces the entire configuration, returns `200`
+- `PUT` requires `Content-MD5`, replaces the entire configuration, and returns `200`
 - `GET` on absent config returns `NoSuchLifecycleConfiguration` / `404`
 - `DELETE` is idempotent and returns `204`
 
@@ -332,7 +332,11 @@ part of the initial design.
 
 ## Implementation Phases
 
-### Phase 1: Lifecycle config CRUD and rule model
+Current status:
+- Phase 1 is complete.
+- Phases 2 through 5 remain pending.
+
+### Phase 1: Lifecycle config CRUD and rule model (Completed)
 
 Implement:
 - typed lifecycle model
@@ -347,6 +351,13 @@ Do not yet execute lifecycle actions, but do wire:
 - `x-amz-abort-*`
 
 This gives us lifecycle policy CRUD plus rule introspection first.
+
+Completed in the current implementation:
+- bucket lifecycle config CRUD
+- strict AWS-compatible lifecycle XML validation
+- `Content-MD5` enforcement for `PUT /bucket?lifecycle`
+- `x-amz-expiration` for current object versions
+- `x-amz-abort-*` for matching multipart uploads
 
 ### Phase 2: Current-version expiration
 
@@ -506,7 +517,7 @@ At the end of implementation, run:
 
 ## Recommended Ordering
 
-1. lifecycle rule model + CRUD
+1. lifecycle rule model + CRUD (completed)
 2. deterministic lifecycle clock / sweep hook
 3. current-version expiration
 4. noncurrent version expiration

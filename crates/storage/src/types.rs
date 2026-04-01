@@ -1163,6 +1163,10 @@ pub struct BucketInfo {
     pub bucket_policy_public: bool,
     /// Monotonic generation incremented on every bucket policy update/delete.
     pub bucket_policy_generation: u64,
+    /// Canonical lifecycle configuration XML (None = no lifecycle config).
+    pub bucket_lifecycle: Option<String>,
+    /// Monotonic generation incremented on every lifecycle update/delete.
+    pub bucket_lifecycle_generation: u64,
     /// Bucket encryption configuration subset currently modeled by storage.
     pub encryption: BucketEncryptionConfig,
 }
@@ -1198,6 +1202,8 @@ pub struct BucketFastPathInfo {
     pub bucket_policy_present: bool,
     pub bucket_policy_public: bool,
     pub bucket_policy_generation: u64,
+    pub bucket_lifecycle_present: bool,
+    pub bucket_lifecycle_generation: u64,
     pub encryption: BucketEncryptionConfig,
 }
 
@@ -1228,6 +1234,8 @@ impl From<BucketInfo> for BucketFastPathInfo {
             bucket_policy_present: info.bucket_policy.is_some(),
             bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
+            bucket_lifecycle_present: info.bucket_lifecycle.is_some(),
+            bucket_lifecycle_generation: info.bucket_lifecycle_generation,
             encryption: info.encryption,
         }
     }
@@ -1251,6 +1259,8 @@ impl From<&BucketInfo> for BucketFastPathInfo {
             bucket_policy_present: info.bucket_policy.is_some(),
             bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
+            bucket_lifecycle_present: info.bucket_lifecycle.is_some(),
+            bucket_lifecycle_generation: info.bucket_lifecycle_generation,
             encryption: info.encryption,
         }
     }
