@@ -3,10 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use ring::{digest, hmac};
-use s3_tests::{
-    build_client_with_ca, build_test_agent, create_public_bucket, sse_c_header_values,
-    test_sse_c_key, unique_bucket, TestServer, CTX,
-};
+use s3_tests::{create_public_bucket, sse_c_header_values, test_sse_c_key, unique_bucket, CTX};
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -407,53 +404,6 @@ fn test_presigned_sse_c_put_object() {
         assert_eq!(&data[..], body);
 
         cleanup(&bucket, &["uploaded-sse-c"]).await;
-    });
-}
-
-#[test]
-fn test_presigned_sse_c_put_requires_https() {
-    s3_tests::run(async {
-        let _server = TestServer::start_http().await;
-        let endpoint = _server.endpoint().to_string();
-        let client = build_client_with_ca(
-            &endpoint,
-            s3_tests::server::TEST_ACCESS_KEY,
-            s3_tests::server::TEST_SECRET_KEY,
-            s3_tests::server::TEST_REGION,
-            None,
-        )
-        .await;
-        let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
-
-        let body = b"presigned insecure sse-c put";
-        let customer_key = test_sse_c_key();
-        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
-
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .put_object()
-            .bucket(&bucket)
-            .key("uploaded-sse-c-http")
-            .sse_customer_algorithm("AES256")
-            .sse_customer_key(key_b64)
-            .sse_customer_key_md5(key_md5_b64)
-            .presigned(presign_config)
-            .await
-            .unwrap();
-
-        let agent = build_test_agent(&endpoint, None);
-        let mut resp = with_presigned_headers!(agent.put(presigned.uri()), presigned)
-            .send(&body[..])
-            .expect("transport error");
-        assert_eq!(resp.status().as_u16(), 400);
-        let body = resp.body_mut().read_to_string().unwrap_or_default();
-        assert!(
-            body.contains("<Code>InvalidArgument</Code>"),
-            "expected InvalidArgument, got {body}"
-        );
-
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
 

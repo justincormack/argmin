@@ -1943,6 +1943,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "s3-http-tests"
+version = "0.1.0"
+dependencies = [
+ "aws-sdk-s3",
+ "s3-tests",
+ "ureq",
+]
+
+[[package]]
 name = "s3-local-tests"
 version = "0.1.0"
 dependencies = [

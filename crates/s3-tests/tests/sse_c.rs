@@ -3,8 +3,7 @@ use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, ObjectAttributes};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, build_client_with_ca, err_status, sse_c_header_values, test_sse_c_key,
-    unique_bucket, TestServer, CTX,
+    assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -96,19 +95,6 @@ fn require_https_endpoint() {
         "SSE-C coverage requires an https:// endpoint; got {}",
         CTX.endpoint()
     );
-}
-
-async fn insecure_local_client() -> (TestServer, aws_sdk_s3::Client) {
-    let server = TestServer::start_http().await;
-    let client = build_client_with_ca(
-        server.endpoint(),
-        s3_tests::server::TEST_ACCESS_KEY,
-        s3_tests::server::TEST_SECRET_KEY,
-        s3_tests::server::TEST_REGION,
-        None,
-    )
-    .await;
-    (server, client)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -521,121 +507,6 @@ fn test_sse_c_put_rejects_key_without_algorithm() {
         assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidArgument");
 
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
-    });
-}
-
-#[test]
-fn test_sse_c_put_requires_https() {
-    s3_tests::run(async {
-        let (_server, client) = insecure_local_client().await;
-        let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
-
-        let key = test_sse_c_key();
-        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
-        let result = client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .sse_customer_algorithm("AES256")
-            .sse_customer_key(key_b64)
-            .sse_customer_key_md5(key_md5_b64)
-            .body(ByteStream::from_static(b"secret"))
-            .send()
-            .await;
-        assert_eq!(err_status(&result), 400);
-        assert_s3_err_code(&result, "InvalidArgument");
-
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
-    });
-}
-
-#[test]
-fn test_sse_c_get_and_head_require_https() {
-    s3_tests::run(async {
-        let (_server, client) = insecure_local_client().await;
-        let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"plain"))
-            .send()
-            .await
-            .unwrap();
-
-        let key = test_sse_c_key();
-        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
-
-        let head = client
-            .head_object()
-            .bucket(&bucket)
-            .key("obj")
-            .sse_customer_algorithm("AES256")
-            .sse_customer_key(key_b64.clone())
-            .sse_customer_key_md5(key_md5_b64.clone())
-            .send()
-            .await;
-        assert_eq!(err_status(&head), 400);
-
-        let get = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .sse_customer_algorithm("AES256")
-            .sse_customer_key(key_b64)
-            .sse_customer_key_md5(key_md5_b64)
-            .send()
-            .await;
-        assert_eq!(err_status(&get), 400);
-
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key("obj")
-            .send()
-            .await
-            .unwrap();
-        client.delete_bucket().bucket(&bucket).send().await.unwrap();
-    });
-}
-
-#[test]
-fn test_plain_http_without_sse_c_still_works() {
-    s3_tests::run(async {
-        let (_server, client) = insecure_local_client().await;
-        let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
-        client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .body(ByteStream::from_static(b"plain-http"))
-            .send()
-            .await
-            .unwrap();
-
-        let get = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            get.body.collect().await.unwrap().into_bytes().as_ref(),
-            b"plain-http"
-        );
-
-        client
-            .delete_object()
-            .bucket(&bucket)
-            .key("obj")
-            .send()
-            .await
-            .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }

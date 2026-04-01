@@ -11,7 +11,9 @@ and `AWS_SECRET_KEY` into the process environment.
 The external `s3-tests` harness now hard-fails if any of these are missing:
 
 - `S3_TEST_ENDPOINT`
-  - Must be `https://...`.
+  - Prefer `https://...` for full coverage.
+  - `http://...` is allowed for partial runs, but tests that explicitly require
+    HTTPS will fail.
 - `S3_TEST_ACCESS_KEY`
 - `S3_TEST_SECRET_KEY`
 - `S3_TEST_ACCOUNT_ID`
@@ -37,6 +39,30 @@ S3_TEST_REGION=us-east-1 \
 S3_TEST_BUCKET_PREFIX=claude-s3- \
 S3_TEST_TIMEOUT_SECS=30 \
 cargo test -p s3-tests --no-fail-fast
+```
+
+You can also point `S3_TEST_ENDPOINT` at `http://...` for exploratory or
+transport-specific runs. This is not the recommended configuration for the main
+suite, because HTTPS-sensitive coverage such as SSE-C checks will fail in that
+mode.
+
+HTTP-only transport checks live in `crates/s3-http-tests`. They reuse the same
+credentials and bucket prefix, but talk to an `http://` endpoint instead:
+
+- If `S3_TEST_HTTP_ENDPOINT` is set, it must be `http://...` and is used as-is.
+- Otherwise `s3-http-tests` derives `http://...` from `S3_TEST_ENDPOINT`.
+
+Recommended command:
+
+```bash
+eval "$(grep = .env)" && \
+S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
+S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
+S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
+S3_TEST_REGION=us-east-1 \
+S3_TEST_BUCKET_PREFIX=claude-s3- \
+S3_TEST_TIMEOUT_SECS=30 \
+cargo test -p s3-http-tests --no-fail-fast
 ```
 
 ## Cross-account requirements
@@ -105,7 +131,6 @@ The local-only `s3-local-tests` crate currently contains:
 
 - `bucket_naming`
 - `test_list_buckets_anonymous`
-- `test_post_object_sse_c_requires_https`
 
 These do not run as part of the AWS-backed `s3-tests` package command above.
 
@@ -115,8 +140,6 @@ Run it locally with the embedded server:
 cargo test -p s3-local-tests
 ```
 
-Most HTTP-only negative SSE-C checks are still exercised during AWS runs by
-using an embedded local HTTP server inside the `s3-tests` package. The POST
-Object `requires_https` case is local-only instead, because it is specifically
-testing rejection of insecure transport rather than AWS-compatible external
-behavior.
+The separate `s3-http-tests` crate covers the small set of transport-sensitive
+AWS checks that must run over plain HTTP, such as rejecting SSE-C on insecure
+connections.

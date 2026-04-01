@@ -48,8 +48,10 @@ pub fn run<F: std::future::Future>(f: F) -> F::Output {
 /// Test context providing an S3 client and (optionally) a local server.
 ///
 /// When `S3_TEST_ENDPOINT` is set, connects to an external S3-compatible
-/// endpoint with the provided credentials. Otherwise, starts a local
-/// `TestServer` on a random port with well-known test credentials.
+/// endpoint with the provided credentials. HTTPS is the recommended mode for
+/// full coverage, but HTTP is allowed for partial runs where HTTPS-dependent
+/// cases are expected to fail. Otherwise, starts a local `TestServer` on a
+/// random port with well-known test credentials.
 pub struct TestContext {
     client: Client,
     alt_client: Client,
@@ -90,8 +92,8 @@ impl TestContext {
         if let Some(endpoint) = external_endpoint {
             // External endpoint mode
             assert!(
-                endpoint.starts_with("https://"),
-                "S3_TEST_ENDPOINT must use https:// for full external s3-tests coverage; got {endpoint}"
+                endpoint.starts_with("https://") || endpoint.starts_with("http://"),
+                "S3_TEST_ENDPOINT must use http:// or https://; https:// is recommended for full external s3-tests coverage; got {endpoint}"
             );
             let access_key = std::env::var("S3_TEST_ACCESS_KEY")
                 .expect("S3_TEST_ACCESS_KEY required with S3_TEST_ENDPOINT");
