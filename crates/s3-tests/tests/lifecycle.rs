@@ -1,7 +1,7 @@
 use base64::Engine;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::primitives::{ByteStream, DateTime, DateTimeFormat};
 use aws_sdk_s3::types::{
     AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, BucketLocationConstraint,
     CreateBucketConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule,
@@ -39,6 +39,18 @@ fn assert_error_code(body: &str, code: &str) {
     assert!(
         body.contains(&expected),
         "expected {expected} in body: {body}"
+    );
+}
+
+fn assert_lifecycle_expiration_header(expiration: Option<&str>, rule_id: &str) {
+    let expiration = expiration.expect("expected x-amz-expiration header");
+    assert!(
+        expiration.contains("expiry-date=\""),
+        "expected expiry-date in header: {expiration}"
+    );
+    assert!(
+        expiration.contains(&format!("rule-id=\"{rule_id}\"")),
+        "expected rule-id {rule_id} in header: {expiration}"
     );
 }
 
@@ -507,6 +519,229 @@ fn test_bucket_lifecycle_crud_round_trip() {
 }
 
 #[test]
+fn test_bucket_lifecycle_get_assigns_ids_when_missing() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .filter(LifecycleRuleFilter::builder().prefix("test1/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().days(31).build())
+                    .build()
+                    .unwrap(),
+            )
+            .rules(
+                LifecycleRule::builder()
+                    .filter(LifecycleRuleFilter::builder().prefix("test2/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().days(120).build())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await
+            .unwrap();
+
+        let get = client
+            .get_bucket_lifecycle_configuration()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(get.rules().len(), 2);
+        for rule in get.rules() {
+            match rule.filter().and_then(LifecycleRuleFilter::prefix) {
+                Some("test1/") => {
+                    assert!(rule.id().is_some_and(|id| !id.is_empty()));
+                    assert_eq!(
+                        rule.expiration().and_then(LifecycleExpiration::days),
+                        Some(31)
+                    );
+                }
+                Some("test2/") => {
+                    assert!(rule.id().is_some_and(|id| !id.is_empty()));
+                    assert_eq!(
+                        rule.expiration().and_then(LifecycleExpiration::days),
+                        Some(120)
+                    );
+                }
+                other => panic!("unexpected lifecycle rule prefix: {other:?}"),
+            }
+        }
+
+        cleanup_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_lifecycle_round_trip_expiration_date_rule() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let expiration_date = DateTime::from_str("2099-01-01T00:00:00Z", DateTimeFormat::DateTime)
+            .expect("valid lifecycle expiration date");
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("expire-by-date")
+                    .filter(LifecycleRuleFilter::builder().prefix("archive/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().date(expiration_date).build())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await
+            .unwrap();
+
+        let get = client
+            .get_bucket_lifecycle_configuration()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(get.rules().len(), 1);
+        let rule = &get.rules()[0];
+        assert_eq!(rule.id(), Some("expire-by-date"));
+        assert_eq!(
+            rule.filter().and_then(LifecycleRuleFilter::prefix),
+            Some("archive/")
+        );
+        assert_eq!(
+            rule.expiration().and_then(LifecycleExpiration::date),
+            Some(&expiration_date)
+        );
+
+        cleanup_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_lifecycle_round_trip_empty_filter_rule() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("empty-filter")
+                    .filter(LifecycleRuleFilter::builder().build())
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().days(7).build())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await
+            .unwrap();
+
+        let get = client
+            .get_bucket_lifecycle_configuration()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(get.rules().len(), 1);
+        let rule = &get.rules()[0];
+        let filter = rule.filter().expect("expected empty filter to round-trip");
+        assert_eq!(rule.id(), Some("empty-filter"));
+        assert_eq!(
+            rule.expiration().and_then(LifecycleExpiration::days),
+            Some(7)
+        );
+        assert_eq!(filter.prefix(), None);
+        assert_eq!(filter.tag(), None);
+        assert_eq!(filter.object_size_greater_than(), None);
+        assert_eq!(filter.object_size_less_than(), None);
+        if let Some(and) = filter.and() {
+            assert_eq!(and.prefix(), None);
+            assert_eq!(and.tags(), &[]);
+            assert_eq!(and.object_size_greater_than(), None);
+            assert_eq!(and.object_size_less_than(), None);
+        }
+
+        cleanup_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_lifecycle_round_trip_tag_filter_rule() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("tag-filter")
+                    .filter(
+                        LifecycleRuleFilter::builder()
+                            .tag(Tag::builder().key("env").value("prod").build().unwrap())
+                            .build(),
+                    )
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().days(14).build())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await
+            .unwrap();
+
+        let get = client
+            .get_bucket_lifecycle_configuration()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(get.rules().len(), 1);
+        let rule = &get.rules()[0];
+        let tag = rule
+            .filter()
+            .and_then(LifecycleRuleFilter::tag)
+            .expect("expected tag filter to round-trip");
+        assert_eq!(rule.id(), Some("tag-filter"));
+        assert_eq!(
+            rule.expiration().and_then(LifecycleExpiration::days),
+            Some(14)
+        );
+        assert_eq!(tag.key(), "env");
+        assert_eq!(tag.value(), "prod");
+
+        cleanup_bucket(&bucket).await;
+    });
+}
+
+#[test]
 fn test_put_object_and_head_object_report_expiration_header_for_prefix_filter() {
     s3_tests::run(async {
         let bucket = unique_bucket();
@@ -538,7 +773,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_prefix_filter() 
             .send()
             .await
             .unwrap();
-        assert!(matching.expiration().is_some());
+        assert_lifecycle_expiration_header(matching.expiration(), "expire-current");
 
         let nonmatching = client
             .put_object()
@@ -557,7 +792,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_prefix_filter() 
             .send()
             .await
             .unwrap();
-        assert!(head.expiration().is_some());
+        assert_lifecycle_expiration_header(head.expiration(), "expire-current");
 
         let get = client
             .get_object()
@@ -566,7 +801,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_prefix_filter() 
             .send()
             .await
             .unwrap();
-        assert!(get.expiration().is_some());
+        assert_lifecycle_expiration_header(get.expiration(), "expire-current");
 
         let _ = client
             .delete_bucket_lifecycle()
@@ -619,7 +854,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_tag_filter() {
             .send()
             .await
             .unwrap();
-        assert!(matching.expiration().is_some());
+        assert_lifecycle_expiration_header(matching.expiration(), "expire-tagged");
 
         let nonmatching = client
             .put_object()
@@ -639,7 +874,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_tag_filter() {
             .send()
             .await
             .unwrap();
-        assert!(head.expiration().is_some());
+        assert_lifecycle_expiration_header(head.expiration(), "expire-tagged");
 
         let get = client
             .get_object()
@@ -648,7 +883,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_tag_filter() {
             .send()
             .await
             .unwrap();
-        assert!(get.expiration().is_some());
+        assert_lifecycle_expiration_header(get.expiration(), "expire-tagged");
 
         let _ = client
             .delete_bucket_lifecycle()
@@ -706,7 +941,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_and_filter() {
             .send()
             .await
             .unwrap();
-        assert!(matching.expiration().is_some());
+        assert_lifecycle_expiration_header(matching.expiration(), "expire-and");
 
         let wrong_prefix = client
             .put_object()
@@ -737,7 +972,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_and_filter() {
             .send()
             .await
             .unwrap();
-        assert!(head.expiration().is_some());
+        assert_lifecycle_expiration_header(head.expiration(), "expire-and");
 
         let get = client
             .get_object()
@@ -746,7 +981,7 @@ fn test_put_object_and_head_object_report_expiration_header_for_and_filter() {
             .send()
             .await
             .unwrap();
-        assert!(get.expiration().is_some());
+        assert_lifecycle_expiration_header(get.expiration(), "expire-and");
 
         let _ = client
             .delete_bucket_lifecycle()

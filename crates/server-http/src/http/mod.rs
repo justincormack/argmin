@@ -95,6 +95,53 @@ fn parse_version_id(req: &S3Request) -> Result<Option<VersionId>, ServerError> {
     }
 }
 
+fn ensure_lifecycle_rule_ids(
+    mut config: storage::BucketLifecycleConfiguration,
+) -> Result<storage::BucketLifecycleConfiguration, ServerError> {
+    for rule in &mut config.rules {
+        if rule.id.is_none() {
+            rule.id = Some(generate_lifecycle_rule_id()?);
+        }
+    }
+    Ok(config)
+}
+
+fn generate_lifecycle_rule_id() -> Result<String, ServerError> {
+    use base64::Engine;
+    use ring::rand::SecureRandom;
+
+    let mut bytes = [0u8; 16];
+    let rng = ring::rand::SystemRandom::new();
+    rng.fill(&mut bytes)
+        .map_err(|_| ServerError::InternalError {
+            reason: "failed to generate lifecycle rule ID".to_string(),
+        })?;
+
+    // Format as UUIDv4, then base64-encode the textual UUID without padding.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let uuid = format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    );
+    Ok(base64::engine::general_purpose::STANDARD_NO_PAD.encode(uuid))
+}
+
 fn expected_bucket_owner(req: &S3Request) -> Option<&str> {
     req.header("x-amz-expected-bucket-owner")
 }
@@ -1625,7 +1672,9 @@ impl HttpFrontend {
             }
             S3Operation::PutBucketLifecycle { bucket } => {
                 require_request_checksum(req, RequestChecksumRequirement::PutBucketLifecycle)?;
-                let config = xml::parse_bucket_lifecycle_configuration_xml(&req.body)?;
+                let config = ensure_lifecycle_rule_ids(
+                    xml::parse_bucket_lifecycle_configuration_xml(&req.body)?,
+                )?;
                 let config_xml = xml::get_bucket_lifecycle_configuration_xml(&config);
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_lifecycle(
@@ -5402,6 +5451,67 @@ mod tests {
             }
             Err(e) => panic!("expected NoSuchLifecycleConfiguration, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn bucket_lifecycle_put_without_ids_gets_generated_rule_ids() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let lifecycle = br#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+  <Rule>
+    <Filter><Prefix>test1/</Prefix></Filter>
+    <Status>Enabled</Status>
+    <Expiration><Days>31</Days></Expiration>
+  </Rule>
+  <Rule>
+    <Filter><Prefix>test2/</Prefix></Filter>
+    <Status>Enabled</Status>
+    <Expiration><Days>120</Days></Expiration>
+  </Rule>
+</LifecycleConfiguration>"#;
+
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "lifecycle",
+            vec![("Content-MD5".to_string(), content_md5_value(lifecycle))],
+            lifecycle.to_vec(),
+        );
+        let put_resp = fe
+            .dispatch_routed(
+                &put_req,
+                &test_auth(),
+                S3Operation::PutBucketLifecycle {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(put_resp.status_code, 200);
+
+        let get_req = new_req(http::Method::GET, "/", "lifecycle", vec![], vec![]);
+        let get_resp = fe
+            .dispatch_routed(
+                &get_req,
+                &test_auth(),
+                S3Operation::GetBucketLifecycle {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(get_resp.status_code, 200);
+
+        let body = String::from_utf8(get_resp.body).unwrap();
+        let parsed = xml::parse_bucket_lifecycle_configuration_xml(body.as_bytes()).unwrap();
+        assert_eq!(parsed.rules.len(), 2);
+        let mut ids = std::collections::HashSet::new();
+        for rule in &parsed.rules {
+            let id = rule.id.as_deref().expect("generated lifecycle rule ID");
+            assert!(!id.is_empty());
+            assert!(ids.insert(id.to_string()), "duplicate generated ID {id}");
         }
     }
 
