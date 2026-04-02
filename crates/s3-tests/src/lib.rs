@@ -212,11 +212,15 @@ async fn build_client(endpoint: &str, access_key: &str, secret_key: &str, region
     build_client_with_ca(endpoint, access_key, secret_key, region, None).await
 }
 
+fn external_test_mode() -> bool {
+    std::env::var_os("S3_TEST_ENDPOINT").is_some()
+}
+
 fn configured_test_timeout() -> std::time::Duration {
     let timeout_secs: u64 = std::env::var("S3_TEST_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(5);
+        .unwrap_or_else(|| if external_test_mode() { 30 } else { 5 });
     std::time::Duration::from_secs(timeout_secs)
 }
 
@@ -257,9 +261,14 @@ pub async fn build_client_with_ca(
     }
     let config = loader.load().await;
 
-    let s3_config = aws_sdk_s3::config::Builder::from(&config)
-        .force_path_style(true)
-        .build();
+    let mut s3_config = aws_sdk_s3::config::Builder::from(&config);
+    s3_config.set_force_path_style(Some(true));
+    if external_test_mode() {
+        s3_config.set_stalled_stream_protection(Some(
+            aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
+        ));
+    }
+    let s3_config = s3_config.build();
 
     Client::from_conf(s3_config)
 }
