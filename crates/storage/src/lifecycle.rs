@@ -380,25 +380,20 @@ fn validate_configuration(rules: &[LifecycleRule]) -> Result<(), LifecycleConfig
         ) && rule.filter.has_tag_filter()
         {
             return Err(LifecycleConfigError::InvalidRequest {
-                reason:
-                    "ExpiredObjectDeleteMarker lifecycle rules do not support tag-based filters"
-                        .to_string(),
+                reason: "ExpiredObjectDeleteMarker cannot be specified with Tags.".to_string(),
             });
         }
 
         if rule.abort_incomplete_multipart_upload.is_some() && rule.filter.has_tag_filter() {
             return Err(LifecycleConfigError::InvalidRequest {
-                reason:
-                    "AbortIncompleteMultipartUpload lifecycle rules do not support tag-based filters"
-                        .to_string(),
+                reason: "AbortIncompleteMultipartUpload cannot be specified with Tags.".to_string(),
             });
         }
 
         if rule.abort_incomplete_multipart_upload.is_some() && rule.filter.has_size_filter() {
             return Err(LifecycleConfigError::InvalidRequest {
-                reason:
-                    "AbortIncompleteMultipartUpload lifecycle rules do not support object size filters"
-                        .to_string(),
+                reason: "AbortIncompleteMultipartUpload cannot be specified with Object Size."
+                    .to_string(),
             });
         }
 
@@ -417,8 +412,9 @@ fn validate_configuration(rules: &[LifecycleRule]) -> Result<(), LifecycleConfig
         ) {
             if min_size >= max_size {
                 return Err(LifecycleConfigError::InvalidRequest {
-                    reason: "ObjectSizeGreaterThan must be less than ObjectSizeLessThan"
-                        .to_string(),
+                    reason:
+                        "'ObjectSizeLessThan' has to be a value greater than 'ObjectSizeGreaterThan'."
+                            .to_string(),
                 });
             }
         }
@@ -1149,7 +1145,6 @@ fn xml_escape(text: &str) -> String {
             '<' => output.push_str("&lt;"),
             '>' => output.push_str("&gt;"),
             '"' => output.push_str("&quot;"),
-            '\'' => output.push_str("&apos;"),
             _ => output.push(character),
         }
     }

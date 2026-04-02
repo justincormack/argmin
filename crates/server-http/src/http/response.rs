@@ -1084,7 +1084,7 @@ impl S3Response {
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                      <Error>\
                      <Code>XAmzContentSHA256Mismatch</Code>\
-                     <Message>The provided &apos;x-amz-content-sha256&apos; header does not match what was computed.</Message>\
+                     <Message>The provided 'x-amz-content-sha256' header does not match what was computed.</Message>\
                      <ClientComputedContentSHA256>{}</ClientComputedContentSHA256>\
                      <S3ComputedContentSHA256>{}</S3ComputedContentSHA256>\
                      <Resource>{}</Resource>\

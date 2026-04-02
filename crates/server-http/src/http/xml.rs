@@ -2009,7 +2009,6 @@ pub fn xml_escape(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&apos;"),
             _ => out.push(c),
         }
     }
@@ -4192,10 +4191,7 @@ mod tests {
 
     #[test]
     fn xml_escape_special_chars() {
-        assert_eq!(
-            xml_escape("a&b<c>d\"e'f"),
-            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
-        );
+        assert_eq!(xml_escape("a&b<c>d\"e'f"), "a&amp;b&lt;c&gt;d&quot;e'f");
     }
 
     // ── parse_delete_objects_xml ─────────────────────────────────────
@@ -5759,7 +5755,7 @@ mod tests {
         };
         let xml = list_multipart_uploads_xml("mybucket", None, None, None, 1000, &result);
         assert!(xml.contains("<Key>key&amp;&lt;&gt;</Key>"));
-        assert!(xml.contains("<UploadId>id&quot;&apos;</UploadId>"));
+        assert!(xml.contains("<UploadId>id&quot;'</UploadId>"));
         assert!(xml.contains("<Owner><ID>"));
         assert!(!xml.contains("<DisplayName>"));
     }

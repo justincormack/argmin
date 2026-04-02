@@ -5758,7 +5758,7 @@ mod tests {
     }
 
     #[test]
-    fn get_object_explicit_current_version_emits_lifecycle_expiration_header() {
+    fn get_object_explicit_current_version_suppresses_lifecycle_expiration_header() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
@@ -5831,13 +5831,11 @@ mod tests {
                 },
             )
             .unwrap();
-        let expiration = find_header(&get_resp, "x-amz-expiration").unwrap();
-        assert!(expiration.contains("expiry-date=\""));
-        assert!(expiration.contains("rule-id=\"expire-current\""));
+        assert!(find_header(&get_resp, "x-amz-expiration").is_none());
     }
 
     #[test]
-    fn head_object_explicit_null_version_emits_lifecycle_expiration_header() {
+    fn head_object_explicit_null_version_suppresses_lifecycle_expiration_header() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
@@ -5894,9 +5892,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let expiration = find_header(&head_resp, "x-amz-expiration").unwrap();
-        assert!(expiration.contains("expiry-date=\""));
-        assert!(expiration.contains("rule-id=\"expire-current\""));
+        assert!(find_header(&head_resp, "x-amz-expiration").is_none());
     }
 
     #[test]
