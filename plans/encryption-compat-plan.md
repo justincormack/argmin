@@ -20,6 +20,12 @@ It also covers the directly related configuration and compatibility surfaces:
 
 This does not yet choose the final key-management architecture.
 
+Detailed follow-up plans should live in separate documents as decisions become
+concrete. The current detailed plan for the first non-`SSE-C` encryption phase
+is:
+
+- `plans/sse-s3-plan.md`
+
 ## Current Status
 
 Implemented:
@@ -53,11 +59,14 @@ Known test surface still blocked on this work:
 
 Server-managed keys for per-object encryption.
 
-Open design work:
-- object metadata needed to record encryption state
-- key generation and storage
-- encryption/decryption on write/read paths
-- response header semantics for encrypted objects
+Chosen direction:
+
+- implement `SSE-S3` first
+- use a temporary but explicit service-managed wrapping-key provider
+- keep that key role separate from the `SSE-C` validator key
+- preserve the per-object random `DEK` envelope model already used by `SSE-C`
+
+See `plans/sse-s3-plan.md` for the detailed implementation plan.
 
 ### 2. SSE-KMS
 
