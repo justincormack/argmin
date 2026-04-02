@@ -1032,8 +1032,14 @@ impl HttpFrontend {
                 let vid = parse_version_id(req)?;
                 let requester = Self::requester_from_auth(auth);
                 let trace = current_trace_context();
-                // partNumber takes precedence over Range header (AWS behavior)
                 if let Some(pn_str) = req.query_param_lossy("partNumber") {
+                    if req.header("range").is_some() {
+                        return Err(ServerError::InvalidRequest {
+                            reason:
+                                "Cannot specify both Range header and partNumber query parameter"
+                                    .to_string(),
+                        });
+                    }
                     let part_number: u32 =
                         pn_str.parse().map_err(|_| ServerError::InvalidArgument {
                             reason: "partNumber must be a positive integer".into(),
@@ -7787,6 +7793,39 @@ mod tests {
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidRange { .. }) => {}
             Err(e) => panic!("expected InvalidRange, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn get_object_part_and_range_rejected_together() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let part1 = vec![0xAA; 5 * 1024 * 1024];
+        let part2 = vec![0xBB; 100];
+        do_multipart_upload(&fe, "mybucket", "k", &[(1, part1), (2, part2)], None);
+
+        let req = new_req(
+            http::Method::GET,
+            "",
+            "partNumber=2",
+            vec![("Range".to_string(), "bytes=0-1".to_string())],
+            vec![],
+        );
+        let op = S3Operation::GetObject {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(
+                    reason,
+                    "Cannot specify both Range header and partNumber query parameter"
+                );
+            }
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }

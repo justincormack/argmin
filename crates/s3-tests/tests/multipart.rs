@@ -941,6 +941,32 @@ fn test_multipart_range_read() {
     });
 }
 
+#[test]
+fn test_multipart_get_part_rejects_range_header() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multipart-part-precedence";
+
+        let part1 = vec![b'A'; PART_SIZE];
+        let part2 = vec![b'B'; 2048];
+        do_multipart_upload(&bucket, key, &[part1, part2.clone()]).await;
+
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .part_number(2)
+            .range("bytes=0-1")
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
 // ── Multiple concurrent uploads for same key ────────────────────────
 
 #[test]

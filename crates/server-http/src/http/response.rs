@@ -511,17 +511,14 @@ impl S3Response {
 
     /// Build a 416 Range Not Satisfiable response.
     #[must_use]
-    pub fn range_not_satisfiable(total_size: u64) -> Self {
-        let content_range = format!("bytes */{total_size}");
+    pub fn range_not_satisfiable(_total_size: u64) -> Self {
         let body = xml::error_xml(
             "InvalidRange",
             "The requested range is not satisfiable",
             "",
             "request-id",
         );
-        Self::new(416)
-            .header("Content-Range", &content_range)
-            .xml_body(body)
+        Self::new(416).xml_body(body)
     }
 
     /// Build a response for `DeleteObject` (204 No Content).
