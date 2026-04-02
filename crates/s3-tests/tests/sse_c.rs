@@ -1,5 +1,8 @@
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{ChecksumAlgorithm, ChecksumMode, ObjectAttributes};
+use aws_sdk_s3::types::{
+    BucketVersioningStatus, ChecksumAlgorithm, ChecksumMode, ObjectAttributes,
+    VersioningConfiguration,
+};
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use ring::hmac;
 use s3_tests::{
@@ -102,6 +105,21 @@ macro_rules! with_sse_c_copy_headers {
 async fn cleanup(bucket: &str, key: &str) {
     let client = CTX.client();
     let _ = client.delete_object().bucket(bucket).key(key).send().await;
+    client.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+async fn cleanup_versioned(bucket: &str, key: &str, version_ids: &[String]) {
+    let client = CTX.client();
+    for version_id in version_ids {
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(version_id)
+            .send()
+            .await
+            .unwrap();
+    }
     client.delete_bucket().bucket(bucket).send().await.unwrap();
 }
 
@@ -289,6 +307,28 @@ fn patterned_bytes(len: usize, seed: u8) -> Vec<u8> {
     (0..len)
         .map(|i| seed.wrapping_add((i % 251) as u8))
         .collect()
+}
+
+async fn setup_sse_c_object(bucket: &str, key: &str, body: Vec<u8>) -> (String, String, Vec<u8>) {
+    let client = CTX.client();
+    client.create_bucket().bucket(bucket).send().await.unwrap();
+
+    let customer_key = test_sse_c_key();
+    let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+    with_sse_c_headers!(
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from(body.clone())),
+        key_b64,
+        key_md5_b64
+    )
+    .send()
+    .await
+    .unwrap();
+
+    (key_b64, key_md5_b64, body)
 }
 
 async fn assert_sse_c_put_get_head_round_trip_size(size: usize, seed: u8, label: &str) {
@@ -556,6 +596,362 @@ sse_c_single_part_round_trip_tests! {
         mib(9) + 12_345,
         0x3b
     ),
+}
+
+#[test]
+fn test_sse_c_range_get_single_part_headers_and_body() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let (key_b64, key_md5_b64, body) = setup_sse_c_object(
+            &bucket,
+            "obj",
+            patterned_bytes(SSE_C_SEGMENT_BOUNDARY_SIZE + 257, 0x44),
+        )
+        .await;
+
+        let start = SSE_C_SEGMENT_BOUNDARY_SIZE - 32;
+        let end = SSE_C_SEGMENT_BOUNDARY_SIZE + 32;
+        let resp = with_sse_c_headers!(
+            CTX.client()
+                .get_object()
+                .bucket(&bucket)
+                .key("obj")
+                .range(format!("bytes={start}-{end}")),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        assert_eq!(resp.accept_ranges(), Some("bytes"));
+        assert_eq!(
+            resp.content_range(),
+            Some(format!("bytes {start}-{end}/{}", body.len()).as_str())
+        );
+        assert_eq!(resp.content_length(), Some((end - start + 1) as i64));
+        assert_eq!(resp.sse_customer_algorithm(), Some("AES256"));
+        assert_eq!(resp.sse_customer_key_md5(), Some(key_md5_b64.as_str()));
+        let got = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(got.as_ref(), &body[start..=end]);
+
+        cleanup(&bucket, "obj").await;
+    });
+}
+
+#[test]
+fn test_sse_c_range_get_unsatisfiable_returns_invalid_range() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let (key_b64, key_md5_b64, _) =
+            setup_sse_c_object(&bucket, "obj", patterned_bytes(26, 0x21)).await;
+
+        let result = with_sse_c_headers!(
+            CTX.client()
+                .get_object()
+                .bucket(&bucket)
+                .key("obj")
+                .range("bytes=100-200"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await;
+        assert_eq!(err_status(&result), 416);
+        assert_s3_err_code(&result, "InvalidRange");
+
+        cleanup(&bucket, "obj").await;
+    });
+}
+
+#[test]
+fn test_sse_c_range_get_empty_object_is_unsatisfiable() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let (key_b64, key_md5_b64, _) = setup_sse_c_object(&bucket, "obj", Vec::new()).await;
+
+        let result = with_sse_c_headers!(
+            CTX.client()
+                .get_object()
+                .bucket(&bucket)
+                .key("obj")
+                .range("bytes=0-0"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await;
+        assert_eq!(err_status(&result), 416);
+        assert_s3_err_code(&result, "InvalidRange");
+
+        cleanup(&bucket, "obj").await;
+    });
+}
+
+#[test]
+fn test_sse_c_range_get_malformed_header_returns_full_object() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let (key_b64, key_md5_b64, body) =
+            setup_sse_c_object(&bucket, "obj", patterned_bytes(64, 0x55)).await;
+
+        let resp = with_sse_c_headers!(
+            CTX.client()
+                .get_object()
+                .bucket(&bucket)
+                .key("obj")
+                .range("bytes=10-5"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.content_range(), None);
+        assert_eq!(resp.content_length(), Some(body.len() as i64));
+        assert_eq!(resp.accept_ranges(), Some("bytes"));
+        let got = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(got.as_ref(), body.as_slice());
+
+        cleanup(&bucket, "obj").await;
+    });
+}
+
+#[test]
+fn test_sse_c_range_get_if_match_returns_partial_content() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let (key_b64, key_md5_b64, body) =
+            setup_sse_c_object(&bucket, "obj", patterned_bytes(128, 0x66)).await;
+
+        let head = with_sse_c_headers!(
+            CTX.client().head_object().bucket(&bucket).key("obj"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let etag = head.e_tag().unwrap().to_string();
+
+        let resp = with_sse_c_headers!(
+            CTX.client()
+                .get_object()
+                .bucket(&bucket)
+                .key("obj")
+                .range("bytes=8-31")
+                .if_match(&etag),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.content_range(), Some("bytes 8-31/128"));
+        let got = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(got.as_ref(), &body[8..=31]);
+
+        cleanup(&bucket, "obj").await;
+    });
+}
+
+#[test]
+fn test_sse_c_range_get_if_none_match_returns_not_modified() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let (key_b64, key_md5_b64, _) =
+            setup_sse_c_object(&bucket, "obj", patterned_bytes(128, 0x77)).await;
+
+        let head = with_sse_c_headers!(
+            CTX.client().head_object().bucket(&bucket).key("obj"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let etag = head.e_tag().unwrap().to_string();
+
+        let result = with_sse_c_headers!(
+            CTX.client()
+                .get_object()
+                .bucket(&bucket)
+                .key("obj")
+                .range("bytes=8-31")
+                .if_none_match(&etag),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await;
+        assert_eq!(err_status(&result), 304);
+
+        cleanup(&bucket, "obj").await;
+    });
+}
+
+#[test]
+fn test_sse_c_range_get_on_versioned_object_returns_requested_version() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+        let first = patterned_bytes(96, 0x81);
+        let second = patterned_bytes(96, 0x91);
+
+        let put_v1 = with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .body(ByteStream::from(first.clone())),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let v1 = put_v1.version_id().unwrap().to_string();
+
+        let put_v2 = with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key("obj")
+                .body(ByteStream::from(second)),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let v2 = put_v2.version_id().unwrap().to_string();
+
+        let resp = with_sse_c_headers!(
+            client
+                .get_object()
+                .bucket(&bucket)
+                .key("obj")
+                .version_id(&v1)
+                .range("bytes=10-19"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        assert_eq!(resp.version_id(), Some(v1.as_str()));
+        assert_eq!(resp.content_range(), Some("bytes 10-19/96"));
+        let got = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(got.as_ref(), &first[10..=19]);
+
+        cleanup_versioned(&bucket, "obj", &[v2, v1]).await;
+    });
+}
+
+#[test]
+fn test_sse_c_range_get_and_part_number_rejected_together() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+        let part1 = patterned_bytes(MULTIPART_MIN_PART_SIZE, 0x33);
+        let part2 = patterned_bytes(1024, 0x44);
+
+        let create = with_sse_c_headers!(
+            client.create_multipart_upload().bucket(&bucket).key("obj"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let mut completed = Vec::new();
+        for (part_number, data) in [(1, part1), (2, part2)] {
+            let part = with_sse_c_headers!(
+                client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key("obj")
+                    .upload_id(&upload_id)
+                    .part_number(part_number)
+                    .body(ByteStream::from(data)),
+                key_b64,
+                key_md5_b64
+            )
+            .send()
+            .await
+            .unwrap();
+            completed.push(
+                CompletedPart::builder()
+                    .e_tag(part.e_tag().unwrap())
+                    .part_number(part_number)
+                    .build(),
+            );
+        }
+
+        with_sse_c_headers!(
+            client
+                .complete_multipart_upload()
+                .bucket(&bucket)
+                .key("obj")
+                .upload_id(&upload_id)
+                .multipart_upload(
+                    CompletedMultipartUpload::builder()
+                        .set_parts(Some(completed))
+                        .build()
+                ),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let result = with_sse_c_headers!(
+            client
+                .get_object()
+                .bucket(&bucket)
+                .key("obj")
+                .part_number(2)
+                .range("bytes=0-1"),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        cleanup(&bucket, "obj").await;
+    });
 }
 
 #[test]
