@@ -481,6 +481,14 @@ impl AclGrants {
     }
 
     #[must_use]
+    pub fn allows_authenticated_users(&self, permission: AclPermission) -> bool {
+        self.0.iter().any(|grant| {
+            matches!(grant.grantee(), AclGrantee::AuthenticatedUsers)
+                && grant.permission().implies(permission)
+        })
+    }
+
+    #[must_use]
     pub fn serialized(&self) -> String {
         let mut out = String::new();
         for grant in &self.0 {

@@ -3938,9 +3938,10 @@ impl Coordinator {
         acl_grants: &AclGrants,
         permission: AclPermission,
     ) -> bool {
-        requester
-            .canonical_user_id()
-            .is_some_and(|id| acl_grants.allows_canonical_user(id, permission))
+        requester.canonical_user_id().is_some_and(|id| {
+            acl_grants.allows_canonical_user(id, permission)
+                || acl_grants.allows_authenticated_users(permission)
+        })
     }
 
     fn acl_grants_public_read(acl_grants: &AclGrants) -> bool {
@@ -5378,19 +5379,9 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
         match acl {
-            PutObjectAcl::AuthenticatedRead => {
-                return Err(ServerError::NotImplemented {
-                    feature: "authenticated-read object ACL".to_string(),
-                });
-            }
             PutObjectAcl::AwsExecRead => {
                 return Err(ServerError::NotImplemented {
                     feature: "aws-exec-read object ACL".to_string(),
-                });
-            }
-            PutObjectAcl::BucketOwnerRead => {
-                return Err(ServerError::NotImplemented {
-                    feature: "bucket-owner-read object ACL".to_string(),
                 });
             }
             PutObjectAcl::Invalid(value) => {
@@ -5402,6 +5393,8 @@ impl Coordinator {
             | PutObjectAcl::Private
             | PutObjectAcl::PublicRead
             | PutObjectAcl::PublicReadWrite
+            | PutObjectAcl::AuthenticatedRead
+            | PutObjectAcl::BucketOwnerRead
             | PutObjectAcl::BucketOwnerFullControl => {}
         }
 
@@ -5450,6 +5443,18 @@ impl Coordinator {
                 grants.push(AclGrant::new(AclGrantee::AllUsers, AclPermission::Read));
                 grants.push(AclGrant::new(AclGrantee::AllUsers, AclPermission::Write));
             }
+            PutObjectAcl::AuthenticatedRead => {
+                grants.push(AclGrant::new(
+                    AclGrantee::AuthenticatedUsers,
+                    AclPermission::Read,
+                ));
+            }
+            PutObjectAcl::BucketOwnerRead if bucket.owner_canonical_id != owner.canonical_id => {
+                grants.push(AclGrant::new(
+                    AclGrantee::CanonicalUser(bucket.owner_canonical_id.clone()),
+                    AclPermission::Read,
+                ));
+            }
             PutObjectAcl::BucketOwnerFullControl
                 if bucket.owner_canonical_id != owner.canonical_id =>
             {
@@ -5461,7 +5466,6 @@ impl Coordinator {
             PutObjectAcl::None
             | PutObjectAcl::Private
             | PutObjectAcl::BucketOwnerFullControl
-            | PutObjectAcl::AuthenticatedRead
             | PutObjectAcl::AwsExecRead
             | PutObjectAcl::BucketOwnerRead
             | PutObjectAcl::Invalid(_) => {}
@@ -21192,14 +21196,14 @@ mod tests {
     }
 
     #[test]
-    fn put_object_rejects_unimplemented_bucket_owner_read_acl() {
+    fn put_object_accepts_bucket_owner_read_acl_for_same_owner() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
 
-        let err = test_helpers::put_object(
+        test_helpers::put_object(
             &coord,
             &PutObjectRequest {
                 sse_customer: None,
@@ -21220,12 +21224,7 @@ mod tests {
                 acl: PutObjectAcl::BucketOwnerRead.into(),
             },
         )
-        .unwrap_err();
-        assert!(matches!(
-            err,
-            ServerError::NotImplemented { ref feature }
-            if feature == "bucket-owner-read object ACL"
-        ));
+        .unwrap();
     }
 
     #[test]
