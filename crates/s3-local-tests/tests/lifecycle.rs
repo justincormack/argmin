@@ -4,7 +4,7 @@ use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use aws_sdk_s3::types::{
     AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, BucketVersioningStatus,
     ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
-    NoncurrentVersionExpiration, ObjectLockMode, VersioningConfiguration,
+    NoncurrentVersionExpiration, ObjectLockMode, Tag, VersioningConfiguration,
 };
 use s3_tests::server::{TEST_ACCESS_KEY, TEST_REGION, TEST_SECRET_KEY};
 use s3_tests::{
@@ -141,6 +141,33 @@ async fn put_expiration_size_filter_lifecycle(
         .unwrap();
 }
 
+async fn put_tag_expiration_lifecycle(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    value: &str,
+) {
+    let rule = LifecycleRule::builder()
+        .id("expire-tagged")
+        .filter(
+            LifecycleRuleFilter::builder()
+                .tag(Tag::builder().key(key).value(value).build().unwrap())
+                .build(),
+        )
+        .status(ExpirationStatus::Enabled)
+        .expiration(LifecycleExpiration::builder().days(1).build())
+        .build()
+        .expect("valid tag expiration lifecycle rule");
+    let config = BucketLifecycleConfiguration::builder()
+        .rules(rule)
+        .build()
+        .expect("valid lifecycle configuration");
+    put_bucket_lifecycle_with_md5(client, bucket, config)
+        .send()
+        .await
+        .unwrap();
+}
+
 async fn put_noncurrent_expiration_lifecycle(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -169,6 +196,37 @@ async fn put_noncurrent_expiration_lifecycle(
         .unwrap();
 }
 
+async fn put_noncurrent_tag_expiration_lifecycle(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    value: &str,
+) {
+    let rule = LifecycleRule::builder()
+        .id("expire-noncurrent-tagged")
+        .filter(
+            LifecycleRuleFilter::builder()
+                .tag(Tag::builder().key(key).value(value).build().unwrap())
+                .build(),
+        )
+        .status(ExpirationStatus::Enabled)
+        .noncurrent_version_expiration(
+            NoncurrentVersionExpiration::builder()
+                .noncurrent_days(1)
+                .build(),
+        )
+        .build()
+        .expect("valid tagged noncurrent expiration lifecycle rule");
+    let config = BucketLifecycleConfiguration::builder()
+        .rules(rule)
+        .build()
+        .expect("valid lifecycle configuration");
+    put_bucket_lifecycle_with_md5(client, bucket, config)
+        .send()
+        .await
+        .unwrap();
+}
+
 async fn put_abort_incomplete_multipart_lifecycle(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -185,6 +243,32 @@ async fn put_abort_incomplete_multipart_lifecycle(
         )
         .build()
         .expect("valid abort lifecycle rule");
+    let config = BucketLifecycleConfiguration::builder()
+        .rules(rule)
+        .build()
+        .expect("valid lifecycle configuration");
+    put_bucket_lifecycle_with_md5(client, bucket, config)
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn put_expired_delete_marker_lifecycle(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+) {
+    let rule = LifecycleRule::builder()
+        .id("expire-marker")
+        .filter(LifecycleRuleFilter::builder().prefix(prefix).build())
+        .status(ExpirationStatus::Enabled)
+        .expiration(
+            LifecycleExpiration::builder()
+                .expired_object_delete_marker(true)
+                .build(),
+        )
+        .build()
+        .expect("valid expired delete marker lifecycle rule");
     let config = BucketLifecycleConfiguration::builder()
         .rules(rule)
         .build()
@@ -230,6 +314,19 @@ async fn current_object_deadline_millis(
 async fn list_object_keys_v2(client: &aws_sdk_s3::Client, bucket: &str) -> Vec<String> {
     client
         .list_objects_v2()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .iter()
+        .filter_map(|entry| entry.key().map(ToString::to_string))
+        .collect()
+}
+
+async fn list_object_keys(client: &aws_sdk_s3::Client, bucket: &str) -> Vec<String> {
+    client
+        .list_objects()
         .bucket(bucket)
         .send()
         .await
@@ -290,6 +387,40 @@ fn test_lifecycle_expiration_deletes_nonversioned_objects_on_manual_sweep() {
         assert_eq!(&kept_body[..], b"keep");
 
         assert_eq!(list_object_keys_v2(&client, bucket).await, vec!["keep/me"]);
+    });
+}
+
+#[test]
+fn test_lifecycle_expiration_updates_list_objects_v1_after_manual_sweep() {
+    run_local(async {
+        let server = TestServer::start().await;
+        let client = test_client(&server).await;
+        let bucket = "lifecycle-list-objects-v1";
+
+        create_bucket(&client, bucket).await;
+        put_expiration_lifecycle(&client, bucket, "logs/").await;
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("logs/expire-me")
+            .body(ByteStream::from_static(b"expired"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("keep/me")
+            .body(ByteStream::from_static(b"keep"))
+            .send()
+            .await
+            .unwrap();
+        let sweep_at = current_object_deadline_millis(&client, bucket, "logs/expire-me", 1).await;
+
+        server.run_lifecycle_sweep_at(sweep_at).unwrap();
+
+        assert_eq!(list_object_keys(&client, bucket).await, vec!["keep/me"]);
     });
 }
 
@@ -381,6 +512,79 @@ fn test_lifecycle_expiration_replaces_suspended_null_current_with_null_delete_ma
         assert_eq!(versions.delete_markers().len(), 1);
         assert_eq!(versions.delete_markers()[0].version_id(), Some("null"));
         assert_eq!(versions.delete_markers()[0].is_latest(), Some(true));
+    });
+}
+
+#[test]
+fn test_lifecycle_tag_expiration_creates_delete_marker_for_matching_versioned_object() {
+    run_local(async {
+        let server = TestServer::start().await;
+        let client = test_client(&server).await;
+        let bucket = "lifecycle-tagged-versioned";
+        let matching_key = "match";
+        let keep_key = "keep";
+
+        create_bucket(&client, bucket).await;
+        enable_versioning(&client, bucket).await;
+        put_tag_expiration_lifecycle(&client, bucket, "env", "prod").await;
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(matching_key)
+            .tagging("env=prod")
+            .body(ByteStream::from_static(b"match"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(keep_key)
+            .tagging("env=dev")
+            .body(ByteStream::from_static(b"keep"))
+            .send()
+            .await
+            .unwrap();
+        let sweep_at = current_object_deadline_millis(&client, bucket, matching_key, 1).await;
+
+        server.run_lifecycle_sweep_at(sweep_at).unwrap();
+
+        let current = client
+            .get_object()
+            .bucket(bucket)
+            .key(matching_key)
+            .send()
+            .await;
+        assert_eq!(err_status(&current), 404);
+        assert_s3_err_code(&current, "NoSuchKey");
+
+        let kept = client
+            .get_object()
+            .bucket(bucket)
+            .key(keep_key)
+            .send()
+            .await
+            .unwrap();
+        let kept_body = kept.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&kept_body[..], b"keep");
+
+        let versions = client
+            .list_object_versions()
+            .bucket(bucket)
+            .prefix(matching_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(versions.versions().len(), 1);
+        assert_eq!(versions.delete_markers().len(), 1);
+        assert_eq!(versions.versions()[0].is_latest(), Some(false));
+        assert_eq!(versions.delete_markers()[0].is_latest(), Some(true));
+
+        assert_eq!(
+            list_object_keys_v2(&client, bucket).await,
+            vec![keep_key.to_string()]
+        );
     });
 }
 
@@ -595,6 +799,101 @@ fn test_lifecycle_noncurrent_expiration_retains_newest_required_noncurrent_versi
 }
 
 #[test]
+fn test_lifecycle_noncurrent_tag_expiration_only_deletes_matching_noncurrent_versions() {
+    run_local(async {
+        let server = TestServer::start().await;
+        let client = test_client(&server).await;
+        let bucket = "lifecycle-noncurrent-tagged";
+        let matching_key = "match";
+        let keep_key = "keep";
+
+        create_bucket(&client, bucket).await;
+        enable_versioning(&client, bucket).await;
+        put_noncurrent_tag_expiration_lifecycle(&client, bucket, "env", "prod").await;
+
+        let matching_first = client
+            .put_object()
+            .bucket(bucket)
+            .key(matching_key)
+            .tagging("env=prod")
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await
+            .unwrap();
+        let matching_first_version_id = matching_first.version_id().unwrap().to_string();
+        client
+            .put_object()
+            .bucket(bucket)
+            .key(matching_key)
+            .body(ByteStream::from_static(b"v2"))
+            .send()
+            .await
+            .unwrap();
+
+        let keep_first = client
+            .put_object()
+            .bucket(bucket)
+            .key(keep_key)
+            .tagging("env=dev")
+            .body(ByteStream::from_static(b"k1"))
+            .send()
+            .await
+            .unwrap();
+        let keep_first_version_id = keep_first.version_id().unwrap().to_string();
+        let keep_second = client
+            .put_object()
+            .bucket(bucket)
+            .key(keep_key)
+            .body(ByteStream::from_static(b"k2"))
+            .send()
+            .await
+            .unwrap();
+        let keep_second_version_id = keep_second.version_id().unwrap().to_string();
+
+        let sweep_at = current_object_deadline_millis(&client, bucket, matching_key, 1).await;
+        server.run_lifecycle_sweep_at(sweep_at).unwrap();
+
+        let expired = client
+            .get_object()
+            .bucket(bucket)
+            .key(matching_key)
+            .version_id(&matching_first_version_id)
+            .send()
+            .await;
+        assert_eq!(err_status(&expired), 404);
+        assert_s3_err_code(&expired, "NoSuchVersion");
+
+        let retained = client
+            .get_object()
+            .bucket(bucket)
+            .key(keep_key)
+            .version_id(&keep_first_version_id)
+            .send()
+            .await
+            .unwrap();
+        let retained_body = retained.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&retained_body[..], b"k1");
+
+        let versions = client
+            .list_object_versions()
+            .bucket(bucket)
+            .prefix(keep_key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(versions.versions().len(), 2);
+        assert_eq!(
+            versions.versions()[0].version_id(),
+            Some(keep_second_version_id.as_str())
+        );
+        assert_eq!(
+            versions.versions()[1].version_id(),
+            Some(keep_first_version_id.as_str())
+        );
+    });
+}
+
+#[test]
 fn test_lifecycle_expiration_days_removes_sole_current_delete_marker() {
     run_local(async {
         let server = TestServer::start().await;
@@ -652,6 +951,68 @@ fn test_lifecycle_expiration_days_removes_sole_current_delete_marker() {
             .unwrap();
         assert!(versions.versions().is_empty());
         assert!(versions.delete_markers().is_empty());
+    });
+}
+
+#[test]
+fn test_lifecycle_expired_object_delete_marker_rule_removes_sole_delete_marker() {
+    run_local(async {
+        let server = TestServer::start().await;
+        let client = test_client(&server).await;
+        let bucket = "lifecycle-expired-delete-marker";
+        let key = "logs/object";
+
+        create_bucket(&client, bucket).await;
+        enable_versioning(&client, bucket).await;
+        put_expired_delete_marker_lifecycle(&client, bucket, "logs/").await;
+
+        let put = client
+            .put_object()
+            .bucket(bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"current"))
+            .send()
+            .await
+            .unwrap();
+        let live_version_id = put.version_id().unwrap().to_string();
+
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .version_id(&live_version_id)
+            .send()
+            .await
+            .unwrap();
+
+        let before = client
+            .list_object_versions()
+            .bucket(bucket)
+            .prefix(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(before.versions().is_empty());
+        assert_eq!(before.delete_markers().len(), 1);
+
+        server.run_lifecycle_sweep_at(0).unwrap();
+
+        let after = client
+            .list_object_versions()
+            .bucket(bucket)
+            .prefix(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(after.versions().is_empty());
+        assert!(after.delete_markers().is_empty());
     });
 }
 

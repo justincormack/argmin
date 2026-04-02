@@ -4,12 +4,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aws_sdk_s3::primitives::{ByteStream, DateTime, DateTimeFormat};
 use aws_sdk_s3::types::{
     AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, BucketLocationConstraint,
-    CreateBucketConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule,
-    LifecycleRuleAndOperator, LifecycleRuleFilter, NoncurrentVersionExpiration, Tag,
+    BucketVersioningStatus, CreateBucketConfiguration, ExpirationStatus, LifecycleExpiration,
+    LifecycleRule, LifecycleRuleAndOperator, LifecycleRuleFilter, NoncurrentVersionExpiration, Tag,
+    VersioningConfiguration,
 };
 use ring::hmac;
 use s3_tests::{
-    delete_all_and_bucket, err_status, put_bucket_lifecycle_with_md5, unique_bucket, CTX,
+    cleanup_versioned_bucket, delete_all_and_bucket, err_status, put_bucket_lifecycle_with_md5,
+    unique_bucket, CTX,
 };
 
 fn agent() -> ureq::Agent {
@@ -32,6 +34,26 @@ async fn cleanup_bucket(bucket: &str) {
     let client = CTX.client();
     let _ = client.delete_bucket_lifecycle().bucket(bucket).send().await;
     let _ = client.delete_bucket().bucket(bucket).send().await;
+}
+
+async fn enable_versioning(bucket: &str) {
+    CTX.client()
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn cleanup_versioned_lifecycle_bucket(bucket: &str) {
+    let client = CTX.client();
+    let _ = client.delete_bucket_lifecycle().bucket(bucket).send().await;
+    cleanup_versioned_bucket(client, bucket).await;
 }
 
 fn assert_error_code(body: &str, code: &str) {
@@ -1121,6 +1143,405 @@ fn test_put_object_and_head_object_report_expiration_header_for_and_filter() {
             ],
         )
         .await;
+    });
+}
+
+#[test]
+fn test_put_object_and_head_object_report_expiration_header_for_date_rule() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let expiration_date = DateTime::from_str("2099-01-01T00:00:00Z", DateTimeFormat::DateTime)
+            .expect("valid lifecycle expiration date");
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("expire-by-date")
+                    .filter(LifecycleRuleFilter::builder().prefix("archive/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().date(expiration_date).build())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await
+            .unwrap();
+
+        let matching = client
+            .put_object()
+            .bucket(&bucket)
+            .key("archive/match")
+            .body(ByteStream::from_static(b"match"))
+            .send()
+            .await
+            .unwrap();
+        assert_lifecycle_expiration_header(matching.expiration(), "expire-by-date");
+
+        let nonmatching = client
+            .put_object()
+            .bucket(&bucket)
+            .key("other/skip")
+            .body(ByteStream::from_static(b"skip"))
+            .send()
+            .await
+            .unwrap();
+        assert!(nonmatching.expiration().is_none());
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("archive/match")
+            .send()
+            .await
+            .unwrap();
+        assert_lifecycle_expiration_header(head.expiration(), "expire-by-date");
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("archive/match")
+            .send()
+            .await
+            .unwrap();
+        assert_lifecycle_expiration_header(get.expiration(), "expire-by-date");
+
+        let _ = client
+            .delete_bucket_lifecycle()
+            .bucket(&bucket)
+            .send()
+            .await;
+        delete_all_and_bucket(
+            client,
+            &bucket,
+            &["archive/match".to_string(), "other/skip".to_string()],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_put_object_and_head_object_report_expiration_header_for_object_size_greater_than_filter() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("expire-large")
+                    .filter(
+                        LifecycleRuleFilter::builder()
+                            .object_size_greater_than(2_000)
+                            .build(),
+                    )
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().days(3).build())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await
+            .unwrap();
+
+        let matching = client
+            .put_object()
+            .bucket(&bucket)
+            .key("large")
+            .body(ByteStream::from(vec![b'a'; 3_000]))
+            .send()
+            .await
+            .unwrap();
+        assert_lifecycle_expiration_header(matching.expiration(), "expire-large");
+
+        let nonmatching = client
+            .put_object()
+            .bucket(&bucket)
+            .key("small")
+            .body(ByteStream::from(vec![b'b'; 1_000]))
+            .send()
+            .await
+            .unwrap();
+        assert!(nonmatching.expiration().is_none());
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("large")
+            .send()
+            .await
+            .unwrap();
+        assert_lifecycle_expiration_header(head.expiration(), "expire-large");
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("large")
+            .send()
+            .await
+            .unwrap();
+        assert_lifecycle_expiration_header(get.expiration(), "expire-large");
+
+        let _ = client
+            .delete_bucket_lifecycle()
+            .bucket(&bucket)
+            .send()
+            .await;
+        delete_all_and_bucket(client, &bucket, &["large".to_string(), "small".to_string()]).await;
+    });
+}
+
+#[test]
+fn test_put_object_and_head_object_report_expiration_header_for_object_size_less_than_filter() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("expire-small")
+                    .filter(
+                        LifecycleRuleFilter::builder()
+                            .object_size_less_than(2_000)
+                            .build(),
+                    )
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().days(3).build())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await
+            .unwrap();
+
+        let matching = client
+            .put_object()
+            .bucket(&bucket)
+            .key("small")
+            .body(ByteStream::from(vec![b'a'; 1_000]))
+            .send()
+            .await
+            .unwrap();
+        assert_lifecycle_expiration_header(matching.expiration(), "expire-small");
+
+        let nonmatching = client
+            .put_object()
+            .bucket(&bucket)
+            .key("large")
+            .body(ByteStream::from(vec![b'b'; 3_000]))
+            .send()
+            .await
+            .unwrap();
+        assert!(nonmatching.expiration().is_none());
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("small")
+            .send()
+            .await
+            .unwrap();
+        assert_lifecycle_expiration_header(head.expiration(), "expire-small");
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("small")
+            .send()
+            .await
+            .unwrap();
+        assert_lifecycle_expiration_header(get.expiration(), "expire-small");
+
+        let _ = client
+            .delete_bucket_lifecycle()
+            .bucket(&bucket)
+            .send()
+            .await;
+        delete_all_and_bucket(client, &bucket, &["small".to_string(), "large".to_string()]).await;
+    });
+}
+
+#[test]
+fn test_get_and_head_object_only_report_expiration_for_current_live_version() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+        enable_versioning(&bucket).await;
+
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("expire-current")
+                    .filter(LifecycleRuleFilter::builder().prefix("logs/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().days(3).build())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await
+            .unwrap();
+
+        let first = client
+            .put_object()
+            .bucket(&bucket)
+            .key("logs/object")
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await
+            .unwrap();
+        assert_lifecycle_expiration_header(first.expiration(), "expire-current");
+        let first_version_id = first.version_id().unwrap().to_string();
+
+        let second = client
+            .put_object()
+            .bucket(&bucket)
+            .key("logs/object")
+            .body(ByteStream::from_static(b"v2"))
+            .send()
+            .await
+            .unwrap();
+        assert_lifecycle_expiration_header(second.expiration(), "expire-current");
+        let second_version_id = second.version_id().unwrap().to_string();
+
+        let implicit_head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("logs/object")
+            .send()
+            .await
+            .unwrap();
+        assert_lifecycle_expiration_header(implicit_head.expiration(), "expire-current");
+
+        let implicit_get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("logs/object")
+            .send()
+            .await
+            .unwrap();
+        assert_lifecycle_expiration_header(implicit_get.expiration(), "expire-current");
+
+        let current_head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("logs/object")
+            .version_id(&second_version_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(current_head.expiration().is_none());
+
+        let current_get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("logs/object")
+            .version_id(&second_version_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(current_get.expiration().is_none());
+
+        let old_head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("logs/object")
+            .version_id(&first_version_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(old_head.expiration().is_none());
+
+        let old_get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("logs/object")
+            .version_id(&first_version_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(old_get.expiration().is_none());
+
+        cleanup_versioned_lifecycle_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_create_multipart_upload_and_list_parts_skip_abort_headers_for_nonmatching_key() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let config = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("abort-incomplete")
+                    .filter(LifecycleRuleFilter::builder().prefix("uploads/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .abort_incomplete_multipart_upload(
+                        AbortIncompleteMultipartUpload::builder()
+                            .days_after_initiation(7)
+                            .build(),
+                    )
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        put_bucket_lifecycle_with_md5(client, &bucket, config)
+            .send()
+            .await
+            .unwrap();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("other/incomplete")
+            .send()
+            .await
+            .unwrap();
+        assert!(create.abort_date().is_none());
+        assert!(create.abort_rule_id().is_none());
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let list_parts = client
+            .list_parts()
+            .bucket(&bucket)
+            .key("other/incomplete")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(list_parts.abort_date().is_none());
+        assert!(list_parts.abort_rule_id().is_none());
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("other/incomplete")
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup_bucket(&bucket).await;
     });
 }
 

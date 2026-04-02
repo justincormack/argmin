@@ -4371,6 +4371,30 @@ impl Coordinator {
         ))
     }
 
+    fn current_object_write_lifecycle_expiration(
+        &self,
+        bucket: &BucketSummary,
+        key: &str,
+        tags_xml: Option<&str>,
+        size: u64,
+        last_modified: u64,
+    ) -> Result<Option<LifecycleExpirationHeader>, ServerError> {
+        let Some(config) = self.cached_bucket_lifecycle(bucket)? else {
+            return Ok(None);
+        };
+        let tags = match tags_xml {
+            Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
+            None => Vec::new(),
+        };
+        Ok(Self::evaluate_current_object_lifecycle_expiration(
+            config.as_ref(),
+            key,
+            &tags,
+            size,
+            last_modified,
+        ))
+    }
+
     fn multipart_lifecycle_abort_headers(
         &self,
         bucket: &BucketSummary,
@@ -4397,12 +4421,8 @@ impl Coordinator {
         if requested_version_id.is_none() {
             return Ok(true);
         }
-        match meta_pg.get_object_meta(bucket, key) {
-            Ok(StoredObject::Live(current)) => Ok(current.version_id == resolved_version_id),
-            Ok(StoredObject::DeleteMarker(_)) => Ok(false),
-            Err(storage::MetadataError::ObjectNotFound) => Ok(false),
-            Err(error) => Err(ServerError::Metadata(error)),
-        }
+        let _ = (meta_pg, bucket, key, resolved_version_id);
+        Ok(false)
     }
 
     fn evaluate_current_object_lifecycle_expiration(
@@ -8275,7 +8295,7 @@ impl Coordinator {
 
             drop(shard_pg_opt);
             drop(meta_pg);
-            let lifecycle_expiration = self.current_object_lifecycle_expiration(
+            let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
                 &bucket_info,
                 req.object.key,
                 lifecycle_tags.as_deref(),
@@ -8954,7 +8974,7 @@ impl Coordinator {
             let lifecycle_last_modified = live_record.last_modified;
 
             drop(meta_guard);
-            let lifecycle_expiration = self.current_object_lifecycle_expiration(
+            let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
                 &bucket_info,
                 key,
                 lifecycle_tags.as_deref(),
@@ -9684,7 +9704,7 @@ impl Coordinator {
             let lifecycle_last_modified = dst_live.last_modified;
             let result_last_modified = dst_stored.last_modified();
             drop(dst_meta_pg);
-            let lifecycle_expiration = self.current_object_lifecycle_expiration(
+            let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
                 &dst_bucket_info,
                 dst_key,
                 lifecycle_tags.as_deref(),
@@ -12822,7 +12842,7 @@ impl Coordinator {
             }
 
             drop(meta_pg);
-            let lifecycle_expiration = self.current_object_lifecycle_expiration(
+            let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
                 &bucket_info,
                 key,
                 lifecycle_tags.as_deref(),
@@ -14397,6 +14417,56 @@ mod tests {
             header.expiry_time_millis,
             Coordinator::lifecycle_day_based_deadline(1_700_000_000_000, 1).unwrap()
         );
+    }
+
+    #[test]
+    fn requested_version_is_current_live_requires_implicit_current_request() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: test_requester(),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+        let put = coord
+            .put_object(&PutObjectRequest {
+                object: object_request("bucket", "key", test_requester()),
+                data: b"body",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                sse_customer: None,
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+            })
+            .unwrap();
+
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        assert!(Coordinator::requested_version_is_current_live(
+            &meta_pg,
+            "bucket",
+            "key",
+            None,
+            put.version_id
+        )
+        .unwrap());
+        assert!(!Coordinator::requested_version_is_current_live(
+            &meta_pg,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            put.version_id
+        )
+        .unwrap());
     }
 
     #[test]
