@@ -41,10 +41,11 @@ use crate::metadata_blob::MetadataBlob;
 use crate::pg::{object_key_hash, part_key_hash, stream_segment_key_hash, PgTopology};
 use crate::range::ByteRange;
 use crate::sse::{
-    decrypt_sse_customer_checksum, decrypt_sse_customer_segment, prepare_sse_customer_write,
-    resume_sse_customer_write, validate_sse_customer_read, SseCustomerRequest,
-    SseCustomerResponseHeaders, SseCustomerSegmentScope, SseCustomerValidatorConfig,
-    SseCustomerWriteContext, SSE_C_SEGMENT_TAG_LEN,
+    decrypt_sse_customer_checksum, decrypt_sse_customer_segment, decrypt_sse_s3_checksum,
+    decrypt_sse_s3_segment, prepare_sse_customer_write, resume_sse_customer_write,
+    validate_sse_customer_read, SseCustomerRequest, SseCustomerResponseHeaders,
+    SseCustomerSegmentScope, SseCustomerValidatorConfig, SseCustomerWriteContext,
+    SseS3WriteContext, StaticManagedKeyProvider, SSE_C_SEGMENT_TAG_LEN,
 };
 use crate::system_metadata::SystemMetadata;
 
@@ -498,7 +499,8 @@ fn segment_payload_buffer_capacity(ec_config: EcConfig) -> usize {
 }
 
 fn max_stored_segment_size() -> usize {
-    // SSE-C stores an authentication tag alongside the largest logical segment.
+    // Encrypted objects store an authentication tag alongside the largest
+    // logical segment.
     INTERNAL_SEGMENT_SIZE.saturating_add(SSE_C_SEGMENT_TAG_LEN)
 }
 
@@ -510,6 +512,7 @@ struct ReadRuntime {
     pg_topology: PgTopology,
     payload_buffer_pool: Arc<PayloadBufferPool>,
     sse_c_validator: Option<SseCustomerValidatorConfig>,
+    sse_s3_provider: Option<StaticManagedKeyProvider>,
 }
 
 #[derive(Debug, Clone)]
@@ -527,10 +530,7 @@ struct SegmentPayloadRecord {
 
 impl SegmentPayloadRecord {
     fn stored_size(&self) -> usize {
-        match self.encryption {
-            ObjectEncryption::None => self.size as usize,
-            ObjectEncryption::SseCustomer(_) => self.size as usize + SSE_C_SEGMENT_TAG_LEN,
-        }
+        self.size as usize + self.encryption.segment_ciphertext_extra_len()
     }
 }
 
@@ -2445,6 +2445,7 @@ pub struct Coordinator {
     payload_buffer_pool: Arc<PayloadBufferPool>,
     region: String,
     sse_c_validator: Option<SseCustomerValidatorConfig>,
+    sse_s3_provider: Option<StaticManagedKeyProvider>,
     _reclaim_sweeper: ReclaimSweeper,
     _lifecycle_sweeper: Arc<LifecycleSweeper>,
 }
@@ -3750,6 +3751,26 @@ impl ReadRuntime {
                     validator,
                     state,
                     request,
+                    segment_scope,
+                    segment.segment_index,
+                    stored_bytes,
+                    segment.size as usize,
+                )
+            }
+            ObjectEncryption::SseS3(state) => {
+                let provider = self
+                    .sse_s3_provider
+                    .as_ref()
+                    .ok_or(ServerError::InternalError {
+                        reason: "SSE-S3 key provider is not configured".to_string(),
+                    })?;
+                let segment_scope = part_number
+                    .map_or(Ok(SseCustomerSegmentScope::object()), |p| {
+                        SseCustomerSegmentScope::multipart_part(p)
+                    })?;
+                decrypt_sse_s3_segment(
+                    provider,
+                    state,
                     segment_scope,
                     segment.segment_index,
                     stored_bytes,
@@ -5987,6 +6008,7 @@ impl Coordinator {
             ec_config,
             region,
             sse_c_validator,
+            None,
             lifecycle_sweeper_factory,
         )
     }
@@ -5996,6 +6018,7 @@ impl Coordinator {
         ec_config: EcConfig,
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
+        sse_s3_provider: Option<StaticManagedKeyProvider>,
         lifecycle_sweeper_factory: F,
     ) -> Result<Self, ServerError>
     where
@@ -6018,6 +6041,7 @@ impl Coordinator {
             pg_topology: pg_topology.clone(),
             payload_buffer_pool: Arc::clone(&payload_buffer_pool),
             sse_c_validator: sse_c_validator.clone(),
+            sse_s3_provider: sse_s3_provider.clone(),
         };
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
@@ -6057,6 +6081,7 @@ impl Coordinator {
             payload_buffer_pool,
             region,
             sse_c_validator,
+            sse_s3_provider,
             _reclaim_sweeper: ReclaimSweeper {
                 storage_node: sweeper_storage_node,
                 stop,
@@ -6078,6 +6103,7 @@ impl Coordinator {
             ec_config,
             region,
             sse_c_validator,
+            None,
             |_, _| Ok(LifecycleSweeper::disabled()),
         )
     }
@@ -6090,6 +6116,7 @@ impl Coordinator {
             pg_topology: self.pg_topology.clone(),
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
             sse_c_validator: self.sse_c_validator.clone(),
+            sse_s3_provider: self.sse_s3_provider.clone(),
         }
     }
 
@@ -7874,11 +7901,13 @@ impl Coordinator {
         bucket_info: &BucketSummary,
         req: &PutCommitRequest<'_>,
     ) -> Result<PreparedPutCommit, ServerError> {
+        self.ensure_write_encryption_supported(req.encryption)?;
         let metadata_blob = SerializedMetadataBlob::from(req.metadata_blob.serialize()?);
         let (system_metadata_blob, encryption) = Self::prepare_stored_system_metadata(
             req.system_metadata,
             req.encryption,
             req.sse_customer_write,
+            None,
         )?;
 
         if !req.cond.is_empty() {
@@ -7969,6 +7998,24 @@ impl Coordinator {
         }
     }
 
+    fn ensure_write_encryption_supported(
+        &self,
+        encryption: &ObjectEncryption,
+    ) -> Result<(), ServerError> {
+        match encryption {
+            ObjectEncryption::None | ObjectEncryption::SseCustomer(_) => Ok(()),
+            ObjectEncryption::SseS3(_) => {
+                if self.sse_s3_provider.is_some() {
+                    Ok(())
+                } else {
+                    Err(ServerError::NotImplemented {
+                        feature: "SSE-S3 requires managed key provider configuration".to_string(),
+                    })
+                }
+            }
+        }
+    }
+
     fn prepare_existing_sse_customer_write_context(
         &self,
         encryption: &ObjectEncryption,
@@ -8009,6 +8056,15 @@ impl Coordinator {
                     segment_scope,
                 )?))
             }
+            ObjectEncryption::SseS3(_) => {
+                if sse_customer.is_some() {
+                    return Err(ServerError::InvalidRequest {
+                        reason: "SSE-C headers may not be used for a non-SSE-C multipart upload"
+                            .to_string(),
+                    });
+                }
+                Ok(None)
+            }
         }
     }
 
@@ -8038,6 +8094,14 @@ impl Coordinator {
                             reason: "SSE-C validator key is not configured".to_string(),
                         })?;
                 Ok(Some(validate_sse_customer_read(validator, state, request)?))
+            }
+            ObjectEncryption::SseS3(_) => {
+                if sse_customer.is_some() {
+                    return Err(ServerError::InvalidRequest {
+                        reason: "SSE-C headers may not be used for a non-SSE-C object".to_string(),
+                    });
+                }
+                Ok(None)
             }
         }
     }
@@ -8350,10 +8414,8 @@ impl Coordinator {
             )? {
                 return Err(ServerError::AccessDenied);
             }
-            Self::ensure_sse_c_allowed(
-                &bucket_info,
-                matches!(req.encryption, ObjectEncryption::SseCustomer(_)),
-            )?;
+            Self::ensure_sse_c_allowed(&bucket_info, req.encryption.uses_sse_customer_headers())?;
+            self.ensure_write_encryption_supported(&req.encryption)?;
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
             Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
 
@@ -8441,10 +8503,8 @@ impl Coordinator {
         )? {
             return Err(ServerError::AccessDenied);
         }
-        Self::ensure_sse_c_allowed(
-            &bucket_info,
-            matches!(upload.encryption, ObjectEncryption::SseCustomer(_)),
-        )?;
+        Self::ensure_sse_c_allowed(&bucket_info, upload.encryption.uses_sse_customer_headers())?;
+        self.ensure_write_encryption_supported(&upload.encryption)?;
         let sse_customer = self.prepare_existing_sse_customer_write_context(
             &upload.encryption,
             req.sse_customer,
@@ -8721,7 +8781,7 @@ impl Coordinator {
             Self::validate_stream_session_binding(&session, bucket, key)?;
             let logical_size = match &session.encryption {
                 ObjectEncryption::None => data.len() as u64,
-                ObjectEncryption::SseCustomer(_) => {
+                ObjectEncryption::SseCustomer(_) | ObjectEncryption::SseS3(_) => {
                     let ciphertext_len = data.len();
                     let logical_len = ciphertext_len.checked_sub(SSE_C_SEGMENT_TAG_LEN).ok_or(
                         ServerError::InvalidRequest {
@@ -9453,6 +9513,8 @@ impl Coordinator {
                     .is_some_and(|src_request| {
                         src_request.customer_key() == dst_request.customer_key()
                     }),
+                (ObjectEncryption::SseS3(_), None) => true,
+                (ObjectEncryption::SseS3(_), Some(_)) => false,
             };
             if matches!(
                 directive,
@@ -9777,6 +9839,7 @@ impl Coordinator {
         system_metadata: &SystemMetadata,
         encryption: &ObjectEncryption,
         sse_customer_write: Option<&SseCustomerWriteContext>,
+        sse_s3_write: Option<&SseS3WriteContext>,
     ) -> Result<(SerializedSystemMetadataBlob, ObjectEncryption), ServerError> {
         let mut stored_system_metadata = system_metadata.clone();
         let stored_encryption = match encryption {
@@ -9795,6 +9858,19 @@ impl Coordinator {
                     });
                 }
             }
+            ObjectEncryption::SseS3(_) => {
+                let checksum = stored_system_metadata.take_checksum();
+                if let Some(sse_s3_write) = sse_s3_write {
+                    sse_s3_write.seal_checksum_metadata(checksum.as_ref())?
+                } else if checksum.is_none() {
+                    encryption.clone()
+                } else {
+                    return Err(ServerError::InternalError {
+                        reason: "SSE-S3 write context is required when storing checksum metadata for this object"
+                            .to_string(),
+                    });
+                }
+            }
         };
         Ok((
             SerializedSystemMetadataBlob::from(stored_system_metadata.serialize()?),
@@ -9809,22 +9885,47 @@ impl Coordinator {
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<SystemMetadata, ServerError> {
         let mut system_metadata = Self::deserialize_system_metadata(system_metadata_blob)?;
-        if let (ObjectEncryption::SseCustomer(state), Some(request)) = (encryption, sse_customer) {
-            if !state.encrypted_checksum_metadata.is_empty() {
-                let validator =
-                    self.sse_c_validator
-                        .as_ref()
-                        .ok_or(ServerError::InternalError {
-                            reason: "SSE-C validator key is not configured".to_string(),
-                        })?;
-                if let Some(checksum) = decrypt_sse_customer_checksum(validator, state, request)? {
-                    system_metadata.set_checksum(
-                        checksum.algorithm(),
-                        checksum.checksum_type(),
-                        checksum.value(),
-                    );
+        match encryption {
+            ObjectEncryption::SseCustomer(state) => {
+                let Some(request) = sse_customer else {
+                    return Ok(system_metadata);
+                };
+                if !state.encrypted_checksum_metadata.is_empty() {
+                    let validator =
+                        self.sse_c_validator
+                            .as_ref()
+                            .ok_or(ServerError::InternalError {
+                                reason: "SSE-C validator key is not configured".to_string(),
+                            })?;
+                    if let Some(checksum) =
+                        decrypt_sse_customer_checksum(validator, state, request)?
+                    {
+                        system_metadata.set_checksum(
+                            checksum.algorithm(),
+                            checksum.checksum_type(),
+                            checksum.value(),
+                        );
+                    }
                 }
             }
+            ObjectEncryption::SseS3(state) => {
+                if !state.encrypted_checksum_metadata.is_empty() {
+                    let provider =
+                        self.sse_s3_provider
+                            .as_ref()
+                            .ok_or(ServerError::InternalError {
+                                reason: "SSE-S3 key provider is not configured".to_string(),
+                            })?;
+                    if let Some(checksum) = decrypt_sse_s3_checksum(provider, state)? {
+                        system_metadata.set_checksum(
+                            checksum.algorithm(),
+                            checksum.checksum_type(),
+                            checksum.value(),
+                        );
+                    }
+                }
+            }
+            ObjectEncryption::None => {}
         }
         Ok(system_metadata)
     }
@@ -12492,7 +12593,7 @@ impl Coordinator {
             }
             Self::ensure_sse_c_allowed(
                 &bucket_info,
-                matches!(upload.encryption, ObjectEncryption::SseCustomer(_)),
+                upload.encryption.uses_sse_customer_headers(),
             )?;
             let multipart_sse_write = self.prepare_existing_sse_customer_write_context(
                 &upload.encryption,
@@ -12751,10 +12852,12 @@ impl Coordinator {
             if let (Some(algo), Some(ref val)) = (checksum_algo, &checksum_value) {
                 system_metadata.set_checksum(algo, checksum_type, val.clone());
             }
+            self.ensure_write_encryption_supported(&upload.encryption)?;
             let (system_metadata_bytes, final_encryption) = Self::prepare_stored_system_metadata(
                 &system_metadata,
                 &upload.encryption,
                 multipart_sse_write.as_ref(),
+                None,
             )?;
 
             let obj_req = CommitMultipartReq {
@@ -13206,7 +13309,10 @@ mod tests {
     use super::test_helpers::{self, UploadPartRequest};
     use super::*;
     use crate::conditional::{DeleteCondition, ReadCondition, SpecificEtag, WriteCondition};
-    use crate::sse::SSE_C_CUSTOMER_KEY_LEN;
+    use crate::sse::{
+        prepare_sse_s3_write, ManagedWrappingKeyConfig, StaticManagedKeyProvider,
+        SSE_C_CUSTOMER_KEY_LEN,
+    };
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::Barrier;
@@ -13324,6 +13430,22 @@ mod tests {
 
     fn test_sse_customer_request() -> SseCustomerRequest {
         SseCustomerRequest::new([7u8; SSE_C_CUSTOMER_KEY_LEN], "dummy-md5".to_string())
+    }
+
+    fn test_sse_s3_encryption() -> ObjectEncryption {
+        use base64::Engine;
+
+        let provider = StaticManagedKeyProvider::single(
+            ManagedWrappingKeyConfig::from_base64(
+                7,
+                &base64::engine::general_purpose::STANDARD.encode([5u8; 32]),
+            )
+            .unwrap(),
+        );
+        prepare_sse_s3_write(&provider)
+            .unwrap()
+            .encryption()
+            .clone()
     }
 
     fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), ServerError> {
@@ -24087,6 +24209,30 @@ mod tests {
     }
 
     #[test]
+    fn begin_stream_put_rejects_sse_s3_without_provider() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .begin_stream_put(&BeginStreamPutRequest {
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy: PutObjectPolicyContext::default(),
+                encryption: test_sse_s3_encryption(),
+                object_lock: ObjectLockState::default(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::NotImplemented { ref feature }
+            if feature == "SSE-S3 requires managed key provider configuration"
+        ));
+    }
+
+    #[test]
     fn begin_stream_part_rejects_non_owner_requester() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -34799,6 +34945,7 @@ mod tests {
             pg_topology: PgTopology::new(&[0]).unwrap(),
             payload_buffer_pool: PayloadBufferPool::new(ec_config),
             sse_c_validator: None,
+            sse_s3_provider: None,
         };
 
         let data = vec![1u8, 2, 3, 4];

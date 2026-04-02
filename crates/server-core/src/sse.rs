@@ -2,9 +2,10 @@ use std::fmt;
 
 use ring::{aead, hmac, rand::SecureRandom};
 use storage::{
-    ObjectEncryption, SseCustomerObjectState, SSE_C_CHECKSUM_NONCE_LEN,
+    ObjectEncryption, SseCustomerObjectState, SseS3ObjectState, SSE_C_CHECKSUM_NONCE_LEN,
     SSE_C_SEGMENT_NONCE_PREFIX_LEN, SSE_C_SEGMENT_NONCE_SCOPE_LEN, SSE_C_VALIDATOR_HMAC_LEN,
     SSE_C_VALIDATOR_SALT_LEN, SSE_C_WRAPPED_DEK_LEN, SSE_C_WRAP_NONCE_LEN, SSE_C_WRAP_SALT_LEN,
+    SSE_S3_CHECKSUM_NONCE_LEN, SSE_S3_SEGMENT_NONCE_PREFIX_LEN, SSE_S3_WRAP_NONCE_LEN,
 };
 use subtle::ConstantTimeEq;
 
@@ -20,6 +21,14 @@ const SSE_C_SEGMENT_AAD: &[u8] = b"argmin:sse-c:segment:v1";
 const SSE_C_CHECKSUM_AAD: &[u8] = b"argmin:sse-c:checksum:v1";
 const SSE_C_HKDF_INFO: &[u8] = b"argmin:sse-c:kek:v1";
 const SSE_C_CHECKSUM_METADATA_VERSION: u8 = 1;
+const SSE_S3_WRAP_AAD: &[u8] = b"argmin:sse-s3:wrap:v1";
+const SSE_S3_SEGMENT_AAD: &[u8] = b"argmin:sse-s3:segment:v1";
+const SSE_S3_CHECKSUM_AAD: &[u8] = b"argmin:sse-s3:checksum:v1";
+
+struct AeadDescriptor<'a> {
+    aad: &'a [u8],
+    label: &'a str,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct SseCustomerRequest {
@@ -111,6 +120,103 @@ impl fmt::Debug for SseCustomerValidatorConfig {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct ManagedWrappingKeyConfig {
+    pub key_id: u32,
+    wrapping_key: [u8; 32],
+}
+
+impl ManagedWrappingKeyConfig {
+    pub fn from_base64(key_id: u32, encoded: &str) -> Result<Self, String> {
+        use base64::Engine;
+
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| "invalid base64 in managed wrapping key".to_string())?;
+        let wrapping_key = decoded
+            .try_into()
+            .map_err(|_| "managed wrapping key must decode to exactly 32 bytes".to_string())?;
+        Ok(Self {
+            key_id,
+            wrapping_key,
+        })
+    }
+
+    fn wrapping_key(&self) -> &[u8; 32] {
+        &self.wrapping_key
+    }
+}
+
+impl fmt::Debug for ManagedWrappingKeyConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ManagedWrappingKeyConfig")
+            .field("key_id", &self.key_id)
+            .finish_non_exhaustive()
+    }
+}
+
+pub trait ManagedKeyProvider {
+    fn active_key(&self) -> &ManagedWrappingKeyConfig;
+    fn lookup_key(&self, key_id: u32) -> Option<&ManagedWrappingKeyConfig>;
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct StaticManagedKeyProvider {
+    active_key_id: u32,
+    keys: Vec<ManagedWrappingKeyConfig>,
+}
+
+impl StaticManagedKeyProvider {
+    #[must_use]
+    pub fn single(key: ManagedWrappingKeyConfig) -> Self {
+        Self {
+            active_key_id: key.key_id,
+            keys: vec![key],
+        }
+    }
+
+    pub fn new(
+        active_key_id: u32,
+        keys: Vec<ManagedWrappingKeyConfig>,
+    ) -> Result<Self, ServerError> {
+        if keys.is_empty() {
+            return Err(ServerError::InternalError {
+                reason: "managed key provider requires at least one wrapping key".to_string(),
+            });
+        }
+        if !keys.iter().any(|key| key.key_id == active_key_id) {
+            return Err(ServerError::InternalError {
+                reason: format!("managed key provider missing active wrapping key {active_key_id}"),
+            });
+        }
+        Ok(Self {
+            active_key_id,
+            keys,
+        })
+    }
+}
+
+impl ManagedKeyProvider for StaticManagedKeyProvider {
+    fn active_key(&self) -> &ManagedWrappingKeyConfig {
+        self.lookup_key(self.active_key_id)
+            .expect("active wrapping key id validated at construction time")
+    }
+
+    fn lookup_key(&self, key_id: u32) -> Option<&ManagedWrappingKeyConfig> {
+        self.keys.iter().find(|key| key.key_id == key_id)
+    }
+}
+
+impl fmt::Debug for StaticManagedKeyProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let key_ids: Vec<u32> = self.keys.iter().map(|key| key.key_id).collect();
+        f.debug_struct("StaticManagedKeyProvider")
+            .field("active_key_id", &self.active_key_id)
+            .field("key_ids", &key_ids)
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct SseCustomerWriteContext {
     request: SseCustomerRequest,
@@ -159,7 +265,7 @@ impl SseCustomerWriteContext {
             });
         };
         let (checksum_nonce, encrypted_checksum_metadata) =
-            encrypt_checksum_with_dek(&self.dek, checksum)?;
+            encrypt_checksum_with_dek(&self.dek, checksum, SSE_C_CHECKSUM_AAD, "SSE-C")?;
         Ok(ObjectEncryption::SseCustomer(SseCustomerObjectState {
             validator_key_id: state.validator_key_id,
             validator_salt: state.validator_salt,
@@ -178,6 +284,72 @@ impl fmt::Debug for SseCustomerWriteContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SseCustomerWriteContext")
             .field("request", &self.request)
+            .field("encryption", &self.encryption)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
+pub struct SseS3WriteContext {
+    encryption: ObjectEncryption,
+    dek: [u8; SSE_C_DEK_LEN],
+    segment_scope: SseCustomerSegmentScope,
+}
+
+impl SseS3WriteContext {
+    #[must_use]
+    pub fn encryption(&self) -> &ObjectEncryption {
+        &self.encryption
+    }
+
+    pub fn encrypt_segment(
+        &self,
+        segment_index: u32,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, ServerError> {
+        let ObjectEncryption::SseS3(state) = &self.encryption else {
+            return Err(ServerError::InternalError {
+                reason: "SSE-S3 write context missing encryption state".to_string(),
+            });
+        };
+        encrypt_segment_with_dek_and_prefix(
+            &self.dek,
+            &state.segment_nonce_prefix,
+            self.segment_scope,
+            segment_index,
+            plaintext,
+            AeadDescriptor {
+                aad: SSE_S3_SEGMENT_AAD,
+                label: "SSE-S3",
+            },
+        )
+    }
+
+    pub fn seal_checksum_metadata(
+        &self,
+        checksum: Option<&ObjectChecksumMetadata>,
+    ) -> Result<ObjectEncryption, ServerError> {
+        let ObjectEncryption::SseS3(state) = &self.encryption else {
+            return Err(ServerError::InternalError {
+                reason: "SSE-S3 write context missing encryption state".to_string(),
+            });
+        };
+        let (checksum_nonce, encrypted_checksum_metadata) =
+            encrypt_checksum_with_dek(&self.dek, checksum, SSE_S3_CHECKSUM_AAD, "SSE-S3")?;
+        Ok(ObjectEncryption::SseS3(SseS3ObjectState {
+            wrapping_key_id: state.wrapping_key_id,
+            wrap_nonce: state.wrap_nonce,
+            wrapped_dek: state.wrapped_dek,
+            segment_nonce_prefix: state.segment_nonce_prefix,
+            checksum_nonce,
+            encrypted_checksum_metadata,
+        }))
+    }
+}
+
+impl fmt::Debug for SseS3WriteContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SseS3WriteContext")
             .field("encryption", &self.encryption)
             .finish()
     }
@@ -243,7 +415,7 @@ pub fn prepare_sse_customer_write(
     })?;
 
     let kek = derive_wrap_key(request.customer_key(), &wrap_salt)?;
-    let wrapped_dek = wrap_dek(&kek, &wrap_nonce, &dek)?;
+    let wrapped_dek = wrap_managed_dek(&kek, &wrap_nonce, &dek, SSE_C_WRAP_AAD, "SSE-C")?;
 
     let mut segment_nonce_prefix = [0u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN];
     rng.fill(&mut segment_nonce_prefix)
@@ -277,7 +449,13 @@ pub(crate) fn resume_sse_customer_write(
 ) -> Result<SseCustomerWriteContext, ServerError> {
     validate_sse_customer_write(validator, state, request)?;
     let kek = derive_wrap_key(request.customer_key(), &state.wrap_salt)?;
-    let dek = unwrap_dek(&kek, &state.wrap_nonce, &state.wrapped_dek)?;
+    let dek = unwrap_managed_dek(
+        &kek,
+        &state.wrap_nonce,
+        &state.wrapped_dek,
+        SSE_C_WRAP_AAD,
+        "SSE-C",
+    )?;
     Ok(SseCustomerWriteContext {
         request: request.clone(),
         encryption: ObjectEncryption::SseCustomer(state.clone()),
@@ -301,6 +479,141 @@ pub fn validate_sse_customer_read(
         return Err(ServerError::AccessDenied);
     }
     Ok(request.response_headers())
+}
+
+pub fn prepare_sse_s3_write(
+    provider: &impl ManagedKeyProvider,
+) -> Result<SseS3WriteContext, ServerError> {
+    let rng = ring::rand::SystemRandom::new();
+    let wrapping_key = provider.active_key();
+
+    let mut wrap_nonce = [0u8; SSE_S3_WRAP_NONCE_LEN];
+    rng.fill(&mut wrap_nonce)
+        .map_err(|_| ServerError::InternalError {
+            reason: "failed to generate SSE-S3 wrap nonce".to_string(),
+        })?;
+
+    let mut dek = [0u8; SSE_C_DEK_LEN];
+    rng.fill(&mut dek).map_err(|_| ServerError::InternalError {
+        reason: "failed to generate SSE-S3 object DEK".to_string(),
+    })?;
+
+    let wrapped_dek = wrap_managed_dek(
+        wrapping_key.wrapping_key(),
+        &wrap_nonce,
+        &dek,
+        SSE_S3_WRAP_AAD,
+        "SSE-S3",
+    )?;
+
+    let mut segment_nonce_prefix = [0u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN];
+    rng.fill(&mut segment_nonce_prefix)
+        .map_err(|_| ServerError::InternalError {
+            reason: "failed to generate SSE-S3 segment nonce prefix".to_string(),
+        })?;
+
+    Ok(SseS3WriteContext {
+        encryption: ObjectEncryption::SseS3(SseS3ObjectState {
+            wrapping_key_id: wrapping_key.key_id,
+            wrap_nonce,
+            wrapped_dek,
+            segment_nonce_prefix,
+            checksum_nonce: [0u8; SSE_S3_CHECKSUM_NONCE_LEN],
+            encrypted_checksum_metadata: Vec::new(),
+        }),
+        dek,
+        segment_scope: SseCustomerSegmentScope::object(),
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn resume_sse_s3_write(
+    provider: &impl ManagedKeyProvider,
+    state: &SseS3ObjectState,
+    segment_scope: SseCustomerSegmentScope,
+) -> Result<SseS3WriteContext, ServerError> {
+    let wrapping_key =
+        provider
+            .lookup_key(state.wrapping_key_id)
+            .ok_or(ServerError::InternalError {
+                reason: "SSE-S3 wrapping key for object is not available".to_string(),
+            })?;
+    let dek = unwrap_managed_dek(
+        wrapping_key.wrapping_key(),
+        &state.wrap_nonce,
+        &state.wrapped_dek,
+        SSE_S3_WRAP_AAD,
+        "SSE-S3",
+    )?;
+    Ok(SseS3WriteContext {
+        encryption: ObjectEncryption::SseS3(state.clone()),
+        dek,
+        segment_scope,
+    })
+}
+
+pub(crate) fn decrypt_sse_s3_segment(
+    provider: &impl ManagedKeyProvider,
+    state: &SseS3ObjectState,
+    segment_scope: SseCustomerSegmentScope,
+    segment_index: u32,
+    ciphertext: &[u8],
+    plaintext_len: usize,
+) -> Result<Vec<u8>, ServerError> {
+    let wrapping_key =
+        provider
+            .lookup_key(state.wrapping_key_id)
+            .ok_or(ServerError::InternalError {
+                reason: "SSE-S3 wrapping key for object is not available".to_string(),
+            })?;
+    let dek = unwrap_managed_dek(
+        wrapping_key.wrapping_key(),
+        &state.wrap_nonce,
+        &state.wrapped_dek,
+        SSE_S3_WRAP_AAD,
+        "SSE-S3",
+    )?;
+    decrypt_segment_with_dek_and_prefix(
+        &dek,
+        &state.segment_nonce_prefix,
+        segment_scope,
+        segment_index,
+        ciphertext,
+        plaintext_len,
+        AeadDescriptor {
+            aad: SSE_S3_SEGMENT_AAD,
+            label: "SSE-S3",
+        },
+    )
+}
+
+pub fn decrypt_sse_s3_checksum(
+    provider: &impl ManagedKeyProvider,
+    state: &SseS3ObjectState,
+) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
+    if state.encrypted_checksum_metadata.is_empty() {
+        return Ok(None);
+    }
+    let wrapping_key =
+        provider
+            .lookup_key(state.wrapping_key_id)
+            .ok_or(ServerError::InternalError {
+                reason: "SSE-S3 wrapping key for object is not available".to_string(),
+            })?;
+    let dek = unwrap_managed_dek(
+        wrapping_key.wrapping_key(),
+        &state.wrap_nonce,
+        &state.wrapped_dek,
+        SSE_S3_WRAP_AAD,
+        "SSE-S3",
+    )?;
+    decrypt_checksum_with_dek(
+        &dek,
+        &state.checksum_nonce,
+        &state.encrypted_checksum_metadata,
+        SSE_S3_CHECKSUM_AAD,
+        "SSE-S3",
+    )
 }
 
 fn validate_sse_customer_write(
@@ -335,14 +648,24 @@ pub(crate) fn decrypt_sse_customer_segment(
 ) -> Result<Vec<u8>, ServerError> {
     validate_sse_customer_read(validator, state, request)?;
     let kek = derive_wrap_key(request.customer_key(), &state.wrap_salt)?;
-    let dek = unwrap_dek(&kek, &state.wrap_nonce, &state.wrapped_dek)?;
-    decrypt_segment_with_dek(
+    let dek = unwrap_managed_dek(
+        &kek,
+        &state.wrap_nonce,
+        &state.wrapped_dek,
+        SSE_C_WRAP_AAD,
+        "SSE-C",
+    )?;
+    decrypt_segment_with_dek_and_prefix(
         &dek,
-        state,
+        &state.segment_nonce_prefix,
         segment_scope,
         segment_index,
         ciphertext,
         plaintext_len,
+        AeadDescriptor {
+            aad: SSE_C_SEGMENT_AAD,
+            label: "SSE-C",
+        },
     )
 }
 
@@ -356,8 +679,20 @@ pub fn decrypt_sse_customer_checksum(
     }
     validate_sse_customer_read(validator, state, request)?;
     let kek = derive_wrap_key(request.customer_key(), &state.wrap_salt)?;
-    let dek = unwrap_dek(&kek, &state.wrap_nonce, &state.wrapped_dek)?;
-    decrypt_checksum_with_dek(&dek, state)
+    let dek = unwrap_managed_dek(
+        &kek,
+        &state.wrap_nonce,
+        &state.wrapped_dek,
+        SSE_C_WRAP_AAD,
+        "SSE-C",
+    )?;
+    decrypt_checksum_with_dek(
+        &dek,
+        &state.checksum_nonce,
+        &state.encrypted_checksum_metadata,
+        SSE_C_CHECKSUM_AAD,
+        "SSE-C",
+    )
 }
 
 fn compute_validator_hmac(
@@ -400,55 +735,59 @@ fn derive_wrap_key(
     Ok(out)
 }
 
-fn wrap_dek(
+fn wrap_managed_dek(
     kek: &[u8; 32],
     wrap_nonce: &[u8; SSE_C_WRAP_NONCE_LEN],
     dek: &[u8; SSE_C_DEK_LEN],
+    wrap_aad: &[u8],
+    label: &str,
 ) -> Result<[u8; SSE_C_WRAPPED_DEK_LEN], ServerError> {
     let unbound =
         aead::UnboundKey::new(&aead::AES_256_GCM, kek).map_err(|_| ServerError::InternalError {
-            reason: "failed to create SSE-C wrapping key".to_string(),
+            reason: format!("failed to create {label} wrapping key"),
         })?;
     let sealing_key = aead::LessSafeKey::new(unbound);
     let mut buf = dek.to_vec();
     sealing_key
         .seal_in_place_append_tag(
             aead::Nonce::assume_unique_for_key(*wrap_nonce),
-            aead::Aad::from(SSE_C_WRAP_AAD),
+            aead::Aad::from(wrap_aad),
             &mut buf,
         )
         .map_err(|_| ServerError::InternalError {
-            reason: "failed to wrap SSE-C DEK".to_string(),
+            reason: format!("failed to wrap {label} DEK"),
         })?;
     buf.try_into().map_err(|_| ServerError::InternalError {
-        reason: "wrapped SSE-C DEK length mismatch".to_string(),
+        reason: format!("wrapped {label} DEK length mismatch"),
     })
 }
 
-fn unwrap_dek(
+fn unwrap_managed_dek(
     kek: &[u8; 32],
     wrap_nonce: &[u8; SSE_C_WRAP_NONCE_LEN],
     wrapped_dek: &[u8; SSE_C_WRAPPED_DEK_LEN],
+    wrap_aad: &[u8],
+    label: &str,
 ) -> Result<[u8; SSE_C_DEK_LEN], ServerError> {
     let unbound =
         aead::UnboundKey::new(&aead::AES_256_GCM, kek).map_err(|_| ServerError::InternalError {
-            reason: "failed to create SSE-C unwrap key".to_string(),
+            reason: format!("failed to create {label} unwrap key"),
         })?;
     let opening_key = aead::LessSafeKey::new(unbound);
     let mut buf = wrapped_dek.to_vec();
     let plaintext = opening_key
         .open_in_place(
             aead::Nonce::assume_unique_for_key(*wrap_nonce),
-            aead::Aad::from(SSE_C_WRAP_AAD),
+            aead::Aad::from(wrap_aad),
             &mut buf,
         )
-        .map_err(|_| ServerError::InvalidRequest {
-            reason: "The provided SSE-C key is invalid".to_string(),
+        .map_err(|_| ServerError::InternalError {
+            reason: format!("failed to unwrap {label} DEK"),
         })?;
     plaintext
         .try_into()
         .map_err(|_| ServerError::InternalError {
-            reason: "unwrapped SSE-C DEK length mismatch".to_string(),
+            reason: format!("unwrapped {label} DEK length mismatch"),
         })
 }
 
@@ -459,51 +798,74 @@ fn encrypt_segment_with_dek(
     segment_index: u32,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, ServerError> {
+    encrypt_segment_with_dek_and_prefix(
+        dek,
+        &state.segment_nonce_prefix,
+        segment_scope,
+        segment_index,
+        plaintext,
+        AeadDescriptor {
+            aad: SSE_C_SEGMENT_AAD,
+            label: "SSE-C",
+        },
+    )
+}
+
+fn encrypt_segment_with_dek_and_prefix(
+    dek: &[u8; SSE_C_DEK_LEN],
+    segment_nonce_prefix: &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+    segment_scope: SseCustomerSegmentScope,
+    segment_index: u32,
+    plaintext: &[u8],
+    descriptor: AeadDescriptor<'_>,
+) -> Result<Vec<u8>, ServerError> {
     let unbound =
         aead::UnboundKey::new(&aead::AES_256_GCM, dek).map_err(|_| ServerError::InternalError {
-            reason: "failed to create SSE-C segment sealing key".to_string(),
+            reason: format!("failed to create {} segment sealing key", descriptor.label),
         })?;
     let sealing_key = aead::LessSafeKey::new(unbound);
     let mut buf = plaintext.to_vec();
     sealing_key
         .seal_in_place_append_tag(
-            segment_nonce(state, segment_scope, segment_index),
-            aead::Aad::from(SSE_C_SEGMENT_AAD),
+            segment_nonce(segment_nonce_prefix, segment_scope, segment_index),
+            aead::Aad::from(descriptor.aad),
             &mut buf,
         )
         .map_err(|_| ServerError::InternalError {
-            reason: "failed to encrypt SSE-C segment".to_string(),
+            reason: format!("failed to encrypt {} segment", descriptor.label),
         })?;
     Ok(buf)
 }
 
-fn decrypt_segment_with_dek(
+fn decrypt_segment_with_dek_and_prefix(
     dek: &[u8; SSE_C_DEK_LEN],
-    state: &SseCustomerObjectState,
+    segment_nonce_prefix: &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
     segment_scope: SseCustomerSegmentScope,
     segment_index: u32,
     ciphertext: &[u8],
     plaintext_len: usize,
+    descriptor: AeadDescriptor<'_>,
 ) -> Result<Vec<u8>, ServerError> {
     let unbound =
         aead::UnboundKey::new(&aead::AES_256_GCM, dek).map_err(|_| ServerError::InternalError {
-            reason: "failed to create SSE-C segment opening key".to_string(),
+            reason: format!("failed to create {} segment opening key", descriptor.label),
         })?;
     let opening_key = aead::LessSafeKey::new(unbound);
     let mut buf = ciphertext.to_vec();
     let plaintext = opening_key
         .open_in_place(
-            segment_nonce(state, segment_scope, segment_index),
-            aead::Aad::from(SSE_C_SEGMENT_AAD),
+            segment_nonce(segment_nonce_prefix, segment_scope, segment_index),
+            aead::Aad::from(descriptor.aad),
             &mut buf,
         )
         .map_err(|_| ServerError::InternalError {
-            reason: "failed to decrypt SSE-C segment".to_string(),
+            reason: format!("failed to decrypt {} segment", descriptor.label),
         })?;
     if plaintext.len() != plaintext_len {
         return Err(ServerError::InternalError {
             reason: format!(
-                "decrypted SSE-C segment length {} did not match expected {}",
+                "decrypted {} segment length {} did not match expected {}",
+                descriptor.label,
                 plaintext.len(),
                 plaintext_len
             ),
@@ -513,12 +875,12 @@ fn decrypt_segment_with_dek(
 }
 
 fn segment_nonce(
-    state: &SseCustomerObjectState,
+    segment_nonce_prefix: &[u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
     segment_scope: SseCustomerSegmentScope,
     segment_index: u32,
 ) -> aead::Nonce {
     let mut nonce = [0u8; 12];
-    nonce[..SSE_C_SEGMENT_NONCE_PREFIX_LEN].copy_from_slice(&state.segment_nonce_prefix);
+    nonce[..SSE_C_SEGMENT_NONCE_PREFIX_LEN].copy_from_slice(segment_nonce_prefix);
     let scope_start = SSE_C_SEGMENT_NONCE_PREFIX_LEN;
     let scope_end = scope_start + SSE_C_SEGMENT_NONCE_SCOPE_LEN;
     nonce[scope_start..scope_end].copy_from_slice(&segment_scope.encode());
@@ -584,55 +946,60 @@ fn decode_checksum_metadata(data: &[u8]) -> Result<ObjectChecksumMetadata, Serve
 fn encrypt_checksum_with_dek(
     dek: &[u8; SSE_C_DEK_LEN],
     checksum: Option<&ObjectChecksumMetadata>,
+    aad: &[u8],
+    label: &str,
 ) -> Result<([u8; SSE_C_CHECKSUM_NONCE_LEN], Vec<u8>), ServerError> {
     let Some(checksum) = checksum else {
         return Ok(([0u8; SSE_C_CHECKSUM_NONCE_LEN], Vec::new()));
     };
     let unbound =
         aead::UnboundKey::new(&aead::AES_256_GCM, dek).map_err(|_| ServerError::InternalError {
-            reason: "failed to create SSE-C checksum sealing key".to_string(),
+            reason: format!("failed to create {label} checksum sealing key"),
         })?;
     let sealing_key = aead::LessSafeKey::new(unbound);
     let rng = ring::rand::SystemRandom::new();
     let mut nonce = [0u8; SSE_C_CHECKSUM_NONCE_LEN];
     rng.fill(&mut nonce)
         .map_err(|_| ServerError::InternalError {
-            reason: "failed to generate SSE-C checksum nonce".to_string(),
+            reason: format!("failed to generate {label} checksum nonce"),
         })?;
     let mut buf = encode_checksum_metadata(checksum)?;
     sealing_key
         .seal_in_place_append_tag(
             aead::Nonce::assume_unique_for_key(nonce),
-            aead::Aad::from(SSE_C_CHECKSUM_AAD),
+            aead::Aad::from(aad),
             &mut buf,
         )
         .map_err(|_| ServerError::InternalError {
-            reason: "failed to encrypt SSE-C checksum metadata".to_string(),
+            reason: format!("failed to encrypt {label} checksum metadata"),
         })?;
     Ok((nonce, buf))
 }
 
 fn decrypt_checksum_with_dek(
     dek: &[u8; SSE_C_DEK_LEN],
-    state: &SseCustomerObjectState,
+    checksum_nonce: &[u8; SSE_C_CHECKSUM_NONCE_LEN],
+    encrypted_checksum_metadata: &[u8],
+    aad: &[u8],
+    label: &str,
 ) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
-    if state.encrypted_checksum_metadata.is_empty() {
+    if encrypted_checksum_metadata.is_empty() {
         return Ok(None);
     }
     let unbound =
         aead::UnboundKey::new(&aead::AES_256_GCM, dek).map_err(|_| ServerError::InternalError {
-            reason: "failed to create SSE-C checksum opening key".to_string(),
+            reason: format!("failed to create {label} checksum opening key"),
         })?;
     let opening_key = aead::LessSafeKey::new(unbound);
-    let mut buf = state.encrypted_checksum_metadata.clone();
+    let mut buf = encrypted_checksum_metadata.to_vec();
     let plaintext = opening_key
         .open_in_place(
-            aead::Nonce::assume_unique_for_key(state.checksum_nonce),
-            aead::Aad::from(SSE_C_CHECKSUM_AAD),
+            aead::Nonce::assume_unique_for_key(*checksum_nonce),
+            aead::Aad::from(aad),
             &mut buf,
         )
         .map_err(|_| ServerError::InternalError {
-            reason: "failed to decrypt SSE-C checksum metadata".to_string(),
+            reason: format!("failed to decrypt {label} checksum metadata"),
         })?;
     Ok(Some(decode_checksum_metadata(plaintext)?))
 }
@@ -660,6 +1027,13 @@ mod tests {
             key_id: 1,
             validator_key: [9u8; 32],
         }
+    }
+
+    fn sse_s3_provider() -> StaticManagedKeyProvider {
+        StaticManagedKeyProvider::single(ManagedWrappingKeyConfig {
+            key_id: 7,
+            wrapping_key: [11u8; 32],
+        })
     }
 
     #[test]
@@ -798,5 +1172,95 @@ mod tests {
             .unwrap()
             .expect("expected checksum metadata");
         assert_eq!(decrypted, checksum);
+    }
+
+    #[test]
+    fn sse_s3_round_trip() {
+        let provider = sse_s3_provider();
+        let ctx = prepare_sse_s3_write(&provider).unwrap();
+        let ObjectEncryption::SseS3(state) = ctx.encryption() else {
+            panic!("expected SSE-S3 object state");
+        };
+        let ciphertext = ctx.encrypt_segment(4, b"hello sse-s3").unwrap();
+        let plaintext = decrypt_sse_s3_segment(
+            &provider,
+            state,
+            SseCustomerSegmentScope::object(),
+            4,
+            &ciphertext,
+            12,
+        )
+        .unwrap();
+        assert_eq!(plaintext, b"hello sse-s3");
+    }
+
+    #[test]
+    fn sse_s3_resume_write_round_trip() {
+        let provider = sse_s3_provider();
+        let initial = prepare_sse_s3_write(&provider).unwrap();
+        let ObjectEncryption::SseS3(state) = initial.encryption() else {
+            panic!("expected SSE-S3 object state");
+        };
+        let resumed = resume_sse_s3_write(
+            &provider,
+            state,
+            SseCustomerSegmentScope::multipart_part(2).unwrap(),
+        )
+        .unwrap();
+        let ciphertext = resumed.encrypt_segment(1, b"part-data").unwrap();
+        let plaintext = decrypt_sse_s3_segment(
+            &provider,
+            state,
+            SseCustomerSegmentScope::multipart_part(2).unwrap(),
+            1,
+            &ciphertext,
+            9,
+        )
+        .unwrap();
+        assert_eq!(plaintext, b"part-data");
+    }
+
+    #[test]
+    fn sse_s3_checksum_metadata_round_trip() {
+        let provider = sse_s3_provider();
+        let ctx = prepare_sse_s3_write(&provider).unwrap();
+        let checksum = ObjectChecksumMetadata::new(
+            ChecksumAlgorithm::Sha256,
+            Some(ChecksumType::FullObject),
+            "beadfeed".to_string(),
+        );
+        let ObjectEncryption::SseS3(state) = ctx.seal_checksum_metadata(Some(&checksum)).unwrap()
+        else {
+            panic!("expected SSE-S3 object state");
+        };
+        assert!(!state.encrypted_checksum_metadata.is_empty());
+        let decrypted = decrypt_sse_s3_checksum(&provider, &state)
+            .unwrap()
+            .expect("expected checksum metadata");
+        assert_eq!(decrypted, checksum);
+    }
+
+    #[test]
+    fn sse_s3_missing_wrapping_key_fails() {
+        let provider = sse_s3_provider();
+        let ctx = prepare_sse_s3_write(&provider).unwrap();
+        let ObjectEncryption::SseS3(state) = ctx.encryption() else {
+            panic!("expected SSE-S3 object state");
+        };
+        let ciphertext = ctx.encrypt_segment(0, b"abc").unwrap();
+        let missing_provider = StaticManagedKeyProvider::single(ManagedWrappingKeyConfig {
+            key_id: 8,
+            wrapping_key: [12u8; 32],
+        });
+        let err = decrypt_sse_s3_segment(
+            &missing_provider,
+            state,
+            SseCustomerSegmentScope::object(),
+            0,
+            &ciphertext,
+            3,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InternalError { .. }));
     }
 }

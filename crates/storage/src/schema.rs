@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS objects (
     CHECK (status IN (0, 1)),
     CHECK (etag_kind IN (0, 1)),
     CHECK (data_layout IN (0, 1)),
-    CHECK (encryption_type IN (0, 1)),
+    CHECK (encryption_type IN (0, 1, 2)),
     CHECK (
         (status = 0 AND (
             generation_id IS NOT NULL AND generation_id > 0 AND
@@ -80,7 +80,7 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     metadata_blob    BLOB NOT NULL,
     system_metadata_blob BLOB NOT NULL,
     owner_principal  TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
-    encryption_type  INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1)),
+    encryption_type  INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1, 2)),
     encryption_state BLOB,
     owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) = 64),
     initiator_principal TEXT CHECK (
@@ -157,7 +157,7 @@ CREATE TABLE IF NOT EXISTS stream_uploads (
     part_number   INTEGER,
     state         INTEGER NOT NULL DEFAULT 0,
     created_at    INTEGER NOT NULL,
-    encryption_type INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1)),
+    encryption_type INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1, 2)),
     encryption_state BLOB,
     CHECK (op_kind IN (0, 1)),
     CHECK (state IN (0, 1, 2, 3)),
