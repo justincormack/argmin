@@ -13,6 +13,10 @@ const MULTIPART_MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 // regression.
 const SSE_C_SEGMENT_BOUNDARY_SIZE: usize = 8 * 1024 * 1024;
 
+const fn mib(size: usize) -> usize {
+    size * 1024 * 1024
+}
+
 macro_rules! with_sse_c_headers {
     ($op:expr, $key_b64:expr, $key_md5_b64:expr) => {{
         $op.customize().mutate_request({
@@ -30,6 +34,34 @@ macro_rules! with_sse_c_headers {
             }
         })
     }};
+}
+
+macro_rules! sse_c_single_part_round_trip_tests {
+    ($( $name:ident => ($label:expr, $size:expr, $seed:expr), )* ) => {
+        $(
+            #[test]
+            fn $name() {
+                require_https_endpoint();
+                s3_tests::run(async {
+                    assert_sse_c_put_get_head_round_trip_size($size, $seed, $label).await;
+                });
+            }
+        )*
+    };
+}
+
+macro_rules! sse_c_multipart_round_trip_tests {
+    ($( $name:ident => ($label:expr, $size:expr, $seed:expr), )* ) => {
+        $(
+            #[test]
+            fn $name() {
+                require_https_endpoint();
+                s3_tests::run(async {
+                    assert_sse_c_multipart_round_trip_size($size, $seed, $label).await;
+                });
+            }
+        )*
+    };
 }
 
 macro_rules! with_sse_c_copy_headers {
@@ -259,6 +291,188 @@ fn patterned_bytes(len: usize, seed: u8) -> Vec<u8> {
         .collect()
 }
 
+async fn assert_sse_c_put_get_head_round_trip_size(size: usize, seed: u8, label: &str) {
+    let client = CTX.client();
+    let bucket = unique_bucket();
+    let object_key = format!("obj-{label}");
+    client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+    let key = test_sse_c_key();
+    let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+    let body = patterned_bytes(size, seed);
+
+    with_sse_c_headers!(
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(&object_key)
+            .body(ByteStream::from(body.clone())),
+        key_b64,
+        key_md5_b64
+    )
+    .send()
+    .await
+    .unwrap();
+
+    let head = with_sse_c_headers!(
+        client.head_object().bucket(&bucket).key(&object_key),
+        key_b64,
+        key_md5_b64
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        head.content_length(),
+        Some(body.len() as i64),
+        "HEAD content length mismatch for {label}",
+    );
+    assert_eq!(
+        head.sse_customer_algorithm(),
+        Some("AES256"),
+        "HEAD SSE-C algorithm mismatch for {label}",
+    );
+    assert_eq!(
+        head.sse_customer_key_md5(),
+        Some(key_md5_b64.as_str()),
+        "HEAD SSE-C key MD5 mismatch for {label}",
+    );
+
+    let get = with_sse_c_headers!(
+        client.get_object().bucket(&bucket).key(&object_key),
+        key_b64,
+        key_md5_b64
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        get.sse_customer_algorithm(),
+        Some("AES256"),
+        "GET SSE-C algorithm mismatch for {label}",
+    );
+    assert_eq!(
+        get.sse_customer_key_md5(),
+        Some(key_md5_b64.as_str()),
+        "GET SSE-C key MD5 mismatch for {label}",
+    );
+    assert_eq!(
+        get.body.collect().await.unwrap().into_bytes().as_ref(),
+        body.as_slice(),
+        "GET body mismatch for {label}",
+    );
+
+    cleanup(&bucket, &object_key).await;
+}
+
+async fn assert_sse_c_multipart_round_trip_size(size: usize, seed: u8, label: &str) {
+    let client = CTX.client();
+    let bucket = unique_bucket();
+    let object_key = format!("obj-{label}");
+    client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+    let key = test_sse_c_key();
+    let (key_b64, key_md5_b64) = sse_c_header_values(&key);
+    let body = patterned_bytes(size, seed);
+
+    let create = with_sse_c_headers!(
+        client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(&object_key),
+        key_b64,
+        key_md5_b64
+    )
+    .send()
+    .await
+    .unwrap();
+    let upload_id = create.upload_id().unwrap().to_string();
+
+    let part = with_sse_c_headers!(
+        client
+            .upload_part()
+            .bucket(&bucket)
+            .key(&object_key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(body.clone())),
+        key_b64,
+        key_md5_b64
+    )
+    .send()
+    .await
+    .unwrap();
+    let etag = part.e_tag().unwrap().to_string();
+
+    with_sse_c_headers!(
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(&object_key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
+                    .build()
+            ),
+        key_b64,
+        key_md5_b64
+    )
+    .send()
+    .await
+    .unwrap();
+
+    let head = with_sse_c_headers!(
+        client.head_object().bucket(&bucket).key(&object_key),
+        key_b64,
+        key_md5_b64
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        head.content_length(),
+        Some(body.len() as i64),
+        "multipart HEAD content length mismatch for {label}",
+    );
+    assert_eq!(
+        head.sse_customer_algorithm(),
+        Some("AES256"),
+        "multipart HEAD SSE-C algorithm mismatch for {label}",
+    );
+    assert_eq!(
+        head.sse_customer_key_md5(),
+        Some(key_md5_b64.as_str()),
+        "multipart HEAD SSE-C key MD5 mismatch for {label}",
+    );
+
+    let get = with_sse_c_headers!(
+        client.get_object().bucket(&bucket).key(&object_key),
+        key_b64,
+        key_md5_b64
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        get.sse_customer_algorithm(),
+        Some("AES256"),
+        "multipart GET SSE-C algorithm mismatch for {label}",
+    );
+    assert_eq!(
+        get.sse_customer_key_md5(),
+        Some(key_md5_b64.as_str()),
+        "multipart GET SSE-C key MD5 mismatch for {label}",
+    );
+    assert_eq!(
+        get.body.collect().await.unwrap().into_bytes().as_ref(),
+        body.as_slice(),
+        "multipart GET body mismatch for {label}",
+    );
+
+    cleanup(&bucket, &object_key).await;
+}
+
 #[test]
 fn test_sse_c_put_get_head_round_trip() {
     require_https_endpoint();
@@ -316,60 +530,32 @@ fn test_sse_c_put_get_head_round_trip() {
     });
 }
 
-#[test]
-fn test_sse_c_put_get_head_round_trip_at_segment_boundary() {
-    require_https_endpoint();
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
-
-        let key = test_sse_c_key();
-        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
-        let body = patterned_bytes(SSE_C_SEGMENT_BOUNDARY_SIZE, 0x23);
-
-        with_sse_c_headers!(
-            client
-                .put_object()
-                .bucket(&bucket)
-                .key("obj")
-                .body(ByteStream::from(body.clone())),
-            key_b64,
-            key_md5_b64
-        )
-        .send()
-        .await
-        .unwrap();
-
-        let head = with_sse_c_headers!(
-            client.head_object().bucket(&bucket).key("obj"),
-            key_b64,
-            key_md5_b64
-        )
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(head.content_length(), Some(body.len() as i64));
-        assert_eq!(head.sse_customer_algorithm(), Some("AES256"));
-        assert_eq!(head.sse_customer_key_md5(), Some(key_md5_b64.as_str()));
-
-        let get = with_sse_c_headers!(
-            client.get_object().bucket(&bucket).key("obj"),
-            key_b64,
-            key_md5_b64
-        )
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(get.sse_customer_algorithm(), Some("AES256"));
-        assert_eq!(get.sse_customer_key_md5(), Some(key_md5_b64.as_str()));
-        assert_eq!(
-            get.body.collect().await.unwrap().into_bytes().as_ref(),
-            body.as_slice()
-        );
-
-        cleanup(&bucket, "obj").await;
-    });
+sse_c_single_part_round_trip_tests! {
+    test_sse_c_put_get_head_round_trip_empty => ("empty", 0, 0x11),
+    test_sse_c_put_get_head_round_trip_one_mib => ("one-mib", mib(1), 0x13),
+    test_sse_c_put_get_head_round_trip_four_mib => ("four-mib", mib(4), 0x17),
+    test_sse_c_put_get_head_round_trip_segment_minus_one => (
+        "segment-minus-one",
+        SSE_C_SEGMENT_BOUNDARY_SIZE - 1,
+        0x1d
+    ),
+    test_sse_c_put_get_head_round_trip_segment_boundary => (
+        "segment-boundary",
+        SSE_C_SEGMENT_BOUNDARY_SIZE,
+        0x23
+    ),
+    test_sse_c_put_get_head_round_trip_segment_plus_one => (
+        "segment-plus-one",
+        SSE_C_SEGMENT_BOUNDARY_SIZE + 1,
+        0x29
+    ),
+    test_sse_c_put_get_head_round_trip_ten_mib => ("ten-mib", mib(10), 0x2f),
+    test_sse_c_put_get_head_round_trip_two_segments => ("two-segments", mib(16), 0x35),
+    test_sse_c_put_get_head_round_trip_irregular_nine_mib_plus => (
+        "irregular-nine-mib-plus",
+        mib(9) + 12_345,
+        0x3b
+    ),
 }
 
 #[test]
@@ -761,91 +947,36 @@ fn test_sse_c_multipart_round_trip() {
     });
 }
 
-#[test]
-fn test_sse_c_multipart_round_trip_at_segment_boundary() {
-    require_https_endpoint();
-    s3_tests::run(async {
-        let client = CTX.client();
-        let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
-
-        let key = test_sse_c_key();
-        let (key_b64, key_md5_b64) = sse_c_header_values(&key);
-        let body = patterned_bytes(SSE_C_SEGMENT_BOUNDARY_SIZE, 0x61);
-
-        let create = with_sse_c_headers!(
-            client.create_multipart_upload().bucket(&bucket).key("obj"),
-            key_b64,
-            key_md5_b64
-        )
-        .send()
-        .await
-        .unwrap();
-        let upload_id = create.upload_id().unwrap().to_string();
-
-        let part = with_sse_c_headers!(
-            client
-                .upload_part()
-                .bucket(&bucket)
-                .key("obj")
-                .upload_id(&upload_id)
-                .part_number(1)
-                .body(ByteStream::from(body.clone())),
-            key_b64,
-            key_md5_b64
-        )
-        .send()
-        .await
-        .unwrap();
-        let etag = part.e_tag().unwrap().to_string();
-
-        with_sse_c_headers!(
-            client
-                .complete_multipart_upload()
-                .bucket(&bucket)
-                .key("obj")
-                .upload_id(&upload_id)
-                .multipart_upload(
-                    CompletedMultipartUpload::builder()
-                        .parts(CompletedPart::builder().e_tag(etag).part_number(1).build())
-                        .build()
-                ),
-            key_b64,
-            key_md5_b64
-        )
-        .send()
-        .await
-        .unwrap();
-
-        let head = with_sse_c_headers!(
-            client.head_object().bucket(&bucket).key("obj"),
-            key_b64,
-            key_md5_b64
-        )
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(head.content_length(), Some(body.len() as i64));
-        assert_eq!(head.sse_customer_algorithm(), Some("AES256"));
-        assert_eq!(head.sse_customer_key_md5(), Some(key_md5_b64.as_str()));
-
-        let get = with_sse_c_headers!(
-            client.get_object().bucket(&bucket).key("obj"),
-            key_b64,
-            key_md5_b64
-        )
-        .send()
-        .await
-        .unwrap();
-        assert_eq!(get.sse_customer_algorithm(), Some("AES256"));
-        assert_eq!(get.sse_customer_key_md5(), Some(key_md5_b64.as_str()));
-        assert_eq!(
-            get.body.collect().await.unwrap().into_bytes().as_ref(),
-            body.as_slice()
-        );
-
-        cleanup(&bucket, "obj").await;
-    });
+sse_c_multipart_round_trip_tests! {
+    test_sse_c_multipart_round_trip_one_mib => ("one-mib", mib(1), 0x41),
+    test_sse_c_multipart_round_trip_four_mib => ("four-mib", mib(4), 0x47),
+    test_sse_c_multipart_round_trip_min_part_size => (
+        "multipart-min-part-size",
+        MULTIPART_MIN_PART_SIZE,
+        0x4d
+    ),
+    test_sse_c_multipart_round_trip_segment_minus_one => (
+        "segment-minus-one",
+        SSE_C_SEGMENT_BOUNDARY_SIZE - 1,
+        0x53
+    ),
+    test_sse_c_multipart_round_trip_segment_boundary => (
+        "segment-boundary",
+        SSE_C_SEGMENT_BOUNDARY_SIZE,
+        0x61
+    ),
+    test_sse_c_multipart_round_trip_segment_plus_one => (
+        "segment-plus-one",
+        SSE_C_SEGMENT_BOUNDARY_SIZE + 1,
+        0x67
+    ),
+    test_sse_c_multipart_round_trip_ten_mib => ("ten-mib", mib(10), 0x6d),
+    test_sse_c_multipart_round_trip_two_segments => ("two-segments", mib(16), 0x73),
+    test_sse_c_multipart_round_trip_irregular_nine_mib_plus => (
+        "irregular-nine-mib-plus",
+        mib(9) + 12_345,
+        0x79
+    ),
 }
 
 #[test]
