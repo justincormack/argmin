@@ -6,6 +6,9 @@ pub enum LifecycleConfigError {
     #[error("malformed XML: {reason}")]
     MalformedXml { reason: String },
 
+    #[error("invalid request: {reason}")]
+    InvalidRequest { reason: String },
+
     #[error("invalid argument: {reason}")]
     InvalidArgument { reason: String },
 
@@ -376,7 +379,7 @@ fn validate_configuration(rules: &[LifecycleRule]) -> Result<(), LifecycleConfig
             Some(LifecycleExpiration::ExpiredObjectDeleteMarker)
         ) && rule.filter.has_tag_filter()
         {
-            return Err(LifecycleConfigError::InvalidArgument {
+            return Err(LifecycleConfigError::InvalidRequest {
                 reason:
                     "ExpiredObjectDeleteMarker lifecycle rules do not support tag-based filters"
                         .to_string(),
@@ -384,7 +387,7 @@ fn validate_configuration(rules: &[LifecycleRule]) -> Result<(), LifecycleConfig
         }
 
         if rule.abort_incomplete_multipart_upload.is_some() && rule.filter.has_tag_filter() {
-            return Err(LifecycleConfigError::InvalidArgument {
+            return Err(LifecycleConfigError::InvalidRequest {
                 reason:
                     "AbortIncompleteMultipartUpload lifecycle rules do not support tag-based filters"
                         .to_string(),
@@ -392,7 +395,7 @@ fn validate_configuration(rules: &[LifecycleRule]) -> Result<(), LifecycleConfig
         }
 
         if rule.abort_incomplete_multipart_upload.is_some() && rule.filter.has_size_filter() {
-            return Err(LifecycleConfigError::InvalidArgument {
+            return Err(LifecycleConfigError::InvalidRequest {
                 reason:
                     "AbortIncompleteMultipartUpload lifecycle rules do not support object size filters"
                         .to_string(),
@@ -401,7 +404,7 @@ fn validate_configuration(rules: &[LifecycleRule]) -> Result<(), LifecycleConfig
 
         if let Some(noncurrent) = &rule.noncurrent_version_expiration {
             if noncurrent.newer_noncurrent_versions.is_some() && !rule.filter.has_scope() {
-                return Err(LifecycleConfigError::InvalidArgument {
+                return Err(LifecycleConfigError::MalformedXml {
                     reason: "NewerNoncurrentVersions requires an explicit lifecycle filter"
                         .to_string(),
                 });
@@ -413,7 +416,7 @@ fn validate_configuration(rules: &[LifecycleRule]) -> Result<(), LifecycleConfig
             rule.filter.object_size_less_than,
         ) {
             if min_size >= max_size {
-                return Err(LifecycleConfigError::InvalidArgument {
+                return Err(LifecycleConfigError::InvalidRequest {
                     reason: "ObjectSizeGreaterThan must be less than ObjectSizeLessThan"
                         .to_string(),
                 });
@@ -685,7 +688,7 @@ fn parse_expiration(element: &XmlElement) -> Result<LifecycleExpiration, Lifecyc
             reason: "Expiration may not specify both Days and Date".to_string(),
         }),
         (Some(_), _, Some(true)) | (_, Some(_), Some(true)) => {
-            Err(LifecycleConfigError::InvalidArgument {
+            Err(LifecycleConfigError::MalformedXml {
                 reason: "ExpiredObjectDeleteMarker may not be combined with Days or Date"
                     .to_string(),
             })
@@ -1474,7 +1477,7 @@ mod tests {
             </LifecycleConfiguration>",
         )
         .unwrap_err();
-        assert!(matches!(err, LifecycleConfigError::InvalidArgument { .. }));
+        assert!(matches!(err, LifecycleConfigError::InvalidRequest { .. }));
     }
 
     #[test]
@@ -1489,7 +1492,7 @@ mod tests {
             </LifecycleConfiguration>",
         )
         .unwrap_err();
-        assert!(matches!(err, LifecycleConfigError::InvalidArgument { .. }));
+        assert!(matches!(err, LifecycleConfigError::InvalidRequest { .. }));
     }
 
     #[test]
@@ -1504,7 +1507,7 @@ mod tests {
             </LifecycleConfiguration>",
         )
         .unwrap_err();
-        assert!(matches!(err, LifecycleConfigError::InvalidArgument { .. }));
+        assert!(matches!(err, LifecycleConfigError::InvalidRequest { .. }));
     }
 
     #[test]
@@ -1521,7 +1524,7 @@ mod tests {
             </LifecycleConfiguration>",
         )
         .unwrap_err();
-        assert!(matches!(err, LifecycleConfigError::InvalidArgument { .. }));
+        assert!(matches!(err, LifecycleConfigError::MalformedXml { .. }));
     }
 
     #[test]

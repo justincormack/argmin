@@ -6811,6 +6811,9 @@ impl Coordinator {
                     storage::LifecycleConfigError::MalformedXml { reason } => {
                         ServerError::MalformedXML { reason }
                     }
+                    storage::LifecycleConfigError::InvalidRequest { reason } => {
+                        ServerError::InvalidRequest { reason }
+                    }
                     storage::LifecycleConfigError::InvalidArgument { reason } => {
                         ServerError::InvalidArgument { reason }
                     }

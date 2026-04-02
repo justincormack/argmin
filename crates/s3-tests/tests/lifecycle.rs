@@ -392,6 +392,129 @@ fn test_put_bucket_lifecycle_rejects_zero_days() {
 }
 
 #[test]
+fn test_put_bucket_lifecycle_rejects_expired_object_delete_marker_with_days() {
+    s3_tests::run(async {
+        let body = "<LifecycleConfiguration>\
+                <Rule>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration>\
+                        <Days>1</Days>\
+                        <ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>\
+                    </Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>";
+        assert_invalid_lifecycle_put_rejected(body, "MalformedXML").await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_expired_object_delete_marker_with_date() {
+    s3_tests::run(async {
+        let body = "<LifecycleConfiguration>\
+                <Rule>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration>\
+                        <Date>2099-01-01T00:00:00Z</Date>\
+                        <ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>\
+                    </Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>";
+        assert_invalid_lifecycle_put_rejected(body, "MalformedXML").await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_expired_object_delete_marker_with_tag_filter() {
+    s3_tests::run(async {
+        let body = "<LifecycleConfiguration>\
+                <Rule>\
+                    <Filter>\
+                        <Tag><Key>env</Key><Value>prod</Value></Tag>\
+                    </Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration>\
+                        <ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>\
+                    </Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>";
+        assert_invalid_lifecycle_put_rejected(body, "InvalidRequest").await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_abort_incomplete_multipart_with_tag_filter() {
+    s3_tests::run(async {
+        let body = "<LifecycleConfiguration>\
+                <Rule>\
+                    <Filter>\
+                        <Tag><Key>env</Key><Value>prod</Value></Tag>\
+                    </Filter>\
+                    <Status>Enabled</Status>\
+                    <AbortIncompleteMultipartUpload>\
+                        <DaysAfterInitiation>1</DaysAfterInitiation>\
+                    </AbortIncompleteMultipartUpload>\
+                </Rule>\
+            </LifecycleConfiguration>";
+        assert_invalid_lifecycle_put_rejected(body, "InvalidRequest").await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_abort_incomplete_multipart_with_size_filter() {
+    s3_tests::run(async {
+        let body = "<LifecycleConfiguration>\
+                <Rule>\
+                    <Filter>\
+                        <ObjectSizeGreaterThan>10</ObjectSizeGreaterThan>\
+                    </Filter>\
+                    <Status>Enabled</Status>\
+                    <AbortIncompleteMultipartUpload>\
+                        <DaysAfterInitiation>1</DaysAfterInitiation>\
+                    </AbortIncompleteMultipartUpload>\
+                </Rule>\
+            </LifecycleConfiguration>";
+        assert_invalid_lifecycle_put_rejected(body, "InvalidRequest").await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_invalid_object_size_range() {
+    s3_tests::run(async {
+        let body = "<LifecycleConfiguration>\
+                <Rule>\
+                    <Filter>\
+                        <And>\
+                            <ObjectSizeGreaterThan>10</ObjectSizeGreaterThan>\
+                            <ObjectSizeLessThan>10</ObjectSizeLessThan>\
+                        </And>\
+                    </Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>1</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>";
+        assert_invalid_lifecycle_put_rejected(body, "InvalidRequest").await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_newer_noncurrent_versions_without_filter() {
+    s3_tests::run(async {
+        let body = "<LifecycleConfiguration>\
+                <Rule>\
+                    <Status>Enabled</Status>\
+                    <NoncurrentVersionExpiration>\
+                        <NoncurrentDays>1</NoncurrentDays>\
+                        <NewerNoncurrentVersions>1</NewerNoncurrentVersions>\
+                    </NoncurrentVersionExpiration>\
+                </Rule>\
+            </LifecycleConfiguration>";
+        assert_invalid_lifecycle_put_rejected(body, "MalformedXML").await;
+    });
+}
+
+#[test]
 fn test_bucket_lifecycle_crud_round_trip() {
     s3_tests::run(async {
         let bucket = unique_bucket();

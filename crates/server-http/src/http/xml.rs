@@ -1863,6 +1863,9 @@ pub fn parse_bucket_lifecycle_configuration_xml(
         storage::LifecycleConfigError::MalformedXml { reason } => {
             ServerError::MalformedXML { reason }
         }
+        storage::LifecycleConfigError::InvalidRequest { reason } => {
+            ServerError::InvalidRequest { reason }
+        }
         storage::LifecycleConfigError::InvalidArgument { reason } => {
             ServerError::InvalidArgument { reason }
         }

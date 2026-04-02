@@ -89,6 +89,58 @@ async fn put_expiration_lifecycle(client: &aws_sdk_s3::Client, bucket: &str, pre
         .unwrap();
 }
 
+async fn put_expiration_date_lifecycle(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    date: DateTime,
+) {
+    let rule = LifecycleRule::builder()
+        .id("expire-by-date")
+        .filter(LifecycleRuleFilter::builder().prefix(prefix).build())
+        .status(ExpirationStatus::Enabled)
+        .expiration(LifecycleExpiration::builder().date(date).build())
+        .build()
+        .expect("valid date expiration lifecycle rule");
+    let config = BucketLifecycleConfiguration::builder()
+        .rules(rule)
+        .build()
+        .expect("valid lifecycle configuration");
+    put_bucket_lifecycle_with_md5(client, bucket, config)
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn put_expiration_size_filter_lifecycle(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    id: &str,
+    object_size_greater_than: Option<i64>,
+    object_size_less_than: Option<i64>,
+) {
+    let rule = LifecycleRule::builder()
+        .id(id)
+        .filter(
+            LifecycleRuleFilter::builder()
+                .set_object_size_greater_than(object_size_greater_than)
+                .set_object_size_less_than(object_size_less_than)
+                .build(),
+        )
+        .status(ExpirationStatus::Enabled)
+        .expiration(LifecycleExpiration::builder().days(1).build())
+        .build()
+        .expect("valid size-filter expiration lifecycle rule");
+    let config = BucketLifecycleConfiguration::builder()
+        .rules(rule)
+        .build()
+        .expect("valid lifecycle configuration");
+    put_bucket_lifecycle_with_md5(client, bucket, config)
+        .send()
+        .await
+        .unwrap();
+}
+
 async fn put_noncurrent_expiration_lifecycle(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -175,6 +227,19 @@ async fn current_object_deadline_millis(
     lifecycle_day_deadline(smithy_millis(head.last_modified().unwrap()), days)
 }
 
+async fn list_object_keys_v2(client: &aws_sdk_s3::Client, bucket: &str) -> Vec<String> {
+    client
+        .list_objects_v2()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap()
+        .contents()
+        .iter()
+        .filter_map(|entry| entry.key().map(ToString::to_string))
+        .collect()
+}
+
 #[test]
 fn test_lifecycle_expiration_deletes_nonversioned_objects_on_manual_sweep() {
     run_local(async {
@@ -223,6 +288,8 @@ fn test_lifecycle_expiration_deletes_nonversioned_objects_on_manual_sweep() {
             .unwrap();
         let kept_body = kept.body.collect().await.unwrap().into_bytes();
         assert_eq!(&kept_body[..], b"keep");
+
+        assert_eq!(list_object_keys_v2(&client, bucket).await, vec!["keep/me"]);
     });
 }
 
@@ -653,5 +720,122 @@ fn test_lifecycle_noncurrent_expiration_respects_object_lock_retention() {
             Some(first_version_id.as_str())
         );
         assert_eq!(versions.versions()[1].is_latest(), Some(false));
+    });
+}
+
+#[test]
+fn test_lifecycle_expiration_date_expires_due_prefix_and_updates_list_objects_v2() {
+    run_local(async {
+        let server = TestServer::start().await;
+        let client = test_client(&server).await;
+        let bucket = "lifecycle-date-expiration";
+
+        create_bucket(&client, bucket).await;
+
+        let past_date = DateTime::from_secs(0);
+        put_expiration_date_lifecycle(&client, bucket, "past/", past_date).await;
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("past/foo")
+            .body(ByteStream::from_static(b"expire"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("future/bar")
+            .body(ByteStream::from_static(b"keep"))
+            .send()
+            .await
+            .unwrap();
+
+        server
+            .run_lifecycle_sweep_at(smithy_millis(&past_date))
+            .unwrap();
+
+        let expired = client
+            .get_object()
+            .bucket(bucket)
+            .key("past/foo")
+            .send()
+            .await;
+        assert_eq!(err_status(&expired), 404);
+        assert_s3_err_code(&expired, "NoSuchKey");
+
+        assert_eq!(
+            list_object_keys_v2(&client, bucket).await,
+            vec!["future/bar"]
+        );
+    });
+}
+
+#[test]
+fn test_lifecycle_expiration_size_greater_than_expires_matching_objects() {
+    run_local(async {
+        let server = TestServer::start().await;
+        let client = test_client(&server).await;
+        let bucket = "lifecycle-size-gt";
+
+        create_bucket(&client, bucket).await;
+        put_expiration_size_filter_lifecycle(&client, bucket, "size-gt", Some(2000), None).await;
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("small")
+            .body(ByteStream::from(vec![b'a'; 1000]))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("big")
+            .body(ByteStream::from(vec![b'b'; 3000]))
+            .send()
+            .await
+            .unwrap();
+
+        let sweep_at = current_object_deadline_millis(&client, bucket, "big", 1).await;
+        server.run_lifecycle_sweep_at(sweep_at).unwrap();
+
+        assert_eq!(list_object_keys_v2(&client, bucket).await, vec!["small"]);
+    });
+}
+
+#[test]
+fn test_lifecycle_expiration_size_less_than_expires_matching_objects() {
+    run_local(async {
+        let server = TestServer::start().await;
+        let client = test_client(&server).await;
+        let bucket = "lifecycle-size-lt";
+
+        create_bucket(&client, bucket).await;
+        put_expiration_size_filter_lifecycle(&client, bucket, "size-lt", None, Some(2000)).await;
+
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("small")
+            .body(ByteStream::from(vec![b'a'; 1000]))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("big")
+            .body(ByteStream::from(vec![b'b'; 3000]))
+            .send()
+            .await
+            .unwrap();
+
+        let sweep_at = current_object_deadline_millis(&client, bucket, "small", 1).await;
+        server.run_lifecycle_sweep_at(sweep_at).unwrap();
+
+        assert_eq!(list_object_keys_v2(&client, bucket).await, vec!["big"]);
     });
 }

@@ -2046,6 +2046,36 @@ mod tests {
     }
 
     #[test]
+    fn list_parts_response_includes_lifecycle_abort_headers() {
+        let resp = S3Response::list_parts(
+            "bucket",
+            "key",
+            "upload-1",
+            None,
+            1000,
+            &ListPartsResult {
+                parts: Vec::new(),
+                is_truncated: false,
+                next_part_number_marker: None,
+                checksum_algorithm: None,
+                checksum_type: None,
+                lifecycle_abort: Some(LifecycleAbortHeaders {
+                    abort_time_millis: 1_705_321_845_000,
+                    rule_id: Some("abort upload".to_string()),
+                }),
+            },
+        );
+        assert_eq!(
+            find_header(&resp, "x-amz-abort-date"),
+            Some("Mon, 15 Jan 2024 12:30:45 GMT")
+        );
+        assert_eq!(
+            find_header(&resp, "x-amz-abort-rule-id"),
+            Some("abort%20upload")
+        );
+    }
+
+    #[test]
     fn complete_multipart_upload_response_includes_lifecycle_expiration_header() {
         let resp = S3Response::complete_multipart_upload(
             "bucket",
