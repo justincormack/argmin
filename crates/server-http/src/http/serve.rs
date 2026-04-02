@@ -507,6 +507,8 @@ async fn handle(
                 ))
             }
         };
+        let origin = s3req.header("origin").map(str::to_string);
+        let method = s3req.method.as_str().to_string();
         let chunked = match parse_chunked_mode(&s3req) {
             Ok(mode) => mode,
             Err(err) => {
@@ -520,16 +522,26 @@ async fn handle(
         };
         let resp = match op {
             StreamingWriteOp::PutObject { bucket, key } => {
-                handle_streaming_put(
+                let mut resp = handle_streaming_put(
                     Arc::clone(&state),
                     s3req,
                     body,
-                    bucket,
+                    bucket.clone(),
                     key,
                     chunked,
                     trace.clone(),
                 )
-                .await
+                .await;
+                append_actual_cors_headers(
+                    &state,
+                    &mut resp,
+                    &bucket,
+                    origin.as_deref(),
+                    &method,
+                    &trace,
+                )
+                .await;
+                resp
             }
             StreamingWriteOp::UploadPart {
                 bucket,
@@ -537,18 +549,28 @@ async fn handle(
                 upload_id,
                 part_number,
             } => {
-                handle_streaming_part(
+                let mut resp = handle_streaming_part(
                     Arc::clone(&state),
                     s3req,
                     body,
-                    bucket,
+                    bucket.clone(),
                     key,
                     upload_id,
                     part_number,
                     chunked,
                     trace.clone(),
                 )
-                .await
+                .await;
+                append_actual_cors_headers(
+                    &state,
+                    &mut resp,
+                    &bucket,
+                    origin.as_deref(),
+                    &method,
+                    &trace,
+                )
+                .await;
+                resp
             }
         };
         return Ok(s3_response_to_hyper(
@@ -571,9 +593,25 @@ async fn handle(
                 ));
             }
         };
-        let resp =
-            handle_streaming_post_object(Arc::clone(&state), s3req, body, bucket, trace.clone())
-                .await;
+        let origin = s3req.header("origin").map(str::to_string);
+        let method = s3req.method.as_str().to_string();
+        let mut resp = handle_streaming_post_object(
+            Arc::clone(&state),
+            s3req,
+            body,
+            bucket.clone(),
+            trace.clone(),
+        )
+        .await;
+        append_actual_cors_headers(
+            &state,
+            &mut resp,
+            &bucket,
+            origin.as_deref(),
+            &method,
+            &trace,
+        )
+        .await;
         return Ok(s3_response_to_hyper(
             resp,
             Some(req_permit),
@@ -629,6 +667,32 @@ async fn handle(
         state.config.stream_read_chunk_size,
         response_trace,
     ))
+}
+
+async fn append_actual_cors_headers(
+    state: &Arc<ServerState>,
+    resp: &mut S3Response,
+    bucket: &str,
+    origin: Option<&str>,
+    method: &str,
+    trace: &observability::TraceContext,
+) {
+    let Some(origin) = origin else {
+        return;
+    };
+
+    let st = Arc::clone(state);
+    let bucket = bucket.to_string();
+    let origin = origin.to_string();
+    let method = method.to_string();
+    let headers = spawn_blocking_with_trace(trace.clone(), move || {
+        let frontend = acquire_frontend(&st);
+        frontend.actual_cors_headers(&bucket, &origin, &method)
+    })
+    .await
+    .unwrap_or_default();
+
+    resp.headers.extend(headers);
 }
 
 /// Check if a PUT request should use the streaming write path.

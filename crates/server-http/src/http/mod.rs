@@ -569,21 +569,31 @@ impl HttpFrontend {
 
     /// Apply CORS headers to an actual (non-preflight) response if the request
     /// has an Origin header and a matching CORS rule exists.
-    fn apply_cors_headers(&self, resp: &mut S3Response, bucket: &str, origin: &str, method: &str) {
+    pub(crate) fn actual_cors_headers(
+        &self,
+        bucket: &str,
+        origin: &str,
+        method: &str,
+    ) -> Vec<(String, String)> {
         let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket) {
             Ok(Some(xml)) => xml,
-            _ => return,
+            _ => return Vec::new(),
         };
         let config = match crate::http::xml::parse_cors_config_xml(cors_config_xml.as_bytes()) {
             Ok(c) => c,
-            Err(_) => return,
+            Err(_) => return Vec::new(),
         };
 
         if let Some(m) = crate::cors::find_matching_rule(&config, origin, method, &[]) {
-            let headers = crate::cors::actual_response_headers(m.rule, origin, m.matched_origin);
-            for (k, v) in headers {
-                resp.headers.push((k, v));
-            }
+            crate::cors::actual_response_headers(m.rule, origin, m.matched_origin)
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn apply_cors_headers(&self, resp: &mut S3Response, bucket: &str, origin: &str, method: &str) {
+        for (k, v) in self.actual_cors_headers(bucket, origin, method) {
+            resp.headers.push((k, v));
         }
     }
 
