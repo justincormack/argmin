@@ -71,6 +71,24 @@ S3_TEST_TIMEOUT_SECS=30 \
 cargo test -p s3-http-tests --no-fail-fast
 ```
 
+## Cleanup helper
+
+Failed AWS-backed runs can leave behind versioned test buckets, delete markers,
+legal holds, or governance-retained objects under the `claude-s3-` prefix. For
+that case, [`scripts/cleanup.sh`](../scripts/cleanup.sh) provides a manual
+cleanup pass for leftover test buckets.
+
+It currently:
+
+- lists buckets with names starting `claude-s3-`
+- removes object versions and delete markers
+- attempts to disable legal holds and bypass governance retention
+- deletes the bucket once it is empty
+
+The script requires `aws`, `jq`, and AWS credentials in the environment that
+are allowed to delete those buckets and objects. It is intended as an
+after-failure cleanup tool, not part of the normal test invocation.
+
 ## Cross-account requirements
 
 - The alternate credentials must belong to a different AWS account.
