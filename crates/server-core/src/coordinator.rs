@@ -229,21 +229,173 @@ pub struct BeginStreamPartResult {
     pub sse_customer: Option<SseCustomerWriteContext>,
 }
 
-#[derive(Debug)]
-pub struct ActiveWriteEncryption {
-    pub sse_customer: Option<SseCustomerWriteContext>,
-    pub managed_write: Option<ManagedEncryptionWriteContext>,
-    pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
+#[derive(Debug, Clone)]
+pub enum ActiveWriteEncryption {
+    None,
+    SseCustomer {
+        encryption: ObjectEncryption,
+        write: Option<SseCustomerWriteContext>,
+    },
+    Managed {
+        encryption: ObjectEncryption,
+        algorithm: ManagedEncryptionAlgorithm,
+        write: Option<ManagedEncryptionWriteContext>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ActiveWriteEncryptionRef<'a> {
+    None,
+    SseCustomer(&'a SseCustomerWriteContext),
+    Managed {
+        algorithm: ManagedEncryptionAlgorithm,
+        write: &'a ManagedEncryptionWriteContext,
+    },
 }
 
 impl ActiveWriteEncryption {
-    fn encrypt_segment(&self, segment_index: u32, data: &[u8]) -> Result<Vec<u8>, ServerError> {
-        if let Some(sse_customer) = self.sse_customer.as_ref() {
-            sse_customer.encrypt_segment(segment_index, data)
-        } else if let Some(managed_write) = self.managed_write.as_ref() {
-            managed_write.encrypt_segment(segment_index, data)
-        } else {
-            Ok(data.to_vec())
+    fn none() -> Self {
+        Self::None
+    }
+
+    fn sse_customer(write: SseCustomerWriteContext) -> Self {
+        Self::SseCustomer {
+            encryption: write.encryption().clone(),
+            write: Some(write),
+        }
+    }
+
+    fn managed(
+        algorithm: ManagedEncryptionAlgorithm,
+        write: ManagedEncryptionWriteContext,
+    ) -> Self {
+        Self::Managed {
+            encryption: write.encryption().clone(),
+            algorithm,
+            write: Some(write),
+        }
+    }
+
+    pub fn as_ref(&self) -> ActiveWriteEncryptionRef<'_> {
+        match self {
+            Self::None => ActiveWriteEncryptionRef::None,
+            Self::SseCustomer {
+                write: Some(sse_customer),
+                ..
+            } => ActiveWriteEncryptionRef::SseCustomer(sse_customer),
+            Self::SseCustomer { write: None, .. } => ActiveWriteEncryptionRef::None,
+            Self::Managed {
+                algorithm,
+                write: Some(write),
+                ..
+            } => ActiveWriteEncryptionRef::Managed {
+                algorithm: *algorithm,
+                write,
+            },
+            Self::Managed { write: None, .. } => ActiveWriteEncryptionRef::None,
+        }
+    }
+
+    fn is_sse_customer(&self) -> bool {
+        matches!(self, Self::SseCustomer { .. })
+    }
+
+    fn object_encryption(&self) -> ObjectEncryption {
+        match self {
+            Self::None => ObjectEncryption::None,
+            Self::SseCustomer { encryption, .. } | Self::Managed { encryption, .. } => {
+                encryption.clone()
+            }
+        }
+    }
+
+    pub fn encrypt_segment(&self, segment_index: u32, data: &[u8]) -> Result<Vec<u8>, ServerError> {
+        match self {
+            Self::None => Ok(data.to_vec()),
+            Self::SseCustomer {
+                write: Some(sse_customer),
+                ..
+            } => sse_customer.encrypt_segment(segment_index, data),
+            Self::Managed {
+                write: Some(write), ..
+            } => write.encrypt_segment(segment_index, data),
+            Self::SseCustomer { write: None, .. } => Err(ServerError::InvalidRequest {
+                reason: "SSE-C write context is required for streaming segment encryption"
+                    .to_string(),
+            }),
+            Self::Managed { write: None, .. } => Err(ServerError::InternalError {
+                reason: "SSE-S3 write context is required for streaming segment encryption"
+                    .to_string(),
+            }),
+        }
+    }
+
+    fn from_stored_and_active(
+        encryption: &ObjectEncryption,
+        active: ActiveWriteEncryptionRef<'_>,
+    ) -> Result<Self, ServerError> {
+        match (encryption, active) {
+            (ObjectEncryption::None, ActiveWriteEncryptionRef::None) => Ok(Self::None),
+            (ObjectEncryption::None, ActiveWriteEncryptionRef::SseCustomer(_))
+            | (ObjectEncryption::None, ActiveWriteEncryptionRef::Managed { .. }) => {
+                Err(ServerError::InvalidRequest {
+                    reason: "write encryption context does not match unencrypted session"
+                        .to_string(),
+                })
+            }
+            (
+                ObjectEncryption::SseCustomer(state),
+                ActiveWriteEncryptionRef::SseCustomer(sse_customer),
+            ) => {
+                if sse_customer.encryption() != encryption {
+                    return Err(ServerError::InvalidRequest {
+                        reason: "SSE-C write context does not match session encryption state"
+                            .to_string(),
+                    });
+                }
+                let _ = state;
+                Ok(Self::sse_customer(sse_customer.clone()))
+            }
+            (ObjectEncryption::SseCustomer(state), ActiveWriteEncryptionRef::None) => {
+                Ok(Self::SseCustomer {
+                    encryption: ObjectEncryption::SseCustomer(state.clone()),
+                    write: None,
+                })
+            }
+            (ObjectEncryption::SseCustomer(_), ActiveWriteEncryptionRef::Managed { .. }) => {
+                Err(ServerError::InvalidRequest {
+                    reason: "managed write context may not be used for an SSE-C session"
+                        .to_string(),
+                })
+            }
+            (
+                ObjectEncryption::SseS3(_),
+                ActiveWriteEncryptionRef::Managed { algorithm, write },
+            ) => {
+                if Some(algorithm) != encryption.managed_encryption_algorithm() {
+                    return Err(ServerError::InternalError {
+                        reason: "SSE-S3 session is missing managed write encryption context"
+                            .to_string(),
+                    });
+                }
+                if write.encryption() != encryption {
+                    return Err(ServerError::InvalidRequest {
+                        reason: "SSE-S3 write context does not match session encryption state"
+                            .to_string(),
+                    });
+                }
+                Ok(Self::managed(algorithm, write.clone()))
+            }
+            (ObjectEncryption::SseS3(state), ActiveWriteEncryptionRef::None) => Ok(Self::Managed {
+                encryption: ObjectEncryption::SseS3(state.clone()),
+                algorithm: ManagedEncryptionAlgorithm::Aes256,
+                write: None,
+            }),
+            (ObjectEncryption::SseS3(_), ActiveWriteEncryptionRef::SseCustomer(_)) => {
+                Err(ServerError::InvalidRequest {
+                    reason: "SSE-C headers may not be used for an SSE-S3 session".to_string(),
+                })
+            }
         }
     }
 }
@@ -1265,8 +1417,7 @@ pub struct CopyObjectRequest<'a> {
     pub tagging: TaggingDirective<'a>,
     pub acl: PutObjectAcl<'a>,
     pub source_sse_customer: Option<&'a SseCustomerRequest>,
-    pub dst_sse_customer: Option<&'a SseCustomerRequest>,
-    pub dst_sse_s3: bool,
+    pub destination_encryption: WriteEncryptionRequest<'a>,
     pub object_lock: ObjectLockState,
 }
 
@@ -1386,102 +1537,9 @@ struct PutCommitRequest<'a> {
     key: &'a str,
     metadata_blob: &'a MetadataBlob,
     system_metadata: &'a SystemMetadata,
-    write_encryption: &'a ResolvedWriteEncryption,
+    write_encryption: &'a ActiveWriteEncryption,
     tags: Option<&'a str>,
     cond: &'a WriteCondition,
-}
-
-struct ResolvedWriteEncryption {
-    encryption: ObjectEncryption,
-    sse_customer: Option<SseCustomerWriteContext>,
-    managed_write: Option<ManagedEncryptionWriteContext>,
-}
-
-impl ResolvedWriteEncryption {
-    fn none() -> Self {
-        Self {
-            encryption: ObjectEncryption::None,
-            sse_customer: None,
-            managed_write: None,
-        }
-    }
-
-    fn from_stored_and_active(
-        encryption: &ObjectEncryption,
-        active: &ActiveWriteEncryption,
-    ) -> Result<Self, ServerError> {
-        match encryption {
-            ObjectEncryption::None => {
-                if active.sse_customer.is_some()
-                    || active.managed_write.is_some()
-                    || active.managed_encryption.is_some()
-                {
-                    return Err(ServerError::InvalidRequest {
-                        reason: "write encryption context does not match unencrypted session"
-                            .to_string(),
-                    });
-                }
-                Ok(Self::none())
-            }
-            ObjectEncryption::SseCustomer(state) => {
-                if active.managed_write.is_some() || active.managed_encryption.is_some() {
-                    return Err(ServerError::InvalidRequest {
-                        reason: "managed write context may not be used for an SSE-C session"
-                            .to_string(),
-                    });
-                }
-                if let Some(sse_customer) = active.sse_customer.as_ref() {
-                    if sse_customer.encryption() != encryption {
-                        return Err(ServerError::InvalidRequest {
-                            reason: "SSE-C write context does not match session encryption state"
-                                .to_string(),
-                        });
-                    }
-                }
-                Ok(Self {
-                    encryption: ObjectEncryption::SseCustomer(state.clone()),
-                    sse_customer: active.sse_customer.clone(),
-                    managed_write: None,
-                })
-            }
-            ObjectEncryption::SseS3(state) => {
-                if active.sse_customer.is_some() {
-                    return Err(ServerError::InvalidRequest {
-                        reason: "SSE-C headers may not be used for an SSE-S3 session".to_string(),
-                    });
-                }
-                if active.managed_encryption != Some(ManagedEncryptionAlgorithm::Aes256) {
-                    return Err(ServerError::InternalError {
-                        reason: "SSE-S3 session is missing managed write encryption context"
-                            .to_string(),
-                    });
-                }
-                if let Some(managed_write) = active.managed_write.as_ref() {
-                    if managed_write.encryption() != encryption {
-                        return Err(ServerError::InvalidRequest {
-                            reason: "SSE-S3 write context does not match session encryption state"
-                                .to_string(),
-                        });
-                    }
-                }
-                Ok(Self {
-                    encryption: ObjectEncryption::SseS3(state.clone()),
-                    sse_customer: None,
-                    managed_write: active.managed_write.clone(),
-                })
-            }
-        }
-    }
-}
-
-impl From<ResolvedWriteEncryption> for ActiveWriteEncryption {
-    fn from(value: ResolvedWriteEncryption) -> Self {
-        Self {
-            managed_encryption: value.encryption.managed_encryption_algorithm(),
-            sse_customer: value.sse_customer,
-            managed_write: value.managed_write,
-        }
-    }
 }
 
 /// Authenticated requester context needed by core-side authorization.
@@ -2254,8 +2312,7 @@ pub struct FinalizeStreamPutRequest<'a> {
     pub total_size: u64,
     pub metadata_blob: &'a MetadataBlob,
     pub system_metadata: &'a SystemMetadata,
-    pub sse_customer: Option<&'a SseCustomerWriteContext>,
-    pub managed_write: Option<&'a ManagedEncryptionWriteContext>,
+    pub write_encryption: ActiveWriteEncryptionRef<'a>,
     pub tags: Option<&'a str>,
     pub cond: &'a WriteCondition,
     pub acl: PutObjectWriteAcl<'a>,
@@ -8175,7 +8232,7 @@ impl Coordinator {
         bucket_info: &BucketSummary,
         req: &PutCommitRequest<'_>,
     ) -> Result<PreparedPutCommit, ServerError> {
-        self.ensure_write_encryption_supported(&req.write_encryption.encryption)?;
+        self.ensure_write_encryption_supported(&req.write_encryption.object_encryption())?;
         let metadata_blob = SerializedMetadataBlob::from(req.metadata_blob.serialize()?);
         let (system_metadata_blob, encryption) =
             Self::prepare_stored_system_metadata(req.system_metadata, req.write_encryption)?;
@@ -8284,33 +8341,26 @@ impl Coordinator {
         &self,
         bucket: &BucketSummary,
         request_encryption: WriteEncryptionRequest<'_>,
-    ) -> Result<ResolvedWriteEncryption, ServerError> {
+    ) -> Result<ActiveWriteEncryption, ServerError> {
         if let Some(sse_customer_request) = request_encryption.sse_customer_request() {
             let sse_customer =
                 self.prepare_sse_customer_write_context(Some(sse_customer_request))?;
-            return Ok(ResolvedWriteEncryption {
-                encryption: sse_customer
-                    .as_ref()
-                    .expect("SSE-C request should produce write context")
-                    .encryption()
-                    .clone(),
-                sse_customer,
-                managed_write: None,
-            });
+            return Ok(ActiveWriteEncryption::sse_customer(
+                sse_customer.expect("SSE-C request should produce write context"),
+            ));
         }
 
         if request_encryption.explicit_managed_encryption().is_some()
             || bucket.encryption.default_encryption == ManagedEncryptionAlgorithm::Aes256
         {
             let managed_write = self.prepare_managed_write_context()?;
-            return Ok(ResolvedWriteEncryption {
-                encryption: managed_write.encryption().clone(),
-                sse_customer: None,
-                managed_write: Some(managed_write),
-            });
+            return Ok(ActiveWriteEncryption::managed(
+                ManagedEncryptionAlgorithm::Aes256,
+                managed_write,
+            ));
         }
 
-        Ok(ResolvedWriteEncryption::none())
+        Ok(ActiveWriteEncryption::none())
     }
 
     fn resume_write_encryption(
@@ -8319,19 +8369,33 @@ impl Coordinator {
         sse_customer: Option<&SseCustomerRequest>,
         segment_scope: SseCustomerSegmentScope,
         sse_customer_headers_required: bool,
-    ) -> Result<ResolvedWriteEncryption, ServerError> {
+    ) -> Result<ActiveWriteEncryption, ServerError> {
         match encryption {
-            ObjectEncryption::None | ObjectEncryption::SseCustomer(_) => {
+            ObjectEncryption::None => {
                 let sse_customer = self.prepare_existing_sse_customer_write_context(
                     encryption,
                     sse_customer,
                     segment_scope,
                     sse_customer_headers_required,
                 )?;
-                Ok(ResolvedWriteEncryption {
-                    encryption: encryption.clone(),
+                Ok(match sse_customer {
+                    Some(sse_customer) => ActiveWriteEncryption::sse_customer(sse_customer),
+                    None => ActiveWriteEncryption::None,
+                })
+            }
+            ObjectEncryption::SseCustomer(state) => {
+                let sse_customer = self.prepare_existing_sse_customer_write_context(
+                    encryption,
                     sse_customer,
-                    managed_write: None,
+                    segment_scope,
+                    sse_customer_headers_required,
+                )?;
+                Ok(match sse_customer {
+                    Some(sse_customer) => ActiveWriteEncryption::sse_customer(sse_customer),
+                    None => ActiveWriteEncryption::SseCustomer {
+                        encryption: ObjectEncryption::SseCustomer(state.clone()),
+                        write: None,
+                    },
                 })
             }
             ObjectEncryption::SseS3(state) => {
@@ -8348,11 +8412,10 @@ impl Coordinator {
                         })?;
                 let managed_write =
                     resume_managed_encryption_write(provider, state, segment_scope)?;
-                Ok(ResolvedWriteEncryption {
-                    encryption: encryption.clone(),
-                    sse_customer: None,
-                    managed_write: Some(managed_write),
-                })
+                Ok(ActiveWriteEncryption::managed(
+                    ManagedEncryptionAlgorithm::Aes256,
+                    managed_write,
+                ))
             }
         }
     }
@@ -8377,7 +8440,6 @@ impl Coordinator {
             SseCustomerSegmentScope::object(),
             false,
         )
-        .map(Into::into)
     }
 
     pub fn load_stream_part_write_encryption(
@@ -8401,7 +8463,6 @@ impl Coordinator {
             SseCustomerSegmentScope::multipart_part(part_number)?,
             false,
         )
-        .map(Into::into)
     }
 
     #[cfg(test)]
@@ -8630,8 +8691,7 @@ impl Coordinator {
                     total_size: req.data.len() as u64,
                     metadata_blob: req.metadata,
                     system_metadata: req.system_metadata,
-                    sse_customer: write_encryption.sse_customer.as_ref(),
-                    managed_write: write_encryption.managed_write.as_ref(),
+                    write_encryption: write_encryption.as_ref(),
                     tags: req.tags,
                     cond: req.cond,
                     acl: req.acl.clone(),
@@ -8662,7 +8722,7 @@ impl Coordinator {
                 return Err(ServerError::AccessDenied);
             }
             let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
-            Self::ensure_sse_c_allowed(&bucket_info, write_encryption.sse_customer.is_some())?;
+            Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
             let resolved_object_lock =
                 Self::resolve_new_object_lock_state(&bucket_info, req.object_lock)?;
@@ -8690,13 +8750,7 @@ impl Coordinator {
                 &segment_index.to_string(),
                 segment_vid.get(),
             );
-            let storage_bytes = if let Some(ctx) = &write_encryption.sse_customer {
-                ctx.encrypt_segment(segment_index, req.data)?
-            } else if let Some(ctx) = &write_encryption.managed_write {
-                ctx.encrypt_segment(segment_index, req.data)?
-            } else {
-                req.data.to_vec()
-            };
+            let storage_bytes = write_encryption.encrypt_segment(segment_index, req.data)?;
 
             let written_shards =
                 self.write_segment_shards(shard_pg_id, &segment_okh, segment_vid, &storage_bytes)?;
@@ -8862,7 +8916,7 @@ impl Coordinator {
             }
             let stored_encryption = self
                 .resolve_write_encryption(&bucket_info, req.encryption)?
-                .encryption;
+                .object_encryption();
             Self::ensure_sse_c_allowed(
                 &bucket_info,
                 stored_encryption.uses_sse_customer_headers(),
@@ -9398,11 +9452,7 @@ impl Coordinator {
                 });
             }
             let write_encryption =
-                ResolvedWriteEncryption::from_stored_and_active(&session.encryption, &ActiveWriteEncryption {
-                    sse_customer: req.sse_customer.cloned(),
-                    managed_write: req.managed_write.cloned(),
-                    managed_encryption: session.encryption.managed_encryption_algorithm(),
-                })?;
+                ActiveWriteEncryption::from_stored_and_active(&session.encryption, req.write_encryption)?;
 
             let prepared = self.prepare_put_commit_locked(
                 &meta_guard,
@@ -9894,8 +9944,9 @@ impl Coordinator {
         let requester = &req.destination.bucket.requester;
         let acl = req.acl;
         let source_sse_customer = req.source_sse_customer;
-        let dst_explicit_sse_customer =
-            self.prepare_sse_customer_write_context(req.dst_sse_customer)?;
+        let dst_explicit_sse_customer = self.prepare_sse_customer_write_context(
+            req.destination_encryption.sse_customer_request(),
+        )?;
         let dst_response_sse_customer = dst_explicit_sse_customer
             .as_ref()
             .map(|ctx| ctx.request().response_headers());
@@ -9911,17 +9962,18 @@ impl Coordinator {
         let metadata_directive = req.directive.policy_condition_value();
         let canned_acl = acl.policy_condition_value();
 
+        let dst_policy_context =
+            req.destination_encryption
+                .with_policy_context(PutObjectPolicyContext::new(
+                    Some(copy_source_policy_value.as_str()),
+                    metadata_directive,
+                    canned_acl,
+                ));
         let dst_bucket_info = self.authorize_put_object_requester(
             requester,
             dst_bucket,
             dst_key,
-            PutObjectPolicyContext::new(
-                Some(copy_source_policy_value.as_str()),
-                metadata_directive,
-                canned_acl,
-            )
-            .with_managed_encryption(req.dst_sse_s3.then_some(ManagedEncryptionAlgorithm::Aes256))
-            .with_sse_customer_algorithm(req.dst_sse_customer.map(SseCustomerRequest::algorithm)),
+            dst_policy_context,
             req.expected_bucket_owner(),
         )?;
 
@@ -9967,21 +10019,21 @@ impl Coordinator {
 
             let same_key_same_bucket = src_bucket == dst_bucket && src_key == dst_key;
             let encryption_attrs_unchanged =
-                match (&src_record.encryption, req.dst_sse_customer, req.dst_sse_s3) {
-                    (ObjectEncryption::None, None, false) => true,
-                    (ObjectEncryption::None, None, true) => false,
-                    (ObjectEncryption::None, Some(_), _) => false,
-                    (ObjectEncryption::SseCustomer(_), None, false) => false,
-                    (ObjectEncryption::SseCustomer(_), None, true) => false,
-                    (ObjectEncryption::SseCustomer(_), Some(dst_request), false) => {
-                        source_sse_customer.is_some_and(|src_request| {
-                            src_request.customer_key() == dst_request.customer_key()
-                        })
-                    }
-                    (ObjectEncryption::SseCustomer(_), Some(_), true) => false,
-                    (ObjectEncryption::SseS3(_), None, false) => true,
-                    (ObjectEncryption::SseS3(_), None, true) => true,
-                    (ObjectEncryption::SseS3(_), Some(_), _) => false,
+                match (&src_record.encryption, req.destination_encryption) {
+                    (ObjectEncryption::None, WriteEncryptionRequest::None) => true,
+                    (ObjectEncryption::None, WriteEncryptionRequest::Managed(_)) => false,
+                    (ObjectEncryption::None, WriteEncryptionRequest::SseCustomer(_)) => false,
+                    (ObjectEncryption::SseCustomer(_), WriteEncryptionRequest::None) => false,
+                    (ObjectEncryption::SseCustomer(_), WriteEncryptionRequest::Managed(_)) => false,
+                    (
+                        ObjectEncryption::SseCustomer(_),
+                        WriteEncryptionRequest::SseCustomer(dst_request),
+                    ) => source_sse_customer.is_some_and(|src_request| {
+                        src_request.customer_key() == dst_request.customer_key()
+                    }),
+                    (ObjectEncryption::SseS3(_), WriteEncryptionRequest::None) => true,
+                    (ObjectEncryption::SseS3(_), WriteEncryptionRequest::Managed(_)) => true,
+                    (ObjectEncryption::SseS3(_), WriteEncryptionRequest::SseCustomer(_)) => false,
                 };
             if matches!(
                 directive,
@@ -10116,6 +10168,13 @@ impl Coordinator {
             } => Some(StreamingChecksumAccumulator::new(*algo)),
             _ => None,
         };
+        let session_policy =
+            req.destination_encryption
+                .with_policy_context(PutObjectPolicyContext::new(
+                    Some(copy_source_policy_value.as_str()),
+                    metadata_directive,
+                    canned_acl,
+                ));
         let session_id = self.begin_stream_put(&BeginStreamPutRequest {
             object: ObjectRequest::new(
                 dst_bucket,
@@ -10124,24 +10183,15 @@ impl Coordinator {
                 req.expected_bucket_owner(),
             ),
             acl: acl.into(),
-            policy: PutObjectPolicyContext::new(
-                Some(copy_source_policy_value.as_str()),
-                metadata_directive,
-                canned_acl,
-            )
-            .with_managed_encryption(req.dst_sse_s3.then_some(ManagedEncryptionAlgorithm::Aes256))
-            .with_sse_customer_algorithm(req.dst_sse_customer.map(SseCustomerRequest::algorithm)),
-            encryption: WriteEncryptionRequest::from_request_parts(
-                req.dst_sse_customer,
-                req.dst_sse_s3.then_some(ManagedEncryptionAlgorithm::Aes256),
-            ),
+            policy: session_policy,
+            encryption: req.destination_encryption,
             object_lock: req.object_lock,
         })?;
         let dst_write_encryption = self.load_stream_put_write_encryption(
             dst_bucket,
             dst_key,
             &session_id,
-            req.dst_sse_customer,
+            req.destination_encryption.sse_customer_request(),
         )?;
         let not_found = |e: ServerError| match e {
             ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
@@ -10168,15 +10218,7 @@ impl Coordinator {
                 if let Some(checksum) = replacement_checksum.as_mut() {
                     checksum.update(&chunk);
                 }
-                let storage_chunk = if let Some(sse_customer) =
-                    dst_write_encryption.sse_customer.as_ref()
-                {
-                    sse_customer.encrypt_segment(segment_index, &chunk)?
-                } else if let Some(managed_write) = dst_write_encryption.managed_write.as_ref() {
-                    managed_write.encrypt_segment(segment_index, &chunk)?
-                } else {
-                    chunk.to_vec()
-                };
+                let storage_chunk = dst_write_encryption.encrypt_segment(segment_index, &chunk)?;
                 self.append_stream_segment(
                     dst_bucket,
                     dst_key,
@@ -10213,8 +10255,7 @@ impl Coordinator {
                 total_size,
                 metadata_blob: &metadata_blob,
                 system_metadata: &system_metadata,
-                sse_customer: dst_write_encryption.sse_customer.as_ref(),
-                managed_write: dst_write_encryption.managed_write.as_ref(),
+                write_encryption: dst_write_encryption.as_ref(),
                 tags: tags.as_deref(),
                 cond: dst_cond,
                 acl: acl.into(),
@@ -10223,11 +10264,11 @@ impl Coordinator {
                     metadata_directive,
                     acl.policy_condition_value(),
                 )
-                .with_managed_encryption(
-                    req.dst_sse_s3.then_some(ManagedEncryptionAlgorithm::Aes256),
-                )
+                .with_managed_encryption(req.destination_encryption.explicit_managed_encryption())
                 .with_sse_customer_algorithm(
-                    req.dst_sse_customer.map(SseCustomerRequest::algorithm),
+                    req.destination_encryption
+                        .sse_customer_request()
+                        .map(SseCustomerRequest::algorithm),
                 )
                 .with_request_object_tags_xml(tags.as_deref()),
                 requested_object_lock: req.object_lock,
@@ -10320,35 +10361,40 @@ impl Coordinator {
 
     fn prepare_stored_system_metadata(
         system_metadata: &SystemMetadata,
-        write_encryption: &ResolvedWriteEncryption,
+        write_encryption: &ActiveWriteEncryption,
     ) -> Result<(SerializedSystemMetadataBlob, ObjectEncryption), ServerError> {
         let mut stored_system_metadata = system_metadata.clone();
-        let stored_encryption = match &write_encryption.encryption {
-            ObjectEncryption::None => ObjectEncryption::None,
-            ObjectEncryption::SseCustomer(_) => {
+        let stored_encryption = match write_encryption {
+            ActiveWriteEncryption::None => ObjectEncryption::None,
+            ActiveWriteEncryption::SseCustomer {
+                write: Some(sse_customer_write),
+                ..
+            } => {
                 let checksum = stored_system_metadata.take_checksum();
-                if let Some(sse_customer_write) = write_encryption.sse_customer.as_ref() {
-                    sse_customer_write.seal_checksum_metadata(checksum.as_ref())?
+                sse_customer_write.seal_checksum_metadata(checksum.as_ref())?
+            }
+            ActiveWriteEncryption::Managed { write, .. } => {
+                let checksum = stored_system_metadata.take_checksum();
+                if let Some(write) = write.as_ref() {
+                    write.seal_checksum_metadata(checksum.as_ref())?
                 } else if checksum.is_none() {
-                    write_encryption.encryption.clone()
+                    write_encryption.object_encryption()
+                } else {
+                    return Err(ServerError::InternalError {
+                        reason: "SSE-S3 write context is required when storing checksum metadata for this object"
+                            .to_string(),
+                    });
+                }
+            }
+            ActiveWriteEncryption::SseCustomer { write: None, .. } => {
+                let checksum = stored_system_metadata.take_checksum();
+                if checksum.is_none() {
+                    write_encryption.object_encryption()
                 } else {
                     return Err(ServerError::InvalidRequest {
                         reason:
                             "SSE-C headers are required when storing checksum metadata for this object"
                                 .to_string(),
-                    });
-                }
-            }
-            ObjectEncryption::SseS3(_) => {
-                let checksum = stored_system_metadata.take_checksum();
-                if let Some(managed_write) = write_encryption.managed_write.as_ref() {
-                    managed_write.seal_checksum_metadata(checksum.as_ref())?
-                } else if checksum.is_none() {
-                    write_encryption.encryption.clone()
-                } else {
-                    return Err(ServerError::InternalError {
-                        reason: "SSE-S3 write context is required when storing checksum metadata for this object"
-                            .to_string(),
                     });
                 }
             }
@@ -12697,7 +12743,7 @@ impl Coordinator {
             let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
             let public_read = Self::acl_grants_public_read(&acl_grants);
             Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
-            Self::ensure_sse_c_allowed(&bucket_info, write_encryption.sse_customer.is_some())?;
+            Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
 
             let meta_pg_id = self.object_pg_id(bucket, key);
             let pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -12714,7 +12760,7 @@ impl Coordinator {
                 public_read,
                 object_lock: req.object_lock,
                 checksum: req.checksum,
-                encryption: write_encryption.encryption,
+                encryption: write_encryption.object_encryption(),
             })?;
             let upload = pg.get_multipart_upload(&UploadId::from(upload_id.as_str()))?;
             let initiated_at = upload.initiated_at;
@@ -22483,8 +22529,7 @@ mod tests {
 
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -22520,8 +22565,7 @@ mod tests {
 
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
@@ -22609,8 +22653,7 @@ mod tests {
 
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -22630,8 +22673,7 @@ mod tests {
 
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
@@ -25395,8 +25437,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -25416,6 +25457,164 @@ mod tests {
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"hello copy");
+    }
+
+    #[test]
+    fn copy_object_explicit_sse_s3_destination_preserves_managed_encryption() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator_with_sse_c(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let sse_customer = test_sse_customer_request();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::sse_customer(&sse_customer),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+                data: b"copy managed destination",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let result = coord
+            .copy_object(&CopyObjectRequest {
+                source: copy_source("bucket", "src", None),
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst-sse-s3",
+                    test_requester(),
+                    None,
+                ),
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                source_sse_customer: Some(&sse_customer),
+                destination_encryption: WriteEncryptionRequest::managed(
+                    ManagedEncryptionAlgorithm::Aes256,
+                ),
+                object_lock: ObjectLockState::default(),
+            })
+            .unwrap();
+        assert_eq!(
+            result.managed_encryption,
+            Some(ManagedEncryptionAlgorithm::Aes256)
+        );
+        assert!(result.sse_customer.is_none());
+
+        let destination = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst-sse-s3",
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(
+            destination.body.read_all().unwrap(),
+            b"copy managed destination"
+        );
+        assert_eq!(
+            destination.managed_encryption,
+            Some(ManagedEncryptionAlgorithm::Aes256)
+        );
+    }
+
+    #[test]
+    fn copy_object_explicit_sse_c_destination_requires_customer_headers() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator_with_sse_c(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+                data: b"copy sse-c destination",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let sse_customer = test_sse_customer_request();
+        let result = coord
+            .copy_object(&CopyObjectRequest {
+                source: copy_source("bucket", "src", None),
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst-sse-c",
+                    test_requester(),
+                    None,
+                ),
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                source_sse_customer: None,
+                destination_encryption: WriteEncryptionRequest::sse_customer(&sse_customer),
+                object_lock: ObjectLockState::default(),
+            })
+            .unwrap();
+        assert!(result.managed_encryption.is_none());
+        assert!(result.sse_customer.is_some());
+
+        let err = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst-sse-c",
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
+
+        let destination = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: Some(&sse_customer),
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst-sse-c",
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(
+            destination.body.read_all().unwrap(),
+            b"copy sse-c destination"
+        );
+        assert!(destination.managed_encryption.is_none());
+        assert!(destination.sse_customer.is_some());
     }
 
     #[test]
@@ -25467,8 +25666,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
@@ -25536,8 +25734,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
@@ -25632,8 +25829,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -25719,8 +25915,7 @@ mod tests {
 
                 acl: PutObjectAcl::PublicRead.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
@@ -25777,8 +25972,7 @@ mod tests {
 
                 acl: PutObjectAcl::PublicRead.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
@@ -25832,8 +26026,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -25909,8 +26102,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -25993,8 +26185,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -26066,8 +26257,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -26140,8 +26330,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -26221,8 +26410,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -26304,8 +26492,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -26376,8 +26563,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
@@ -26431,8 +26617,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
@@ -26490,8 +26675,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
@@ -26564,8 +26748,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap_err();
@@ -26638,8 +26821,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -26720,8 +26902,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -27897,8 +28078,7 @@ mod tests {
 
                 acl: PutObjectAcl::None,
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState {
                     retention: None,
                     legal_hold: StoredLegalHoldStatus::On,
@@ -29092,8 +29272,7 @@ mod tests {
 
                     acl: NO_PUT_OBJECT_ACL.into(),
                     source_sse_customer: None,
-                    dst_sse_customer: None,
-                    dst_sse_s3: false,
+                    destination_encryption: WriteEncryptionRequest::none(),
                     object_lock: ObjectLockState::default(),
                 })
             });
@@ -29602,8 +29781,7 @@ mod tests {
                 total_size: expected.len() as u64,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -29786,8 +29964,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
         });
@@ -33643,8 +33820,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -33978,8 +34154,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -34506,6 +34681,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn complete_multipart_sse_c_checksum_requires_headers() {
+        use base64::Engine;
+
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator_with_sse_c(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let sse_customer = test_sse_customer_request();
+        let create = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request("bucket", "key", test_requester()),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: Some(
+                    MultipartChecksumConfig::new(ChecksumAlgorithm::Sha256, None).unwrap(),
+                ),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::sse_customer(&sse_customer),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let part_data = b"hello multipart checksum";
+        let part_checksum = base64::engine::general_purpose::STANDARD
+            .encode(compute_checksum(ChecksumAlgorithm::Sha256, part_data).bytes());
+        let part_checksum_claim =
+            ChecksumClaim::from_base64(ChecksumAlgorithm::Sha256, &part_checksum).unwrap();
+        let result = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
+                upload: multipart_object_request(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                ),
+                part_number: 1,
+                data: part_data,
+                claimed_checksum: Some(&part_checksum_claim),
+                sse_customer: Some(&sse_customer),
+            },
+        )
+        .unwrap();
+        let complete_parts = [CompletePart {
+            part_number: 1,
+            etag: result.etag,
+            checksum: Some(part_checksum_claim),
+        }];
+        let object_checksum_claim =
+            EncodedChecksumClaim::new(ChecksumAlgorithm::Sha256, format!("{part_checksum}-1"));
+
+        let err = coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &complete_parts,
+                claimed_checksum: Some(&object_checksum_claim),
+                cond: &WriteCondition::default(),
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::InvalidRequest { .. }),
+            "expected InvalidRequest when SSE-C checksum finalize omits headers, got {err:?}"
+        );
+    }
+
     // ── Streaming upload session tests ──────────────────────────────────
 
     #[test]
@@ -34544,8 +34796,7 @@ mod tests {
                 total_size: full_data.len() as u64,
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -34715,8 +34966,7 @@ mod tests {
                 total_size: 5,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &system_metadata,
-                sse_customer: Some(&wrong_context),
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::SseCustomer(&wrong_context),
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -34755,8 +35005,10 @@ mod tests {
                 total_size: 5,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &system_metadata,
-                sse_customer: None,
-                managed_write: Some(&wrong_context),
+                write_encryption: ActiveWriteEncryptionRef::Managed {
+                    algorithm: ManagedEncryptionAlgorithm::Aes256,
+                    write: &wrong_context,
+                },
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -34856,8 +35108,7 @@ mod tests {
                 total_size: 0,
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -34907,8 +35158,7 @@ mod tests {
                 total_size: 5,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: Some(tags_xml),
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -34988,8 +35238,7 @@ mod tests {
                 total_size: 0,
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35034,8 +35283,7 @@ mod tests {
                 total_size: 0,
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35098,8 +35346,7 @@ mod tests {
                 total_size: 0,
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35170,8 +35417,7 @@ mod tests {
                 total_size: new_data.len() as u64,
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35241,8 +35487,7 @@ mod tests {
                 total_size: 7,
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &cond,
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35266,8 +35511,7 @@ mod tests {
                 total_size: 5,
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &bad_cond,
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35319,8 +35563,7 @@ mod tests {
                 total_size: full_data.len() as u64,
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35405,8 +35648,7 @@ mod tests {
                 total_size: 5,
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35479,8 +35721,7 @@ mod tests {
                 total_size: 10,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35561,8 +35802,7 @@ mod tests {
                 total_size: data.len() as u64,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: NO_WRITE,
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35633,8 +35873,7 @@ mod tests {
                 total_size: 8,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35734,8 +35973,7 @@ mod tests {
                 total_size: 7,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35760,8 +35998,7 @@ mod tests {
 
                 acl: NO_PUT_OBJECT_ACL.into(),
                 source_sse_customer: None,
-                dst_sse_customer: None,
-                dst_sse_s3: false,
+                destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
             })
             .unwrap();
@@ -36042,8 +36279,7 @@ mod tests {
                 total_size: 0,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36091,8 +36327,7 @@ mod tests {
                 total_size: 8,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36148,8 +36383,7 @@ mod tests {
                 total_size: 11,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36232,8 +36466,7 @@ mod tests {
                 total_size: 9,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36295,8 +36528,7 @@ mod tests {
                 total_size: 9,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36366,8 +36598,7 @@ mod tests {
                 total_size: 11,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36449,8 +36680,7 @@ mod tests {
                 total_size: data.len() as u64,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36652,8 +36882,7 @@ mod tests {
                 total_size: 5,
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36687,8 +36916,7 @@ mod tests {
                 total_size: 999, // wrong — actual is 5
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -37370,8 +37598,7 @@ mod tests {
                 total_size: 9,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -37493,8 +37720,7 @@ mod tests {
                 total_size: 16,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -37654,8 +37880,7 @@ mod tests {
                 total_size: 2,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -37739,8 +37964,7 @@ mod tests {
                 total_size: 8,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -37762,8 +37986,7 @@ mod tests {
                 total_size: 8,
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
-                sse_customer: None,
-                managed_write: None,
+                write_encryption: ActiveWriteEncryptionRef::None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),

@@ -930,9 +930,8 @@ impl HttpFrontend {
                     let requester = Self::requester_from_auth(auth);
                     let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                     let dst_sse_customer = parse_sse_customer_request(req)?;
-                    let dst_sse_s3 =
-                        parse_managed_encryption_request(req, dst_sse_customer.is_some())?
-                            .is_some();
+                    let destination_managed_encryption =
+                        parse_managed_encryption_request(req, dst_sse_customer.is_some())?;
                     let object_lock = parse_object_lock_headers(req)?;
                     let acl = parse_put_object_acl(req.header("x-amz-acl"));
                     let src_cond = copy_source_condition_from_headers(req);
@@ -1021,8 +1020,11 @@ impl HttpFrontend {
                         tagging,
                         acl,
                         source_sse_customer: source_sse_customer.as_ref(),
-                        dst_sse_customer: dst_sse_customer.as_ref(),
-                        dst_sse_s3,
+                        destination_encryption:
+                            crate::coordinator::WriteEncryptionRequest::from_request_parts(
+                                dst_sse_customer.as_ref(),
+                                destination_managed_encryption,
+                            ),
                         object_lock,
                     })?;
                     Ok(S3Response::copy_object(&result))
@@ -3015,8 +3017,7 @@ impl HttpFrontend {
                 total_size,
                 metadata_blob: &ctx.metadata_blob,
                 system_metadata: &ctx.system_metadata,
-                sse_customer: write_encryption.sse_customer.as_ref(),
-                managed_write: write_encryption.managed_write.as_ref(),
+                write_encryption: write_encryption.as_ref(),
                 tags: ctx.tags_xml.as_deref(),
                 cond: &crate::conditional::WriteCondition::default(),
                 acl: acl.into(),
@@ -3065,13 +3066,7 @@ impl HttpFrontend {
                 .as_ref()
                 .map(SseCustomerWriteContext::request),
         )?;
-        let data = if let Some(sse_customer) = write_encryption.sse_customer.as_ref() {
-            sse_customer.encrypt_segment(segment_index, data)?
-        } else if let Some(managed_write) = write_encryption.managed_write.as_ref() {
-            managed_write.encrypt_segment(segment_index, data)?
-        } else {
-            data.to_vec()
-        };
+        let data = write_encryption.encrypt_segment(segment_index, data)?;
         self.coordinator.append_stream_segment(
             &ctx.binding.bucket,
             &ctx.binding.key,
@@ -3332,13 +3327,7 @@ impl HttpFrontend {
                 .as_ref()
                 .map(SseCustomerWriteContext::request),
         )?;
-        let segment_data = if let Some(sse_customer) = write_encryption.sse_customer.as_ref() {
-            sse_customer.encrypt_segment(segment_index, data)?
-        } else if let Some(managed_write) = write_encryption.managed_write.as_ref() {
-            managed_write.encrypt_segment(segment_index, data)?
-        } else {
-            data.to_vec()
-        };
+        let segment_data = write_encryption.encrypt_segment(segment_index, data)?;
         self.coordinator.append_stream_segment(
             &ctx.bucket,
             &ctx.key,
@@ -3454,8 +3443,7 @@ impl HttpFrontend {
                 total_size,
                 metadata_blob: &metadata_blob,
                 system_metadata: &system_metadata,
-                sse_customer: write_encryption.sse_customer.as_ref(),
-                managed_write: write_encryption.managed_write.as_ref(),
+                write_encryption: write_encryption.as_ref(),
                 tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
                 acl: put_object_write_acl_from_components(
@@ -3598,13 +3586,7 @@ impl HttpFrontend {
                 .as_ref()
                 .map(SseCustomerWriteContext::request),
         )?;
-        let data = if let Some(sse_customer) = write_encryption.sse_customer.as_ref() {
-            sse_customer.encrypt_segment(segment_index, data)?
-        } else if let Some(managed_write) = write_encryption.managed_write.as_ref() {
-            managed_write.encrypt_segment(segment_index, data)?
-        } else {
-            data.to_vec()
-        };
+        let data = write_encryption.encrypt_segment(segment_index, data)?;
         self.coordinator.append_stream_segment(
             &ctx.binding.object.bucket,
             &ctx.binding.object.key,
@@ -8104,13 +8086,7 @@ mod tests {
                 .chunks(crate::coordinator::INTERNAL_SEGMENT_SIZE)
                 .enumerate()
             {
-                let chunk = if let Some(sse_customer) = write_encryption.sse_customer.as_ref() {
-                    sse_customer.encrypt_segment(segment_index as u32, chunk)?
-                } else if let Some(managed_write) = write_encryption.managed_write.as_ref() {
-                    managed_write.encrypt_segment(segment_index as u32, chunk)?
-                } else {
-                    chunk.to_vec()
-                };
+                let chunk = write_encryption.encrypt_segment(segment_index as u32, chunk)?;
                 staged.extend_from_slice(&chunk);
                 fe.coordinator.append_stream_segment(
                     bucket,

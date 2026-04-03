@@ -24,7 +24,7 @@ Detailed follow-up plans should live in separate documents as decisions become
 concrete. The current detailed plan for the first non-`SSE-C` encryption phase
 is:
 
-- `plans/sse-s3-plan.md`
+- `plans/completed/sse-s3-plan.md`
 
 ## Current Status
 
@@ -66,7 +66,7 @@ Chosen direction:
 - keep that key role separate from the `SSE-C` validator key
 - preserve the per-object random `DEK` envelope model already used by `SSE-C`
 
-See `plans/sse-s3-plan.md` for the detailed implementation plan.
+See `plans/completed/sse-s3-plan.md` for the detailed implementation plan.
 
 ### 2. SSE-KMS
 

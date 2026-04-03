@@ -481,6 +481,16 @@ Completed so far:
    the `s3:x-amz-server-side-encryption` string condition only at the final
    auth boundary rather than threading `"AES256"` through internal request
    helpers
+10. the runtime write-encryption bundle is now represented as
+    `ActiveWriteEncryption` / `ActiveWriteEncryptionRef` instead of parallel
+    optional fields, so streaming finalize and commit paths no longer admit
+    impossible mixed SSE-C / SSE-S3 states
+11. `CopyObjectRequest` now uses the same typed `WriteEncryptionRequest` for
+    destination encryption as the rest of the write surface, removing one of
+    the last split `dst_sse_customer` / `dst_sse_s3` seams
+12. explicit regression coverage now pins `CopyObject` with destination
+    `SSE-S3` and destination `SSE-C`, in addition to the multipart SSE-C
+    checksum-complete regression caught during this cleanup
 
 1. replace split write-encryption request inputs such as:
    - `sse_customer`
@@ -575,3 +585,6 @@ All phases in this document are now complete. The next encryption work should
 move into a separate `SSE-KMS` plan that extends or replaces the managed key
 provider rather than reworking object crypto state or the managed-encryption
 runtime seam.
+
+This document has been moved into `plans/completed/` now that the implementation
+work and the follow-on interface cleanups are done.
