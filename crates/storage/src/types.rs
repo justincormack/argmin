@@ -1348,8 +1348,8 @@ pub struct BucketInfo {
     pub bucket_lifecycle: Option<String>,
     /// Monotonic generation incremented on every lifecycle update/delete.
     pub bucket_lifecycle_generation: u64,
-    /// Bucket encryption configuration subset currently modeled by storage.
-    pub encryption: BucketEncryptionConfig,
+    /// Effective bucket encryption semantics used on hot paths.
+    pub encryption: EffectiveBucketEncryptionConfig,
 }
 
 /// Complete bucket metadata required when creating a bucket row.
@@ -1385,23 +1385,14 @@ pub struct BucketFastPathInfo {
     pub bucket_policy_generation: u64,
     pub bucket_lifecycle_present: bool,
     pub bucket_lifecycle_generation: u64,
-    pub encryption: BucketEncryptionConfig,
+    pub encryption: EffectiveBucketEncryptionConfig,
 }
 
-/// Bucket encryption configuration subset currently implemented by Argmin.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Stored bucket encryption configuration subset currently implemented by Argmin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BucketEncryptionConfig {
     pub default_encryption: Option<ManagedEncryptionAlgorithm>,
     pub sse_c_blocked: bool,
-}
-
-impl Default for BucketEncryptionConfig {
-    fn default() -> Self {
-        Self {
-            default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
-            sse_c_blocked: false,
-        }
-    }
 }
 
 impl BucketEncryptionConfig {
@@ -1411,13 +1402,29 @@ impl BucketEncryptionConfig {
     }
 
     #[must_use]
-    pub const fn normalize(self) -> Self {
-        Self {
+    pub const fn effective(self) -> EffectiveBucketEncryptionConfig {
+        EffectiveBucketEncryptionConfig {
             default_encryption: match self.default_encryption {
-                Some(value) => Some(value),
-                None => Some(ManagedEncryptionAlgorithm::Aes256),
+                Some(value) => value,
+                None => ManagedEncryptionAlgorithm::Aes256,
             },
             sse_c_blocked: self.sse_c_blocked,
+        }
+    }
+}
+
+/// Effective bucket encryption semantics after applying AWS defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveBucketEncryptionConfig {
+    pub default_encryption: ManagedEncryptionAlgorithm,
+    pub sse_c_blocked: bool,
+}
+
+impl Default for EffectiveBucketEncryptionConfig {
+    fn default() -> Self {
+        Self {
+            default_encryption: ManagedEncryptionAlgorithm::Aes256,
+            sse_c_blocked: false,
         }
     }
 }

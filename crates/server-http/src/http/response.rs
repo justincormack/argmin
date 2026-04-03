@@ -16,7 +16,7 @@ use s3_types::{
 };
 use server_core::sse::{SseCustomerResponseHeaders, SSE_CUSTOMER_ALGORITHM};
 use server_core::system_metadata::SystemMetadata;
-use storage::{BucketEncryptionConfig, ManagedEncryptionAlgorithm};
+use storage::{EffectiveBucketEncryptionConfig, ManagedEncryptionAlgorithm};
 
 use super::xml;
 
@@ -653,7 +653,7 @@ impl S3Response {
 
     /// Build a response for `GetBucketEncryption`.
     #[must_use]
-    pub fn get_bucket_encryption(config: BucketEncryptionConfig) -> Self {
+    pub fn get_bucket_encryption(config: EffectiveBucketEncryptionConfig) -> Self {
         let body = xml::get_bucket_encryption_xml(config);
         Self::new(200).xml_body(body)
     }
@@ -2032,7 +2032,7 @@ mod tests {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
-            encryption: BucketEncryptionConfig::default(),
+            encryption: EffectiveBucketEncryptionConfig::default(),
         };
         let resp = S3Response::head_bucket(&info);
         assert_eq!(resp.status_code, 200);
@@ -2079,7 +2079,7 @@ mod tests {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
-            encryption: BucketEncryptionConfig::default(),
+            encryption: EffectiveBucketEncryptionConfig::default(),
         }];
         let owner_canonical_id = CanonicalUserId::from_principal("owner");
         let resp = S3Response::list_buckets(&buckets, "Owner A", &owner_canonical_id);

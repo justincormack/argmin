@@ -2842,8 +2842,7 @@ mod tests {
                 acl: crate::coordinator::PutObjectAcl::None.into(),
                 policy_context: crate::coordinator::PutObjectPolicyContext::default(),
                 object_lock: s3_types::ObjectLockState::default(),
-                sse_customer: None,
-                sse_s3: false,
+                encryption: crate::coordinator::WriteEncryptionRequest::none(),
             })
             .unwrap()
             .upload_id

@@ -721,6 +721,11 @@ fn file_bucket_metadata_config_roundtrip() {
     store.delete_bucket_ownership_controls("bucket").unwrap();
     assert_eq!(store.get_bucket_ownership_controls("bucket").unwrap(), None);
 
+    assert_eq!(
+        store.get_bucket_encryption("bucket").unwrap(),
+        BucketEncryptionConfig::default()
+    );
+
     store
         .put_bucket_encryption(
             "bucket",
@@ -733,7 +738,7 @@ fn file_bucket_metadata_config_roundtrip() {
     assert_eq!(
         store.get_bucket_encryption("bucket").unwrap(),
         BucketEncryptionConfig {
-            default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
+            default_encryption: None,
             sse_c_blocked: true,
         }
     );
@@ -743,6 +748,13 @@ fn file_bucket_metadata_config_roundtrip() {
             .unwrap()
             .encryption
             .sse_c_blocked
+    );
+    store
+        .put_bucket_encryption("bucket", BucketEncryptionConfig::default())
+        .unwrap();
+    assert_eq!(
+        store.get_bucket_encryption("bucket").unwrap(),
+        BucketEncryptionConfig::default()
     );
 
     store

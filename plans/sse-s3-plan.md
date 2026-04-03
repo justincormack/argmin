@@ -441,13 +441,41 @@ Exit criteria:
 
 ### Phase 6: Tighten encryption interfaces and type boundaries
 
-Status: planned
+Status: in progress
 
 The recent fixes exposed that the remaining risk is less about missing
 `SSE-S3` features and more about internal interfaces carrying the same
 encryption decision in multiple loosely-coupled forms.
 
 This phase is about making those states harder to express incorrectly.
+
+Completed so far:
+
+1. `PutObjectRequest` and `CreateMultipartUploadRequest` now carry a typed
+   `WriteEncryptionRequest` instead of parallel `sse_customer` / `sse_s3`
+   request fields.
+2. the HTTP layer and direct coordinator callers now build that request-level
+   encryption intent directly instead of reconstructing it piecemeal
+3. stored bucket encryption config is now distinct from effective bucket
+   encryption semantics:
+   - storage persists and returns the raw configured value
+   - coordinator fast paths and `GetBucketEncryption` use an explicit
+     effective type after applying AWS defaults
+4. `BeginStreamPutRequest` now uses the same typed request-level encryption
+   intent and derives its policy context from that typed state before auth,
+   so streaming write admission cannot drift from the requested encryption
+5. bucket creation and `DeleteBucketEncryption` now preserve raw
+   “unset/implicit AWS default” state in storage rather than persisting an
+   explicit `AES256` configuration
+
+Remaining in this phase:
+
+1. keep pushing typed managed-encryption state through policy evaluation so
+   fewer auth paths depend on stringly-typed `server_side_encryption`
+2. tighten commit/finalize helpers so stored encryption state and runtime write
+   contexts are passed as one coherent bundle
+3. add targeted wire-format compatibility tests around persisted `SSE-S3`
+   constants and envelopes
 
 1. replace split write-encryption request inputs such as:
    - `sse_customer`

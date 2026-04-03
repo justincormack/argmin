@@ -1078,8 +1078,12 @@ impl HttpFrontend {
                                 acl,
                                 policy_context,
                                 object_lock,
-                                sse_customer: sse_customer.as_ref(),
-                                sse_s3,
+                                encryption:
+                                    crate::coordinator::WriteEncryptionRequest::from_request_parts(
+                                        sse_customer.as_ref(),
+                                        sse_s3
+                                            .then_some(storage::ManagedEncryptionAlgorithm::Aes256),
+                                    ),
                             })?;
                     let mut resp = S3Response::put_object(&result);
                     apply_sse_customer_write_response_headers(&mut resp, sse_customer.as_ref());
@@ -2197,8 +2201,10 @@ impl HttpFrontend {
                         acl,
                         policy_context,
                         object_lock,
-                        sse_customer: sse_customer.as_ref(),
-                        sse_s3,
+                        encryption: crate::coordinator::WriteEncryptionRequest::from_request_parts(
+                            sse_customer.as_ref(),
+                            sse_s3.then_some(storage::ManagedEncryptionAlgorithm::Aes256),
+                        ),
                     },
                 )?;
                 Ok(S3Response::create_multipart_upload(
@@ -2863,12 +2869,10 @@ impl HttpFrontend {
             .with_server_side_encryption(managed_encryption.map(ManagedEncryptionAlgorithm::as_str))
             .with_sse_customer_algorithm(sse_customer.as_ref().map(|ctx| ctx.request().algorithm()))
             .with_request_object_tags_xml(tags_xml.as_deref()),
-            encryption: sse_customer
-                .as_ref()
-                .map_or(storage::ObjectEncryption::None, |ctx| {
-                    ctx.encryption().clone()
-                }),
-            sse_s3: managed_encryption.is_some(),
+            encryption: crate::coordinator::WriteEncryptionRequest::from_request_parts(
+                sse_customer.as_ref().map(SseCustomerWriteContext::request),
+                managed_encryption,
+            ),
             object_lock: ObjectLockState::default(),
         })?;
 
@@ -3293,13 +3297,12 @@ impl HttpFrontend {
                 ctx.acl_grants.as_ref(),
             ),
             policy: ctx.policy_context(),
-            encryption: ctx
-                .sse_customer
-                .as_ref()
-                .map_or(storage::ObjectEncryption::None, |ctx| {
-                    ctx.encryption().clone()
-                }),
-            sse_s3: ctx.managed_encryption.is_some(),
+            encryption: crate::coordinator::WriteEncryptionRequest::from_request_parts(
+                ctx.sse_customer
+                    .as_ref()
+                    .map(SseCustomerWriteContext::request),
+                ctx.managed_encryption,
+            ),
             object_lock: ctx.object_lock,
         })
     }
@@ -3385,11 +3388,12 @@ impl HttpFrontend {
                 ),
                 policy_context: ctx.policy_context(),
                 object_lock: ctx.object_lock,
-                sse_customer: ctx
-                    .sse_customer
-                    .as_ref()
-                    .map(SseCustomerWriteContext::request),
-                sse_s3: ctx.managed_encryption.is_some(),
+                encryption: crate::coordinator::WriteEncryptionRequest::from_request_parts(
+                    ctx.sse_customer
+                        .as_ref()
+                        .map(SseCustomerWriteContext::request),
+                    ctx.managed_encryption,
+                ),
             })?;
 
         let mut resp = S3Response::put_object(&result);
@@ -6584,8 +6588,7 @@ mod tests {
                 acl: crate::coordinator::PutObjectAcl::None.into(),
                 policy_context: crate::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
-                sse_customer: None,
-                sse_s3: false,
+                encryption: crate::coordinator::WriteEncryptionRequest::none(),
             })
             .unwrap();
 
@@ -6956,8 +6959,7 @@ mod tests {
                 acl: crate::coordinator::PutObjectAcl::None.into(),
                 policy_context: crate::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
-                sse_customer: None,
-                sse_s3: false,
+                encryption: crate::coordinator::WriteEncryptionRequest::none(),
             })
             .unwrap();
         let req = new_req(http::Method::PUT, "", "", vec![], body);
@@ -7001,8 +7003,7 @@ mod tests {
                 acl: crate::coordinator::PutObjectAcl::None.into(),
                 policy_context: crate::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
-                sse_customer: None,
-                sse_s3: false,
+                encryption: crate::coordinator::WriteEncryptionRequest::none(),
             })
             .unwrap();
         let req = new_req(http::Method::PUT, "", "", vec![], body);
@@ -7037,8 +7038,7 @@ mod tests {
                 acl: crate::coordinator::PutObjectAcl::None.into(),
                 policy_context: crate::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
-                sse_customer: None,
-                sse_s3: false,
+                encryption: crate::coordinator::WriteEncryptionRequest::none(),
             })
             .unwrap();
 

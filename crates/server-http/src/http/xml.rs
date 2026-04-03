@@ -15,7 +15,10 @@ use s3_types::{
     CanonicalUserId, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention,
     RetentionPeriod,
 };
-use storage::{BucketEncryptionConfig, BucketLifecycleConfiguration, ManagedEncryptionAlgorithm};
+use storage::{
+    BucketEncryptionConfig, BucketLifecycleConfiguration, EffectiveBucketEncryptionConfig,
+    ManagedEncryptionAlgorithm,
+};
 
 use super::response::format_version_id;
 
@@ -1843,17 +1846,15 @@ pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig
 
 /// Format a `GetBucketEncryption` XML response.
 #[must_use]
-pub fn get_bucket_encryption_xml(config: BucketEncryptionConfig) -> String {
+pub fn get_bucket_encryption_xml(config: EffectiveBucketEncryptionConfig) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Rule>",
     );
-    if let Some(default_encryption) = config.default_encryption {
-        xml.push_str("<ApplyServerSideEncryptionByDefault><SSEAlgorithm>");
-        xml.push_str(default_encryption.as_str());
-        xml.push_str("</SSEAlgorithm></ApplyServerSideEncryptionByDefault>");
-    }
+    xml.push_str("<ApplyServerSideEncryptionByDefault><SSEAlgorithm>");
+    xml.push_str(config.default_encryption.as_str());
+    xml.push_str("</SSEAlgorithm></ApplyServerSideEncryptionByDefault>");
     if config.sse_c_blocked {
         xml.push_str(
             "<BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes>",
@@ -3852,7 +3853,7 @@ mod tests {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
-            encryption: BucketEncryptionConfig::default(),
+            encryption: EffectiveBucketEncryptionConfig::default(),
         }];
         let owner_canonical_id = CanonicalUserId::from_principal("owner");
         let xml = list_buckets_xml(&buckets, "Owner A", &owner_canonical_id);
@@ -4790,16 +4791,19 @@ mod tests {
             default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
             sse_c_blocked: true,
         };
-        let xml = get_bucket_encryption_xml(blocked);
+        let xml = get_bucket_encryption_xml(blocked.effective());
         let parsed = parse_bucket_encryption_xml(xml.as_bytes()).unwrap();
         assert_eq!(parsed, blocked);
 
-        let unblocked_xml = get_bucket_encryption_xml(BucketEncryptionConfig {
-            default_encryption: None,
-            sse_c_blocked: false,
-        });
+        let unblocked_xml = get_bucket_encryption_xml(
+            BucketEncryptionConfig {
+                default_encryption: None,
+                sse_c_blocked: false,
+            }
+            .effective(),
+        );
         assert!(!unblocked_xml.contains("<EncryptionType>"));
-        assert!(!unblocked_xml.contains("<SSEAlgorithm>"));
+        assert!(unblocked_xml.contains("<SSEAlgorithm>AES256</SSEAlgorithm>"));
     }
 
     // ── CORS XML ─────────────────────────────────────────────────────
@@ -6117,7 +6121,6 @@ mod tests {
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
-                sse_customer: None,
                 policy_context: server_core::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
                 object: test_object_request("test-bucket", "dir/file1.txt"),
@@ -6127,14 +6130,13 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                sse_s3: false,
+                encryption: server_core::coordinator::WriteEncryptionRequest::none(),
             },
         )
         .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
-                sse_customer: None,
                 policy_context: server_core::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
                 object: test_object_request("test-bucket", "dir/file2.txt"),
@@ -6144,14 +6146,13 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                sse_s3: false,
+                encryption: server_core::coordinator::WriteEncryptionRequest::none(),
             },
         )
         .unwrap();
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
-                sse_customer: None,
                 policy_context: server_core::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
                 object: test_object_request("test-bucket", "root.txt"),
@@ -6161,7 +6162,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 acl: NO_PUT_OBJECT_ACL.into(),
-                sse_s3: false,
+                encryption: server_core::coordinator::WriteEncryptionRequest::none(),
             },
         )
         .unwrap();
@@ -6255,7 +6256,6 @@ mod tests {
             test_helpers::put_object(
                 &coord,
                 &PutObjectRequest {
-                    sse_customer: None,
                     policy_context: server_core::coordinator::PutObjectPolicyContext::default(),
                     object_lock: Default::default(),
                     object: test_object_request("bucket", &key),
@@ -6265,7 +6265,7 @@ mod tests {
                     tags: None,
                     cond: NO_WRITE,
                     acl: NO_PUT_OBJECT_ACL.into(),
-                    sse_s3: false,
+                    encryption: server_core::coordinator::WriteEncryptionRequest::none(),
                 },
             )
             .unwrap();

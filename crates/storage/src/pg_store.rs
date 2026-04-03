@@ -940,7 +940,7 @@ impl PgStore {
                     .transpose()?,
                 sse_c_blocked: row.get::<_, i64>(22)? != 0,
             }
-            .normalize(),
+            .effective(),
         })
     }
 
@@ -1432,7 +1432,7 @@ impl PgStore {
                 config.acl_grants.serialized(),
                 i32::from(config.public_read),
                 i32::from(config.public_write),
-                ManagedEncryptionAlgorithm::Aes256 as u8,
+                Option::<u8>::None,
                 object_lock_enabled,
                 object_lock_default_mode,
                 object_lock_default_days,
@@ -2414,8 +2414,7 @@ impl PgMetadataStore for PgStore {
                             })
                             .transpose()?,
                         sse_c_blocked: row.get::<_, i64>(1)? != 0,
-                    }
-                    .normalize())
+                    })
                 },
             )
             .optional()
