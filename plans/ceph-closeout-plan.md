@@ -46,23 +46,22 @@ Evidence for that reassessment:
 
 ### 1. Bucket policy `IfExists`
 
-This is the only confirmed remaining product gap on the currently implemented
-surface.
+Status: implemented on the currently supported condition-key subset.
 
-Missing Ceph case:
+Originally missing Ceph case:
 - `test_bucket_policy_set_condition_operator_end_with_IfExists`
 
 Current state:
-- the Rust port exists as a commented-out test in
-  `crates/s3-tests/tests/bucket_policy.rs`
-- the comment explicitly states that `IfExists` condition operators are not yet
-  implemented
+- `auth` now accepts and evaluates `StringEqualsIfExists`,
+  `StringLikeIfExists`, and `StringNotEqualsIfExists` for the currently
+  supported string-condition subset
+- the stale commented integration placeholder in
+  `crates/s3-tests/tests/bucket_policy.rs` has been replaced with an active
+  end-to-end test on a supported S3 condition key
 
-Deliver:
-- implement `StringLikeIfExists` semantics for the currently supported
-  condition-key subset
-- enable the commented Rust integration test
-- run the targeted AWS-backed verification for that case
+Follow-up verification:
+- keep the targeted AWS-backed verification for this case in the closeout log
+  for the implementation commit
 
 ### 2. Bucket recreate / ACL parity ports
 
@@ -115,15 +114,13 @@ These should not stay on the closeout list:
 
 ## Recommended Order
 
-1. Finish bucket-policy `IfExists`.
-2. Port the two versioning concurrent create/remove tests.
-3. Close the bucket recreate / ACL subset, either by porting or by explicitly
+1. Port the two versioning concurrent create/remove tests.
+2. Close the bucket recreate / ACL subset, either by porting or by explicitly
    documenting when an existing Rust test already covers the same behavior.
 
 ## Exit Criteria
 
 This closeout plan is complete when:
-- the `IfExists` bucket-policy case is implemented and tested
 - the two remaining versioning concurrency cases are ported
 - the bucket recreate / ACL subset is either ported or explicitly closed as
   already covered

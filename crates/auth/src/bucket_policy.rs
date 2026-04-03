@@ -1063,41 +1063,47 @@ fn condition_clause_matches_request(
 }
 
 fn condition_clause_supported_for_evaluable_object_actions(clause: &PolicyConditionClause) -> bool {
-    (clause.operator == "StringEquals" && clause.key.starts_with("s3:ExistingObjectTag/"))
-        || (matches!(
-            clause.operator.as_str(),
-            "StringEquals" | "StringLike" | "StringNotEquals" | "Null"
-        ) && matches!(
-            clause.key.as_str(),
-            "s3:x-amz-copy-source"
-                | "s3:x-amz-metadata-directive"
-                | "s3:x-amz-acl"
-                | "s3:x-amz-server-side-encryption"
-                | "s3:x-amz-server-side-encryption-customer-algorithm"
-                | "s3:x-amz-grant-read"
-                | "s3:x-amz-grant-write"
-                | "s3:x-amz-grant-read-acp"
-                | "s3:x-amz-grant-write-acp"
-                | "s3:x-amz-grant-full-control"
-        ))
-        || (matches!(
-            clause.operator.as_str(),
-            "StringEquals" | "StringLike" | "StringNotEquals" | "Null"
-        ) && clause.key.starts_with("s3:RequestObjectTag/"))
+    (matches!(
+        clause.operator.as_str(),
+        "StringEquals" | "StringEqualsIfExists"
+    ) && clause.key.starts_with("s3:ExistingObjectTag/"))
+        || (evaluable_string_condition_operator_supported(clause.operator.as_str())
+            && matches!(
+                clause.key.as_str(),
+                "s3:x-amz-copy-source"
+                    | "s3:x-amz-metadata-directive"
+                    | "s3:x-amz-acl"
+                    | "s3:x-amz-server-side-encryption"
+                    | "s3:x-amz-server-side-encryption-customer-algorithm"
+                    | "s3:x-amz-grant-read"
+                    | "s3:x-amz-grant-write"
+                    | "s3:x-amz-grant-read-acp"
+                    | "s3:x-amz-grant-write-acp"
+                    | "s3:x-amz-grant-full-control"
+            ))
+        || (evaluable_string_condition_operator_supported(clause.operator.as_str())
+            && clause.key.starts_with("s3:RequestObjectTag/"))
 }
 
 fn string_equals_condition_matches(
     clause: &PolicyConditionClause,
     actual: Option<&str>,
 ) -> ConditionMatchResult {
-    if clause.operator != "StringEquals" {
+    let (operator, if_exists) = split_if_exists_operator(clause.operator.as_str());
+    if operator != "StringEquals" {
         return ConditionMatchResult::Unsupported;
     }
 
-    if actual.is_some_and(|actual| clause.values.iter().any(|expected| expected == actual)) {
-        ConditionMatchResult::Matches
-    } else {
-        ConditionMatchResult::NoMatch
+    match actual {
+        Some(actual) => {
+            if clause.values.iter().any(|expected| expected == actual) {
+                ConditionMatchResult::Matches
+            } else {
+                ConditionMatchResult::NoMatch
+            }
+        }
+        None if if_exists => ConditionMatchResult::Matches,
+        None => ConditionMatchResult::NoMatch,
     }
 }
 
@@ -1105,31 +1111,34 @@ fn string_condition_matches(
     clause: &PolicyConditionClause,
     actual: Option<&str>,
 ) -> ConditionMatchResult {
-    match clause.operator.as_str() {
-        "StringEquals" => {
-            let Some(actual) = actual else {
-                return ConditionMatchResult::NoMatch;
-            };
-            if clause.values.iter().any(|expected| expected == actual) {
-                ConditionMatchResult::Matches
-            } else {
-                ConditionMatchResult::NoMatch
+    let (operator, if_exists) = split_if_exists_operator(clause.operator.as_str());
+    match operator {
+        "StringEquals" => match actual {
+            Some(actual) => {
+                if clause.values.iter().any(|expected| expected == actual) {
+                    ConditionMatchResult::Matches
+                } else {
+                    ConditionMatchResult::NoMatch
+                }
             }
-        }
-        "StringLike" => {
-            let Some(actual) = actual else {
-                return ConditionMatchResult::NoMatch;
-            };
-            if clause
-                .values
-                .iter()
-                .any(|expected| wildcard_matches(expected, actual))
-            {
-                ConditionMatchResult::Matches
-            } else {
-                ConditionMatchResult::NoMatch
+            None if if_exists => ConditionMatchResult::Matches,
+            None => ConditionMatchResult::NoMatch,
+        },
+        "StringLike" => match actual {
+            Some(actual) => {
+                if clause
+                    .values
+                    .iter()
+                    .any(|expected| wildcard_matches(expected, actual))
+                {
+                    ConditionMatchResult::Matches
+                } else {
+                    ConditionMatchResult::NoMatch
+                }
             }
-        }
+            None if if_exists => ConditionMatchResult::Matches,
+            None => ConditionMatchResult::NoMatch,
+        },
         "StringNotEquals" => match actual {
             Some(actual) => {
                 if clause.values.iter().all(|expected| expected != actual) {
@@ -1157,6 +1166,26 @@ fn string_condition_matches(
             }
         }
         _ => ConditionMatchResult::Unsupported,
+    }
+}
+
+fn evaluable_string_condition_operator_supported(operator: &str) -> bool {
+    matches!(
+        operator,
+        "StringEquals"
+            | "StringLike"
+            | "StringNotEquals"
+            | "Null"
+            | "StringEqualsIfExists"
+            | "StringLikeIfExists"
+            | "StringNotEqualsIfExists"
+    )
+}
+
+fn split_if_exists_operator(operator: &str) -> (&str, bool) {
+    match operator.strip_suffix("IfExists") {
+        Some(base) => (base, true),
+        None => (operator, false),
     }
 }
 
@@ -1443,6 +1472,25 @@ mod tests {
             policy.evaluate(&mismatched_request),
             PolicyEvaluation::NoMatch
         );
+    }
+
+    #[test]
+    fn existing_object_tag_string_equals_if_exists_matches_missing_tag() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEqualsIfExists":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let missing_tags: [PolicyTag<'_>; 0] = [];
+        let request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            &missing_tags,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+        assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
     }
 
     #[test]
@@ -1793,6 +1841,32 @@ mod tests {
                 .with_copy_source(Some("src/public/foo"));
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn copy_source_condition_string_like_if_exists_matches_missing_header() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::dst/*","Condition":{"StringLikeIfExists":{"s3:x-amz-copy-source":"src/public/*"}}}]}"#,
+        )
+        .unwrap();
+        let request =
+            PolicyRequest::new(PolicyAction::PutObject, "dst", "key", Some("caller"), None);
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+        assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
+    }
+
+    #[test]
+    fn copy_source_condition_string_like_if_exists_rejects_mismatched_header() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::dst/*","Condition":{"StringLikeIfExists":{"s3:x-amz-copy-source":"src/public/*"}}}]}"#,
+        )
+        .unwrap();
+        let request =
+            PolicyRequest::new(PolicyAction::PutObject, "dst", "key", Some("caller"), None)
+                .with_copy_source(Some("src/private/foo"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
     }
 
     #[test]
