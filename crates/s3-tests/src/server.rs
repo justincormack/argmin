@@ -18,6 +18,7 @@ pub const ALT_ACCOUNT_ID: &str = "444455556666";
 pub const ALT_ACCESS_KEY: &str = "AKIAI44QH8DHBEXAMPLE";
 pub const ALT_SECRET_KEY: &str = "je7MtGbClwBF/2Zp9Utk/h3yCo8nvbEXAMPLEKEY";
 pub const TEST_SSE_C_VALIDATOR_KEY_B64: &str = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+pub const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
 pub const TEST_TLS_CA_CERT_PEM: &[u8] = include_bytes!("../testdata/ca-cert.pem");
 pub const TEST_TLS_CERT_PEM: &[u8] = include_bytes!("../testdata/localhost-cert.pem");
 const TEST_TLS_KEY_PEM: &[u8] = include_bytes!("../testdata/localhost-key.pem");
@@ -117,11 +118,18 @@ impl TestServer {
                 TEST_SSE_C_VALIDATOR_KEY_B64,
             )
             .expect("valid test SSE-C validator key");
-            server_core::coordinator::Coordinator::new(
+            let sse_s3_provider = server_core::sse::ManagedWrappingKeyConfig::from_base64(
+                1,
+                TEST_SSE_S3_WRAPPING_KEY_B64,
+            )
+            .map(server_core::sse::StaticManagedKeyProvider::single)
+            .expect("valid test SSE-S3 wrapping key");
+            server_core::coordinator::Coordinator::new_with_managed_key_provider(
                 Arc::clone(&storage_node),
                 ec_config,
                 TEST_REGION.to_string(),
                 Some(sse_c_validator),
+                sse_s3_provider,
             )
             .expect("create control coordinator")
         };
@@ -134,13 +142,21 @@ impl TestServer {
                     TEST_SSE_C_VALIDATOR_KEY_B64,
                 )
                 .expect("valid test SSE-C validator key");
-                let coordinator = server_core::coordinator::Coordinator::new(
-                    Arc::clone(&storage_node),
-                    ec_config,
-                    TEST_REGION.to_string(),
-                    Some(sse_c_validator),
+                let sse_s3_provider = server_core::sse::ManagedWrappingKeyConfig::from_base64(
+                    1,
+                    TEST_SSE_S3_WRAPPING_KEY_B64,
                 )
-                .expect("create coordinator");
+                .map(server_core::sse::StaticManagedKeyProvider::single)
+                .expect("valid test SSE-S3 wrapping key");
+                let coordinator =
+                    server_core::coordinator::Coordinator::new_with_managed_key_provider(
+                        Arc::clone(&storage_node),
+                        ec_config,
+                        TEST_REGION.to_string(),
+                        Some(sse_c_validator),
+                        sse_s3_provider,
+                    )
+                    .expect("create coordinator");
 
                 let mut credentials = auth::CredentialStore::default();
                 credentials.add_record(auth::CredentialRecord {

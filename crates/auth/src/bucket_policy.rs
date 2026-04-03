@@ -171,6 +171,7 @@ pub struct PolicyRequest<'a> {
     copy_source: Option<&'a str>,
     metadata_directive: Option<&'a str>,
     canned_acl: Option<&'a str>,
+    server_side_encryption: Option<&'a str>,
     sse_customer_algorithm: Option<&'a str>,
     grant_read: Option<&'a str>,
     grant_write: Option<&'a str>,
@@ -200,6 +201,7 @@ impl<'a> PolicyRequest<'a> {
             copy_source: None,
             metadata_directive: None,
             canned_acl: None,
+            server_side_encryption: None,
             sse_customer_algorithm: None,
             grant_read: None,
             grant_write: None,
@@ -228,6 +230,7 @@ impl<'a> PolicyRequest<'a> {
             copy_source: None,
             metadata_directive: None,
             canned_acl: None,
+            server_side_encryption: None,
             sse_customer_algorithm: None,
             grant_read: None,
             grant_write: None,
@@ -305,6 +308,12 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
+    pub fn with_server_side_encryption(mut self, server_side_encryption: Option<&'a str>) -> Self {
+        self.server_side_encryption = server_side_encryption;
+        self
+    }
+
+    #[must_use]
     pub fn with_sse_customer_algorithm(mut self, sse_customer_algorithm: Option<&'a str>) -> Self {
         self.sse_customer_algorithm = sse_customer_algorithm;
         self
@@ -353,6 +362,11 @@ impl<'a> PolicyRequest<'a> {
     #[must_use]
     fn canned_acl(&self) -> Option<&'a str> {
         self.canned_acl
+    }
+
+    #[must_use]
+    fn server_side_encryption(&self) -> Option<&'a str> {
+        self.server_side_encryption
     }
 
     #[must_use]
@@ -1031,6 +1045,9 @@ fn condition_clause_matches_request(
             string_condition_matches(clause, request.metadata_directive())
         }
         "s3:x-amz-acl" => string_condition_matches(clause, request.canned_acl()),
+        "s3:x-amz-server-side-encryption" => {
+            string_condition_matches(clause, request.server_side_encryption())
+        }
         "s3:x-amz-server-side-encryption-customer-algorithm" => {
             string_condition_matches(clause, request.sse_customer_algorithm())
         }
@@ -1055,6 +1072,7 @@ fn condition_clause_supported_for_evaluable_object_actions(clause: &PolicyCondit
             "s3:x-amz-copy-source"
                 | "s3:x-amz-metadata-directive"
                 | "s3:x-amz-acl"
+                | "s3:x-amz-server-side-encryption"
                 | "s3:x-amz-server-side-encryption-customer-algorithm"
                 | "s3:x-amz-grant-read"
                 | "s3:x-amz-grant-write"
@@ -1674,6 +1692,59 @@ mod tests {
             None,
         )
         .with_sse_customer_algorithm(Some("AES192"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
+    fn server_side_encryption_condition_matches() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-server-side-encryption":"AES256"}}}]}"#,
+        )
+        .unwrap();
+        let request = PolicyRequest::new(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+        )
+        .with_server_side_encryption(Some("AES256"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn server_side_encryption_null_condition_matches_missing_header() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-server-side-encryption":"true"}}}]}"#,
+        )
+        .unwrap();
+        let request = PolicyRequest::new(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
+    fn server_side_encryption_string_not_equals_matches_mismatched_header() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"s3:x-amz-server-side-encryption":"AES256"}}}]}"#,
+        )
+        .unwrap();
+        let request = PolicyRequest::new(
+            PolicyAction::PutObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+        )
+        .with_server_side_encryption(Some("aws:kms"));
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
     }

@@ -16,7 +16,7 @@ use s3_types::{
 };
 use server_core::sse::{SseCustomerResponseHeaders, SSE_CUSTOMER_ALGORITHM};
 use server_core::system_metadata::SystemMetadata;
-use storage::BucketEncryptionConfig;
+use storage::{BucketEncryptionConfig, ManagedEncryptionAlgorithm};
 
 use super::xml;
 
@@ -113,6 +113,14 @@ pub struct S3Response {
     pub stream: Option<ReadHandle>,
 }
 
+pub struct CreateMultipartUploadResponseContext<'a> {
+    pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    pub checksum_type: Option<ChecksumType>,
+    pub lifecycle_abort: Option<&'a LifecycleAbortHeaders>,
+    pub sse_customer: Option<&'a SseCustomerResponseHeaders>,
+}
+
 impl S3Response {
     fn new(status_code: u16) -> Self {
         Self {
@@ -181,6 +189,16 @@ impl S3Response {
             "x-amz-server-side-encryption-customer-key-md5",
             &sse_customer.key_md5_b64,
         )
+    }
+
+    fn apply_managed_encryption_headers(
+        self,
+        managed_encryption: Option<ManagedEncryptionAlgorithm>,
+    ) -> Self {
+        let Some(managed_encryption) = managed_encryption else {
+            return self;
+        };
+        self.header("x-amz-server-side-encryption", managed_encryption.as_str())
     }
 
     fn apply_system_metadata_headers(mut self, metadata: &SystemMetadata) -> Self {
@@ -284,6 +302,7 @@ impl S3Response {
             resp = resp.header("x-amz-version-id", &vid);
         }
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_managed_encryption_headers(result.managed_encryption)
     }
 
     /// Build a response for a successful POST Object.
@@ -321,6 +340,7 @@ impl S3Response {
             resp = resp.header("x-amz-version-id", &vid);
         }
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_managed_encryption_headers(result.managed_encryption)
     }
 
     /// Build a response for a successful `CopyObject`.
@@ -333,6 +353,7 @@ impl S3Response {
             resp.headers.push(("x-amz-version-id".to_string(), vid));
         }
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_managed_encryption_headers(result.managed_encryption)
             .apply_sse_customer_headers(result.sse_customer.as_ref())
     }
 
@@ -359,6 +380,7 @@ impl S3Response {
         }
 
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_managed_encryption_headers(result.managed_encryption)
             .apply_sse_customer_headers(result.sse_customer.as_ref())
             .streaming_body(result.body, result.size)
     }
@@ -403,6 +425,7 @@ impl S3Response {
         }
 
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_managed_encryption_headers(result.managed_encryption)
             .apply_sse_customer_headers(result.sse_customer.as_ref())
     }
 
@@ -436,6 +459,7 @@ impl S3Response {
         }
 
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_managed_encryption_headers(result.managed_encryption)
     }
 
     /// Build a response for a successful range `GetObject` (206 Partial Content).
@@ -460,6 +484,7 @@ impl S3Response {
             .apply_object_lock_headers(result.object_lock);
 
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_managed_encryption_headers(result.managed_encryption)
             .apply_sse_customer_headers(result.sse_customer.as_ref())
             .streaming_body(result.body, result.range_end - result.range_start + 1)
     }
@@ -505,6 +530,7 @@ impl S3Response {
         }
 
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_managed_encryption_headers(result.managed_encryption)
             .apply_sse_customer_headers(result.sse_customer.as_ref())
             .streaming_body(result.body, result.part_size)
     }
@@ -617,6 +643,12 @@ impl S3Response {
     #[must_use]
     pub fn put_bucket_encryption() -> Self {
         Self::new(200)
+    }
+
+    /// Build a response for `DeleteBucketEncryption`.
+    #[must_use]
+    pub fn delete_bucket_encryption() -> Self {
+        Self::new(204)
     }
 
     /// Build a response for `GetBucketEncryption`.
@@ -869,6 +901,7 @@ impl S3Response {
         body_xml: &str,
         last_modified: u64,
         version_id: VersionId,
+        managed_encryption: Option<ManagedEncryptionAlgorithm>,
         sse_customer: Option<&SseCustomerResponseHeaders>,
     ) -> Self {
         let mut resp = Self::new(200)
@@ -877,7 +910,8 @@ impl S3Response {
         if version_id.is_versioned() {
             resp = resp.header("x-amz-version-id", &format_version_id(version_id));
         }
-        resp.apply_sse_customer_headers(sse_customer)
+        resp.apply_managed_encryption_headers(managed_encryption)
+            .apply_sse_customer_headers(sse_customer)
     }
 
     /// Build a response for `PutBucketAcl` (200 OK, no body).
@@ -934,22 +968,20 @@ impl S3Response {
         bucket: &str,
         key: &str,
         upload_id: &str,
-        checksum_algorithm: Option<ChecksumAlgorithm>,
-        checksum_type: Option<ChecksumType>,
-        lifecycle_abort: Option<&LifecycleAbortHeaders>,
-        sse_customer: Option<&SseCustomerResponseHeaders>,
+        ctx: CreateMultipartUploadResponseContext<'_>,
     ) -> Self {
         let body = xml::initiate_multipart_upload_xml(
             bucket,
             key,
             upload_id,
-            checksum_algorithm.map(ChecksumAlgorithm::as_str),
-            checksum_type.map(ChecksumType::as_str),
+            ctx.checksum_algorithm.map(ChecksumAlgorithm::as_str),
+            ctx.checksum_type.map(ChecksumType::as_str),
         );
         Self::new(200)
             .xml_body(body)
-            .apply_lifecycle_abort_headers(lifecycle_abort)
-            .apply_sse_customer_headers(sse_customer)
+            .apply_lifecycle_abort_headers(ctx.lifecycle_abort)
+            .apply_managed_encryption_headers(ctx.managed_encryption)
+            .apply_sse_customer_headers(ctx.sse_customer)
     }
 
     /// Build a response for `UploadPart` (200 OK, `ETag` header, optional checksum).
@@ -957,6 +989,7 @@ impl S3Response {
     pub fn upload_part(
         etag: &str,
         checksum: Option<&RawChecksum>,
+        managed_encryption: Option<ManagedEncryptionAlgorithm>,
         sse_customer: Option<&SseCustomerResponseHeaders>,
     ) -> Self {
         let mut resp = Self::new(200).header("ETag", etag);
@@ -965,7 +998,8 @@ impl S3Response {
             let b64 = base64::engine::general_purpose::STANDARD.encode(cksum.bytes());
             resp = resp.header(cksum.algorithm().header_name(), &b64);
         }
-        resp.apply_sse_customer_headers(sse_customer)
+        resp.apply_managed_encryption_headers(managed_encryption)
+            .apply_sse_customer_headers(sse_customer)
     }
 
     /// Build a response for `UploadPartCopy` (200 OK, XML body with `CopyPartResult`).
@@ -973,11 +1007,13 @@ impl S3Response {
     pub fn upload_part_copy(
         etag: &str,
         last_modified: u64,
+        managed_encryption: Option<ManagedEncryptionAlgorithm>,
         sse_customer: Option<&SseCustomerResponseHeaders>,
     ) -> Self {
         let body = xml::copy_part_result_xml(etag, last_modified);
         Self::new(200)
             .xml_body(body)
+            .apply_managed_encryption_headers(managed_encryption)
             .apply_sse_customer_headers(sse_customer)
     }
 
@@ -1006,6 +1042,7 @@ impl S3Response {
             resp = resp.header("x-amz-checksum-type", ct.as_str());
         }
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+            .apply_managed_encryption_headers(result.managed_encryption)
     }
 
     /// Build a response for `AbortMultipartUpload` (204 No Content).
@@ -1335,6 +1372,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::put_object(&result);
@@ -1345,10 +1383,26 @@ mod tests {
     }
 
     #[test]
+    fn put_object_response_includes_managed_encryption_header() {
+        let result = PutObjectResult {
+            etag: "\"abc123\"".to_string(),
+            version_id: VersionId::Null,
+            managed_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
+            lifecycle_expiration: None,
+        };
+        let resp = S3Response::put_object(&result);
+        assert_eq!(
+            find_header(&resp, "x-amz-server-side-encryption"),
+            Some("AES256")
+        );
+    }
+
+    #[test]
     fn put_object_response_versioned() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::from_u64(42),
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::put_object(&result);
@@ -1362,6 +1416,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::post_object(
@@ -1387,6 +1442,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::post_object(
@@ -1410,6 +1466,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::post_object(
@@ -1429,6 +1486,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            managed_encryption: None,
             lifecycle_expiration: Some(LifecycleExpirationHeader {
                 expiry_time_millis: 1_705_321_845_000,
                 rule_id: Some("expire current".to_string()),
@@ -1456,6 +1514,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, None);
@@ -1477,6 +1536,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, None);
@@ -1499,6 +1559,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, None);
@@ -1525,6 +1586,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, None);
@@ -1558,6 +1620,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, Some("ENABLED"));
@@ -1584,6 +1647,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, None);
@@ -1610,6 +1674,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::get_object(result, None);
@@ -1640,6 +1705,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: Some(LifecycleExpirationHeader {
                 expiry_time_millis: 1_705_321_845_000,
                 rule_id: None,
@@ -1666,6 +1732,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, None);
@@ -1688,6 +1755,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, None);
@@ -1712,6 +1780,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, None);
@@ -1731,6 +1800,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, None);
@@ -1752,6 +1822,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, Some("ENABLED"));
@@ -1774,6 +1845,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, None);
@@ -1799,6 +1871,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: None,
         };
         let resp = S3Response::head_object(&result, None);
@@ -1825,6 +1898,7 @@ mod tests {
             last_modified: 0,
             version_id: VersionId::Null,
             tags: None,
+            managed_encryption: None,
             lifecycle_expiration: Some(LifecycleExpirationHeader {
                 expiry_time_millis: 1_705_321_845_000,
                 rule_id: Some("expire/head".to_string()),
@@ -2027,13 +2101,16 @@ mod tests {
             "bucket",
             "key",
             "upload-1",
-            Some(ChecksumAlgorithm::Sha256),
-            Some(ChecksumType::FullObject),
-            Some(&LifecycleAbortHeaders {
-                abort_time_millis: 1_705_321_845_000,
-                rule_id: Some("abort upload".to_string()),
-            }),
-            None,
+            CreateMultipartUploadResponseContext {
+                managed_encryption: None,
+                checksum_algorithm: Some(ChecksumAlgorithm::Sha256),
+                checksum_type: Some(ChecksumType::FullObject),
+                lifecycle_abort: Some(&LifecycleAbortHeaders {
+                    abort_time_millis: 1_705_321_845_000,
+                    rule_id: Some("abort upload".to_string()),
+                }),
+                sse_customer: None,
+            },
         );
         assert_eq!(
             find_header(&resp, "x-amz-abort-date"),
@@ -2042,6 +2119,26 @@ mod tests {
         assert_eq!(
             find_header(&resp, "x-amz-abort-rule-id"),
             Some("abort%20upload")
+        );
+    }
+
+    #[test]
+    fn create_multipart_upload_response_includes_managed_encryption_header() {
+        let resp = S3Response::create_multipart_upload(
+            "bucket",
+            "key",
+            "upload-1",
+            CreateMultipartUploadResponseContext {
+                managed_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
+                checksum_algorithm: None,
+                checksum_type: None,
+                lifecycle_abort: None,
+                sse_customer: None,
+            },
+        );
+        assert_eq!(
+            find_header(&resp, "x-amz-server-side-encryption"),
+            Some("AES256")
         );
     }
 
@@ -2083,6 +2180,7 @@ mod tests {
             &CompleteMultipartUploadResult {
                 etag: "\"etag\"".to_string(),
                 version_id: VersionId::Null,
+                managed_encryption: None,
                 checksum_algorithm: None,
                 checksum_type: None,
                 checksum_value: None,

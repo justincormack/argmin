@@ -303,6 +303,30 @@ impl ObjectEncryptionType {
     }
 }
 
+/// Service-managed server-side encryption algorithms exposed through the S3 API.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedEncryptionAlgorithm {
+    Aes256 = 1,
+}
+
+impl ManagedEncryptionAlgorithm {
+    #[must_use]
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(Self::Aes256),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Aes256 => "AES256",
+        }
+    }
+}
+
 pub const OBJECT_ENCRYPTION_WRAP_NONCE_LEN: usize = 12;
 pub const OBJECT_ENCRYPTION_WRAPPED_DEK_LEN: usize = 48;
 pub const OBJECT_ENCRYPTION_SEGMENT_NONCE_PREFIX_LEN: usize = 6;
@@ -588,6 +612,14 @@ impl ObjectEncryption {
     #[must_use]
     pub const fn uses_sse_customer_headers(&self) -> bool {
         matches!(self, Self::SseCustomer(_))
+    }
+
+    #[must_use]
+    pub const fn managed_encryption_algorithm(&self) -> Option<ManagedEncryptionAlgorithm> {
+        match self {
+            Self::SseS3(_) => Some(ManagedEncryptionAlgorithm::Aes256),
+            Self::None | Self::SseCustomer(_) => None,
+        }
     }
 
     pub fn decode(
@@ -1357,12 +1389,37 @@ pub struct BucketFastPathInfo {
 }
 
 /// Bucket encryption configuration subset currently implemented by Argmin.
-///
-/// AWS now exposes bucket-level blocked encryption types. For the current
-/// implementation scope, the only relevant gate is whether `SSE-C` is blocked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BucketEncryptionConfig {
+    pub default_encryption: Option<ManagedEncryptionAlgorithm>,
     pub sse_c_blocked: bool,
+}
+
+impl Default for BucketEncryptionConfig {
+    fn default() -> Self {
+        Self {
+            default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
+            sse_c_blocked: false,
+        }
+    }
+}
+
+impl BucketEncryptionConfig {
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.default_encryption.is_none() && !self.sse_c_blocked
+    }
+
+    #[must_use]
+    pub const fn normalize(self) -> Self {
+        Self {
+            default_encryption: match self.default_encryption {
+                Some(value) => Some(value),
+                None => Some(ManagedEncryptionAlgorithm::Aes256),
+            },
+            sse_c_blocked: self.sse_c_blocked,
+        }
+    }
 }
 
 impl From<BucketInfo> for BucketFastPathInfo {

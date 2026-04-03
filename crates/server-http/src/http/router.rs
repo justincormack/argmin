@@ -24,6 +24,7 @@ pub enum S3Operation {
     GetBucketObjectLockConfiguration { bucket: String },
     PutBucketEncryption { bucket: String },
     GetBucketEncryption { bucket: String },
+    DeleteBucketEncryption { bucket: String },
     PutBucketCors { bucket: String },
     GetBucketCors { bucket: String },
     DeleteBucketCors { bucket: String },
@@ -248,6 +249,11 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         ("DELETE", None) if has_query_key(query, "cors") => Ok(S3Operation::DeleteBucketCors {
             bucket: bucket.to_string(),
         }),
+        ("DELETE", None) if has_query_key(query, "encryption") => {
+            Ok(S3Operation::DeleteBucketEncryption {
+                bucket: bucket.to_string(),
+            })
+        }
         ("DELETE", None) if has_query_key(query, "publicAccessBlock") => {
             Ok(S3Operation::DeleteBucketPublicAccessBlock {
                 bucket: bucket.to_string(),
@@ -869,6 +875,16 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "encryption").unwrap(),
             S3Operation::GetBucketEncryption {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn delete_bucket_encryption() {
+        assert_eq!(
+            route("DELETE", "/mybucket", "encryption").unwrap(),
+            S3Operation::DeleteBucketEncryption {
                 bucket: "mybucket".to_string()
             }
         );

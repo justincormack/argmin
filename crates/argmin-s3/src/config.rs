@@ -13,6 +13,7 @@ pub(crate) struct ServerConfig {
     pub(crate) access_key_id: String,
     pub(crate) secret_access_key: String,
     pub(crate) sse_c_validator_key_b64: Option<String>,
+    pub(crate) sse_s3_wrapping_key_b64: String,
     pub(crate) region: String,
     pub(crate) workers: u32,
     pub(crate) max_connections: u32,
@@ -54,6 +55,8 @@ impl ServerConfig {
         let secret_access_key = get("ARGMIN_SECRET_ACCESS_KEY")
             .ok_or_else(|| "ARGMIN_SECRET_ACCESS_KEY is required".to_string())?;
         let sse_c_validator_key_b64 = get("ARGMIN_SSE_C_VALIDATOR_KEY");
+        let sse_s3_wrapping_key_b64 = get("ARGMIN_SSE_S3_WRAPPING_KEY")
+            .ok_or_else(|| "ARGMIN_SSE_S3_WRAPPING_KEY is required".to_string())?;
 
         let listen_addr = get("ARGMIN_LISTEN_ADDR").unwrap_or_else(|| "127.0.0.1:9000".to_string());
         let tls_cert_path = get("ARGMIN_TLS_CERT_PATH");
@@ -130,6 +133,7 @@ impl ServerConfig {
             access_key_id,
             secret_access_key,
             sse_c_validator_key_b64,
+            sse_s3_wrapping_key_b64,
             region,
             workers,
             max_connections,
@@ -168,6 +172,10 @@ mod tests {
         m.insert("ARGMIN_ACCOUNT_ID", "111122223333");
         m.insert("ARGMIN_ACCESS_KEY_ID", "AKID");
         m.insert("ARGMIN_SECRET_ACCESS_KEY", "SECRET");
+        m.insert(
+            "ARGMIN_SSE_S3_WRAPPING_KEY",
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=",
+        );
         m
     }
 
@@ -239,6 +247,10 @@ mod tests {
         assert_eq!(cfg.access_key_id, "AKID");
         assert_eq!(cfg.secret_access_key, "SECRET");
         assert_eq!(cfg.sse_c_validator_key_b64, None);
+        assert_eq!(
+            cfg.sse_s3_wrapping_key_b64,
+            "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
+        );
     }
 
     #[test]
@@ -248,6 +260,7 @@ mod tests {
             ("ARGMIN_ACCESS_KEY_ID", "mykey"),
             ("ARGMIN_SECRET_ACCESS_KEY", "mysecret"),
             ("ARGMIN_SSE_C_VALIDATOR_KEY", "Zm9v"),
+            ("ARGMIN_SSE_S3_WRAPPING_KEY", "YmFy"),
             ("ARGMIN_LISTEN_ADDR", "0.0.0.0:8080"),
             ("ARGMIN_TLS_CERT_PATH", "/tmp/cert.pem"),
             ("ARGMIN_TLS_KEY_PATH", "/tmp/key.pem"),
@@ -276,6 +289,18 @@ mod tests {
         assert_eq!(cfg.access_key_id, "mykey");
         assert_eq!(cfg.secret_access_key, "mysecret");
         assert_eq!(cfg.sse_c_validator_key_b64, Some("Zm9v".to_string()));
+        assert_eq!(cfg.sse_s3_wrapping_key_b64, "YmFy");
+    }
+
+    #[test]
+    fn missing_sse_s3_wrapping_key() {
+        let err = ServerConfig::from_lookup(make_env(&[
+            ("ARGMIN_ACCOUNT_ID", "111122223333"),
+            ("ARGMIN_ACCESS_KEY_ID", "a"),
+            ("ARGMIN_SECRET_ACCESS_KEY", "s"),
+        ]))
+        .unwrap_err();
+        assert!(err.contains("ARGMIN_SSE_S3_WRAPPING_KEY"));
     }
 
     #[test]

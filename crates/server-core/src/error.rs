@@ -115,6 +115,9 @@ pub enum ServerError {
     #[error("object lock configuration not found: {bucket}")]
     ObjectLockConfigurationNotFound { bucket: String },
 
+    #[error("server-side encryption configuration not found: {bucket}")]
+    ServerSideEncryptionConfigurationNotFound { bucket: String },
+
     #[error("bucket is in an invalid state for this operation")]
     InvalidBucketState,
 
@@ -238,6 +241,9 @@ impl ServerError {
             Self::MalformedPolicy { .. } => "MalformedPolicy",
             Self::OwnershipControlsNotFound { .. } => "OwnershipControlsNotFoundError",
             Self::ObjectLockConfigurationNotFound { .. } => "ObjectLockConfigurationNotFoundError",
+            Self::ServerSideEncryptionConfigurationNotFound { .. } => {
+                "ServerSideEncryptionConfigurationNotFoundError"
+            }
             Self::InvalidBucketState => "InvalidBucketState",
             Self::AccessControlListNotSupported => "AccessControlListNotSupported",
             Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
@@ -299,6 +305,7 @@ impl ServerError {
             Self::MalformedPolicy { .. } => 400,
             Self::OwnershipControlsNotFound { .. } => 404,
             Self::ObjectLockConfigurationNotFound { .. } => 404,
+            Self::ServerSideEncryptionConfigurationNotFound { .. } => 404,
             Self::InvalidBucketState => 409,
             Self::InvalidTag { .. } => 400,
             Self::AccessControlListNotSupported

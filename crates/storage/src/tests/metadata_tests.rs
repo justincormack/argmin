@@ -725,6 +725,7 @@ fn file_bucket_metadata_config_roundtrip() {
         .put_bucket_encryption(
             "bucket",
             BucketEncryptionConfig {
+                default_encryption: None,
                 sse_c_blocked: true,
             },
         )
@@ -732,6 +733,7 @@ fn file_bucket_metadata_config_roundtrip() {
     assert_eq!(
         store.get_bucket_encryption("bucket").unwrap(),
         BucketEncryptionConfig {
+            default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
             sse_c_blocked: true,
         }
     );
@@ -888,6 +890,7 @@ fn file_bucket_metadata_config_on_nonexistent_bucket() {
         .put_bucket_encryption(
             "nope",
             BucketEncryptionConfig {
+                default_encryption: None,
                 sse_c_blocked: true,
             },
         )

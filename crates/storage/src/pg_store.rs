@@ -883,12 +883,12 @@ impl PgStore {
             Self::parse_canonical_user_id(owner_canonical_id_raw, 2, "owner_canonical_id")?;
         let object_lock = Self::parse_bucket_object_lock(
             (
-                row.get::<_, i64>(22)?,
-                row.get::<_, Option<u8>>(23)?,
-                row.get::<_, Option<i64>>(24)?,
+                row.get::<_, i64>(23)?,
+                row.get::<_, Option<u8>>(24)?,
                 row.get::<_, Option<i64>>(25)?,
+                row.get::<_, Option<i64>>(26)?,
             ),
-            [22, 23, 24, 25],
+            [23, 24, 25, 26],
         )?;
         let acl_grants = Self::parse_acl_grants(row.get::<_, String>(7)?, 7, "acl_grants")?;
         Ok(BucketInfo {
@@ -926,8 +926,21 @@ impl PgStore {
             bucket_lifecycle: row.get(19)?,
             bucket_lifecycle_generation: row.get::<_, i64>(20)? as u64,
             encryption: BucketEncryptionConfig {
-                sse_c_blocked: row.get::<_, i64>(21)? != 0,
-            },
+                default_encryption: row
+                    .get::<_, Option<u8>>(21)?
+                    .map(|value| {
+                        ManagedEncryptionAlgorithm::from_u8(value).ok_or_else(|| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                21,
+                                rusqlite::types::Type::Integer,
+                                Box::from(format!("invalid default_encryption_type: {value}")),
+                            )
+                        })
+                    })
+                    .transpose()?,
+                sse_c_blocked: row.get::<_, i64>(22)? != 0,
+            }
+            .normalize(),
         })
     }
 
@@ -1407,8 +1420,8 @@ impl PgStore {
         })?;
         let result = self.conn.execute(
             "INSERT INTO buckets \
-             (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, ?10, ?11, ?12, ?13)",
+             (name, owner_principal, owner_canonical_id, created_at, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0, 0, ?10, 0, ?11, ?12, ?13, ?14)",
             params![
                 config.name,
                 config.owner_principal,
@@ -1419,6 +1432,7 @@ impl PgStore {
                 config.acl_grants.serialized(),
                 i32::from(config.public_read),
                 i32::from(config.public_write),
+                ManagedEncryptionAlgorithm::Aes256 as u8,
                 object_lock_enabled,
                 object_lock_default_mode,
                 object_lock_default_days,
@@ -1649,7 +1663,7 @@ impl PgMetadataStore for PgStore {
     fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, bucket_lifecycle, bucket_lifecycle_generation, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, bucket_lifecycle, bucket_lifecycle_generation, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
                  FROM buckets WHERE name = ?1",
                 params![name],
                 Self::row_to_bucket_info,
@@ -1675,7 +1689,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, bucket_lifecycle, bucket_lifecycle_generation, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, bucket_lifecycle, bucket_lifecycle_generation, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
                  FROM buckets WHERE owner_principal = ?1 AND state = ?2 ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -1712,7 +1726,7 @@ impl PgMetadataStore for PgStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, bucket_lifecycle, bucket_lifecycle_generation, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+                "SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, cors_config, tags, public_access_block, ownership_controls, bucket_policy, bucket_policy_public, bucket_policy_generation, bucket_lifecycle, bucket_lifecycle_generation, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
                  FROM buckets WHERE state = ?1 AND bucket_lifecycle IS NOT NULL ORDER BY name ASC",
             )
             .map_err(|e| MetadataError::Db {
@@ -2359,8 +2373,12 @@ impl PgMetadataStore for PgStore {
         let updated = self
             .conn
             .execute(
-                "UPDATE buckets SET sse_c_blocked = ?1 WHERE name = ?2",
-                params![i32::from(config.sse_c_blocked), name],
+                "UPDATE buckets SET default_encryption_type = ?1, sse_c_blocked = ?2 WHERE name = ?3",
+                params![
+                    config.default_encryption.map(|value| value as u8),
+                    i32::from(config.sse_c_blocked),
+                    name
+                ],
             )
             .map_err(|e| MetadataError::Db {
                 context: "put bucket encryption",
@@ -2377,12 +2395,27 @@ impl PgMetadataStore for PgStore {
     fn get_bucket_encryption(&self, name: &str) -> Result<BucketEncryptionConfig, MetadataError> {
         self.conn
             .query_row(
-                "SELECT sse_c_blocked FROM buckets WHERE name = ?1",
+                "SELECT default_encryption_type, sse_c_blocked FROM buckets WHERE name = ?1",
                 params![name],
                 |row| {
                     Ok(BucketEncryptionConfig {
-                        sse_c_blocked: row.get::<_, i64>(0)? != 0,
-                    })
+                        default_encryption: row
+                            .get::<_, Option<u8>>(0)?
+                            .map(|value| {
+                                ManagedEncryptionAlgorithm::from_u8(value).ok_or_else(|| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        0,
+                                        rusqlite::types::Type::Integer,
+                                        Box::from(format!(
+                                            "invalid default_encryption_type: {value}"
+                                        )),
+                                    )
+                                })
+                            })
+                            .transpose()?,
+                        sse_c_blocked: row.get::<_, i64>(1)? != 0,
+                    }
+                    .normalize())
                 },
             )
             .optional()

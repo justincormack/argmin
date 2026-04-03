@@ -352,6 +352,9 @@ CREATE TABLE IF NOT EXISTS buckets (
     bucket_policy_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_generation >= 0),
     bucket_lifecycle TEXT,
     bucket_lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_lifecycle_generation >= 0),
+    default_encryption_type INTEGER CHECK (
+        default_encryption_type IS NULL OR default_encryption_type IN (1)
+    ),
     sse_c_blocked    INTEGER NOT NULL DEFAULT 0 CHECK (sse_c_blocked IN (0, 1)),
     object_lock_enabled INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_enabled IN (0, 1)),
     object_lock_default_mode INTEGER CHECK (

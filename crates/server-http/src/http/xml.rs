@@ -15,7 +15,7 @@ use s3_types::{
     CanonicalUserId, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention,
     RetentionPeriod,
 };
-use storage::{BucketEncryptionConfig, BucketLifecycleConfiguration};
+use storage::{BucketEncryptionConfig, BucketLifecycleConfiguration, ManagedEncryptionAlgorithm};
 
 use super::response::format_version_id;
 
@@ -1796,9 +1796,9 @@ pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig
             feature: "KMS bucket encryption configuration".to_string(),
         });
     }
-    if apply_default_seen {
+    let default_encryption = if apply_default_seen {
         match sse_algorithm.as_deref().map(str::trim) {
-            Some("AES256") => {}
+            Some("AES256") => Some(ManagedEncryptionAlgorithm::Aes256),
             Some(other) => {
                 return Err(ServerError::NotImplemented {
                     feature: format!("bucket encryption algorithm {other}"),
@@ -1810,7 +1810,9 @@ pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig
                 ));
             }
         }
-    }
+    } else {
+        None
+    };
 
     let encryption_types: Vec<&str> = encryption_types
         .iter()
@@ -1833,27 +1835,32 @@ pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig
         }
     };
 
-    Ok(BucketEncryptionConfig { sse_c_blocked })
+    Ok(BucketEncryptionConfig {
+        default_encryption,
+        sse_c_blocked,
+    })
 }
 
 /// Format a `GetBucketEncryption` XML response.
 #[must_use]
 pub fn get_bucket_encryption_xml(config: BucketEncryptionConfig) -> String {
-    let encryption_type = if config.sse_c_blocked {
-        "SSE-C"
-    } else {
-        "NONE"
-    };
-    format!(
+    let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-         <Rule>\
-         <ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>\
-         <BlockedEncryptionTypes><EncryptionType>{}</EncryptionType></BlockedEncryptionTypes>\
-         </Rule>\
-         </ServerSideEncryptionConfiguration>",
-        encryption_type
-    )
+         <Rule>",
+    );
+    if let Some(default_encryption) = config.default_encryption {
+        xml.push_str("<ApplyServerSideEncryptionByDefault><SSEAlgorithm>");
+        xml.push_str(default_encryption.as_str());
+        xml.push_str("</SSEAlgorithm></ApplyServerSideEncryptionByDefault>");
+    }
+    if config.sse_c_blocked {
+        xml.push_str(
+            "<BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes>",
+        );
+    }
+    xml.push_str("</Rule></ServerSideEncryptionConfiguration>");
+    xml
 }
 
 pub fn parse_bucket_lifecycle_configuration_xml(
@@ -3759,15 +3766,28 @@ mod tests {
     };
     use crate::metadata_blob::MetadataBlob;
     use ec::EcConfig;
+    use server_core::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider};
     use server_core::system_metadata::SystemMetadata;
     use std::sync::Arc;
     use storage::SharedStorageNode;
+
+    const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
 
     fn setup_coordinator(dir: &std::path::Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
-        Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap()
+        let sse_s3_provider = StaticManagedKeyProvider::single(
+            ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
+        );
+        Coordinator::new_with_managed_key_provider(
+            storage_node,
+            ec_config,
+            "us-east-1".to_string(),
+            None,
+            sse_s3_provider,
+        )
+        .unwrap()
     }
 
     const NO_WRITE: &WriteCondition = &WriteCondition::None;
@@ -4767,6 +4787,7 @@ mod tests {
     #[test]
     fn bucket_encryption_xml_round_trip() {
         let blocked = BucketEncryptionConfig {
+            default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
             sse_c_blocked: true,
         };
         let xml = get_bucket_encryption_xml(blocked);
@@ -4774,9 +4795,11 @@ mod tests {
         assert_eq!(parsed, blocked);
 
         let unblocked_xml = get_bucket_encryption_xml(BucketEncryptionConfig {
+            default_encryption: None,
             sse_c_blocked: false,
         });
-        assert!(unblocked_xml.contains("<EncryptionType>NONE</EncryptionType>"));
+        assert!(!unblocked_xml.contains("<EncryptionType>"));
+        assert!(!unblocked_xml.contains("<SSEAlgorithm>"));
     }
 
     // ── CORS XML ─────────────────────────────────────────────────────
@@ -6104,6 +6127,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                sse_s3: false,
             },
         )
         .unwrap();
@@ -6120,6 +6144,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                sse_s3: false,
             },
         )
         .unwrap();
@@ -6136,6 +6161,7 @@ mod tests {
                 tags: None,
                 cond: NO_WRITE,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                sse_s3: false,
             },
         )
         .unwrap();
@@ -6239,6 +6265,7 @@ mod tests {
                     tags: None,
                     cond: NO_WRITE,
                     acl: NO_PUT_OBJECT_ACL.into(),
+                    sse_s3: false,
                 },
             )
             .unwrap();

@@ -8,6 +8,7 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use server_core::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -47,11 +48,18 @@ async fn start_server(
     let frontends: Vec<server_http::http::HttpFrontend> = (0..pool_size)
         .map(|_| {
             let ec_config = ec::EcConfig::new(4, 2).unwrap();
-            let coordinator = server_core::coordinator::Coordinator::new(
+            let sse_s3_provider = ManagedWrappingKeyConfig::from_base64(
+                1,
+                s3_tests::server::TEST_SSE_S3_WRAPPING_KEY_B64,
+            )
+            .map(StaticManagedKeyProvider::single)
+            .expect("valid test SSE-S3 wrapping key");
+            let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider(
                 Arc::clone(&storage_node),
                 ec_config,
                 "us-east-1".to_string(),
                 None,
+                sse_s3_provider,
             )
             .expect("create coordinator");
 

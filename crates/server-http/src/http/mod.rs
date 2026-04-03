@@ -53,6 +53,7 @@ use server_core::sse::{
     SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
 };
 use server_core::system_metadata::SystemMetadata;
+use storage::ManagedEncryptionAlgorithm;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 
 const TRACE_TARGET: &str = "server_http";
@@ -929,6 +930,9 @@ impl HttpFrontend {
                     let requester = Self::requester_from_auth(auth);
                     let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                     let dst_sse_customer = parse_sse_customer_request(req)?;
+                    let dst_sse_s3 =
+                        parse_managed_encryption_request(req, dst_sse_customer.is_some())?
+                            .is_some();
                     let object_lock = parse_object_lock_headers(req)?;
                     let acl = parse_put_object_acl(req.header("x-amz-acl"));
                     let src_cond = copy_source_condition_from_headers(req);
@@ -1018,6 +1022,7 @@ impl HttpFrontend {
                         acl,
                         source_sse_customer: source_sse_customer.as_ref(),
                         dst_sse_customer: dst_sse_customer.as_ref(),
+                        dst_sse_s3,
                         object_lock,
                     })?;
                     Ok(S3Response::copy_object(&result))
@@ -1031,6 +1036,8 @@ impl HttpFrontend {
                     };
                     require_request_checksum(req, checksum_requirement)?;
                     let sse_customer = parse_sse_customer_request(req)?;
+                    let sse_s3 =
+                        parse_managed_encryption_request(req, sse_customer.is_some())?.is_some();
                     let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging")
                     {
                         let tags = xml::parse_url_encoded_tags(tagging_header)?;
@@ -1072,6 +1079,7 @@ impl HttpFrontend {
                                 policy_context,
                                 object_lock,
                                 sse_customer: sse_customer.as_ref(),
+                                sse_s3,
                             })?;
                     let mut resp = S3Response::put_object(&result);
                     apply_sse_customer_write_response_headers(&mut resp, sse_customer.as_ref());
@@ -1084,6 +1092,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::GetObject { bucket, key } => {
+                reject_managed_encryption_read_headers(req)?;
                 let sse_customer = parse_sse_customer_request(req)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
@@ -1271,6 +1280,7 @@ impl HttpFrontend {
                 Ok(S3Response::delete_object(&result))
             }
             S3Operation::HeadObject { bucket, key } => {
+                reject_managed_encryption_read_headers(req)?;
                 let sse_customer = parse_sse_customer_request(req)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
@@ -1343,6 +1353,7 @@ impl HttpFrontend {
                 }
             }
             S3Operation::GetObjectAttributes { bucket, key } => {
+                reject_managed_encryption_read_headers(req)?;
                 let sse_customer = parse_sse_customer_request(req)?;
                 // Parse x-amz-object-attributes header (required, comma-separated).
                 // The AWS Rust SDK may send one header per list element; accept both
@@ -1429,6 +1440,7 @@ impl HttpFrontend {
                     &body_xml,
                     result.last_modified,
                     result.version_id,
+                    result.managed_encryption,
                     result.sse_customer.as_ref(),
                 ))
             }
@@ -1574,6 +1586,16 @@ impl HttpFrontend {
                             expected_bucket_owner,
                         })?;
                 Ok(S3Response::get_bucket_encryption(config))
+            }
+            S3Operation::DeleteBucketEncryption { bucket } => {
+                let requester = Self::requester_from_auth(auth);
+                self.coordinator
+                    .delete_bucket_encryption(&crate::coordinator::BucketRequest {
+                        name: &bucket,
+                        requester,
+                        expected_bucket_owner,
+                    })?;
+                Ok(S3Response::delete_bucket_encryption())
             }
             S3Operation::PostObject { .. } => {
                 // POST Object is handled by the streaming path in serve.rs.
@@ -2108,6 +2130,8 @@ impl HttpFrontend {
             }
             S3Operation::CreateMultipartUpload { bucket, key } => {
                 let sse_customer = parse_sse_customer_request(req)?;
+                let sse_s3 =
+                    parse_managed_encryption_request(req, sse_customer.is_some())?.is_some();
                 let sse_customer_headers = sse_customer
                     .as_ref()
                     .map(SseCustomerRequest::response_headers);
@@ -2174,16 +2198,20 @@ impl HttpFrontend {
                         policy_context,
                         object_lock,
                         sse_customer: sse_customer.as_ref(),
+                        sse_s3,
                     },
                 )?;
                 Ok(S3Response::create_multipart_upload(
                     &bucket,
                     &key,
                     &result.upload_id,
-                    checksum_algorithm,
-                    checksum_type,
-                    result.lifecycle_abort.as_ref(),
-                    sse_customer_headers.as_ref(),
+                    crate::http::response::CreateMultipartUploadResponseContext {
+                        managed_encryption: result.managed_encryption,
+                        checksum_algorithm,
+                        checksum_type,
+                        lifecycle_abort: result.lifecycle_abort.as_ref(),
+                        sse_customer: sse_customer_headers.as_ref(),
+                    },
                 ))
             }
             S3Operation::UploadPart { bucket, key } => {
@@ -2224,6 +2252,7 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                 let sse_customer = parse_sse_customer_request(req)?;
+                reject_managed_encryption_read_headers(req)?;
                 let src_cond = copy_source_condition_from_headers(req);
                 let copy_source_range =
                     if let Some(range_header) = req.header("x-amz-copy-source-range") {
@@ -2254,10 +2283,12 @@ impl HttpFrontend {
                 Ok(S3Response::upload_part_copy(
                     &result.etag,
                     result.last_modified,
+                    result.managed_encryption,
                     result.sse_customer.as_ref(),
                 ))
             }
             S3Operation::CompleteMultipartUpload { bucket, key } => {
+                reject_managed_encryption_read_headers(req)?;
                 let upload_id = req.query_param_lossy("uploadId").ok_or_else(|| {
                     ServerError::InvalidRequest {
                         reason: "missing uploadId query parameter".to_string(),
@@ -2816,6 +2847,8 @@ impl HttpFrontend {
         let sse_customer = self
             .coordinator
             .prepare_sse_customer_write_context(sse_customer_request.as_ref())?;
+        let managed_encryption =
+            parse_managed_encryption_form_fields(form_fields, sse_customer.is_some())?;
 
         let requester = Self::requester_from_auth(effective_auth);
         let acl = parse_put_object_acl(field("acl"));
@@ -2827,6 +2860,7 @@ impl HttpFrontend {
                 None,
                 acl.policy_condition_value(),
             )
+            .with_server_side_encryption(managed_encryption.map(ManagedEncryptionAlgorithm::as_str))
             .with_sse_customer_algorithm(sse_customer.as_ref().map(|ctx| ctx.request().algorithm()))
             .with_request_object_tags_xml(tags_xml.as_deref()),
             encryption: sse_customer
@@ -2834,6 +2868,7 @@ impl HttpFrontend {
                 .map_or(storage::ObjectEncryption::None, |ctx| {
                     ctx.encryption().clone()
                 }),
+            sse_s3: managed_encryption.is_some(),
             object_lock: ObjectLockState::default(),
         })?;
 
@@ -2863,6 +2898,7 @@ impl HttpFrontend {
             checksum_sha256_b64: field("x-amz-checksum-sha256")
                 .map(std::string::ToString::to_string),
             tags_xml,
+            managed_encryption,
             sse_customer,
         })
     }
@@ -2944,12 +2980,24 @@ impl HttpFrontend {
             None,
             acl.policy_condition_value(),
         )
+        .with_server_side_encryption(
+            ctx.managed_encryption
+                .map(ManagedEncryptionAlgorithm::as_str),
+        )
         .with_sse_customer_algorithm(
             ctx.sse_customer
                 .as_ref()
                 .map(|ctx| ctx.request().algorithm()),
         )
         .with_request_object_tags_xml(ctx.tags_xml.as_deref());
+        let write_encryption = self.coordinator.load_stream_put_write_encryption(
+            &ctx.binding.bucket,
+            &ctx.binding.key,
+            &ctx.binding.session_id,
+            ctx.sse_customer
+                .as_ref()
+                .map(SseCustomerWriteContext::request),
+        )?;
         let result = self
             .coordinator
             .finalize_stream_put(&FinalizeStreamPutRequest {
@@ -2964,7 +3012,8 @@ impl HttpFrontend {
                 total_size,
                 metadata_blob: &ctx.metadata_blob,
                 system_metadata: &ctx.system_metadata,
-                sse_customer: ctx.sse_customer.as_ref(),
+                sse_customer: write_encryption.sse_customer.as_ref(),
+                sse_s3: write_encryption.sse_s3.as_ref(),
                 tags: ctx.tags_xml.as_deref(),
                 cond: &crate::conditional::WriteCondition::default(),
                 acl: acl.into(),
@@ -3005,8 +3054,18 @@ impl HttpFrontend {
             segment_index,
             data.len()
         );
-        let data = if let Some(sse_customer) = ctx.sse_customer.as_ref() {
+        let write_encryption = self.coordinator.load_stream_put_write_encryption(
+            &ctx.binding.bucket,
+            &ctx.binding.key,
+            &ctx.binding.session_id,
+            ctx.sse_customer
+                .as_ref()
+                .map(SseCustomerWriteContext::request),
+        )?;
+        let data = if let Some(sse_customer) = write_encryption.sse_customer.as_ref() {
             sse_customer.encrypt_segment(segment_index, data)?
+        } else if let Some(sse_s3) = write_encryption.sse_s3.as_ref() {
+            sse_s3.encrypt_segment(segment_index, data)?
         } else {
             data.to_vec()
         };
@@ -3123,6 +3182,7 @@ impl HttpFrontend {
         let sse_customer = self
             .coordinator
             .prepare_sse_customer_write_context(sse_customer_request.as_ref())?;
+        let managed_encryption = parse_managed_encryption_request(req, sse_customer.is_some())?;
 
         // Parse inline tags before starting the session.
         let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging") {
@@ -3201,6 +3261,7 @@ impl HttpFrontend {
                 content_md5,
                 response_headers: ChecksumResponseHeaders(checksum_response),
             },
+            managed_encryption,
             sse_customer,
             streaming_signing: auth.streaming,
         })
@@ -3238,6 +3299,7 @@ impl HttpFrontend {
                 .map_or(storage::ObjectEncryption::None, |ctx| {
                     ctx.encryption().clone()
                 }),
+            sse_s3: ctx.managed_encryption.is_some(),
             object_lock: ctx.object_lock,
         })
     }
@@ -3260,9 +3322,20 @@ impl HttpFrontend {
             segment_index,
             data.len()
         );
-        let segment_data = match ctx.sse_customer.as_ref() {
-            Some(sse_customer) => sse_customer.encrypt_segment(segment_index, data)?,
-            None => data.to_vec(),
+        let write_encryption = self.coordinator.load_stream_put_write_encryption(
+            &ctx.bucket,
+            &ctx.key,
+            session_id,
+            ctx.sse_customer
+                .as_ref()
+                .map(SseCustomerWriteContext::request),
+        )?;
+        let segment_data = if let Some(sse_customer) = write_encryption.sse_customer.as_ref() {
+            sse_customer.encrypt_segment(segment_index, data)?
+        } else if let Some(sse_s3) = write_encryption.sse_s3.as_ref() {
+            sse_s3.encrypt_segment(segment_index, data)?
+        } else {
+            data.to_vec()
         };
         self.coordinator.append_stream_segment(
             &ctx.bucket,
@@ -3316,6 +3389,7 @@ impl HttpFrontend {
                     .sse_customer
                     .as_ref()
                     .map(SseCustomerWriteContext::request),
+                sse_s3: ctx.managed_encryption.is_some(),
             })?;
 
         let mut resp = S3Response::put_object(&result);
@@ -3354,6 +3428,14 @@ impl HttpFrontend {
         );
         let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
         let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
+        let write_encryption = self.coordinator.load_stream_put_write_encryption(
+            &ctx.bucket,
+            &ctx.key,
+            session_id,
+            ctx.sse_customer
+                .as_ref()
+                .map(SseCustomerWriteContext::request),
+        )?;
 
         let result = self
             .coordinator
@@ -3369,7 +3451,8 @@ impl HttpFrontend {
                 total_size,
                 metadata_blob: &metadata_blob,
                 system_metadata: &system_metadata,
-                sse_customer: ctx.sse_customer.as_ref(),
+                sse_customer: write_encryption.sse_customer.as_ref(),
+                sse_s3: write_encryption.sse_s3.as_ref(),
                 tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
                 acl: put_object_write_acl_from_components(
@@ -3503,8 +3586,19 @@ impl HttpFrontend {
             segment_index,
             data.len()
         );
-        let data = if let Some(sse_customer) = ctx.sse_customer.as_ref() {
+        let write_encryption = self.coordinator.load_stream_part_write_encryption(
+            &ctx.binding.object.bucket,
+            &ctx.binding.object.key,
+            &ctx.binding.object.session_id,
+            ctx.binding.part_number,
+            ctx.sse_customer
+                .as_ref()
+                .map(SseCustomerWriteContext::request),
+        )?;
+        let data = if let Some(sse_customer) = write_encryption.sse_customer.as_ref() {
             sse_customer.encrypt_segment(segment_index, data)?
+        } else if let Some(sse_s3) = write_encryption.sse_s3.as_ref() {
+            sse_s3.encrypt_segment(segment_index, data)?
         } else {
             data.to_vec()
         };
@@ -3580,6 +3674,7 @@ impl HttpFrontend {
         let mut resp = S3Response::upload_part(
             &result.etag,
             result.checksum.as_ref(),
+            result.managed_encryption,
             sse_customer_headers.as_ref(),
         );
         // The coordinator's result already includes the checksum via
@@ -3689,6 +3784,7 @@ pub struct StreamingPutContext {
     pub inline_tags_xml: Option<String>,
     pub object_lock: ObjectLockState,
     pub checksum: StreamingPutChecksumContract,
+    pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
     pub sse_customer: Option<SseCustomerWriteContext>,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     pub streaming_signing: Option<auth::StreamingSigningContext>,
@@ -3701,6 +3797,8 @@ impl StreamingPutContext {
             None,
             None,
             parse_put_object_acl(self.acl_header.as_deref()).policy_condition_value(),
+            self.managed_encryption
+                .map(ManagedEncryptionAlgorithm::as_str),
             self.sse_customer
                 .as_ref()
                 .map(|ctx| ctx.request().algorithm()),
@@ -3729,6 +3827,7 @@ pub struct StreamingPostContext {
     pub policy_b64: Option<String>,
     pub checksum_sha256_b64: Option<String>,
     pub tags_xml: Option<String>,
+    pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
     pub sse_customer: Option<SseCustomerWriteContext>,
 }
 
@@ -3812,6 +3911,8 @@ const CHECKSUM_HEADERS: &[(&str, &str)] = &[
 const SSE_C_ALGORITHM_HEADER: &str = "x-amz-server-side-encryption-customer-algorithm";
 const SSE_C_KEY_HEADER: &str = "x-amz-server-side-encryption-customer-key";
 const SSE_C_KEY_MD5_HEADER: &str = "x-amz-server-side-encryption-customer-key-md5";
+const SSE_HEADER: &str = "x-amz-server-side-encryption";
+const SSE_KMS_KEY_ID_HEADER: &str = "x-amz-server-side-encryption-aws-kms-key-id";
 const SSE_C_COPY_SOURCE_ALGORITHM_HEADER: &str =
     "x-amz-copy-source-server-side-encryption-customer-algorithm";
 const SSE_C_COPY_SOURCE_KEY_HEADER: &str = "x-amz-copy-source-server-side-encryption-customer-key";
@@ -4052,6 +4153,101 @@ fn apply_sse_customer_write_response_headers(
         SSE_C_KEY_MD5_HEADER.to_string(),
         sse_customer.response_headers().key_md5_b64,
     ));
+}
+
+fn parse_managed_encryption_request(
+    req: &S3Request,
+    sse_customer_present: bool,
+) -> Result<Option<ManagedEncryptionAlgorithm>, ServerError> {
+    for header in [SSE_HEADER, SSE_KMS_KEY_ID_HEADER] {
+        if header_count(req, header) > 1 {
+            return Err(ServerError::InvalidRequest {
+                reason: format!("duplicate header: {header}"),
+            });
+        }
+    }
+
+    let server_side_encryption = req.header(SSE_HEADER);
+    let kms_key_id = req.header(SSE_KMS_KEY_ID_HEADER);
+
+    if sse_customer_present && (server_side_encryption.is_some() || kms_key_id.is_some()) {
+        return Err(ServerError::InvalidArgument {
+            reason: "x-amz-server-side-encryption may not be used with SSE-C headers".to_string(),
+        });
+    }
+
+    match (server_side_encryption, kms_key_id) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(ServerError::InvalidArgument {
+            reason:
+                "x-amz-server-side-encryption-aws-kms-key-id requires x-amz-server-side-encryption: aws:kms"
+                    .to_string(),
+        }),
+        (Some("AES256"), None) => Ok(Some(ManagedEncryptionAlgorithm::Aes256)),
+        (Some("AES256"), Some(_)) => Err(ServerError::InvalidArgument {
+            reason:
+                "x-amz-server-side-encryption-aws-kms-key-id may not be used with x-amz-server-side-encryption: AES256"
+                    .to_string(),
+        }),
+        (Some("aws:kms"), _) => Err(ServerError::NotImplemented {
+            feature: "SSE-KMS object encryption".to_string(),
+        }),
+        (Some(other), _) => Err(ServerError::InvalidArgument {
+            reason: format!("invalid x-amz-server-side-encryption value: {other}"),
+        }),
+    }
+}
+
+fn parse_managed_encryption_form_fields(
+    form_fields: &[(String, String)],
+    sse_customer_present: bool,
+) -> Result<Option<ManagedEncryptionAlgorithm>, ServerError> {
+    let server_side_encryption = parse_form_field_once(form_fields, SSE_HEADER)?;
+    let kms_key_id = parse_form_field_once(form_fields, SSE_KMS_KEY_ID_HEADER)?;
+
+    if sse_customer_present && (server_side_encryption.is_some() || kms_key_id.is_some()) {
+        return Err(ServerError::InvalidArgument {
+            reason: "x-amz-server-side-encryption may not be used with SSE-C headers".to_string(),
+        });
+    }
+
+    match (server_side_encryption, kms_key_id) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(ServerError::InvalidArgument {
+            reason:
+                "x-amz-server-side-encryption-aws-kms-key-id requires x-amz-server-side-encryption: aws:kms"
+                    .to_string(),
+        }),
+        (Some("AES256"), None) => Ok(Some(ManagedEncryptionAlgorithm::Aes256)),
+        (Some("AES256"), Some(_)) => Err(ServerError::InvalidArgument {
+            reason:
+                "x-amz-server-side-encryption-aws-kms-key-id may not be used with x-amz-server-side-encryption: AES256"
+                    .to_string(),
+        }),
+        (Some("aws:kms"), _) => Err(ServerError::NotImplemented {
+            feature: "SSE-KMS POST object encryption".to_string(),
+        }),
+        (Some(other), _) => Err(ServerError::InvalidArgument {
+            reason: format!("invalid x-amz-server-side-encryption value: {other}"),
+        }),
+    }
+}
+
+fn reject_managed_encryption_read_headers(req: &S3Request) -> Result<(), ServerError> {
+    for header in [SSE_HEADER, SSE_KMS_KEY_ID_HEADER] {
+        if header_count(req, header) > 1 {
+            return Err(ServerError::InvalidRequest {
+                reason: format!("duplicate header: {header}"),
+            });
+        }
+    }
+    if req.header(SSE_HEADER).is_some() || req.header(SSE_KMS_KEY_ID_HEADER).is_some() {
+        return Err(ServerError::InvalidRequest {
+            reason: "x-amz-server-side-encryption headers are not valid for this operation"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4595,6 +4791,7 @@ fn put_object_policy_context_from_request<'a>(
         copy_source,
         metadata_directive,
         canned_acl,
+        req.header(SSE_HEADER),
         req.header(SSE_C_ALGORITHM_HEADER),
         PutObjectGrantHeaders {
             grant_read: req.header("x-amz-grant-read"),
@@ -4620,10 +4817,12 @@ fn put_object_policy_context_from_request_fields<'a>(
     copy_source: Option<&'a str>,
     metadata_directive: Option<&'a str>,
     canned_acl: Option<&'a str>,
+    server_side_encryption: Option<&'a str>,
     sse_customer_algorithm: Option<&'a str>,
     grants: PutObjectGrantHeaders<'a>,
 ) -> crate::coordinator::PutObjectPolicyContext<'a> {
     crate::coordinator::PutObjectPolicyContext::new(copy_source, metadata_directive, canned_acl)
+        .with_server_side_encryption(server_side_encryption)
         .with_sse_customer_algorithm(sse_customer_algorithm)
         .with_request_object_tags_xml(tags_xml)
         .with_acl_grant_headers(
@@ -4747,15 +4946,31 @@ mod tests {
     use super::*;
     use crate::coordinator::Coordinator;
     use ec::EcConfig;
+    use server_core::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider};
     use std::sync::Arc;
     use storage::SharedStorageNode;
 
+    const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
+
     fn setup_frontend(dir: &std::path::Path) -> HttpFrontend {
+        setup_frontend_with_sse_s3(dir)
+    }
+
+    fn setup_frontend_with_sse_s3(dir: &std::path::Path) -> HttpFrontend {
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
         let ec_config = EcConfig::new(4, 2).unwrap();
-        let coordinator =
-            Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap();
+        let sse_s3_provider = StaticManagedKeyProvider::single(
+            ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
+        );
+        let coordinator = Coordinator::new_with_managed_key_provider(
+            storage_node,
+            ec_config,
+            "us-east-1".to_string(),
+            None,
+            sse_s3_provider,
+        )
+        .unwrap();
         let credentials = auth::CredentialStore::new();
         HttpFrontend {
             coordinator,
@@ -4998,6 +5213,172 @@ mod tests {
             other => panic!(
                 "expected InvalidEncryptionAlgorithmError for lowercase POST SSE-C algorithm, got {other:?}"
             ),
+        }
+    }
+
+    #[test]
+    fn put_object_explicit_sse_s3_returns_encryption_headers() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend_with_sse_s3(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let put_req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![(SSE_HEADER.to_string(), "AES256".to_string())],
+            b"hello world".to_vec(),
+        );
+        let put_resp = fe
+            .dispatch_routed(
+                &put_req,
+                &test_auth(),
+                S3Operation::PutObject {
+                    bucket: "mybucket".to_string(),
+                    key: "mykey".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(put_resp.status_code, 200);
+        assert_eq!(
+            find_header(&put_resp, "x-amz-server-side-encryption"),
+            Some("AES256")
+        );
+
+        let head_req = new_req(http::Method::HEAD, "", "", vec![], vec![]);
+        let head_resp = fe
+            .dispatch_routed(
+                &head_req,
+                &test_auth(),
+                S3Operation::HeadObject {
+                    bucket: "mybucket".to_string(),
+                    key: "mykey".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(head_resp.status_code, 200);
+        assert_eq!(
+            find_header(&head_resp, "x-amz-server-side-encryption"),
+            Some("AES256")
+        );
+    }
+
+    #[test]
+    fn put_object_rejects_sse_s3_with_sse_c_headers() {
+        use base64::Engine;
+
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let key_b64 = base64::engine::general_purpose::STANDARD.encode([0u8; 32]);
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![
+                (SSE_HEADER.to_string(), "AES256".to_string()),
+                (
+                    SSE_C_ALGORITHM_HEADER.to_string(),
+                    SSE_CUSTOMER_ALGORITHM.to_string(),
+                ),
+                (SSE_C_KEY_HEADER.to_string(), key_b64),
+                (
+                    SSE_C_KEY_MD5_HEADER.to_string(),
+                    "cLyPS3KoaSFGi/joRB3OUQ==".to_string(),
+                ),
+            ],
+            b"hello world".to_vec(),
+        );
+
+        match fe.dispatch_routed(
+            &req,
+            &test_auth(),
+            S3Operation::PutObject {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string(),
+            },
+        ) {
+            Err(ServerError::InvalidArgument { reason })
+                if reason == "x-amz-server-side-encryption may not be used with SSE-C headers" => {}
+            Err(err) => panic!("expected InvalidArgument, got {err:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn put_object_rejects_aes256_with_kms_key_id() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![
+                (SSE_HEADER.to_string(), "AES256".to_string()),
+                (
+                    SSE_KMS_KEY_ID_HEADER.to_string(),
+                    "arn:aws:kms:us-east-1:111122223333:key/example".to_string(),
+                ),
+            ],
+            b"hello world".to_vec(),
+        );
+
+        match fe.dispatch_routed(
+            &req,
+            &test_auth(),
+            S3Operation::PutObject {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string(),
+            },
+        ) {
+            Err(ServerError::InvalidArgument { reason })
+                if reason
+                    == "x-amz-server-side-encryption-aws-kms-key-id may not be used with x-amz-server-side-encryption: AES256" => {}
+            Err(err) => panic!("expected InvalidArgument, got {err:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn head_object_rejects_managed_encryption_request_headers() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let put_req = new_req(http::Method::PUT, "", "", vec![], b"hello world".to_vec());
+        fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutObject {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string(),
+            },
+        )
+        .unwrap();
+
+        let head_req = new_req(
+            http::Method::HEAD,
+            "",
+            "",
+            vec![(SSE_HEADER.to_string(), "AES256".to_string())],
+            vec![],
+        );
+        match fe.dispatch_routed(
+            &head_req,
+            &test_auth(),
+            S3Operation::HeadObject {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string(),
+            },
+        ) {
+            Err(ServerError::InvalidRequest { reason })
+                if reason
+                    == "x-amz-server-side-encryption headers are not valid for this operation" => {}
+            Err(err) => panic!("expected InvalidRequest, got {err:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
         }
     }
 
@@ -6204,6 +6585,7 @@ mod tests {
                 policy_context: crate::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
                 sse_customer: None,
+                sse_s3: false,
             })
             .unwrap();
 
@@ -6575,6 +6957,7 @@ mod tests {
                 policy_context: crate::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
                 sse_customer: None,
+                sse_s3: false,
             })
             .unwrap();
         let req = new_req(http::Method::PUT, "", "", vec![], body);
@@ -6619,6 +7002,7 @@ mod tests {
                 policy_context: crate::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
                 sse_customer: None,
+                sse_s3: false,
             })
             .unwrap();
         let req = new_req(http::Method::PUT, "", "", vec![], body);
@@ -6654,6 +7038,7 @@ mod tests {
                 policy_context: crate::coordinator::PutObjectPolicyContext::default(),
                 object_lock: Default::default(),
                 sse_customer: None,
+                sse_s3: false,
             })
             .unwrap();
 
@@ -7707,16 +8092,33 @@ mod tests {
         let result = (|| {
             use base64::Engine;
 
+            let write_encryption = fe.coordinator.load_stream_part_write_encryption(
+                bucket,
+                key,
+                &session.session_id,
+                part_number,
+                None,
+            )?;
+            let mut staged = Vec::new();
+
             for (segment_index, chunk) in data
                 .chunks(crate::coordinator::INTERNAL_SEGMENT_SIZE)
                 .enumerate()
             {
+                let chunk = if let Some(sse_customer) = write_encryption.sse_customer.as_ref() {
+                    sse_customer.encrypt_segment(segment_index as u32, chunk)?
+                } else if let Some(sse_s3) = write_encryption.sse_s3.as_ref() {
+                    sse_s3.encrypt_segment(segment_index as u32, chunk)?
+                } else {
+                    chunk.to_vec()
+                };
+                staged.extend_from_slice(&chunk);
                 fe.coordinator.append_stream_segment(
                     bucket,
                     key,
                     &session.session_id,
                     segment_index as u32,
-                    chunk,
+                    &chunk,
                 )?;
             }
             let computed_checksum =
@@ -7731,7 +8133,7 @@ mod tests {
                     upload: MultipartObjectRequest::new(bucket, key, upload_id, requester, None),
                     session_id: &session.session_id,
                     part_number,
-                    crc64: checksum::crc64::checksum(data),
+                    crc64: checksum::crc64::checksum(&staged),
                     total_size: data.len() as u64,
                     claimed_checksum: claimed_checksum.as_ref(),
                     computed_checksum,

@@ -49,12 +49,15 @@ pub fn upload_part(
     })?;
     let session_id = &session.session_id;
     let result = (|| {
+        let write_encryption = coord.load_stream_part_write_encryption(
+            req.upload.bucket_name(),
+            req.upload.key(),
+            session_id,
+            req.part_number,
+            req.sse_customer,
+        )?;
         for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
-            let data = if let Some(sse_customer) = session.sse_customer.as_ref() {
-                sse_customer.encrypt_segment(idx as u32, chunk)?
-            } else {
-                chunk.to_vec()
-            };
+            let data = write_encryption.encrypt_segment(idx as u32, chunk)?;
             coord.append_stream_segment(
                 req.upload.bucket_name(),
                 req.upload.key(),

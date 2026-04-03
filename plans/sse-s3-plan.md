@@ -50,7 +50,7 @@ That is too broken because:
 If account or bucket identity is used at all, it should only be derivation
 context or AEAD associated data, not the replacement for random `DEK`s.
 
-## Current State
+## Original Starting State
 
 The existing `SSE-C` implementation already established the right basic shape:
 
@@ -68,13 +68,38 @@ Relevant current code:
 3. `crates/storage/src/types.rs`
 4. `crates/server-http/src/http/xml.rs`
 
-Current gaps:
+Original gaps:
 
 1. object encryption types only cover `None | SseCustomer`
 2. bucket encryption config is still a stub focused on `SSE-C` blocking
 3. there is no service-managed key provider abstraction
 4. request parsing and response emission for `SSE-S3` are not implemented
 5. policy condition support only covers `SSE-C`
+
+## Plan Update
+
+During implementation, the phase boundaries in this document turned out to be
+too optimistic.
+
+Unexpected work was required in three areas:
+
+1. current AWS bucket-encryption behavior is no longer the older
+   “configuration absent by default” model
+2. once new buckets default to `SSE-S3`, many internal tests and helper
+   constructors that created coordinators without a managed-key provider became
+   invalid
+3. the streaming write paths exposed internal lock-order / self-deadlock bugs
+   that were previously hidden by the old unencrypted-by-default behavior
+
+As a result, the real implementation sequence is:
+
+1. generalize encryption internals
+2. explicit `SSE-S3` request handling plus AWS-current bucket default behavior
+3. internal runtime and test harness hardening for the new default
+4. remaining API/policy/POST cleanup
+
+This is still the right plan, but the work is less neatly separable than the
+original phase list implied.
 
 ## AWS Compatibility Surface To Match First
 
@@ -227,13 +252,14 @@ Bucket encryption must stop pretending to be implemented and become real for the
 
 That means:
 
-1. `GetBucketEncryption` returns
-   `ServerSideEncryptionConfigurationNotFoundError` when unset
-2. `PutBucketEncryption` persists a real default configuration for
-   `AES256`
-3. `DeleteBucketEncryption` clears that configuration
-4. object writes without explicit encryption inherit the bucket default
-5. existing `BlockedEncryptionTypes` support for `SSE-C` keeps working on top
+1. new buckets behave like AWS now does: the effective default is `SSE-S3`
+   (`AES256`)
+2. `GetBucketEncryption` returns an `AES256` default for a fresh bucket
+3. `PutBucketEncryption` persists a real default configuration for `AES256`
+4. `DeleteBucketEncryption` resets the bucket back to the default `SSE-S3`
+   state rather than to “no configuration”
+5. object writes without explicit encryption inherit the bucket default
+6. existing `BlockedEncryptionTypes` support for `SSE-C` keeps working on top
    of the real default-encryption config
 
 For this phase:
@@ -305,6 +331,8 @@ because that belongs with real `SSE-KMS`.
 
 ### Phase 1: Generalize encryption internals
 
+Status: complete
+
 1. add managed key-provider abstractions
 2. add `SSE-S3` object encryption state
 3. generalize segment encryption/decryption and checksum-metadata sealing
@@ -316,37 +344,51 @@ Exit criteria:
 2. encryption/decryption paths work for a service-managed `DEK`
 3. existing `SSE-C` tests still pass
 
-### Phase 2: Explicit `SSE-S3` request support
+### Phase 2: Explicit `SSE-S3` request support and AWS-current bucket defaults
+
+Status: complete
 
 1. parse and validate `x-amz-server-side-encryption: AES256`
 2. reject conflicting request combinations
 3. return `x-amz-server-side-encryption: AES256` on encrypted responses
+4. make fresh buckets effectively default to `SSE-S3` / `AES256`
+5. make bucket-encryption read/delete behavior match current AWS semantics
 
 Exit criteria:
 
 1. explicit `PutObject(..., ServerSideEncryption='AES256')` works
 2. invalid/conflicting request combinations fail correctly
 3. read-side header misuse is rejected correctly
+4. fresh-bucket `GetBucketEncryption` matches AWS
+5. `DeleteBucketEncryption` resets to `SSE-S3`
 
-### Phase 3: Real bucket default encryption for `AES256`
+### Phase 3: Runtime and internal test hardening for the new default
 
-1. persist bucket default encryption state
-2. implement `GetBucketEncryption` / `PutBucketEncryption` /
-   `DeleteBucketEncryption` for the `AES256` subset
-3. apply bucket-default `SSE-S3` to `PutObject`, multipart initiate, and `POST`
-   object
+Status: required unexpected work, now complete
+
+1. ensure normal coordinator construction is valid for the effective default
+   encryption model used by tests
+2. move shared-storage and concurrency tests onto provider-backed coordinator
+   setup where they are not explicitly testing the no-provider error path
+3. fix streaming helpers and copy paths that accidentally assumed plaintext
+   could be appended directly into encrypted stream sessions
+4. fix lock-order / self-deadlock bugs exposed by the new default, especially
+   around large-object streaming writes
 
 Exit criteria:
 
-1. unset buckets return the not-found encryption error
-2. set buckets return real persisted config
-3. inherited `SSE-S3` works for standard writes, multipart, and `POST`
+1. `server-core` tests do not hang under the `SSE-S3` default
+2. internal helpers stage encrypted stream data correctly
+3. shared-storage / race / bucket-lock tests use valid provider-backed
+   coordinators unless they are explicitly negative tests
 
-### Phase 4: Bucket-policy integration
+### Phase 4: Remaining API cleanup and bucket-policy integration
 
-1. add policy request fields for managed encryption algorithm
-2. evaluate `s3:x-amz-server-side-encryption`
-3. cover explicit and inherited `SSE-S3` behavior
+1. finish the remaining write paths that should inherit bucket-default
+   `SSE-S3`, especially `POST` object
+2. add policy request fields for managed encryption algorithm
+3. evaluate `s3:x-amz-server-side-encryption`
+4. cover explicit and inherited `SSE-S3` behavior
 
 Exit criteria:
 
@@ -395,7 +437,8 @@ Relevant target commands once tests exist:
 2. `cargo test -p s3-tests --test bucket_policy`
 3. `cargo test -p s3-tests --test multipart`
 4. `cargo test -p s3-tests --test post_object`
-5. AWS/local upstream harness cases for `SSE-S3`
+5. `cargo test -p server-core --lib`
+6. AWS/local upstream harness cases for `SSE-S3`
 
 ## Explicit Deferrals
 

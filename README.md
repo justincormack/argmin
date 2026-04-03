@@ -39,6 +39,7 @@ The server is configured via environment variables:
 | `ARGMIN_ACCOUNT_ID` | *(required)* | 12-digit bucket-owner account ID used for ownership and `x-amz-expected-bucket-owner` checks |
 | `ARGMIN_ACCESS_KEY_ID` | *(required)* | S3 access key |
 | `ARGMIN_SECRET_ACCESS_KEY` | *(required)* | S3 secret key |
+| `ARGMIN_SSE_S3_WRAPPING_KEY` | *(required)* | Base64-encoded 32-byte SSE-S3 wrapping key; required because new buckets default to `AES256` / SSE-S3 |
 | `ARGMIN_SSE_C_VALIDATOR_KEY` | *(unset)* | Base64-encoded 32-byte SSE-C validator secret; required to use SSE-C |
 | `ARGMIN_LISTEN_ADDR` | `127.0.0.1:9000` | Listen address |
 | `ARGMIN_TLS_CERT_PATH` | *(unset)* | PEM certificate path for direct HTTPS |
@@ -60,6 +61,12 @@ If both `ARGMIN_TLS_CERT_PATH` and `ARGMIN_TLS_KEY_PATH` are set, the server
 accepts direct HTTPS on `ARGMIN_LISTEN_ADDR`. Both variables must be set
 together.
 
+`ARGMIN_SSE_S3_WRAPPING_KEY` has no built-in default. It is required at
+startup because fresh buckets now default to SSE-S3 (`AES256`), so ordinary
+`PutObject` and multipart writes need a managed wrapping key from the start.
+It must be a base64-encoded 32-byte secret and should be kept stable for the
+lifetime of existing SSE-S3 objects.
+
 `ARGMIN_SSE_C_VALIDATOR_KEY` has no built-in default. If it is unset, SSE-C
 requests are rejected. This is intentional; we do not want a shared implicit
 validator secret. For now it is configured directly via environment variable.
@@ -73,10 +80,17 @@ For an existing data directory, treat these settings as stable:
 
 - `ARGMIN_PG_COUNT` is part of placement. Changing it without migration will
   route buckets and objects to different PGs.
+- `ARGMIN_SSE_S3_WRAPPING_KEY` must remain stable for existing SSE-S3 objects.
 - `ARGMIN_SSE_C_VALIDATOR_KEY` must remain stable for existing SSE-C objects.
 - `ARGMIN_EC_K` and `ARGMIN_EC_M` are stored per object, but reconfiguration is
   not currently a supported operational workflow, so they should also be
   treated as cluster-creation settings for now.
+
+Example: generate a new wrapping key
+
+```bash
+openssl rand -base64 32
+```
 
 Start the server:
 
@@ -84,6 +98,7 @@ Start the server:
 ARGMIN_ACCOUNT_ID=111122223333 \
 ARGMIN_ACCESS_KEY_ID=admin \
 ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
+ARGMIN_SSE_S3_WRAPPING_KEY='<base64-encoded-32-byte-secret>' \
   ./target/release/argmin-s3
 ```
 
@@ -93,6 +108,7 @@ Enable tracing:
 ARGMIN_ACCOUNT_ID=111122223333 \
 ARGMIN_ACCESS_KEY_ID=admin \
 ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
+ARGMIN_SSE_S3_WRAPPING_KEY='<base64-encoded-32-byte-secret>' \
 ARGMIN_TRACE=1 \
 ARGMIN_TRACE_FILTER=server_http,auth,server_core,storage,ec \
 ARGMIN_TRACE_FILE=/tmp/argmin.trace \
@@ -105,6 +121,7 @@ Start the server with direct HTTPS:
 ARGMIN_ACCOUNT_ID=111122223333 \
 ARGMIN_ACCESS_KEY_ID=admin \
 ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
+ARGMIN_SSE_S3_WRAPPING_KEY='<base64-encoded-32-byte-secret>' \
 ARGMIN_TLS_CERT_PATH=/path/to/cert.pem \
 ARGMIN_TLS_KEY_PATH=/path/to/key.pem \
   ./target/release/argmin-s3

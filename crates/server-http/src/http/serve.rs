@@ -2761,12 +2761,14 @@ mod tests {
     use auth::sigv4::derive_signing_key;
     use hyper_util::rt::TokioIo;
     use ring::hmac;
+    use server_core::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider};
     use storage::SharedStorageNode;
 
     use crate::metadata_blob::MetadataBlob;
 
     const TEST_ACCESS_KEY: &str = "AKID";
     const TEST_SECRET_KEY: &str = "test-secret";
+    const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
 
     struct ServerGuard(tokio::task::JoinHandle<()>);
 
@@ -2795,11 +2797,15 @@ mod tests {
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
         let ec_config = ec::EcConfig::new(4, 2).unwrap();
-        let coordinator = server_core::coordinator::Coordinator::new(
+        let sse_s3_provider = StaticManagedKeyProvider::single(
+            ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
+        );
+        let coordinator = server_core::coordinator::Coordinator::new_with_managed_key_provider(
             storage_node,
             ec_config,
             "us-east-1".to_string(),
             None,
+            sse_s3_provider,
         )
         .unwrap();
         let mut credentials = auth::CredentialStore::new();
@@ -2837,6 +2843,7 @@ mod tests {
                 policy_context: crate::coordinator::PutObjectPolicyContext::default(),
                 object_lock: s3_types::ObjectLockState::default(),
                 sse_customer: None,
+                sse_s3: false,
             })
             .unwrap()
             .upload_id
