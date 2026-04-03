@@ -5682,11 +5682,6 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
         match acl {
-            PutObjectAcl::AwsExecRead => {
-                return Err(ServerError::NotImplemented {
-                    feature: "aws-exec-read object ACL".to_string(),
-                });
-            }
             PutObjectAcl::Invalid(value) => {
                 return Err(ServerError::InvalidArgument {
                     reason: format!("invalid x-amz-acl value: {value}"),
@@ -5697,6 +5692,7 @@ impl Coordinator {
             | PutObjectAcl::PublicRead
             | PutObjectAcl::PublicReadWrite
             | PutObjectAcl::AuthenticatedRead
+            | PutObjectAcl::AwsExecRead
             | PutObjectAcl::BucketOwnerRead
             | PutObjectAcl::BucketOwnerFullControl => {}
         }
@@ -5752,6 +5748,12 @@ impl Coordinator {
                     AclPermission::Read,
                 ));
             }
+            PutObjectAcl::AwsExecRead => {
+                grants.push(AclGrant::new(
+                    AclGrantee::CanonicalUser(CanonicalUserId::aws_exec_read()),
+                    AclPermission::Read,
+                ));
+            }
             PutObjectAcl::BucketOwnerRead if bucket.owner_canonical_id != owner.canonical_id => {
                 grants.push(AclGrant::new(
                     AclGrantee::CanonicalUser(bucket.owner_canonical_id.clone()),
@@ -5769,7 +5771,6 @@ impl Coordinator {
             PutObjectAcl::None
             | PutObjectAcl::Private
             | PutObjectAcl::BucketOwnerFullControl
-            | PutObjectAcl::AwsExecRead
             | PutObjectAcl::BucketOwnerRead
             | PutObjectAcl::Invalid(_) => {}
         }

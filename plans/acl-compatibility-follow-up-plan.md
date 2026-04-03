@@ -51,14 +51,16 @@ Implemented today:
 - explicit `AuthenticatedUsers` ACL grants via XML and `x-amz-grant-*`
 - AWS-aligned explicit ACL grant persistence without implicit owner
   `FULL_CONTROL` normalization
+- object `aws-exec-read` canned ACL, stored as owner `FULL_CONTROL` plus the
+  fixed AWS execution canonical-user `READ` grant
 - Rust conformance coverage for:
   - bucket `authenticated-read`
   - explicit `AuthenticatedUsers` bucket ACL XML grants
   - explicit `AuthenticatedUsers` object header grants
   - exact explicit-grant round-trips for bucket/object ACL write paths
+  - `aws-exec-read` round-trips for `PutObject` and `PutObjectAcl`
 
 Missing or intentionally rejected today:
-- object `aws-exec-read`
 - `LogDelivery` grantee / `log-delivery-write` (deferred until bucket logging
   itself is in scope)
 - Rust conformance coverage for much of the Ceph bucket-grant matrix
@@ -101,14 +103,17 @@ Without that modeled grantee, we cannot represent:
 - the parts of logging compatibility that depend on ACL shape rather than
   bucket policy alone
 
-### 3. Object `aws-exec-read`
+### 3. `aws-exec-read` uses a fixed canonical-user grant
 
-`PutObjectAcl` parses `aws-exec-read`, but the coordinator returns
-`NotImplemented`.
+AWS-backed verification for Phase 2 showed that `aws-exec-read` does not map to
+a group grantee. AWS stores it as:
+- owner `FULL_CONTROL`
+- `READ` for a fixed canonical user id:
+  `6aa5a366c34c1cbe25dc49211496e913e0351eb0e8c37aa3477e40942ec6b97c`
 
-This is part of the documented object canned ACL surface. It is less important
-than the `AuthenticatedUsers` and `LogDelivery` gaps, but it is still a known
-compatibility hole.
+That behavior is now the compatibility target for both:
+- `PutObject` with `x-amz-acl: aws-exec-read`
+- `PutObjectAcl` with canned `aws-exec-read`
 
 ### 4. Conformance coverage gaps
 
@@ -228,6 +233,14 @@ Follow-up note from implementation:
   or when a canned ACL semantics requires it
 
 ### Phase 2: Decide and implement `aws-exec-read`
+
+Status: complete.
+
+Completed:
+- verified AWS behavior directly against AWS on an ACL-enabled bucket
+- implemented `aws-exec-read` as owner `FULL_CONTROL` plus the fixed AWS
+  execution canonical-user `READ` grant
+- added Rust round-trip coverage for create-time and `PutObjectAcl` paths
 
 Deliver:
 - verify current AWS behavior for `aws-exec-read`

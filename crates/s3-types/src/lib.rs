@@ -230,6 +230,9 @@ impl std::fmt::Display for VersionId {
 pub struct CanonicalUserId(String);
 
 impl CanonicalUserId {
+    const AWS_EXEC_READ_CANONICAL_ID: &'static str =
+        "6aa5a366c34c1cbe25dc49211496e913e0351eb0e8c37aa3477e40942ec6b97c";
+
     /// Deterministically derive a canonical user id from a stable principal.
     #[must_use]
     pub fn from_principal(principal: &str) -> Self {
@@ -260,6 +263,13 @@ impl CanonicalUserId {
     #[must_use]
     pub fn into_string(self) -> String {
         self.0
+    }
+
+    /// Canonical user id AWS uses for the `aws-exec-read` canned ACL.
+    #[must_use]
+    pub fn aws_exec_read() -> Self {
+        Self::new(Self::AWS_EXEC_READ_CANONICAL_ID)
+            .expect("aws-exec-read canonical user id must stay valid")
     }
 }
 

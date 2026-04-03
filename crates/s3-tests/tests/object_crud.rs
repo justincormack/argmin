@@ -14,6 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
 const AUTHENTICATED_USERS_GROUP_URI: &str =
     "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
+const AWS_EXEC_READ_CANONICAL_ID: &str =
+    "6aa5a366c34c1cbe25dc49211496e913e0351eb0e8c37aa3477e40942ec6b97c";
 
 /// Create a bucket, returning its name. Tests are responsible for cleanup.
 async fn setup_bucket() -> String {
@@ -2024,6 +2026,47 @@ fn test_put_object_acl_canned_authenticated_read_round_trip() {
 }
 
 #[test]
+fn test_object_acl_canned_aws_exec_read_during_create() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_acl_enabled_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("foo")
+            .acl(ObjectCannedAcl::AwsExecRead)
+            .body(ByteStream::from_static(b"bar"))
+            .send()
+            .await
+            .unwrap();
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("foo")
+            .send()
+            .await
+            .unwrap();
+        let owner_id = acl
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected owner ID in GetObjectAcl")
+            .to_string();
+        assert_exact_grants(
+            acl.grants(),
+            &[
+                (Permission::Read, Some(AWS_EXEC_READ_CANONICAL_ID), None),
+                (Permission::FullControl, Some(owner_id.as_str()), None),
+            ],
+            "aws-exec-read object ACL during create",
+        );
+
+        delete_all_and_bucket(client, &bucket, &["foo".to_string()]).await;
+    });
+}
+
+#[test]
 fn test_put_object_acl_canned_bucket_owner_read_round_trip() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -2068,6 +2111,55 @@ fn test_put_object_acl_canned_bucket_owner_read_round_trip() {
                 (Permission::Read, Some(bucket_owner_id.as_str()), None),
             ],
             "bucket-owner-read object ACL via PutObjectAcl",
+        );
+
+        delete_all_and_bucket(client, &bucket, &["foo".to_string()]).await;
+    });
+}
+
+#[test]
+fn test_put_object_acl_canned_aws_exec_read_round_trip() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_acl_enabled_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("foo")
+            .body(ByteStream::from_static(b"bar"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object_acl()
+            .bucket(&bucket)
+            .key("foo")
+            .acl(ObjectCannedAcl::AwsExecRead)
+            .send()
+            .await
+            .unwrap();
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("foo")
+            .send()
+            .await
+            .unwrap();
+        let owner_id = acl
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected owner ID in GetObjectAcl")
+            .to_string();
+        assert_exact_grants(
+            acl.grants(),
+            &[
+                (Permission::Read, Some(AWS_EXEC_READ_CANONICAL_ID), None),
+                (Permission::FullControl, Some(owner_id.as_str()), None),
+            ],
+            "aws-exec-read object ACL via PutObjectAcl",
         );
 
         delete_all_and_bucket(client, &bucket, &["foo".to_string()]).await;
