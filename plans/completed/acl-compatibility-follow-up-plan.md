@@ -277,6 +277,27 @@ Priority order:
 
 ### Phase 4: AWS verification pass
 
+Status: complete.
+
+Completed:
+- reran the narrowed ACL subset against AWS for:
+  - bucket canned `authenticated-read`
+  - explicit `AuthenticatedUsers` bucket ACL XML grants
+  - create-time non-private bucket ACL rejection on fresh buckets
+  - explicit `AuthenticatedUsers` object header grants
+  - object canned `authenticated-read`
+  - object `aws-exec-read` during create and `PutObjectAcl`
+- confirmed the current AWS-aligned behavior already implemented by the repo:
+  - bucket `authenticated-read` works on `PutBucketAcl`
+  - explicit `AuthenticatedUsers` grants work on the supported bucket/object
+    ACL write paths
+  - fresh buckets reject create-time non-private ACLs with
+    `InvalidBucketAclWithObjectOwnership`
+  - `aws-exec-read` round-trips on object create and `PutObjectAcl`
+
+No AWS divergence was found in this subset, so the compatibility target
+remains AWS as currently modeled by the implementation and tests.
+
 Deliver:
 - rerun the narrowed ACL subset against AWS
 - confirm exact error codes and status codes for:
