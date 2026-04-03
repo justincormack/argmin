@@ -91,12 +91,13 @@ async fn main() {
             eprintln!("invalid SSE-C validator key: {e}");
             std::process::exit(1);
         });
-    let sse_s3_provider = ManagedWrappingKeyConfig::from_base64(1, &config.sse_s3_wrapping_key_b64)
-        .map(StaticManagedKeyProvider::single)
-        .unwrap_or_else(|e| {
-            eprintln!("invalid SSE-S3 wrapping key: {e}");
-            std::process::exit(1);
-        });
+    let managed_key_provider =
+        ManagedWrappingKeyConfig::from_base64(1, &config.sse_s3_wrapping_key_b64)
+            .map(StaticManagedKeyProvider::single)
+            .unwrap_or_else(|e| {
+                eprintln!("invalid SSE-S3 wrapping key: {e}");
+                std::process::exit(1);
+            });
 
     // Create one shared storage node for all workers.
     let storage_node = match SharedStorageNode::open(data_dir, &pg_ids) {
@@ -116,7 +117,7 @@ async fn main() {
             ec_config,
             config.region.clone(),
             sse_c_validator.clone(),
-            sse_s3_provider.clone(),
+            managed_key_provider.clone(),
         );
         let coordinator = match coordinator {
             Ok(c) => c,

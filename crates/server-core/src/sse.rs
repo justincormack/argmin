@@ -21,9 +21,12 @@ const SSE_C_SEGMENT_AAD: &[u8] = b"argmin:sse-c:segment:v1";
 const SSE_C_CHECKSUM_AAD: &[u8] = b"argmin:sse-c:checksum:v1";
 const SSE_C_HKDF_INFO: &[u8] = b"argmin:sse-c:kek:v1";
 const SSE_C_CHECKSUM_METADATA_VERSION: u8 = 1;
-const SSE_S3_WRAP_AAD: &[u8] = b"argmin:sse-s3:wrap:v1";
-const SSE_S3_SEGMENT_AAD: &[u8] = b"argmin:sse-s3:segment:v1";
-const SSE_S3_CHECKSUM_AAD: &[u8] = b"argmin:sse-s3:checksum:v1";
+// Keep the persisted SSE-S3 wire format stable even though the internal
+// provider boundary is now modelled as generic managed encryption.
+const MANAGED_WRAP_AAD: &[u8] = b"argmin:sse-s3:wrap:v1";
+const MANAGED_SEGMENT_AAD: &[u8] = b"argmin:sse-s3:segment:v1";
+const MANAGED_CHECKSUM_AAD: &[u8] = b"argmin:sse-s3:checksum:v1";
+const MANAGED_ENCRYPTION_LABEL: &str = "managed encryption";
 
 struct AeadDescriptor<'a> {
     aad: &'a [u8],
@@ -290,13 +293,13 @@ impl fmt::Debug for SseCustomerWriteContext {
 }
 
 #[derive(Clone)]
-pub struct SseS3WriteContext {
+pub struct ManagedEncryptionWriteContext {
     encryption: ObjectEncryption,
     dek: [u8; SSE_C_DEK_LEN],
     segment_scope: SseCustomerSegmentScope,
 }
 
-impl SseS3WriteContext {
+impl ManagedEncryptionWriteContext {
     #[must_use]
     pub fn encryption(&self) -> &ObjectEncryption {
         &self.encryption
@@ -309,7 +312,7 @@ impl SseS3WriteContext {
     ) -> Result<Vec<u8>, ServerError> {
         let ObjectEncryption::SseS3(state) = &self.encryption else {
             return Err(ServerError::InternalError {
-                reason: "SSE-S3 write context missing encryption state".to_string(),
+                reason: "managed write context missing encryption state".to_string(),
             });
         };
         encrypt_segment_with_dek_and_prefix(
@@ -319,8 +322,8 @@ impl SseS3WriteContext {
             segment_index,
             plaintext,
             AeadDescriptor {
-                aad: SSE_S3_SEGMENT_AAD,
-                label: "SSE-S3",
+                aad: MANAGED_SEGMENT_AAD,
+                label: MANAGED_ENCRYPTION_LABEL,
             },
         )
     }
@@ -331,11 +334,15 @@ impl SseS3WriteContext {
     ) -> Result<ObjectEncryption, ServerError> {
         let ObjectEncryption::SseS3(state) = &self.encryption else {
             return Err(ServerError::InternalError {
-                reason: "SSE-S3 write context missing encryption state".to_string(),
+                reason: "managed write context missing encryption state".to_string(),
             });
         };
-        let (checksum_nonce, encrypted_checksum_metadata) =
-            encrypt_checksum_with_dek(&self.dek, checksum, SSE_S3_CHECKSUM_AAD, "SSE-S3")?;
+        let (checksum_nonce, encrypted_checksum_metadata) = encrypt_checksum_with_dek(
+            &self.dek,
+            checksum,
+            MANAGED_CHECKSUM_AAD,
+            MANAGED_ENCRYPTION_LABEL,
+        )?;
         Ok(ObjectEncryption::SseS3(SseS3ObjectState {
             wrapping_key_id: state.wrapping_key_id,
             wrap_nonce: state.wrap_nonce,
@@ -347,13 +354,15 @@ impl SseS3WriteContext {
     }
 }
 
-impl fmt::Debug for SseS3WriteContext {
+impl fmt::Debug for ManagedEncryptionWriteContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SseS3WriteContext")
+        f.debug_struct("ManagedEncryptionWriteContext")
             .field("encryption", &self.encryption)
             .finish()
     }
 }
+
+pub type SseS3WriteContext = ManagedEncryptionWriteContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SseCustomerSegmentScope(u16);
@@ -481,38 +490,38 @@ pub fn validate_sse_customer_read(
     Ok(request.response_headers())
 }
 
-pub fn prepare_sse_s3_write(
+pub fn prepare_managed_encryption_write(
     provider: &impl ManagedKeyProvider,
-) -> Result<SseS3WriteContext, ServerError> {
+) -> Result<ManagedEncryptionWriteContext, ServerError> {
     let rng = ring::rand::SystemRandom::new();
     let wrapping_key = provider.active_key();
 
     let mut wrap_nonce = [0u8; SSE_S3_WRAP_NONCE_LEN];
     rng.fill(&mut wrap_nonce)
         .map_err(|_| ServerError::InternalError {
-            reason: "failed to generate SSE-S3 wrap nonce".to_string(),
+            reason: "failed to generate managed wrap nonce".to_string(),
         })?;
 
     let mut dek = [0u8; SSE_C_DEK_LEN];
     rng.fill(&mut dek).map_err(|_| ServerError::InternalError {
-        reason: "failed to generate SSE-S3 object DEK".to_string(),
+        reason: "failed to generate managed object DEK".to_string(),
     })?;
 
     let wrapped_dek = wrap_managed_dek(
         wrapping_key.wrapping_key(),
         &wrap_nonce,
         &dek,
-        SSE_S3_WRAP_AAD,
-        "SSE-S3",
+        MANAGED_WRAP_AAD,
+        MANAGED_ENCRYPTION_LABEL,
     )?;
 
     let mut segment_nonce_prefix = [0u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN];
     rng.fill(&mut segment_nonce_prefix)
         .map_err(|_| ServerError::InternalError {
-            reason: "failed to generate SSE-S3 segment nonce prefix".to_string(),
+            reason: "failed to generate managed segment nonce prefix".to_string(),
         })?;
 
-    Ok(SseS3WriteContext {
+    Ok(ManagedEncryptionWriteContext {
         encryption: ObjectEncryption::SseS3(SseS3ObjectState {
             wrapping_key_id: wrapping_key.key_id,
             wrap_nonce,
@@ -527,32 +536,32 @@ pub fn prepare_sse_s3_write(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn resume_sse_s3_write(
+pub(crate) fn resume_managed_encryption_write(
     provider: &impl ManagedKeyProvider,
     state: &SseS3ObjectState,
     segment_scope: SseCustomerSegmentScope,
-) -> Result<SseS3WriteContext, ServerError> {
+) -> Result<ManagedEncryptionWriteContext, ServerError> {
     let wrapping_key =
         provider
             .lookup_key(state.wrapping_key_id)
             .ok_or(ServerError::InternalError {
-                reason: "SSE-S3 wrapping key for object is not available".to_string(),
+                reason: "managed wrapping key for object is not available".to_string(),
             })?;
     let dek = unwrap_managed_dek(
         wrapping_key.wrapping_key(),
         &state.wrap_nonce,
         &state.wrapped_dek,
-        SSE_S3_WRAP_AAD,
-        "SSE-S3",
+        MANAGED_WRAP_AAD,
+        MANAGED_ENCRYPTION_LABEL,
     )?;
-    Ok(SseS3WriteContext {
+    Ok(ManagedEncryptionWriteContext {
         encryption: ObjectEncryption::SseS3(state.clone()),
         dek,
         segment_scope,
     })
 }
 
-pub(crate) fn decrypt_sse_s3_segment(
+pub(crate) fn decrypt_managed_encryption_segment(
     provider: &impl ManagedKeyProvider,
     state: &SseS3ObjectState,
     segment_scope: SseCustomerSegmentScope,
@@ -564,14 +573,14 @@ pub(crate) fn decrypt_sse_s3_segment(
         provider
             .lookup_key(state.wrapping_key_id)
             .ok_or(ServerError::InternalError {
-                reason: "SSE-S3 wrapping key for object is not available".to_string(),
+                reason: "managed wrapping key for object is not available".to_string(),
             })?;
     let dek = unwrap_managed_dek(
         wrapping_key.wrapping_key(),
         &state.wrap_nonce,
         &state.wrapped_dek,
-        SSE_S3_WRAP_AAD,
-        "SSE-S3",
+        MANAGED_WRAP_AAD,
+        MANAGED_ENCRYPTION_LABEL,
     )?;
     decrypt_segment_with_dek_and_prefix(
         &dek,
@@ -581,13 +590,13 @@ pub(crate) fn decrypt_sse_s3_segment(
         ciphertext,
         plaintext_len,
         AeadDescriptor {
-            aad: SSE_S3_SEGMENT_AAD,
-            label: "SSE-S3",
+            aad: MANAGED_SEGMENT_AAD,
+            label: MANAGED_ENCRYPTION_LABEL,
         },
     )
 }
 
-pub fn decrypt_sse_s3_checksum(
+pub fn decrypt_managed_encryption_checksum(
     provider: &impl ManagedKeyProvider,
     state: &SseS3ObjectState,
 ) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
@@ -598,22 +607,65 @@ pub fn decrypt_sse_s3_checksum(
         provider
             .lookup_key(state.wrapping_key_id)
             .ok_or(ServerError::InternalError {
-                reason: "SSE-S3 wrapping key for object is not available".to_string(),
+                reason: "managed wrapping key for object is not available".to_string(),
             })?;
     let dek = unwrap_managed_dek(
         wrapping_key.wrapping_key(),
         &state.wrap_nonce,
         &state.wrapped_dek,
-        SSE_S3_WRAP_AAD,
-        "SSE-S3",
+        MANAGED_WRAP_AAD,
+        MANAGED_ENCRYPTION_LABEL,
     )?;
     decrypt_checksum_with_dek(
         &dek,
         &state.checksum_nonce,
         &state.encrypted_checksum_metadata,
-        SSE_S3_CHECKSUM_AAD,
-        "SSE-S3",
+        MANAGED_CHECKSUM_AAD,
+        MANAGED_ENCRYPTION_LABEL,
     )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn prepare_sse_s3_write(
+    provider: &impl ManagedKeyProvider,
+) -> Result<ManagedEncryptionWriteContext, ServerError> {
+    prepare_managed_encryption_write(provider)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn resume_sse_s3_write(
+    provider: &impl ManagedKeyProvider,
+    state: &SseS3ObjectState,
+    segment_scope: SseCustomerSegmentScope,
+) -> Result<ManagedEncryptionWriteContext, ServerError> {
+    resume_managed_encryption_write(provider, state, segment_scope)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn decrypt_sse_s3_segment(
+    provider: &impl ManagedKeyProvider,
+    state: &SseS3ObjectState,
+    segment_scope: SseCustomerSegmentScope,
+    segment_index: u32,
+    ciphertext: &[u8],
+    plaintext_len: usize,
+) -> Result<Vec<u8>, ServerError> {
+    decrypt_managed_encryption_segment(
+        provider,
+        state,
+        segment_scope,
+        segment_index,
+        ciphertext,
+        plaintext_len,
+    )
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn decrypt_sse_s3_checksum(
+    provider: &impl ManagedKeyProvider,
+    state: &SseS3ObjectState,
+) -> Result<Option<ObjectChecksumMetadata>, ServerError> {
+    decrypt_managed_encryption_checksum(provider, state)
 }
 
 fn validate_sse_customer_write(
@@ -1029,7 +1081,7 @@ mod tests {
         }
     }
 
-    fn sse_s3_provider() -> StaticManagedKeyProvider {
+    fn managed_key_provider() -> StaticManagedKeyProvider {
         StaticManagedKeyProvider::single(ManagedWrappingKeyConfig {
             key_id: 7,
             wrapping_key: [11u8; 32],
@@ -1176,7 +1228,7 @@ mod tests {
 
     #[test]
     fn sse_s3_round_trip() {
-        let provider = sse_s3_provider();
+        let provider = managed_key_provider();
         let ctx = prepare_sse_s3_write(&provider).unwrap();
         let ObjectEncryption::SseS3(state) = ctx.encryption() else {
             panic!("expected SSE-S3 object state");
@@ -1196,7 +1248,7 @@ mod tests {
 
     #[test]
     fn sse_s3_resume_write_round_trip() {
-        let provider = sse_s3_provider();
+        let provider = managed_key_provider();
         let initial = prepare_sse_s3_write(&provider).unwrap();
         let ObjectEncryption::SseS3(state) = initial.encryption() else {
             panic!("expected SSE-S3 object state");
@@ -1222,7 +1274,7 @@ mod tests {
 
     #[test]
     fn sse_s3_checksum_metadata_round_trip() {
-        let provider = sse_s3_provider();
+        let provider = managed_key_provider();
         let ctx = prepare_sse_s3_write(&provider).unwrap();
         let checksum = ObjectChecksumMetadata::new(
             ChecksumAlgorithm::Sha256,
@@ -1242,7 +1294,7 @@ mod tests {
 
     #[test]
     fn sse_s3_missing_wrapping_key_fails() {
-        let provider = sse_s3_provider();
+        let provider = managed_key_provider();
         let ctx = prepare_sse_s3_write(&provider).unwrap();
         let ObjectEncryption::SseS3(state) = ctx.encryption() else {
             panic!("expected SSE-S3 object state");

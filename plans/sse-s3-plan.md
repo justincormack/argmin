@@ -410,17 +410,84 @@ Exit criteria:
 
 ### Phase 5: Follow-up cleanup for KMS readiness
 
+Status: complete
+
 1. verify the temporary managed-key provider boundary is sufficient for later
    `SSE-KMS`
 2. separate any remaining `SSE-S3`-specific logic from provider-independent
    managed-encryption logic
 3. leave `aws:kms` request acceptance for the later KMS plan
 
+Completed work:
+
+1. renamed the shared crypto/write context in `server-core` from
+   `SSE-S3`-specific naming to provider-neutral managed-encryption naming,
+   while intentionally leaving the persisted object state as
+   `ObjectEncryption::SseS3`
+2. renamed coordinator/runtime internals from `sse_s3_provider` and
+   `sse_s3` write-context plumbing to `managed_key_provider` and
+   `managed_write`, so the runtime seam now models “managed encryption”
+   rather than “SSE-S3 everywhere”
+3. propagated that provider-neutral seam through the HTTP streaming paths and
+   startup wiring without changing the external `SSE-S3` API surface
+4. revalidated that `aws:kms` object writes remain rejected as
+   `NotImplemented`
+
 Exit criteria:
 
 1. no fake `aws:kms` mode exists
 2. the next step toward `SSE-KMS` is adding a real provider, not redesigning
    object crypto state
+
+### Phase 6: Tighten encryption interfaces and type boundaries
+
+Status: planned
+
+The recent fixes exposed that the remaining risk is less about missing
+`SSE-S3` features and more about internal interfaces carrying the same
+encryption decision in multiple loosely-coupled forms.
+
+This phase is about making those states harder to express incorrectly.
+
+1. replace split write-encryption request inputs such as:
+   - `sse_customer`
+   - `sse_s3: bool`
+   - `policy_context.server_side_encryption`
+   with one typed request-level encryption intent
+2. distinguish request encryption intent from resolved write encryption:
+   - request intent = what the caller explicitly asked for
+   - resolved encryption = request intent after bucket-default application and
+     provider resolution
+3. make policy-facing managed encryption typed internally instead of
+   stringly-typed `Option<&str>` until the final auth boundary
+4. split stored bucket encryption config from effective bucket encryption
+   semantics so `None` does not have to mean both “unset” and
+   “effectively AES256”
+5. group stored encryption plus runtime write context into one commit-time
+   type so commit helpers cannot be called with mismatched pieces
+6. isolate the persisted `ObjectEncryption::SseS3` wire-format constants and
+   compatibility rules behind a clearly marked boundary with golden tests
+7. keep `SSE-C` and managed encryption as distinct persisted/runtime modes;
+   do not over-unify their access-control semantics
+
+Concrete design target:
+
+1. a typed request-level encryption enum for write APIs
+2. a typed resolved/runtime encryption enum or struct for streaming/commit APIs
+3. a typed policy-encryption view used for bucket-policy evaluation
+4. explicit stored-versus-effective bucket encryption types
+
+Exit criteria:
+
+1. coordinator write requests cannot represent contradictory encryption state
+2. policy evaluation does not require helper repairs to reconstruct obvious
+   managed-encryption facts
+3. bucket encryption code no longer relies on silent normalization to bridge
+   stored and effective meanings
+4. commit-time helpers accept one coherent encryption bundle rather than
+   parallel matched arguments
+5. persisted `SSE-S3` wire-format compatibility is protected by targeted tests
+   and comments at the format boundary
 
 ## Validation
 
@@ -471,7 +538,7 @@ a small but structurally correct service-managed key provider, and the next
 increment to `SSE-KMS` is “replace or extend the provider” rather than “redo
 the whole encryption model”.
 
-At this point, phases 1 through 4 are complete. The remaining planned work in
-this document is phase 5 only: KMS-readiness cleanup and verifying that the
-temporary managed-key-provider boundary is the right long-term seam for
-`SSE-KMS`.
+All phases in this document are now complete. The next encryption work should
+move into a separate `SSE-KMS` plan that extends or replaces the managed key
+provider rather than reworking object crypto state or the managed-encryption
+runtime seam.

@@ -42,11 +42,12 @@ use crate::metadata_blob::MetadataBlob;
 use crate::pg::{object_key_hash, part_key_hash, stream_segment_key_hash, PgTopology};
 use crate::range::ByteRange;
 use crate::sse::{
-    decrypt_sse_customer_checksum, decrypt_sse_customer_segment, decrypt_sse_s3_checksum,
-    decrypt_sse_s3_segment, prepare_sse_customer_write, prepare_sse_s3_write,
-    resume_sse_customer_write, resume_sse_s3_write, validate_sse_customer_read, SseCustomerRequest,
+    decrypt_managed_encryption_checksum, decrypt_managed_encryption_segment,
+    decrypt_sse_customer_checksum, decrypt_sse_customer_segment, prepare_managed_encryption_write,
+    prepare_sse_customer_write, resume_managed_encryption_write, resume_sse_customer_write,
+    validate_sse_customer_read, ManagedEncryptionWriteContext, SseCustomerRequest,
     SseCustomerResponseHeaders, SseCustomerSegmentScope, SseCustomerValidatorConfig,
-    SseCustomerWriteContext, SseS3WriteContext, StaticManagedKeyProvider, SSE_C_SEGMENT_TAG_LEN,
+    SseCustomerWriteContext, StaticManagedKeyProvider, SSE_C_SEGMENT_TAG_LEN,
 };
 use crate::system_metadata::SystemMetadata;
 
@@ -231,7 +232,7 @@ pub struct BeginStreamPartResult {
 #[derive(Debug)]
 pub struct ActiveWriteEncryption {
     pub sse_customer: Option<SseCustomerWriteContext>,
-    pub sse_s3: Option<SseS3WriteContext>,
+    pub managed_write: Option<ManagedEncryptionWriteContext>,
     pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
 }
 
@@ -239,8 +240,8 @@ impl ActiveWriteEncryption {
     fn encrypt_segment(&self, segment_index: u32, data: &[u8]) -> Result<Vec<u8>, ServerError> {
         if let Some(sse_customer) = self.sse_customer.as_ref() {
             sse_customer.encrypt_segment(segment_index, data)
-        } else if let Some(sse_s3) = self.sse_s3.as_ref() {
-            sse_s3.encrypt_segment(segment_index, data)
+        } else if let Some(managed_write) = self.managed_write.as_ref() {
+            managed_write.encrypt_segment(segment_index, data)
         } else {
             Ok(data.to_vec())
         }
@@ -533,7 +534,7 @@ struct ReadRuntime {
     pg_topology: PgTopology,
     payload_buffer_pool: Arc<PayloadBufferPool>,
     sse_c_validator: Option<SseCustomerValidatorConfig>,
-    sse_s3_provider: Option<StaticManagedKeyProvider>,
+    managed_key_provider: Option<StaticManagedKeyProvider>,
 }
 
 #[derive(Debug, Clone)]
@@ -1313,7 +1314,7 @@ struct PutCommitRequest<'a> {
     system_metadata: &'a SystemMetadata,
     encryption: &'a ObjectEncryption,
     sse_customer_write: Option<&'a SseCustomerWriteContext>,
-    sse_s3_write: Option<&'a SseS3WriteContext>,
+    managed_write: Option<&'a ManagedEncryptionWriteContext>,
     tags: Option<&'a str>,
     cond: &'a WriteCondition,
 }
@@ -1321,7 +1322,7 @@ struct PutCommitRequest<'a> {
 struct ResolvedWriteEncryption {
     encryption: ObjectEncryption,
     sse_customer: Option<SseCustomerWriteContext>,
-    sse_s3: Option<SseS3WriteContext>,
+    managed_write: Option<ManagedEncryptionWriteContext>,
 }
 
 impl ResolvedWriteEncryption {
@@ -1329,7 +1330,7 @@ impl ResolvedWriteEncryption {
         Self {
             encryption: ObjectEncryption::None,
             sse_customer: None,
-            sse_s3: None,
+            managed_write: None,
         }
     }
 }
@@ -1339,7 +1340,7 @@ impl From<ResolvedWriteEncryption> for ActiveWriteEncryption {
         Self {
             managed_encryption: value.encryption.managed_encryption_algorithm(),
             sse_customer: value.sse_customer,
-            sse_s3: value.sse_s3,
+            managed_write: value.managed_write,
         }
     }
 }
@@ -2124,7 +2125,7 @@ pub struct FinalizeStreamPutRequest<'a> {
     pub metadata_blob: &'a MetadataBlob,
     pub system_metadata: &'a SystemMetadata,
     pub sse_customer: Option<&'a SseCustomerWriteContext>,
-    pub sse_s3: Option<&'a SseS3WriteContext>,
+    pub managed_write: Option<&'a ManagedEncryptionWriteContext>,
     pub tags: Option<&'a str>,
     pub cond: &'a WriteCondition,
     pub acl: PutObjectWriteAcl<'a>,
@@ -2536,7 +2537,7 @@ pub struct Coordinator {
     payload_buffer_pool: Arc<PayloadBufferPool>,
     region: String,
     sse_c_validator: Option<SseCustomerValidatorConfig>,
-    sse_s3_provider: Option<StaticManagedKeyProvider>,
+    managed_key_provider: Option<StaticManagedKeyProvider>,
     _reclaim_sweeper: ReclaimSweeper,
     _lifecycle_sweeper: Arc<LifecycleSweeper>,
 }
@@ -3849,17 +3850,17 @@ impl ReadRuntime {
                 )
             }
             ObjectEncryption::SseS3(state) => {
-                let provider = self
-                    .sse_s3_provider
-                    .as_ref()
-                    .ok_or(ServerError::InternalError {
-                        reason: "SSE-S3 key provider is not configured".to_string(),
-                    })?;
+                let provider =
+                    self.managed_key_provider
+                        .as_ref()
+                        .ok_or(ServerError::InternalError {
+                            reason: "SSE-S3 key provider is not configured".to_string(),
+                        })?;
                 let segment_scope = part_number
                     .map_or(Ok(SseCustomerSegmentScope::object()), |p| {
                         SseCustomerSegmentScope::multipart_part(p)
                     })?;
-                decrypt_sse_s3_segment(
+                decrypt_managed_encryption_segment(
                     provider,
                     state,
                     segment_scope,
@@ -6119,13 +6120,13 @@ impl Coordinator {
         )
     }
 
-    /// Create a new coordinator with a managed SSE-S3 wrapping-key provider.
+    /// Create a new coordinator with a managed object-encryption wrapping-key provider.
     pub fn new_with_managed_key_provider(
         storage_node: Arc<SharedStorageNode>,
         ec_config: EcConfig,
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
-        sse_s3_provider: StaticManagedKeyProvider,
+        managed_key_provider: StaticManagedKeyProvider,
     ) -> Result<Self, ServerError> {
         let lifecycle_sweeper_factory =
             |storage_node: &Arc<SharedStorageNode>, read_runtime: ReadRuntime| {
@@ -6136,7 +6137,7 @@ impl Coordinator {
             ec_config,
             region,
             sse_c_validator,
-            Some(sse_s3_provider),
+            Some(managed_key_provider),
             lifecycle_sweeper_factory,
         )
     }
@@ -6146,7 +6147,7 @@ impl Coordinator {
         ec_config: EcConfig,
         region: String,
         sse_c_validator: Option<SseCustomerValidatorConfig>,
-        sse_s3_provider: Option<StaticManagedKeyProvider>,
+        managed_key_provider: Option<StaticManagedKeyProvider>,
         lifecycle_sweeper_factory: F,
     ) -> Result<Self, ServerError>
     where
@@ -6169,7 +6170,7 @@ impl Coordinator {
             pg_topology: pg_topology.clone(),
             payload_buffer_pool: Arc::clone(&payload_buffer_pool),
             sse_c_validator: sse_c_validator.clone(),
-            sse_s3_provider: sse_s3_provider.clone(),
+            managed_key_provider: managed_key_provider.clone(),
         };
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
@@ -6209,7 +6210,7 @@ impl Coordinator {
             payload_buffer_pool,
             region,
             sse_c_validator,
-            sse_s3_provider,
+            managed_key_provider,
             _reclaim_sweeper: ReclaimSweeper {
                 storage_node: sweeper_storage_node,
                 stop,
@@ -6226,7 +6227,7 @@ impl Coordinator {
             pg_topology: self.pg_topology.clone(),
             payload_buffer_pool: Arc::clone(&self.payload_buffer_pool),
             sse_c_validator: self.sse_c_validator.clone(),
-            sse_s3_provider: self.sse_s3_provider.clone(),
+            managed_key_provider: self.managed_key_provider.clone(),
         }
     }
 
@@ -8046,7 +8047,7 @@ impl Coordinator {
             req.system_metadata,
             req.encryption,
             req.sse_customer_write,
-            req.sse_s3_write,
+            req.managed_write,
         )?;
 
         if !req.cond.is_empty() {
@@ -8137,14 +8138,16 @@ impl Coordinator {
         }
     }
 
-    pub fn prepare_sse_s3_write_context(&self) -> Result<SseS3WriteContext, ServerError> {
+    pub fn prepare_managed_write_context(
+        &self,
+    ) -> Result<ManagedEncryptionWriteContext, ServerError> {
         let provider = self
-            .sse_s3_provider
+            .managed_key_provider
             .as_ref()
             .ok_or(ServerError::NotImplemented {
                 feature: "SSE-S3 requires managed key provider configuration".to_string(),
             })?;
-        prepare_sse_s3_write(provider)
+        prepare_managed_encryption_write(provider)
     }
 
     fn resolve_write_encryption(
@@ -8168,18 +8171,18 @@ impl Coordinator {
                     .encryption()
                     .clone(),
                 sse_customer,
-                sse_s3: None,
+                managed_write: None,
             });
         }
 
         if sse_s3_requested
             || bucket.encryption.default_encryption == Some(ManagedEncryptionAlgorithm::Aes256)
         {
-            let sse_s3 = self.prepare_sse_s3_write_context()?;
+            let managed_write = self.prepare_managed_write_context()?;
             return Ok(ResolvedWriteEncryption {
-                encryption: sse_s3.encryption().clone(),
+                encryption: managed_write.encryption().clone(),
                 sse_customer: None,
-                sse_s3: Some(sse_s3),
+                managed_write: Some(managed_write),
             });
         }
 
@@ -8204,7 +8207,7 @@ impl Coordinator {
                 Ok(ResolvedWriteEncryption {
                     encryption: encryption.clone(),
                     sse_customer,
-                    sse_s3: None,
+                    managed_write: None,
                 })
             }
             ObjectEncryption::SseS3(state) => {
@@ -8213,17 +8216,18 @@ impl Coordinator {
                         reason: "SSE-C headers may not be used for a non-SSE-C upload".to_string(),
                     });
                 }
-                let provider = self
-                    .sse_s3_provider
-                    .as_ref()
-                    .ok_or(ServerError::InternalError {
-                        reason: "SSE-S3 key provider is not configured".to_string(),
-                    })?;
-                let sse_s3 = resume_sse_s3_write(provider, state, segment_scope)?;
+                let provider =
+                    self.managed_key_provider
+                        .as_ref()
+                        .ok_or(ServerError::InternalError {
+                            reason: "SSE-S3 key provider is not configured".to_string(),
+                        })?;
+                let managed_write =
+                    resume_managed_encryption_write(provider, state, segment_scope)?;
                 Ok(ResolvedWriteEncryption {
                     encryption: encryption.clone(),
                     sse_customer: None,
-                    sse_s3: Some(sse_s3),
+                    managed_write: Some(managed_write),
                 })
             }
         }
@@ -8324,7 +8328,7 @@ impl Coordinator {
         match encryption {
             ObjectEncryption::None | ObjectEncryption::SseCustomer(_) => Ok(()),
             ObjectEncryption::SseS3(_) => {
-                if self.sse_s3_provider.is_some() {
+                if self.managed_key_provider.is_some() {
                     Ok(())
                 } else {
                     Err(ServerError::NotImplemented {
@@ -8508,7 +8512,7 @@ impl Coordinator {
                     metadata_blob: req.metadata,
                     system_metadata: req.system_metadata,
                     sse_customer: write_encryption.sse_customer.as_ref(),
-                    sse_s3: write_encryption.sse_s3.as_ref(),
+                    managed_write: write_encryption.managed_write.as_ref(),
                     tags: req.tags,
                     cond: req.cond,
                     acl: req.acl.clone(),
@@ -8570,7 +8574,7 @@ impl Coordinator {
             );
             let storage_bytes = if let Some(ctx) = &write_encryption.sse_customer {
                 ctx.encrypt_segment(segment_index, req.data)?
-            } else if let Some(ctx) = &write_encryption.sse_s3 {
+            } else if let Some(ctx) = &write_encryption.managed_write {
                 ctx.encrypt_segment(segment_index, req.data)?
             } else {
                 req.data.to_vec()
@@ -8607,7 +8611,7 @@ impl Coordinator {
                     system_metadata: req.system_metadata,
                     encryption: &write_encryption.encryption,
                     sse_customer_write: write_encryption.sse_customer.as_ref(),
-                    sse_s3_write: write_encryption.sse_s3.as_ref(),
+                    managed_write: write_encryption.managed_write.as_ref(),
                     tags: req.tags,
                     cond: req.cond,
                 },
@@ -9292,7 +9296,7 @@ impl Coordinator {
                     system_metadata: req.system_metadata,
                     encryption: &session.encryption,
                     sse_customer_write: req.sse_customer,
-                    sse_s3_write: req.sse_s3,
+                    managed_write: req.managed_write,
                     tags,
                     cond,
                 },
@@ -10055,14 +10059,15 @@ impl Coordinator {
                 if let Some(checksum) = replacement_checksum.as_mut() {
                     checksum.update(&chunk);
                 }
-                let storage_chunk =
-                    if let Some(sse_customer) = dst_write_encryption.sse_customer.as_ref() {
-                        sse_customer.encrypt_segment(segment_index, &chunk)?
-                    } else if let Some(sse_s3) = dst_write_encryption.sse_s3.as_ref() {
-                        sse_s3.encrypt_segment(segment_index, &chunk)?
-                    } else {
-                        chunk.to_vec()
-                    };
+                let storage_chunk = if let Some(sse_customer) =
+                    dst_write_encryption.sse_customer.as_ref()
+                {
+                    sse_customer.encrypt_segment(segment_index, &chunk)?
+                } else if let Some(managed_write) = dst_write_encryption.managed_write.as_ref() {
+                    managed_write.encrypt_segment(segment_index, &chunk)?
+                } else {
+                    chunk.to_vec()
+                };
                 self.append_stream_segment(
                     dst_bucket,
                     dst_key,
@@ -10100,7 +10105,7 @@ impl Coordinator {
                 metadata_blob: &metadata_blob,
                 system_metadata: &system_metadata,
                 sse_customer: dst_write_encryption.sse_customer.as_ref(),
-                sse_s3: dst_write_encryption.sse_s3.as_ref(),
+                managed_write: dst_write_encryption.managed_write.as_ref(),
                 tags: tags.as_deref(),
                 cond: dst_cond,
                 acl: acl.into(),
@@ -10209,7 +10214,7 @@ impl Coordinator {
         system_metadata: &SystemMetadata,
         encryption: &ObjectEncryption,
         sse_customer_write: Option<&SseCustomerWriteContext>,
-        sse_s3_write: Option<&SseS3WriteContext>,
+        managed_write: Option<&ManagedEncryptionWriteContext>,
     ) -> Result<(SerializedSystemMetadataBlob, ObjectEncryption), ServerError> {
         let mut stored_system_metadata = system_metadata.clone();
         let stored_encryption = match encryption {
@@ -10230,8 +10235,8 @@ impl Coordinator {
             }
             ObjectEncryption::SseS3(_) => {
                 let checksum = stored_system_metadata.take_checksum();
-                if let Some(sse_s3_write) = sse_s3_write {
-                    sse_s3_write.seal_checksum_metadata(checksum.as_ref())?
+                if let Some(managed_write) = managed_write {
+                    managed_write.seal_checksum_metadata(checksum.as_ref())?
                 } else if checksum.is_none() {
                     encryption.clone()
                 } else {
@@ -10281,12 +10286,12 @@ impl Coordinator {
             ObjectEncryption::SseS3(state) => {
                 if !state.encrypted_checksum_metadata.is_empty() {
                     let provider =
-                        self.sse_s3_provider
+                        self.managed_key_provider
                             .as_ref()
                             .ok_or(ServerError::InternalError {
                                 reason: "SSE-S3 key provider is not configured".to_string(),
                             })?;
-                    if let Some(checksum) = decrypt_sse_s3_checksum(provider, state)? {
+                    if let Some(checksum) = decrypt_managed_encryption_checksum(provider, state)? {
                         system_metadata.set_checksum(
                             checksum.algorithm(),
                             checksum.checksum_type(),
@@ -13265,7 +13270,7 @@ impl Coordinator {
                 &system_metadata,
                 &upload.encryption,
                 multipart_write_encryption.sse_customer.as_ref(),
-                multipart_write_encryption.sse_s3.as_ref(),
+                multipart_write_encryption.managed_write.as_ref(),
             )?;
             let managed_encryption = final_encryption.managed_encryption_algorithm();
 
@@ -29691,7 +29696,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -34685,7 +34690,7 @@ mod tests {
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -34901,7 +34906,7 @@ mod tests {
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -34952,7 +34957,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: Some(tags_xml),
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35033,7 +35038,7 @@ mod tests {
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35079,7 +35084,7 @@ mod tests {
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35143,7 +35148,7 @@ mod tests {
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35216,7 +35221,7 @@ mod tests {
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35288,7 +35293,7 @@ mod tests {
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &cond,
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35313,7 +35318,7 @@ mod tests {
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &bad_cond,
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35366,7 +35371,7 @@ mod tests {
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35452,7 +35457,7 @@ mod tests {
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35526,7 +35531,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35563,7 +35568,7 @@ mod tests {
             pg_topology: PgTopology::new(&[0]).unwrap(),
             payload_buffer_pool: PayloadBufferPool::new(ec_config),
             sse_c_validator: None,
-            sse_s3_provider: None,
+            managed_key_provider: None,
         };
 
         let data = vec![1u8, 2, 3, 4];
@@ -35608,7 +35613,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: NO_WRITE,
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35680,7 +35685,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35781,7 +35786,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36094,7 +36099,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36143,7 +36148,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36200,7 +36205,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36285,7 +36290,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36348,7 +36353,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36419,7 +36424,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36503,7 +36508,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36709,7 +36714,7 @@ mod tests {
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -36744,7 +36749,7 @@ mod tests {
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -37434,7 +37439,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -37557,7 +37562,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -37719,7 +37724,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -37805,7 +37810,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -37828,7 +37833,7 @@ mod tests {
                 metadata_blob: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
                 sse_customer: None,
-                sse_s3: None,
+                managed_write: None,
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),

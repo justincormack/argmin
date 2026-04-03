@@ -3013,7 +3013,7 @@ impl HttpFrontend {
                 metadata_blob: &ctx.metadata_blob,
                 system_metadata: &ctx.system_metadata,
                 sse_customer: write_encryption.sse_customer.as_ref(),
-                sse_s3: write_encryption.sse_s3.as_ref(),
+                managed_write: write_encryption.managed_write.as_ref(),
                 tags: ctx.tags_xml.as_deref(),
                 cond: &crate::conditional::WriteCondition::default(),
                 acl: acl.into(),
@@ -3064,8 +3064,8 @@ impl HttpFrontend {
         )?;
         let data = if let Some(sse_customer) = write_encryption.sse_customer.as_ref() {
             sse_customer.encrypt_segment(segment_index, data)?
-        } else if let Some(sse_s3) = write_encryption.sse_s3.as_ref() {
-            sse_s3.encrypt_segment(segment_index, data)?
+        } else if let Some(managed_write) = write_encryption.managed_write.as_ref() {
+            managed_write.encrypt_segment(segment_index, data)?
         } else {
             data.to_vec()
         };
@@ -3332,8 +3332,8 @@ impl HttpFrontend {
         )?;
         let segment_data = if let Some(sse_customer) = write_encryption.sse_customer.as_ref() {
             sse_customer.encrypt_segment(segment_index, data)?
-        } else if let Some(sse_s3) = write_encryption.sse_s3.as_ref() {
-            sse_s3.encrypt_segment(segment_index, data)?
+        } else if let Some(managed_write) = write_encryption.managed_write.as_ref() {
+            managed_write.encrypt_segment(segment_index, data)?
         } else {
             data.to_vec()
         };
@@ -3452,7 +3452,7 @@ impl HttpFrontend {
                 metadata_blob: &metadata_blob,
                 system_metadata: &system_metadata,
                 sse_customer: write_encryption.sse_customer.as_ref(),
-                sse_s3: write_encryption.sse_s3.as_ref(),
+                managed_write: write_encryption.managed_write.as_ref(),
                 tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
                 acl: put_object_write_acl_from_components(
@@ -3597,8 +3597,8 @@ impl HttpFrontend {
         )?;
         let data = if let Some(sse_customer) = write_encryption.sse_customer.as_ref() {
             sse_customer.encrypt_segment(segment_index, data)?
-        } else if let Some(sse_s3) = write_encryption.sse_s3.as_ref() {
-            sse_s3.encrypt_segment(segment_index, data)?
+        } else if let Some(managed_write) = write_encryption.managed_write.as_ref() {
+            managed_write.encrypt_segment(segment_index, data)?
         } else {
             data.to_vec()
         };
@@ -8107,8 +8107,8 @@ mod tests {
             {
                 let chunk = if let Some(sse_customer) = write_encryption.sse_customer.as_ref() {
                     sse_customer.encrypt_segment(segment_index as u32, chunk)?
-                } else if let Some(sse_s3) = write_encryption.sse_s3.as_ref() {
-                    sse_s3.encrypt_segment(segment_index as u32, chunk)?
+                } else if let Some(managed_write) = write_encryption.managed_write.as_ref() {
+                    managed_write.encrypt_segment(segment_index as u32, chunk)?
                 } else {
                     chunk.to_vec()
                 };
