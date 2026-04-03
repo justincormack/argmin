@@ -2072,11 +2072,25 @@ impl<'a> BeginStreamPartRequest<'a> {
     }
 }
 
+fn with_explicit_sse_s3_policy_context<'a>(
+    policy_context: PutObjectPolicyContext<'a>,
+    sse_s3_requested: bool,
+) -> PutObjectPolicyContext<'a> {
+    if policy_context.server_side_encryption.is_some() || !sse_s3_requested {
+        policy_context
+    } else {
+        policy_context
+            .with_server_side_encryption(Some(ManagedEncryptionAlgorithm::Aes256.as_str()))
+    }
+}
+
 impl<'a> PutObjectRequest<'a> {
     fn effective_policy_context(&self) -> PutObjectPolicyContext<'a> {
-        let policy_context = self
-            .policy_context
-            .with_default_canned_acl(self.acl.policy_condition_value());
+        let policy_context = with_explicit_sse_s3_policy_context(
+            self.policy_context
+                .with_default_canned_acl(self.acl.policy_condition_value()),
+            self.sse_s3,
+        );
         if policy_context.request_object_tags_xml.is_some() {
             policy_context
         } else {
@@ -2087,9 +2101,11 @@ impl<'a> PutObjectRequest<'a> {
 
 impl<'a> CreateMultipartUploadRequest<'a> {
     fn effective_policy_context(&self) -> PutObjectPolicyContext<'a> {
-        let policy_context = self
-            .policy_context
-            .with_default_canned_acl(self.acl.policy_condition_value());
+        let policy_context = with_explicit_sse_s3_policy_context(
+            self.policy_context
+                .with_default_canned_acl(self.acl.policy_condition_value()),
+            self.sse_s3,
+        );
         if policy_context.request_object_tags_xml.is_some() {
             policy_context
         } else {
@@ -4195,6 +4211,20 @@ impl Coordinator {
             policy,
             Self::requester_can_write_multipart_upload(requester, bucket, upload),
         )
+    }
+
+    fn with_multipart_upload_managed_encryption_policy_context<'a>(
+        policy_context: PutObjectPolicyContext<'a>,
+        upload: &'a MultipartUploadRecord,
+    ) -> PutObjectPolicyContext<'a> {
+        if policy_context.server_side_encryption.is_some() {
+            return policy_context;
+        }
+
+        match upload.encryption.managed_encryption_algorithm() {
+            Some(algorithm) => policy_context.with_server_side_encryption(Some(algorithm.as_str())),
+            None => policy_context,
+        }
     }
 
     fn requester_can_manage_object_tags(
@@ -8799,6 +8829,8 @@ impl Coordinator {
                 upload_id: upload_id.to_string(),
             });
         }
+        let policy_context =
+            Self::with_multipart_upload_managed_encryption_policy_context(policy_context, &upload);
         if !Self::requester_can_write_multipart_upload_with_bucket_policy(
             req.upload.requester(),
             &bucket_info,
@@ -9768,6 +9800,10 @@ impl Coordinator {
                 metadata_directive,
                 canned_acl,
             )
+            .with_server_side_encryption(
+                req.dst_sse_s3
+                    .then_some(ManagedEncryptionAlgorithm::Aes256.as_str()),
+            )
             .with_sse_customer_algorithm(req.dst_sse_customer.map(SseCustomerRequest::algorithm)),
             req.expected_bucket_owner(),
         )?;
@@ -9976,6 +10012,10 @@ impl Coordinator {
                 metadata_directive,
                 canned_acl,
             )
+            .with_server_side_encryption(
+                req.dst_sse_s3
+                    .then_some(ManagedEncryptionAlgorithm::Aes256.as_str()),
+            )
             .with_sse_customer_algorithm(req.dst_sse_customer.map(SseCustomerRequest::algorithm)),
             encryption: dst_explicit_sse_customer
                 .as_ref()
@@ -10068,6 +10108,10 @@ impl Coordinator {
                     Some(copy_source_policy_value.as_str()),
                     metadata_directive,
                     acl.policy_condition_value(),
+                )
+                .with_server_side_encryption(
+                    req.dst_sse_s3
+                        .then_some(ManagedEncryptionAlgorithm::Aes256.as_str()),
                 )
                 .with_sse_customer_algorithm(
                     req.dst_sse_customer.map(SseCustomerRequest::algorithm),
@@ -12613,13 +12657,37 @@ impl Coordinator {
         let requester = req.upload.requester();
         let source_sse_customer = req.source_sse_customer;
 
-        let _dst_bucket_info = self.authorize_put_object_requester(
-            requester,
-            dst_bucket,
-            dst_key,
+        let dst_bucket_info =
+            self.active_bucket_summary(dst_bucket, req.expected_bucket_owner())?;
+        let dst_bucket_policy = self.cached_bucket_policy(&dst_bucket_info)?;
+        let dst_meta_pg = self
+            .storage_node
+            .get_pg(self.object_pg_id(dst_bucket, dst_key))?;
+        let dst_upload = dst_meta_pg.get_multipart_upload(upload_id)?;
+        if dst_upload.bucket != dst_bucket || dst_upload.key != dst_key {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        if dst_upload.state != UploadState::InProgress {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
             policy_context,
-            req.expected_bucket_owner(),
-        )?;
+            &dst_upload,
+        );
+        if !Self::requester_can_write_multipart_upload_with_bucket_policy(
+            requester,
+            &dst_bucket_info,
+            &dst_upload,
+            policy_context,
+            dst_bucket_policy.as_deref(),
+        )? {
+            return Err(ServerError::AccessDenied);
+        }
+        drop(dst_meta_pg);
         let not_found = |e: ServerError| match e {
             ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
                 bucket: src_bucket.to_string(),
@@ -12874,9 +12942,6 @@ impl Coordinator {
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             let meta_pg_id = self.object_pg_id(bucket, key);
             let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-            let policy_context = PutObjectPolicyContext::default()
-                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm));
-
             let upload = meta_pg.get_multipart_upload(upload_id)?;
             if upload.bucket != bucket || upload.key != key {
                 return Err(ServerError::NoSuchUpload {
@@ -12888,6 +12953,11 @@ impl Coordinator {
                     upload_id: upload_id.to_string(),
                 });
             }
+            let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
+                PutObjectPolicyContext::default()
+                    .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm)),
+                &upload,
+            );
             if !Self::requester_can_write_multipart_upload_with_bucket_policy(
                 req.upload.requester(),
                 &bucket_info,
@@ -13798,6 +13868,53 @@ mod tests {
             test_sse_s3_provider(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn put_object_effective_policy_context_derives_explicit_sse_s3() {
+        let metadata = MetadataBlob::default();
+        let system_metadata = SystemMetadata::default();
+        let request = PutObjectRequest {
+            object: ObjectRequest::new("bucket", "key", test_requester(), None),
+            data: b"body",
+            metadata: &metadata,
+            system_metadata: &system_metadata,
+            tags: None,
+            cond: NO_WRITE,
+            acl: PutObjectWriteAcl::None,
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            sse_customer: None,
+            sse_s3: true,
+        };
+
+        assert_eq!(
+            request.effective_policy_context().server_side_encryption,
+            Some(ManagedEncryptionAlgorithm::Aes256.as_str())
+        );
+    }
+
+    #[test]
+    fn create_multipart_effective_policy_context_derives_explicit_sse_s3() {
+        let metadata = MetadataBlob::default();
+        let system_metadata = SystemMetadata::default();
+        let request = CreateMultipartUploadRequest {
+            object: ObjectRequest::new("bucket", "key", test_requester(), None),
+            metadata: &metadata,
+            system_metadata: &system_metadata,
+            tags: None,
+            checksum: None,
+            acl: PutObjectWriteAcl::None,
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            sse_customer: None,
+            sse_s3: true,
+        };
+
+        assert_eq!(
+            request.effective_policy_context().server_side_encryption,
+            Some(ManagedEncryptionAlgorithm::Aes256.as_str())
+        );
     }
 
     fn test_sse_customer_request() -> SseCustomerRequest {

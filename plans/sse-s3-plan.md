@@ -96,7 +96,8 @@ As a result, the real implementation sequence is:
 1. generalize encryption internals
 2. explicit `SSE-S3` request handling plus AWS-current bucket default behavior
 3. internal runtime and test harness hardening for the new default
-4. remaining API/policy/POST cleanup
+4. remaining API/policy/POST cleanup, including propagating managed-encryption
+   policy state through multipart and copy follow-on operations
 
 This is still the right plan, but the work is less neatly separable than the
 original phase list implied.
@@ -384,17 +385,28 @@ Exit criteria:
 
 ### Phase 4: Remaining API cleanup and bucket-policy integration
 
+Status: complete
+
 1. finish the remaining write paths that should inherit bucket-default
    `SSE-S3`, especially `POST` object
 2. add policy request fields for managed encryption algorithm
 3. evaluate `s3:x-amz-server-side-encryption`
 4. cover explicit and inherited `SSE-S3` behavior
+5. make multipart and copy follow-on policy evaluation reuse the fixed
+   encryption decision from initiate time
+6. make direct coordinator request helpers derive
+   `s3:x-amz-server-side-encryption = AES256` from explicit `sse_s3: true`
+   without requiring HTTP-layer hand wiring
 
 Exit criteria:
 
 1. deny-unencrypted bucket policies work
 2. deny-wrong-algorithm bucket policies work
 3. inherited bucket-default encryption interacts correctly with policy checks
+4. multipart/copy policy evaluation preserves the initiate-time `SSE-S3`
+   decision
+5. non-HTTP coordinator callers cannot silently drop explicit `SSE-S3` policy
+   context
 
 ### Phase 5: Follow-up cleanup for KMS readiness
 
@@ -438,7 +450,8 @@ Relevant target commands once tests exist:
 3. `cargo test -p s3-tests --test multipart`
 4. `cargo test -p s3-tests --test post_object`
 5. `cargo test -p server-core --lib`
-6. AWS/local upstream harness cases for `SSE-S3`
+6. `cargo test --workspace --no-fail-fast`
+7. AWS/local upstream harness cases for `SSE-S3`
 
 ## Explicit Deferrals
 
@@ -457,3 +470,8 @@ This plan is complete when Argmin has a real `SSE-S3` implementation backed by
 a small but structurally correct service-managed key provider, and the next
 increment to `SSE-KMS` is “replace or extend the provider” rather than “redo
 the whole encryption model”.
+
+At this point, phases 1 through 4 are complete. The remaining planned work in
+this document is phase 5 only: KMS-readiness cleanup and verifying that the
+temporary managed-key-provider boundary is the right long-term seam for
+`SSE-KMS`.

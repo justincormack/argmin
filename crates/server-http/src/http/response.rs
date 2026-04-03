@@ -1438,6 +1438,21 @@ mod tests {
     }
 
     #[test]
+    fn post_object_response_includes_managed_encryption_header() {
+        let result = PutObjectResult {
+            etag: "\"abc123\"".to_string(),
+            version_id: VersionId::Null,
+            managed_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
+            lifecycle_expiration: None,
+        };
+        let resp = S3Response::post_object(&result, "my-bucket", "my-key", 204, None);
+        assert_eq!(
+            find_header(&resp, "x-amz-server-side-encryption"),
+            Some("AES256")
+        );
+    }
+
+    #[test]
     fn post_object_response_redirect_appends_to_existing_query() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),

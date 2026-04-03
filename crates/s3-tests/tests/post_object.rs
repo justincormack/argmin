@@ -1,5 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aws_sdk_s3::types::ServerSideEncryption;
 use ring::hmac;
 use s3_tests::{
     assert_s3_err_code, err_status, sigv4_post_sse_c_fields_for_credentials, sse_c_header_values,
@@ -463,6 +464,110 @@ fn test_post_object_sse_c_round_trip() {
 }
 
 #[test]
+fn test_post_object_sse_s3_round_trip() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-sse-s3";
+        let file_data = b"hello from POST with SSE-S3";
+
+        let mut fields = sigv4_fields(
+            &bucket,
+            key,
+            &[serde_json::json!({"x-amz-server-side-encryption": "AES256"})],
+        );
+        fields.push((
+            "x-amz-server-side-encryption".to_string(),
+            "AES256".to_string(),
+        ));
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let (status, body) = post_object(&bucket, &field_refs, file_data, "test.txt");
+        assert_eq!(status, 204, "expected 204, got {} body={}", status, body);
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.content_length(), Some(file_data.len() as i64));
+        assert_eq!(
+            head.server_side_encryption(),
+            Some(&ServerSideEncryption::Aes256)
+        );
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            get.server_side_encryption(),
+            Some(&ServerSideEncryption::Aes256)
+        );
+        let data = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], file_data);
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_inherits_bucket_default_sse_s3() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-default-sse-s3";
+        let file_data = b"hello from POST with inherited SSE-S3";
+
+        let fields = sigv4_fields(&bucket, key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let (status, body) = post_object(&bucket, &field_refs, file_data, "test.txt");
+        assert_eq!(status, 204, "expected 204, got {} body={}", status, body);
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.content_length(), Some(file_data.len() as i64));
+        assert_eq!(
+            head.server_side_encryption(),
+            Some(&ServerSideEncryption::Aes256)
+        );
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
 fn test_post_object_sse_c_bucket_policy_rejects_lowercase_algorithm() {
     require_https_endpoint();
     s3_tests::run(async {
@@ -532,6 +637,100 @@ fn test_post_object_sse_c_bucket_policy_rejects_lowercase_algorithm() {
             body.contains("<ArgumentValue>aes256</ArgumentValue>"),
             "expected lowercase algorithm to be echoed in body, got {body}"
         );
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_sse_s3_bucket_policy_requires_explicit_header() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-sse-s3-policy";
+        let file_data = b"hello from POST with SSE-S3 policy";
+
+        let policy = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": format!("arn:aws:s3:::{bucket}/*"),
+                "Condition": {
+                    "Null": {
+                        "s3:x-amz-server-side-encryption": "true"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let denied_fields = sigv4_fields(&bucket, key, &[]);
+        let denied_field_refs: Vec<(&str, &str)> = denied_fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (denied_status, denied_body) =
+            post_object(&bucket, &denied_field_refs, file_data, "test.txt");
+        assert_eq!(
+            denied_status, 403,
+            "expected 403, got {} body={}",
+            denied_status, denied_body
+        );
+        assert_error_code(&denied_body, "AccessDenied");
+
+        let head = client.head_object().bucket(&bucket).key(key).send().await;
+        assert_eq!(err_status(&head), 404);
+
+        let mut allowed_fields = sigv4_fields(
+            &bucket,
+            key,
+            &[serde_json::json!({"x-amz-server-side-encryption": "AES256"})],
+        );
+        allowed_fields.push((
+            "x-amz-server-side-encryption".to_string(),
+            "AES256".to_string(),
+        ));
+        let allowed_field_refs: Vec<(&str, &str)> = allowed_fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let (allowed_status, allowed_body) =
+            post_object(&bucket, &allowed_field_refs, file_data, "test.txt");
+        assert_eq!(
+            allowed_status, 204,
+            "expected 204, got {} body={}",
+            allowed_status, allowed_body
+        );
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            get.server_side_encryption(),
+            Some(&ServerSideEncryption::Aes256)
+        );
+        let data = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], file_data);
 
         client
             .delete_object()

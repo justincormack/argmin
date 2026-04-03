@@ -2,6 +2,7 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     CompletedMultipartUpload, CompletedPart, Grant, ObjectOwnership, Permission,
+    ServerSideEncryption,
 };
 use s3_tests::{
     assert_s3_err_code, create_public_bucket, disable_bucket_public_access_block, err_status,
@@ -43,6 +44,15 @@ macro_rules! with_sse_c_headers {
                     key_md5_b64.clone(),
                 );
             }
+        })
+    }};
+}
+
+macro_rules! with_sse_s3_header {
+    ($op:expr) => {{
+        $op.customize().mutate_request(move |req| {
+            req.headers_mut()
+                .insert("x-amz-server-side-encryption", "AES256");
         })
     }};
 }
@@ -955,6 +965,72 @@ fn test_bucket_policy_put_obj_requires_sse_c_algorithm_header() {
 }
 
 #[test]
+fn test_bucket_policy_put_obj_requires_sse_s3_header() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "Null": {
+                        "s3:x-amz-server-side-encryption": "true"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = client
+            .put_object()
+            .bucket(&bucket)
+            .key("denied")
+            .body(ByteStream::from_static(b"plain"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("allowed")
+            .server_side_encryption(ServerSideEncryption::Aes256)
+            .body(ByteStream::from_static(b"secret"))
+            .send()
+            .await
+            .unwrap();
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key("allowed")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            head.server_side_encryption(),
+            Some(&ServerSideEncryption::Aes256)
+        );
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_obj_sse_c_algorithm_string_not_equals() {
     require_https_endpoint();
     s3_tests::run(async {
@@ -1004,6 +1080,60 @@ fn test_bucket_policy_put_obj_sse_c_algorithm_string_not_equals() {
             .sse_customer_algorithm("AES256")
             .sse_customer_key(key_b64)
             .sse_customer_key_md5(key_md5_b64)
+            .body(ByteStream::from_static(b"secret"))
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_obj_sse_s3_string_not_equals() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringNotEquals": {
+                        "s3:x-amz-server-side-encryption": "AES256"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = client
+            .put_object()
+            .bucket(&bucket)
+            .key("denied")
+            .body(ByteStream::from_static(b"plain"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("allowed")
+            .server_side_encryption(ServerSideEncryption::Aes256)
             .body(ByteStream::from_static(b"secret"))
             .send()
             .await
@@ -1078,6 +1208,74 @@ fn test_bucket_policy_copy_object_recognizes_destination_sse_c_header() {
         .send()
         .await
         .unwrap();
+        assert_eq!(
+            get.body.collect().await.unwrap().into_bytes().as_ref(),
+            b"copy-source"
+        );
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_copy_object_recognizes_destination_sse_s3_header() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("src")
+            .body(ByteStream::from_static(b"copy-source"))
+            .send()
+            .await
+            .unwrap();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "Null": {
+                        "s3:x-amz-server-side-encryption": "true"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        with_sse_s3_header!(client
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{bucket}/src")))
+        .send()
+        .await
+        .unwrap();
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("dst")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            get.server_side_encryption(),
+            Some(&ServerSideEncryption::Aes256)
+        );
         assert_eq!(
             get.body.collect().await.unwrap().into_bytes().as_ref(),
             b"copy-source"
@@ -1193,6 +1391,101 @@ fn test_bucket_policy_complete_multipart_does_not_reuse_destination_sse_c_header
         .await;
         assert_eq!(err_status(&get), 404);
         assert_s3_err_code(&get, "NoSuchKey");
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_multipart_copy_inherits_destination_sse_s3() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("src")
+            .body(ByteStream::from_static(b"copy-source"))
+            .send()
+            .await
+            .unwrap();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "Null": {
+                        "s3:x-amz-server-side-encryption": "true"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let create =
+            with_sse_s3_header!(client.create_multipart_upload().bucket(&bucket).key("dst"))
+                .send()
+                .await
+                .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let copied_part = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key("dst")
+            .upload_id(&upload_id)
+            .part_number(1)
+            .copy_source(format!("{bucket}/src"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key("dst")
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(copied_part.copy_part_result().unwrap().e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key("dst")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            get.server_side_encryption(),
+            Some(&ServerSideEncryption::Aes256)
+        );
+        assert_eq!(
+            get.body.collect().await.unwrap().into_bytes().as_ref(),
+            b"copy-source"
+        );
 
         cleanup(&bucket, &["src", "dst"]).await;
     });
