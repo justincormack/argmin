@@ -1947,3 +1947,154 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
         cleanup(&src_bucket, &["public/foo", "public/bar", "private/foo"]).await;
     });
 }
+
+/// Apply the same policy to two different buckets and verify both work.
+///
+/// Matches Ceph: test_bucket_policy_another_bucket
+#[test]
+fn test_bucket_policy_another_bucket() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let principal = alt_policy_principal();
+
+        let bucket1 = unique_bucket();
+        let bucket2 = unique_bucket();
+        client
+            .create_bucket()
+            .bucket(&bucket1)
+            .send()
+            .await
+            .unwrap();
+        client
+            .create_bucket()
+            .bucket(&bucket2)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket1)
+            .key("obj1")
+            .body(ByteStream::from_static(b"data1"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object()
+            .bucket(&bucket2)
+            .key("obj2")
+            .body(ByteStream::from_static(b"data2"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket1)
+            .policy(bucket_policy_document(
+                principal.clone(),
+                "Allow",
+                "s3:ListBucket",
+                bucket_resource(&bucket1),
+            ))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket2)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:ListBucket",
+                bucket_resource(&bucket2),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let resp1 = alt_client
+            .list_objects()
+            .bucket(&bucket1)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp1.contents().len(), 1);
+        assert_eq!(resp1.contents()[0].key(), Some("obj1"));
+
+        let resp2 = alt_client
+            .list_objects()
+            .bucket(&bucket2)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.contents().len(), 1);
+        assert_eq!(resp2.contents()[0].key(), Some("obj2"));
+
+        cleanup(&bucket1, &["obj1"]).await;
+        cleanup(&bucket2, &["obj2"]).await;
+    });
+}
+
+// StringLikeIfExists condition operator: condition is satisfied when the key
+// is absent from the request (IfExists semantics).
+//
+// Matches Ceph: test_bucket_policy_set_condition_operator_end_with_IfExists
+//
+// NOTE: IfExists condition operators are not yet implemented.
+// Uncomment when support is added.
+// #[test]
+// fn test_bucket_policy_condition_operator_if_exists() {
+//     s3_tests::run(async {
+//         let client = CTX.client();
+//         let alt_client = CTX.alt_client();
+//         let bucket = create_bucket_allowing_public_policy(client).await;
+//
+//         client
+//             .put_object()
+//             .bucket(&bucket)
+//             .key("foo")
+//             .body(ByteStream::from_static(b"bar"))
+//             .send()
+//             .await
+//             .unwrap();
+//
+//         let policy = json!({
+//             "Version": "2012-10-17",
+//             "Statement": [{
+//                 "Effect": "Allow",
+//                 "Principal": alt_policy_principal(),
+//                 "Action": "s3:GetObject",
+//                 "Resource": bucket_wildcard_resource(&bucket),
+//                 "Condition": {
+//                     "StringLikeIfExists": {
+//                         "s3:prefix": "foo"
+//                     }
+//                 }
+//             }]
+//         })
+//         .to_string();
+//
+//         client
+//             .put_bucket_policy()
+//             .bucket(&bucket)
+//             .policy(policy)
+//             .send()
+//             .await
+//             .unwrap();
+//
+//         let resp = alt_client
+//             .get_object()
+//             .bucket(&bucket)
+//             .key("foo")
+//             .send()
+//             .await
+//             .unwrap();
+//         let body = resp.body.collect().await.unwrap().into_bytes();
+//         assert_eq!(body.as_ref(), b"bar");
+//
+//         cleanup(&bucket, &["foo"]).await;
+//     });
+// }
