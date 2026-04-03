@@ -87,20 +87,17 @@ Deliver:
 
 ### 3. Versioning concurrent create/remove ports
 
-These remain credible uncovered Ceph concurrency cases.
+Status: implemented.
 
-Remaining Ceph cases:
+Completed Ceph cases:
 - `test_versioned_concurrent_object_create_concurrent_remove`
 - `test_versioned_concurrent_object_create_and_remove`
 
 Current state:
-- versioning coverage is otherwise broad in `crates/s3-tests/tests/versioning.rs`
-- there is already some concurrent versioning coverage, but not these exact
-  create/remove races
-
-Deliver:
-- port both Ceph cases into `crates/s3-tests/tests/versioning.rs`
-- keep them deterministic and compatible with both local and AWS runs
+- both concurrency races are now ported in
+  `crates/s3-tests/tests/versioning.rs`
+- versioning closeout work is now down to the remaining bucket recreate / ACL
+  subset
 
 ## Not Remaining For This Plan
 
@@ -114,14 +111,12 @@ These should not stay on the closeout list:
 
 ## Recommended Order
 
-1. Port the two versioning concurrent create/remove tests.
-2. Close the bucket recreate / ACL subset, either by porting or by explicitly
+1. Close the bucket recreate / ACL subset, either by porting or by explicitly
    documenting when an existing Rust test already covers the same behavior.
 
 ## Exit Criteria
 
 This closeout plan is complete when:
-- the two remaining versioning concurrency cases are ported
 - the bucket recreate / ACL subset is either ported or explicitly closed as
   already covered
 - we have a short written statement that Ceph closeout is done for implemented

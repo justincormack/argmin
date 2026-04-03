@@ -172,6 +172,66 @@ async fn cleanup_versioned(bucket: &str, key: &str, version_ids: &[String]) {
     client.delete_bucket().bucket(bucket).send().await.unwrap();
 }
 
+async fn create_versioned_object_concurrent(
+    client: aws_sdk_s3::Client,
+    bucket: String,
+    key: String,
+    num: usize,
+) {
+    let mut tasks = Vec::with_capacity(num);
+    for i in 0..num {
+        let client = client.clone();
+        let bucket = bucket.clone();
+        let key = key.clone();
+        tasks.push(tokio::spawn(async move {
+            let body = format!("data {i}");
+            client
+                .put_object()
+                .bucket(bucket)
+                .key(key)
+                .body(ByteStream::from(body.into_bytes()))
+                .send()
+                .await
+                .unwrap();
+        }));
+    }
+
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
+
+async fn clear_versioned_bucket_concurrent(client: aws_sdk_s3::Client, bucket: String) {
+    let resp = client
+        .list_object_versions()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+
+    let mut tasks = Vec::with_capacity(resp.versions().len());
+    for version in resp.versions() {
+        let client = client.clone();
+        let bucket = bucket.clone();
+        let key = version.key().unwrap().to_string();
+        let version_id = version.version_id().unwrap().to_string();
+        tasks.push(tokio::spawn(async move {
+            client
+                .delete_object()
+                .bucket(bucket)
+                .key(key)
+                .version_id(version_id)
+                .send()
+                .await
+                .unwrap();
+        }));
+    }
+
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
+
 // ── Basic versioning CRUD ───────────────────────────────────────────
 
 #[test]
@@ -1410,6 +1470,92 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
 }
 
 // ── Concurrent delete ───────────────────────────────────────────────
+
+#[test]
+fn test_versioned_concurrent_object_create_concurrent_remove() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "myobj";
+        let num_versions = 5;
+
+        for _ in 0..5 {
+            create_versioned_object_concurrent(
+                client.clone(),
+                bucket.clone(),
+                key.to_string(),
+                num_versions,
+            )
+            .await;
+
+            let resp = client
+                .list_object_versions()
+                .bucket(&bucket)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.versions().len(), num_versions);
+
+            clear_versioned_bucket_concurrent(client.clone(), bucket.clone()).await;
+
+            let resp = client
+                .list_object_versions()
+                .bucket(&bucket)
+                .send()
+                .await
+                .unwrap();
+            assert!(
+                resp.versions().is_empty(),
+                "expected no versions after concurrent removal"
+            );
+        }
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_versioned_concurrent_object_create_and_remove() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "myobj";
+        let num_versions = 3;
+
+        let mut tasks = Vec::new();
+        for _ in 0..3 {
+            tasks.push(tokio::spawn(create_versioned_object_concurrent(
+                client.clone(),
+                bucket.clone(),
+                key.to_string(),
+                num_versions,
+            )));
+            tasks.push(tokio::spawn(clear_versioned_bucket_concurrent(
+                client.clone(),
+                bucket.clone(),
+            )));
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        clear_versioned_bucket_concurrent(client.clone(), bucket.clone()).await;
+
+        let resp = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            resp.versions().is_empty(),
+            "expected no versions after final concurrent cleanup"
+        );
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
 
 #[test]
 fn test_versioning_concurrent_multi_object_delete() {
