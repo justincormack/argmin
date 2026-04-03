@@ -1293,6 +1293,102 @@ mod tests {
     }
 
     #[test]
+    fn sse_s3_wire_format_vectors_stay_stable() {
+        let wrapping_key = [0x11u8; 32];
+        let dek = [0x22u8; SSE_C_DEK_LEN];
+        let wrap_nonce = [0x33u8; SSE_S3_WRAP_NONCE_LEN];
+        let segment_prefix = [0x44u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN];
+        let checksum_nonce = [0x55u8; SSE_S3_CHECKSUM_NONCE_LEN];
+        let plaintext = b"compat-sse-s3";
+        let checksum = ObjectChecksumMetadata::new(
+            ChecksumAlgorithm::Sha256,
+            Some(ChecksumType::FullObject),
+            "0123456789abcdef".to_string(),
+        );
+
+        let wrapped_dek = wrap_managed_dek(
+            &wrapping_key,
+            &wrap_nonce,
+            &dek,
+            MANAGED_WRAP_AAD,
+            MANAGED_ENCRYPTION_LABEL,
+        )
+        .unwrap();
+        assert_eq!(
+            wrapped_dek,
+            [
+                0xa6, 0xa1, 0x70, 0x64, 0xe8, 0xb0, 0x57, 0x0e, 0x90, 0x9a, 0xc9, 0x4f, 0x85, 0x09,
+                0xc1, 0x0a, 0x24, 0xea, 0x2d, 0x16, 0xa8, 0xfb, 0xa7, 0x8e, 0xda, 0x68, 0x2b, 0xa7,
+                0x81, 0xac, 0xa8, 0x08, 0x26, 0x08, 0xbe, 0xf0, 0x5b, 0x07, 0x42, 0x11, 0x8e, 0xd7,
+                0x91, 0xa6, 0x05, 0x0c, 0x86, 0x37,
+            ]
+        );
+        let segment_ciphertext = encrypt_segment_with_dek_and_prefix(
+            &dek,
+            &segment_prefix,
+            SseCustomerSegmentScope::object(),
+            7,
+            plaintext,
+            AeadDescriptor {
+                aad: MANAGED_SEGMENT_AAD,
+                label: MANAGED_ENCRYPTION_LABEL,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            segment_ciphertext,
+            vec![
+                0xf0, 0x05, 0xef, 0x0d, 0x52, 0xfe, 0x04, 0x8e, 0xae, 0x22, 0x79, 0xa0, 0x1a, 0x23,
+                0x8c, 0x13, 0xfe, 0x8f, 0x3a, 0x1d, 0xe6, 0xef, 0x57, 0xff, 0xf6, 0x5e, 0x4d, 0xd8,
+                0x7d,
+            ]
+        );
+        let decrypted_segment = decrypt_segment_with_dek_and_prefix(
+            &dek,
+            &segment_prefix,
+            SseCustomerSegmentScope::object(),
+            7,
+            &segment_ciphertext,
+            plaintext.len(),
+            AeadDescriptor {
+                aad: MANAGED_SEGMENT_AAD,
+                label: MANAGED_ENCRYPTION_LABEL,
+            },
+        )
+        .unwrap();
+        assert_eq!(decrypted_segment, plaintext);
+
+        let unbound = aead::UnboundKey::new(&aead::AES_256_GCM, &dek).unwrap();
+        let sealing_key = aead::LessSafeKey::new(unbound);
+        let mut checksum_ciphertext = encode_checksum_metadata(&checksum).unwrap();
+        sealing_key
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(checksum_nonce),
+                aead::Aad::from(MANAGED_CHECKSUM_AAD),
+                &mut checksum_ciphertext,
+            )
+            .unwrap();
+        assert_eq!(
+            checksum_ciphertext,
+            vec![
+                0x58, 0x11, 0xd6, 0xb2, 0xc9, 0xd6, 0xd4, 0xca, 0xd8, 0xf1, 0x56, 0xcf, 0xc3, 0xa8,
+                0x61, 0x77, 0x29, 0x03, 0xef, 0x16, 0x9a, 0xfe, 0x87, 0xaa, 0x1d, 0x39, 0x2d, 0xda,
+                0x7e, 0xf5, 0xc7, 0x5a, 0x63, 0x50, 0x28, 0x67, 0x41,
+            ]
+        );
+        let decrypted_checksum = decrypt_checksum_with_dek(
+            &dek,
+            &checksum_nonce,
+            &checksum_ciphertext,
+            MANAGED_CHECKSUM_AAD,
+            MANAGED_ENCRYPTION_LABEL,
+        )
+        .unwrap()
+        .expect("expected checksum metadata");
+        assert_eq!(decrypted_checksum, checksum);
+    }
+
+    #[test]
     fn sse_s3_missing_wrapping_key_fails() {
         let provider = managed_key_provider();
         let ctx = prepare_sse_s3_write(&provider).unwrap();

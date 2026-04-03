@@ -467,15 +467,17 @@ Completed so far:
 5. bucket creation and `DeleteBucketEncryption` now preserve raw
    “unset/implicit AWS default” state in storage rather than persisting an
    explicit `AES256` configuration
+6. commit-time helpers now consume one resolved write-encryption bundle
+   instead of parallel stored-encryption and runtime-context arguments, so
+   direct puts, streaming finalize, and multipart completion share the same
+   seal-and-persist path
+7. the persisted `SSE-S3` crypto boundary now has explicit fixed-vector tests
+   for DEK wrapping, segment encryption, and checksum metadata envelopes
 
 Remaining in this phase:
 
 1. keep pushing typed managed-encryption state through policy evaluation so
    fewer auth paths depend on stringly-typed `server_side_encryption`
-2. tighten commit/finalize helpers so stored encryption state and runtime write
-   contexts are passed as one coherent bundle
-3. add targeted wire-format compatibility tests around persisted `SSE-S3`
-   constants and envelopes
 
 1. replace split write-encryption request inputs such as:
    - `sse_customer`
