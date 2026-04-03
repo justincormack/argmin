@@ -308,6 +308,168 @@ async fn alt_get_object_eventually(
     unreachable!()
 }
 
+async fn assert_alt_get_object_allowed(bucket: &str, key: &str, expected_body: &[u8]) {
+    let get = CTX
+        .alt_client()
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let body = get.body.collect().await.unwrap().into_bytes();
+    assert_eq!(body.as_ref(), expected_body);
+}
+
+async fn assert_alt_get_object_denied(bucket: &str, key: &str) {
+    let result = CTX
+        .alt_client()
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await;
+    assert_eq!(err_status(&result), 403);
+}
+
+async fn assert_alt_get_object_acl_allowed(bucket: &str, key: &str) {
+    CTX.alt_client()
+        .get_object_acl()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn assert_alt_get_object_acl_denied(bucket: &str, key: &str) {
+    let result = CTX
+        .alt_client()
+        .get_object_acl()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await;
+    assert_eq!(err_status(&result), 403);
+}
+
+async fn assert_alt_put_object_acl_allowed(
+    bucket: &str,
+    key: &str,
+    owner_id: &str,
+    alt_owner_id: &str,
+    alt_permission: Permission,
+) {
+    CTX.alt_client()
+        .put_object_acl()
+        .bucket(bucket)
+        .key(key)
+        .access_control_policy(access_control_policy(
+            owner_id,
+            vec![
+                canonical_user_grant(owner_id, Permission::FullControl),
+                canonical_user_grant(alt_owner_id, alt_permission),
+            ],
+        ))
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn assert_alt_put_object_acl_denied(bucket: &str, key: &str) {
+    let result = CTX
+        .alt_client()
+        .put_object_acl()
+        .bucket(bucket)
+        .key(key)
+        .acl(ObjectCannedAcl::Private)
+        .send()
+        .await;
+    assert_eq!(err_status(&result), 403);
+}
+
+async fn setup_object_with_alt_acl_grant(permission: Permission) -> (String, String, String) {
+    let client = CTX.client();
+    let alt_client = CTX.alt_client();
+    let bucket = setup_acl_enabled_bucket().await;
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("foo")
+        .body(ByteStream::from_static(b"bar"))
+        .send()
+        .await
+        .unwrap();
+
+    let owner_id = object_owner_id(client, &bucket, "foo").await;
+    let alt_owner_id = canonical_owner_id(alt_client).await;
+    client
+        .put_object_acl()
+        .bucket(&bucket)
+        .key("foo")
+        .access_control_policy(access_control_policy(
+            &owner_id,
+            vec![
+                canonical_user_grant(&owner_id, Permission::FullControl),
+                canonical_user_grant(&alt_owner_id, permission),
+            ],
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    (bucket, owner_id, alt_owner_id)
+}
+
+async fn run_object_acl_canonical_user_permission_case(
+    permission: Permission,
+    expect_get_object: bool,
+    expect_get_object_acl: bool,
+    expect_put_object_acl: bool,
+) {
+    let client = CTX.client();
+    let (bucket, owner_id, alt_owner_id) =
+        setup_object_with_alt_acl_grant(permission.clone()).await;
+
+    let acl = client
+        .get_object_acl()
+        .bucket(&bucket)
+        .key("foo")
+        .send()
+        .await
+        .unwrap();
+    assert_exact_grants(
+        acl.grants(),
+        &[
+            (Permission::FullControl, Some(owner_id.as_str()), None),
+            (permission.clone(), Some(alt_owner_id.as_str()), None),
+        ],
+        "object ACL canonical-user grant matrix setup",
+    );
+
+    if expect_get_object {
+        assert_alt_get_object_allowed(&bucket, "foo", b"bar").await;
+    } else {
+        assert_alt_get_object_denied(&bucket, "foo").await;
+    }
+
+    if expect_get_object_acl {
+        assert_alt_get_object_acl_allowed(&bucket, "foo").await;
+    } else {
+        assert_alt_get_object_acl_denied(&bucket, "foo").await;
+    }
+
+    if expect_put_object_acl {
+        assert_alt_put_object_acl_allowed(&bucket, "foo", &owner_id, &alt_owner_id, permission)
+            .await;
+    } else {
+        assert_alt_put_object_acl_denied(&bucket, "foo").await;
+    }
+
+    delete_all_and_bucket(client, &bucket, &["foo".to_string()]).await;
+}
+
 fn agent() -> ureq::Agent {
     s3_tests::test_agent()
 }
@@ -2468,5 +2630,36 @@ fn test_put_object_acl_explicit_grants_do_not_add_owner_full_control() {
             .unwrap();
 
         delete_all_and_bucket(client, &bucket, &["foo".to_string()]).await;
+    });
+}
+
+#[test]
+fn test_object_acl_grant_canonical_user_read() {
+    s3_tests::run(async {
+        run_object_acl_canonical_user_permission_case(Permission::Read, true, false, false).await;
+    });
+}
+
+#[test]
+fn test_object_acl_grant_canonical_user_read_acp() {
+    s3_tests::run(async {
+        run_object_acl_canonical_user_permission_case(Permission::ReadAcp, false, true, false)
+            .await;
+    });
+}
+
+#[test]
+fn test_object_acl_grant_canonical_user_write_acp() {
+    s3_tests::run(async {
+        run_object_acl_canonical_user_permission_case(Permission::WriteAcp, false, false, true)
+            .await;
+    });
+}
+
+#[test]
+fn test_object_acl_grant_canonical_user_full_control() {
+    s3_tests::run(async {
+        run_object_acl_canonical_user_permission_case(Permission::FullControl, true, true, true)
+            .await;
     });
 }

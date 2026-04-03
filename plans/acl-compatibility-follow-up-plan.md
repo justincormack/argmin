@@ -59,11 +59,23 @@ Implemented today:
   - explicit `AuthenticatedUsers` object header grants
   - exact explicit-grant round-trips for bucket/object ACL write paths
   - `aws-exec-read` round-trips for `PutObject` and `PutObjectAcl`
+  - bucket canonical-user grant authorization matrix for:
+    - `FULL_CONTROL`
+    - `READ`
+    - `READ_ACP`
+    - `WRITE`
+    - `WRITE_ACP`
+  - object canonical-user grant authorization matrix for:
+    - `FULL_CONTROL`
+    - `READ`
+    - `READ_ACP`
+    - `WRITE_ACP`
 
 Missing or intentionally rejected today:
 - `LogDelivery` grantee / `log-delivery-write` (deferred until bucket logging
   itself is in scope)
-- Rust conformance coverage for much of the Ceph bucket-grant matrix
+- Rust conformance coverage for the remaining bucket ACL round-trip, group
+  grant, and interaction cases that are still only present in Ceph
 
 Out of scope:
 - email grantees / `AmazonCustomerByEmail`
@@ -121,12 +133,6 @@ Several Ceph ACL cases are still not ported into Rust, even where the current
 implementation likely already supports them.
 
 The largest remaining gaps are:
-- bucket canonical-user grant matrix:
-  - `FULL_CONTROL`
-  - `READ`
-  - `READ_ACP`
-  - `WRITE`
-  - `WRITE_ACP`
 - bucket ACL XML/group-grant coverage beyond the currently added cases
 - create-time ACL coverage for the remaining bucket variants
 - targeted ACL interaction cases that currently only exist in Ceph
@@ -254,8 +260,17 @@ consumer scenarios.
 
 ### Phase 3: Port the remaining high-value Ceph ACL cases
 
-Deliver:
+Status: in progress.
+
+Completed:
 - bucket canonical-user grant matrix in `crates/s3-tests`
+- object canonical-user authorization matrix in `crates/s3-tests` for:
+  - `FULL_CONTROL`
+  - `READ`
+  - `READ_ACP`
+  - `WRITE_ACP`
+
+Deliver:
 - missing bucket ACL create/update round-trip coverage
 - explicit bucket group-grant coverage
 - remaining ACL interaction tests that exercise real authorization behavior,
@@ -320,12 +335,7 @@ AWS-backed verification:
 
 ## Open Decisions
 
-### 1. `aws-exec-read`
-
-We should confirm whether AWS still meaningfully supports this ACL in the paths
-we care about, or whether it should remain a documented unsupported corner.
-
-### 2. `LogDelivery` rollout breadth
+### 1. `LogDelivery` rollout breadth
 
 This should stay deferred until bucket logging implementation starts.
 
