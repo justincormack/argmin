@@ -1160,7 +1160,7 @@ pub struct PutObjectPolicyContext<'a> {
     pub copy_source: Option<&'a str>,
     pub metadata_directive: Option<&'a str>,
     pub canned_acl: Option<&'a str>,
-    pub server_side_encryption: Option<&'a str>,
+    pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
     pub sse_customer_algorithm: Option<&'a str>,
     pub grant_read: Option<&'a str>,
     pub grant_write: Option<&'a str>,
@@ -1181,7 +1181,7 @@ impl<'a> PutObjectPolicyContext<'a> {
             copy_source,
             metadata_directive,
             canned_acl,
-            server_side_encryption: None,
+            managed_encryption: None,
             sse_customer_algorithm: None,
             grant_read: None,
             grant_write: None,
@@ -1193,11 +1193,11 @@ impl<'a> PutObjectPolicyContext<'a> {
     }
 
     #[must_use]
-    pub const fn with_server_side_encryption(
+    pub const fn with_managed_encryption(
         mut self,
-        server_side_encryption: Option<&'a str>,
+        managed_encryption: Option<ManagedEncryptionAlgorithm>,
     ) -> Self {
-        self.server_side_encryption = server_side_encryption;
+        self.managed_encryption = managed_encryption;
         self
     }
 
@@ -1344,13 +1344,13 @@ impl<'a> WriteEncryptionRequest<'a> {
     ) -> PutObjectPolicyContext<'a> {
         match self {
             Self::None => policy_context
-                .with_server_side_encryption(None)
+                .with_managed_encryption(None)
                 .with_sse_customer_algorithm(None),
             Self::SseCustomer(request) => policy_context
-                .with_server_side_encryption(None)
+                .with_managed_encryption(None)
                 .with_sse_customer_algorithm(Some(request.algorithm())),
             Self::Managed(algorithm) => policy_context
-                .with_server_side_encryption(Some(algorithm.as_str()))
+                .with_managed_encryption(Some(algorithm))
                 .with_sse_customer_algorithm(None),
         }
     }
@@ -4348,12 +4348,12 @@ impl Coordinator {
         policy_context: PutObjectPolicyContext<'a>,
         upload: &'a MultipartUploadRecord,
     ) -> PutObjectPolicyContext<'a> {
-        if policy_context.server_side_encryption.is_some() {
+        if policy_context.managed_encryption.is_some() {
             return policy_context;
         }
 
         match upload.encryption.managed_encryption_algorithm() {
-            Some(algorithm) => policy_context.with_server_side_encryption(Some(algorithm.as_str())),
+            Some(algorithm) => policy_context.with_managed_encryption(Some(algorithm)),
             None => policy_context,
         }
     }
@@ -5038,7 +5038,11 @@ impl Coordinator {
         .with_copy_source(policy_context.copy_source)
         .with_metadata_directive(policy_context.metadata_directive)
         .with_canned_acl(policy_context.canned_acl)
-        .with_server_side_encryption(policy_context.server_side_encryption)
+        .with_server_side_encryption(
+            policy_context
+                .managed_encryption
+                .map(ManagedEncryptionAlgorithm::as_str),
+        )
         .with_sse_customer_algorithm(policy_context.sse_customer_algorithm)
         .with_grant_read(policy_context.grant_read)
         .with_grant_write(policy_context.grant_write)
@@ -9916,10 +9920,7 @@ impl Coordinator {
                 metadata_directive,
                 canned_acl,
             )
-            .with_server_side_encryption(
-                req.dst_sse_s3
-                    .then_some(ManagedEncryptionAlgorithm::Aes256.as_str()),
-            )
+            .with_managed_encryption(req.dst_sse_s3.then_some(ManagedEncryptionAlgorithm::Aes256))
             .with_sse_customer_algorithm(req.dst_sse_customer.map(SseCustomerRequest::algorithm)),
             req.expected_bucket_owner(),
         )?;
@@ -10128,10 +10129,7 @@ impl Coordinator {
                 metadata_directive,
                 canned_acl,
             )
-            .with_server_side_encryption(
-                req.dst_sse_s3
-                    .then_some(ManagedEncryptionAlgorithm::Aes256.as_str()),
-            )
+            .with_managed_encryption(req.dst_sse_s3.then_some(ManagedEncryptionAlgorithm::Aes256))
             .with_sse_customer_algorithm(req.dst_sse_customer.map(SseCustomerRequest::algorithm)),
             encryption: WriteEncryptionRequest::from_request_parts(
                 req.dst_sse_customer,
@@ -10225,9 +10223,8 @@ impl Coordinator {
                     metadata_directive,
                     acl.policy_condition_value(),
                 )
-                .with_server_side_encryption(
-                    req.dst_sse_s3
-                        .then_some(ManagedEncryptionAlgorithm::Aes256.as_str()),
+                .with_managed_encryption(
+                    req.dst_sse_s3.then_some(ManagedEncryptionAlgorithm::Aes256),
                 )
                 .with_sse_customer_algorithm(
                     req.dst_sse_customer.map(SseCustomerRequest::algorithm),
@@ -14000,8 +13997,8 @@ mod tests {
         };
 
         assert_eq!(
-            request.effective_policy_context().server_side_encryption,
-            Some(ManagedEncryptionAlgorithm::Aes256.as_str())
+            request.effective_policy_context().managed_encryption,
+            Some(ManagedEncryptionAlgorithm::Aes256)
         );
     }
 
@@ -14019,13 +14016,13 @@ mod tests {
             cond: NO_WRITE,
             acl: PutObjectWriteAcl::None,
             policy_context: PutObjectPolicyContext::default()
-                .with_server_side_encryption(Some("AES256")),
+                .with_managed_encryption(Some(ManagedEncryptionAlgorithm::Aes256)),
             object_lock: ObjectLockState::default(),
             encryption: WriteEncryptionRequest::sse_customer(&sse_customer),
         };
 
         let policy_context = request.effective_policy_context();
-        assert_eq!(policy_context.server_side_encryption, None);
+        assert_eq!(policy_context.managed_encryption, None);
         assert_eq!(
             policy_context.sse_customer_algorithm,
             Some(SSE_CUSTOMER_ALGORITHM)
@@ -14049,8 +14046,8 @@ mod tests {
         };
 
         assert_eq!(
-            request.effective_policy_context().server_side_encryption,
-            Some(ManagedEncryptionAlgorithm::Aes256.as_str())
+            request.effective_policy_context().managed_encryption,
+            Some(ManagedEncryptionAlgorithm::Aes256)
         );
     }
 
@@ -14061,13 +14058,13 @@ mod tests {
             object: ObjectRequest::new("bucket", "key", test_requester(), None),
             acl: PutObjectWriteAcl::None,
             policy: PutObjectPolicyContext::default()
-                .with_server_side_encryption(Some("AES256"))
+                .with_managed_encryption(Some(ManagedEncryptionAlgorithm::Aes256))
                 .with_sse_customer_algorithm(Some("AES256")),
             encryption: WriteEncryptionRequest::none(),
             object_lock: ObjectLockState::default(),
         };
         let cleared = request.effective_policy_context();
-        assert_eq!(cleared.server_side_encryption, None);
+        assert_eq!(cleared.managed_encryption, None);
         assert_eq!(cleared.sse_customer_algorithm, None);
 
         let request = BeginStreamPutRequest {
@@ -14078,7 +14075,7 @@ mod tests {
             object_lock: ObjectLockState::default(),
         };
         let sse_c = request.effective_policy_context();
-        assert_eq!(sse_c.server_side_encryption, None);
+        assert_eq!(sse_c.managed_encryption, None);
         assert_eq!(sse_c.sse_customer_algorithm, Some(SSE_CUSTOMER_ALGORITHM));
     }
 

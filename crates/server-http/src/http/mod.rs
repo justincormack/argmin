@@ -1060,6 +1060,7 @@ impl HttpFrontend {
                         None,
                         None,
                         acl.policy_condition_value(),
+                        sse_s3.then_some(ManagedEncryptionAlgorithm::Aes256),
                     );
                     let result =
                         self.coordinator
@@ -2189,6 +2190,7 @@ impl HttpFrontend {
                     None,
                     None,
                     acl.policy_condition_value(),
+                    sse_s3.then_some(ManagedEncryptionAlgorithm::Aes256),
                 );
 
                 let result = self.coordinator.create_multipart_upload(
@@ -2866,7 +2868,7 @@ impl HttpFrontend {
                 None,
                 acl.policy_condition_value(),
             )
-            .with_server_side_encryption(managed_encryption.map(ManagedEncryptionAlgorithm::as_str))
+            .with_managed_encryption(managed_encryption)
             .with_sse_customer_algorithm(sse_customer.as_ref().map(|ctx| ctx.request().algorithm()))
             .with_request_object_tags_xml(tags_xml.as_deref()),
             encryption: crate::coordinator::WriteEncryptionRequest::from_request_parts(
@@ -2984,10 +2986,7 @@ impl HttpFrontend {
             None,
             acl.policy_condition_value(),
         )
-        .with_server_side_encryption(
-            ctx.managed_encryption
-                .map(ManagedEncryptionAlgorithm::as_str),
-        )
+        .with_managed_encryption(ctx.managed_encryption)
         .with_sse_customer_algorithm(
             ctx.sse_customer
                 .as_ref()
@@ -3801,8 +3800,7 @@ impl StreamingPutContext {
             None,
             None,
             parse_put_object_acl(self.acl_header.as_deref()).policy_condition_value(),
-            self.managed_encryption
-                .map(ManagedEncryptionAlgorithm::as_str),
+            self.managed_encryption,
             self.sse_customer
                 .as_ref()
                 .map(|ctx| ctx.request().algorithm()),
@@ -4789,13 +4787,14 @@ fn put_object_policy_context_from_request<'a>(
     copy_source: Option<&'a str>,
     metadata_directive: Option<&'a str>,
     canned_acl: Option<&'a str>,
+    managed_encryption: Option<ManagedEncryptionAlgorithm>,
 ) -> crate::coordinator::PutObjectPolicyContext<'a> {
     put_object_policy_context_from_request_fields(
         tags_xml,
         copy_source,
         metadata_directive,
         canned_acl,
-        req.header(SSE_HEADER),
+        managed_encryption,
         req.header(SSE_C_ALGORITHM_HEADER),
         PutObjectGrantHeaders {
             grant_read: req.header("x-amz-grant-read"),
@@ -4821,12 +4820,12 @@ fn put_object_policy_context_from_request_fields<'a>(
     copy_source: Option<&'a str>,
     metadata_directive: Option<&'a str>,
     canned_acl: Option<&'a str>,
-    server_side_encryption: Option<&'a str>,
+    managed_encryption: Option<ManagedEncryptionAlgorithm>,
     sse_customer_algorithm: Option<&'a str>,
     grants: PutObjectGrantHeaders<'a>,
 ) -> crate::coordinator::PutObjectPolicyContext<'a> {
     crate::coordinator::PutObjectPolicyContext::new(copy_source, metadata_directive, canned_acl)
-        .with_server_side_encryption(server_side_encryption)
+        .with_managed_encryption(managed_encryption)
         .with_sse_customer_algorithm(sse_customer_algorithm)
         .with_request_object_tags_xml(tags_xml)
         .with_acl_grant_headers(

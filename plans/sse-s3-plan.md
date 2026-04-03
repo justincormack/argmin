@@ -441,7 +441,7 @@ Exit criteria:
 
 ### Phase 6: Tighten encryption interfaces and type boundaries
 
-Status: in progress
+Status: complete
 
 The recent fixes exposed that the remaining risk is less about missing
 `SSE-S3` features and more about internal interfaces carrying the same
@@ -473,11 +473,14 @@ Completed so far:
    seal-and-persist path
 7. the persisted `SSE-S3` crypto boundary now has explicit fixed-vector tests
    for DEK wrapping, segment encryption, and checksum metadata envelopes
-
-Remaining in this phase:
-
-1. keep pushing typed managed-encryption state through policy evaluation so
-   fewer auth paths depend on stringly-typed `server_side_encryption`
+8. `PutObjectPolicyContext` now carries managed-encryption policy state as
+   `ManagedEncryptionAlgorithm` instead of a raw SSE header string, and the
+   HTTP helpers and direct coordinator request paths build that typed state
+   directly
+9. bucket-policy auth evaluation now lowers managed-encryption policy state to
+   the `s3:x-amz-server-side-encryption` string condition only at the final
+   auth boundary rather than threading `"AES256"` through internal request
+   helpers
 
 1. replace split write-encryption request inputs such as:
    - `sse_customer`
