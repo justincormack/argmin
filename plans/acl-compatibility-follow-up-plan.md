@@ -56,6 +56,7 @@ Implemented today:
 - Rust conformance coverage for:
   - bucket `authenticated-read`
   - explicit `AuthenticatedUsers` bucket ACL XML grants
+  - explicit `AllUsers` bucket ACL XML `READ` grants
   - explicit `AuthenticatedUsers` object header grants
   - exact explicit-grant round-trips for bucket/object ACL write paths
   - `aws-exec-read` round-trips for `PutObject` and `PutObjectAcl`
@@ -70,12 +71,14 @@ Implemented today:
     - `READ`
     - `READ_ACP`
     - `WRITE_ACP`
+  - rejection of create-time non-private bucket ACLs on fresh buckets with the
+    default ownership mode
 
 Missing or intentionally rejected today:
 - `LogDelivery` grantee / `log-delivery-write` (deferred until bucket logging
   itself is in scope)
-- Rust conformance coverage for the remaining bucket ACL round-trip, group
-  grant, and interaction cases that are still only present in Ceph
+- Rust conformance coverage for the remaining bucket ACL interaction cases that
+  are still only present in Ceph
 
 Out of scope:
 - email grantees / `AmazonCustomerByEmail`
@@ -133,8 +136,6 @@ Several Ceph ACL cases are still not ported into Rust, even where the current
 implementation likely already supports them.
 
 The largest remaining gaps are:
-- bucket ACL XML/group-grant coverage beyond the currently added cases
-- create-time ACL coverage for the remaining bucket variants
 - targeted ACL interaction cases that currently only exist in Ceph
 
 These are important because this codebase depends on conformance tests, not on
@@ -264,15 +265,18 @@ Status: in progress.
 
 Completed:
 - bucket canonical-user grant matrix in `crates/s3-tests`
+- explicit bucket group-grant coverage for:
+  - `AuthenticatedUsers` via ACL XML
+  - `AllUsers` `READ` via ACL XML
 - object canonical-user authorization matrix in `crates/s3-tests` for:
   - `FULL_CONTROL`
   - `READ`
   - `READ_ACP`
   - `WRITE_ACP`
+- create-time non-private bucket ACL rejection coverage under default
+  `BucketOwnerEnforced` ownership
 
 Deliver:
-- missing bucket ACL create/update round-trip coverage
-- explicit bucket group-grant coverage
 - remaining ACL interaction tests that exercise real authorization behavior,
   not just storage shape
 

@@ -7,7 +7,9 @@ use aws_sdk_s3::types::{
     AccessControlPolicy, BucketCannedAcl, Grant, Grantee, ObjectOwnership, Owner,
     OwnershipControls, OwnershipControlsRule, Permission, Type,
 };
-use s3_tests::{disable_bucket_public_access_block, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, disable_bucket_public_access_block, err_status, unique_bucket, CTX,
+};
 
 const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
 const AUTHENTICATED_USERS_GROUP_URI: &str =
@@ -109,6 +111,19 @@ fn authenticated_users_group_grant(permission: Permission) -> Grant {
                 .uri(AUTHENTICATED_USERS_GROUP_URI)
                 .build()
                 .expect("authenticated users grantee"),
+        )
+        .permission(permission)
+        .build()
+}
+
+fn all_users_group_grant(permission: Permission) -> Grant {
+    Grant::builder()
+        .grantee(
+            Grantee::builder()
+                .r#type(Type::Group)
+                .uri(ALL_USERS_GROUP_URI)
+                .build()
+                .expect("all users grantee"),
         )
         .permission(permission)
         .build()
@@ -392,6 +407,23 @@ fn test_bucket_acl_canned_authenticated_read() {
 }
 
 #[test]
+fn test_create_bucket_acl_canned_authenticated_read_rejected_with_default_ownership() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+
+        let result = client
+            .create_bucket()
+            .bucket(&bucket)
+            .acl(BucketCannedAcl::AuthenticatedRead)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidBucketAclWithObjectOwnership");
+    });
+}
+
+#[test]
 fn test_bucket_acl_grant_authenticated_users_read_via_xml() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -446,6 +478,59 @@ fn test_bucket_acl_grant_authenticated_users_read_via_xml() {
         assert!(
             body.contains("AccessDenied"),
             "expected AccessDenied for anonymous bucket access, got {body}"
+        );
+
+        cleanup(&bucket).await;
+    });
+}
+
+#[test]
+fn test_put_bucket_acl_grant_all_users_read_via_xml() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_acl_enabled_bucket().await;
+        let owner_id = bucket_owner_id(&bucket).await;
+
+        let acl = AccessControlPolicy::builder()
+            .owner(Owner::builder().id(&owner_id).build())
+            .set_grants(Some(vec![
+                canonical_user_grant(&owner_id, Permission::FullControl),
+                all_users_group_grant(Permission::Read),
+            ]))
+            .build();
+
+        client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .access_control_policy(acl)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_exact_grants(
+            resp.grants(),
+            &[
+                (Permission::FullControl, Some(owner_id.as_str()), None),
+                (Permission::Read, None, Some(ALL_USERS_GROUP_URI)),
+            ],
+            "bucket ACL XML all users read grant",
+        );
+
+        let mut anon = agent()
+            .get(&format!("{}/{}", CTX.endpoint(), bucket))
+            .call()
+            .expect("anonymous bucket transport error");
+        assert_eq!(anon.status().as_u16(), 200);
+        let body = anon.body_mut().read_to_string().unwrap();
+        assert!(
+            body.contains("ListBucketResult"),
+            "expected anonymous bucket list response, got {body}"
         );
 
         cleanup(&bucket).await;
