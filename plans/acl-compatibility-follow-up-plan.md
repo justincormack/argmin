@@ -38,6 +38,7 @@ auth or ownership plans.
 
 Implemented today:
 - bucket `private`, `public-read`, and `public-read-write` canned ACLs
+- bucket `authenticated-read`
 - object `private`, `public-read`, `public-read-write`,
   `authenticated-read`, `bucket-owner-read`, and
   `bucket-owner-full-control` canned ACLs
@@ -47,10 +48,16 @@ Implemented today:
 - public access block interaction for public canned ACLs
 - bucket-owner-enforced ACL restrictions
 - explicit ACL grant headers for canonical users and group URIs
+- explicit `AuthenticatedUsers` ACL grants via XML and `x-amz-grant-*`
+- AWS-aligned explicit ACL grant persistence without implicit owner
+  `FULL_CONTROL` normalization
+- Rust conformance coverage for:
+  - bucket `authenticated-read`
+  - explicit `AuthenticatedUsers` bucket ACL XML grants
+  - explicit `AuthenticatedUsers` object header grants
+  - exact explicit-grant round-trips for bucket/object ACL write paths
 
 Missing or intentionally rejected today:
-- bucket `authenticated-read`
-- explicit `AuthenticatedUsers` ACL grants via XML or `x-amz-grant-*`
 - object `aws-exec-read`
 - `LogDelivery` grantee / `log-delivery-write` (deferred until bucket logging
   itself is in scope)
@@ -68,36 +75,17 @@ Reason:
 
 ## Confirmed Gaps
 
-### 1. Bucket `authenticated-read`
+### 1. Explicit ACL grants are exact on AWS
 
-The HTTP layer accepts `authenticated-read`, but the coordinator rejects it as
-`NotImplemented` for bucket ACL creation and update.
+AWS-backed testing for Phase 1 established an important compatibility rule:
+when callers provide an explicit ACL grant set through ACL XML or
+`x-amz-grant-*`, S3 stores that grant set as provided. It does not implicitly
+re-add owner `FULL_CONTROL`.
 
-That blocks:
-- `CreateBucket` with `x-amz-acl: authenticated-read`
-- `PutBucketAcl` with canned `authenticated-read`
-- Ceph scenarios that depend on authenticated bucket read through ACL
-- bucket-policy-status scenarios that treat authenticated-read as public
+That means explicit-grant paths must stay distinct from canned-ACL paths in the
+implementation and in the tests.
 
-This is the most obvious currently-commented ACL gap in the Rust suite.
-
-### 2. Explicit `AuthenticatedUsers` grants
-
-The ACL model already includes `AuthenticatedUsers`, and authorization already
-checks that grant for signed callers. But bucket and object ACL validation
-reject explicit `AuthenticatedUsers` grants on write.
-
-That means we currently have a read/evaluation model that is broader than the
-write model.
-
-Practical consequences:
-- ACL XML with `AuthenticatedUsers` cannot be stored
-- `x-amz-grant-*` headers targeting the `AuthenticatedUsers` group cannot be
-  stored
-- canned behavior can only cover the object path today, not the general grant
-  path
-
-### 3. `LogDelivery` grantee and `log-delivery-write`
+### 2. `LogDelivery` grantee and `log-delivery-write`
 
 The current ACL grantee model only represents:
 - canonical users
@@ -113,7 +101,7 @@ Without that modeled grantee, we cannot represent:
 - the parts of logging compatibility that depend on ACL shape rather than
   bucket policy alone
 
-### 4. Object `aws-exec-read`
+### 3. Object `aws-exec-read`
 
 `PutObjectAcl` parses `aws-exec-read`, but the coordinator returns
 `NotImplemented`.
@@ -122,7 +110,7 @@ This is part of the documented object canned ACL surface. It is less important
 than the `AuthenticatedUsers` and `LogDelivery` gaps, but it is still a known
 compatibility hole.
 
-### 5. Conformance coverage gaps
+### 4. Conformance coverage gaps
 
 Several Ceph ACL cases are still not ported into Rust, even where the current
 implementation likely already supports them.
@@ -208,6 +196,17 @@ plan explicitly excludes it.
 
 ### Phase 1: Finish `AuthenticatedUsers` ACL support
 
+Status: complete.
+
+Completed:
+- bucket canned `authenticated-read`
+- explicit `AuthenticatedUsers` group grants for bucket ACLs
+- explicit `AuthenticatedUsers` group grants for object ACLs where the
+  permission is otherwise valid
+- Rust tests for canned and explicit `AuthenticatedUsers` ACL paths
+- regression coverage for the AWS rule that explicit ACL grants do not
+  implicitly add owner `FULL_CONTROL`
+
 Deliver:
 - implement bucket canned `authenticated-read`
 - allow explicit `AuthenticatedUsers` group grants for bucket ACLs
@@ -222,6 +221,11 @@ Success criteria:
 - explicit `AuthenticatedUsers` grants round-trip through `GetBucketAcl` /
   `GetObjectAcl`
 - signed non-owner callers gain access exactly where AWS grants it
+
+Follow-up note from implementation:
+- explicit ACL inputs must round-trip exactly as provided
+- owner `FULL_CONTROL` must only appear when the caller explicitly included it
+  or when a canned ACL semantics requires it
 
 ### Phase 2: Decide and implement `aws-exec-read`
 

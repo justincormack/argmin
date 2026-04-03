@@ -6388,7 +6388,7 @@ mod tests {
     }
 
     #[test]
-    fn put_bucket_acl_rejects_authenticated_users_header_grant() {
+    fn put_bucket_acl_accepts_authenticated_users_header_grant() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
@@ -6410,19 +6410,27 @@ mod tests {
             },
             vec![],
         );
-        match fe.dispatch_routed(
+        fe.dispatch_routed(
             &put_req,
             &test_auth(),
             S3Operation::PutBucketAcl {
                 bucket: "mybucket".to_string(),
             },
-        ) {
-            Err(ServerError::NotImplemented { feature }) => {
-                assert!(feature.contains("AuthenticatedUsers"));
-            }
-            Err(e) => panic!("expected NotImplemented, got {e:?}"),
-            Ok(_) => panic!("expected NotImplemented, got Ok"),
-        }
+        )
+        .unwrap();
+
+        let get_req = new_req(http::Method::GET, "/", "acl", vec![], vec![]);
+        let resp = fe
+            .dispatch_routed(
+                &get_req,
+                &test_auth(),
+                S3Operation::GetBucketAcl {
+                    bucket: "mybucket".to_string(),
+                },
+            )
+            .unwrap();
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains(s3_types::AclGrantee::authenticated_users_uri()));
     }
 
     #[test]

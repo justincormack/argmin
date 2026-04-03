@@ -225,12 +225,20 @@ async fn run_object_header_acl_grants_case(key: &str, body: Vec<u8>) {
         Some(&alt_owner_id),
         None
     ));
-
     let owner_id = acl
         .owner()
         .and_then(|owner| owner.id())
         .expect("expected owner ID in GetObjectAcl")
         .to_string();
+    assert_eq!(
+        grants.len(),
+        4,
+        "expected exact explicit grants without implicit owner FULL_CONTROL, got {grants:?}"
+    );
+    assert!(
+        !has_grant(grants, Permission::FullControl, Some(&owner_id), None),
+        "did not expect implicit owner FULL_CONTROL grant in {grants:?}"
+    );
 
     let read = alt_get_object_eventually(&bucket, key).await;
     let read_body = read.body.collect().await.unwrap().into_bytes();
@@ -2258,5 +2266,115 @@ fn test_object_header_acl_grants_streaming_put() {
     s3_tests::run(async {
         let body = vec![0x5Au8; server_core::coordinator::INTERNAL_SEGMENT_SIZE + 1];
         run_object_header_acl_grants_case("streaming-testobj", body).await;
+    });
+}
+
+#[test]
+fn test_object_header_acl_grants_authenticated_users_read() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_acl_enabled_bucket().await;
+        let key = "auth-users-header-grant";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"authenticated-read"))
+            .customize()
+            .mutate_request(move |req| {
+                req.headers_mut().insert(
+                    "x-amz-grant-read",
+                    format!("uri=\"{}\"", AUTHENTICATED_USERS_GROUP_URI),
+                );
+            })
+            .send()
+            .await
+            .unwrap();
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_exact_grants(
+            acl.grants(),
+            &[(Permission::Read, None, Some(AUTHENTICATED_USERS_GROUP_URI))],
+            "authenticated users object ACL via header grant",
+        );
+
+        let resp = alt_get_object_eventually(&bucket, key).await;
+        let body = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), b"authenticated-read");
+
+        let mut anon = agent()
+            .get(&format!("{}/{}/{}", CTX.endpoint(), bucket, key))
+            .call()
+            .expect("anonymous GET transport error");
+        assert_eq!(anon.status().as_u16(), 403);
+        let anon_body = anon.body_mut().read_to_string().unwrap();
+        assert!(
+            anon_body.contains("AccessDenied"),
+            "expected AccessDenied for anonymous GET, got {anon_body}"
+        );
+
+        delete_all_and_bucket(client, &bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_put_object_acl_explicit_grants_do_not_add_owner_full_control() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = setup_acl_enabled_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("foo")
+            .body(ByteStream::from_static(b"bar"))
+            .send()
+            .await
+            .unwrap();
+
+        let owner_id = object_owner_id(client, &bucket, "foo").await;
+        let alt_owner_id = canonical_owner_id(alt_client).await;
+        client
+            .put_object_acl()
+            .bucket(&bucket)
+            .key("foo")
+            .access_control_policy(access_control_policy(
+                &owner_id,
+                vec![canonical_user_grant(&alt_owner_id, Permission::FullControl)],
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("foo")
+            .send()
+            .await
+            .unwrap();
+        assert_exact_grants(
+            acl.grants(),
+            &[(Permission::FullControl, Some(alt_owner_id.as_str()), None)],
+            "explicit PutObjectAcl grant without implicit owner FULL_CONTROL",
+        );
+
+        alt_client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("foo")
+            .send()
+            .await
+            .unwrap();
+
+        delete_all_and_bucket(client, &bucket, &["foo".to_string()]).await;
     });
 }

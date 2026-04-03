@@ -5591,9 +5591,10 @@ impl Coordinator {
                 grants.push(AclGrant::new(AclGrantee::AllUsers, AclPermission::Write));
             }
             BucketAcl::AuthenticatedRead => {
-                return Err(ServerError::NotImplemented {
-                    feature: "authenticated-read ACL".to_string(),
-                });
+                grants.push(AclGrant::new(
+                    AclGrantee::AuthenticatedUsers,
+                    AclPermission::Read,
+                ));
             }
         }
         Ok(AclGrants::new(grants))
@@ -5618,18 +5619,6 @@ impl Coordinator {
         AclGrants::new(grants)
     }
 
-    fn normalize_bucket_acl_grants_for_owner(
-        bucket_owner: &OwnerIdentity,
-        acl_grants: AclGrants,
-    ) -> AclGrants {
-        let mut grants: Vec<AclGrant> = acl_grants.iter().cloned().collect();
-        grants.push(AclGrant::new(
-            AclGrantee::CanonicalUser(bucket_owner.canonical_id.clone()),
-            AclPermission::FullControl,
-        ));
-        AclGrants::new(grants)
-    }
-
     fn ensure_put_bucket_acl_supported(
         bucket: &BucketSummary,
         acl: BucketAcl,
@@ -5639,11 +5628,6 @@ impl Coordinator {
         }
         if Self::blocks_public_acls(bucket.public_access_block.as_deref()) && acl.is_public() {
             return Err(ServerError::AccessDenied);
-        }
-        if matches!(acl, BucketAcl::AuthenticatedRead) {
-            return Err(ServerError::NotImplemented {
-                feature: "authenticated-read ACL".to_string(),
-            });
         }
         Ok(())
     }
@@ -5804,25 +5788,11 @@ impl Coordinator {
             PutObjectWriteAcl::Canned(acl) => {
                 Self::object_acl_grants_for_write(bucket, owner, *acl)
             }
-            PutObjectWriteAcl::Grants(acl_grants) => {
-                let mut grants: Vec<AclGrant> = acl_grants.iter().cloned().collect();
-                grants.push(AclGrant::new(
-                    AclGrantee::CanonicalUser(owner.canonical_id.clone()),
-                    AclPermission::FullControl,
-                ));
-                AclGrants::new(grants)
-            }
+            PutObjectWriteAcl::Grants(acl_grants) => acl_grants.clone(),
         }
     }
 
-    fn ensure_supported_bucket_acl_grants(acl_grants: &AclGrants) -> Result<(), ServerError> {
-        for grant in acl_grants.iter() {
-            if matches!(grant.grantee(), AclGrantee::AuthenticatedUsers) {
-                return Err(ServerError::NotImplemented {
-                    feature: "AuthenticatedUsers ACL grants".to_string(),
-                });
-            }
-        }
+    fn ensure_supported_bucket_acl_grants(_acl_grants: &AclGrants) -> Result<(), ServerError> {
         Ok(())
     }
 
@@ -5833,31 +5803,8 @@ impl Coordinator {
                     reason: "object ACLs do not support WRITE grants".to_string(),
                 });
             }
-            if matches!(grant.grantee(), AclGrantee::AuthenticatedUsers) {
-                return Err(ServerError::NotImplemented {
-                    feature: "AuthenticatedUsers ACL grants".to_string(),
-                });
-            }
         }
         Ok(())
-    }
-
-    fn normalize_bucket_acl_grants(bucket: &BucketSummary, acl_grants: AclGrants) -> AclGrants {
-        let mut grants: Vec<AclGrant> = acl_grants.iter().cloned().collect();
-        grants.push(AclGrant::new(
-            AclGrantee::CanonicalUser(bucket.owner_canonical_id.clone()),
-            AclPermission::FullControl,
-        ));
-        AclGrants::new(grants)
-    }
-
-    fn normalize_object_acl_grants(object: &StoredObject, acl_grants: AclGrants) -> AclGrants {
-        let mut grants: Vec<AclGrant> = acl_grants.iter().cloned().collect();
-        grants.push(AclGrant::new(
-            AclGrantee::CanonicalUser(object.owner().canonical_id.clone()),
-            AclPermission::FullControl,
-        ));
-        AclGrants::new(grants)
     }
 
     fn acl_grants_owner_full_control_only(
@@ -6489,7 +6436,7 @@ impl Coordinator {
             CreateBucketAcl::Canned(acl) => Self::bucket_acl_grants_from_canned(&owner, *acl)?,
             CreateBucketAcl::Grants(acl_grants) => {
                 Self::ensure_supported_bucket_acl_grants(acl_grants)?;
-                Self::normalize_bucket_acl_grants_for_owner(&owner, acl_grants.clone())
+                acl_grants.clone()
             }
         };
 
@@ -7563,7 +7510,7 @@ impl Coordinator {
                     return Err(ServerError::AccessControlListNotSupported);
                 }
                 Self::ensure_supported_bucket_acl_grants(acl_grants)?;
-                Self::normalize_bucket_acl_grants(&bucket_info, acl_grants.clone())
+                acl_grants.clone()
             }
         };
         let public_read = Self::acl_grants_public_read(&acl_grants);
@@ -7612,7 +7559,6 @@ impl Coordinator {
         acl_grants: AclGrants,
     ) -> Result<VersionId, ServerError> {
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
-        let acl_grants = Self::normalize_object_acl_grants(stored, acl_grants);
         let public_read = Self::acl_grants_public_read(&acl_grants);
         let public_write = Self::acl_grants_public_write(&acl_grants);
         if Self::blocks_public_acls(bucket_info.public_access_block.as_deref())
@@ -18262,12 +18208,6 @@ mod tests {
             &AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
             AclPermission::FullControl,
         ));
-        assert!(grants_contain(
-            &acl.acl_grants,
-            &AclGrantee::CanonicalUser(owner.canonical_user_id().clone()),
-            AclPermission::FullControl,
-        ));
-
         test_helpers::put_object(
             &coord,
             &PutObjectRequest {
@@ -22044,11 +21984,6 @@ mod tests {
             &acl.acl_grants,
             &AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
             AclPermission::ReadAcp,
-        ));
-        assert!(grants_contain(
-            &acl.acl_grants,
-            &AclGrantee::CanonicalUser(owner.canonical_user_id().clone()),
-            AclPermission::FullControl,
         ));
     }
 

@@ -599,6 +599,11 @@ fn test_bucket_header_acl_grants() {
             .expect("expected owner ID in GetBucketAcl");
         assert_canonical_owner_id(owner_id);
         let grants = acl.grants();
+        assert_eq!(
+            grants.len(),
+            5,
+            "expected exact alternate-user grants without implicit owner FULL_CONTROL, got {grants:?}"
+        );
         assert!(
             has_canonical_user_grant(grants, &alt_owner_id, Permission::Read),
             "expected READ grant for alternate owner in {grants:?}"
@@ -618,6 +623,10 @@ fn test_bucket_header_acl_grants() {
         assert!(
             has_canonical_user_grant(grants, &alt_owner_id, Permission::FullControl),
             "expected FULL_CONTROL grant for alternate owner in {grants:?}"
+        );
+        assert!(
+            !has_canonical_user_grant(grants, owner_id, Permission::FullControl),
+            "did not expect implicit owner FULL_CONTROL grant in {grants:?}"
         );
 
         alt_client
