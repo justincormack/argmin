@@ -77,8 +77,6 @@ Implemented today:
 Missing or intentionally rejected today:
 - `LogDelivery` grantee / `log-delivery-write` (deferred until bucket logging
   itself is in scope)
-- Rust conformance coverage for the remaining bucket ACL interaction cases that
-  are still only present in Ceph
 
 Out of scope:
 - email grantees / `AmazonCustomerByEmail`
@@ -132,14 +130,8 @@ That behavior is now the compatibility target for both:
 
 ### 4. Conformance coverage gaps
 
-Several Ceph ACL cases are still not ported into Rust, even where the current
-implementation likely already supports them.
-
-The largest remaining gaps are:
-- targeted ACL interaction cases that currently only exist in Ceph
-
-These are important because this codebase depends on conformance tests, not on
-implementation confidence alone.
+The previously missing Ceph-derived ACL cases are now ported into Rust for the
+AWS-relevant surface, including the bucket/object access matrix behavior.
 
 ## AWS Reference Surface
 
@@ -261,7 +253,7 @@ consumer scenarios.
 
 ### Phase 3: Port the remaining high-value Ceph ACL cases
 
-Status: in progress.
+Status: complete.
 
 Completed:
 - bucket canonical-user grant matrix in `crates/s3-tests`
@@ -275,10 +267,8 @@ Completed:
   - `WRITE_ACP`
 - create-time non-private bucket ACL rejection coverage under default
   `BucketOwnerEnforced` ownership
-
-Deliver:
-- remaining ACL interaction tests that exercise real authorization behavior,
-  not just storage shape
+- Ceph-derived bucket/object ACL interaction coverage in
+  `crates/s3-tests/tests/access_matrix.rs`
 
 Priority order:
 1. cases that prove authorization semantics
