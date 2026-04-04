@@ -151,6 +151,34 @@ fn expected_source_bucket_owner(req: &S3Request) -> Option<&str> {
     req.header("x-amz-source-expected-bucket-owner")
 }
 
+fn reject_directory_bucket_only_object_features(req: &S3Request) -> Result<(), ServerError> {
+    const DIRECTORY_BUCKET_ONLY_OBJECT_HEADERS: [&str; 6] = [
+        "x-amz-write-offset-bytes",
+        "x-amz-rename-source",
+        "x-amz-rename-source-if-match",
+        "x-amz-rename-source-if-none-match",
+        "x-amz-rename-source-if-modified-since",
+        "x-amz-rename-source-if-unmodified-since",
+    ];
+
+    if let Some(header) = DIRECTORY_BUCKET_ONLY_OBJECT_HEADERS
+        .into_iter()
+        .find(|header| req.header(header).is_some())
+    {
+        return Err(ServerError::HeaderNotImplemented {
+            header: header.to_string(),
+        });
+    }
+
+    if req.query_param_lossy("renameObject").is_some() {
+        return Err(ServerError::QueryParameterNotImplemented {
+            query_parameter: "renameObject".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 /// The HTTP frontend that handles incoming requests.
 pub struct HttpFrontend {
     pub coordinator: Coordinator,
@@ -914,6 +942,7 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::PutObject { bucket, key } => {
+                reject_directory_bucket_only_object_features(req)?;
                 if let Some(copy_source) = req.header("x-amz-copy-source") {
                     // CopyObject path
                     let (src_bucket, src_key, src_version_id_str) =
@@ -3172,6 +3201,7 @@ impl HttpFrontend {
             key
         );
         let auth = self.authenticate_with_payload_check(req, false)?;
+        reject_directory_bucket_only_object_features(req)?;
 
         let object_lock = parse_object_lock_headers(req)?;
         let checksum_state = validate_request_checksum_headers(req, false, true)?;

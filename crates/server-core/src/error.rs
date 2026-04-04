@@ -155,6 +155,12 @@ pub enum ServerError {
     #[error("not implemented: {feature}")]
     NotImplemented { feature: String },
 
+    #[error("header not implemented: {header}")]
+    HeaderNotImplemented { header: String },
+
+    #[error("query parameter not implemented: {query_parameter}")]
+    QueryParameterNotImplemented { query_parameter: String },
+
     #[error("x-amz-content-sha256 mismatch: client={client_hash}, server={server_hash}")]
     XAmzContentSHA256Mismatch {
         client_hash: String,
@@ -272,7 +278,9 @@ impl ServerError {
             Self::MissingContentLength => "MissingContentLength",
             Self::MalformedTrailerError { .. } => "MalformedTrailerError",
             Self::XAmzContentSHA256Mismatch { .. } => "XAmzContentSHA256Mismatch",
-            Self::NotImplemented { .. } => "NotImplemented",
+            Self::NotImplemented { .. }
+            | Self::HeaderNotImplemented { .. }
+            | Self::QueryParameterNotImplemented { .. } => "NotImplemented",
             Self::InternalError { .. } => "InternalError",
             Self::IntegrityError { .. } => "InternalError",
             Self::Store(_) => "InternalError",
@@ -333,7 +341,9 @@ impl ServerError {
             Self::AccessDenied => 403,
             Self::NoSuchUpload { .. } => 404,
             Self::InvalidPart { .. } | Self::InvalidPartOrder | Self::EntityTooSmall { .. } => 400,
-            Self::NotImplemented { .. } => 501,
+            Self::NotImplemented { .. }
+            | Self::HeaderNotImplemented { .. }
+            | Self::QueryParameterNotImplemented { .. } => 501,
             Self::InternalError { .. } => 500,
             Self::ObjectTooLarge { .. } => 400,
             Self::MethodNotAllowed => 405,

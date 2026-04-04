@@ -74,6 +74,28 @@ pub fn header_not_implemented_xml(header: &str, resource: &str, request_id: &str
     )
 }
 
+/// Format an S3 `NotImplemented` error that identifies the query parameter.
+#[must_use]
+pub fn query_parameter_not_implemented_xml(
+    query_parameter: &str,
+    resource: &str,
+    request_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>NotImplemented</Code>\
+         <Message>A query parameter you provided implies functionality that is not implemented</Message>\
+         <QueryParameter>{}</QueryParameter>\
+         <Resource>{}</Resource>\
+         <RequestId>{}</RequestId>\
+         </Error>",
+        xml_escape(query_parameter),
+        xml_escape(resource),
+        xml_escape(request_id),
+    )
+}
+
 /// Format a `ListAllMyBucketsResult` XML response.
 #[must_use]
 pub fn list_buckets_xml(

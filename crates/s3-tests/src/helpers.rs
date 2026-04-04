@@ -422,6 +422,19 @@ where
                 request = request.header(name, value);
             }
             request.call().expect("raw HEAD transport error")
+        } else if method == "GET" {
+            let mut request = agent
+                .get(url_str)
+                .header("Authorization", &authorization)
+                .header("x-amz-date", &amz_date)
+                .header("x-amz-content-sha256", &payload_hash);
+            for (name, value) in &request_headers {
+                if name == "host" || name == "x-amz-content-sha256" || name == "x-amz-date" {
+                    continue;
+                }
+                request = request.header(name, value);
+            }
+            request.call().expect("raw GET transport error")
         } else {
             let mut request = match method {
                 "PUT" => agent.put(url_str),

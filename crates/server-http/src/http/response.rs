@@ -1153,6 +1153,20 @@ impl S3Response {
                 let body = xml::header_not_implemented_xml("Authorization", resource, "request-id");
                 return Self::new(501).xml_body(body);
             }
+            ServerError::HeaderNotImplemented { ref header } => {
+                let body = xml::header_not_implemented_xml(header, resource, "request-id");
+                return Self::new(501).xml_body(body);
+            }
+            ServerError::QueryParameterNotImplemented {
+                ref query_parameter,
+            } => {
+                let body = xml::query_parameter_not_implemented_xml(
+                    query_parameter,
+                    resource,
+                    "request-id",
+                );
+                return Self::new(501).xml_body(body);
+            }
             ServerError::InvalidSseCustomerKeyMd5 => {
                 let body = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -1193,6 +1207,10 @@ impl S3Response {
             ServerError::InvalidBucketName { reason } => reason.as_str(),
             ServerError::MetadataBlobError { reason } => reason.as_str(),
             ServerError::NotImplemented { feature } => feature.as_str(),
+            ServerError::HeaderNotImplemented { header } => header.as_str(),
+            ServerError::QueryParameterNotImplemented { query_parameter } => {
+                query_parameter.as_str()
+            }
             ServerError::VersionNotFound { .. } => "The specified version does not exist.",
             _ => {
                 fallback = err.to_string();
