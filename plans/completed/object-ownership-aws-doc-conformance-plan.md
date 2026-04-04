@@ -166,22 +166,20 @@ Constraint clarified during this pass:
 
 ### 3. Re-run a focused AWS ownership subset
 
-Run a narrow AWS-backed ownership suite and keep the exact verified cases in
-the commit log / plan notes.
+Status: complete.
 
-Minimum AWS subset:
+Ran the narrowed AWS-backed ownership suite in `us-east-1` and it passed.
+
+Verified AWS subset:
 - `test_create_bucket_bucket_owner_enforced`
 - `test_put_bucket_ownership_bucket_owner_enforced`
 - `test_bucket_owner_enforced_acl_read_and_restore_semantics`
 - `test_bucket_owner_preferred_cross_account_object_ownership_matrix`
 - `test_object_writer_cross_account_object_ownership_matrix`
-
-Add any new targeted tests from phase 2 to this subset.
-
-Add from this pass:
 - `test_bucket_owner_enforced_rejects_remaining_canned_object_acls`
 - `test_bucket_owner_enforced_rejects_explicit_object_acl_grants`
 - `test_bucket_owner_enforced_bucket_acl_read_and_restore_semantics`
+- `test_bucket_policy_copy_object_grant_full_control`
 
 ### 4. Record any remaining intentional differences
 
@@ -197,7 +195,9 @@ then record that explicitly with:
 
 This should stay short and only cover real exceptions.
 
-Current known exception to record:
+Status: complete.
+
+Current recorded exception:
 - AWS docs still describe BOE object uploads in the stricter
   no-ACL / `bucket-owner-full-control` form, but focused AWS verification on
   the implemented general-purpose bucket surface accepted `private` and
@@ -215,3 +215,5 @@ This plan is complete when:
 
 At that point, Object Ownership compatibility should be considered closed for
 the currently implemented surface.
+
+Status: complete.
