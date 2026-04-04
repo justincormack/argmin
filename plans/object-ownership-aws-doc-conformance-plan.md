@@ -55,45 +55,114 @@ What still needs to be tightened:
   we found while fixing fallout
 - a written record of any AWS doc ambiguities or observed exceptions
 
+## Ownership Behavior Matrix
+
+Sources:
+- AWS user guide: `https://docs.aws.amazon.com/AmazonS3/latest/userguide/about-object-ownership.html`
+- AWS `CreateBucket` API: `https://docs.aws.amazon.com/AmazonS3/latest/API/API_CreateBucket.html`
+- AWS `PutObject` API: `https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutObject.html`
+- AWS `CopyObject` API: `https://docs.aws.amazon.com/AmazonS3/latest/API/API_CopyObject.html`
+- AWS `PutBucketOwnershipControls` API:
+  `https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketOwnershipControls.html`
+
+### Documented Baseline
+
+| Operation | BucketOwnerEnforced | BucketOwnerPreferred | ObjectWriter |
+| --- | --- | --- | --- |
+| `CreateBucket` | Default for new buckets. `CreateBucket` docs say any ACL on create requires choosing a non-default ownership mode first. | ACLs enabled. Bucket ACLs allowed on create. | ACLs enabled. Bucket ACLs allowed on create. |
+| `PutBucketOwnershipControls` | Enables ACL-disabled mode. Existing bucket/object ACL permissions must first be migrated and bucket ACL reset to private. | Enables ACLs. | Enables ACLs. |
+| `PutObject` | Docs say only no ACL or `bucket-owner-full-control` should be accepted. Other ACLs should fail with `AccessControlListNotSupported`. | All uploads accepted; bucket owner owns only if upload uses `bucket-owner-full-control`. | All uploads accepted; writer owns object. |
+| `CopyObject` | Docs say only no ACL or `bucket-owner-full-control` should be accepted. Other ACLs should fail. Destination object owned by bucket owner. | ACLs enabled. Ownership follows `bucket-owner-full-control` rule. | ACLs enabled. Writer/caller owns destination object. |
+| `CreateMultipartUpload` | User guide says uploads accepted are only no ACL or `bucket-owner-full-control`. | ACLs enabled. Ownership follows `bucket-owner-full-control` rule at completion. | ACLs enabled. Initiator/writer owns completed object. |
+| `PutObjectAcl` | Requests to set/update ACLs fail. | Allowed. | Allowed. |
+| `GetObjectAcl` | Supported, but ACL read should show bucket owner full control while BOE is active. | Allowed. | Allowed. |
+| `PutBucketAcl` | Requests to set/update ACLs fail. | Allowed. | Allowed. |
+| `GetBucketAcl` | Supported, but ACL read should show bucket owner full control while BOE is active. | Allowed. | Allowed. |
+
+### AWS-Observed Adjustments We Already Implement
+
+Focused AWS verification during the Ceph closeout found one important
+implemented-surface exception to the documented BOE write-path contract:
+
+| Operation | Docs say | AWS accepted in our verification |
+| --- | --- | --- |
+| `PutObject` | no ACL, `bucket-owner-full-control` | also accepted `private` and `bucket-owner-read` |
+| `CopyObject` | no ACL, `bucket-owner-full-control` | also accepted `private` and `bucket-owner-read` |
+| `CreateMultipartUpload` | no ACL, `bucket-owner-full-control` | also accepted `private` and `bucket-owner-read` |
+
+The current implementation and tests already match this narrower
+AWS-observed contract.
+
+### Current Test Coverage Against The Matrix
+
+Covered now:
+- default ownership is `BucketOwnerEnforced`
+- create / get / delete ownership controls
+- BOE create-time and update-time rejection when bucket ACL is still public
+- BOE write-path acceptance for:
+  - no ACL
+  - `bucket-owner-full-control`
+  - `private`
+  - `bucket-owner-read`
+- BOE write-path rejection for `public-read`
+- BOE rejection of `PutBucketAcl`
+- `BucketOwnerPreferred` and `ObjectWriter` cross-account ownership outcomes
+- object ACL read/restore semantics across BOE transitions
+- same-account non-owner existing and missing object discovery under BOE
+
+Still worth pinning down explicitly:
+- short written note that AWS docs still state the stricter BOE upload rule,
+  while AWS behavior for the implemented general-purpose bucket surface accepts
+  `private` and `bucket-owner-read`
+- the focused AWS rerun for the ownership subset below
+- a final note on whether any remaining doc wording should be treated as
+  ambiguous rather than normative for the implemented surface
+
 ## Work Items
 
 ### 1. Write the ownership behavior matrix
 
-Create a small checked-in matrix, derived from the AWS doc and verified tests,
-for:
-- `CreateBucket`
-- `PutBucketOwnershipControls`
-- `PutObject`
-- `CopyObject`
-- `CreateMultipartUpload`
-- `PutObjectAcl`
-- `GetObjectAcl`
-- `PutBucketAcl`
-- `GetBucketAcl`
+Status: complete.
 
-For each ownership mode, record:
-- whether ACLs are enabled, disabled, or ignored
-- which canned ACLs are accepted
-- which ACL operations must fail
-- whether ACL reads still return stored/restorable ACL state
-
-This should live in the plan itself unless it grows large enough to justify a
-guide.
+The matrix above now records:
+- the documented contract
+- the AWS-observed BOE exception on object write-style requests
+- the concrete remaining regression targets
 
 ### 2. Fill any missing implemented-surface tests
 
-Use the matrix to identify gaps in:
-- `crates/s3-tests/tests/ownership.rs`
-- `crates/s3-tests/tests/object_crud.rs`
-- `crates/s3-tests/tests/bucket_acl.rs`
-- `crates/server-core/src/coordinator.rs` regression tests
+Status: complete for the current local coverage pass.
 
-Priority cases:
-- BOE accepted canned ACL subset across all object write-style entry points
-- BOE rejected canned ACL subset across the same entry points
-- ACL read semantics under BOE after mode changes
-- same-account non-owner vs cross-account behavior where ownership mode changes
-  authorization or cloaking
+Completed in this pass:
+- BOE rejected canned ACL coverage for:
+  - `public-read-write`
+  - `authenticated-read`
+  - `aws-exec-read`
+  across:
+  - `PutObject`
+  - `CopyObject`
+  - `CreateMultipartUpload`
+- BOE rejected explicit ACL grant coverage across:
+  - `PutObject`
+  - `CopyObject`
+  - `CreateMultipartUpload`
+  - `PutObjectAcl`
+- BOE `GetBucketAcl` response coverage for owner full-control rendering
+- same-account bucket-owner-account `GetBucketAcl` regression coverage in
+  `server-core`
+
+Implementation fallout found and fixed:
+- the `CopyObject` HTTP path was only parsing `x-amz-acl` and was silently
+  ignoring `x-amz-grant-*`
+- `CopyObjectRequest` now carries `PutObjectWriteAcl`, so explicit grants are
+  enforced the same way as `PutObject` and multipart initiation
+- `GetBucketAcl` now collapses to bucket-owner full control under BOE, and BOE
+  bucket-ACL authorization ignores stored ACL grants
+
+Constraint clarified during this pass:
+- bucket ACL "restore semantics" are not a meaningful BOE transition case the
+  way object ACL restore semantics are, because AWS requires the bucket ACL to
+  be private before enabling `BucketOwnerEnforced`
 
 ### 3. Re-run a focused AWS ownership subset
 
@@ -109,6 +178,11 @@ Minimum AWS subset:
 
 Add any new targeted tests from phase 2 to this subset.
 
+Add from this pass:
+- `test_bucket_owner_enforced_rejects_remaining_canned_object_acls`
+- `test_bucket_owner_enforced_rejects_explicit_object_acl_grants`
+- `test_bucket_owner_enforced_bucket_acl_read_and_restore_semantics`
+
 ### 4. Record any remaining intentional differences
 
 If AWS behavior is:
@@ -122,6 +196,13 @@ then record that explicitly with:
 - why that is the correct compatibility contract
 
 This should stay short and only cover real exceptions.
+
+Current known exception to record:
+- AWS docs still describe BOE object uploads in the stricter
+  no-ACL / `bucket-owner-full-control` form, but focused AWS verification on
+  the implemented general-purpose bucket surface accepted `private` and
+  `bucket-owner-read` for `PutObject`, `CopyObject`, and
+  `CreateMultipartUpload`
 
 ## Exit Criteria
 

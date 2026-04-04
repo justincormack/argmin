@@ -891,6 +891,106 @@ fn test_bucket_policy_put_obj_grant_full_control() {
 }
 
 #[test]
+fn test_bucket_policy_copy_object_grant_full_control() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+        let owner_id = canonical_owner_id(client, &bucket).await;
+        let full_control_header = format!("id=\"{owner_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal.clone(),
+                    "Action": "s3:GetObject",
+                    "Resource": bucket_wildcard_resource(&bucket)
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:x-amz-grant-full-control": full_control_header
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("src")
+            .body(ByteStream::from_static(b"copy-source"))
+            .send()
+            .await
+            .unwrap();
+
+        let denied = alt_client
+            .copy_object()
+            .bucket(&bucket)
+            .key("denied")
+            .copy_source(format!("{bucket}/src"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        alt_client
+            .copy_object()
+            .bucket(&bucket)
+            .key("allowed")
+            .copy_source(format!("{bucket}/src"))
+            .customize()
+            .mutate_request({
+                let full_control_header = full_control_header.clone();
+                move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-full-control", full_control_header.clone());
+                }
+            })
+            .send()
+            .await
+            .unwrap();
+
+        let allowed_acl = alt_client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("allowed")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_grant(
+                allowed_acl.grants(),
+                Permission::FullControl,
+                Some(&owner_id),
+            ),
+            "expected FULL_CONTROL grant for bucket owner, got {:?}",
+            allowed_acl.grants()
+        );
+
+        cleanup(&bucket, &["src", "allowed", "denied"]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_obj_requires_sse_c_algorithm_header() {
     require_https_endpoint();
     s3_tests::run(async {

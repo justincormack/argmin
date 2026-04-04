@@ -933,7 +933,7 @@ impl HttpFrontend {
                     let destination_managed_encryption =
                         parse_managed_encryption_request(req, dst_sse_customer.is_some())?;
                     let object_lock = parse_object_lock_headers(req)?;
-                    let acl = parse_put_object_acl(req.header("x-amz-acl"));
+                    let acl = parse_put_object_write_acl(req)?;
                     let src_cond = copy_source_condition_from_headers(req);
                     let dst_cond = write_condition_from_headers(req)?;
                     // Parse metadata and checksum algorithm at the HTTP boundary
@@ -1001,6 +1001,14 @@ impl HttpFrontend {
                     } else {
                         TaggingDirective::Copy
                     };
+                    let policy_context = put_object_policy_context_from_request(
+                        req,
+                        replace_tags_xml.as_deref(),
+                        Some(copy_source),
+                        directive.policy_condition_value(),
+                        acl.policy_condition_value(),
+                        destination_managed_encryption,
+                    );
                     let result = self.coordinator.copy_object(&CopyObjectRequest {
                         source: CopySource {
                             bucket: &src_bucket,
@@ -1019,6 +1027,7 @@ impl HttpFrontend {
                         directive,
                         tagging,
                         acl,
+                        policy_context,
                         source_sse_customer: source_sse_customer.as_ref(),
                         destination_encryption:
                             crate::coordinator::WriteEncryptionRequest::from_request_parts(

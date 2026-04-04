@@ -133,6 +133,23 @@ fn has_grant(grants: &[Grant], permission: Permission, canonical_user_id: &str) 
     })
 }
 
+fn assert_acl_not_supported<T, E: std::fmt::Debug>(
+    result: &Result<T, aws_sdk_s3::error::SdkError<E>>,
+    context: &str,
+) {
+    match result {
+        Ok(_) => panic!("expected AccessControlListNotSupported for {context}, got Ok"),
+        Err(_) => {
+            assert_eq!(
+                err_status(result),
+                400,
+                "expected 400 AccessControlListNotSupported for {context}"
+            );
+            assert_s3_err_code(result, "AccessControlListNotSupported");
+        }
+    }
+}
+
 async fn put_object_and_assert_owner(
     bucket: &str,
     key: &str,
@@ -1151,6 +1168,139 @@ fn test_bucket_owner_preferred_cross_account_object_ownership_matrix() {
 }
 
 #[test]
+fn test_bucket_owner_enforced_rejects_remaining_canned_object_acls() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerEnforced)
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("src")
+            .body(ByteStream::from_static(b"src"))
+            .send()
+            .await
+            .unwrap();
+
+        for (suffix, acl) in [
+            ("public-read-write", ObjectCannedAcl::PublicReadWrite),
+            ("authenticated-read", ObjectCannedAcl::AuthenticatedRead),
+            ("aws-exec-read", ObjectCannedAcl::AwsExecRead),
+        ] {
+            let put_result = client
+                .put_object()
+                .bucket(&bucket)
+                .key(format!("put-{suffix}"))
+                .acl(acl.clone())
+                .body(ByteStream::from_static(b"data"))
+                .send()
+                .await;
+            assert_acl_not_supported(&put_result, &format!("PutObject {suffix}"));
+
+            let copy_result = client
+                .copy_object()
+                .bucket(&bucket)
+                .key(format!("copy-{suffix}"))
+                .copy_source(format!("{bucket}/src"))
+                .acl(acl.clone())
+                .send()
+                .await;
+            assert_acl_not_supported(&copy_result, &format!("CopyObject {suffix}"));
+
+            let mpu_result = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(format!("mpu-{suffix}"))
+                .acl(acl)
+                .send()
+                .await;
+            assert_acl_not_supported(&mpu_result, &format!("CreateMultipartUpload {suffix}"));
+        }
+
+        cleanup_keys(&bucket, &["src"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_owner_enforced_rejects_explicit_object_acl_grants() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_owner = canonical_owner_id(CTX.alt_client()).await;
+        let bucket = unique_bucket();
+        client
+            .create_bucket()
+            .bucket(&bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerEnforced)
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("src")
+            .body(ByteStream::from_static(b"src"))
+            .send()
+            .await
+            .unwrap();
+
+        let put_status = send_signed_request(
+            "PUT",
+            &format!("{}/{}/put-grant-read", CTX.endpoint(), bucket),
+            b"data",
+            &[("x-amz-grant-read", &format!("id=\"{alt_owner}\""))],
+        );
+        assert_eq!(
+            put_status, 400,
+            "expected 400 AccessControlListNotSupported for PutObject explicit grant, got {put_status}"
+        );
+
+        let copy_status = send_signed_request(
+            "PUT",
+            &format!("{}/{}/copy-grant-read", CTX.endpoint(), bucket),
+            b"",
+            &[
+                ("x-amz-copy-source", &format!("{bucket}/src")),
+                ("x-amz-grant-read", &format!("id=\"{alt_owner}\"")),
+            ],
+        );
+        assert_eq!(
+            copy_status, 400,
+            "expected 400 AccessControlListNotSupported for CopyObject explicit grant, got {copy_status}"
+        );
+
+        let mpu_status = send_signed_request(
+            "POST",
+            &format!("{}/{}/mpu-grant-read?uploads", CTX.endpoint(), bucket),
+            b"",
+            &[("x-amz-grant-read", &format!("id=\"{alt_owner}\""))],
+        );
+        assert_eq!(
+            mpu_status, 400,
+            "expected 400 AccessControlListNotSupported for CreateMultipartUpload explicit grant, got {mpu_status}"
+        );
+
+        let put_acl_status = send_signed_request(
+            "PUT",
+            &format!("{}/{}/src?acl", CTX.endpoint(), bucket),
+            b"",
+            &[("x-amz-grant-read", &format!("id=\"{alt_owner}\""))],
+        );
+        assert_eq!(
+            put_acl_status, 400,
+            "expected 400 AccessControlListNotSupported for PutObjectAcl explicit grant, got {put_acl_status}"
+        );
+
+        cleanup_keys(&bucket, &["src"]).await;
+    });
+}
+
+#[test]
 fn test_object_writer_cross_account_object_ownership_matrix() {
     s3_tests::run(async {
         run_cross_account_object_ownership_matrix(
@@ -1248,9 +1398,53 @@ fn test_bucket_owner_enforced_acl_read_and_restore_semantics() {
     });
 }
 
-// ── Helper: send a signed PUT request via raw HTTP ───────────────────
+#[test]
+fn test_bucket_owner_enforced_bucket_acl_read_and_restore_semantics() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let mut request = client
+            .create_bucket()
+            .bucket(&bucket)
+            .object_ownership(ObjectOwnership::BucketOwnerEnforced);
+        if CTX.region() != "us-east-1" {
+            let config = CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                .build();
+            request = request.create_bucket_configuration(config);
+        }
+        request.send().await.unwrap();
+        let bucket_owner = bucket_owner_id(&bucket).await;
 
-fn send_signed_put(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) -> u16 {
+        let boe_acl = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            boe_acl.owner().and_then(|owner| owner.id()),
+            Some(bucket_owner.as_str())
+        );
+        assert_eq!(boe_acl.grants().len(), 1);
+        assert!(
+            has_grant(boe_acl.grants(), Permission::FullControl, &bucket_owner),
+            "expected bucket owner FULL_CONTROL during BOE, got {:?}",
+            boe_acl.grants()
+        );
+
+        cleanup(&bucket).await;
+    });
+}
+
+// ── Helper: send a signed request via raw HTTP ───────────────────────
+
+fn send_signed_request(
+    method: &str,
+    url_str: &str,
+    body: &[u8],
+    extra_headers: &[(&str, &str)],
+) -> u16 {
     use std::time::SystemTime;
 
     let a = agent();
@@ -1307,7 +1501,7 @@ fn send_signed_put(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) -
         .collect();
 
     let canonical_request =
-        format!("PUT\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
+        format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
 
     let cr_hash = sha256_hex(canonical_request.as_bytes());
     let scope = format!("{date_stamp}/{region}/{service}/aws4_request");
@@ -1327,11 +1521,14 @@ fn send_signed_put(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) -
         "AWS4-HMAC-SHA256 Credential={access_key}/{scope}, SignedHeaders={signed_headers}, Signature={signature}"
     );
 
-    let mut request = a
-        .put(url_str)
-        .header("Authorization", &auth_header)
-        .header("x-amz-date", &dt)
-        .header("x-amz-content-sha256", &payload_hash);
+    let mut request = match method {
+        "PUT" => a.put(url_str),
+        "POST" => a.post(url_str),
+        other => panic!("unsupported method for signed request helper: {other}"),
+    }
+    .header("Authorization", &auth_header)
+    .header("x-amz-date", &dt)
+    .header("x-amz-content-sha256", &payload_hash);
 
     for (k, v) in extra_headers {
         request = request.header(*k, *v);
@@ -1339,6 +1536,10 @@ fn send_signed_put(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) -
 
     let resp = request.send(body).expect("transport error");
     resp.status().as_u16()
+}
+
+fn send_signed_put(url_str: &str, body: &[u8], extra_headers: &[(&str, &str)]) -> u16 {
+    send_signed_request("PUT", url_str, body, extra_headers)
 }
 
 fn sha256_hex(data: &[u8]) -> String {

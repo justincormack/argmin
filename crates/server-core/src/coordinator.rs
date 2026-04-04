@@ -1291,7 +1291,7 @@ pub enum MetadataDirective<'a> {
 
 impl MetadataDirective<'_> {
     #[must_use]
-    const fn policy_condition_value(&self) -> Option<&'static str> {
+    pub const fn policy_condition_value(&self) -> Option<&'static str> {
         match self {
             Self::Copy => None,
             Self::CopyExplicit => Some("COPY"),
@@ -1415,7 +1415,8 @@ pub struct CopyObjectRequest<'a> {
     pub dst_condition: &'a WriteCondition,
     pub directive: MetadataDirective<'a>,
     pub tagging: TaggingDirective<'a>,
-    pub acl: PutObjectAcl<'a>,
+    pub acl: PutObjectWriteAcl<'a>,
+    pub policy_context: PutObjectPolicyContext<'a>,
     pub source_sse_customer: Option<&'a SseCustomerRequest>,
     pub destination_encryption: WriteEncryptionRequest<'a>,
     pub object_lock: ObjectLockState,
@@ -4290,6 +4291,11 @@ impl Coordinator {
     }
 
     fn requester_can_read_bucket_acl(requester: &Requester, bucket: &BucketSummary) -> bool {
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+            return Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+                || Self::requester_is_bucket_owner_account(requester, bucket);
+        }
+
         Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
             || Self::requester_has_acl_permission(
                 requester,
@@ -4299,6 +4305,11 @@ impl Coordinator {
     }
 
     fn requester_can_write_bucket_acl(requester: &Requester, bucket: &BucketSummary) -> bool {
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+            return Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+                || Self::requester_is_bucket_owner_account(requester, bucket);
+        }
+
         Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
             || Self::requester_has_acl_permission(
                 requester,
@@ -7503,6 +7514,17 @@ impl Coordinator {
         if !Self::requester_can_read_bucket_acl(&req.requester, &bucket) {
             return Err(ServerError::AccessDenied);
         }
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+            let owner = Self::bucket_owner_identity(&bucket);
+            return Ok(GetBucketAclResult {
+                owner_principal: owner.principal,
+                owner_canonical_id: owner.canonical_id.clone(),
+                acl_grants: AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::CanonicalUser(owner.canonical_id),
+                    AclPermission::FullControl,
+                )]),
+            });
+        }
         Ok(GetBucketAclResult {
             owner_principal: bucket.owner_principal,
             owner_canonical_id: bucket.owner_canonical_id,
@@ -9972,7 +9994,7 @@ impl Coordinator {
         let dst_cond = req.dst_condition;
         let directive = &req.directive;
         let requester = &req.destination.bucket.requester;
-        let acl = req.acl;
+        let acl = req.acl.clone();
         let source_sse_customer = req.source_sse_customer;
         let dst_explicit_sse_customer = self.prepare_sse_customer_write_context(
             req.destination_encryption.sse_customer_request(),
@@ -9991,14 +10013,26 @@ impl Coordinator {
         );
         let metadata_directive = req.directive.policy_condition_value();
         let canned_acl = acl.policy_condition_value();
-
-        let dst_policy_context =
-            req.destination_encryption
-                .with_policy_context(PutObjectPolicyContext::new(
-                    Some(copy_source_policy_value.as_str()),
-                    metadata_directive,
-                    canned_acl,
-                ));
+        let request_object_tags_xml = match &req.tagging {
+            TaggingDirective::Copy => None,
+            TaggingDirective::Replace(tags) => *tags,
+        };
+        let copy_policy_context = PutObjectPolicyContext::new(
+            Some(copy_source_policy_value.as_str()),
+            metadata_directive,
+            canned_acl,
+        )
+        .with_acl_grant_headers(
+            req.policy_context.grant_read,
+            req.policy_context.grant_write,
+            req.policy_context.grant_read_acp,
+            req.policy_context.grant_write_acp,
+            req.policy_context.grant_full_control,
+        )
+        .with_request_object_tags_xml(request_object_tags_xml);
+        let dst_policy_context = req
+            .destination_encryption
+            .with_policy_context(copy_policy_context);
         let dst_bucket_info = self.authorize_put_object_requester(
             requester,
             dst_bucket,
@@ -10007,7 +10041,7 @@ impl Coordinator {
             req.expected_bucket_owner(),
         )?;
 
-        Self::ensure_put_object_acl_supported(&dst_bucket_info, acl)?;
+        Self::ensure_put_object_write_acl_supported(&dst_bucket_info, &acl)?;
 
         // Phase 1: Snapshot source metadata and prepare a read handle.
         let (src_metadata, src_system_metadata, src_tags, mut source_body) = {
@@ -10198,13 +10232,9 @@ impl Coordinator {
             } => Some(StreamingChecksumAccumulator::new(*algo)),
             _ => None,
         };
-        let session_policy =
-            req.destination_encryption
-                .with_policy_context(PutObjectPolicyContext::new(
-                    Some(copy_source_policy_value.as_str()),
-                    metadata_directive,
-                    canned_acl,
-                ));
+        let session_policy = req
+            .destination_encryption
+            .with_policy_context(copy_policy_context);
         let session_id = self.begin_stream_put(&BeginStreamPutRequest {
             object: ObjectRequest::new(
                 dst_bucket,
@@ -10212,7 +10242,7 @@ impl Coordinator {
                 requester.clone(),
                 req.expected_bucket_owner(),
             ),
-            acl: acl.into(),
+            acl: acl.clone(),
             policy: session_policy,
             encryption: req.destination_encryption,
             object_lock: req.object_lock,
@@ -10288,19 +10318,10 @@ impl Coordinator {
                 write_encryption: dst_write_encryption.as_ref(),
                 tags: tags.as_deref(),
                 cond: dst_cond,
-                acl: acl.into(),
-                policy_context: PutObjectPolicyContext::new(
-                    Some(copy_source_policy_value.as_str()),
-                    metadata_directive,
-                    acl.policy_condition_value(),
-                )
-                .with_managed_encryption(req.destination_encryption.explicit_managed_encryption())
-                .with_sse_customer_algorithm(
-                    req.destination_encryption
-                        .sse_customer_request()
-                        .map(SseCustomerRequest::algorithm),
-                )
-                .with_request_object_tags_xml(tags.as_deref()),
+                acl: acl.clone(),
+                policy_context: req
+                    .destination_encryption
+                    .with_policy_context(copy_policy_context),
                 requested_object_lock: req.object_lock,
             })?;
 
@@ -18317,6 +18338,57 @@ mod tests {
     }
 
     #[test]
+    fn get_bucket_acl_bucket_owner_enforced_allows_same_account_owner_view() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let bucket_owner = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            CanonicalUserId::from_principal("bucket-owner-acl-canonical"),
+            "Bucket Owner",
+        );
+        let same_account_user = AccountIdentity::new(
+            "arn:aws:iam::111122223333:user/reader",
+            CanonicalUserId::from_principal("bucket-same-account-acl-canonical"),
+            "Same Account Reader",
+        );
+        let owner_requester = Requester::authenticated(bucket_owner.clone());
+        let same_account_requester = Requester::authenticated(same_account_user);
+
+        create_bucket_for_owner_with_flags(
+            &coord,
+            bucket_owner.principal(),
+            bucket_owner.canonical_user_id(),
+            "bucket",
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        put_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+
+        let boe_acl = get_bucket_acl_test(&coord, "bucket", same_account_requester, None).unwrap();
+        assert_eq!(
+            boe_acl.owner_canonical_id,
+            bucket_owner.canonical_user_id().clone()
+        );
+        assert_eq!(boe_acl.acl_grants.iter().count(), 1);
+        assert!(boe_acl.acl_grants.iter().any(|grant| {
+            grant
+                == &AclGrant::new(
+                    AclGrantee::CanonicalUser(bucket_owner.canonical_user_id().clone()),
+                    AclPermission::FullControl,
+                )
+        }));
+    }
+
+    #[test]
     fn create_bucket_rejects_explicit_private_with_owner_enforced() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -22664,7 +22736,8 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
 
-                acl: PutObjectAcl::None,
+                acl: PutObjectAcl::None.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -22700,7 +22773,8 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
 
-                acl: PutObjectAcl::None,
+                acl: PutObjectAcl::None.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -22788,7 +22862,8 @@ mod tests {
                 directive: MetadataDirective::CopyExplicit,
                 tagging: TaggingDirective::Copy,
 
-                acl: PutObjectAcl::None,
+                acl: PutObjectAcl::None.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -22808,7 +22883,8 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
 
-                acl: PutObjectAcl::None,
+                acl: PutObjectAcl::None.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -25723,6 +25799,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -25785,6 +25862,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: Some(&sse_customer),
                 destination_encryption: WriteEncryptionRequest::managed(
                     ManagedEncryptionAlgorithm::Aes256,
@@ -25860,6 +25938,7 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::sse_customer(&sse_customer),
                 object_lock: ObjectLockState::default(),
@@ -25952,6 +26031,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26020,6 +26100,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26115,6 +26196,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26201,6 +26283,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: PutObjectAcl::PublicRead.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26258,6 +26341,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: PutObjectAcl::PublicRead.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26312,6 +26396,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26388,6 +26473,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26471,6 +26557,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26543,6 +26630,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26616,6 +26704,7 @@ mod tests {
                 tagging: TaggingDirective::Replace(Some(dst_tags)),
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26696,6 +26785,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26778,6 +26868,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26849,6 +26940,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26903,6 +26995,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -26961,6 +27054,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -27034,6 +27128,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -27107,6 +27202,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -27188,6 +27284,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -28363,7 +28460,8 @@ mod tests {
                 directive: MetadataDirective::Copy,
                 tagging: TaggingDirective::Copy,
 
-                acl: PutObjectAcl::None,
+                acl: PutObjectAcl::None.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState {
@@ -29558,6 +29656,7 @@ mod tests {
                     tagging: TaggingDirective::Copy,
 
                     acl: NO_PUT_OBJECT_ACL.into(),
+                    policy_context: PutObjectPolicyContext::default(),
                     source_sse_customer: None,
                     destination_encryption: WriteEncryptionRequest::none(),
                     object_lock: ObjectLockState::default(),
@@ -30250,6 +30349,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -34106,6 +34206,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -34440,6 +34541,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
@@ -36284,6 +36386,7 @@ mod tests {
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
                 source_sse_customer: None,
                 destination_encryption: WriteEncryptionRequest::none(),
                 object_lock: ObjectLockState::default(),
