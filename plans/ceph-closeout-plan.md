@@ -65,25 +65,38 @@ Follow-up verification:
 
 ### 2. Bucket recreate / ACL parity ports
 
-These look like closeout test gaps rather than large product gaps.
+Status: implemented.
 
-Remaining Ceph cases to account for:
+Completed Ceph cases:
 - `test_bucket_recreate_overwrite_acl`
 - `test_bucket_recreate_new_acl`
 - `test_bucket_recreate_not_overriding`
 - `test_bucket_concurrent_set_canned_acl`
 
 Current state:
-- general same-owner recreate and delete-then-recreate behavior is already
-  covered in `crates/s3-tests/tests/bucket_crud.rs`
-- bucket ACL compatibility itself is now broadly covered in
-  `crates/s3-tests/tests/bucket_acl.rs`
-- what remains is the narrow recreate/concurrency subset above
-
-Deliver:
-- port these cases directly where they still add distinct behavior coverage
-- if one of them is already fully implied by existing tests, document that and
-  close it explicitly instead of duplicating it silently
+- `crates/s3-tests/tests/bucket_crud.rs` now covers same-owner recreate object
+  preservation, recreate ACL overwrite, valid recreate with new canonical-user
+  ACL grants, rejection of `CreateBucket` public ACL requests, and the
+  region-specific `BucketAlreadyOwnedByYou` branch outside `us-east-1`
+- `crates/s3-tests/tests/bucket_acl.rs` now covers concurrent canned ACL
+  updates
+- `server-core` now matches AWS CreateBucket semantics for same-owner existing
+  buckets:
+  - `us-east-1`: `200 OK`, preserve contents, allow ACL reset for otherwise
+    valid requests
+  - other regions: `409 BucketAlreadyOwnedByYou`
+- AWS-backed verification now covers:
+  - `us-east-1` recreate with explicit canonical-user grants
+  - `us-east-1` recreate with `public-read` returning
+    `InvalidBucketAclWithBlockPublicAccessError`
+  - `us-west-2` same-owner CreateBucket
+  - `us-west-2` recreate with the same explicit-grant request returning
+    `BucketAlreadyOwnedByYou`
+  - `us-west-2` recreate with `public-read` returning
+    `InvalidBucketAclWithBlockPublicAccessError`
+- the external `s3-tests` setup now creates its distinct-owner probe buckets
+  with the configured region's `LocationConstraint`, so multi-region AWS runs
+  work correctly
 
 ### 3. Versioning concurrent create/remove ports
 
@@ -96,8 +109,6 @@ Completed Ceph cases:
 Current state:
 - both concurrency races are now ported in
   `crates/s3-tests/tests/versioning.rs`
-- versioning closeout work is now down to the remaining bucket recreate / ACL
-  subset
 
 ## Not Remaining For This Plan
 
@@ -109,10 +120,94 @@ These should not stay on the closeout list:
 - bucket-policy owner-root self-deny / root carveout behavior
 - encryption rows that belong to `plans/encryption-compat-plan.md`
 
-## Recommended Order
+## AWS Verification Fallout
 
-1. Close the bucket recreate / ACL subset, either by porting or by explicitly
-   documenting when an existing Rust test already covers the same behavior.
+The AWS-backed closeout pass surfaced a few important corrections that were not
+obvious from the earlier Ceph-porting work alone.
+
+### 1. Concurrent bucket ACL updates are not a strict all-success contract
+
+Ceph's concurrent canned-ACL case is useful coverage, but AWS may return
+`409 OperationAborted` when multiple `PutBucketAcl` requests race on the same
+bucket.
+
+Implication:
+- the test contract should accept either:
+  - success
+  - `409 OperationAborted`
+- while still asserting that at least one request succeeds and that the final
+  ACL state is correct
+- the local server does not need to emulate a timing-dependent propagation or
+  async internal-control-plane path just to force this exact transient
+  response
+
+### 2. BOE accepted canned-ACL subset was misread during the first ownership pass
+
+The first pass over the Object Ownership documentation treated
+`BucketOwnerEnforced` as allowing only:
+- no ACL
+- `bucket-owner-full-control`
+
+Focused AWS verification showed that both:
+- `private`
+- `bucket-owner-read`
+
+are also accepted for object write-style requests on BOE buckets in the cases
+we exercise here.
+
+Implication:
+- BOE regression tests must not assert `AccessControlListNotSupported` for
+  `private` or `bucket-owner-read`
+- the implementation should match AWS's actual accepted canned-ACL subset, not
+  the stricter interpretation from the initial doc read
+
+### 3. The ownership test helper initially used invalid bucket-policy actions
+
+The first cross-account ownership helper attempted to authorize multipart flows
+with bucket-policy actions such as:
+- `s3:CreateMultipartUpload`
+- `s3:UploadPart`
+- `s3:CompleteMultipartUpload`
+
+AWS rejects those policy actions as invalid.
+
+Implication:
+- the test helper must use the real bucket-policy action surface and keep
+  multipart-specific authorization expectations separate from object-ownership
+  expectations
+- AWS verification was necessary here because the invalid helper shape would
+  have looked fine against a too-permissive local implementation
+
+### 4. The local `bucket_acl` slowdown exposed a test-harness issue, not a
+product need to serialize
+
+The `bucket_acl` binary hanging under parallelism was initially tempting to
+work around by serialization, but that would have hidden the signal.
+
+What actually happened:
+- an aggressive anonymous-GET retry/timeout helper made the failure easier to
+  trigger but was not the right fix
+- the local embedded test server was configured with a lower connection cap
+  than the production default, which amplified connection pressure in this test
+  binary
+
+Implication:
+- keep parallel execution; it is valuable for surfacing these issues
+- prefer fixing harness/runtime mismatches and bad assumptions rather than
+  weakening the test runner
+
+### 5. Closeout work needs explicit AWS verification, not just Ceph parity
+
+The net result of this batch is that the closeout process itself found
+behavioral corrections outside the original Ceph gap list.
+
+Conclusion:
+- Ceph parity is no longer the only useful closeout signal
+- focused AWS verification should remain part of any final closeout pass for:
+  - ACLs
+  - ownership controls
+  - region-specific create/recreate behavior
+  - concurrency-sensitive control-plane cases
 
 ## Exit Criteria
 
@@ -124,3 +219,8 @@ This closeout plan is complete when:
   - bucket logging
   - encryption areas still tracked separately
   - the root-principal bucket-policy carveout plan
+
+Status: complete. Ceph closeout is done for implemented S3 behavior, excluding:
+- bucket logging
+- encryption areas still tracked separately
+- the root-principal bucket-policy carveout plan

@@ -88,7 +88,7 @@ impl HttpTestContext {
 }
 
 pub fn test_agent() -> ureq::Agent {
-    build_test_agent(CTX.endpoint(), None)
+    build_test_agent(CTX.endpoint(), None, std::time::Duration::from_secs(30))
 }
 
 pub fn unique_bucket() -> String {

@@ -9,6 +9,12 @@ pub enum ServerError {
     #[error("bucket already exists")]
     BucketAlreadyExists,
 
+    #[error("bucket already owned by you")]
+    BucketAlreadyOwnedByYou,
+
+    #[error("bucket ACL cannot be public when block public access is enabled")]
+    InvalidBucketAclWithBlockPublicAccessError,
+
     #[error("bucket not empty")]
     BucketNotEmpty,
 
@@ -194,6 +200,10 @@ impl ServerError {
         match self {
             Self::BucketNotFound { .. } => "NoSuchBucket",
             Self::BucketAlreadyExists => "BucketAlreadyExists",
+            Self::BucketAlreadyOwnedByYou => "BucketAlreadyOwnedByYou",
+            Self::InvalidBucketAclWithBlockPublicAccessError => {
+                "InvalidBucketAclWithBlockPublicAccessError"
+            }
             Self::BucketNotEmpty => "BucketNotEmpty",
             Self::ObjectNotFound { .. } => "NoSuchKey",
             Self::VersionNotFound { .. } => "NoSuchVersion",
@@ -276,6 +286,8 @@ impl ServerError {
         match self {
             Self::BucketNotFound { .. } => 404,
             Self::BucketAlreadyExists => 409,
+            Self::BucketAlreadyOwnedByYou => 409,
+            Self::InvalidBucketAclWithBlockPublicAccessError => 400,
             Self::BucketNotEmpty => 409,
             Self::ObjectNotFound { .. } => 404,
             Self::VersionNotFound { .. } => 404,
@@ -626,8 +638,17 @@ mod tests {
     #[test]
     fn http_status_409() {
         assert_eq!(ServerError::BucketAlreadyExists.http_status(), 409);
+        assert_eq!(ServerError::BucketAlreadyOwnedByYou.http_status(), 409);
         assert_eq!(ServerError::BucketNotEmpty.http_status(), 409);
         assert_eq!(ServerError::InvalidBucketState.http_status(), 409);
+    }
+
+    #[test]
+    fn http_status_invalid_bucket_acl_with_block_public_access() {
+        assert_eq!(
+            ServerError::InvalidBucketAclWithBlockPublicAccessError.http_status(),
+            400
+        );
     }
 
     #[test]

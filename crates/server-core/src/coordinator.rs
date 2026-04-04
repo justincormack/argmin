@@ -1615,7 +1615,7 @@ impl PutObjectAcl<'_> {
     const fn is_supported_with_bucket_owner_enforced(self) -> bool {
         matches!(
             self,
-            Self::None | Self::Private | Self::BucketOwnerFullControl
+            Self::None | Self::Private | Self::BucketOwnerRead | Self::BucketOwnerFullControl
         )
     }
 
@@ -4279,7 +4279,9 @@ impl Coordinator {
         bucket: &BucketSummary,
         object: &StoredObject,
     ) -> bool {
-        requester.principal_opt() == Some(object.owner().principal.as_str())
+        (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+            && Self::requester_is_bucket_owner_account(requester, bucket))
+            || requester.principal_opt() == Some(object.owner().principal.as_str())
             || object.acl_grants().is_some_and(|grants| {
                 Self::requester_has_acl_permission(requester, grants, AclPermission::Read)
             })
@@ -4307,10 +4309,12 @@ impl Coordinator {
 
     fn requester_can_read_object_acl(
         requester: &Requester,
-        _bucket: &BucketSummary,
+        bucket: &BucketSummary,
         object: &StoredObject,
     ) -> bool {
-        requester.principal_opt() == Some(object.owner().principal.as_str())
+        (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+            && Self::requester_is_bucket_owner_account(requester, bucket))
+            || requester.principal_opt() == Some(object.owner().principal.as_str())
             || object.acl_grants().is_some_and(|grants| {
                 Self::requester_has_acl_permission(requester, grants, AclPermission::ReadAcp)
             })
@@ -4318,10 +4322,12 @@ impl Coordinator {
 
     fn requester_can_write_object_acl(
         requester: &Requester,
-        _bucket: &BucketSummary,
+        bucket: &BucketSummary,
         object: &StoredObject,
     ) -> bool {
-        requester.principal_opt() == Some(object.owner().principal.as_str())
+        (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+            && Self::requester_is_bucket_owner_account(requester, bucket))
+            || requester.principal_opt() == Some(object.owner().principal.as_str())
             || object.acl_grants().is_some_and(|grants| {
                 Self::requester_has_acl_permission(requester, grants, AclPermission::WriteAcp)
             })
@@ -4356,6 +4362,28 @@ impl Coordinator {
             return false;
         };
         Self::principal_account_id(&bucket.owner_principal) == Some(requester_account_id)
+    }
+
+    fn requester_can_discover_missing_object(
+        requester: &Requester,
+        bucket: &BucketSummary,
+    ) -> bool {
+        Self::requester_can_read_bucket(
+            requester,
+            &bucket.owner_principal,
+            &bucket.acl_grants,
+            Self::effective_public_read(bucket),
+        ) || (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+            && Self::requester_is_bucket_owner_account(requester, bucket))
+    }
+
+    fn requester_can_discover_missing_object_acl(
+        requester: &Requester,
+        bucket: &BucketSummary,
+    ) -> bool {
+        Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+            || (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+                && Self::requester_is_bucket_owner_account(requester, bucket))
     }
 
     fn requester_can_manage_multipart_upload(
@@ -5866,7 +5894,7 @@ impl Coordinator {
     ) -> Result<(BucketSummary, LockedReadObject<'a>), ServerError> {
         let bucket_info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
         let can_discover_missing =
-            Self::requester_can_bucket_admin(requester, &bucket_info.owner_principal);
+            Self::requester_can_discover_missing_object_acl(requester, &bucket_info);
         let bucket_policy = match authorization {
             ObjectAclAuthorization::ReadWithPolicy(_) => self.cached_bucket_policy(&bucket_info)?,
             ObjectAclAuthorization::Write => None,
@@ -6016,12 +6044,7 @@ impl Coordinator {
         expected_bucket_owner: Option<&str>,
     ) -> Result<LockedReadObject<'a>, ServerError> {
         let bucket_info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
-        let can_read_bucket = Self::requester_can_read_bucket(
-            requester,
-            &bucket_info.owner_principal,
-            &bucket_info.acl_grants,
-            Self::effective_public_read(&bucket_info),
-        );
+        let can_read_bucket = Self::requester_can_discover_missing_object(requester, &bucket_info);
         let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
             Ok(locked) => locked,
             Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
@@ -6049,12 +6072,7 @@ impl Coordinator {
         expected_bucket_owner: Option<&str>,
     ) -> Result<LockedReadObject<'a>, ServerError> {
         let bucket_info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
-        let can_read_bucket = Self::requester_can_read_bucket(
-            requester,
-            &bucket_info.owner_principal,
-            &bucket_info.acl_grants,
-            Self::effective_public_read(&bucket_info),
-        );
+        let can_read_bucket = Self::requester_can_discover_missing_object(requester, &bucket_info);
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
             Ok(locked) => locked,
@@ -6440,6 +6458,9 @@ impl Coordinator {
                 acl_grants.clone()
             }
         };
+        if Self::acl_grants_public_read(&acl_grants) || Self::acl_grants_public_write(&acl_grants) {
+            return Err(ServerError::InvalidBucketAclWithBlockPublicAccessError);
+        }
 
         let create_outcome = self.create_bucket_with_acl_grants(
             &owner,
@@ -6458,7 +6479,15 @@ impl Coordinator {
                     config: &Self::ownership_controls_xml(req.ownership),
                 })
             }
-            BucketCreateOutcome::AlreadyOwned => Ok(()),
+            BucketCreateOutcome::AlreadyOwned => {
+                if self.region != "us-east-1" {
+                    return Err(ServerError::BucketAlreadyOwnedByYou);
+                }
+                let existing = self.active_bucket_summary(req.name, None)?;
+                let resolved =
+                    self.resolve_create_bucket_recreate_acl_update(&existing, &owner, &req.acl)?;
+                self.apply_bucket_acl_update(req.name, &resolved)
+            }
         }
     }
 
@@ -6537,6 +6566,40 @@ impl Coordinator {
             }
             Err(other) => Err(ServerError::Metadata(other)),
         }
+    }
+
+    fn resolve_create_bucket_recreate_acl_update(
+        &self,
+        bucket: &BucketSummary,
+        owner: &OwnerIdentity,
+        acl: &CreateBucketAcl,
+    ) -> Result<ResolvedBucketAclUpdate, ServerError> {
+        let acl_grants = match acl {
+            CreateBucketAcl::DefaultPrivate => Self::owner_full_control_grants(owner),
+            CreateBucketAcl::Canned(acl) => {
+                Self::ensure_put_bucket_acl_supported(bucket, *acl)?;
+                Self::bucket_acl_grants_from_canned(owner, *acl)?
+            }
+            CreateBucketAcl::Grants(acl_grants) => {
+                if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+                    return Err(ServerError::AccessControlListNotSupported);
+                }
+                Self::ensure_supported_bucket_acl_grants(acl_grants)?;
+                acl_grants.clone()
+            }
+        };
+        let public_read = Self::acl_grants_public_read(&acl_grants);
+        let public_write = Self::acl_grants_public_write(&acl_grants);
+        if Self::blocks_public_acls(bucket.public_access_block.as_deref())
+            && (public_read || public_write)
+        {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(ResolvedBucketAclUpdate {
+            acl_grants,
+            public_read,
+            public_write,
+        })
     }
 
     pub fn delete_bucket(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
@@ -7459,27 +7522,7 @@ impl Coordinator {
             }
         );
         let resolved = self.resolve_put_bucket_acl_update(req)?;
-        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
-        bucket_pg
-            .put_bucket_acl(
-                req.bucket.name,
-                &resolved.acl_grants,
-                resolved.public_read,
-                resolved.public_write,
-            )
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
-                info.acl_grants = resolved.acl_grants.clone();
-                info.public_read = resolved.public_read;
-                info.public_write = resolved.public_write;
-            });
-        Ok(())
+        self.apply_bucket_acl_update(req.bucket.name, &resolved)
     }
 
     pub fn validate_put_bucket_acl_request(
@@ -7526,6 +7569,34 @@ impl Coordinator {
             public_read,
             public_write,
         })
+    }
+
+    fn apply_bucket_acl_update(
+        &self,
+        bucket_name: &str,
+        resolved: &ResolvedBucketAclUpdate,
+    ) -> Result<(), ServerError> {
+        let bucket_pg = self.get_bucket_pg(bucket_name)?;
+        bucket_pg
+            .put_bucket_acl(
+                bucket_name,
+                &resolved.acl_grants,
+                resolved.public_read,
+                resolved.public_write,
+            )
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.storage_node
+            .update_bucket_fast_path_if_present(bucket_name, |info| {
+                info.acl_grants = resolved.acl_grants.clone();
+                info.public_read = resolved.public_read;
+                info.public_write = resolved.public_write;
+            });
+        Ok(())
     }
 
     /// Loads the raw bucket CORS configuration for HTTP CORS evaluation.
@@ -8102,7 +8173,7 @@ impl Coordinator {
             req.object.key,
             req.version_id
         );
-        let (_bucket_info, locked) = self.lock_object_for_authorized_acl(
+        let (bucket_info, locked) = self.lock_object_for_authorized_acl(
             req.object.requester(),
             req.object.bucket_name(),
             req.object.key,
@@ -8114,6 +8185,18 @@ impl Coordinator {
         )?;
         let LockedReadObject { record: stored, .. } = locked;
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
+            let owner = Self::bucket_owner_identity(&bucket_info);
+            return Ok(GetObjectAclResult {
+                owner_principal: owner.principal,
+                owner_canonical_id: owner.canonical_id.clone(),
+                acl_grants: AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::CanonicalUser(owner.canonical_id),
+                    AclPermission::FullControl,
+                )]),
+                version_id: live.version_id,
+            });
+        }
         Ok(GetObjectAclResult {
             owner_principal: live.owner.principal.clone(),
             owner_canonical_id: live.owner.canonical_id.clone(),
@@ -13890,6 +13973,20 @@ mod tests {
         setup_coordinator_with_pg_count(dir, 4)
     }
 
+    fn setup_coordinator_in_region(dir: &Path, region: &str) -> Coordinator {
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
+        let ec_config = EcConfig::new(4, 2).unwrap();
+        Coordinator::new_with_managed_key_provider(
+            storage_node,
+            ec_config,
+            region.to_string(),
+            None,
+            test_sse_s3_provider(),
+        )
+        .unwrap()
+    }
+
     fn setup_coordinator_with_pg_count(dir: &Path, pg_count: u32) -> Coordinator {
         let pg_ids: Vec<u32> = (0..pg_count).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
@@ -14912,6 +15009,90 @@ mod tests {
             })
             .unwrap();
         assert_eq!(buckets.len(), 1);
+    }
+
+    #[test]
+    fn create_bucket_idempotent_in_us_east_1_resets_acl() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: test_helpers::requester("owner-a"),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+        put_bucket_canned_acl_test(
+            &coord,
+            "bucket",
+            BucketAcl::PublicRead,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: test_helpers::requester("owner-a"),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+
+        let acl = get_bucket_acl_test(&coord, "bucket", test_helpers::requester("owner-a"), None)
+            .unwrap();
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::CanonicalUser(CanonicalUserId::from_principal("owner-a")),
+            AclPermission::FullControl,
+        ));
+        assert!(!grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::AllUsers,
+            AclPermission::Read,
+        ));
+
+        let controls = get_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(controls.contains("<ObjectOwnership>ObjectWriter</ObjectOwnership>"));
+        assert!(!controls.contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>"));
+    }
+
+    #[test]
+    fn create_bucket_same_owner_non_us_east_1_returns_bucket_already_owned_by_you() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator_in_region(tmp.path(), "us-west-2");
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: test_helpers::requester("default-owner"),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+        let err = coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: test_helpers::requester("default-owner"),
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::BucketAlreadyOwnedByYou));
     }
 
     #[test]
@@ -18086,6 +18267,26 @@ mod tests {
         assert!(matches!(
             err,
             ServerError::InvalidBucketAclWithObjectOwnership
+        ));
+    }
+
+    #[test]
+    fn create_bucket_rejects_public_read_with_object_writer() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        let err = coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: test_helpers::requester("owner-a"),
+                acl: CreateBucketAcl::Canned(BucketAcl::PublicRead),
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::InvalidBucketAclWithBlockPublicAccessError
         ));
     }
 
@@ -23822,6 +24023,156 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn bucket_owner_enforced_same_account_non_owner_can_discover_missing_object_and_acl() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let bucket_owner = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            CanonicalUserId::from_principal("bucket-owner-canonical"),
+            "Bucket Owner",
+        );
+        let same_account_user = AccountIdentity::new(
+            "arn:aws:iam::111122223333:user/reader",
+            CanonicalUserId::from_principal("same-account-reader-canonical"),
+            "Same Account Reader",
+        );
+        let owner_requester = Requester::authenticated(bucket_owner.clone());
+        let same_account_requester = Requester::authenticated(same_account_user);
+
+        create_bucket_for_owner_with_flags(
+            &coord,
+            bucket_owner.principal(),
+            bucket_owner.canonical_user_id(),
+            "bucket",
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+        put_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+
+        let current = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    same_account_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(object.body.read_all().unwrap(), b"data");
+
+        get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            same_account_requester.clone(),
+            None,
+        )
+        .unwrap();
+
+        let missing_object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "missing",
+                    None,
+                    same_account_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap_err();
+        assert!(matches!(missing_object, ServerError::ObjectNotFound { .. }));
+
+        let missing_acl = get_object_acl_test(
+            &coord,
+            "bucket",
+            "missing",
+            None,
+            same_account_requester.clone(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(missing_acl, ServerError::ObjectNotFound { .. }));
+
+        let missing_version = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(VersionId::from_u64(current.version_id.to_u64() + 1000)),
+                    same_account_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            missing_version,
+            ServerError::VersionNotFound { .. }
+        ));
+
+        let missing_acl_version = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(VersionId::from_u64(current.version_id.to_u64() + 1000)),
+            same_account_requester,
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            missing_acl_version,
+            ServerError::VersionNotFound { .. }
+        ));
     }
 
     #[test]

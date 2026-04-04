@@ -15,6 +15,23 @@ const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUse
 const AUTHENTICATED_USERS_GROUP_URI: &str =
     "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
 
+fn sdk_err_status<E: std::fmt::Debug>(err: &aws_sdk_s3::error::SdkError<E>) -> u16 {
+    err.raw_response()
+        .map(|response| response.status().as_u16())
+        .unwrap_or_else(|| panic!("error has no raw HTTP response: {err:?}"))
+}
+
+fn assert_sdk_err_code<E: std::fmt::Debug>(
+    err: &aws_sdk_s3::error::SdkError<E>,
+    expected_code: &str,
+) {
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains(expected_code),
+        "expected error code '{expected_code}' in error: {msg}"
+    );
+}
+
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
@@ -45,7 +62,22 @@ async fn setup_acl_enabled_bucket() -> String {
 
 async fn cleanup(bucket: &str) {
     let client = CTX.client();
-    client.delete_bucket().bucket(bucket).send().await.unwrap();
+    for attempt in 0..20 {
+        let result = client.delete_bucket().bucket(bucket).send().await;
+        match result {
+            Ok(_) => return,
+            Err(err) => {
+                if sdk_err_status(&err) == 409 {
+                    assert_sdk_err_code(&err, "OperationAborted");
+                    if attempt < 19 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
+                }
+                panic!("delete bucket cleanup failed: {err:?}");
+            }
+        }
+    }
 }
 
 async fn cleanup_object_if_present(bucket: &str, key: &str) {
@@ -53,8 +85,16 @@ async fn cleanup_object_if_present(bucket: &str, key: &str) {
     let _ = client.delete_object().bucket(bucket).key(key).send().await;
 }
 
-fn agent() -> ureq::Agent {
-    s3_tests::test_agent()
+async fn anonymous_get(url: &str) -> ureq::http::Response<ureq::Body> {
+    let url = url.to_string();
+    tokio::task::spawn_blocking(move || s3_tests::test_agent().get(&url).call())
+        .await
+        .expect("anonymous GET task join")
+        .unwrap_or_else(|err| panic!("anonymous bucket transport error: {err}"))
+}
+
+fn run_bucket_acl_test<F: std::future::Future>(future: F) -> F::Output {
+    s3_tests::run(future)
 }
 
 fn has_grant(
@@ -284,7 +324,7 @@ async fn assert_alt_put_bucket_acl_denied(bucket: &str) {
 /// Matches Ceph: test_bucket_acl_default
 #[test]
 fn test_bucket_acl_default() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let bucket = setup_bucket().await;
 
         let resp = CTX
@@ -316,7 +356,7 @@ fn test_bucket_acl_default() {
 /// Matches Ceph: test_bucket_acl_canned
 #[test]
 fn test_bucket_acl_canned_public_read() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let client = CTX.client();
         let bucket = setup_acl_enabled_bucket().await;
 
@@ -360,7 +400,7 @@ fn test_bucket_acl_canned_public_read() {
 ///
 #[test]
 fn test_bucket_acl_canned_authenticated_read() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = setup_acl_enabled_bucket().await;
@@ -408,7 +448,7 @@ fn test_bucket_acl_canned_authenticated_read() {
 
 #[test]
 fn test_create_bucket_acl_canned_authenticated_read_rejected_with_default_ownership() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let client = CTX.client();
         let bucket = unique_bucket();
 
@@ -425,7 +465,7 @@ fn test_create_bucket_acl_canned_authenticated_read_rejected_with_default_owners
 
 #[test]
 fn test_bucket_acl_grant_authenticated_users_read_via_xml() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = setup_acl_enabled_bucket().await;
@@ -469,10 +509,7 @@ fn test_bucket_acl_grant_authenticated_users_read_via_xml() {
             .await
             .unwrap();
 
-        let mut anon = agent()
-            .get(&format!("{}/{}", CTX.endpoint(), bucket))
-            .call()
-            .expect("anonymous bucket transport error");
+        let mut anon = anonymous_get(&format!("{}/{}", CTX.endpoint(), bucket)).await;
         assert_eq!(anon.status().as_u16(), 403);
         let body = anon.body_mut().read_to_string().unwrap();
         assert!(
@@ -486,7 +523,7 @@ fn test_bucket_acl_grant_authenticated_users_read_via_xml() {
 
 #[test]
 fn test_put_bucket_acl_grant_all_users_read_via_xml() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let client = CTX.client();
         let bucket = setup_acl_enabled_bucket().await;
         let owner_id = bucket_owner_id(&bucket).await;
@@ -522,10 +559,7 @@ fn test_put_bucket_acl_grant_all_users_read_via_xml() {
             "bucket ACL XML all users read grant",
         );
 
-        let mut anon = agent()
-            .get(&format!("{}/{}", CTX.endpoint(), bucket))
-            .call()
-            .expect("anonymous bucket transport error");
+        let mut anon = anonymous_get(&format!("{}/{}", CTX.endpoint(), bucket)).await;
         assert_eq!(anon.status().as_u16(), 200);
         let body = anon.body_mut().read_to_string().unwrap();
         assert!(
@@ -539,7 +573,7 @@ fn test_put_bucket_acl_grant_all_users_read_via_xml() {
 
 #[test]
 fn test_bucket_acl_grant_canonical_user_full_control() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let client = CTX.client();
         let bucket = setup_acl_enabled_bucket().await;
         let owner_id = bucket_owner_id(&bucket).await;
@@ -592,7 +626,7 @@ fn test_bucket_acl_grant_canonical_user_full_control() {
 
 #[test]
 fn test_bucket_acl_grant_canonical_user_read() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let bucket = setup_acl_enabled_bucket().await;
         let owner_id = bucket_owner_id(&bucket).await;
         let alt_owner_id = alt_canonical_owner_id().await;
@@ -612,7 +646,7 @@ fn test_bucket_acl_grant_canonical_user_read() {
 
 #[test]
 fn test_bucket_acl_grant_canonical_user_read_acp() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let bucket = setup_acl_enabled_bucket().await;
         let owner_id = bucket_owner_id(&bucket).await;
         let alt_owner_id = alt_canonical_owner_id().await;
@@ -632,7 +666,7 @@ fn test_bucket_acl_grant_canonical_user_read_acp() {
 
 #[test]
 fn test_bucket_acl_grant_canonical_user_write() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let bucket = setup_acl_enabled_bucket().await;
         let owner_id = bucket_owner_id(&bucket).await;
         let alt_owner_id = alt_canonical_owner_id().await;
@@ -652,7 +686,7 @@ fn test_bucket_acl_grant_canonical_user_write() {
 
 #[test]
 fn test_bucket_acl_grant_canonical_user_write_acp() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let bucket = setup_acl_enabled_bucket().await;
         let owner_id = bucket_owner_id(&bucket).await;
         let alt_owner_id = alt_canonical_owner_id().await;
@@ -675,7 +709,7 @@ fn test_bucket_acl_grant_canonical_user_write_acp() {
 /// Matches Ceph: test_bucket_acl_canned_private_to_private
 #[test]
 fn test_bucket_acl_canned_private_to_private() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let client = CTX.client();
         let bucket = setup_acl_enabled_bucket().await;
 
@@ -711,12 +745,71 @@ fn test_bucket_acl_canned_private_to_private() {
     });
 }
 
+#[test]
+fn test_bucket_concurrent_set_canned_acl() {
+    run_bucket_acl_test(async {
+        let bucket = setup_acl_enabled_bucket().await;
+        let mut tasks = Vec::new();
+
+        for _ in 0..50 {
+            let client = CTX.client().clone();
+            let bucket = bucket.clone();
+            tasks.push(tokio::spawn(async move {
+                client
+                    .put_bucket_acl()
+                    .bucket(&bucket)
+                    .acl(BucketCannedAcl::PublicRead)
+                    .send()
+                    .await
+            }));
+        }
+
+        let mut success_count = 0usize;
+        for task in tasks {
+            match task.await.unwrap() {
+                Ok(_) => success_count += 1,
+                Err(err) => {
+                    assert_eq!(sdk_err_status(&err), 409);
+                    assert_sdk_err_code(&err, "OperationAborted");
+                }
+            }
+        }
+        assert!(
+            success_count > 0,
+            "expected at least one PutBucketAcl to succeed"
+        );
+
+        let acl = CTX
+            .client()
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let owner_id = acl
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected owner ID in GetBucketAcl")
+            .to_string();
+        assert_exact_grants(
+            acl.grants(),
+            &[
+                (Permission::FullControl, Some(owner_id.as_str()), None),
+                (Permission::Read, None, Some(ALL_USERS_GROUP_URI)),
+            ],
+            "concurrent public-read bucket ACL",
+        );
+
+        cleanup(&bucket).await;
+    });
+}
+
 /// Grant by nonexistent canonical user ID returns 400 InvalidArgument.
 ///
 /// Matches Ceph: test_bucket_acl_grant_nonexist_user
 #[test]
 fn test_bucket_acl_grant_nonexist_user() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let client = CTX.client();
         let bucket = setup_acl_enabled_bucket().await;
         let owner_id = bucket_owner_id(&bucket).await;
@@ -752,7 +845,7 @@ fn test_bucket_acl_grant_nonexist_user() {
 /// Matches Ceph: test_bucket_acl_revoke_all
 #[test]
 fn test_bucket_acl_revoke_all() {
-    s3_tests::run(async {
+    run_bucket_acl_test(async {
         let client = CTX.client();
         let bucket = setup_acl_enabled_bucket().await;
         let owner_id = bucket_owner_id(&bucket).await;

@@ -1,5 +1,11 @@
-use aws_sdk_s3::types::{BucketCannedAcl, ObjectCannedAcl, ObjectOwnership};
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{
+    BucketCannedAcl, BucketLocationConstraint, CompletedMultipartUpload, CompletedPart,
+    CreateBucketConfiguration, Grant, ObjectCannedAcl, ObjectOwnership, OwnershipControls,
+    OwnershipControlsRule, Permission,
+};
 use s3_tests::{assert_s3_err_code, create_public_write_bucket, err_status, unique_bucket, CTX};
+use serde_json::json;
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> ureq::Agent {
@@ -10,6 +16,213 @@ fn agent() -> ureq::Agent {
 async fn cleanup(bucket: &str) {
     let client = CTX.client();
     client.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+async fn create_bucket_in_test_region(client: &aws_sdk_s3::Client, bucket: &str) {
+    let mut request = client.create_bucket().bucket(bucket);
+    if CTX.region() != "us-east-1" {
+        let config = CreateBucketConfiguration::builder()
+            .location_constraint(BucketLocationConstraint::from(CTX.region()))
+            .build();
+        request = request.create_bucket_configuration(config);
+    }
+    request.send().await.unwrap();
+}
+
+async fn set_bucket_ownership(bucket: &str, ownership: ObjectOwnership) {
+    let rule = OwnershipControlsRule::builder()
+        .object_ownership(ownership)
+        .build()
+        .unwrap();
+    let controls = OwnershipControls::builder().rules(rule).build().unwrap();
+    CTX.client()
+        .put_bucket_ownership_controls()
+        .bucket(bucket)
+        .ownership_controls(controls)
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn delete_bucket_ownership(bucket: &str) {
+    CTX.client()
+        .delete_bucket_ownership_controls()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn put_alt_object_access_policy(bucket: &str) {
+    let policy = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "AllowAltObjectOwnershipExercises",
+            "Effect": "Allow",
+            "Principal": { "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) },
+            "Action": [
+                "s3:GetObject",
+                "s3:GetObjectAcl",
+                "s3:PutObject",
+                "s3:PutObjectAcl",
+                "s3:AbortMultipartUpload"
+            ],
+            "Resource": format!("arn:aws:s3:::{bucket}/*")
+        }]
+    });
+
+    CTX.client()
+        .put_bucket_policy()
+        .bucket(bucket)
+        .policy(policy.to_string())
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn bucket_owner_id(bucket: &str) -> String {
+    CTX.client()
+        .get_bucket_acl()
+        .bucket(bucket)
+        .send()
+        .await
+        .unwrap()
+        .owner()
+        .and_then(|owner| owner.id())
+        .expect("expected owner ID in GetBucketAcl")
+        .to_string()
+}
+
+async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
+    let bucket = unique_bucket();
+    create_bucket_in_test_region(client, &bucket).await;
+    let owner_id = client
+        .get_bucket_acl()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap()
+        .owner()
+        .and_then(|owner| owner.id())
+        .expect("expected owner ID in GetBucketAcl")
+        .to_string();
+    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    owner_id
+}
+
+async fn object_owner_id(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> String {
+    client
+        .get_object_acl()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap()
+        .owner()
+        .and_then(|owner| owner.id())
+        .expect("expected owner ID in GetObjectAcl")
+        .to_string()
+}
+
+fn has_grant(grants: &[Grant], permission: Permission, canonical_user_id: &str) -> bool {
+    grants.iter().any(|grant| {
+        grant.permission() == Some(&permission)
+            && grant
+                .grantee()
+                .is_some_and(|grantee| grantee.id() == Some(canonical_user_id))
+    })
+}
+
+async fn put_object_and_assert_owner(
+    bucket: &str,
+    key: &str,
+    acl: Option<ObjectCannedAcl>,
+    expected_owner_id: &str,
+) {
+    let alt = CTX.alt_client();
+    let mut request = alt
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"data"));
+    if let Some(acl) = acl {
+        request = request.acl(acl);
+    }
+    request.send().await.unwrap();
+
+    assert_eq!(object_owner_id(alt, bucket, key).await, expected_owner_id);
+}
+
+async fn complete_single_part_multipart_and_assert_owner(
+    bucket: &str,
+    key: &str,
+    acl: Option<ObjectCannedAcl>,
+    expected_owner_id: &str,
+) {
+    let alt = CTX.alt_client();
+    let mut create = alt.create_multipart_upload().bucket(bucket).key(key);
+    if let Some(acl) = acl {
+        create = create.acl(acl);
+    }
+    let upload = create.send().await.unwrap();
+    let upload_id = upload.upload_id().expect("expected upload ID");
+
+    let part = alt
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .part_number(1)
+        .body(ByteStream::from_static(b"data"))
+        .send()
+        .await
+        .unwrap();
+    let etag = part.e_tag().expect("expected upload part ETag");
+    let completed = CompletedMultipartUpload::builder()
+        .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
+        .build();
+    alt.complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(upload_id)
+        .multipart_upload(completed)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(object_owner_id(alt, bucket, key).await, expected_owner_id);
+}
+
+async fn copy_object_and_assert_owner(
+    bucket: &str,
+    src_key: &str,
+    dst_key: &str,
+    acl: Option<ObjectCannedAcl>,
+    expected_owner_id: &str,
+) {
+    let alt = CTX.alt_client();
+    let mut request = alt
+        .copy_object()
+        .bucket(bucket)
+        .key(dst_key)
+        .copy_source(format!("{bucket}/{src_key}"));
+    if let Some(acl) = acl {
+        request = request.acl(acl);
+    }
+    request.send().await.unwrap();
+
+    assert_eq!(
+        object_owner_id(alt, bucket, dst_key).await,
+        expected_owner_id
+    );
+}
+
+async fn create_bucket_with_alt_object_access(ownership: ObjectOwnership) -> String {
+    let bucket = unique_bucket();
+    create_bucket_in_test_region(CTX.client(), &bucket).await;
+    set_bucket_ownership(&bucket, ownership).await;
+    put_alt_object_access_policy(&bucket).await;
+    bucket
 }
 
 // ── test_create_bucket_no_ownership_controls ────────────────────────
@@ -219,47 +432,52 @@ fn test_create_bucket_bucket_owner_enforced() {
             ObjectOwnership::BucketOwnerEnforced
         );
 
-        // PutObject without ACL should succeed
         client
             .put_object()
             .bucket(&bucket)
             .key("put-object-no-acl")
-            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
+            .body(ByteStream::from_static(b"data"))
             .send()
             .await
             .unwrap();
-
-        // PutObject with bucket-owner-full-control should succeed
         client
             .put_object()
             .bucket(&bucket)
             .key("put-object-bofc")
             .acl(ObjectCannedAcl::BucketOwnerFullControl)
-            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
+            .body(ByteStream::from_static(b"data"))
             .send()
             .await
             .unwrap();
-
-        // PutObject with ACL=private should succeed (private is compatible with BOE)
-        client
+        let _put_private = client
             .put_object()
             .bucket(&bucket)
             .key("put-object-private")
             .acl(ObjectCannedAcl::Private)
-            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        let put_public = client
+            .put_object()
+            .bucket(&bucket)
+            .key("put-object-public")
+            .acl(ObjectCannedAcl::PublicRead)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await;
+        assert_eq!(err_status(&put_public), 400);
+        assert_s3_err_code(&put_public, "AccessControlListNotSupported");
+        let _put_bucket_owner_read = client
+            .put_object()
+            .bucket(&bucket)
+            .key("put-object-bor")
+            .acl(ObjectCannedAcl::BucketOwnerRead)
+            .body(ByteStream::from_static(b"data"))
             .send()
             .await
             .unwrap();
 
-        // PutObject with ACL=public-read should fail
-        let obj_url3 = format!("{}/{}/put-object-public", CTX.endpoint(), bucket);
-        let status = send_signed_put(&obj_url3, b"data", &[("x-amz-acl", "public-read")]);
-        assert_eq!(
-            status, 400,
-            "PutObject with ACL=public-read should fail under BOE, got {status}"
-        );
-
-        // CopyObject without ACL should succeed
         client
             .copy_object()
             .bucket(&bucket)
@@ -268,9 +486,16 @@ fn test_create_bucket_bucket_owner_enforced() {
             .send()
             .await
             .unwrap();
-
-        // CopyObject with ACL=private should succeed (private is compatible with BOE)
         client
+            .copy_object()
+            .bucket(&bucket)
+            .key("copy-object-bofc")
+            .copy_source(format!("{}/put-object-no-acl", bucket))
+            .acl(ObjectCannedAcl::BucketOwnerFullControl)
+            .send()
+            .await
+            .unwrap();
+        let _copy_private = client
             .copy_object()
             .bucket(&bucket)
             .key("copy-object-private")
@@ -279,40 +504,109 @@ fn test_create_bucket_bucket_owner_enforced() {
             .send()
             .await
             .unwrap();
+        let copy_public = client
+            .copy_object()
+            .bucket(&bucket)
+            .key("copy-object-public")
+            .copy_source(format!("{}/put-object-no-acl", bucket))
+            .acl(ObjectCannedAcl::PublicRead)
+            .send()
+            .await;
+        assert_eq!(err_status(&copy_public), 400);
+        assert_s3_err_code(&copy_public, "AccessControlListNotSupported");
+        let _copy_bucket_owner_read = client
+            .copy_object()
+            .bucket(&bucket)
+            .key("copy-object-bor")
+            .copy_source(format!("{}/put-object-no-acl", bucket))
+            .acl(ObjectCannedAcl::BucketOwnerRead)
+            .send()
+            .await
+            .unwrap();
 
-        // CopyObject with ACL=public-read should fail
-        let copy_url2 = format!("{}/{}/copy-object-public", CTX.endpoint(), bucket);
-        let status = send_signed_put(
-            &copy_url2,
-            b"",
-            &[
-                ("x-amz-acl", "public-read"),
-                (
-                    "x-amz-copy-source",
-                    &format!("{}/put-object-no-acl", bucket),
-                ),
-            ],
-        );
-        assert_eq!(
-            status, 400,
-            "CopyObject with ACL=public-read should fail under BOE, got {status}"
-        );
+        let mpu_no_acl = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("mpu-no-acl")
+            .send()
+            .await
+            .unwrap();
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("mpu-no-acl")
+            .upload_id(mpu_no_acl.upload_id().unwrap())
+            .send()
+            .await
+            .unwrap();
+        let mpu_bofc = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("mpu-bofc")
+            .acl(ObjectCannedAcl::BucketOwnerFullControl)
+            .send()
+            .await
+            .unwrap();
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("mpu-bofc")
+            .upload_id(mpu_bofc.upload_id().unwrap())
+            .send()
+            .await
+            .unwrap();
+        let mpu_private = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("mpu-private")
+            .acl(ObjectCannedAcl::Private)
+            .send()
+            .await
+            .unwrap();
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("mpu-private")
+            .upload_id(mpu_private.upload_id().unwrap())
+            .send()
+            .await
+            .unwrap();
+        let mpu_bucket_owner_read = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("mpu-bor")
+            .acl(ObjectCannedAcl::BucketOwnerRead)
+            .send()
+            .await
+            .unwrap();
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("mpu-bor")
+            .upload_id(mpu_bucket_owner_read.upload_id().unwrap())
+            .send()
+            .await
+            .unwrap();
 
-        // PutBucketAcl private should fail (all PutBucketAcl rejected under BOE)
-        let acl_url = format!("{}/{}?acl", CTX.endpoint(), bucket);
-        let status = send_signed_put(&acl_url, b"", &[("x-amz-acl", "private")]);
-        assert_eq!(
-            status, 400,
-            "PutBucketAcl private should fail under BOE, got {status}"
-        );
+        let put_bucket_acl = client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .acl(BucketCannedAcl::Private)
+            .send()
+            .await;
+        assert_eq!(err_status(&put_bucket_acl), 400);
+        assert_s3_err_code(&put_bucket_acl, "AccessControlListNotSupported");
 
         // Cleanup objects
         for key in [
             "put-object-no-acl",
             "put-object-bofc",
             "put-object-private",
+            "put-object-bor",
             "copy-object-no-acl",
+            "copy-object-bofc",
             "copy-object-private",
+            "copy-object-bor",
         ] {
             client
                 .delete_object()
@@ -526,13 +820,12 @@ fn test_put_bucket_ownership_bucket_owner_enforced() {
             .await
             .unwrap();
 
-        // PutObject with ACL=private should succeed (private is compatible with BOE)
-        client
+        let _put_private = client
             .put_object()
             .bucket(&bucket)
             .key("put-object-private")
             .acl(ObjectCannedAcl::Private)
-            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
+            .body(ByteStream::from_static(b"data"))
             .send()
             .await
             .unwrap();
@@ -545,8 +838,7 @@ fn test_put_bucket_ownership_bucket_owner_enforced() {
             "PutObject with ACL=public-read should fail under BOE, got {status}"
         );
 
-        // CopyObject with ACL=private should succeed (private is compatible with BOE)
-        client
+        let _copy_private = client
             .copy_object()
             .bucket(&bucket)
             .key("copy-object-private")
@@ -715,6 +1007,244 @@ fn test_put_bucket_ownership_object_writer() {
         assert_eq!(rules[0].object_ownership, ObjectOwnership::ObjectWriter);
 
         cleanup(&bucket).await;
+    });
+}
+
+async fn cleanup_keys(bucket: &str, keys: &[&str]) {
+    let client = CTX.client();
+    for key in keys {
+        let _ = client.delete_object().bucket(bucket).key(*key).send().await;
+    }
+    cleanup(bucket).await;
+}
+
+async fn run_cross_account_object_ownership_matrix(
+    ownership: ObjectOwnership,
+    expected_no_acl_owner_is_bucket_owner: bool,
+    expected_bofc_owner_is_bucket_owner: bool,
+    expected_private_owner_is_bucket_owner: bool,
+) {
+    let client = CTX.client();
+    let alt = CTX.alt_client();
+    let bucket = create_bucket_with_alt_object_access(ownership).await;
+    let bucket_owner = bucket_owner_id(&bucket).await;
+    let alt_owner = canonical_owner_id(alt).await;
+
+    client
+        .put_object()
+        .bucket(&bucket)
+        .key("src")
+        .body(ByteStream::from_static(b"src"))
+        .send()
+        .await
+        .unwrap();
+
+    let expected_no_acl_owner = if expected_no_acl_owner_is_bucket_owner {
+        bucket_owner.as_str()
+    } else {
+        alt_owner.as_str()
+    };
+    let expected_bofc_owner = if expected_bofc_owner_is_bucket_owner {
+        bucket_owner.as_str()
+    } else {
+        alt_owner.as_str()
+    };
+    let expected_private_owner = if expected_private_owner_is_bucket_owner {
+        bucket_owner.as_str()
+    } else {
+        alt_owner.as_str()
+    };
+
+    put_object_and_assert_owner(&bucket, "put-no-acl", None, expected_no_acl_owner).await;
+    put_object_and_assert_owner(
+        &bucket,
+        "put-bofc",
+        Some(ObjectCannedAcl::BucketOwnerFullControl),
+        expected_bofc_owner,
+    )
+    .await;
+    put_object_and_assert_owner(
+        &bucket,
+        "put-private",
+        Some(ObjectCannedAcl::Private),
+        expected_private_owner,
+    )
+    .await;
+
+    complete_single_part_multipart_and_assert_owner(
+        &bucket,
+        "mpu-no-acl",
+        None,
+        expected_no_acl_owner,
+    )
+    .await;
+    complete_single_part_multipart_and_assert_owner(
+        &bucket,
+        "mpu-bofc",
+        Some(ObjectCannedAcl::BucketOwnerFullControl),
+        expected_bofc_owner,
+    )
+    .await;
+    complete_single_part_multipart_and_assert_owner(
+        &bucket,
+        "mpu-private",
+        Some(ObjectCannedAcl::Private),
+        expected_private_owner,
+    )
+    .await;
+
+    copy_object_and_assert_owner(&bucket, "src", "copy-no-acl", None, expected_no_acl_owner).await;
+    copy_object_and_assert_owner(
+        &bucket,
+        "src",
+        "copy-bofc",
+        Some(ObjectCannedAcl::BucketOwnerFullControl),
+        expected_bofc_owner,
+    )
+    .await;
+    copy_object_and_assert_owner(
+        &bucket,
+        "src",
+        "copy-private",
+        Some(ObjectCannedAcl::Private),
+        expected_private_owner,
+    )
+    .await;
+
+    alt.put_object_acl()
+        .bucket(&bucket)
+        .key("put-no-acl")
+        .acl(ObjectCannedAcl::Private)
+        .send()
+        .await
+        .unwrap();
+
+    cleanup_keys(
+        &bucket,
+        &[
+            "src",
+            "put-no-acl",
+            "put-bofc",
+            "put-private",
+            "mpu-no-acl",
+            "mpu-bofc",
+            "mpu-private",
+            "copy-no-acl",
+            "copy-bofc",
+            "copy-private",
+        ],
+    )
+    .await;
+}
+
+#[test]
+fn test_bucket_owner_preferred_cross_account_object_ownership_matrix() {
+    s3_tests::run(async {
+        run_cross_account_object_ownership_matrix(
+            ObjectOwnership::BucketOwnerPreferred,
+            false,
+            true,
+            false,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_object_writer_cross_account_object_ownership_matrix() {
+    s3_tests::run(async {
+        run_cross_account_object_ownership_matrix(
+            ObjectOwnership::ObjectWriter,
+            false,
+            false,
+            false,
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_bucket_owner_enforced_acl_read_and_restore_semantics() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt = CTX.alt_client();
+        let bucket = create_bucket_with_alt_object_access(ObjectOwnership::ObjectWriter).await;
+        let bucket_owner = bucket_owner_id(&bucket).await;
+        let alt_owner = canonical_owner_id(alt).await;
+
+        alt.put_object()
+            .bucket(&bucket)
+            .key("pre-boe")
+            .body(ByteStream::from_static(b"before"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(object_owner_id(alt, &bucket, "pre-boe").await, alt_owner);
+
+        set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
+
+        let boe_acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("pre-boe")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            boe_acl.owner().and_then(|owner| owner.id()),
+            Some(bucket_owner.as_str())
+        );
+        assert_eq!(boe_acl.grants().len(), 1);
+        assert!(
+            has_grant(boe_acl.grants(), Permission::FullControl, &bucket_owner),
+            "expected bucket owner FULL_CONTROL during BOE, got {:?}",
+            boe_acl.grants()
+        );
+
+        let body = client
+            .get_object()
+            .bucket(&bucket)
+            .key("pre-boe")
+            .send()
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(&body[..], b"before");
+
+        alt.put_object()
+            .bucket(&bucket)
+            .key("during-boe")
+            .body(ByteStream::from_static(b"during"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            object_owner_id(client, &bucket, "during-boe").await,
+            bucket_owner
+        );
+
+        delete_bucket_ownership(&bucket).await;
+
+        assert_eq!(object_owner_id(alt, &bucket, "pre-boe").await, alt_owner);
+        assert_eq!(
+            object_owner_id(client, &bucket, "during-boe").await,
+            bucket_owner
+        );
+
+        let result = client
+            .get_object()
+            .bucket(&bucket)
+            .key("pre-boe")
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
+        assert_s3_err_code(&result, "AccessDenied");
+
+        cleanup_keys(&bucket, &["pre-boe", "during-boe"]).await;
     });
 }
 

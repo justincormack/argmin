@@ -16,10 +16,14 @@ fn test_list_buckets_anonymous() {
     run_local(async {
         let server = TestServer::start().await;
         let url = format!("{}/", server.endpoint());
-        let mut resp = build_test_agent(server.endpoint(), server.tls_ca_pem())
-            .get(&url)
-            .call()
-            .expect("transport error");
+        let mut resp = build_test_agent(
+            server.endpoint(),
+            server.tls_ca_pem(),
+            std::time::Duration::from_secs(5),
+        )
+        .get(&url)
+        .call()
+        .expect("transport error");
         let status = resp.status().as_u16();
         let body = resp.body_mut().read_to_string().unwrap();
         assert_eq!(

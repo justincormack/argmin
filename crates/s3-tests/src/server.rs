@@ -28,6 +28,8 @@ const TEST_TLS_KEY_PEM: &[u8] = include_bytes!("../testdata/localhost-key.pem");
 /// All frontends share one `SharedStorageNode` (PG access serialized by mutex).
 /// This controls the parallelism level for request processing.
 const POOL_SIZE: usize = 4;
+const TEST_MAX_CONNECTIONS: u32 = 512;
+const TEST_MAX_INFLIGHT_REQUESTS: u32 = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TestServerTransport {
@@ -196,8 +198,8 @@ impl TestServer {
             TestServerTransport::Http => tokio::spawn(server_http::http::serve::serve(
                 listener,
                 frontends,
-                64,
-                32,
+                TEST_MAX_CONNECTIONS,
+                TEST_MAX_INFLIGHT_REQUESTS,
                 server_http::http::serve::ServeConfig::default(),
             )),
             TestServerTransport::Https => {
@@ -206,8 +208,8 @@ impl TestServer {
                     listener,
                     tls_acceptor,
                     frontends,
-                    64,
-                    32,
+                    TEST_MAX_CONNECTIONS,
+                    TEST_MAX_INFLIGHT_REQUESTS,
                     server_http::http::serve::ServeConfig::default(),
                 ))
             }

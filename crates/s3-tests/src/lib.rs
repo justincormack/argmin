@@ -18,6 +18,7 @@ pub use server::TestServer;
 
 use std::sync::LazyLock;
 
+use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use aws_sdk_s3::Client;
 use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider, TlsContext, TrustStore};
 use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
@@ -120,8 +121,14 @@ impl TestContext {
             let client = build_client(&endpoint, &access_key, &secret_key, &region).await;
             let alt_client =
                 build_client(&endpoint, &alt_access_key, &alt_secret_key, &region).await;
-            assert_distinct_external_s3_owners(&client, &alt_client, &account_id, &alt_account_id)
-                .await;
+            assert_distinct_external_s3_owners(
+                &client,
+                &alt_client,
+                &account_id,
+                &alt_account_id,
+                &region,
+            )
+            .await;
             TestContext {
                 client,
                 alt_client,
@@ -278,6 +285,7 @@ async fn assert_distinct_external_s3_owners(
     alt_client: &Client,
     account_id: &str,
     alt_account_id: &str,
+    region: &str,
 ) {
     assert_ne!(
         account_id, alt_account_id,
@@ -285,15 +293,12 @@ async fn assert_distinct_external_s3_owners(
     );
 
     let primary_bucket = unique_bucket();
-    client
-        .create_bucket()
-        .bucket(&primary_bucket)
-        .send()
+    create_bucket_in_region(client, &primary_bucket, region)
         .await
         .expect("create primary probe bucket for external s3-tests setup");
 
     let alt_bucket = unique_bucket();
-    if let Err(err) = alt_client.create_bucket().bucket(&alt_bucket).send().await {
+    if let Err(err) = create_bucket_in_region(alt_client, &alt_bucket, region).await {
         let _ = client.delete_bucket().bucket(&primary_bucket).send().await;
         panic!("create alternate probe bucket for external s3-tests setup: {err:?}");
     }
@@ -340,15 +345,39 @@ async fn assert_distinct_external_s3_owners(
     );
 }
 
+async fn create_bucket_in_region(
+    client: &Client,
+    bucket: &str,
+    region: &str,
+) -> Result<(), aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>>
+{
+    let mut request = client.create_bucket().bucket(bucket);
+    if region != "us-east-1" {
+        let config = CreateBucketConfiguration::builder()
+            .location_constraint(BucketLocationConstraint::from(region))
+            .build();
+        request = request.create_bucket_configuration(config);
+    }
+    request.send().await.map(|_| ())
+}
+
 pub fn test_agent() -> ureq::Agent {
+    test_agent_with_timeout(configured_test_timeout())
+}
+
+pub fn test_agent_with_timeout(timeout: std::time::Duration) -> ureq::Agent {
     build_test_agent(
         CTX.endpoint(),
         CTX._server.as_ref().and_then(TestServer::tls_ca_pem),
+        timeout,
     )
 }
 
-pub fn build_test_agent(endpoint: &str, tls_ca_pem: Option<&[u8]>) -> ureq::Agent {
-    let timeout = configured_test_timeout();
+pub fn build_test_agent(
+    endpoint: &str,
+    tls_ca_pem: Option<&[u8]>,
+    timeout: std::time::Duration,
+) -> ureq::Agent {
     let mut builder = ureq::config::Config::builder()
         .http_status_as_error(false)
         .timeout_global(Some(timeout));

@@ -2,10 +2,15 @@ use std::time::{Duration, Instant};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BucketLocationConstraint, CreateBucketConfiguration, ObjectOwnership, Permission,
-    VersioningConfiguration,
+    BucketCannedAcl, BucketLocationConstraint, CreateBucketConfiguration, ObjectOwnership,
+    Permission, VersioningConfiguration,
 };
-use s3_tests::{assert_s3_err_code, cleanup_versioned_bucket, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, cleanup_versioned_bucket, delete_all_and_bucket,
+    disable_bucket_public_access_block, err_status, unique_bucket, CTX,
+};
+
+const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
 
 fn assert_canonical_owner_id(id: &str) {
     assert_eq!(
@@ -62,7 +67,7 @@ fn expected_bucket_location_constraint_for_sdk(region: &str) -> Option<&str> {
 
 async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    create_bucket_in_test_region(client, &bucket).await;
     let owner_id = client
         .get_bucket_acl()
         .bucket(&bucket)
@@ -88,6 +93,30 @@ fn has_canonical_user_grant(
                 .grantee()
                 .is_some_and(|grantee| grantee.id() == Some(canonical_user_id))
     })
+}
+
+fn has_group_grant(grants: &[aws_sdk_s3::types::Grant], uri: &str, permission: Permission) -> bool {
+    grants.iter().any(|grant| {
+        grant.permission() == Some(&permission)
+            && grant
+                .grantee()
+                .is_some_and(|grantee| grantee.uri() == Some(uri))
+    })
+}
+
+async fn create_acl_enabled_bucket(client: &aws_sdk_s3::Client, bucket: &str) {
+    let mut request = client
+        .create_bucket()
+        .bucket(bucket)
+        .object_ownership(ObjectOwnership::ObjectWriter);
+    if CTX.region() != "us-east-1" {
+        let config = CreateBucketConfiguration::builder()
+            .location_constraint(BucketLocationConstraint::from(CTX.region()))
+            .build();
+        request = request.create_bucket_configuration(config);
+    }
+    request.send().await.unwrap();
+    disable_bucket_public_access_block(client, bucket).await;
 }
 
 // ── CreateBucket ─────────────────────────────────────────────────────
@@ -122,11 +151,292 @@ fn test_bucket_create_already_exists() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        create_bucket_in_test_region(client, &bucket).await;
 
-        // Creating the same bucket again by the same owner succeeds (idempotent,
-        // matches AWS BucketAlreadyOwnedByYou behavior — returns 200).
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        let mut request = client.create_bucket().bucket(&bucket);
+        if CTX.region() != "us-east-1" {
+            let config = CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                .build();
+            request = request.create_bucket_configuration(config);
+        }
+        let result = request.send().await;
+        if CTX.region() == "us-east-1" {
+            result.unwrap();
+        } else {
+            assert_eq!(err_status(&result), 409);
+            assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
+        }
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_recreate_not_overriding() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let keys = vec!["mykey1".to_string(), "mykey2".to_string()];
+
+        create_bucket_in_test_region(client, &bucket).await;
+        for key in &keys {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"data"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let mut request = client.create_bucket().bucket(&bucket);
+        if CTX.region() != "us-east-1" {
+            let config = CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                .build();
+            request = request.create_bucket_configuration(config);
+        }
+        let result = request.send().await;
+        if CTX.region() == "us-east-1" {
+            result.unwrap();
+        } else {
+            assert_eq!(err_status(&result), 409);
+            assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
+        }
+
+        let listed = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let mut got: Vec<_> = listed
+            .contents()
+            .iter()
+            .filter_map(|obj| obj.key().map(ToString::to_string))
+            .collect();
+        got.sort();
+        assert_eq!(got, keys);
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_recreate_overwrite_acl() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+
+        create_acl_enabled_bucket(client, &bucket).await;
+        client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .acl(BucketCannedAcl::PublicRead)
+            .send()
+            .await
+            .unwrap();
+
+        let mut request = client.create_bucket().bucket(&bucket);
+        if CTX.region() != "us-east-1" {
+            let config = CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                .build();
+            request = request.create_bucket_configuration(config);
+        }
+        let result = request.send().await;
+
+        let acl = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let owner_id = acl
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected owner ID in GetBucketAcl");
+        if CTX.region() == "us-east-1" {
+            result.unwrap();
+            assert_eq!(acl.grants().len(), 1);
+            assert!(has_canonical_user_grant(
+                acl.grants(),
+                owner_id,
+                Permission::FullControl
+            ));
+            assert!(!has_group_grant(
+                acl.grants(),
+                ALL_USERS_GROUP_URI,
+                Permission::Read
+            ));
+        } else {
+            assert_eq!(err_status(&result), 409);
+            assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
+            assert_eq!(acl.grants().len(), 2);
+            assert!(has_group_grant(
+                acl.grants(),
+                ALL_USERS_GROUP_URI,
+                Permission::Read
+            ));
+        }
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_recreate_new_acl() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+
+        create_acl_enabled_bucket(client, &bucket).await;
+
+        let mut request = client
+            .create_bucket()
+            .bucket(&bucket)
+            .acl(BucketCannedAcl::PublicRead)
+            .object_ownership(ObjectOwnership::ObjectWriter);
+        if CTX.region() != "us-east-1" {
+            let config = CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                .build();
+            request = request.create_bucket_configuration(config);
+        }
+        let result = request.send().await;
+
+        let acl = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let owner_id = acl
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected owner ID in GetBucketAcl");
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidBucketAclWithBlockPublicAccessError");
+        assert_eq!(acl.grants().len(), 1);
+        assert!(has_canonical_user_grant(
+            acl.grants(),
+            owner_id,
+            Permission::FullControl
+        ));
+        assert!(!has_group_grant(
+            acl.grants(),
+            ALL_USERS_GROUP_URI,
+            Permission::Read
+        ));
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_create_public_read_acl_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+
+        let mut request = client
+            .create_bucket()
+            .bucket(&bucket)
+            .acl(BucketCannedAcl::PublicRead)
+            .object_ownership(ObjectOwnership::ObjectWriter);
+        if CTX.region() != "us-east-1" {
+            let config = CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                .build();
+            request = request.create_bucket_configuration(config);
+        }
+
+        let result = request.send().await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidBucketAclWithBlockPublicAccessError");
+    });
+}
+
+#[test]
+fn test_bucket_recreate_new_header_grants() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+
+        create_acl_enabled_bucket(client, &bucket).await;
+        let owner_id = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap()
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected owner ID in GetBucketAcl")
+            .to_string();
+        let alt_owner_id = canonical_owner_id(alt_client).await;
+
+        let mut request = client
+            .create_bucket()
+            .bucket(&bucket)
+            .object_ownership(ObjectOwnership::ObjectWriter);
+        if CTX.region() != "us-east-1" {
+            let config = CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                .build();
+            request = request.create_bucket_configuration(config);
+        }
+        let result = request
+            .customize()
+            .mutate_request({
+                let owner_id = owner_id.clone();
+                let alt_owner_id = alt_owner_id.clone();
+                move |req| {
+                    let headers = req.headers_mut();
+                    headers.insert("x-amz-grant-full-control", format!("id={owner_id}"));
+                    headers.insert("x-amz-grant-read", format!("id={alt_owner_id}"));
+                }
+            })
+            .send()
+            .await;
+
+        let acl = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        if CTX.region() == "us-east-1" {
+            result.unwrap();
+            assert_eq!(acl.grants().len(), 2);
+            assert!(has_canonical_user_grant(
+                acl.grants(),
+                &owner_id,
+                Permission::FullControl
+            ));
+            assert!(has_canonical_user_grant(
+                acl.grants(),
+                &alt_owner_id,
+                Permission::Read
+            ));
+        } else {
+            assert_eq!(err_status(&result), 409);
+            assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
+            assert_eq!(acl.grants().len(), 1);
+            assert!(has_canonical_user_grant(
+                acl.grants(),
+                &owner_id,
+                Permission::FullControl
+            ));
+            assert!(!has_canonical_user_grant(
+                acl.grants(),
+                &alt_owner_id,
+                Permission::Read
+            ));
+        }
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
