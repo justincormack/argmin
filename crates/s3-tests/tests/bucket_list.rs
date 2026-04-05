@@ -3,6 +3,7 @@ use s3_tests::{
     assert_s3_err_code, create_objects, create_objects_with_keys, delete_all_and_bucket,
     err_status, unique_bucket, CTX,
 };
+use std::time::Duration;
 
 fn assert_canonical_owner_id(id: &str) {
     assert_eq!(
@@ -39,6 +40,27 @@ fn get_prefixes(prefixes: &[aws_sdk_s3::types::CommonPrefix]) -> Vec<String> {
         .iter()
         .filter_map(|p| p.prefix().map(str::to_string))
         .collect()
+}
+
+async fn head_object_eventually_after_versioning_enable(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> aws_sdk_s3::operation::head_object::HeadObjectOutput {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = client.head_object().bucket(bucket).key(key).send().await;
+        match result {
+            Ok(head) => return head,
+            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(err) => panic!("head_object after enabling versioning: {err:?}"),
+        }
+    }
+
+    unreachable!("loop should return or panic")
 }
 
 // ── Empty / basic ───────────────────────────────────────────────────
@@ -2059,13 +2081,7 @@ fn test_bucket_list_return_data_versioning() {
         let mut expected: std::collections::HashMap<String, (String, i64, String)> =
             std::collections::HashMap::new();
         for key in &key_names {
-            let head = client
-                .head_object()
-                .bucket(&bucket)
-                .key(*key)
-                .send()
-                .await
-                .unwrap();
+            let head = head_object_eventually_after_versioning_enable(client, &bucket, key).await;
             let etag = head.e_tag().unwrap().to_string();
             let size = head.content_length().unwrap();
             let version_id = head.version_id().unwrap().to_string();
