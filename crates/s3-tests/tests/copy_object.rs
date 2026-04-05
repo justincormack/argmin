@@ -1,12 +1,12 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    AccessControlPolicy, Grant, Grantee, ObjectCannedAcl, ObjectOwnership, Owner, Permission,
-    PublicAccessBlockConfiguration, Type,
+    AccessControlPolicy, ChecksumType, Grant, Grantee, ObjectAttributes, ObjectCannedAcl,
+    ObjectOwnership, Owner, Permission, PublicAccessBlockConfiguration, Type,
 };
 use aws_sdk_s3::Client;
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version, err_status,
-    unique_bucket, CTX,
+    send_signed_request, unique_bucket, CTX,
 };
 
 /// Create a bucket, returning its name.
@@ -1207,6 +1207,64 @@ fn test_copy_object_replace_checksum_algorithm_recomputes() {
         let digest = ring::digest::digest(&ring::digest::SHA256, data);
         let expected_b64 = base64::engine::general_purpose::STANDARD.encode(digest.as_ref());
         assert_eq!(sha256_val, expected_b64);
+
+        cleanup(&bucket, &["src", "dst"]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_default_checksum_is_crc64nvme() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let data = b"hello";
+        let src_url = format!("{}/{}/src", CTX.endpoint(), bucket);
+        let put_resp =
+            send_signed_request("PUT", &src_url, data, std::iter::empty::<(&str, &str)>());
+        assert_eq!(put_resp.status, 200, "source PUT failed: {}", put_resp.body);
+
+        let src_attrs = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key("src")
+            .object_attributes(ObjectAttributes::Checksum)
+            .send()
+            .await
+            .unwrap();
+        let src_checksum = src_attrs.checksum().expect("expected source checksum");
+        let src_crc64 = src_checksum
+            .checksum_crc64_nvme()
+            .unwrap_or_else(|| panic!("expected default CRC64NVME checksum, got {src_checksum:?}"))
+            .to_string();
+        assert_eq!(
+            src_checksum.checksum_type(),
+            Some(&ChecksumType::FullObject)
+        );
+
+        let dst_url = format!("{}/{}/dst", CTX.endpoint(), bucket);
+        let copy_source = format!("{}/src", bucket);
+        let copy_resp = send_signed_request(
+            "PUT",
+            &dst_url,
+            b"",
+            [("x-amz-copy-source", copy_source.as_str())],
+        );
+        assert_eq!(copy_resp.status, 200, "copy PUT failed: {}", copy_resp.body);
+
+        let dst_attrs = client
+            .get_object_attributes()
+            .bucket(&bucket)
+            .key("dst")
+            .object_attributes(ObjectAttributes::Checksum)
+            .send()
+            .await
+            .unwrap();
+        let dst_checksum = dst_attrs.checksum().expect("expected destination checksum");
+        assert_eq!(
+            dst_checksum.checksum_type(),
+            Some(&ChecksumType::FullObject)
+        );
+        assert_eq!(dst_checksum.checksum_crc64_nvme(), Some(src_crc64.as_str()));
 
         cleanup(&bucket, &["src", "dst"]).await;
     });

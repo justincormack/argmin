@@ -60,6 +60,9 @@ pub enum ServerError {
     #[error("object too large: {size} bytes (max {max})")]
     ObjectTooLarge { size: u64, max: u64 },
 
+    #[error("metadata too large")]
+    MetadataTooLarge,
+
     #[error("method not allowed")]
     MethodNotAllowed,
 
@@ -238,6 +241,7 @@ impl ServerError {
             Self::InvalidBucketName { .. } => "InvalidBucketName",
             Self::MetadataBlobError { .. } => "InternalError",
             Self::ObjectTooLarge { .. } => "EntityTooLarge",
+            Self::MetadataTooLarge => "MetadataTooLarge",
             Self::MethodNotAllowed => "MethodNotAllowed",
             Self::InvalidRange { .. } => "InvalidRange",
             Self::SlowDown => "SlowDown",
@@ -345,7 +349,7 @@ impl ServerError {
             | Self::HeaderNotImplemented { .. }
             | Self::QueryParameterNotImplemented { .. } => 501,
             Self::InternalError { .. } => 500,
-            Self::ObjectTooLarge { .. } => 400,
+            Self::ObjectTooLarge { .. } | Self::MetadataTooLarge => 400,
             Self::MethodNotAllowed => 405,
             Self::InvalidRange { .. } => 416,
             Self::PreconditionFailed => 412,
@@ -547,6 +551,14 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_metadata_too_large() {
+        assert_eq!(
+            ServerError::MetadataTooLarge.s3_error_code(),
+            "MetadataTooLarge"
+        );
+    }
+
+    #[test]
     fn s3_error_code_method_not_allowed() {
         assert_eq!(
             ServerError::MethodNotAllowed.s3_error_code(),
@@ -679,6 +691,7 @@ mod tests {
             ServerError::ObjectTooLarge { size: 1, max: 0 }.http_status(),
             400
         );
+        assert_eq!(ServerError::MetadataTooLarge.http_status(), 400);
         assert_eq!(
             ServerError::MalformedPolicy {
                 reason: "bad".into()

@@ -1328,6 +1328,28 @@ fn test_object_metadata_unicode_accepted() {
     });
 }
 
+#[test]
+fn test_object_metadata_too_large() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let oversized = "m".repeat(3000);
+
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key("metadata-too-large")
+            .metadata("mint-test", oversized)
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MetadataTooLarge");
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
 // ── ETag consistency ─────────────────────────────────────────────────
 
 #[test]

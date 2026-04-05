@@ -8327,6 +8327,31 @@ impl Coordinator {
         })
     }
 
+    fn object_system_metadata_with_default_checksum(
+        system_metadata: &SystemMetadata,
+        write_encryption: &ActiveWriteEncryption,
+        crc64: u64,
+    ) -> SystemMetadata {
+        let can_store_checksum = matches!(
+            write_encryption,
+            ActiveWriteEncryption::None
+                | ActiveWriteEncryption::SseCustomer { write: Some(_), .. }
+                | ActiveWriteEncryption::Managed { write: Some(_), .. }
+        );
+        if system_metadata.checksum().is_some() || !can_store_checksum {
+            return system_metadata.clone();
+        }
+        use base64::Engine;
+        let mut system_metadata = system_metadata.clone();
+        let checksum = base64::engine::general_purpose::STANDARD.encode(crc64.to_be_bytes());
+        system_metadata.set_checksum(
+            ChecksumAlgorithm::Crc64nvme,
+            Some(ChecksumType::FullObject),
+            checksum,
+        );
+        system_metadata
+    }
+
     fn finalize_put_commit_metadata_locked(
         meta_pg: &storage::PgStore,
         bucket: &str,
@@ -8685,6 +8710,7 @@ impl Coordinator {
     /// Put an object, using a direct single-segment commit when possible.
     pub fn put_object(&self, req: &PutObjectRequest<'_>) -> Result<PutObjectResult, ServerError> {
         let policy_context = req.effective_policy_context();
+        let object_crc64 = checksum::crc64::checksum(req.data);
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object",
@@ -8739,7 +8765,7 @@ impl Coordinator {
                         req.expected_bucket_owner(),
                     ),
                     session_id: &session_id,
-                    crc64: checksum::crc64::checksum(req.data),
+                    crc64: object_crc64,
                     total_size: req.data.len() as u64,
                     metadata_blob: req.metadata,
                     system_metadata: req.system_metadata,
@@ -8824,6 +8850,11 @@ impl Coordinator {
                 .iter()
                 .map(|written| (&written.key, written.ack))
                 .collect();
+            let system_metadata = Self::object_system_metadata_with_default_checksum(
+                req.system_metadata,
+                &write_encryption,
+                object_crc64,
+            );
 
             let prepared = match self.prepare_put_commit_locked(
                 &meta_pg,
@@ -8832,7 +8863,7 @@ impl Coordinator {
                     bucket: req.object.bucket_name(),
                     key: req.object.key,
                     metadata_blob: req.metadata,
-                    system_metadata: req.system_metadata,
+                    system_metadata: &system_metadata,
                     write_encryption: &write_encryption,
                     tags: req.tags,
                     cond: req.cond,
@@ -8870,7 +8901,7 @@ impl Coordinator {
                 public_read: Self::acl_grants_public_read(&acl_grants),
                 generation_id: prepared.generation_id,
                 size: req.data.len() as u64,
-                etag: storage::ObjectEtag::single_part(checksum::crc64::checksum(req.data)),
+                etag: storage::ObjectEtag::single_part(object_crc64),
                 ec: EcShape {
                     k: self.ec_config.data_shards,
                     m: self.ec_config.parity_shards,
@@ -8926,7 +8957,7 @@ impl Coordinator {
             }
 
             Ok(PutObjectResult {
-                etag: format_etag(checksum::crc64::checksum(req.data)),
+                etag: format_etag(object_crc64),
                 version_id: prepared.version_id,
                 managed_encryption: prepared.encryption.managed_encryption_algorithm(),
                 lifecycle_expiration,
@@ -9505,6 +9536,11 @@ impl Coordinator {
             }
             let write_encryption =
                 ActiveWriteEncryption::from_stored_and_active(&session.encryption, req.write_encryption)?;
+            let system_metadata = Self::object_system_metadata_with_default_checksum(
+                req.system_metadata,
+                &write_encryption,
+                crc64,
+            );
 
             let prepared = self.prepare_put_commit_locked(
                 &meta_guard,
@@ -9513,7 +9549,7 @@ impl Coordinator {
                     bucket,
                     key,
                     metadata_blob,
-                    system_metadata: req.system_metadata,
+                    system_metadata: &system_metadata,
                     write_encryption: &write_encryption,
                     tags,
                     cond,
@@ -26728,9 +26764,10 @@ mod tests {
     }
 
     #[test]
-    fn copy_object_replace_strips_unverified_inline_checksum() {
+    fn copy_object_replace_strips_unverified_inline_checksum_and_applies_default_checksum() {
         // Regression: CopyObject with REPLACE must not persist client-supplied
         // checksum value headers, since there is no body to verify them against.
+        // AWS still applies the default CRC64NVME checksum for the copied body.
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord
@@ -26806,8 +26843,14 @@ mod tests {
             })
             .unwrap();
         assert_eq!(obj.body.read_all().unwrap(), b"hello");
-        // No checksum should be present since none was requested.
-        assert!(obj.system_metadata.checksum().is_none());
+        use base64::Engine;
+        let expected_crc = checksum::crc64::checksum(b"hello");
+        let expected_b64 =
+            base64::engine::general_purpose::STANDARD.encode(expected_crc.to_be_bytes());
+        let checksum = obj.system_metadata.checksum().unwrap();
+        assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Crc64nvme);
+        assert_eq!(checksum.checksum_type(), Some(ChecksumType::FullObject));
+        assert_eq!(checksum.value(), expected_b64.as_str());
     }
 
     #[test]
@@ -35177,6 +35220,9 @@ mod tests {
         full_data.extend_from_slice(segment1);
         let crc = checksum::crc64::checksum(&full_data);
         let metadata = MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap();
+        let write_encryption = coord
+            .load_stream_put_write_encryption("bucket", "mykey", &session_id, None)
+            .unwrap();
         let result = coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
                 object: object_request("bucket", "mykey", test_requester()),
@@ -35185,7 +35231,7 @@ mod tests {
                 total_size: full_data.len() as u64,
                 metadata_blob: &metadata,
                 system_metadata: &SystemMetadata::EMPTY,
-                write_encryption: ActiveWriteEncryptionRef::None,
+                write_encryption: write_encryption.as_ref(),
                 tags: None,
                 cond: &WriteCondition::default(),
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -35214,6 +35260,12 @@ mod tests {
         assert_eq!(head.size, full_data.len() as u64);
         assert_eq!(head.etag, format_etag(crc));
         assert_eq!(head.metadata.get("x-amz-meta-foo"), Some("bar"));
+        use base64::Engine;
+        let expected_checksum = base64::engine::general_purpose::STANDARD.encode(crc.to_be_bytes());
+        let checksum = head.system_metadata.checksum().unwrap();
+        assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Crc64nvme);
+        assert_eq!(checksum.checksum_type(), Some(ChecksumType::FullObject));
+        assert_eq!(checksum.value(), expected_checksum.as_str());
     }
 
     #[test]
@@ -35307,6 +35359,55 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn put_object_applies_default_crc64nvme_checksum() {
+        use base64::Engine;
+
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let body = b"hello";
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "obj", test_requester(), None),
+                data: body,
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let head = coord
+            .head_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj",
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        let checksum = head.system_metadata.checksum().unwrap();
+        let expected = base64::engine::general_purpose::STANDARD
+            .encode(checksum::crc64::checksum(body).to_be_bytes());
+        assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Crc64nvme);
+        assert_eq!(checksum.checksum_type(), Some(ChecksumType::FullObject));
+        assert_eq!(checksum.value(), expected.as_str());
     }
 
     #[test]

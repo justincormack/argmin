@@ -16,6 +16,7 @@ use crate::error::ServerError;
 const FORMAT_VERSION: u8 = 1;
 /// Minimum blob size: 4 (len) + 1 (version) + 2 (count) = 7 bytes
 const MIN_BLOB_SIZE: usize = 7;
+const USER_METADATA_SIZE_LIMIT: usize = 2 * 1024;
 
 /// A single metadata key-value entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +70,7 @@ impl MetadataBlob {
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
         let mut entries = Vec::new();
+        let mut total_metadata_size = 0usize;
         for (name, value) in headers {
             let lower = name.to_ascii_lowercase();
             if lower.starts_with("x-amz-meta-") {
@@ -86,6 +88,13 @@ impl MetadataBlob {
                 } else {
                     value.to_string()
                 };
+                total_metadata_size = total_metadata_size
+                    .checked_add(lower.len())
+                    .and_then(|size| size.checked_add(value.len()))
+                    .ok_or(ServerError::MetadataTooLarge)?;
+                if total_metadata_size > USER_METADATA_SIZE_LIMIT {
+                    return Err(ServerError::MetadataTooLarge);
+                }
                 entries.push(MetadataEntry {
                     key: lower,
                     value: stored_value,
@@ -499,5 +508,23 @@ mod tests {
     fn from_headers_accepts_clean_values() {
         let headers = [("X-Amz-Meta-Tag", "hello world 123 !@#$%")];
         assert!(MetadataBlob::from_headers(&headers).is_ok());
+    }
+
+    #[test]
+    fn from_headers_accepts_metadata_at_limit() {
+        let key = "X-Amz-Meta-Limit";
+        let value = "m".repeat(USER_METADATA_SIZE_LIMIT - key.len());
+        let headers = [(key, value.as_str())];
+        let blob = MetadataBlob::from_headers(&headers).unwrap();
+        assert_eq!(blob.get("x-amz-meta-limit"), Some(value.as_str()));
+    }
+
+    #[test]
+    fn from_headers_rejects_metadata_over_limit() {
+        let key = "X-Amz-Meta-Limit";
+        let value = "m".repeat(USER_METADATA_SIZE_LIMIT + 1 - key.len());
+        let headers = [(key, value.as_str())];
+        let err = MetadataBlob::from_headers(&headers).unwrap_err();
+        assert!(matches!(err, ServerError::MetadataTooLarge));
     }
 }
