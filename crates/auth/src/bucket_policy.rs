@@ -1,4 +1,4 @@
-use s3_types::CanonicalUserId;
+use s3_types::{aws_account_id_from_principal, CanonicalUserId};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1250,26 +1250,12 @@ fn aws_principal_matches_request(requester_principal: &str, policy_value: &str) 
     };
 
     requester_principal == policy_root_account_id
-        || iam_principal_account_id(requester_principal) == Some(policy_root_account_id)
+        || aws_account_id_from_principal(requester_principal) == Some(policy_root_account_id)
 }
 
 fn root_account_principal_account_id(value: &str) -> Option<&str> {
-    let account_id = iam_principal_account_id(value)?;
+    let account_id = aws_account_id_from_principal(value)?;
     value.ends_with(":root").then_some(account_id)
-}
-
-fn iam_principal_account_id(value: &str) -> Option<&str> {
-    let rest = value.strip_prefix("arn:")?;
-    let mut parts = rest.splitn(6, ':');
-    let _partition = parts.next()?;
-    let service = parts.next()?;
-    if service != "iam" {
-        return None;
-    }
-    let _region = parts.next()?;
-    let account_id = parts.next()?;
-    let _resource = parts.next()?;
-    (!account_id.is_empty()).then_some(account_id)
 }
 
 fn is_non_public_condition_clause(clause: &PolicyConditionClause) -> bool {

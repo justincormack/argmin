@@ -121,6 +121,10 @@ The committed policy assumes:
 
 If you change `S3_TEST_BUCKET_PREFIX`, update the policy resource ARNs to match.
 
+For account-regional bucket namespace tests, generated bucket names must still
+begin with `S3_TEST_BUCKET_PREFIX` so the same IAM policy resource pattern
+continues to authorize `CreateBucket`.
+
 If AWS-backed object-lock tests fail immediately with `AccessDenied` on
 `PutBucketObjectLockConfiguration`, re-attach the committed policy after pulling
 the latest version.

@@ -82,6 +82,29 @@ pub fn error_xml_with_region(
     )
 }
 
+/// Format an S3 error response XML with an extra `<BucketNamespace>` element.
+#[must_use]
+pub fn error_xml_with_bucket_namespace(
+    code: &str,
+    message: &str,
+    bucket_namespace: &str,
+    request_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>{}</Code>\
+         <Message>{}</Message>\
+         <BucketNamespace>{}</BucketNamespace>\
+         <RequestId>{}</RequestId>\
+         </Error>",
+        xml_escape(code),
+        xml_escape(message),
+        xml_escape(bucket_namespace),
+        xml_escape(request_id),
+    )
+}
+
 /// Format an S3 `NotImplemented` error that identifies the header causing it.
 #[must_use]
 pub fn header_not_implemented_xml(header: &str, resource: &str, request_id: &str) -> String {
@@ -3862,6 +3885,7 @@ mod tests {
             .create_bucket(&crate::coordinator::CreateBucketRequest {
                 name,
                 requester: test_requester(),
+                namespace: s3_types::BucketNamespace::Global,
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
                 ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,

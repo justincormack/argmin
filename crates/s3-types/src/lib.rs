@@ -6,6 +6,9 @@ use std::num::{NonZeroU32, NonZeroU64};
 /// Maximum supported principal string length stored in metadata.
 pub const MAX_PRINCIPAL_LEN: usize = 256;
 
+/// AWS account IDs are 12 decimal digits.
+pub const AWS_ACCOUNT_ID_LEN: usize = 12;
+
 /// S3 canonical user IDs are 64 lowercase hex characters.
 pub const CANONICAL_USER_ID_LEN: usize = 64;
 
@@ -53,6 +56,110 @@ pub fn supports_legacy_sigv2(region: &str) -> bool {
 #[must_use]
 pub fn requires_sigv4(region: &str) -> bool {
     !supports_legacy_sigv2(region)
+}
+
+/// Returns whether a string is a valid 12-digit AWS account ID.
+#[must_use]
+pub fn is_valid_aws_account_id(account_id: &str) -> bool {
+    account_id.len() == AWS_ACCOUNT_ID_LEN && account_id.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Extract an AWS account ID from a principal string when present.
+///
+/// Accepted forms:
+/// - a bare 12-digit account ID
+/// - IAM ARNs such as `arn:aws:iam::123456789012:user/name`
+#[must_use]
+pub fn aws_account_id_from_principal(principal: &str) -> Option<&str> {
+    if is_valid_aws_account_id(principal) {
+        return Some(principal);
+    }
+
+    let rest = principal.strip_prefix("arn:")?;
+    let mut parts = rest.splitn(6, ':');
+    let _partition = parts.next()?;
+    let service = parts.next()?;
+    if service != "iam" {
+        return None;
+    }
+    let _region = parts.next()?;
+    let account_id = parts.next()?;
+    let _resource = parts.next()?;
+    is_valid_aws_account_id(account_id).then_some(account_id)
+}
+
+/// Bucket namespace requested by `CreateBucket`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketNamespace {
+    Global,
+    AccountRegional,
+}
+
+impl BucketNamespace {
+    #[must_use]
+    pub const fn as_header_value(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::AccountRegional => "account-regional",
+        }
+    }
+}
+
+/// Parsed `-<account-id>-<region>-an` suffix for account-regional bucket names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountRegionalBucketName<'a> {
+    account_id: &'a str,
+    region: &'a str,
+}
+
+impl<'a> AccountRegionalBucketName<'a> {
+    #[must_use]
+    pub const fn account_id(self) -> &'a str {
+        self.account_id
+    }
+
+    #[must_use]
+    pub const fn region(self) -> &'a str {
+        self.region
+    }
+}
+
+/// Parse the AWS account-regional bucket-name suffix if present.
+///
+/// This recognizes names that end in `-<12-digit-account-id>-<region>-an`.
+#[must_use]
+pub fn parse_account_regional_bucket_name(name: &str) -> Option<AccountRegionalBucketName<'_>> {
+    let stem = name.strip_suffix("-an")?;
+    let bytes = stem.as_bytes();
+    if bytes.len() <= AWS_ACCOUNT_ID_LEN + 2 {
+        return None;
+    }
+
+    for idx in (1..bytes.len()).rev() {
+        if bytes[idx] != b'-' {
+            continue;
+        }
+        let account_start = idx + 1;
+        let account_end = account_start + AWS_ACCOUNT_ID_LEN;
+        if account_end >= bytes.len() || bytes[account_end] != b'-' {
+            continue;
+        }
+        let account_id = &stem[account_start..account_end];
+        if !is_valid_aws_account_id(account_id) {
+            continue;
+        }
+        let region = &stem[account_end + 1..];
+        if region.is_empty() {
+            continue;
+        }
+        let prefix = &stem[..idx];
+        if prefix.is_empty() {
+            continue;
+        }
+        return Some(AccountRegionalBucketName { account_id, region });
+    }
+
+    None
 }
 
 /// Bucket versioning state.
@@ -366,6 +473,12 @@ impl AccountIdentity {
         &self.principal
     }
 
+    /// AWS account ID when the principal is represented as one.
+    #[must_use]
+    pub fn account_id(&self) -> Option<&str> {
+        aws_account_id_from_principal(&self.principal)
+    }
+
     /// Stable canonical owner ID for XML owner identity fields.
     #[must_use]
     pub fn canonical_user_id(&self) -> &CanonicalUserId {
@@ -597,7 +710,8 @@ impl AclGrants {
 #[cfg(test)]
 mod tests {
     use super::{
-        bucket_location_constraint, is_legacy_create_bucket_region, requires_sigv4,
+        aws_account_id_from_principal, bucket_location_constraint, is_legacy_create_bucket_region,
+        is_valid_aws_account_id, parse_account_regional_bucket_name, requires_sigv4,
         supports_legacy_sigv2, AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission,
         BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, LegalHoldStatus,
         ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState, ObjectRetention,
@@ -788,6 +902,73 @@ mod tests {
         assert_eq!(account.principal(), "owner-a");
         assert_eq!(account.display_name(), "Owner A");
         assert_eq!(account.canonical_user_id(), &canonical);
+        assert_eq!(account.account_id(), None);
+    }
+
+    #[test]
+    fn account_identity_account_id_detects_12_digit_ids() {
+        let account = AccountIdentity::new(
+            "111122223333",
+            CanonicalUserId::from_principal("111122223333"),
+            "owner",
+        );
+        assert_eq!(account.account_id(), Some("111122223333"));
+        assert!(is_valid_aws_account_id("111122223333"));
+        assert!(!is_valid_aws_account_id("owner-a"));
+    }
+
+    #[test]
+    fn account_identity_account_id_extracts_iam_arn_account_id() {
+        let account = AccountIdentity::new(
+            "arn:aws:iam::111122223333:user/reader",
+            CanonicalUserId::from_principal("reader"),
+            "reader",
+        );
+        assert_eq!(account.account_id(), Some("111122223333"));
+    }
+
+    #[test]
+    fn aws_account_id_from_principal_accepts_iam_arn_and_bare_id() {
+        assert_eq!(
+            aws_account_id_from_principal("arn:aws:iam::111122223333:root"),
+            Some("111122223333")
+        );
+        assert_eq!(
+            aws_account_id_from_principal("arn:aws:iam::111122223333:user/example"),
+            Some("111122223333")
+        );
+        assert_eq!(
+            aws_account_id_from_principal("111122223333"),
+            Some("111122223333")
+        );
+        assert_eq!(aws_account_id_from_principal("arn:aws:s3:::bucket"), None);
+        assert_eq!(aws_account_id_from_principal("owner-a"), None);
+    }
+
+    #[test]
+    fn parse_account_regional_bucket_name_extracts_suffix() {
+        let parsed =
+            parse_account_regional_bucket_name("example-111122223333-us-west-2-an").unwrap();
+        assert_eq!(parsed.account_id(), "111122223333");
+        assert_eq!(parsed.region(), "us-west-2");
+    }
+
+    #[test]
+    fn parse_account_regional_bucket_name_uses_last_matching_suffix() {
+        let parsed = parse_account_regional_bucket_name(
+            "prefix-111122223333-middle-444455556666-us-east-1-an",
+        )
+        .unwrap();
+        assert_eq!(parsed.account_id(), "444455556666");
+        assert_eq!(parsed.region(), "us-east-1");
+    }
+
+    #[test]
+    fn parse_account_regional_bucket_name_rejects_non_matching_shapes() {
+        assert!(parse_account_regional_bucket_name("plain-bucket").is_none());
+        assert!(parse_account_regional_bucket_name("bucket-111122223333-an").is_none());
+        assert!(parse_account_regional_bucket_name("111122223333-us-east-1-an").is_none());
+        assert!(parse_account_regional_bucket_name("bucket-abcdef-us-east-1-an").is_none());
     }
 
     #[test]

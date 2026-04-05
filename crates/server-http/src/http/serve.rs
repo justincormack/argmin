@@ -2814,6 +2814,7 @@ mod tests {
             .create_bucket(&crate::coordinator::CreateBucketRequest {
                 name: bucket,
                 requester: requester.clone(),
+                namespace: s3_types::BucketNamespace::Global,
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
                 ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,

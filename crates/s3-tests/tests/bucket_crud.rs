@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use aws_sdk_s3::primitives::ByteStream;
@@ -6,11 +7,14 @@ use aws_sdk_s3::types::{
     Permission, VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, cleanup_versioned_bucket, delete_all_and_bucket,
-    disable_bucket_public_access_block, err_status, unique_bucket, CTX,
+    assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, delete_all_and_bucket,
+    disable_bucket_public_access_block, err_status, send_signed_request, unique_bucket,
+    RawResponse, CTX,
 };
+use s3_types::{is_legacy_create_bucket_region, BucketNamespace};
 
 const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
+static ACCOUNT_REGIONAL_BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn assert_canonical_owner_id(id: &str) {
     assert_eq!(
@@ -111,6 +115,54 @@ async fn create_acl_enabled_bucket(client: &aws_sdk_s3::Client, bucket: &str) {
         .await
         .unwrap();
     disable_bucket_public_access_block(client, bucket).await;
+}
+
+fn account_regional_bucket_name(account_id: &str, region: &str) -> String {
+    let suffix = format!("-{account_id}-{region}-an");
+    let n = ACCOUNT_REGIONAL_BUCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let prefix_max = 63usize
+        .checked_sub(suffix.len())
+        .expect("account-regional suffix should leave room for a prefix");
+    let mut prefix = format!("{}{}{}", bucket_prefix(), std::process::id(), n);
+    if prefix.len() > prefix_max {
+        prefix.truncate(prefix_max);
+    }
+    format!("{prefix}{suffix}")
+}
+
+fn create_bucket_configuration_body(region: &str) -> Vec<u8> {
+    if is_legacy_create_bucket_region(region) {
+        Vec::new()
+    } else {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><CreateBucketConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><LocationConstraint>{region}</LocationConstraint></CreateBucketConfiguration>"#
+        )
+        .into_bytes()
+    }
+}
+
+fn create_bucket_in_namespace(bucket: &str, namespace: BucketNamespace) -> RawResponse {
+    let url = format!("{}/{}", CTX.endpoint(), bucket);
+    let body = create_bucket_configuration_body(CTX.region());
+    send_signed_request(
+        "PUT",
+        &url,
+        &body,
+        [("x-amz-bucket-namespace", namespace.as_header_value())],
+    )
+}
+
+fn assert_raw_s3_error(response: &RawResponse, status: u16, code: &str) {
+    assert_eq!(
+        response.status, status,
+        "unexpected response body: {}",
+        response.body
+    );
+    assert!(
+        response.body.contains(&format!("<Code>{code}</Code>")),
+        "expected {code} in response body, got: {}",
+        response.body
+    );
 }
 
 // ── CreateBucket ─────────────────────────────────────────────────────
@@ -215,6 +267,64 @@ fn test_bucket_recreate_not_overriding() {
         assert_eq!(got, keys);
 
         delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_account_regional_bucket_create_succeeds_when_suffix_matches() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = account_regional_bucket_name(CTX.account_id(), CTX.region());
+        let response = create_bucket_in_namespace(&bucket, BucketNamespace::AccountRegional);
+        assert_eq!(
+            response.status, 200,
+            "unexpected response body: {}",
+            response.body
+        );
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_account_regional_bucket_rejects_mismatched_account_suffix() {
+    s3_tests::run(async {
+        let bucket = account_regional_bucket_name(CTX.alt_account_id(), CTX.region());
+        let response = create_bucket_in_namespace(&bucket, BucketNamespace::AccountRegional);
+        assert_raw_s3_error(&response, 400, "InvalidBucketNamespace");
+    });
+}
+
+#[test]
+fn test_account_regional_bucket_rejects_mismatched_region_suffix() {
+    s3_tests::run(async {
+        let wrong_region = if CTX.region() == "us-east-1" {
+            "us-west-2"
+        } else {
+            "us-east-1"
+        };
+        let bucket = account_regional_bucket_name(CTX.account_id(), wrong_region);
+        let response = create_bucket_in_namespace(&bucket, BucketNamespace::AccountRegional);
+        assert_raw_s3_error(&response, 400, "InvalidBucketNamespace");
+    });
+}
+
+#[test]
+fn test_account_regional_bucket_recreate_returns_bucket_already_owned_by_you() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = account_regional_bucket_name(CTX.account_id(), CTX.region());
+
+        let first = create_bucket_in_namespace(&bucket, BucketNamespace::AccountRegional);
+        assert_eq!(
+            first.status, 200,
+            "unexpected response body: {}",
+            first.body
+        );
+
+        let second = create_bucket_in_namespace(&bucket, BucketNamespace::AccountRegional);
+        assert_raw_s3_error(&second, 409, "BucketAlreadyOwnedByYou");
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
 }
 

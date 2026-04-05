@@ -1220,6 +1220,18 @@ impl S3Response {
                     .header("x-amz-bucket-region", expected_region)
                     .xml_body(body);
             }
+            ServerError::InvalidBucketNamespace {
+                reason,
+                bucket_namespace,
+            } => {
+                let body = xml::error_xml_with_bucket_namespace(
+                    "InvalidBucketNamespace",
+                    reason,
+                    bucket_namespace,
+                    "request-id",
+                );
+                return Self::new(400).xml_body(body);
+            }
             _ => {}
         }
 
@@ -1228,6 +1240,7 @@ impl S3Response {
             ServerError::InvalidRequest { reason } => reason.as_str(),
             ServerError::InvalidArgument { reason } => reason.as_str(),
             ServerError::InvalidBucketName { reason } => reason.as_str(),
+            ServerError::InvalidBucketNamespace { reason, .. } => reason.as_str(),
             ServerError::MetadataBlobError { reason } => reason.as_str(),
             ServerError::NotImplemented { feature } => feature.as_str(),
             ServerError::HeaderNotImplemented { header } => header.as_str(),
@@ -2093,6 +2106,22 @@ mod tests {
         assert!(body.contains("<Code>AuthorizationHeaderMalformed</Code>"));
         assert!(body.contains("<Region>us-west-2</Region>"));
         assert!(body.contains("expecting 'us-west-2'"));
+    }
+
+    #[test]
+    fn invalid_bucket_namespace_error_response_includes_bucket_namespace() {
+        let err = ServerError::InvalidBucketNamespace {
+            reason: "namespace mismatch".to_string(),
+            bucket_namespace: "bucket-111122223333-us-east-1-an".to_string(),
+        };
+        let resp = S3Response::error(&err, "/bucket");
+        assert_eq!(resp.status_code, 400);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("<Code>InvalidBucketNamespace</Code>"));
+        assert!(body.contains("<Message>namespace mismatch</Message>"));
+        assert!(
+            body.contains("<BucketNamespace>bucket-111122223333-us-east-1-an</BucketNamespace>")
+        );
     }
 
     #[test]

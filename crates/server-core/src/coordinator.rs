@@ -9,9 +9,10 @@ use checksum::{
 };
 use ec::{EcConfig, ErasureCodec};
 use s3_types::{
-    AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission, BucketVersioningState,
-    CanonicalUserId, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention,
-    RetentionPeriod, StoredLegalHoldStatus, VersionId,
+    aws_account_id_from_principal, parse_account_regional_bucket_name, AccountIdentity, AclGrant,
+    AclGrantee, AclGrants, AclPermission, BucketNamespace, BucketVersioningState, CanonicalUserId,
+    LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention, RetentionPeriod,
+    StoredLegalHoldStatus, VersionId,
 };
 use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
@@ -1719,6 +1720,7 @@ impl BucketObjectOwnership {
 pub struct CreateBucketRequest<'a> {
     pub name: &'a str,
     pub requester: Requester,
+    pub namespace: BucketNamespace,
     pub acl: CreateBucketAcl,
     pub ownership: BucketObjectOwnership,
     pub object_lock_enabled: bool,
@@ -4357,16 +4359,6 @@ impl Coordinator {
         })
     }
 
-    fn principal_account_id(principal: &str) -> Option<&str> {
-        if principal.len() == 12 && principal.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Some(principal);
-        }
-
-        let arn = principal.strip_prefix("arn:aws:iam::")?;
-        let (account_id, _) = arn.split_once(':')?;
-        (!account_id.is_empty()).then_some(account_id)
-    }
-
     fn requester_is_bucket_owner_account(requester: &Requester, bucket: &BucketSummary) -> bool {
         let Some(account) = requester.account() else {
             return false;
@@ -4375,10 +4367,10 @@ impl Coordinator {
             return true;
         }
 
-        let Some(requester_account_id) = Self::principal_account_id(account.principal()) else {
+        let Some(requester_account_id) = aws_account_id_from_principal(account.principal()) else {
             return false;
         };
-        Self::principal_account_id(&bucket.owner_principal) == Some(requester_account_id)
+        aws_account_id_from_principal(&bucket.owner_principal) == Some(requester_account_id)
     }
 
     fn requester_can_discover_missing_object(
@@ -6472,6 +6464,8 @@ impl Coordinator {
             req.object_lock_enabled
         );
         let owner_account = req.requester.account().ok_or(ServerError::AccessDenied)?;
+        let locked_to_account_region =
+            self.validate_create_bucket_namespace(req.name, req.namespace, owner_account)?;
         if req.ownership == BucketObjectOwnership::BucketOwnerEnforced && req.acl.is_explicit() {
             return Err(ServerError::InvalidBucketAclWithObjectOwnership);
         }
@@ -6509,7 +6503,9 @@ impl Coordinator {
                 })
             }
             BucketCreateOutcome::AlreadyOwned => {
-                if !s3_types::is_legacy_create_bucket_region(&self.region) {
+                if locked_to_account_region
+                    || !s3_types::is_legacy_create_bucket_region(&self.region)
+                {
                     return Err(ServerError::BucketAlreadyOwnedByYou);
                 }
                 let existing = self.active_bucket_summary(req.name, None)?;
@@ -6518,6 +6514,63 @@ impl Coordinator {
                 self.apply_bucket_acl_update(req.name, &resolved)
             }
         }
+    }
+
+    fn validate_create_bucket_namespace(
+        &self,
+        bucket: &str,
+        namespace: BucketNamespace,
+        owner_account: &AccountIdentity,
+    ) -> Result<bool, ServerError> {
+        let locked = parse_account_regional_bucket_name(bucket);
+        if namespace == BucketNamespace::AccountRegional && locked.is_none() {
+            let account_id =
+                owner_account
+                    .account_id()
+                    .ok_or_else(|| ServerError::InvalidRequest {
+                        reason:
+                            "account-regional bucket namespace requires a 12-digit AWS account ID"
+                                .to_string(),
+                    })?;
+            return Err(ServerError::InvalidBucketNamespace {
+                reason: format!(
+                    "The requested bucket is an account-regional namespace bucket, but the bucket name does not end with -{account_id}-{}-an. Specify the targeted account and region in the bucket name.",
+                    self.region
+                ),
+                bucket_namespace: bucket.to_string(),
+            });
+        }
+
+        let Some(locked) = locked else {
+            return Ok(false);
+        };
+
+        let account_id = owner_account
+            .account_id()
+            .ok_or_else(|| ServerError::InvalidRequest {
+                reason: "account-regional bucket namespace requires a 12-digit AWS account ID"
+                    .to_string(),
+            })?;
+        if locked.account_id() != account_id || locked.region() != self.region {
+            let reason = if locked.account_id() != account_id {
+                format!(
+                    "The requested bucket is an account-regional namespace bucket, but the requested AWS Account ID '{}' does not match the caller's AWS Account ID '{}'. Specify the caller's AWS Account ID in the bucket name.",
+                    locked.account_id(),
+                    account_id
+                )
+            } else {
+                format!(
+                    "The requested bucket is an account-regional namespace bucket, but the requested region '{}' does not match the current region '{}'. Specify the targeted region in the bucket name.",
+                    locked.region(),
+                    self.region
+                )
+            };
+            return Err(ServerError::InvalidBucketNamespace {
+                reason,
+                bucket_namespace: bucket.to_string(),
+            });
+        }
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -14888,6 +14941,7 @@ mod tests {
         coord.create_bucket(&CreateBucketRequest {
             name,
             requester: owner_requester,
+            namespace: BucketNamespace::Global,
             acl: CreateBucketAcl::Grants(AclGrants::new(vec![AclGrant::new(
                 AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
                 AclPermission::Write,
@@ -15132,6 +15186,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -15150,6 +15205,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
                 object_lock_enabled: false,
@@ -15190,6 +15246,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("default-owner"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
                 object_lock_enabled: false,
@@ -15199,12 +15256,86 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("default-owner"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
                 object_lock_enabled: false,
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketAlreadyOwnedByYou));
+    }
+
+    #[test]
+    fn create_bucket_account_regional_rejects_mismatched_account_suffix() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        let err = coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket-444455556666-us-east-1-an",
+                requester: test_helpers::requester("111122223333"),
+                namespace: BucketNamespace::AccountRegional,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap_err();
+        match err {
+            ServerError::InvalidBucketNamespace {
+                bucket_namespace,
+                reason,
+            } => {
+                assert_eq!(bucket_namespace, "bucket-444455556666-us-east-1-an");
+                assert!(reason.contains("requested AWS Account ID '444455556666'"));
+                assert!(reason.contains("caller's AWS Account ID '111122223333'"));
+            }
+            other => panic!("expected InvalidBucketNamespace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_bucket_account_regional_rejects_mismatched_region_suffix() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator_in_region(tmp.path(), "eu-central-1");
+
+        let err = coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket-111122223333-us-east-1-an",
+                requester: test_helpers::requester("111122223333"),
+                namespace: BucketNamespace::AccountRegional,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap_err();
+        match err {
+            ServerError::InvalidBucketNamespace {
+                bucket_namespace,
+                reason,
+            } => {
+                assert_eq!(bucket_namespace, "bucket-111122223333-us-east-1-an");
+                assert!(reason.contains("requested region 'us-east-1'"));
+                assert!(reason.contains("current region 'eu-central-1'"));
+            }
+            other => panic!("expected InvalidBucketNamespace, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_bucket_account_regional_accepts_iam_arn_principal() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket-111122223333-us-east-1-an",
+                requester: test_helpers::requester("arn:aws:iam::111122223333:user/reader"),
+                namespace: BucketNamespace::AccountRegional,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
     }
 
     #[test]
@@ -15302,6 +15433,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -15328,6 +15460,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -15371,6 +15504,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -15474,6 +15608,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_requester(),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -16787,6 +16922,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,
@@ -17456,6 +17592,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -17482,6 +17619,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -17515,6 +17653,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -17548,6 +17687,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -17576,6 +17716,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -17604,6 +17745,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -18012,6 +18154,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -18035,6 +18178,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -18087,6 +18231,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -18158,6 +18303,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -18265,6 +18411,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(bucket_owner.clone()),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -18334,6 +18481,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -18344,6 +18492,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
                 object_lock_enabled: false,
@@ -18371,6 +18520,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::Canned(BucketAcl::PublicRead),
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
                 object_lock_enabled: false,
@@ -18391,6 +18541,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::Canned(BucketAcl::PublicRead),
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -18411,6 +18562,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
                 object_lock_enabled: false,
@@ -18488,6 +18640,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::Canned(BucketAcl::Private),
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
                 object_lock_enabled: false,
@@ -18520,6 +18673,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::Grants(AclGrants::new(vec![
                     AclGrant::new(
                         AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
@@ -22278,6 +22432,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -22373,6 +22528,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::Grants(AclGrants::new(vec![AclGrant::new(
                     AclGrantee::CanonicalUser(writer.canonical_user_id().clone()),
                     AclPermission::Write,
@@ -22452,6 +22608,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -22508,6 +22665,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::BucketOwnerEnforced,
                 object_lock_enabled: false,
@@ -23980,6 +24138,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,
@@ -26221,6 +26380,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: owner_requester.clone(),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -27473,6 +27633,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -27588,6 +27749,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: requester.clone(),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -27728,6 +27890,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,
@@ -27909,6 +28072,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,
@@ -28066,6 +28230,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,
@@ -28098,6 +28263,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,
@@ -28169,6 +28335,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,
@@ -28263,6 +28430,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,
@@ -28336,6 +28504,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,
@@ -28665,6 +28834,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,
@@ -28736,6 +28906,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,
@@ -28833,6 +29004,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,
@@ -28939,6 +29111,7 @@ mod tests {
             .create_bucket(&CreateBucketRequest {
                 name: "bucket",
                 requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
                 ownership: BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: true,

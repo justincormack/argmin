@@ -60,6 +60,12 @@ pub enum ServerError {
 
     #[error("invalid bucket name: {reason}")]
     InvalidBucketName { reason: String },
+
+    #[error("invalid bucket namespace: {reason}")]
+    InvalidBucketNamespace {
+        reason: String,
+        bucket_namespace: String,
+    },
     #[error("metadata blob error: {reason}")]
     MetadataBlobError { reason: String },
 
@@ -248,6 +254,7 @@ impl ServerError {
             Self::InvalidArgument { .. } => "InvalidArgument",
             Self::InvalidURI { .. } => "InvalidURI",
             Self::InvalidBucketName { .. } => "InvalidBucketName",
+            Self::InvalidBucketNamespace { .. } => "InvalidBucketNamespace",
             Self::MetadataBlobError { .. } => "InternalError",
             Self::ObjectTooLarge { .. } => "EntityTooLarge",
             Self::MetadataTooLarge => "MetadataTooLarge",
@@ -327,6 +334,7 @@ impl ServerError {
             | Self::InvalidArgument { .. }
             | Self::InvalidURI { .. }
             | Self::InvalidBucketName { .. }
+            | Self::InvalidBucketNamespace { .. }
             | Self::BadDigest
             | Self::InvalidDigest
             | Self::InvalidSseCustomerKeyMd5

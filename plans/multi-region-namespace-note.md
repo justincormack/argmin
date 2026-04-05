@@ -16,8 +16,18 @@ AWS S3 bucket naming is not region-local.
 Within an AWS partition, the bucket namespace is global:
 
 - standard AWS regions share one bucket namespace
+- standard general-purpose buckets still require global coordination
 - GovCloud is a separate partition with its own namespace
 - other partitions should be treated similarly
+
+AWS has also added an account-regional namespace for some general-purpose
+bucket names. Buckets named with the `-<account-id>-<region>-an` suffix are
+locked to that owning account and region. That means this specific naming form
+can be validated locally for owner/region correctness, and it does encode the
+bucket's region directly.
+
+That does not remove the broader compatibility requirement for the normal
+global namespace. It is a scoped exception, not a replacement model.
 
 That means a true multi-region S3-compatible deployment cannot be modeled as
 fully independent regional servers that know only their own local buckets.
@@ -28,6 +38,7 @@ They need some shared control-plane behavior for at least:
 - mapping bucket name to owning region
 - returning the correct region hint for wrong-region requests
 - preventing duplicate bucket creation in different regions
+- handling account-regional bucket names as a special locally-validatable case
 
 ## Why this matters
 

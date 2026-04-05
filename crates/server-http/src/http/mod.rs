@@ -49,8 +49,8 @@ use request::{S3Request, TransportSecurity};
 use response::S3Response;
 use router::{route, S3Operation};
 use s3_types::{
-    requires_sigv4, LegalHoldStatus, ObjectLockMode, ObjectLockState, ObjectRetention,
-    StoredLegalHoldStatus, VersionId,
+    requires_sigv4, BucketNamespace, LegalHoldStatus, ObjectLockMode, ObjectLockState,
+    ObjectRetention, StoredLegalHoldStatus, VersionId,
 };
 use server_core::sse::{
     SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
@@ -152,6 +152,21 @@ fn expected_bucket_owner(req: &S3Request) -> Option<&str> {
 
 fn expected_source_bucket_owner(req: &S3Request) -> Option<&str> {
     req.header("x-amz-source-expected-bucket-owner")
+}
+
+fn parse_bucket_namespace(req: &S3Request) -> Result<BucketNamespace, ServerError> {
+    if req.header_count("x-amz-bucket-namespace") > 1 {
+        return Err(ServerError::InvalidArgument {
+            reason: "x-amz-bucket-namespace must not be repeated".to_string(),
+        });
+    }
+    match req.header("x-amz-bucket-namespace") {
+        None | Some("global") => Ok(BucketNamespace::Global),
+        Some("account-regional") => Ok(BucketNamespace::AccountRegional),
+        Some(value) => Err(ServerError::InvalidArgument {
+            reason: format!("invalid x-amz-bucket-namespace: {value}"),
+        }),
+    }
 }
 
 fn reject_directory_bucket_only_object_features(req: &S3Request) -> Result<(), ServerError> {
@@ -820,12 +835,14 @@ impl HttpFrontend {
                 let object_lock_enabled = parse_bucket_object_lock_enabled(
                     req.header("x-amz-bucket-object-lock-enabled"),
                 )?;
+                let namespace = parse_bucket_namespace(req)?;
                 let ownership = parse_bucket_ownership(req.header("x-amz-object-ownership"))?;
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .create_bucket(&crate::coordinator::CreateBucketRequest {
                         name: &bucket,
                         requester,
+                        namespace,
                         acl,
                         ownership,
                         object_lock_enabled,
@@ -5072,6 +5089,7 @@ mod tests {
             .create_bucket(&crate::coordinator::CreateBucketRequest {
                 name,
                 requester: crate::coordinator::test_helpers::requester("testuser"),
+                namespace: BucketNamespace::Global,
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
                 ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -5198,6 +5216,7 @@ mod tests {
             .create_bucket(&crate::coordinator::CreateBucketRequest {
                 name: "mybucket",
                 requester: crate::coordinator::Requester::authenticated(account.clone()),
+                namespace: BucketNamespace::Global,
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
                 ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
@@ -5276,6 +5295,50 @@ mod tests {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn parse_bucket_namespace_defaults_to_global() {
+        let req = new_req(http::Method::PUT, "/bucket", "", vec![], vec![]);
+        assert_eq!(
+            parse_bucket_namespace(&req).unwrap(),
+            BucketNamespace::Global
+        );
+    }
+
+    #[test]
+    fn parse_bucket_namespace_accepts_account_regional() {
+        let req = new_req(
+            http::Method::PUT,
+            "/bucket",
+            "",
+            vec![(
+                "x-amz-bucket-namespace".to_string(),
+                "account-regional".to_string(),
+            )],
+            vec![],
+        );
+        assert_eq!(
+            parse_bucket_namespace(&req).unwrap(),
+            BucketNamespace::AccountRegional
+        );
+    }
+
+    #[test]
+    fn parse_bucket_namespace_rejects_invalid_values() {
+        let req = new_req(
+            http::Method::PUT,
+            "/bucket",
+            "",
+            vec![("x-amz-bucket-namespace".to_string(), "bogus".to_string())],
+            vec![],
+        );
+        match parse_bucket_namespace(&req).unwrap_err() {
+            ServerError::InvalidArgument { reason } => {
+                assert_eq!(reason, "invalid x-amz-bucket-namespace: bogus");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
     }
 
     #[test]
@@ -6528,6 +6591,7 @@ mod tests {
             .create_bucket(&crate::coordinator::CreateBucketRequest {
                 name: "mybucket",
                 requester: crate::coordinator::test_helpers::requester("testuser"),
+                namespace: BucketNamespace::Global,
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
                 ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
                 object_lock_enabled: false,
