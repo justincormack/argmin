@@ -1,8 +1,9 @@
 /// Integration tests for aws-chunked transfer encoding.
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use aws_sdk_s3::Client;
 use ring::{digest, hmac};
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{build_client_with_ca, build_test_agent, unique_bucket, TestServer, CTX};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -72,8 +73,8 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
-fn host() -> &'static str {
-    CTX.endpoint()
+fn host_for_endpoint(endpoint: &str) -> &str {
+    endpoint
         .trim_start_matches("http://")
         .trim_start_matches("https://")
 }
@@ -112,6 +113,107 @@ struct SignResult {
     timestamp: String,
 }
 
+struct StreamingSigner<'a> {
+    endpoint: &'a str,
+    access_key: &'a str,
+    secret_key: &'a str,
+    region: &'a str,
+}
+
+struct StreamingSignRequest<'a> {
+    method: &'a str,
+    path: &'a str,
+    content_sha256: &'a str,
+    decoded_content_length: usize,
+    content_encoding: &'a str,
+    extra_signed_headers: &'a [(&'a str, &'a str)],
+}
+
+impl StreamingSigner<'_> {
+    fn sign(&self, request: &StreamingSignRequest<'_>) -> SignResult {
+        let (date_long, date_short) = now_parts();
+        let service = "s3";
+
+        let host_val = host_for_endpoint(self.endpoint);
+
+        // Build sorted signed header names and canonical header string.
+        let mut all_headers: Vec<(&str, String)> = vec![
+            ("content-encoding", request.content_encoding.to_string()),
+            ("host", host_val.to_string()),
+            ("x-amz-content-sha256", request.content_sha256.to_string()),
+            ("x-amz-date", date_long.clone()),
+            (
+                "x-amz-decoded-content-length",
+                request.decoded_content_length.to_string(),
+            ),
+        ];
+
+        for (k, v) in request.extra_signed_headers {
+            all_headers.push((k, v.to_string()));
+        }
+        all_headers.sort_by_key(|(k, _)| *k);
+
+        // Deduplicate: keep only the last entry for each key
+        // (extra_signed_headers may override default headers like x-amz-checksum-*).
+        all_headers.dedup_by_key(|(k, _)| *k);
+
+        let signed_headers_list: Vec<&str> = all_headers.iter().map(|(k, _)| *k).collect();
+        let signed_headers = signed_headers_list.join(";");
+
+        let canonical_headers_str: String = all_headers
+            .iter()
+            .map(|(k, v)| format!("{}:{}\n", k, v))
+            .collect();
+
+        let canonical_request = format!(
+            "{}\n{}\n\n{}\n{}\n{}",
+            request.method,
+            request.path,
+            canonical_headers_str,
+            signed_headers,
+            request.content_sha256
+        );
+
+        let canonical_hash = sha256_hex(canonical_request.as_bytes());
+        let scope = format!("{}/{}/{}/aws4_request", date_short, self.region, service);
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+            date_long, scope, canonical_hash
+        );
+
+        let signing_key = derive_signing_key(self.secret_key, &date_short, self.region, service);
+        let signature = hmac_sha256(signing_key.as_ref(), string_to_sign.as_bytes());
+        let sig_hex = hex_encode(signature.as_ref());
+
+        let credential = format!(
+            "{}/{}/{}/{}/aws4_request",
+            self.access_key, date_short, self.region, service
+        );
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}, SignedHeaders={}, Signature={}",
+            credential, signed_headers, sig_hex
+        );
+
+        SignResult {
+            authorization,
+            amz_date: date_long.clone(),
+            seed_signature: sig_hex,
+            signing_key: signing_key.as_ref().to_vec(),
+            scope,
+            timestamp: date_long,
+        }
+    }
+}
+
+fn ctx_streaming_signer() -> StreamingSigner<'static> {
+    StreamingSigner {
+        endpoint: CTX.endpoint(),
+        access_key: CTX.access_key(),
+        secret_key: CTX.secret_key(),
+        region: CTX.region(),
+    }
+}
+
 /// Sign a request with SigV4 for aws-chunked uploads.
 fn sign_streaming_request(
     method: &str,
@@ -120,75 +222,65 @@ fn sign_streaming_request(
     decoded_content_length: usize,
     extra_signed_headers: &[(&str, &str)],
 ) -> SignResult {
-    let (date_long, date_short) = now_parts();
-    let region = CTX.region();
-    let access_key = CTX.access_key();
-    let secret_key = CTX.secret_key();
-    let service = "s3";
+    ctx_streaming_signer().sign(&StreamingSignRequest {
+        method,
+        path,
+        content_sha256,
+        decoded_content_length,
+        content_encoding: "aws-chunked",
+        extra_signed_headers,
+    })
+}
 
-    let host_val = host();
+struct ChunkedPutContext {
+    client: Client,
+    endpoint: String,
+    access_key: String,
+    secret_key: String,
+    region: String,
+    _server: Option<TestServer>,
+}
 
-    // Build sorted signed header names and canonical header string.
-    let mut all_headers: Vec<(&str, String)> = vec![
-        ("content-encoding", "aws-chunked".to_string()),
-        ("host", host_val.to_string()),
-        ("x-amz-content-sha256", content_sha256.to_string()),
-        ("x-amz-date", date_long.clone()),
-        (
-            "x-amz-decoded-content-length",
-            decoded_content_length.to_string(),
-        ),
-    ];
-
-    for (k, v) in extra_signed_headers {
-        all_headers.push((k, v.to_string()));
+async fn chunked_put_context_for_content_encoding_case() -> ChunkedPutContext {
+    if std::env::var("S3_TEST_ENDPOINT").is_ok() {
+        ChunkedPutContext {
+            client: CTX.client().clone(),
+            endpoint: CTX.endpoint().to_string(),
+            access_key: CTX.access_key().to_string(),
+            secret_key: CTX.secret_key().to_string(),
+            region: CTX.region().to_string(),
+            _server: None,
+        }
+    } else {
+        let server = TestServer::start_http().await;
+        let endpoint = server.endpoint().to_string();
+        let client = build_client_with_ca(
+            &endpoint,
+            s3_tests::server::TEST_ACCESS_KEY,
+            s3_tests::server::TEST_SECRET_KEY,
+            s3_tests::server::TEST_REGION,
+            server.tls_ca_pem(),
+        )
+        .await;
+        ChunkedPutContext {
+            client,
+            endpoint,
+            access_key: s3_tests::server::TEST_ACCESS_KEY.to_string(),
+            secret_key: s3_tests::server::TEST_SECRET_KEY.to_string(),
+            region: s3_tests::server::TEST_REGION.to_string(),
+            _server: Some(server),
+        }
     }
-    all_headers.sort_by_key(|(k, _)| *k);
+}
 
-    // Deduplicate: keep only the last entry for each key (extra_signed_headers
-    // may override default headers like x-amz-checksum-*).
-    all_headers.dedup_by_key(|(k, _)| *k);
-
-    let signed_headers_list: Vec<&str> = all_headers.iter().map(|(k, _)| *k).collect();
-    let signed_headers = signed_headers_list.join(";");
-
-    let canonical_headers_str: String = all_headers
-        .iter()
-        .map(|(k, v)| format!("{}:{}\n", k, v))
-        .collect();
-
-    let canonical_request = format!(
-        "{}\n{}\n\n{}\n{}\n{}",
-        method, path, canonical_headers_str, signed_headers, content_sha256
-    );
-
-    let canonical_hash = sha256_hex(canonical_request.as_bytes());
-    let scope = format!("{}/{}/{}/aws4_request", date_short, region, service);
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        date_long, scope, canonical_hash
-    );
-
-    let signing_key = derive_signing_key(secret_key, &date_short, region, service);
-    let signature = hmac_sha256(signing_key.as_ref(), string_to_sign.as_bytes());
-    let sig_hex = hex_encode(signature.as_ref());
-
-    let credential = format!(
-        "{}/{}/{}/{}/aws4_request",
-        access_key, date_short, region, service
-    );
-    let authorization = format!(
-        "AWS4-HMAC-SHA256 Credential={}, SignedHeaders={}, Signature={}",
-        credential, signed_headers, sig_hex
-    );
-
-    SignResult {
-        authorization,
-        amz_date: date_long.clone(),
-        seed_signature: sig_hex,
-        signing_key: signing_key.as_ref().to_vec(),
-        scope,
-        timestamp: date_long,
+impl ChunkedPutContext {
+    fn streaming_signer(&self) -> StreamingSigner<'_> {
+        StreamingSigner {
+            endpoint: &self.endpoint,
+            access_key: &self.access_key,
+            secret_key: &self.secret_key,
+            region: &self.region,
+        }
     }
 }
 
@@ -211,7 +303,7 @@ fn sign_streaming_request_custom(
     let secret_key = CTX.secret_key();
     let service = "s3";
 
-    let host_val = host();
+    let host_val = host_for_endpoint(CTX.endpoint());
 
     let mut all_headers: Vec<(&str, String)> = Vec::new();
     if !skip_content_encoding {
@@ -295,7 +387,7 @@ fn sign_streaming_request_custom_with_query(
     let secret_key = CTX.secret_key();
     let service = "s3";
 
-    let host_val = host();
+    let host_val = host_for_endpoint(CTX.endpoint());
 
     let mut all_headers: Vec<(&str, String)> = Vec::new();
     if !skip_content_encoding {
@@ -698,6 +790,86 @@ fn test_signed_chunked_put() {
         assert_eq!(head.content_encoding(), None);
 
         cleanup(&bucket, &["signed-chunked"]).await;
+    });
+}
+
+#[test]
+fn test_signed_chunked_put_with_gzip_content_encoding() {
+    s3_tests::run(async {
+        let ctx = chunked_put_context_for_content_encoding_case().await;
+        let bucket = unique_bucket();
+        ctx.client
+            .create_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        let data = b"hello from signed chunked gzip";
+        let path = format!("/{}/signed-chunked-gzip", bucket);
+        let content_sha256 = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+
+        let sign = ctx.streaming_signer().sign(&StreamingSignRequest {
+            method: "PUT",
+            path: &path,
+            content_sha256,
+            decoded_content_length: data.len(),
+            content_encoding: "gzip",
+            extra_signed_headers: &[],
+        });
+        let wire = build_signed_chunked_body(&sign, data);
+        let agent = build_test_agent(&ctx.endpoint, None, std::time::Duration::from_secs(30));
+
+        let url = format!("{}{}", ctx.endpoint, path);
+        let mut resp = agent
+            .put(&url)
+            .header("Authorization", &sign.authorization)
+            .header("x-amz-date", &sign.amz_date)
+            .header("x-amz-content-sha256", content_sha256)
+            .header("content-encoding", "gzip")
+            .header("x-amz-decoded-content-length", &data.len().to_string())
+            .header("content-length", &wire.len().to_string())
+            .send(&wire[..])
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 200, "PUT failed ({}): {}", status, body_str);
+
+        let get_resp = ctx
+            .client
+            .get_object()
+            .bucket(&bucket)
+            .key("signed-chunked-gzip")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get_resp.content_encoding(), Some("gzip"));
+        let got = get_resp.body.collect().await.unwrap().into_bytes().to_vec();
+        assert_eq!(got, data);
+
+        let head = ctx
+            .client
+            .head_object()
+            .bucket(&bucket)
+            .key("signed-chunked-gzip")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.content_encoding(), Some("gzip"));
+
+        let _ = ctx
+            .client
+            .delete_object()
+            .bucket(&bucket)
+            .key("signed-chunked-gzip")
+            .send()
+            .await;
+        ctx.client
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
     });
 }
 

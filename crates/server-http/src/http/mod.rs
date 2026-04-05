@@ -2606,18 +2606,6 @@ impl HttpFrontend {
             }
         }
 
-        // Require content-encoding contains aws-chunked.
-        let has_aws_chunked = req.header("content-encoding").is_some_and(|ce| {
-            ce.split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
-        });
-        if !has_aws_chunked {
-            return Err(ServerError::MalformedTrailerError {
-                reason: "content-encoding must contain aws-chunked for streaming uploads"
-                    .to_string(),
-            });
-        }
-
         // Require x-amz-decoded-content-length.
         let expected_str = req
             .header("x-amz-decoded-content-length")
@@ -2661,18 +2649,6 @@ impl HttpFrontend {
                     reason: format!("unsupported streaming token: {content_sha}"),
                 });
             }
-        }
-
-        // Require content-encoding contains aws-chunked.
-        let has_aws_chunked = req.header("content-encoding").is_some_and(|ce| {
-            ce.split(',')
-                .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
-        });
-        if !has_aws_chunked {
-            return Err(ServerError::MalformedTrailerError {
-                reason: "content-encoding must contain aws-chunked for streaming uploads"
-                    .to_string(),
-            });
         }
 
         // Require x-amz-decoded-content-length.
@@ -8546,6 +8522,43 @@ mod tests {
             Err(ServerError::InvalidRequest { .. }) => {} // expected
             other => panic!("expected InvalidRequest, got {:?}", other.err()),
         }
+    }
+
+    #[test]
+    fn unsigned_streaming_with_non_aws_content_encoding_decodes_and_preserves_header() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+
+        let req = new_req(
+            http::Method::PUT,
+            "/mybucket/key",
+            "",
+            vec![
+                (
+                    "x-amz-content-sha256".to_string(),
+                    "STREAMING-UNSIGNED-PAYLOAD-TRAILER".to_string(),
+                ),
+                ("content-encoding".to_string(), "gzip".to_string()),
+                ("x-amz-decoded-content-length".to_string(), "5".to_string()),
+                (
+                    "x-amz-trailer".to_string(),
+                    "x-amz-checksum-crc32".to_string(),
+                ),
+            ],
+            b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:AAAA\r\n\r\n".to_vec(),
+        );
+
+        match fe.reject_streaming_fallthrough(&req) {
+            Err(ServerError::InvalidRequest { .. }) => {}
+            other => panic!("expected streaming-path rejection, got {:?}", other),
+        }
+
+        let decoded = fe
+            .maybe_decode_chunked(&req, &test_auth())
+            .expect("decode should succeed")
+            .expect("streaming body should decode");
+        assert_eq!(decoded.header("content-encoding"), Some("gzip"));
+        assert_eq!(decoded.body, b"hello");
     }
 
     #[test]

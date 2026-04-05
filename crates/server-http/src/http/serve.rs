@@ -747,18 +747,6 @@ fn parse_chunked_mode(req: &S3Request) -> Result<ChunkedMode, ServerError> {
         "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
         | "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER"
         | "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => {
-            // content-encoding must contain aws-chunked.
-            let has_aws_chunked = req.header("content-encoding").is_some_and(|ce| {
-                ce.split(',')
-                    .any(|part| part.trim().eq_ignore_ascii_case("aws-chunked"))
-            });
-            if !has_aws_chunked {
-                return Err(ServerError::MalformedTrailerError {
-                    reason: "content-encoding must contain aws-chunked for streaming uploads"
-                        .to_string(),
-                });
-            }
-
             // x-amz-decoded-content-length must be present and valid.
             let expected_len_str = req
                 .header("x-amz-decoded-content-length")
@@ -3164,7 +3152,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_chunked_mode_missing_content_encoding_rejected() {
+    fn parse_chunked_mode_missing_content_encoding_allowed() {
         let req = make_s3req(
             "PUT",
             "/mybucket/mykey",
@@ -3173,8 +3161,23 @@ mod tests {
                 ("x-amz-decoded-content-length", "100"),
             ],
         );
-        let err = parse_chunked_mode(&req).unwrap_err();
-        assert!(matches!(err, ServerError::MalformedTrailerError { .. }));
+        let mode = parse_chunked_mode(&req).unwrap();
+        assert!(matches!(mode, ChunkedMode::Signed { expected_len: 100 }));
+    }
+
+    #[test]
+    fn parse_chunked_mode_non_aws_content_encoding_allowed() {
+        let req = make_s3req(
+            "PUT",
+            "/mybucket/mykey",
+            &[
+                ("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"),
+                ("content-encoding", "gzip"),
+                ("x-amz-decoded-content-length", "100"),
+            ],
+        );
+        let mode = parse_chunked_mode(&req).unwrap();
+        assert!(matches!(mode, ChunkedMode::Signed { expected_len: 100 }));
     }
 
     #[test]
