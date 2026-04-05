@@ -954,6 +954,32 @@ fn test_bucket_listv2_delimiter_not_skip_special() {
 }
 
 #[test]
+fn test_bucket_listv2_delimiter_dedupes_folder_object_common_prefix() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let (bucket, keys) =
+            create_objects_with_keys(client, &["folder/file.txt", "folder/"]).await;
+
+        let resp = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .delimiter("/")
+            .send()
+            .await
+            .unwrap();
+
+        assert!(
+            get_keys(resp.contents()).is_empty(),
+            "expected folder marker to be rolled into CommonPrefixes, got contents={:?}",
+            get_keys(resp.contents())
+        );
+        assert_eq!(get_prefixes(resp.common_prefixes()), vec!["folder/"]);
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
 fn test_bucket_listv2_delimiter_prefix_underscore() {
     s3_tests::run(async {
         let client = CTX.client();
