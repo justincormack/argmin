@@ -14,7 +14,7 @@ fn agent() -> ureq::Agent {
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     bucket
 }
 
@@ -798,12 +798,7 @@ fn test_signed_chunked_put_with_gzip_content_encoding() {
     s3_tests::run(async {
         let ctx = chunked_put_context_for_content_encoding_case().await;
         let bucket = unique_bucket();
-        ctx.client
-            .create_bucket()
-            .bucket(&bucket)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::create_bucket(&ctx.client, &bucket).await.unwrap();
 
         let data = b"hello from signed chunked gzip";
         let path = format!("/{}/signed-chunked-gzip", bucket);

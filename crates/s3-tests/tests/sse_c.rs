@@ -311,7 +311,7 @@ fn patterned_bytes(len: usize, seed: u8) -> Vec<u8> {
 
 async fn setup_sse_c_object(bucket: &str, key: &str, body: Vec<u8>) -> (String, String, Vec<u8>) {
     let client = CTX.client();
-    client.create_bucket().bucket(bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, bucket).await.unwrap();
 
     let customer_key = test_sse_c_key();
     let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
@@ -335,7 +335,7 @@ async fn assert_sse_c_put_get_head_round_trip_size(size: usize, seed: u8, label:
     let client = CTX.client();
     let bucket = unique_bucket();
     let object_key = format!("obj-{label}");
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
 
     let key = test_sse_c_key();
     let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -409,7 +409,7 @@ async fn assert_sse_c_multipart_round_trip_size(size: usize, seed: u8, label: &s
     let client = CTX.client();
     let bucket = unique_bucket();
     let object_key = format!("obj-{label}");
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
 
     let key = test_sse_c_key();
     let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -519,7 +519,7 @@ fn test_sse_c_put_get_head_round_trip() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -802,7 +802,7 @@ fn test_sse_c_range_get_on_versioned_object_returns_requested_version() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_bucket_versioning()
             .bucket(&bucket)
@@ -876,7 +876,7 @@ fn test_sse_c_range_get_and_part_number_rejected_together() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -960,7 +960,7 @@ fn test_sse_c_get_requires_headers() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -992,7 +992,7 @@ fn test_sse_c_head_requires_headers() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -1023,7 +1023,7 @@ fn test_sse_c_put_rejects_invalid_key_md5() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, _) = sse_c_header_values(&key);
@@ -1050,7 +1050,7 @@ fn test_sse_c_put_invalid_key_md5_argument_name_matches_aws() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, _) = sse_c_header_values(&key);
@@ -1084,7 +1084,7 @@ fn test_sse_c_put_requires_key_md5_header() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, _) = sse_c_header_values(&key);
@@ -1110,7 +1110,7 @@ fn test_sse_c_put_requires_key_header() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let result = client
             .put_object()
@@ -1133,7 +1133,7 @@ fn test_sse_c_put_rejects_key_without_algorithm() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -1159,7 +1159,7 @@ fn test_sse_c_get_rejects_wrong_key() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -1199,7 +1199,7 @@ fn test_sse_c_head_checksum_mode_uses_customer_key() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -1246,7 +1246,7 @@ fn test_sse_c_multipart_round_trip() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -1381,7 +1381,7 @@ fn test_sse_c_multipart_range_read() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -1489,7 +1489,7 @@ fn test_sse_c_multipart_get_part() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -1635,7 +1635,7 @@ fn test_sse_c_non_multipart_get_part() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -1722,7 +1722,7 @@ fn test_sse_c_upload_part_requires_headers() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -1758,7 +1758,7 @@ fn test_sse_c_upload_part_rejects_wrong_key() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -1800,7 +1800,7 @@ fn test_sse_c_upload_part_rejects_invalid_key_md5() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -1839,7 +1839,7 @@ fn test_sse_c_complete_multipart_allows_missing_headers() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -1897,7 +1897,7 @@ fn test_sse_c_complete_multipart_checksum_requires_headers() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -1964,7 +1964,7 @@ fn test_sse_c_complete_multipart_checksum_round_trip() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -2074,7 +2074,7 @@ fn test_sse_c_complete_multipart_rejects_wrong_key() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -2139,7 +2139,7 @@ fn test_sse_c_copy_object_round_trip() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let src_key = test_sse_c_key();
         let (src_key_b64, src_key_md5_b64) = sse_c_header_values(&src_key);
@@ -2221,7 +2221,7 @@ fn test_sse_c_copy_object_requires_source_headers() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -2266,7 +2266,7 @@ fn test_sse_c_copy_object_invalid_source_key_md5_argument_name_matches_aws() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -2319,7 +2319,7 @@ fn test_sse_c_upload_part_copy_round_trip() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let src_key = test_sse_c_key();
         let (src_key_b64, src_key_md5_b64) = sse_c_header_values(&src_key);
@@ -2442,7 +2442,7 @@ fn test_sse_c_upload_part_copy_requires_source_headers() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let src_key = test_sse_c_key();
         let (src_key_b64, src_key_md5_b64) = sse_c_header_values(&src_key);
@@ -2518,7 +2518,7 @@ fn test_sse_c_upload_part_copy_rejects_wrong_destination_key() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let src_key = test_sse_c_key();
         let (src_key_b64, src_key_md5_b64) = sse_c_header_values(&src_key);

@@ -83,7 +83,7 @@ fn test_get_bucket_encryption_default_sse_s3() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let resp = client
             .get_bucket_encryption()
@@ -113,7 +113,7 @@ fn test_put_get_bucket_encryption_blocks_and_unblocks_sse_c() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         client
             .put_bucket_encryption()
@@ -168,7 +168,7 @@ fn test_bucket_encryption_blocks_sse_c_put_object() {
         let client = CTX.client();
         let bucket = unique_bucket();
         let key = "blocked-put";
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_bucket_encryption()
             .bucket(&bucket)
@@ -204,7 +204,7 @@ fn test_bucket_encryption_blocks_sse_c_create_multipart_upload() {
         let client = CTX.client();
         let bucket = unique_bucket();
         let key = "blocked-mpu";
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_bucket_encryption()
             .bucket(&bucket)
@@ -236,7 +236,7 @@ fn test_bucket_encryption_does_not_block_existing_sse_c_reads() {
         let client = CTX.client();
         let bucket = unique_bucket();
         let key = "existing-sse-c-object";
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let customer_key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);

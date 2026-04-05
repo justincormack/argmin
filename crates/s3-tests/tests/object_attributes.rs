@@ -74,7 +74,7 @@ fn test_get_object_attributes() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let put_resp = client
             .put_object()
@@ -123,7 +123,7 @@ fn test_get_versioned_object_attributes() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Enable versioning
         client
@@ -217,7 +217,7 @@ fn test_get_checksum_object_attributes() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let checksum_sha256 = "arcu6553sHVAiX4MjW0j7I7vD4w6R+Gz9Ok0Q9lTa+0=";
         let put_resp = client
@@ -270,7 +270,7 @@ fn test_get_sse_c_encrypted_object_attributes() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -315,7 +315,7 @@ fn test_get_sse_c_object_attributes_requires_headers() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -354,7 +354,7 @@ fn test_get_sse_c_object_attributes_rejects_wrong_key() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -399,7 +399,7 @@ fn test_get_sse_c_checksum_object_attributes() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -498,7 +498,7 @@ fn test_get_multipart_object_attributes() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let part1 = vec![b'a'; PART_SIZE];
         let part2 = vec![b'b'; 1024];
@@ -530,7 +530,7 @@ fn test_get_single_multipart_object_attributes() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let part1 = vec![b'x'; PART_SIZE];
         do_multipart_upload(&bucket, "mpu-single", &[part1]).await;
@@ -560,7 +560,7 @@ fn test_get_paginated_multipart_object_attributes() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = "mpu-page";
         let parts_data: Vec<Vec<u8>> = vec![
@@ -688,7 +688,7 @@ fn test_get_zero_max_parts_object_attributes() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = "mpu-zero";
         let parts_data = [vec![b'a'; PART_SIZE], vec![b'b'; 1024]];
@@ -770,7 +770,7 @@ fn test_get_multipart_checksum_object_attributes() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = "mpu-cksum";
         let part1_data = vec![b'X'; PART_SIZE];
@@ -971,7 +971,7 @@ fn test_multipart_crc32_default_composite() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = "mpu-crc32-default";
         let complete =
@@ -1008,7 +1008,7 @@ fn test_multipart_crc32c_default_composite() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = "mpu-crc32c-default";
         let complete =
@@ -1046,7 +1046,7 @@ fn test_multipart_sha256_default_composite() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = "mpu-sha256-default";
         let complete =
@@ -1084,7 +1084,7 @@ fn test_multipart_crc64nvme_default_full_object() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = "mpu-crc64nvme-default";
         let _complete =
@@ -1114,7 +1114,7 @@ fn test_multipart_crc64nvme_composite_rejected() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let result = client
             .create_multipart_upload()
@@ -1136,7 +1136,7 @@ fn test_multipart_crc32_explicit_full_object() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = "mpu-crc32-full-object";
         let _complete = do_checksummed_multipart_upload(

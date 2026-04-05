@@ -13,7 +13,7 @@ use s3_tests::{
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     bucket
 }
 
@@ -53,7 +53,7 @@ async fn disable_bucket_public_access_block(bucket: &str) {
 
 async fn canonical_owner_id(client: &Client) -> String {
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     let owner_id = client
         .get_bucket_acl()
         .bucket(&bucket)
@@ -898,18 +898,8 @@ fn test_object_copy_not_owned_bucket() {
         let bucket1 = unique_bucket();
         let bucket2 = unique_bucket();
 
-        client
-            .create_bucket()
-            .bucket(&bucket1)
-            .send()
-            .await
-            .unwrap();
-        alt_client
-            .create_bucket()
-            .bucket(&bucket2)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::create_bucket(client, &bucket1).await.unwrap();
+        s3_tests::create_bucket(alt_client, &bucket2).await.unwrap();
 
         client
             .put_object()

@@ -21,7 +21,7 @@ async fn setup_public_write_bucket() -> String {
 async fn setup_private_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     bucket
 }
 

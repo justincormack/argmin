@@ -11,7 +11,9 @@ use aws_sdk_s3::operation::put_bucket_lifecycle_configuration::{
     PutBucketLifecycleConfigurationError, PutBucketLifecycleConfigurationOutput,
 };
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketLifecycleConfiguration, Delete};
+use aws_sdk_s3::types::{
+    BucketLifecycleConfiguration, BucketLocationConstraint, CreateBucketConfiguration, Delete,
+};
 use aws_sdk_s3::Client;
 use base64::Engine;
 use md5_legacy::Digest;
@@ -93,17 +95,24 @@ fn timestamp_millis() -> u64 {
         .as_millis() as u64
 }
 
+async fn create_test_bucket(client: &Client, bucket: &str) {
+    let mut request = client.create_bucket().bucket(bucket);
+    if CTX.region() != "us-east-1" {
+        request = request.create_bucket_configuration(
+            CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                .build(),
+        );
+    }
+    request.send().await.expect("create bucket");
+}
+
 /// Create a bucket and populate it with `n` objects named "key0", "key1", ...
 ///
 /// Returns the bucket name and the list of keys.
 pub async fn create_objects(client: &Client, prefix: &str, n: usize) -> (String, Vec<String>) {
     let bucket = unique_bucket();
-    client
-        .create_bucket()
-        .bucket(&bucket)
-        .send()
-        .await
-        .expect("create bucket");
+    create_test_bucket(client, &bucket).await;
 
     let mut keys = Vec::with_capacity(n);
     for i in 0..n {
@@ -126,12 +135,7 @@ pub async fn create_objects(client: &Client, prefix: &str, n: usize) -> (String,
 /// Each object body is `b"content"`. Returns `(bucket_name, keys_as_owned_strings)`.
 pub async fn create_objects_with_keys(client: &Client, keys: &[&str]) -> (String, Vec<String>) {
     let bucket = unique_bucket();
-    client
-        .create_bucket()
-        .bucket(&bucket)
-        .send()
-        .await
-        .expect("create bucket");
+    create_test_bucket(client, &bucket).await;
 
     let mut owned_keys = Vec::with_capacity(keys.len());
     for key in keys {
@@ -160,12 +164,7 @@ pub async fn create_public_bucket(client: &Client) -> String {
     let bucket = unique_bucket();
 
     // 1. Create the bucket (private, default ownership)
-    client
-        .create_bucket()
-        .bucket(&bucket)
-        .send()
-        .await
-        .expect("create bucket");
+    create_test_bucket(client, &bucket).await;
 
     // 2. Disable BlockPublicAccess on this bucket
     disable_bucket_public_access_block(client, &bucket).await;
@@ -208,12 +207,7 @@ pub async fn create_public_write_bucket(client: &Client) -> String {
 
     let bucket = unique_bucket();
 
-    client
-        .create_bucket()
-        .bucket(&bucket)
-        .send()
-        .await
-        .expect("create bucket");
+    create_test_bucket(client, &bucket).await;
 
     disable_bucket_public_access_block(client, &bucket).await;
 

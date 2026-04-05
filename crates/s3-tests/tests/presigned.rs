@@ -9,7 +9,7 @@ use s3_tests::{create_public_bucket, sse_c_header_values, test_sse_c_key, unique
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     bucket
 }
 
@@ -294,7 +294,7 @@ async fn assert_presigned_put_object_with_acl(client: &aws_sdk_s3::Client) {
     use aws_sdk_s3::types::{ObjectOwnership, OwnershipControls, OwnershipControlsRule};
 
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     let ownership = OwnershipControls::builder()
         .rules(
             OwnershipControlsRule::builder()

@@ -169,7 +169,7 @@ fn test_multi_object_delete_nonexistent_keys() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Delete keys that were never created — should succeed (idempotent)
         let delete = make_delete_request(&["nokey1", "nokey2", "nokey3"], false);
@@ -306,7 +306,7 @@ fn test_multi_object_delete_per_object_if_match() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let ok = client
             .put_object()
@@ -361,7 +361,7 @@ fn test_multi_object_delete_key_limit() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Build a request with >1000 keys (server limit)
         let key_strs: Vec<String> = (0..1001).map(|i| format!("key{}", i)).collect();
@@ -415,7 +415,7 @@ fn test_multi_objectv2_delete_key_limit() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Build a request with >1000 keys (server limit), verify via V2 list
         let key_strs: Vec<String> = (0..1001).map(|i| format!("key{}", i)).collect();
@@ -436,7 +436,7 @@ fn test_object_delete_key_bucket_gone() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
 
         // Try to delete an object from the now-deleted bucket
@@ -455,7 +455,7 @@ fn test_object_delete_key_bucket_gone() {
 async fn setup_versioned_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     client
         .put_bucket_versioning()
         .bucket(&bucket)

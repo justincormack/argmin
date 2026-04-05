@@ -1,6 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
+use base64::Engine;
 use ring::{digest, hmac};
 use s3_tests::{unique_bucket, CTX};
 
@@ -13,7 +15,15 @@ fn agent() -> ureq::Agent {
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    let mut request = client.create_bucket().bucket(&bucket);
+    if CTX.region() != "us-east-1" {
+        request = request.create_bucket_configuration(
+            CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                .build(),
+        );
+    }
+    request.send().await.unwrap();
     bucket
 }
 
@@ -74,6 +84,43 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+fn current_http_date() -> String {
+    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let days = secs / 86_400;
+    let (year, month, day) = days_to_ymd(days);
+    let secs_today = secs % 86_400;
+    let hour = secs_today / 3_600;
+    let minute = (secs_today % 3_600) / 60;
+    let second = secs_today % 60;
+    let weekday = WEEKDAYS[(days % 7) as usize];
+    let month_name = MONTHS[(month - 1) as usize];
+
+    format!("{weekday}, {day:02} {month_name} {year:04} {hour:02}:{minute:02}:{second:02} GMT")
+}
+
+fn sigv2_authorization(bucket: &str, date: &str) -> String {
+    let string_to_sign = format!("GET\n\n\n{date}\n/{bucket}");
+    let key = hmac::Key::new(
+        hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
+        CTX.secret_key().as_bytes(),
+    );
+    let signature = hmac::sign(&key, string_to_sign.as_bytes());
+    let signature_b64 = base64::engine::general_purpose::STANDARD.encode(signature.as_ref());
+    format!("AWS {}:{signature_b64}", CTX.access_key())
+}
+
+fn sigv2_unsupported_in_region(region: &str) -> bool {
+    matches!(region, "eu-central-1")
 }
 
 fn host() -> &'static str {
@@ -1331,6 +1378,32 @@ fn test_put_wrong_service() {
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 400, "expected 400, got {}", status);
         assert_error_code(&rbody, "AuthorizationHeaderMalformed");
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_sigv2_rejected_in_region_that_requires_sigv4() {
+    s3_tests::run(async {
+        if !sigv2_unsupported_in_region(CTX.region()) {
+            return;
+        }
+        let bucket = setup_bucket().await;
+        let url = format!("{}/{}", CTX.endpoint(), bucket);
+        let date = current_http_date();
+        let mut resp = agent()
+            .get(&url)
+            .header("Authorization", &sigv2_authorization(&bucket, &date))
+            .header("Date", &date)
+            .call()
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let rbody = resp.body_mut().read_to_string().unwrap();
+        assert_eq!(status, 400, "expected 400, got {}", status);
+        assert_error_code(&rbody, "InvalidRequest");
+        assert!(rbody.contains(
+            "The authorization mechanism you have provided is not supported. Please use AWS4-HMAC-SHA256."
+        ));
         cleanup(&bucket, &[]).await;
     });
 }

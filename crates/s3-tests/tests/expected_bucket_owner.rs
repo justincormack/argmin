@@ -181,10 +181,7 @@ fn legal_hold(status: ObjectLockLegalHoldStatus) -> ObjectLockLegalHold {
 
 async fn create_bucket() -> String {
     let bucket = unique_bucket();
-    CTX.client()
-        .create_bucket()
-        .bucket(&bucket)
-        .send()
+    s3_tests::create_bucket(CTX.client(), &bucket)
         .await
         .unwrap();
     bucket
@@ -204,9 +201,7 @@ async fn create_versioned_bucket() -> String {
 
 async fn create_object_lock_bucket() -> String {
     let bucket = unique_bucket();
-    CTX.client()
-        .create_bucket()
-        .bucket(&bucket)
+    s3_tests::create_bucket_request(CTX.client(), &bucket)
         .object_lock_enabled_for_bucket(true)
         .send()
         .await
@@ -400,9 +395,7 @@ fn test_create_bucket_ignores_expected_bucket_owner() {
         let client = CTX.client();
         let bucket = unique_bucket();
 
-        let result = client
-            .create_bucket()
-            .bucket(&bucket)
+        let result = s3_tests::create_bucket_request(client, &bucket)
             .customize()
             .mutate_request(|req| {
                 req.headers_mut()

@@ -92,7 +92,7 @@ async fn setup_access_matrix(
     let client = CTX.client();
     let bucket = unique_bucket();
 
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     disable_bucket_public_access_block(client, &bucket).await;
     set_bucket_owner_preferred(&bucket).await;
 

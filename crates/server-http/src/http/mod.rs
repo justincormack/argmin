@@ -2609,7 +2609,7 @@ impl HttpFrontend {
     }
 
     fn should_defer_region_check(&self, operation: &S3Operation) -> bool {
-        operation.bucket_name().is_some() && !matches!(operation, S3Operation::CreateBucket { .. })
+        operation.bucket_name().is_some()
     }
 
     fn enforce_bucket_region_for_operation(
@@ -5116,6 +5116,16 @@ mod tests {
             &auth,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn create_bucket_defers_region_check() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+
+        assert!(fe.should_defer_region_check(&S3Operation::CreateBucket {
+            bucket: "mybucket".to_string(),
+        }));
     }
 
     fn test_bucket_request(name: &str) -> crate::coordinator::BucketRequest<'_> {

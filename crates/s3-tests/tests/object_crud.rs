@@ -21,7 +21,7 @@ const AWS_EXEC_READ_CANONICAL_ID: &str =
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     bucket
 }
 
@@ -62,7 +62,7 @@ async fn setup_acl_enabled_bucket() -> String {
 
 async fn canonical_owner_id(client: &Client) -> String {
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     let owner_id = client
         .get_bucket_acl()
         .bucket(&bucket)

@@ -19,7 +19,7 @@ async fn cleanup(bucket: &str) {
 }
 
 async fn create_bucket_in_test_region(client: &aws_sdk_s3::Client, bucket: &str) {
-    let mut request = client.create_bucket().bucket(bucket);
+    let mut request = s3_tests::create_bucket_request(client, bucket);
     if CTX.region() != "us-east-1" {
         let config = CreateBucketConfiguration::builder()
             .location_constraint(BucketLocationConstraint::from(CTX.region()))
@@ -250,7 +250,7 @@ fn test_create_bucket_no_ownership_controls() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // GET ownership controls should return BucketOwnerEnforced (AWS default)
         let resp = client
@@ -275,21 +275,23 @@ fn test_create_bucket_existing_bucket_does_not_overwrite_ownership_controls() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
+        s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::ObjectWriter)
             .send()
             .await
             .unwrap();
 
-        client
-            .create_bucket()
-            .bucket(&bucket)
+        let result = s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerEnforced)
             .send()
-            .await
-            .unwrap();
+            .await;
+
+        if CTX.region() == "us-east-1" {
+            result.unwrap();
+        } else {
+            assert_eq!(err_status(&result), 409);
+            assert_s3_err_code(&result, "BucketAlreadyOwnedByYou");
+        }
 
         let resp = client
             .get_bucket_ownership_controls()
@@ -349,7 +351,7 @@ fn test_bucket_create_delete_bucket_ownership() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // PUT ownership controls
         let rule = aws_sdk_s3::types::OwnershipControlsRule::builder()
@@ -427,9 +429,7 @@ fn test_create_bucket_bucket_owner_enforced() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
+        s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerEnforced)
             .send()
             .await
@@ -697,9 +697,7 @@ fn test_bucket_owner_enforced_rejects_object_acl() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
+        s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerEnforced)
             .send()
             .await
@@ -745,9 +743,7 @@ fn test_bucket_owner_enforced_allows_bucket_owner_full_control() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
+        s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerEnforced)
             .send()
             .await
@@ -898,9 +894,7 @@ fn test_create_bucket_bucket_owner_preferred() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
+        s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerPreferred)
             .send()
             .await
@@ -928,9 +922,7 @@ fn test_create_bucket_object_writer() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
+        s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::ObjectWriter)
             .send()
             .await
@@ -955,7 +947,7 @@ fn test_put_bucket_ownership_bucket_owner_preferred() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let rule = aws_sdk_s3::types::OwnershipControlsRule::builder()
             .object_ownership(ObjectOwnership::BucketOwnerPreferred)
@@ -995,7 +987,7 @@ fn test_put_bucket_ownership_object_writer() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let rule = aws_sdk_s3::types::OwnershipControlsRule::builder()
             .object_ownership(ObjectOwnership::ObjectWriter)
@@ -1172,9 +1164,7 @@ fn test_bucket_owner_enforced_rejects_remaining_canned_object_acls() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
+        s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerEnforced)
             .send()
             .await
@@ -1233,9 +1223,7 @@ fn test_bucket_owner_enforced_rejects_explicit_object_acl_grants() {
         let client = CTX.client();
         let alt_owner = canonical_owner_id(CTX.alt_client()).await;
         let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
+        s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerEnforced)
             .send()
             .await
@@ -1403,9 +1391,7 @@ fn test_bucket_owner_enforced_bucket_acl_read_and_restore_semantics() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        let mut request = client
-            .create_bucket()
-            .bucket(&bucket)
+        let mut request = s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerEnforced);
         if CTX.region() != "us-east-1" {
             let config = CreateBucketConfiguration::builder()

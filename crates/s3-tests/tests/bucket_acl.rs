@@ -35,7 +35,7 @@ fn assert_sdk_err_code<E: std::fmt::Debug>(
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     bucket
 }
 
@@ -192,12 +192,7 @@ fn bucket_acl_policy(owner_id: &str, grants: Vec<Grant>) -> AccessControlPolicy 
 async fn alt_canonical_owner_id() -> String {
     let bucket = unique_bucket();
     let alt_client = CTX.alt_client();
-    alt_client
-        .create_bucket()
-        .bucket(&bucket)
-        .send()
-        .await
-        .unwrap();
+    s3_tests::create_bucket(alt_client, &bucket).await.unwrap();
     let id = alt_client
         .get_bucket_acl()
         .bucket(&bucket)
@@ -452,9 +447,7 @@ fn test_create_bucket_acl_canned_authenticated_read_rejected_with_default_owners
         let client = CTX.client();
         let bucket = unique_bucket();
 
-        let result = client
-            .create_bucket()
-            .bucket(&bucket)
+        let result = s3_tests::create_bucket_request(client, &bucket)
             .acl(BucketCannedAcl::AuthenticatedRead)
             .send()
             .await;

@@ -71,7 +71,7 @@ fn test_put_get_delete_bucket_tagging() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // PUT bucket tagging
         let tags = tagging(vec![tag("env", "prod"), tag("team", "platform")]);
@@ -121,7 +121,7 @@ fn test_get_bucket_tagging_not_set() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // GET bucket tagging when not set → error (NoSuchTagSet 404)
         let result = client.get_bucket_tagging().bucket(&bucket).send().await;
@@ -136,7 +136,7 @@ fn test_delete_bucket_tagging_not_set() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // DELETE bucket tagging when not set → idempotent, should succeed
         client
@@ -155,7 +155,7 @@ fn test_put_bucket_tagging_max_tags() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // 50 tags should succeed (bucket limit)
         let tags: Vec<Tag> = (0..50)
@@ -186,7 +186,7 @@ fn test_put_bucket_tagging_too_many() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // 51 tags should fail (bucket limit is 50)
         let tags: Vec<Tag> = (0..51)
@@ -211,7 +211,7 @@ fn test_put_get_delete_object_tagging() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -278,7 +278,7 @@ fn test_get_object_tagging_not_set() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -307,7 +307,7 @@ fn test_delete_object_tagging_not_set() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -335,7 +335,7 @@ fn test_put_object_tagging_max_tags() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -376,7 +376,7 @@ fn test_put_object_tagging_too_many() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -408,7 +408,7 @@ fn test_put_object_tagging_overwrite() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -462,7 +462,7 @@ fn test_put_object_with_tagging_header() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // PutObject with x-amz-tagging header including a bare key (empty value)
         client
@@ -541,7 +541,7 @@ fn test_get_object_tagging_count_header() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Put object with tags
         client
@@ -574,7 +574,7 @@ fn test_head_object_tagging_count_header() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Put object with tags
         client
@@ -608,7 +608,7 @@ fn test_copy_object_with_tagging() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Put source object
         client
@@ -662,7 +662,7 @@ fn test_set_bucket_tagging() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // GET before set → NoSuchTagSet
         let result = client.get_bucket_tagging().bucket(&bucket).send().await;
@@ -711,7 +711,7 @@ fn test_get_obj_tagging() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -753,7 +753,7 @@ fn test_get_obj_head_tagging() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -792,7 +792,7 @@ fn test_put_max_tags() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -838,7 +838,7 @@ fn test_put_excess_tags() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -880,7 +880,7 @@ fn test_put_modify_tags() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -948,7 +948,7 @@ fn test_put_delete_tags() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -1005,7 +1005,7 @@ fn test_put_obj_with_tags() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let data = "A".repeat(100);
         client
@@ -1059,7 +1059,7 @@ fn test_put_max_kvsize_tags() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -1104,7 +1104,7 @@ fn test_put_excess_key_tags() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -1144,7 +1144,7 @@ fn test_put_excess_val_tags() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -1188,7 +1188,7 @@ fn test_put_object_invalid_tagging_not_stored() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // 11 tags via URL-encoded header should be rejected
         let tag_str: String = (0..11)
@@ -1219,7 +1219,7 @@ fn test_copy_object_default_copies_tags() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Put source with tags
         client
@@ -1270,7 +1270,7 @@ fn test_copy_object_replace_clears_tags() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Put source with tags
         client
@@ -1315,7 +1315,7 @@ fn test_copy_object_replace_clears_tags() {
 async fn create_delete_marker() -> (String, String, String) {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
 
     // Enable versioning
     client
@@ -1482,7 +1482,7 @@ fn test_delete_tagged_object_no_tags_on_delete_marker() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Enable versioning
         client
@@ -1563,7 +1563,7 @@ fn test_set_multipart_tagging() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = "multipart-tagged";
         let create = client
@@ -1655,7 +1655,7 @@ fn test_get_tags_acl_public() {
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
         let key = "testputtagsacl";
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -1717,7 +1717,7 @@ fn test_put_tags_acl_public() {
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
         let key = "testputtagsacl";
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -1779,7 +1779,7 @@ fn test_delete_tags_obj_public() {
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
         let key = "testputtagsacl";
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -1847,7 +1847,7 @@ fn test_bucket_policy_get_obj_existing_tag() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         for key in ["publictag", "privatetag", "invalidtag"] {
             client
@@ -1938,7 +1938,7 @@ fn test_bucket_policy_get_obj_tagging_existing_tag() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         for key in ["publictag", "privatetag", "invalidtag"] {
             client
@@ -2040,7 +2040,7 @@ fn test_bucket_policy_put_obj_tagging_existing_tag() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         for key in ["publictag", "privatetag"] {
             client
@@ -2143,18 +2143,8 @@ fn test_bucket_policy_put_obj_copy_source() {
         let alt_client = CTX.alt_client();
         let src_bucket = unique_bucket();
         let dst_bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&src_bucket)
-            .send()
-            .await
-            .unwrap();
-        client
-            .create_bucket()
-            .bucket(&dst_bucket)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::create_bucket(client, &src_bucket).await.unwrap();
+        s3_tests::create_bucket(client, &dst_bucket).await.unwrap();
 
         for key in ["public/foo", "public/bar", "private/foo"] {
             client
@@ -2263,18 +2253,8 @@ fn test_bucket_policy_put_obj_copy_source_meta() {
         let alt_client = CTX.alt_client();
         let src_bucket = unique_bucket();
         let dst_bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&src_bucket)
-            .send()
-            .await
-            .unwrap();
-        client
-            .create_bucket()
-            .bucket(&dst_bucket)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::create_bucket(client, &src_bucket).await.unwrap();
+        s3_tests::create_bucket(client, &dst_bucket).await.unwrap();
 
         for key in ["public/foo", "public/bar"] {
             client
@@ -2369,7 +2349,7 @@ fn test_bucket_policy_put_obj_acl() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let policy = json!({
             "Version": "2012-10-17",
@@ -2455,7 +2435,7 @@ fn test_bucket_policy_get_obj_acl_existing_tag() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         for key in ["publictag", "privatetag", "invalidtag"] {
             client

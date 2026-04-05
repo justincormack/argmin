@@ -15,7 +15,7 @@ const TEN_MIB: usize = 10 * ONE_MIB;
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     bucket
 }
 
@@ -319,7 +319,7 @@ fn test_atomic_write_bucket_gone() {
         let bucket = unique_bucket();
 
         // Create then immediately delete the bucket
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
 
         // PUT to the gone bucket → 404

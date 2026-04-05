@@ -345,12 +345,41 @@ async fn assert_distinct_external_s3_owners(
     );
 }
 
+pub async fn create_bucket(
+    client: &Client,
+    bucket: &str,
+) -> Result<(), aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>>
+{
+    create_bucket_request(client, bucket)
+        .send()
+        .await
+        .map(|_| ())
+}
+
+pub fn create_bucket_request(
+    client: &Client,
+    bucket: &str,
+) -> aws_sdk_s3::operation::create_bucket::builders::CreateBucketFluentBuilder {
+    create_bucket_request_in_region(client, bucket, CTX.region())
+}
+
 async fn create_bucket_in_region(
     client: &Client,
     bucket: &str,
     region: &str,
 ) -> Result<(), aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>>
 {
+    create_bucket_request_in_region(client, bucket, region)
+        .send()
+        .await
+        .map(|_| ())
+}
+
+fn create_bucket_request_in_region(
+    client: &Client,
+    bucket: &str,
+    region: &str,
+) -> aws_sdk_s3::operation::create_bucket::builders::CreateBucketFluentBuilder {
     let mut request = client.create_bucket().bucket(bucket);
     if region != "us-east-1" {
         let config = CreateBucketConfiguration::builder()
@@ -358,7 +387,7 @@ async fn create_bucket_in_region(
             .build();
         request = request.create_bucket_configuration(config);
     }
-    request.send().await.map(|_| ())
+    request
 }
 
 pub fn test_agent() -> ureq::Agent {

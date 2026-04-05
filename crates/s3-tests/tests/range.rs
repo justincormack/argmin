@@ -5,7 +5,7 @@ use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     bucket
 }
 
@@ -46,7 +46,7 @@ async fn setup_public_object_with_body(body: &'static [u8]) -> (String, String, 
 async fn setup_versioned_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     client
         .put_bucket_versioning()
         .bucket(&bucket)

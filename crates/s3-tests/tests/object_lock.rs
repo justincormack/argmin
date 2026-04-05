@@ -42,16 +42,14 @@ fn now_epoch_secs() -> i64 {
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     bucket
 }
 
 async fn setup_object_lock_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client
-        .create_bucket()
-        .bucket(&bucket)
+    s3_tests::create_bucket_request(client, &bucket)
         .object_lock_enabled_for_bucket(true)
         .send()
         .await
@@ -62,9 +60,7 @@ async fn setup_object_lock_bucket() -> String {
 async fn setup_public_write_object_lock_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client
-        .create_bucket()
-        .bucket(&bucket)
+    s3_tests::create_bucket_request(client, &bucket)
         .object_lock_enabled_for_bucket(true)
         .send()
         .await

@@ -48,7 +48,7 @@ fn test_bucket_list_empty() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
         assert!(resp.contents().is_empty());
@@ -114,12 +114,7 @@ fn test_bucket_list_distinct() {
         let client = CTX.client();
         let (bucket_a, keys_a) = create_objects_with_keys(client, &["foo", "bar"]).await;
         let bucket_b = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket_b)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::create_bucket(client, &bucket_b).await.unwrap();
 
         let resp = client
             .list_objects()
@@ -1837,7 +1832,7 @@ fn test_bucket_list_objects_anonymous_fail() {
         let client = CTX.client();
         let bucket = unique_bucket();
         // Private bucket (default ACL)
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let url = format!("{}/{}", CTX.endpoint(), bucket);
         let mut resp = anon_agent().get(&url).call().expect("transport error");
@@ -1859,7 +1854,7 @@ fn test_bucket_listv2_objects_anonymous_fail() {
         let client = CTX.client();
         let bucket = unique_bucket();
         // Private bucket (default ACL)
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let url = format!("{}/{}?list-type=2", CTX.endpoint(), bucket);
         let mut resp = anon_agent().get(&url).call().expect("transport error");
@@ -1889,7 +1884,7 @@ fn test_bucket_list_long_name() {
             format!("{}{}", base, "a".repeat(63 - base.len()))
         };
         assert_eq!(bucket.len(), 63);
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let resp = client.list_objects().bucket(&bucket).send().await.unwrap();
         assert!(resp.contents().is_empty());
@@ -2007,7 +2002,7 @@ fn test_bucket_list_return_data_versioning() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Enable versioning.
         client

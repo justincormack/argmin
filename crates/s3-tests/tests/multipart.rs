@@ -21,7 +21,7 @@ const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     bucket
 }
 
@@ -61,7 +61,7 @@ async fn disable_bucket_public_access_block(bucket: &str) {
 
 async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     let owner_id = client
         .get_bucket_acl()
         .bucket(&bucket)
@@ -532,7 +532,7 @@ fn test_abort_multipart_upload_after_bucket_delete_and_recreate_fails() {
             .await
             .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let result = client
             .abort_multipart_upload()

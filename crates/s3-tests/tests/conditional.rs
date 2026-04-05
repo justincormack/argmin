@@ -9,7 +9,7 @@ use s3_tests::{cleanup_versioned_bucket, err_status, unique_bucket, CTX};
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     bucket
 }
 
@@ -802,7 +802,7 @@ fn test_complete_multipart_ifnonmatch_current_object_in_versioned_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_bucket_versioning()
             .bucket(&bucket)
@@ -874,7 +874,7 @@ fn test_complete_multipart_ifmatch_current_object_in_versioned_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_bucket_versioning()
             .bucket(&bucket)
@@ -1562,7 +1562,7 @@ fn test_delete_object_version_if_match_not_implemented() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_bucket_versioning()
             .bucket(&bucket)

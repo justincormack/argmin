@@ -40,7 +40,7 @@ fn test_put_public_block() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // PUT public access block — matches Ceph: RestrictPublicBuckets=false
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
@@ -83,7 +83,7 @@ fn test_put_get_delete_public_block() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // PUT config
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
@@ -144,7 +144,7 @@ fn test_get_undefined_public_block() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Delete first (matching Ceph: ensures clean state)
         client
@@ -179,9 +179,7 @@ fn test_block_public_put_bucket_acls() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
+        s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerPreferred)
             .send()
             .await
@@ -443,9 +441,7 @@ fn test_block_public_object_canned_acls() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
+        s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::BucketOwnerPreferred)
             .send()
             .await
@@ -511,7 +507,7 @@ fn test_block_public_policy() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .block_public_acls(false)
@@ -556,7 +552,7 @@ fn test_block_public_policy_with_principal() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .block_public_acls(false)
@@ -620,7 +616,7 @@ fn test_block_public_restrict_public_buckets() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         client
             .delete_public_access_block()
@@ -725,7 +721,7 @@ fn test_get_public_block_deny_bucket_policy() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let pab = aws_sdk_s3::types::PublicAccessBlockConfiguration::builder()
             .block_public_acls(true)

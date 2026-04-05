@@ -13,7 +13,7 @@ fn agent() -> ureq::Agent {
 async fn setup_cors_bucket(rules: Vec<CorsRule>) -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
 
     let config = CorsConfiguration::builder()
         .set_cors_rules(Some(rules))
@@ -76,7 +76,7 @@ fn test_cors_set_get_delete() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // PUT CORS config
         let rule = CorsRule::builder()
@@ -137,7 +137,7 @@ fn test_cors_get_round_trip_multiple_rules_and_headers() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let rule1 = CorsRule::builder()
             .allowed_origins("http://example.com")
@@ -222,7 +222,7 @@ fn test_cors_get_no_config() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // GET CORS with no config should return error
         let result = client.get_bucket_cors().bucket(&bucket).send().await;
@@ -237,7 +237,7 @@ fn test_cors_delete_no_config() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // DELETE CORS when no config → should succeed (idempotent, 204)
         client

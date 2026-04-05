@@ -16,14 +16,14 @@ const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     bucket
 }
 
 async fn setup_versioned_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     client
         .put_bucket_versioning()
         .bucket(&bucket)

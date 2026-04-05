@@ -26,7 +26,7 @@ fn assert_canonical_owner_id(id: &str) {
 async fn setup_versioned_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     client
         .put_bucket_versioning()
         .bucket(&bucket)
@@ -44,7 +44,7 @@ async fn setup_versioned_bucket() -> String {
 async fn setup_versioned_acl_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     let ownership_rule = OwnershipControlsRule::builder()
         .object_ownership(aws_sdk_s3::types::ObjectOwnership::ObjectWriter)
         .build()
@@ -76,7 +76,7 @@ async fn setup_versioned_acl_bucket() -> String {
 
 async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     let owner_id = client
         .get_bucket_acl()
         .bucket(&bucket)
@@ -449,7 +449,7 @@ fn test_versioning_obj_plain_null_version_removal() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Put object before versioning is enabled (null version)
         let key = "testobjfoo";
@@ -507,7 +507,7 @@ fn test_versioning_obj_plain_null_version_overwrite() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = "testobjfoo";
         // Put before versioning
@@ -739,7 +739,7 @@ fn test_versioning_obj_plain_null_version_overwrite_suspended() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = "testobjbar";
         // Put before versioning
@@ -869,12 +869,7 @@ fn test_versioning_obj_suspended_copy() {
 
         // Copy to another non-versioned bucket
         let bucket2 = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket2)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::create_bucket(client, &bucket2).await.unwrap();
         client
             .copy_object()
             .bucket(&bucket2)
@@ -1126,12 +1121,7 @@ fn test_versioning_copy_obj_version() {
 
         // Copy each version to another bucket
         let bucket2 = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket2)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::create_bucket(client, &bucket2).await.unwrap();
 
         for i in 0..num {
             let new_key = format!("key_{}", i);
@@ -1402,12 +1392,7 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
 
         // Default (no versioning): should not return a version ID
         let bucket2 = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket2)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::create_bucket(client, &bucket2).await.unwrap();
         let resp = client
             .put_object()
             .bucket(&bucket2)
@@ -1436,12 +1421,7 @@ fn test_versioning_bucket_atomic_upload_return_version_id() {
 
         // Suspended: should not return a version ID
         let bucket3 = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket3)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::create_bucket(client, &bucket3).await.unwrap();
         client
             .put_bucket_versioning()
             .bucket(&bucket3)
@@ -1634,7 +1614,7 @@ fn test_delete_marker_nonversioned() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let key = "frodo.txt";
         client
@@ -1716,7 +1696,7 @@ fn test_versioning_bucket_create_suspend() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Fresh bucket: versioning status should be absent (unversioned)
         let resp = client

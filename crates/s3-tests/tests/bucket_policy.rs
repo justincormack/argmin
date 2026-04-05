@@ -101,7 +101,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
 
 async fn create_bucket_allowing_public_policy(client: &aws_sdk_s3::Client) -> String {
     let bucket = unique_bucket();
-    client.create_bucket().bucket(&bucket).send().await.unwrap();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
     disable_bucket_public_access_block(client, &bucket).await;
     bucket
 }
@@ -283,7 +283,7 @@ fn test_get_bucket_policy_status_private_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let result = client
             .get_bucket_policy_status()
@@ -405,7 +405,7 @@ fn test_get_bucket_policy_status_nonpublic_fixed_principal_policy() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         let policy = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -438,7 +438,7 @@ fn test_get_bucket_policy_status_cross_account_allow() {
         let alt_client = CTX.alt_client();
 
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         let policy = bucket_policy_document(
             principal,
             "Allow",
@@ -473,7 +473,7 @@ fn test_get_bucket_policy_status_cross_account_deny_overrides_allow() {
         let alt_client = CTX.alt_client();
 
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         let policy = json!({
             "Version": "2012-10-17",
             "Statement": [
@@ -529,7 +529,7 @@ fn test_put_bucket_policy_not_principal_rejected() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         let policy = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -562,7 +562,7 @@ fn test_bucket_policy_list_objects_v1() {
         let alt_client = CTX.alt_client();
 
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -606,7 +606,7 @@ fn test_bucket_policy_list_objects_v2() {
         let alt_client = CTX.alt_client();
 
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -728,11 +728,8 @@ fn test_bucket_policy_put_obj_grant_full_control() {
 
         let bucket = unique_bucket();
         let control_bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
-        client
-            .create_bucket()
-            .bucket(&control_bucket)
-            .send()
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::create_bucket(client, &control_bucket)
             .await
             .unwrap();
         set_object_writer_ownership(&bucket).await;
@@ -898,7 +895,7 @@ fn test_bucket_policy_copy_object_grant_full_control() {
         let alt_client = CTX.alt_client();
 
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         set_object_writer_ownership(&bucket).await;
         let owner_id = canonical_owner_id(client, &bucket).await;
         let full_control_header = format!("id=\"{owner_id}\"");
@@ -996,7 +993,7 @@ fn test_bucket_policy_put_obj_requires_sse_c_algorithm_header() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let policy = json!({
             "Version": "2012-10-17",
@@ -1069,7 +1066,7 @@ fn test_bucket_policy_put_obj_requires_sse_s3_header() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let policy = json!({
             "Version": "2012-10-17",
@@ -1136,7 +1133,7 @@ fn test_bucket_policy_put_obj_sse_c_algorithm_string_not_equals() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let policy = json!({
             "Version": "2012-10-17",
@@ -1194,7 +1191,7 @@ fn test_bucket_policy_put_obj_sse_s3_string_not_equals() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let policy = json!({
             "Version": "2012-10-17",
@@ -1249,7 +1246,7 @@ fn test_bucket_policy_copy_object_recognizes_destination_sse_c_header() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         client
             .put_object()
@@ -1322,7 +1319,7 @@ fn test_bucket_policy_copy_object_recognizes_destination_sse_s3_header() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         client
             .put_object()
@@ -1391,7 +1388,7 @@ fn test_bucket_policy_complete_multipart_does_not_reuse_destination_sse_c_header
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         client
             .put_object()
@@ -1501,7 +1498,7 @@ fn test_bucket_policy_multipart_copy_inherits_destination_sse_s3() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         client
             .put_object()
@@ -1597,7 +1594,7 @@ fn test_bucket_policy_streaming_put_rejects_lowercase_sse_c_algorithm() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let customer_key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
@@ -1628,7 +1625,7 @@ fn test_bucket_policy_put_obj_request_object_tag() {
         let alt_client = CTX.alt_client();
 
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         let policy = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -1821,7 +1818,7 @@ fn test_bucket_policy_multipart_upload_request_object_tag() {
         let alt_client = CTX.alt_client();
 
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         let policy = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -1891,16 +1888,8 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
 
         let src_bucket = unique_bucket();
         let dst_bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&src_bucket)
-            .send()
-            .await
-            .unwrap();
-        alt_client
-            .create_bucket()
-            .bucket(&dst_bucket)
-            .send()
+        s3_tests::create_bucket(client, &src_bucket).await.unwrap();
+        s3_tests::create_bucket(alt_client, &dst_bucket)
             .await
             .unwrap();
 
@@ -2060,18 +2049,8 @@ fn test_bucket_policy_another_bucket() {
 
         let bucket1 = unique_bucket();
         let bucket2 = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket1)
-            .send()
-            .await
-            .unwrap();
-        client
-            .create_bucket()
-            .bucket(&bucket2)
-            .send()
-            .await
-            .unwrap();
+        s3_tests::create_bucket(client, &bucket1).await.unwrap();
+        s3_tests::create_bucket(client, &bucket2).await.unwrap();
 
         client
             .put_object()

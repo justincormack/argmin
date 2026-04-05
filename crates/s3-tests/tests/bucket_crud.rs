@@ -28,7 +28,7 @@ fn assert_canonical_owner_id(id: &str) {
 async fn recreate_bucket_after_delete(client: &aws_sdk_s3::Client, bucket: &str) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let result = client.create_bucket().bucket(bucket).send().await;
+        let result = s3_tests::create_bucket_request(client, bucket).send().await;
         match result {
             Ok(_) => return,
             Err(err) => {
@@ -105,17 +105,11 @@ fn has_group_grant(grants: &[aws_sdk_s3::types::Grant], uri: &str, permission: P
 }
 
 async fn create_acl_enabled_bucket(client: &aws_sdk_s3::Client, bucket: &str) {
-    let mut request = client
-        .create_bucket()
-        .bucket(bucket)
-        .object_ownership(ObjectOwnership::ObjectWriter);
-    if CTX.region() != "us-east-1" {
-        let config = CreateBucketConfiguration::builder()
-            .location_constraint(BucketLocationConstraint::from(CTX.region()))
-            .build();
-        request = request.create_bucket_configuration(config);
-    }
-    request.send().await.unwrap();
+    s3_tests::create_bucket_request(client, bucket)
+        .object_ownership(ObjectOwnership::ObjectWriter)
+        .send()
+        .await
+        .unwrap();
     disable_bucket_public_access_block(client, bucket).await;
 }
 
@@ -126,7 +120,7 @@ fn test_bucket_create_delete() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         // Clean up
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
@@ -137,7 +131,7 @@ fn test_bucket_create_exists() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Verify bucket exists via HEAD
         client.head_bucket().bucket(&bucket).send().await.unwrap();
@@ -459,7 +453,7 @@ fn test_bucket_delete_nonempty() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         client
             .put_object()
@@ -494,7 +488,7 @@ fn test_bucket_delete_nonempty_delete_markers() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Enable versioning
         client
@@ -541,7 +535,7 @@ fn test_bucket_delete_then_recreate() {
         let client = CTX.client();
         let bucket = unique_bucket();
 
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
 
         // AWS documents that bucket removal can take time to finish, and
@@ -558,7 +552,7 @@ fn test_bucket_head() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         client.head_bucket().bucket(&bucket).send().await.unwrap();
 
@@ -594,7 +588,7 @@ fn test_bucket_head_expected_owner() {
         let account_id = CTX.account_id().to_string();
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         client
             .head_bucket()
@@ -620,7 +614,7 @@ fn test_bucket_head_wrong_expected_owner() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let result = client
             .head_bucket()
@@ -665,7 +659,7 @@ fn test_buckets_list_contains_created() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let resp = client.list_buckets().send().await.unwrap();
         let names: Vec<&str> = resp.buckets().iter().filter_map(|b| b.name()).collect();
@@ -688,7 +682,7 @@ fn test_bucket_list_objects_empty() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let resp = client
             .list_objects_v2()
@@ -708,7 +702,7 @@ fn test_bucket_list_objects_with_objects() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         for i in 0..3 {
             let key = format!("key{}", i);
@@ -776,7 +770,7 @@ fn test_bucket_head_extended() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // HEAD should return without error and include standard headers
         client.head_bucket().bucket(&bucket).send().await.unwrap();
@@ -790,7 +784,7 @@ fn test_bucket_create_special_key_names() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         // Create objects with special key names
         let special_keys = &["foo/bar", "foo&bar", "foo bar", "foo+bar"];
@@ -833,7 +827,7 @@ fn test_buckets_list_ctime() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
         let resp = client.list_buckets().send().await.unwrap();
         let found = resp
@@ -857,9 +851,11 @@ fn test_bucket_create_exists_nonowner() {
         let alt_client = CTX.alt_client();
 
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
 
-        let result = alt_client.create_bucket().bucket(&bucket).send().await;
+        let result = s3_tests::create_bucket_request(alt_client, &bucket)
+            .send()
+            .await;
         assert_eq!(err_status(&result), 409);
         assert_s3_err_code(&result, "BucketAlreadyExists");
 
@@ -877,9 +873,7 @@ fn test_bucket_header_acl_grants() {
         assert_canonical_owner_id(&alt_owner_id);
 
         let bucket = unique_bucket();
-        client
-            .create_bucket()
-            .bucket(&bucket)
+        s3_tests::create_bucket_request(client, &bucket)
             .object_ownership(ObjectOwnership::ObjectWriter)
             .customize()
             .mutate_request({
