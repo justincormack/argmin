@@ -49,8 +49,8 @@ use request::{S3Request, TransportSecurity};
 use response::S3Response;
 use router::{route, S3Operation};
 use s3_types::{
-    LegalHoldStatus, ObjectLockMode, ObjectLockState, ObjectRetention, StoredLegalHoldStatus,
-    VersionId,
+    requires_sigv4, LegalHoldStatus, ObjectLockMode, ObjectLockState, ObjectRetention,
+    StoredLegalHoldStatus, VersionId,
 };
 use server_core::sse::{
     SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
@@ -2509,6 +2509,15 @@ impl HttpFrontend {
         }
     }
 
+    fn unsupported_sigv2_error(authorization: Option<&str>, region: &str) -> Option<ServerError> {
+        if authorization.is_some_and(|value| value.starts_with("AWS ")) && requires_sigv4(region) {
+            return Some(ServerError::InvalidRequest {
+                reason: "The authorization mechanism you have provided is not supported. Please use AWS4-HMAC-SHA256.".to_string(),
+            });
+        }
+        None
+    }
+
     fn authenticate(
         &self,
         req: &S3Request,
@@ -2583,6 +2592,15 @@ impl HttpFrontend {
             // AWS: "AWS authentication requires a valid Date or x-amz-date header"
             Err(auth::AuthError::MissingSignedHeader { header }) if header == "x-amz-date" => {
                 return Err(ServerError::Auth(auth::AuthError::AccessDenied));
+            }
+            Err(auth::AuthError::UnsupportedAuthType) => {
+                if let Some(err) = Self::unsupported_sigv2_error(
+                    req.header("authorization"),
+                    self.coordinator.region(),
+                ) {
+                    return Err(err);
+                }
+                return Err(ServerError::Auth(auth::AuthError::UnsupportedAuthType));
             }
             Err(err) => return Err(ServerError::Auth(err)),
         };
@@ -5059,6 +5077,27 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
+    }
+
+    #[test]
+    fn unsupported_sigv2_error_returns_sigv4_required_message_in_eu_central_1() {
+        let err = HttpFrontend::unsupported_sigv2_error(Some("AWS AKIA:signature"), "eu-central-1")
+            .expect("expected eu-central-1 SigV2 to be rejected");
+        match err {
+            ServerError::InvalidRequest { reason } => assert_eq!(
+                reason,
+                "The authorization mechanism you have provided is not supported. Please use AWS4-HMAC-SHA256."
+            ),
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unsupported_sigv2_error_does_not_override_other_regions() {
+        assert!(
+            HttpFrontend::unsupported_sigv2_error(Some("AWS AKIA:signature"), "us-west-2")
+                .is_none()
+        );
     }
 
     #[test]

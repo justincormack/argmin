@@ -6509,7 +6509,7 @@ impl Coordinator {
                 })
             }
             BucketCreateOutcome::AlreadyOwned => {
-                if self.region != "us-east-1" {
+                if !s3_types::is_legacy_create_bucket_region(&self.region) {
                     return Err(ServerError::BucketAlreadyOwnedByYou);
                 }
                 let existing = self.active_bucket_summary(req.name, None)?;

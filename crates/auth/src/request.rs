@@ -603,6 +603,10 @@ fn validate_record_token_and_expiry(
         if !matches {
             return Err(AuthError::InvalidToken);
         }
+    } else if let Some(token) = request_token {
+        return Err(AuthError::UnexpectedSecurityToken {
+            token: token.to_string(),
+        });
     }
 
     Ok(())
@@ -1477,6 +1481,23 @@ mod tests {
         };
         let err = validate_record_token_and_expiry(&record, None, 0).unwrap_err();
         assert!(matches!(err, AuthError::InvalidToken));
+    }
+
+    #[test]
+    fn unexpected_token_when_not_required() {
+        let record = CredentialRecord {
+            access_key_id: "AKID".to_string(),
+            secret_key: SecretKey::new("s".to_string()),
+            account: account("p"),
+            session_token: None,
+            expires_at_epoch_secs: None,
+            enabled: true,
+        };
+        let err = validate_record_token_and_expiry(&record, Some("unexpected"), 0).unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::UnexpectedSecurityToken { token } if token == "unexpected"
+        ));
     }
 
     #[test]

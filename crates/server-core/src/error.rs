@@ -233,7 +233,8 @@ impl ServerError {
             Self::Auth(auth::AuthError::SignatureMismatch) => "SignatureDoesNotMatch",
             Self::Auth(auth::AuthError::RequestExpired) => "RequestTimeTooSkewed",
             Self::Auth(auth::AuthError::ExpiredToken) => "ExpiredToken",
-            Self::Auth(auth::AuthError::InvalidToken) => "InvalidToken",
+            Self::Auth(auth::AuthError::InvalidToken)
+            | Self::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => "InvalidToken",
             Self::Auth(auth::AuthError::InvalidQueryParam { .. }) => {
                 "AuthorizationQueryParametersError"
             }
@@ -319,6 +320,7 @@ impl ServerError {
                 | auth::AuthError::InvalidQueryParam { .. }
                 | auth::AuthError::MissingQueryParam { .. },
             ) => 400,
+            Self::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => 400,
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => 501,
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
@@ -508,6 +510,14 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_auth_unexpected_security_token() {
+        let err = ServerError::Auth(auth::AuthError::UnexpectedSecurityToken {
+            token: "unexpected".into(),
+        });
+        assert_eq!(err.s3_error_code(), "InvalidToken");
+    }
+
+    #[test]
     fn s3_error_code_auth_expired_token() {
         let err = ServerError::Auth(auth::AuthError::ExpiredToken);
         assert_eq!(err.s3_error_code(), "ExpiredToken");
@@ -551,6 +561,17 @@ mod tests {
     fn http_status_unsupported_auth_type_400() {
         assert_eq!(
             ServerError::Auth(auth::AuthError::UnsupportedAuthType).http_status(),
+            400
+        );
+    }
+
+    #[test]
+    fn http_status_unexpected_security_token_400() {
+        assert_eq!(
+            ServerError::Auth(auth::AuthError::UnexpectedSecurityToken {
+                token: "unexpected".into(),
+            })
+            .http_status(),
             400
         );
     }

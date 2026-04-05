@@ -22,6 +22,8 @@ pub enum AuthError {
     SignatureMismatch,
     #[error("invalid session token")]
     InvalidToken,
+    #[error("unexpected security token: {token}")]
+    UnexpectedSecurityToken { token: String },
     #[error("token expired")]
     ExpiredToken,
     #[error("missing required signed header: {header}")]

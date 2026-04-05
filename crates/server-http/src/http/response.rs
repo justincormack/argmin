@@ -11,22 +11,14 @@ use crate::error::ServerError;
 use auth::canonical::uri_encode;
 use checksum::{ChecksumAlgorithm, ChecksumType, RawChecksum};
 use s3_types::{
-    BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, LegalHoldStatus,
-    ObjectLockState, ObjectRetention, VersionId,
+    bucket_location_constraint, BucketObjectLockConfig, BucketVersioningState, CanonicalUserId,
+    LegalHoldStatus, ObjectLockState, ObjectRetention, VersionId,
 };
 use server_core::sse::{SseCustomerResponseHeaders, SSE_CUSTOMER_ALGORITHM};
 use server_core::system_metadata::SystemMetadata;
 use storage::{EffectiveBucketEncryptionConfig, ManagedEncryptionAlgorithm};
 
 use super::xml;
-
-fn legacy_bucket_location_constraint(region: &str) -> Option<&str> {
-    match region {
-        "us-east-1" => None,
-        "eu-west-1" => Some("EU"),
-        other => Some(other),
-    }
-}
 
 /// Format a `version_id` for S3 API responses.
 /// Null version is displayed as "null".
@@ -583,7 +575,7 @@ impl S3Response {
     /// Build a response for `GetBucketLocation`.
     #[must_use]
     pub fn get_bucket_location(region: &str) -> Self {
-        let body = xml::get_bucket_location_xml(legacy_bucket_location_constraint(region));
+        let body = xml::get_bucket_location_xml(bucket_location_constraint(region));
         Self::new(200).xml_body(body)
     }
 
@@ -1148,6 +1140,20 @@ impl S3Response {
                     xml::xml_escape(resource),
                 );
                 return Self::new(403).xml_body(body);
+            }
+            ServerError::Auth(auth::AuthError::UnexpectedSecurityToken { token }) => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>InvalidToken</Code>\
+                     <Message>The provided token is malformed or otherwise invalid.</Message>\
+                     <Token-0>{}</Token-0>\
+                     <RequestId>request-id</RequestId>\
+                     <HostId>host-id</HostId>\
+                     </Error>",
+                    xml::xml_escape(token),
+                );
+                return Self::new(400).xml_body(body);
             }
             ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader) => {
                 let body = xml::header_not_implemented_xml("Authorization", resource, "request-id");
@@ -2087,6 +2093,20 @@ mod tests {
         assert!(body.contains("<Code>AuthorizationHeaderMalformed</Code>"));
         assert!(body.contains("<Region>us-west-2</Region>"));
         assert!(body.contains("expecting 'us-west-2'"));
+    }
+
+    #[test]
+    fn unexpected_security_token_error_response_matches_aws_shape() {
+        let err = ServerError::Auth(auth::AuthError::UnexpectedSecurityToken {
+            token: "bad-token-causes-400".to_string(),
+        });
+        let resp = S3Response::error(&err, "/bucket/key");
+        assert_eq!(resp.status_code, 400);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("<Code>InvalidToken</Code>"));
+        assert!(body
+            .contains("<Message>The provided token is malformed or otherwise invalid.</Message>"));
+        assert!(body.contains("<Token-0>bad-token-causes-400</Token-0>"));
     }
 
     #[test]

@@ -1,10 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use base64::Engine;
 use ring::{digest, hmac};
 use s3_tests::{unique_bucket, CTX};
+use s3_types::requires_sigv4;
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -15,15 +15,10 @@ fn agent() -> ureq::Agent {
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
-    let mut request = client.create_bucket().bucket(&bucket);
-    if CTX.region() != "us-east-1" {
-        request = request.create_bucket_configuration(
-            CreateBucketConfiguration::builder()
-                .location_constraint(BucketLocationConstraint::from(CTX.region()))
-                .build(),
-        );
-    }
-    request.send().await.unwrap();
+    s3_tests::create_bucket_request(client, &bucket)
+        .send()
+        .await
+        .unwrap();
     bucket
 }
 
@@ -120,7 +115,7 @@ fn sigv2_authorization(bucket: &str, date: &str) -> String {
 }
 
 fn sigv2_unsupported_in_region(region: &str) -> bool {
-    matches!(region, "eu-central-1")
+    requires_sigv4(region)
 }
 
 fn host() -> &'static str {
@@ -1405,6 +1400,46 @@ fn test_sigv2_rejected_in_region_that_requires_sigv4() {
             "The authorization mechanism you have provided is not supported. Please use AWS4-HMAC-SHA256."
         ));
         cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_unexpected_security_token_on_static_credentials_returns_bad_request() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let key = "token-check.txt";
+        let put = signed_put(&bucket, key, b"token check body");
+        assert_eq!(put.0, 200, "expected setup PUT to succeed, got {}", put.0);
+
+        let url = format!("{}/{}/{}", CTX.endpoint(), bucket, key);
+        let response = s3_tests::send_signed_request(
+            "GET",
+            &url,
+            b"",
+            [("x-amz-security-token", "bad-token-causes-400")],
+        );
+        assert_eq!(
+            response.status, 400,
+            "expected 400, got {}",
+            response.status
+        );
+        assert_error_code(&response.body, "InvalidToken");
+        assert!(
+            response.body.contains(
+                "<Message>The provided token is malformed or otherwise invalid.</Message>"
+            ),
+            "expected InvalidToken message, got: {}",
+            response.body
+        );
+        assert!(
+            response
+                .body
+                .contains("<Token-0>bad-token-causes-400</Token-0>"),
+            "expected echoed token, got: {}",
+            response.body
+        );
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 

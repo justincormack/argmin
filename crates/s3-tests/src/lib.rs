@@ -21,6 +21,7 @@ use std::sync::LazyLock;
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use aws_sdk_s3::Client;
 use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider, TlsContext, TrustStore};
+use s3_types::is_legacy_create_bucket_region;
 use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
 
 /// Shared tokio runtime for all tests in a binary.
@@ -381,7 +382,7 @@ fn create_bucket_request_in_region(
     region: &str,
 ) -> aws_sdk_s3::operation::create_bucket::builders::CreateBucketFluentBuilder {
     let mut request = client.create_bucket().bucket(bucket);
-    if region != "us-east-1" {
+    if !is_legacy_create_bucket_region(region) {
         let config = CreateBucketConfiguration::builder()
             .location_constraint(BucketLocationConstraint::from(region))
             .build();

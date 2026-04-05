@@ -9,6 +9,52 @@ pub const MAX_PRINCIPAL_LEN: usize = 256;
 /// S3 canonical user IDs are 64 lowercase hex characters.
 pub const CANONICAL_USER_ID_LEN: usize = 64;
 
+const LEGACY_SIGV2_REGIONS: &[&str] = &[
+    "us-east-1",
+    "us-west-1",
+    "us-west-2",
+    "eu-west-1",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-northeast-1",
+    "sa-east-1",
+];
+
+/// Returns whether this region uses the legacy `us-east-1` CreateBucket behavior
+/// where a repeated create by the owner remains idempotent and the
+/// `LocationConstraint` is omitted.
+#[must_use]
+pub fn is_legacy_create_bucket_region(region: &str) -> bool {
+    region == "us-east-1"
+}
+
+/// Returns the response/body representation for bucket location constraint.
+///
+/// `None` is the legacy `us-east-1` null/empty location.
+#[must_use]
+pub fn bucket_location_constraint(region: &str) -> Option<&str> {
+    match region {
+        "us-east-1" => None,
+        "eu-west-1" => Some("EU"),
+        other => Some(other),
+    }
+}
+
+/// Returns whether the region still supports the legacy S3 SigV2 auth scheme.
+///
+/// This covers the standard-partition regions launched before 2013. Newer
+/// regions require SigV4.
+#[must_use]
+pub fn supports_legacy_sigv2(region: &str) -> bool {
+    LEGACY_SIGV2_REGIONS.contains(&region)
+}
+
+/// Returns whether the region requires SigV4 and rejects SigV2.
+#[must_use]
+pub fn requires_sigv4(region: &str) -> bool {
+    !supports_legacy_sigv2(region)
+}
+
 /// Bucket versioning state.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,10 +597,11 @@ impl AclGrants {
 #[cfg(test)]
 mod tests {
     use super::{
-        AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission, BucketObjectLockConfig,
-        BucketVersioningState, CanonicalUserId, LegalHoldStatus, ObjectLockDefaultRetention,
-        ObjectLockMode, ObjectLockState, ObjectRetention, RetentionPeriod, StoredLegalHoldStatus,
-        VersionId, CANONICAL_USER_ID_LEN,
+        bucket_location_constraint, is_legacy_create_bucket_region, requires_sigv4,
+        supports_legacy_sigv2, AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission,
+        BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, LegalHoldStatus,
+        ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState, ObjectRetention,
+        RetentionPeriod, StoredLegalHoldStatus, VersionId, CANONICAL_USER_ID_LEN,
     };
 
     #[test]
@@ -772,5 +819,25 @@ mod tests {
         assert_eq!(AclPermission::parse("bogus"), None);
         assert!(AclPermission::FullControl.implies(AclPermission::ReadAcp));
         assert!(!AclPermission::Read.implies(AclPermission::Write));
+    }
+
+    #[test]
+    fn legacy_create_bucket_region_helpers_match_aws_behavior() {
+        assert!(is_legacy_create_bucket_region("us-east-1"));
+        assert!(!is_legacy_create_bucket_region("us-west-2"));
+        assert_eq!(bucket_location_constraint("us-east-1"), None);
+        assert_eq!(bucket_location_constraint("eu-west-1"), Some("EU"));
+        assert_eq!(bucket_location_constraint("us-west-2"), Some("us-west-2"));
+    }
+
+    #[test]
+    fn legacy_sigv2_region_helpers_match_standard_partition_split() {
+        assert!(supports_legacy_sigv2("us-east-1"));
+        assert!(supports_legacy_sigv2("us-west-2"));
+        assert!(supports_legacy_sigv2("ap-southeast-2"));
+        assert!(!supports_legacy_sigv2("eu-central-1"));
+        assert!(!supports_legacy_sigv2("ap-south-1"));
+        assert!(requires_sigv4("eu-central-1"));
+        assert!(!requires_sigv4("us-west-2"));
     }
 }
