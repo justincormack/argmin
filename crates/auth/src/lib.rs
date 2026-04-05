@@ -63,6 +63,7 @@ pub use credential::{CredentialRecord, CredentialScope, CredentialStore, SecretK
 pub use error::AuthError;
 pub use post::{authenticate_post_sigv4, validate_post_policy, PostPolicyError};
 pub use request::{
-    authenticate_request, AuthContext, AuthMode, HeaderSource, StreamingSigningContext,
+    authenticate_request, authenticate_request_allow_wrong_region, AuthContext, AuthMode,
+    HeaderSource, StreamingSigningContext,
 };
 pub use sigv4::{parse_auth_header, verify_request, SigV4Auth};

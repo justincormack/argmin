@@ -65,6 +65,72 @@ pub enum S3Operation {
     OptionsRequest { bucket: String, key: Option<String> },
 }
 
+impl S3Operation {
+    pub fn bucket_name(&self) -> Option<&str> {
+        match self {
+            Self::ListBuckets => None,
+            Self::CreateBucket { bucket }
+            | Self::DeleteBucket { bucket }
+            | Self::HeadBucket { bucket }
+            | Self::GetBucketLocation { bucket }
+            | Self::ListObjectsV1 { bucket }
+            | Self::ListObjectsV2 { bucket }
+            | Self::PostObject { bucket }
+            | Self::DeleteObjects { bucket }
+            | Self::ListObjectVersions { bucket }
+            | Self::PutBucketVersioning { bucket }
+            | Self::GetBucketVersioning { bucket }
+            | Self::PutBucketObjectLockConfiguration { bucket }
+            | Self::GetBucketObjectLockConfiguration { bucket }
+            | Self::PutBucketEncryption { bucket }
+            | Self::GetBucketEncryption { bucket }
+            | Self::DeleteBucketEncryption { bucket }
+            | Self::PutBucketCors { bucket }
+            | Self::GetBucketCors { bucket }
+            | Self::DeleteBucketCors { bucket }
+            | Self::PutBucketTagging { bucket }
+            | Self::GetBucketTagging { bucket }
+            | Self::DeleteBucketTagging { bucket }
+            | Self::PutBucketLifecycle { bucket }
+            | Self::GetBucketLifecycle { bucket }
+            | Self::DeleteBucketLifecycle { bucket }
+            | Self::PutBucketPublicAccessBlock { bucket }
+            | Self::GetBucketPublicAccessBlock { bucket }
+            | Self::DeleteBucketPublicAccessBlock { bucket }
+            | Self::GetBucketAcl { bucket }
+            | Self::PutBucketAcl { bucket }
+            | Self::PutBucketOwnershipControls { bucket }
+            | Self::GetBucketOwnershipControls { bucket }
+            | Self::DeleteBucketOwnershipControls { bucket }
+            | Self::ListMultipartUploads { bucket }
+            | Self::PutBucketPolicy { bucket }
+            | Self::GetBucketPolicy { bucket }
+            | Self::GetBucketPolicyStatus { bucket }
+            | Self::DeleteBucketPolicy { bucket }
+            | Self::OptionsRequest { bucket, .. } => Some(bucket.as_str()),
+            Self::PutObject { bucket, .. }
+            | Self::GetObject { bucket, .. }
+            | Self::DeleteObject { bucket, .. }
+            | Self::HeadObject { bucket, .. }
+            | Self::PutObjectTagging { bucket, .. }
+            | Self::GetObjectTagging { bucket, .. }
+            | Self::DeleteObjectTagging { bucket, .. }
+            | Self::PutObjectRetention { bucket, .. }
+            | Self::GetObjectRetention { bucket, .. }
+            | Self::PutObjectLegalHold { bucket, .. }
+            | Self::GetObjectLegalHold { bucket, .. }
+            | Self::PutObjectAcl { bucket, .. }
+            | Self::GetObjectAcl { bucket, .. }
+            | Self::GetObjectAttributes { bucket, .. }
+            | Self::CreateMultipartUpload { bucket, .. }
+            | Self::UploadPart { bucket, .. }
+            | Self::CompleteMultipartUpload { bucket, .. }
+            | Self::AbortMultipartUpload { bucket, .. }
+            | Self::ListParts { bucket, .. } => Some(bucket.as_str()),
+        }
+    }
+}
+
 /// Validate an S3 bucket name per AWS rules.
 ///
 /// Rules enforced:

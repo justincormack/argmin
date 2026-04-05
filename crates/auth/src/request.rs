@@ -55,6 +55,7 @@ pub struct AuthContext {
     pub access_key_id: Option<String>,
     pub account: Option<AccountIdentity>,
     pub request_epoch_secs: Option<u64>,
+    pub signing_region: Option<String>,
     /// Present when the request uses STREAMING-AWS4-HMAC-SHA256-* content hash.
     pub streaming: Option<StreamingSigningContext>,
 }
@@ -67,6 +68,7 @@ impl AuthContext {
             access_key_id: None,
             account: None,
             request_epoch_secs: None,
+            signing_region: None,
             streaming: None,
         }
     }
@@ -159,6 +161,57 @@ pub fn authenticate_request<H: HeaderSource + ?Sized>(
     expected_service: &str,
     now_epoch_secs: u64,
 ) -> Result<AuthContext, AuthError> {
+    authenticate_request_inner(
+        method,
+        path,
+        query_string,
+        headers,
+        body,
+        store,
+        Some(expected_region),
+        expected_service,
+        now_epoch_secs,
+    )
+}
+
+/// Authenticate a request while deferring SigV4 region validation to a
+/// higher-level bucket-aware caller.
+#[allow(clippy::too_many_arguments)]
+pub fn authenticate_request_allow_wrong_region<H: HeaderSource + ?Sized>(
+    method: &str,
+    path: &str,
+    query_string: &str,
+    headers: &H,
+    body: &[u8],
+    store: &CredentialStore,
+    expected_service: &str,
+    now_epoch_secs: u64,
+) -> Result<AuthContext, AuthError> {
+    authenticate_request_inner(
+        method,
+        path,
+        query_string,
+        headers,
+        body,
+        store,
+        None,
+        expected_service,
+        now_epoch_secs,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn authenticate_request_inner<H: HeaderSource + ?Sized>(
+    method: &str,
+    path: &str,
+    query_string: &str,
+    headers: &H,
+    body: &[u8],
+    store: &CredentialStore,
+    expected_region: Option<&str>,
+    expected_service: &str,
+    now_epoch_secs: u64,
+) -> Result<AuthContext, AuthError> {
     observability::trace_scope!(
         TRACE_TARGET,
         "authenticate_request",
@@ -239,13 +292,14 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
     headers: &H,
     body: &[u8],
     store: &CredentialStore,
-    expected_region: &str,
+    expected_region: Option<&str>,
     expected_service: &str,
     now_epoch_secs: u64,
     auth_header: &str,
 ) -> Result<AuthContext, AuthError> {
     let parsed = parse_auth_header(auth_header)?;
-    if parsed.credential.region != expected_region || parsed.credential.service != expected_service
+    if expected_region.is_some_and(|region| parsed.credential.region != region)
+        || parsed.credential.service != expected_service
     {
         return Err(AuthError::MalformedAuth);
     }
@@ -307,6 +361,7 @@ fn authenticate_header<H: HeaderSource + ?Sized>(
         access_key_id: Some(credential.access_key_id),
         account: Some(record.account.clone()),
         request_epoch_secs,
+        signing_region: Some(credential.region),
         streaming,
     })
 }
@@ -319,7 +374,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
     headers: &H,
     _body: &[u8],
     store: &CredentialStore,
-    expected_region: &str,
+    expected_region: Option<&str>,
     expected_service: &str,
     now_epoch_secs: u64,
 ) -> Result<AuthContext, AuthError> {
@@ -344,7 +399,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         });
     }
     let credential = parse_credential_scope_ref(credential_raw.as_ref())?;
-    if credential.region != expected_region {
+    if expected_region.is_some_and(|region| credential.region != region) {
         return Err(AuthError::InvalidQueryParam {
             param: "X-Amz-Credential",
         });
@@ -468,6 +523,7 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         access_key_id: Some(credential.access_key_id.to_owned()),
         account: Some(record.account.clone()),
         request_epoch_secs: Some(request_epoch),
+        signing_region: Some(credential.region.to_owned()),
         streaming: None,
     })
 }

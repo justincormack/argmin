@@ -43,6 +43,12 @@ pub enum ServerError {
     #[error("auth error: {0}")]
     Auth(#[from] auth::AuthError),
 
+    #[error("authorization header region {provided_region} is wrong; expecting {expected_region}")]
+    WrongRegion {
+        provided_region: String,
+        expected_region: String,
+    },
+
     #[error("invalid request: {reason}")]
     InvalidRequest { reason: String },
 
@@ -218,7 +224,9 @@ impl ServerError {
             Self::VersionNotFound { .. } => "NoSuchVersion",
             Self::DeleteMarkerHit { .. } => "NoSuchKey",
             Self::Auth(auth::AuthError::MissingAuth) => "AccessDenied",
-            Self::Auth(auth::AuthError::MalformedAuth) => "AuthorizationHeaderMalformed",
+            Self::Auth(auth::AuthError::MalformedAuth) | Self::WrongRegion { .. } => {
+                "AuthorizationHeaderMalformed"
+            }
             Self::Auth(auth::AuthError::UnsupportedAuthType) => "InvalidArgument",
             Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => "NotImplemented",
@@ -304,7 +312,8 @@ impl ServerError {
             Self::ObjectNotFound { .. } => 404,
             Self::VersionNotFound { .. } => 404,
             Self::DeleteMarkerHit { .. } => 404,
-            Self::Auth(
+            Self::WrongRegion { .. }
+            | Self::Auth(
                 auth::AuthError::MalformedAuth
                 | auth::AuthError::UnsupportedAuthType
                 | auth::AuthError::InvalidQueryParam { .. }
@@ -484,6 +493,15 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_wrong_region() {
+        let err = ServerError::WrongRegion {
+            provided_region: "us-east-1".to_string(),
+            expected_region: "us-west-2".to_string(),
+        };
+        assert_eq!(err.s3_error_code(), "AuthorizationHeaderMalformed");
+    }
+
+    #[test]
     fn s3_error_code_auth_invalid_token() {
         let err = ServerError::Auth(auth::AuthError::InvalidToken);
         assert_eq!(err.s3_error_code(), "InvalidToken");
@@ -499,6 +517,18 @@ mod tests {
     fn http_status_auth_malformed_400() {
         assert_eq!(
             ServerError::Auth(auth::AuthError::MalformedAuth).http_status(),
+            400
+        );
+    }
+
+    #[test]
+    fn http_status_wrong_region_400() {
+        assert_eq!(
+            ServerError::WrongRegion {
+                provided_region: "us-east-1".to_string(),
+                expected_region: "us-west-2".to_string(),
+            }
+            .http_status(),
             400
         );
     }

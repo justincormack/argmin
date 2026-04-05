@@ -56,6 +56,32 @@ pub fn error_xml(code: &str, message: &str, resource: &str, request_id: &str) ->
     )
 }
 
+/// Format an S3 error response XML with an extra `<Region>` element.
+#[must_use]
+pub fn error_xml_with_region(
+    code: &str,
+    message: &str,
+    resource: &str,
+    request_id: &str,
+    region: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>{}</Code>\
+         <Message>{}</Message>\
+         <Region>{}</Region>\
+         <Resource>{}</Resource>\
+         <RequestId>{}</RequestId>\
+         </Error>",
+        xml_escape(code),
+        xml_escape(message),
+        xml_escape(region),
+        xml_escape(resource),
+        xml_escape(request_id),
+    )
+}
+
 /// Format an S3 `NotImplemented` error that identifies the header causing it.
 #[must_use]
 pub fn header_not_implemented_xml(header: &str, resource: &str, request_id: &str) -> String {

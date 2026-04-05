@@ -575,9 +575,9 @@ impl S3Response {
 
     /// Build a response for `HeadBucket`.
     #[must_use]
-    pub fn head_bucket(info: &BucketSummary) -> Self {
-        let _ = info; // We could add x-amz-bucket-region etc.
-        Self::new(200)
+    pub fn head_bucket(info: &BucketSummary, region: &str) -> Self {
+        let _ = info;
+        Self::new(200).header("x-amz-bucket-region", region)
     }
 
     /// Build a response for `GetBucketLocation`.
@@ -1196,6 +1196,23 @@ impl S3Response {
                     xml::xml_escape(resource),
                 );
                 return Self::new(400).xml_body(body);
+            }
+            ServerError::WrongRegion {
+                provided_region,
+                expected_region,
+            } => {
+                let body = xml::error_xml_with_region(
+                    "AuthorizationHeaderMalformed",
+                    &format!(
+                        "The authorization header is malformed; the region '{provided_region}' is wrong; expecting '{expected_region}'"
+                    ),
+                    resource,
+                    "request-id",
+                    expected_region,
+                );
+                return Self::new(400)
+                    .header("x-amz-bucket-region", expected_region)
+                    .xml_body(body);
             }
             _ => {}
         }
@@ -2052,8 +2069,24 @@ mod tests {
             bucket_lifecycle_generation: 0,
             encryption: EffectiveBucketEncryptionConfig::default(),
         };
-        let resp = S3Response::head_bucket(&info);
+        let resp = S3Response::head_bucket(&info, "us-west-2");
         assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "x-amz-bucket-region"), Some("us-west-2"));
+    }
+
+    #[test]
+    fn wrong_region_error_response_includes_bucket_region_hint() {
+        let err = ServerError::WrongRegion {
+            provided_region: "us-east-1".to_string(),
+            expected_region: "us-west-2".to_string(),
+        };
+        let resp = S3Response::error(&err, "/bucket/key");
+        assert_eq!(resp.status_code, 400);
+        assert_eq!(find_header(&resp, "x-amz-bucket-region"), Some("us-west-2"));
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("<Code>AuthorizationHeaderMalformed</Code>"));
+        assert!(body.contains("<Region>us-west-2</Region>"));
+        assert!(body.contains("expecting 'us-west-2'"));
     }
 
     #[test]

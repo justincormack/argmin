@@ -4328,6 +4328,22 @@ impl PgMetadataStore for PgStore {
             })
     }
 
+    fn delete_completed_multipart_uploads_for_bucket(
+        &self,
+        bucket: &str,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM completed_multipart_uploads WHERE bucket = ?1",
+                params![bucket],
+            )
+            .map(|_| ())
+            .map_err(|e| MetadataError::Db {
+                context: "delete completed multipart uploads for bucket",
+                source: e,
+            })
+    }
+
     fn list_multipart_uploads(
         &self,
         req: &ListMultipartUploadsReq,

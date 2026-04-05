@@ -398,6 +398,12 @@ pub trait PgMetadataStore {
         upload_id: &str,
     ) -> Result<Option<CompletedMultipartUploadRecord>, MetadataError>;
 
+    /// Delete all completed multipart upload records for a bucket.
+    fn delete_completed_multipart_uploads_for_bucket(
+        &self,
+        bucket: &str,
+    ) -> Result<(), MetadataError>;
+
     /// List multipart uploads for a bucket with pagination.
     fn list_multipart_uploads(
         &self,

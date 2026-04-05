@@ -3793,6 +3793,12 @@ impl ReadRuntime {
             return Ok(());
         }
 
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self.storage_node.get_pg(pg_id)?;
+            pg.delete_completed_multipart_uploads_for_bucket(bucket)
+                .map_err(ServerError::Metadata)
+        })?;
+
         let bucket_pg = self.storage_node.get_pg(bucket_pg_id)?;
         match bucket_pg.delete_bucket(bucket) {
             Ok(()) => Ok(()),
@@ -6708,6 +6714,20 @@ impl Coordinator {
             req.name
         );
         self.authorize_bucket_read_requester(&req.requester, req.name, req.expected_bucket_owner())
+    }
+
+    pub fn bucket_exists(&self, name: &str) -> Result<bool, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::bucket_exists",
+            "bucket={}",
+            name
+        );
+        match self.active_bucket_summary(name, None) {
+            Ok(_) => Ok(true),
+            Err(ServerError::BucketNotFound { .. }) => Ok(false),
+            Err(err) => Err(err),
+        }
     }
 
     pub fn list_buckets(
@@ -33473,6 +33493,62 @@ mod tests {
                 "bucket",
                 "key",
                 "definitely-wrong-upload-id",
+                test_requester(),
+                None,
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::NoSuchUpload { .. }),
+            "expected NoSuchUpload, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn abort_completed_multipart_upload_after_bucket_delete_and_recreate_fails() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let (upload_id, parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
+        coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &parts,
+                claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
+
+                sse_customer: None,
+            })
+            .unwrap();
+
+        coord
+            .delete_object(&DeleteObjectRequest {
+                object: object_version_request("bucket", "key", None, test_requester()),
+                bypass_governance: false,
+                cond: &DeleteCondition::default(),
+            })
+            .unwrap();
+        delete_bucket_test(&coord, "bucket").unwrap();
+        wait_until_bucket_gone(&coord, "bucket");
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
                 test_requester(),
                 None,
             ))

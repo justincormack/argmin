@@ -14,7 +14,10 @@ use std::{
     task::{Context, Poll},
 };
 
-use auth::{authenticate_request, AuthContext, AuthMode, CredentialStore};
+use auth::{
+    authenticate_request, authenticate_request_allow_wrong_region, AuthContext, AuthMode,
+    CredentialStore,
+};
 use bytes::Bytes;
 use hyper::body::{Body, Frame, SizeHint};
 
@@ -521,6 +524,7 @@ impl HttpFrontend {
             return self.handle_options_request(s3req, bucket);
         }
 
+        let defer_region_check = self.should_defer_region_check(&operation);
         let auth = {
             observability::trace_scope!(
                 TRACE_TARGET,
@@ -529,15 +533,19 @@ impl HttpFrontend {
                 s3req.method.as_str(),
                 s3req.path()
             );
-            self.authenticate(s3req)
+            self.authenticate(s3req, defer_region_check)
         };
         let result = match auth {
             Ok(auth) => {
-                // Streaming requests (STREAMING-*) should be handled by serve.rs's
-                // streaming path. If one reaches here, it means is_streaming_write
-                // rejected it (missing content-encoding, invalid decoded length, etc.)
-                // — reject it rather than processing raw chunked wire data.
-                if let Err(err) = self.reject_streaming_fallthrough(s3req) {
+                if defer_region_check {
+                    if let Err(err) = self.enforce_bucket_region_for_operation(&operation, &auth) {
+                        Err(err)
+                    } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
+                        Err(err)
+                    } else {
+                        self.dispatch_routed(s3req, &auth, operation)
+                    }
+                } else if let Err(err) = self.reject_streaming_fallthrough(s3req) {
                     Err(err)
                 } else {
                     self.dispatch_routed(s3req, &auth, operation)
@@ -843,7 +851,7 @@ impl HttpFrontend {
                         requester,
                         expected_bucket_owner,
                     })?;
-                Ok(S3Response::head_bucket(&info))
+                Ok(S3Response::head_bucket(&info, self.coordinator.region()))
             }
             S3Operation::GetBucketLocation { bucket } => {
                 let requester = Self::requester_from_auth(auth);
@@ -2501,8 +2509,12 @@ impl HttpFrontend {
         }
     }
 
-    fn authenticate(&self, req: &S3Request) -> Result<AuthContext, ServerError> {
-        self.authenticate_with_payload_check(req, true)
+    fn authenticate(
+        &self,
+        req: &S3Request,
+        defer_region_check: bool,
+    ) -> Result<AuthContext, ServerError> {
+        self.authenticate_with_payload_check(req, true, defer_region_check)
     }
 
     /// Authenticate a request, optionally skipping x-amz-content-sha256 body
@@ -2515,6 +2527,7 @@ impl HttpFrontend {
         &self,
         req: &S3Request,
         verify_payload_hash: bool,
+        defer_region_check: bool,
     ) -> Result<AuthContext, ServerError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2538,17 +2551,30 @@ impl HttpFrontend {
             }
         }
 
-        let auth_result = authenticate_request(
-            req.method.as_str(),
-            req.path(),
-            req.query_string(),
-            &req.header_source(),
-            &req.body,
-            &self.credentials,
-            self.coordinator.region(),
-            "s3",
-            now,
-        );
+        let auth_result = if defer_region_check {
+            authenticate_request_allow_wrong_region(
+                req.method.as_str(),
+                req.path(),
+                req.query_string(),
+                &req.header_source(),
+                &req.body,
+                &self.credentials,
+                "s3",
+                now,
+            )
+        } else {
+            authenticate_request(
+                req.method.as_str(),
+                req.path(),
+                req.query_string(),
+                &req.header_source(),
+                &req.body,
+                &self.credentials,
+                self.coordinator.region(),
+                "s3",
+                now,
+            )
+        };
 
         let auth = match auth_result {
             Ok(auth) => auth,
@@ -2580,6 +2606,37 @@ impl HttpFrontend {
         }
 
         Ok(auth)
+    }
+
+    fn should_defer_region_check(&self, operation: &S3Operation) -> bool {
+        operation.bucket_name().is_some() && !matches!(operation, S3Operation::CreateBucket { .. })
+    }
+
+    fn enforce_bucket_region_for_operation(
+        &self,
+        operation: &S3Operation,
+        auth: &AuthContext,
+    ) -> Result<(), ServerError> {
+        let Some(bucket) = operation.bucket_name() else {
+            return Ok(());
+        };
+        self.enforce_bucket_region(bucket, auth)
+    }
+
+    fn enforce_bucket_region(&self, bucket: &str, auth: &AuthContext) -> Result<(), ServerError> {
+        let Some(signing_region) = auth.signing_region.as_deref() else {
+            return Ok(());
+        };
+        if signing_region == self.coordinator.region() {
+            return Ok(());
+        }
+        if !self.coordinator.bucket_exists(bucket)? {
+            return Ok(());
+        }
+        Err(ServerError::WrongRegion {
+            provided_region: signing_region.to_string(),
+            expected_region: self.coordinator.region().to_string(),
+        })
     }
 
     /// Reject streaming requests that fell through `is_streaming_write` in serve.rs.
@@ -2769,7 +2826,7 @@ impl HttpFrontend {
             bucket,
             file_name.is_some()
         );
-        let header_auth = self.authenticate_with_payload_check(req, false)?;
+        let header_auth = self.authenticate_with_payload_check(req, false, true)?;
 
         let field = |name: &str| -> Option<&str> {
             form_fields
@@ -2827,6 +2884,7 @@ impl HttpFrontend {
         } else {
             &post_auth
         };
+        self.enforce_bucket_region(bucket, effective_auth)?;
 
         // Build metadata headers from form fields.
         let mut header_pairs: Vec<(String, String)> = Vec::new();
@@ -3176,7 +3234,8 @@ impl HttpFrontend {
             bucket,
             key
         );
-        let auth = self.authenticate_with_payload_check(req, false)?;
+        let auth = self.authenticate_with_payload_check(req, false, true)?;
+        self.enforce_bucket_region(bucket, &auth)?;
         reject_directory_bucket_only_object_features(req)?;
 
         let object_lock = parse_object_lock_headers(req)?;
@@ -3513,7 +3572,8 @@ impl HttpFrontend {
             upload_id,
             part_number
         );
-        let auth = self.authenticate_with_payload_check(req, false)?;
+        let auth = self.authenticate_with_payload_check(req, false, true)?;
+        self.enforce_bucket_region(bucket, &auth)?;
 
         validate_request_checksum_headers(req, false, false)?;
         let content_md5 = ContentMd5Claim::from_request(req)?;
@@ -4984,6 +5044,7 @@ mod tests {
             access_key_id: Some("AKID".to_string()),
             account: Some(auth::AccountIdentity::from_principal("testuser")),
             request_epoch_secs: Some(0),
+            signing_region: Some("us-east-1".to_string()),
             streaming: None,
         }
     }
@@ -4998,6 +5059,63 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
+    }
+
+    #[test]
+    fn bucket_region_mismatch_returns_wrong_region_for_existing_bucket() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let auth = auth::AuthContext {
+            mode: auth::AuthMode::HeaderSigV4,
+            access_key_id: Some("AKID".to_string()),
+            account: Some(auth::AccountIdentity::from_principal("testuser")),
+            request_epoch_secs: Some(0),
+            signing_region: Some("us-west-2".to_string()),
+            streaming: None,
+        };
+
+        match fe.enforce_bucket_region_for_operation(
+            &S3Operation::PutObject {
+                bucket: "mybucket".to_string(),
+                key: "key".to_string(),
+            },
+            &auth,
+        ) {
+            Err(ServerError::WrongRegion {
+                provided_region,
+                expected_region,
+            }) => {
+                assert_eq!(provided_region, "us-west-2");
+                assert_eq!(expected_region, "us-east-1");
+            }
+            other => panic!("expected WrongRegion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bucket_region_mismatch_is_ignored_for_missing_bucket() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+
+        let auth = auth::AuthContext {
+            mode: auth::AuthMode::HeaderSigV4,
+            access_key_id: Some("AKID".to_string()),
+            account: Some(auth::AccountIdentity::from_principal("testuser")),
+            request_epoch_secs: Some(0),
+            signing_region: Some("us-west-2".to_string()),
+            streaming: None,
+        };
+
+        fe.enforce_bucket_region_for_operation(
+            &S3Operation::PutObject {
+                bucket: "missing".to_string(),
+                key: "key".to_string(),
+            },
+            &auth,
+        )
+        .unwrap();
     }
 
     fn test_bucket_request(name: &str) -> crate::coordinator::BucketRequest<'_> {
@@ -5052,6 +5170,7 @@ mod tests {
             access_key_id: Some("AKID".to_string()),
             account: Some(account),
             request_epoch_secs: Some(0),
+            signing_region: Some("us-east-1".to_string()),
             streaming: None,
         };
         let resp = fe
@@ -8467,6 +8586,7 @@ mod tests {
             access_key_id: Some("AKID".to_string()),
             account: Some(auth::AccountIdentity::from_principal("testuser")),
             request_epoch_secs: Some(0),
+            signing_region: Some("us-east-1".to_string()),
             streaming: None, // missing!
         };
 

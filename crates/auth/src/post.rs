@@ -75,6 +75,7 @@ pub fn authenticate_post_sigv4(
         access_key_id: Some(access_key_id.to_string()),
         account: Some(record.account.clone()),
         request_epoch_secs: None,
+        signing_region: Some(region.to_string()),
         streaming: None,
     })
 }
