@@ -536,6 +536,86 @@ fn file_bucket_metadata_delete_nonexistent() {
 }
 
 #[test]
+fn delete_bucket_clears_completed_multipart_upload_records() {
+    let (_dir, store) = make_pg_store();
+    store
+        .create_bucket(
+            "bucket",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+    store
+        .create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: "completed-upload".into(),
+            bucket: "bucket".into(),
+            key: "key".into(),
+            tags: None,
+            metadata_blob: vec![].into(),
+            system_metadata_blob: SerializedSystemMetadataBlob::default(),
+            initiator: None,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            object_lock: ObjectLockState::default(),
+            checksum: None,
+            encryption: ObjectEncryption::None,
+        })
+        .unwrap();
+
+    let obj = CommitMultipartReq {
+        bucket: "bucket".into(),
+        key: "key".into(),
+        version_id: VersionId::Null,
+        owner: test_owner(),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        generation_id: GenerationId::MIN,
+        size: 1024,
+        etag_crc64: [0xAA, 0, 0, 0, 0, 0, 0, 0],
+        ec: EcShape { k: 4, m: 2 },
+        tags: None,
+        metadata_blob: Some(vec![].into()),
+        system_metadata_blob: None,
+        object_lock: ObjectLockState::default(),
+        encryption: ObjectEncryption::None,
+    };
+    let parts = vec![ObjectPartRecord {
+        bucket: "bucket".into(),
+        key: "key".into(),
+        version_id: VersionId::Null,
+        part_number: 1,
+        size: 1024,
+        etag: vec![0xAA],
+        etag_kind: EtagKind::Crc64,
+        part_okh: [1u8; 16],
+        part_vid: GenerationId::MIN,
+        ec_k: 4,
+        ec_m: 2,
+        shard_pg_id: 0,
+        checksum: None,
+    }];
+    store
+        .complete_multipart_commit("completed-upload", &obj, &parts)
+        .unwrap();
+
+    assert!(store
+        .get_completed_multipart_upload("completed-upload")
+        .unwrap()
+        .is_some());
+
+    store.delete_bucket("bucket").unwrap();
+
+    assert!(store
+        .get_completed_multipart_upload("completed-upload")
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn file_bucket_metadata_versioning_transitions() {
     let (_dir, store) = make_pg_store();
     store
@@ -1309,6 +1389,14 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         .into_live()
         .unwrap();
     assert_eq!(live.tags.as_deref(), Some(tags));
+
+    let completed = store
+        .get_completed_multipart_upload("uid-cmc")
+        .unwrap()
+        .expect("completed upload record");
+    assert_eq!(completed.bucket.as_str(), "b");
+    assert_eq!(completed.key.as_str(), "k");
+    assert_eq!(completed.owner.principal, "owner");
 }
 
 #[test]

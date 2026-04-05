@@ -392,6 +392,12 @@ pub trait PgMetadataStore {
     /// Delete a multipart upload and its parts (CASCADE).
     fn delete_multipart_upload(&self, upload_id: &str) -> Result<(), MetadataError>;
 
+    /// Get a completed multipart upload record retained for abort semantics.
+    fn get_completed_multipart_upload(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<CompletedMultipartUploadRecord>, MetadataError>;
+
     /// List multipart uploads for a bucket with pagination.
     fn list_multipart_uploads(
         &self,
@@ -463,7 +469,8 @@ pub trait PgMetadataStore {
     /// 2. Write/overwrite the object metadata row
     /// 3. Delete any prior `object_parts` for this version_id (null-version overwrite)
     /// 4. Insert new `object_parts` manifest rows
-    /// 5. Delete the `multipart_uploads` + `multipart_parts` rows
+    /// 5. Record the completed upload for AbortMultipartUpload semantics
+    /// 6. Delete the `multipart_uploads` + `multipart_parts` rows
     fn complete_multipart_commit(
         &self,
         upload_id: &str,

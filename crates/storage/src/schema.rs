@@ -100,6 +100,23 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     object_lock_legal_hold INTEGER NOT NULL DEFAULT 0 CHECK (object_lock_legal_hold IN (0, 1, 2))
 )";
 
+/// Completed multipart uploads retained for AbortMultipartUpload semantics.
+const CREATE_COMPLETED_MULTIPART_UPLOADS_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS completed_multipart_uploads (
+    upload_id        TEXT PRIMARY KEY,
+    bucket           TEXT NOT NULL,
+    key              TEXT NOT NULL,
+    completed_at     INTEGER NOT NULL,
+    owner_principal  TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
+    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) = 64),
+    initiator_principal TEXT CHECK (
+        initiator_principal IS NULL OR length(initiator_principal) BETWEEN 1 AND 256
+    ),
+    initiator_canonical_id TEXT CHECK (
+        initiator_canonical_id IS NULL OR length(initiator_canonical_id) = 64
+    )
+)";
+
 /// Index for listing multipart uploads by bucket/key.
 const CREATE_MPU_BUCKET_KEY_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_mpu_bucket_key \
@@ -391,6 +408,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_OBJECTS_VERSIONS_INDEX, [])?;
     conn.execute(CREATE_OBJECTS_WRITE_SEQUENCE_INDEX, [])?;
     conn.execute(CREATE_MULTIPART_UPLOADS_TABLE, [])?;
+    conn.execute(CREATE_COMPLETED_MULTIPART_UPLOADS_TABLE, [])?;
     conn.execute(CREATE_MPU_BUCKET_KEY_INDEX, [])?;
     conn.execute(CREATE_MULTIPART_PARTS_TABLE, [])?;
     conn.execute(CREATE_OBJECT_PARTS_TABLE, [])?;

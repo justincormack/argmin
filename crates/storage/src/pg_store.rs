@@ -1628,13 +1628,42 @@ impl PgMetadataStore for PgStore {
             self.pg_id,
             name
         );
-        let deleted = self
-            .conn
-            .execute("DELETE FROM buckets WHERE name = ?1", params![name])
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
-                context: "delete bucket",
+                context: "delete bucket (begin txn)",
                 source: e,
             })?;
+        let result = (|| -> Result<usize, rusqlite::Error> {
+            let deleted = self
+                .conn
+                .execute("DELETE FROM buckets WHERE name = ?1", params![name])?;
+            if deleted != 0 {
+                self.conn.execute(
+                    "DELETE FROM completed_multipart_uploads WHERE bucket = ?1",
+                    params![name],
+                )?;
+            }
+            Ok(deleted)
+        })();
+        let deleted = match result {
+            Ok(deleted) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| MetadataError::Db {
+                        context: "delete bucket (commit txn)",
+                        source: e,
+                    })?;
+                deleted
+            }
+            Err(source) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                return Err(MetadataError::Db {
+                    context: "delete bucket",
+                    source,
+                });
+            }
+        };
         if deleted == 0 {
             return Err(MetadataError::BucketNotFound {
                 name: BucketName::from(name),
@@ -4257,6 +4286,48 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    fn get_completed_multipart_upload(
+        &self,
+        upload_id: &str,
+    ) -> Result<Option<CompletedMultipartUploadRecord>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT upload_id, bucket, key, completed_at, owner_principal, owner_canonical_id, \
+                 initiator_principal, initiator_canonical_id \
+                 FROM completed_multipart_uploads WHERE upload_id = ?1",
+                params![upload_id],
+                |row| {
+                    let owner = Self::parse_owner_identity(
+                        row,
+                        4,
+                        5,
+                        "owner_principal",
+                        "owner_canonical_id",
+                    )?;
+                    let initiator = Self::parse_optional_owner_identity(
+                        row,
+                        6,
+                        7,
+                        "initiator_principal",
+                        "initiator_canonical_id",
+                    )?;
+                    Ok(CompletedMultipartUploadRecord {
+                        upload_id: row.get(0)?,
+                        bucket: row.get(1)?,
+                        key: row.get(2)?,
+                        completed_at: row.get::<_, i64>(3)? as u64,
+                        initiator,
+                        owner,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get completed multipart upload",
+                source: e,
+            })
+    }
+
     fn list_multipart_uploads(
         &self,
         req: &ListMultipartUploadsReq,
@@ -5228,7 +5299,32 @@ impl PgMetadataStore for PgStore {
                 ],
             )?;
 
-            // 7. Delete in-progress upload + parts (CASCADE).
+            // 7. Record this upload as completed so AbortMultipartUpload can
+            //    remain idempotently successful for the exact completed upload_id.
+            let (initiator_principal, initiator_canonical_id): (Option<String>, Option<String>) =
+                self.conn.query_row(
+                    "SELECT initiator_principal, initiator_canonical_id \
+                     FROM multipart_uploads WHERE upload_id = ?1",
+                    params![upload_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+            self.conn.execute(
+                "INSERT OR REPLACE INTO completed_multipart_uploads \
+                 (upload_id, bucket, key, completed_at, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    upload_id,
+                    obj.bucket,
+                    obj.key,
+                    now as i64,
+                    obj.owner.principal,
+                    obj.owner.canonical_id.as_str(),
+                    initiator_principal,
+                    initiator_canonical_id,
+                ],
+            )?;
+
+            // 8. Delete in-progress upload + parts (CASCADE).
             self.conn.execute(
                 "DELETE FROM multipart_uploads WHERE upload_id = ?1",
                 params![upload_id],

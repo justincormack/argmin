@@ -179,6 +179,51 @@ async fn do_multipart_upload_with_acl(
     complete.e_tag().unwrap().to_string()
 }
 
+async fn complete_single_part_multipart_upload(bucket: &str, key: &str, body: &[u8]) -> String {
+    let client = CTX.client();
+
+    let create = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    let upload_id = create.upload_id().unwrap().to_string();
+
+    let part = client
+        .upload_part()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .part_number(1)
+        .body(ByteStream::from(body.to_vec()))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .parts(
+                    CompletedPart::builder()
+                        .e_tag(part.e_tag().unwrap())
+                        .part_number(1)
+                        .build(),
+                )
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+
+    upload_id
+}
+
 fn has_grant(grants: &[aws_sdk_s3::types::Grant], permission: Permission, uri: &str) -> bool {
     grants.iter().any(|grant| {
         grant.permission() == Some(&permission)
@@ -336,6 +381,167 @@ fn test_multipart_upload_abort() {
         // The object should not exist
         let result = client.get_object().bucket(&bucket).key(key).send().await;
         assert!(result.is_err());
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_abort_multipart_upload_after_complete_succeeds() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multipart-abort-after-complete";
+        let upload_id = complete_single_part_multipart_upload(&bucket, key, b"hello, world!").await;
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"hello, world!");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_abort_multipart_upload_after_complete_wrong_upload_id_fails() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multipart-abort-after-complete-wrong-upload-id";
+
+        let _upload_id =
+            complete_single_part_multipart_upload(&bucket, key, b"hello, world!").await;
+
+        let result = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id("definitely-wrong-upload-id")
+            .send()
+            .await;
+        assert_s3_err_code(&result, "NoSuchUpload");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_abort_multipart_upload_after_complete_and_delete_succeeds() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multipart-abort-after-complete-delete";
+
+        let upload_id = complete_single_part_multipart_upload(&bucket, key, b"first").await;
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        let get = client.get_object().bucket(&bucket).key(key).send().await;
+        assert_s3_err_code(&get, "NoSuchKey");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_abort_multipart_upload_after_complete_and_overwrite_succeeds() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multipart-abort-after-complete-overwrite";
+
+        let first_upload_id = complete_single_part_multipart_upload(&bucket, key, b"first").await;
+        let second_upload_id = complete_single_part_multipart_upload(&bucket, key, b"second").await;
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&first_upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&second_upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"second");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_abort_multipart_upload_after_bucket_delete_and_recreate_fails() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multipart-abort-after-bucket-recreate";
+
+        let upload_id = complete_single_part_multipart_upload(&bucket, key, b"first").await;
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+        client.create_bucket().bucket(&bucket).send().await.unwrap();
+
+        let result = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        assert_s3_err_code(&result, "NoSuchUpload");
 
         cleanup(&bucket, &[]).await;
     });

@@ -4409,6 +4409,18 @@ impl Coordinator {
             })
     }
 
+    fn requester_can_manage_completed_multipart_upload(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        upload: &storage::CompletedMultipartUploadRecord,
+    ) -> bool {
+        Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+            || Self::requester_matches_owner_identity(requester, &upload.owner)
+            || upload.initiator.as_ref().is_some_and(|initiator| {
+                Self::requester_matches_owner_identity(requester, initiator)
+            })
+    }
+
     fn requester_can_write_multipart_upload(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -13642,19 +13654,42 @@ impl Coordinator {
         let bucket_info = self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
         // 1. Lock meta PG and validate upload.
         let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
-
-        let upload = meta_pg.get_multipart_upload(upload_id)?;
-        if upload.bucket != bucket || upload.key != key {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        if !Self::requester_can_manage_multipart_upload(
-            req.object.requester(),
-            &bucket_info,
-            &upload,
-        ) {
-            return Err(ServerError::AccessDenied);
+        match meta_pg.get_multipart_upload(upload_id) {
+            Ok(upload) => {
+                if upload.bucket != bucket || upload.key != key {
+                    return Err(ServerError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    });
+                }
+                if !Self::requester_can_manage_multipart_upload(
+                    req.object.requester(),
+                    &bucket_info,
+                    &upload,
+                ) {
+                    return Err(ServerError::AccessDenied);
+                }
+            }
+            Err(storage::MetadataError::NoSuchUpload { .. }) => {
+                let Some(completed) = meta_pg.get_completed_multipart_upload(upload_id)? else {
+                    return Err(ServerError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    });
+                };
+                if completed.bucket != bucket || completed.key != key {
+                    return Err(ServerError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    });
+                }
+                if !Self::requester_can_manage_completed_multipart_upload(
+                    req.object.requester(),
+                    &bucket_info,
+                    &completed,
+                ) {
+                    return Err(ServerError::AccessDenied);
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(ServerError::Metadata(error)),
         }
 
         drop(meta_pg);
@@ -33352,7 +33387,7 @@ mod tests {
     }
 
     #[test]
-    fn abort_does_not_affect_completed_object() {
+    fn abort_completed_multipart_upload_succeeds_and_does_not_affect_object() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord
@@ -33380,8 +33415,8 @@ mod tests {
             })
             .unwrap();
 
-        // Abort the same upload_id should fail (already deleted by complete).
-        let err = coord
+        // Abort the same completed upload_id succeeds.
+        coord
             .abort_multipart_upload(&multipart_object_request_with_expected_owner(
                 "bucket",
                 "key",
@@ -33389,11 +33424,7 @@ mod tests {
                 test_requester(),
                 None,
             ))
-            .unwrap_err();
-        assert!(
-            matches!(err, ServerError::NoSuchUpload { .. }),
-            "expected NoSuchUpload, got {err:?}"
-        );
+            .unwrap();
 
         // Object should still exist (visible in listing).
         let list = coord
@@ -33407,6 +33438,49 @@ mod tests {
             .unwrap();
         assert_eq!(list.objects.len(), 1);
         assert_eq!(list.objects[0].key, "key");
+    }
+
+    #[test]
+    fn abort_wrong_upload_id_after_complete_still_fails() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let (upload_id, parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
+        coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &parts,
+                claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
+
+                sse_customer: None,
+            })
+            .unwrap();
+
+        let err = coord
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                "definitely-wrong-upload-id",
+                test_requester(),
+                None,
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::NoSuchUpload { .. }),
+            "expected NoSuchUpload, got {err:?}"
+        );
     }
 
     #[test]
