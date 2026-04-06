@@ -15,6 +15,11 @@ Signals: Security, Validated, Patch generated, Attack-path
 Introduced denial-of-service risk: invalid or huge expiration dates in POST policies can panic or spin the server during date_to_epoch conversion.
 The newly added POST policy validation parses ISO-8601 dates manually and converts them to epoch seconds without validating the ranges of year/month/day. The conversion loop iterates from 1970 to the provided year and indexes a fixed month-day table using the unvalidated month. A policy expiration such as month 14 triggers an out-of-bounds index panic, and an extremely large year forces a massive loop. Because the server processes requests serially and does not catch panics, an authenticated POST Object request with a malicious policy can crash the process or consume CPU.
 
+# Reviewer note
+This report was valid.
+
+It was fixed in commit `2afedac` (`fix: harden post policy expiration parsing`), which tightened ISO-8601 expiration parsing, rejected invalid month/day/time and oversized years, rejected pre-epoch dates, and replaced the unchecked epoch conversion with a bounded checked conversion path plus regression tests.
+
 # Validation
 ## Rubric
 - [x] Trace expiration validation path from validate_post_policy to parse_iso8601 in crates/auth/src/post.rs.
