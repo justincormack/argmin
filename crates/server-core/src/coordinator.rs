@@ -7942,6 +7942,13 @@ impl Coordinator {
                 reason: "Bucket is missing Object Lock Configuration".to_string(),
             });
         }
+        if let Some(retention) = requested.retention {
+            if retention.retain_until_unix_seconds <= Self::current_unix_seconds()? {
+                return Err(ServerError::InvalidArgument {
+                    reason: "The retain until date must be in the future!".to_string(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -29011,6 +29018,39 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn validate_requested_object_lock_state_rejects_past_retention() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
+            .unwrap();
+
+        let bucket = coord.active_bucket_summary("bucket", None).unwrap();
+        let now = Coordinator::current_unix_seconds().unwrap();
+        let err = Coordinator::validate_requested_object_lock_state(
+            &bucket,
+            ObjectLockState {
+                retention: Some(ObjectRetention {
+                    mode: ObjectLockMode::Governance,
+                    retain_until_unix_seconds: now.saturating_sub(1),
+                }),
+                legal_hold: StoredLegalHoldStatus::NotSet,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
 
     #[test]

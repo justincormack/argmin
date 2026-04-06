@@ -32,6 +32,10 @@ fn future_date(seconds_from_now: u64) -> DateTime {
     DateTime::from_secs(now_epoch_secs() + seconds_from_now as i64)
 }
 
+fn past_date(seconds_ago: u64) -> DateTime {
+    DateTime::from_secs(now_epoch_secs() - seconds_ago as i64)
+}
+
 fn now_epoch_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1528,6 +1532,32 @@ fn test_object_lock_put_object_headers_invalid_bucket_large_body() {
 }
 
 #[test]
+fn test_object_lock_put_object_headers_reject_past_retain_until() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"abc"))
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(past_date(60))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        let head = client.head_object().bucket(&bucket).key(key).send().await;
+        assert_eq!(err_status(&head), 404);
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
 fn test_object_lock_put_obj_retention_invalid_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -2686,6 +2716,49 @@ fn test_object_lock_copy_object_headers_invalid_bucket() {
 }
 
 #[test]
+fn test_object_lock_copy_object_headers_reject_past_retain_until() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let src_bucket = setup_bucket().await;
+        let dst_bucket = setup_object_lock_bucket().await;
+        let src_key = "src";
+        let dst_key = "dst";
+
+        client
+            .put_object()
+            .bucket(&src_bucket)
+            .key(src_key)
+            .body(ByteStream::from_static(b"abc"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .copy_object()
+            .copy_source(format!("{src_bucket}/{src_key}"))
+            .bucket(&dst_bucket)
+            .key(dst_key)
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(past_date(60))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        let head = client
+            .head_object()
+            .bucket(&dst_bucket)
+            .key(dst_key)
+            .send()
+            .await;
+        assert_eq!(err_status(&head), 404);
+
+        cleanup_plain_bucket(&src_bucket, &[src_key]).await;
+        cleanup_object_lock_bucket(&dst_bucket).await;
+    });
+}
+
+#[test]
 fn test_object_lock_delete_object_with_legal_hold_on() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -3070,6 +3143,28 @@ fn test_object_lock_create_multipart_upload_headers_persist() {
             .await
             .unwrap();
         delete_version_with_bypass(&bucket, key, &version_id).await;
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_create_multipart_upload_headers_reject_past_retain_until() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+
+        let result = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(past_date(60))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidArgument");
+
         cleanup_object_lock_bucket(&bucket).await;
     });
 }

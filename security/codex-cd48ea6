@@ -1,0 +1,153 @@
+Object Lock headers accept past retention dates
+Link: https://chatgpt.com/codex/security/findings/aa0a3f4c94488191995517c45b1a190f?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: medium)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: cd48ea6
+Author: justin@specialbusservice.com
+Created: 30/03/2026, 11:08:10
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Bug introduced: object lock headers are now honored on write operations, but the requested retention timestamp is accepted verbatim without validating it against the current time or bucket default retention, enabling retention bypass.
+The commit adds Object Lock header parsing and applies the requested retention state during PUT/COPY/multipart writes, but it never checks that the retain‑until timestamp is in the future or at least as strict as the bucket’s default retention. A client can therefore send x-amz-object-lock-mode with a retain‑until date in the past, causing the stored object lock metadata to immediately expire and enabling deletion/overwrite despite default retention requirements.
+
+# Reviewer note
+This report is valid in narrower form.
+
+- The real bug is acceptance of an already-expired explicit retain-until timestamp on write paths. That creates a new version whose retention is immediately expired, so delete enforcement treats it as unprotected.
+- The report overstates the bucket-default-retention part. AWS allows explicit per-object retention to override the bucket default retention rule; that override behavior is expected and is covered by existing tests.
+- AWS behavior was verified directly for `PutObject`, `CopyObject`, and `CreateMultipartUpload`: a past retain-until date returns `400 InvalidArgument` with message `The retain until date must be in the future!`.
+- Local compatibility tests were added in `crates/s3-tests/tests/object_lock.rs` for those three write-path entry points, and core validation was updated in `crates/server-core/src/coordinator.rs` so requested retention must be strictly in the future.
+
+Relevant code paths:
+- `crates/server-http/src/http/mod.rs:4501-4554` in the reported commit parsed Object Lock headers without semantic time validation
+- `crates/server-core/src/coordinator.rs:6597-6618` in the reported commit accepted explicit retention verbatim on new writes
+- `crates/server-core/src/coordinator.rs:8054-8076` delete enforcement treats `retain_until <= now` as expired
+- current fix: `crates/server-core/src/coordinator.rs` now rejects past retain-until dates in `validate_requested_object_lock_state`
+- current AWS-backed regression coverage: `crates/s3-tests/tests/object_lock.rs` tests `reject_past_retain_until` for PUT, COPY, and multipart create
+
+# Validation
+## Rubric
+- [x] Identify object-lock header parsing and confirm no time validation on retain-until (crates/server-http/src/http/mod.rs:4501-4554).
+- [x] Confirm timestamp parser only validates format, not current time (crates/server-http/src/http/xml.rs:2441-2444).
+- [x] Confirm coordinator only validates bucket has Object Lock enabled (crates/server-core/src/coordinator.rs:6585-6594).
+- [x] Confirm explicit retention bypasses bucket default because resolve_new_object_lock_state only applies defaults when retention is None (crates/server-core/src/coordinator.rs:6597-6618).
+- [ ] Run dynamic PoC test demonstrating past retention acceptance (build failed: missing libisal).
+## Report
+Dynamic attempts: `cargo test -p server-core resolve_new_object_lock_state_allows_past_retention -- --nocapture` failed to build because the `ec-sys` build script could not find `libisal` ("libisal not found; install intel-isa-l or set PKG_CONFIG_PATH"), so no runtime PoC could be executed. `valgrind` and `gdb` were not installed in the container.
+
+Code review evidence: the write-path header parser constructs `ObjectRetention` directly from `x-amz-object-lock-mode` and `x-amz-object-lock-retain-until-date` without checking the timestamp against the current time or bucket defaults (crates/server-http/src/http/mod.rs:4501-4554). The retain-until header parser only validates timestamp format, not whether it is in the future (crates/server-http/src/http/xml.rs:2441-2444). On the core side, `validate_requested_object_lock_state` only checks whether Object Lock is enabled for the bucket (crates/server-core/src/coordinator.rs:6585-6594). `resolve_new_object_lock_state` applies the bucket’s default retention only when the request has no retention; explicit retention is accepted verbatim (crates/server-core/src/coordinator.rs:6597-6618). This means a client can supply a retain-until timestamp in the past and bypass default retention by having the server store an already-expired retention value.
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator.rs (L6597 to 6618)
+  Note: resolve_new_object_lock_state accepts the requested retention as-is and only applies defaults when none is provided, with no check that requested retention is valid (e.g., not in the past).
+```
+    fn resolve_new_object_lock_state(
+        bucket: &BucketSummary,
+        requested: ObjectLockState,
+    ) -> Result<ObjectLockState, ServerError> {
+        Self::validate_requested_object_lock_state(bucket, requested)?;
+        if !bucket.object_lock.enabled {
+            return Ok(ObjectLockState::default());
+        }
+
+        let mut resolved = requested;
+        if resolved.retention.is_none() {
+            if let Some(default_retention) = bucket.object_lock.default_retention {
+                resolved.retention = Some(ObjectRetention {
+                    mode: default_retention.mode,
+                    retain_until_unix_seconds: Self::default_retention_deadline(
+                        default_retention,
+                        Self::current_unix_seconds()?,
+                    )?,
+                });
+            }
+        }
+        Ok(resolved)
+```
+
+/workspace/argmin/crates/server-http/src/http/mod.rs (L4501 to 4544)
+  Note: Object Lock headers are parsed and converted into ObjectRetention without validating that retain-until is in the future or meets default retention.
+```
+fn parse_object_lock_headers(req: &S3Request) -> Result<ObjectLockState, ServerError> {
+    const MODE_HEADER: &str = "x-amz-object-lock-mode";
+    const RETAIN_UNTIL_HEADER: &str = "x-amz-object-lock-retain-until-date";
+    const LEGAL_HOLD_HEADER: &str = "x-amz-object-lock-legal-hold";
+
+    for header in [MODE_HEADER, RETAIN_UNTIL_HEADER, LEGAL_HOLD_HEADER] {
+        if header_count(req, header) > 1 {
+            return Err(ServerError::InvalidRequest {
+                reason: format!("duplicate header: {header}"),
+            });
+        }
+    }
+
+    let mode = match req.header(MODE_HEADER) {
+        None => None,
+        Some("GOVERNANCE") => Some(ObjectLockMode::Governance),
+        Some("COMPLIANCE") => Some(ObjectLockMode::Compliance),
+        Some(other) => {
+            return Err(ServerError::InvalidArgument {
+                reason: format!("invalid {MODE_HEADER} value: {other}"),
+            });
+        }
+    };
+    let retain_until = req
+        .header(RETAIN_UNTIL_HEADER)
+        .map(xml::parse_object_lock_header_timestamp_secs)
+        .transpose()?;
+    let legal_hold = match req.header(LEGAL_HOLD_HEADER) {
+        None => StoredLegalHoldStatus::NotSet,
+        Some("ON") => StoredLegalHoldStatus::from_legal_hold_status(Some(LegalHoldStatus::On)),
+        Some("OFF") => StoredLegalHoldStatus::from_legal_hold_status(Some(LegalHoldStatus::Off)),
+        Some(other) => {
+            return Err(ServerError::InvalidArgument {
+                reason: format!("invalid {LEGAL_HOLD_HEADER} value: {other}"),
+            });
+        }
+    };
+
+    let retention = match (mode, retain_until) {
+        (None, None) => None,
+        (Some(mode), Some(retain_until_unix_seconds)) => Some(ObjectRetention {
+            mode,
+            retain_until_unix_seconds,
+        }),
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Although the logic flaw is real and reachable via normal S3 write operations, it requires authenticated write access to an Object Lock-enabled bucket and does not grant new read privileges or cross-tenant access. The impact is a bypass of retention policy for objects written by the attacker, which is serious for integrity/compliance but narrower than typical high-severity authz bypass or data exfiltration. Therefore the severity is adjusted from high to medium based on constrained scope and preconditions.
+## Likelihood
+high - Exploit requires valid write credentials and a bucket with Object Lock enabled, but is straightforward once those preconditions are met (send past retain-until header). | Remote network vector
+## Impact
+medium - Bypassing default retention allows premature deletion or overwrite of objects that should be WORM-protected, undermining integrity/availability guarantees for Object Lock buckets.
+## Assumptions
+- The argmin-s3 HTTP service is reachable by the attacker (ARGMIN_LISTEN_ADDR may be bound to a non-loopback interface).
+- A bucket is configured with Object Lock enabled and default retention.
+- The attacker has valid S3 credentials with write permissions to the target bucket.
+- Authenticated S3 write credentials
+- Bucket with Object Lock enabled (default retention configured)
+- Ability to send x-amz-object-lock-mode and x-amz-object-lock-retain-until-date headers
+## Path
+n1 -> n2 -> n3 -> n4 -> n5
+## Path evidence
+- `crates/server-http/src/http/mod.rs:4501-4554` - Object Lock headers are parsed and ObjectRetention is created directly from header values without validating retain-until semantics.
+- `crates/server-http/src/http/xml.rs:2437-2446` - Header timestamp parser validates only format; no check that retain-until is in the future.
+- `crates/server-core/src/coordinator.rs:6597-6618` - resolve_new_object_lock_state applies default retention only when none is provided; explicit retention is accepted verbatim.
+- `crates/argmin-s3/src/config.rs:1-70` - Service listens on configurable ARGMIN_LISTEN_ADDR (default 127.0.0.1:9000), indicating network-exposed HTTP surface when configured.
+## Narrative
+The HTTP layer parses Object Lock headers and constructs ObjectRetention without checking whether the retain-until timestamp is in the future. The timestamp parser only validates format. The coordinator resolves the new object lock state by applying bucket defaults only when no retention is provided, so an explicit past retain-until is stored verbatim. An authenticated writer can therefore submit a past retain-until date to create objects whose retention is already expired, bypassing the bucket’s default retention policy and allowing deletion/overwrite earlier than intended.
+## Controls
+- SigV4 authentication required for write operations
+- Bucket Object Lock must be enabled for retention to apply
+- Versioning enforced for Object Lock buckets
+## Blindspots
+- No runtime PoC due to build failures (missing libisal); static analysis only.
+- Actual deployment exposure (public vs internal) depends on ARGMIN_LISTEN_ADDR configuration not present in repo.
+- Retention enforcement on delete/overwrite is inferred from design; full end-to-end behavior not exercised dynamically.
