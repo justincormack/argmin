@@ -371,7 +371,7 @@ fn multipart_upload_lifecycle() {
         .set_upload_state("mpu-1", UploadState::Completing)
         .unwrap();
     store
-        .complete_multipart_commit("mpu-1", &obj, &committed_parts)
+        .complete_multipart_commit("mpu-1", 1, &obj, &committed_parts)
         .unwrap();
 
     // Read back the committed object.

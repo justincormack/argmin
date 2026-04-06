@@ -53,6 +53,7 @@ use crate::sse::{
 use crate::system_metadata::SystemMetadata;
 
 const TRACE_TARGET: &str = "server_core";
+const COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT: usize = 10_000;
 
 /// Maximum object size for single PUT or upload part (5 GiB, matches AWS S3).
 pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
@@ -6166,6 +6167,55 @@ impl Coordinator {
             (Err(err), Ok(())) => Err(err),
             (Err(err), Err(_)) => Err(err),
         }
+    }
+
+    fn next_completed_multipart_upload_order_for_bucket(
+        &self,
+        bucket: &str,
+    ) -> Result<u64, ServerError> {
+        let bucket_pg = self.get_bucket_pg(bucket)?;
+        bucket_pg
+            .next_completed_multipart_upload_order_for_bucket(bucket)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    fn prune_completed_multipart_uploads_for_bucket_with_limit(
+        &self,
+        bucket: &str,
+        keep: usize,
+    ) -> Result<(), ServerError> {
+        let mut uploads: Vec<(u32, String, u64)> = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self
+                .storage_node
+                .get_pg(pg_id)
+                .map_err(ServerError::Store)?;
+            let local = pg
+                .list_completed_multipart_uploads_for_bucket(bucket)
+                .map_err(ServerError::Metadata)?;
+            uploads.extend(
+                local
+                    .into_iter()
+                    .map(|(upload_id, completion_order)| (pg_id, upload_id, completion_order)),
+            );
+            Ok::<(), ServerError>(())
+        })?;
+
+        uploads.sort_by(|a, b| b.2.cmp(&a.2));
+        for (pg_id, upload_id, _) in uploads.into_iter().skip(keep) {
+            let pg = self
+                .storage_node
+                .get_pg(pg_id)
+                .map_err(ServerError::Store)?;
+            pg.delete_completed_multipart_upload(&upload_id)
+                .map_err(ServerError::Metadata)?;
+        }
+        Ok(())
     }
 
     fn begin_bucket_write_drain(&self, bucket: &str) -> Result<(), ServerError> {
@@ -13271,6 +13321,8 @@ impl Coordinator {
         self.with_bucket_write_reservation(bucket, |bucket_info| {
             Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+            let _completion_guard = self.storage_node.lock_multipart_completion_bucket(bucket);
+            let completion_order = self.next_completed_multipart_upload_order_for_bucket(bucket)?;
             let meta_pg_id = self.object_pg_id(bucket, key);
             let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
             let upload = meta_pg.get_multipart_upload(upload_id)?;
@@ -13641,7 +13693,7 @@ impl Coordinator {
                 .collect();
 
             meta_pg
-                .complete_multipart_commit(upload_id, &obj_req, &object_parts)
+                .complete_multipart_commit(upload_id, completion_order, &obj_req, &object_parts)
                 .map_err(ServerError::Metadata)?;
             let stored = meta_pg
                 .get_object_meta(bucket, key)
@@ -13685,6 +13737,10 @@ impl Coordinator {
             }
 
             drop(meta_pg);
+            self.prune_completed_multipart_uploads_for_bucket_with_limit(
+                bucket,
+                COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,
+            )?;
             let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
                 &bucket_info,
                 key,
@@ -15013,6 +15069,21 @@ mod tests {
             }
         }
         panic!("failed to find a key with object_pg_id != bucket_pg_id");
+    }
+
+    fn find_key_with_object_pg_eq_bucket_pg(
+        coord: &Coordinator,
+        bucket: &str,
+        prefix: &str,
+    ) -> String {
+        let bucket_pg_id = coord.bucket_pg_id(bucket);
+        for suffix in 0..1024 {
+            let key = format!("{prefix}-{suffix}");
+            if coord.object_pg_id(bucket, &key) == bucket_pg_id {
+                return key;
+            }
+        }
+        panic!("failed to find a key with object_pg_id == bucket_pg_id");
     }
 
     fn grants_contain(
@@ -19284,6 +19355,54 @@ mod tests {
         assert!(
             res.is_ok(),
             "complete_multipart_upload should succeed without waiting on bucket lock: {res:?}"
+        );
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn complete_multipart_upload_waits_for_multipart_completion_lock() {
+        let tmp = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..4).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+        let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+        let completer = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let (upload_id, parts) = create_upload_with_parts(&admin, "bucket", "key", &[(1, b"part")]);
+
+        let guard = storage_node.lock_multipart_completion_bucket("bucket");
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let res = completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &parts,
+                claimed_checksum: None,
+                cond: &WriteCondition::default(),
+                sse_customer: None,
+            });
+            tx.send(res).unwrap();
+        });
+
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(200)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "complete_multipart_upload should wait for multipart completion lock"
+        );
+        drop(guard);
+        let res = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(
+            res.is_ok(),
+            "complete_multipart_upload should succeed after multipart completion lock is released: {res:?}"
         );
         handle.join().unwrap();
     }
@@ -33662,6 +33781,220 @@ mod tests {
             .unwrap();
         assert_eq!(list.objects.len(), 1);
         assert_eq!(list.objects[0].key, "key");
+    }
+
+    #[test]
+    fn abort_completed_multipart_upload_after_object_delete_succeeds() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let (upload_id, parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"data1")]);
+        coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &parts,
+                claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
+
+                sse_customer: None,
+            })
+            .unwrap();
+
+        coord
+            .delete_object(&DeleteObjectRequest {
+                object: object_version_request("bucket", "key", None, test_requester()),
+                bypass_governance: false,
+                cond: &DeleteCondition::default(),
+            })
+            .unwrap();
+
+        coord
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload_id,
+                test_requester(),
+                None,
+            ))
+            .unwrap();
+    }
+
+    #[test]
+    fn abort_completed_multipart_upload_after_overwrite_succeeds() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let (first_upload_id, first_parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"first")]);
+        coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &first_upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &first_parts,
+                claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
+
+                sse_customer: None,
+            })
+            .unwrap();
+
+        let (second_upload_id, second_parts) =
+            create_upload_with_parts(&coord, "bucket", "key", &[(1, b"second")]);
+        coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &second_upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &second_parts,
+                claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
+
+                sse_customer: None,
+            })
+            .unwrap();
+
+        coord
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &first_upload_id,
+                test_requester(),
+                None,
+            ))
+            .unwrap();
+        coord
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &second_upload_id,
+                test_requester(),
+                None,
+            ))
+            .unwrap();
+
+        let object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(object.body.read_all().unwrap(), b"second");
+    }
+
+    #[test]
+    fn completed_multipart_tombstone_prune_limit_is_global_across_object_pgs() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let older_key = find_key_with_object_pg_eq_bucket_pg(&coord, "bucket", "bucket-pg");
+        let newer_key = find_key_with_object_pg_ne_bucket_pg(&coord, "bucket", "other-pg");
+        assert_ne!(
+            coord.object_pg_id("bucket", &older_key),
+            coord.object_pg_id("bucket", &newer_key)
+        );
+
+        let (older_upload_id, older_parts) =
+            create_upload_with_parts(&coord, "bucket", &older_key, &[(1, b"older")]);
+        coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    &older_key,
+                    &older_upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &older_parts,
+                claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
+
+                sse_customer: None,
+            })
+            .unwrap();
+
+        let (newer_upload_id, newer_parts) =
+            create_upload_with_parts(&coord, "bucket", &newer_key, &[(1, b"newer")]);
+        coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    &newer_key,
+                    &newer_upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &newer_parts,
+                claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
+
+                sse_customer: None,
+            })
+            .unwrap();
+
+        coord
+            .prune_completed_multipart_uploads_for_bucket_with_limit("bucket", 1)
+            .unwrap();
+
+        let err = coord
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                &older_key,
+                &older_upload_id,
+                test_requester(),
+                None,
+            ))
+            .unwrap_err();
+        assert!(
+            matches!(err, ServerError::NoSuchUpload { .. }),
+            "expected NoSuchUpload for globally pruned tombstone, got {err:?}"
+        );
+
+        coord
+            .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                &newer_key,
+                &newer_upload_id,
+                test_requester(),
+                None,
+            ))
+            .unwrap();
     }
 
     #[test]

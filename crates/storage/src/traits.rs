@@ -480,6 +480,7 @@ pub trait PgMetadataStore {
     fn complete_multipart_commit(
         &self,
         upload_id: &str,
+        completion_order: u64,
         obj: &CommitMultipartReq,
         parts: &[ObjectPartRecord],
     ) -> Result<(), MetadataError>;

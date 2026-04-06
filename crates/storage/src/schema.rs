@@ -106,6 +106,7 @@ CREATE TABLE IF NOT EXISTS completed_multipart_uploads (
     upload_id        TEXT PRIMARY KEY,
     bucket           TEXT NOT NULL,
     key              TEXT NOT NULL,
+    completion_order INTEGER NOT NULL CHECK (completion_order > 0),
     completed_at     INTEGER NOT NULL,
     owner_principal  TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
     owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) = 64),
@@ -116,6 +117,11 @@ CREATE TABLE IF NOT EXISTS completed_multipart_uploads (
         initiator_canonical_id IS NULL OR length(initiator_canonical_id) = 64
     )
 )";
+
+/// Index for pruning old completed multipart tombstones per bucket.
+const CREATE_COMPLETED_MULTIPART_UPLOADS_BUCKET_ORDER_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS idx_completed_multipart_uploads_bucket_order \
+    ON completed_multipart_uploads (bucket, completion_order)";
 
 /// Index for listing multipart uploads by bucket/key.
 const CREATE_MPU_BUCKET_KEY_INDEX: &str = "\
@@ -369,6 +375,7 @@ CREATE TABLE IF NOT EXISTS buckets (
     bucket_policy_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_generation >= 0),
     bucket_lifecycle TEXT,
     bucket_lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_lifecycle_generation >= 0),
+    completed_multipart_upload_sequence INTEGER NOT NULL DEFAULT 0 CHECK (completed_multipart_upload_sequence >= 0),
     default_encryption_type INTEGER CHECK (
         default_encryption_type IS NULL OR default_encryption_type IN (1)
     ),
@@ -409,6 +416,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_OBJECTS_WRITE_SEQUENCE_INDEX, [])?;
     conn.execute(CREATE_MULTIPART_UPLOADS_TABLE, [])?;
     conn.execute(CREATE_COMPLETED_MULTIPART_UPLOADS_TABLE, [])?;
+    conn.execute(CREATE_COMPLETED_MULTIPART_UPLOADS_BUCKET_ORDER_INDEX, [])?;
     conn.execute(CREATE_MPU_BUCKET_KEY_INDEX, [])?;
     conn.execute(CREATE_MULTIPART_PARTS_TABLE, [])?;
     conn.execute(CREATE_OBJECT_PARTS_TABLE, [])?;

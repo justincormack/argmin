@@ -1,0 +1,132 @@
+Completed multipart upload tombstones accumulate indefinitely
+Link: https://chatgpt.com/codex/security/findings/efa9bf20ef4c8191ab6567c73920c9e5?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: medium)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: b6ecc5a
+Author: justin@specialbusservice.com
+Created: 05/04/2026, 13:34:33
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduces a metadata growth/DoS risk by persisting completed multipart upload tombstones without any expiry or cleanup outside bucket deletion.
+The commit adds a completed_multipart_uploads table and writes a tombstone for every completed multipart upload. AbortMultipartUpload now returns success for completed uploads without deleting the tombstone, and the only cleanup path is during bucket deletion. This means a client with upload permissions can repeatedly complete multipart uploads (optionally deleting the resulting objects) and cause unbounded growth of the metadata DB, leading to potential disk exhaustion or performance degradation.
+
+# Validation
+## Rubric
+- [x] Confirm completed multipart uploads are persisted on completion (pg_store.rs:5302-5325)
+- [x] Verify abort of completed upload returns success without deleting tombstone (coordinator.rs:13672-13690)
+- [x] Verify only cleanup path is bucket deletion (pg_store.rs:1623-1645)
+- [x] Confirm schema lacks expiry/TTL for completed uploads (schema.rs:103-118)
+- [x] Assess unbounded growth potential from repeated completions
+## Report
+Rubric used (see rubric field). Dynamic attempts first: `cargo test -p storage delete_bucket_clears_completed_multipart_upload_records -- --nocapture` failed to build due to missing libisal in ec-sys build script (build error shown in artifacts/build_fail.log). Valgrind is not installed (`valgrind --version` -> command not found). gdb is not installed; lldb is present but no binary could be built to debug due to the libisal build failure. Code review: `PgStore::complete_multipart_commit` records a tombstone for every completed upload by inserting into `completed_multipart_uploads` (crates/storage/src/pg_store.rs:5302-5325). The abort path, when the upload is already completed, returns success after fetching the completed record and does not delete it (crates/server-core/src/coordinator.rs:13672-13690). The only delete path for completed multipart records is in bucket deletion (crates/storage/src/pg_store.rs:1623-1645); a repo-wide search shows no other deletes. The table schema has no TTL/expiry mechanism (crates/storage/src/schema.rs:103-118). This means a client with multipart upload permissions can repeatedly complete uploads with unique IDs, leaving persistent tombstones and causing unbounded metadata DB growth until bucket deletion.
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator.rs (L13672 to 13690)
+  Note: AbortMultipartUpload returns success for completed uploads without removing the tombstone, leaving it to persist.
+```
+            Err(storage::MetadataError::NoSuchUpload { .. }) => {
+                let Some(completed) = meta_pg.get_completed_multipart_upload(upload_id)? else {
+                    return Err(ServerError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    });
+                };
+                if completed.bucket != bucket || completed.key != key {
+                    return Err(ServerError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    });
+                }
+                if !Self::requester_can_manage_completed_multipart_upload(
+                    req.object.requester(),
+                    &bucket_info,
+                    &completed,
+                ) {
+                    return Err(ServerError::AccessDenied);
+                }
+                return Ok(());
+```
+
+/workspace/argmin/crates/storage/src/pg_store.rs (L1631 to 1645)
+  Note: Completed multipart upload tombstones are only cleared on bucket deletion, implying no per-object cleanup/expiry.
+```
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket (begin txn)",
+                source: e,
+            })?;
+        let result = (|| -> Result<usize, rusqlite::Error> {
+            let deleted = self
+                .conn
+                .execute("DELETE FROM buckets WHERE name = ?1", params![name])?;
+            if deleted != 0 {
+                self.conn.execute(
+                    "DELETE FROM completed_multipart_uploads WHERE bucket = ?1",
+                    params![name],
+                )?;
+```
+
+/workspace/argmin/crates/storage/src/pg_store.rs (L5302 to 5325)
+  Note: Each completed multipart upload is recorded in completed_multipart_uploads, creating persistent tombstones.
+```
+            // 7. Record this upload as completed so AbortMultipartUpload can
+            //    remain idempotently successful for the exact completed upload_id.
+            let (initiator_principal, initiator_canonical_id): (Option<String>, Option<String>) =
+                self.conn.query_row(
+                    "SELECT initiator_principal, initiator_canonical_id \
+                     FROM multipart_uploads WHERE upload_id = ?1",
+                    params![upload_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+            self.conn.execute(
+                "INSERT OR REPLACE INTO completed_multipart_uploads \
+                 (upload_id, bucket, key, completed_at, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    upload_id,
+                    obj.bucket,
+                    obj.key,
+                    now as i64,
+                    obj.owner.principal,
+                    obj.owner.canonical_id.as_str(),
+                    initiator_principal,
+                    initiator_canonical_id,
+                ],
+            )?;
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The bug is a real, in-scope availability risk reachable through standard S3 multipart upload operations by authenticated clients. It does not affect confidentiality or integrity and requires valid upload permissions, so it does not rise to high/critical, but it is more than low due to the potential for disk exhaustion and service degradation.
+## Likelihood
+high - Requires valid credentials with multipart upload permission, but exploitation is straightforward and can be automated once access is obtained. | Remote network vector
+## Impact
+medium - Unbounded growth in the metadata DB can exhaust disk or degrade performance, impacting availability for other users and operations.
+## Assumptions
+- Deployments bind ARGMIN_LISTEN_ADDR to a non-loopback interface so network clients can reach the S3 API.
+- No external garbage-collection job or manual maintenance purges completed_multipart_uploads beyond the in-repo bucket deletion path.
+- A tenant with multipart upload permissions can create many completed uploads within a bucket.
+- Valid S3 credentials with permission to initiate and complete multipart uploads
+- Ability to send repeated CompleteMultipartUpload requests
+## Path
+Authenticated client -> CompleteMultipartUpload -> completed_multipart_uploads rows -> DB growth/DoS
+## Path evidence
+- `crates/storage/src/pg_store.rs:5302-5325` - Each completed multipart upload inserts/updates a row in completed_multipart_uploads.
+- `crates/server-core/src/coordinator.rs:13672-13691` - AbortMultipartUpload returns success for completed uploads without deleting the tombstone.
+- `crates/storage/src/pg_store.rs:1623-1645` - Completed multipart upload tombstones are only deleted when a bucket is deleted.
+- `crates/storage/src/schema.rs:103-118` - completed_multipart_uploads table has no TTL/expiry fields.
+- `crates/argmin-s3/src/config.rs:27-62` - Default listen address is 127.0.0.1:9000 but can be configured for network exposure.
+## Narrative
+The server records a tombstone row for every completed multipart upload to preserve AbortMultipartUpload idempotence. The abort path returns success for completed uploads but does not delete the tombstone, and the only cleanup shown is during bucket deletion, leaving completed_multipart_uploads to grow without bound. An authenticated client with multipart upload permissions can repeatedly complete uploads (even if objects are deleted), causing the SQLite metadata DB to grow and risking disk exhaustion or performance degradation for the service.
+## Controls
+- SigV4 authentication and bucket/object authorization checks
+- Connection/in-flight request limits via configuration
+## Blindspots
+- No deployment manifests to confirm whether the service is exposed publicly or only on localhost/private networks.
+- No runtime validation/PoC execution due to build constraints; assessment is static.
+- Potential external cleanup or operator-side quotas are not visible in the repository.

@@ -599,7 +599,7 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
         checksum: None,
     }];
     store
-        .complete_multipart_commit("completed-upload", &obj, &parts)
+        .complete_multipart_commit("completed-upload", 1, &obj, &parts)
         .unwrap();
 
     assert!(store
@@ -1376,7 +1376,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
     ];
 
     store
-        .complete_multipart_commit("uid-cmc", &obj, &parts)
+        .complete_multipart_commit("uid-cmc", 1, &obj, &parts)
         .unwrap();
 
     let committed = store.get_object_parts("b", "k", VersionId::Null).unwrap();
@@ -1397,6 +1397,274 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
     assert_eq!(completed.bucket.as_str(), "b");
     assert_eq!(completed.key.as_str(), "k");
     assert_eq!(completed.owner.principal, "owner");
+}
+
+#[test]
+fn completed_multipart_tombstone_survives_null_version_overwrite() {
+    let (_dir, store) = make_pg_store();
+    store
+        .create_bucket(
+            "bucket",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+    let upload = CreateMultipartUploadReq {
+        upload_id: "upload-1".into(),
+        bucket: "bucket".into(),
+        key: "key".into(),
+        tags: None,
+        metadata_blob: vec![].into(),
+        system_metadata_blob: vec![].into(),
+        initiator: Some(test_owner()),
+        owner: test_owner(),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        object_lock: ObjectLockState::default(),
+        checksum: None,
+        encryption: ObjectEncryption::None,
+    };
+    store.create_multipart_upload(&upload).unwrap();
+
+    let obj = CommitMultipartReq {
+        bucket: "bucket".into(),
+        key: "key".into(),
+        version_id: VersionId::Null,
+        owner: test_owner(),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        generation_id: GenerationId::MIN,
+        size: 32,
+        etag_crc64: [7, 0, 0, 0, 0, 0, 0, 0],
+        ec: EcShape { k: 4, m: 2 },
+        tags: None,
+        metadata_blob: None,
+        system_metadata_blob: None,
+        object_lock: ObjectLockState::default(),
+        encryption: ObjectEncryption::None,
+    };
+    let parts = vec![ObjectPartRecord {
+        bucket: "bucket".into(),
+        key: "key".into(),
+        version_id: VersionId::Null,
+        part_number: 1,
+        size: 32,
+        etag: vec![7; 8],
+        etag_kind: EtagKind::Crc64,
+        part_okh: [3; 16],
+        part_vid: GenerationId::MIN,
+        ec_k: 4,
+        ec_m: 2,
+        shard_pg_id: 0,
+        checksum: None,
+    }];
+    store
+        .complete_multipart_commit("upload-1", 1, &obj, &parts)
+        .unwrap();
+
+    assert!(store
+        .get_completed_multipart_upload("upload-1")
+        .unwrap()
+        .is_some());
+
+    store
+        .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+            bucket: "bucket".into(),
+            key: "key".into(),
+            version_id: VersionId::Null,
+            owner: test_owner(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            generation_id: GenerationId::new(2).unwrap(),
+            ec: EcShape { k: 4, m: 2 },
+            size: 16,
+            etag: ObjectEtag::SinglePart([9, 0, 0, 0, 0, 0, 0, 0]),
+            layout: ObjectLayout::Standard,
+            tags: None,
+            metadata_blob: None,
+            system_metadata_blob: None,
+            object_lock: ObjectLockState::default(),
+            encryption: ObjectEncryption::None,
+        }))
+        .unwrap();
+
+    assert!(store
+        .get_completed_multipart_upload("upload-1")
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn completed_multipart_tombstone_survives_object_version_delete() {
+    let (_dir, store) = make_pg_store();
+    store
+        .create_bucket(
+            "bucket",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+    let version_id = VersionId::Versioned(NonZeroU64::new(1).unwrap());
+    let upload = CreateMultipartUploadReq {
+        upload_id: "upload-versioned".into(),
+        bucket: "bucket".into(),
+        key: "key".into(),
+        tags: None,
+        metadata_blob: vec![].into(),
+        system_metadata_blob: vec![].into(),
+        initiator: Some(test_owner()),
+        owner: test_owner(),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        object_lock: ObjectLockState::default(),
+        checksum: None,
+        encryption: ObjectEncryption::None,
+    };
+    store.create_multipart_upload(&upload).unwrap();
+
+    let obj = CommitMultipartReq {
+        bucket: "bucket".into(),
+        key: "key".into(),
+        version_id,
+        owner: test_owner(),
+        acl_grants: AclGrants::default(),
+        public_read: false,
+        generation_id: GenerationId::MIN,
+        size: 64,
+        etag_crc64: [8, 0, 0, 0, 0, 0, 0, 0],
+        ec: EcShape { k: 4, m: 2 },
+        tags: None,
+        metadata_blob: None,
+        system_metadata_blob: None,
+        object_lock: ObjectLockState::default(),
+        encryption: ObjectEncryption::None,
+    };
+    let parts = vec![ObjectPartRecord {
+        bucket: "bucket".into(),
+        key: "key".into(),
+        version_id,
+        part_number: 1,
+        size: 64,
+        etag: vec![8; 8],
+        etag_kind: EtagKind::Crc64,
+        part_okh: [4; 16],
+        part_vid: GenerationId::MIN,
+        ec_k: 4,
+        ec_m: 2,
+        shard_pg_id: 0,
+        checksum: None,
+    }];
+    store
+        .complete_multipart_commit("upload-versioned", 1, &obj, &parts)
+        .unwrap();
+
+    let completed = store
+        .get_completed_multipart_upload("upload-versioned")
+        .unwrap()
+        .expect("completed upload record");
+    assert_eq!(completed.bucket.as_str(), "bucket");
+    assert_eq!(completed.key.as_str(), "key");
+
+    store
+        .delete_object_version("bucket", "key", version_id)
+        .unwrap();
+
+    assert!(store
+        .get_completed_multipart_upload("upload-versioned")
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn completed_multipart_upload_list_reports_global_completion_orders() {
+    let (_dir, store) = make_pg_store();
+    store
+        .create_bucket(
+            "bucket",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+    let complete_upload = |upload_id: &str, key: &str| {
+        store
+            .create_multipart_upload(&CreateMultipartUploadReq {
+                upload_id: upload_id.into(),
+                bucket: "bucket".into(),
+                key: key.into(),
+                tags: None,
+                metadata_blob: vec![].into(),
+                system_metadata_blob: vec![].into(),
+                initiator: Some(test_owner()),
+                owner: test_owner(),
+                acl_grants: AclGrants::default(),
+                public_read: false,
+                object_lock: ObjectLockState::default(),
+                checksum: None,
+                encryption: ObjectEncryption::None,
+            })
+            .unwrap();
+        store
+            .complete_multipart_commit(
+                upload_id,
+                if upload_id == "z-first" { 1 } else { 2 },
+                &CommitMultipartReq {
+                    bucket: "bucket".into(),
+                    key: key.into(),
+                    version_id: VersionId::Null,
+                    owner: test_owner(),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: 8,
+                    etag_crc64: [1, 0, 0, 0, 0, 0, 0, 0],
+                    ec: EcShape { k: 4, m: 2 },
+                    tags: None,
+                    metadata_blob: None,
+                    system_metadata_blob: None,
+                    object_lock: ObjectLockState::default(),
+                    encryption: ObjectEncryption::None,
+                },
+                &[ObjectPartRecord {
+                    bucket: "bucket".into(),
+                    key: key.into(),
+                    version_id: VersionId::Null,
+                    part_number: 1,
+                    size: 8,
+                    etag: vec![1; 8],
+                    etag_kind: EtagKind::Crc64,
+                    part_okh: [1; 16],
+                    part_vid: GenerationId::MIN,
+                    ec_k: 4,
+                    ec_m: 2,
+                    shard_pg_id: 0,
+                    checksum: None,
+                }],
+            )
+            .unwrap();
+    };
+
+    crate::clock::with_time_override(1_700_000_000_000, || {
+        complete_upload("z-first", "first");
+        complete_upload("a-second", "second");
+    });
+
+    let uploads = store
+        .list_completed_multipart_uploads_for_bucket("bucket")
+        .unwrap();
+    assert!(uploads.contains(&(String::from("z-first"), 1)));
+    assert!(uploads.contains(&(String::from("a-second"), 2)));
 }
 
 #[test]
@@ -6789,7 +7057,7 @@ fn complete_multipart_commit_no_such_upload() {
     }];
     // Should fail — upload "nonexistent" does not exist.
     let err = store
-        .complete_multipart_commit("nonexistent", &obj, &parts)
+        .complete_multipart_commit("nonexistent", 1, &obj, &parts)
         .unwrap_err();
     assert!(
         matches!(
@@ -7099,7 +7367,7 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
     }];
 
     store
-        .complete_multipart_commit("upload-1", &obj, &parts)
+        .complete_multipart_commit("upload-1", 1, &obj, &parts)
         .unwrap();
 
     let committed = store

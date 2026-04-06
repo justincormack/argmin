@@ -125,6 +125,7 @@ pub struct SharedStorageNode {
     pg_id_list: Vec<u32>,
     data_dir: PathBuf,
     bucket_locks: Vec<Mutex<()>>,
+    multipart_completion_locks: Vec<Mutex<()>>,
     bucket_fast_path: RwLock<HashMap<String, BucketFastPathInfo>>,
     object_payload_leases: Mutex<HashMap<(String, String, GenerationId), usize>>,
     reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
@@ -180,6 +181,10 @@ impl SharedStorageNode {
         for _ in 0..BUCKET_LOCK_STRIPES {
             bucket_locks.push(Mutex::new(()));
         }
+        let mut multipart_completion_locks = Vec::with_capacity(BUCKET_LOCK_STRIPES);
+        for _ in 0..BUCKET_LOCK_STRIPES {
+            multipart_completion_locks.push(Mutex::new(()));
+        }
 
         Ok(Self {
             stores,
@@ -187,6 +192,7 @@ impl SharedStorageNode {
             pg_id_list,
             data_dir: data_dir.to_path_buf(),
             bucket_locks,
+            multipart_completion_locks,
             bucket_fast_path: RwLock::new(HashMap::new()),
             object_payload_leases: Mutex::new(HashMap::new()),
             reclaim_queue: (
@@ -270,6 +276,43 @@ impl SharedStorageNode {
                 trace,
                 TRACE_TARGET,
                 "bucket_lock_acquired",
+                Some(format_args!(
+                    "bucket={} stripe={} wait_us={}",
+                    bucket, idx, wait_us
+                )),
+            );
+        }
+        BucketLockGuard {
+            guard,
+            bucket: bucket.to_string(),
+            stripe: idx,
+            acquired_at,
+            trace,
+        }
+    }
+
+    /// Lock a bucket-scoped stripe mutex used to serialize multipart
+    /// completion publication order across coordinators.
+    pub fn lock_multipart_completion_bucket(&self, bucket: &str) -> BucketLockGuard<'_> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::lock_multipart_completion_bucket",
+            "bucket={}",
+            bucket
+        );
+        let idx = self.bucket_lock_index(bucket);
+        let trace = observability::current_context();
+        let wait_started_at = Instant::now();
+        let guard = self.multipart_completion_locks[idx]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let wait_us = wait_started_at.elapsed().as_micros();
+        let acquired_at = Instant::now();
+        if let Some(trace) = &trace {
+            let _ = observability::event_in_context(
+                trace,
+                TRACE_TARGET,
+                "multipart_completion_bucket_lock_acquired",
                 Some(format_args!(
                     "bucket={} stripe={} wait_us={}",
                     bucket, idx, wait_us

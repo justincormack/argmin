@@ -11,6 +11,7 @@ This guide defines the lock and read/write rules for object operations in
 Applies to object data/metadata operations:
 
 - `put_object`
+- `complete_multipart_upload`
 - `begin_stream_put` / `append_stream_segment` / `finalize_stream_put` / `abort_stream_put`
 - `copy_object` (source read and destination write)
 - `upload_part` / streamed `UploadPart` finalize
@@ -36,6 +37,11 @@ metadata paths (for example, `DeleteBucket` emptiness checks).
 10. Shard payload must become visible only after durable shard files exist; raw shard files may exist before metadata publication, but reads must treat metadata rows as the visibility boundary.
 11. Mixed bucket+object metadata operations must lock PGs in global ascending PG
     ID order when more than one PG is held.
+12. `CompleteMultipartUpload` tombstone publication order must match actual completion publication order for the bucket, not wall-clock ties or request arrival order.
+13. `CompleteMultipartUpload` must serialize bucket-scoped tombstone publication with `SharedStorageNode::lock_multipart_completion_bucket(bucket)`; do not reuse the general bucket lock for this.
+14. `CompleteMultipartUpload` must take the multipart-completion bucket lock before acquiring any bucket/object PG lock needed for completion-order allocation or object publication.
+15. Bucket-scoped tombstone pruning must order rows by the durable bucket-global completion order allocated inside that serialized completion critical section.
+16. `CompleteMultipartUpload` must remain compatible with AWS abort semantics for completed uploads: abort of the exact completed upload ID must still succeed after overwrite/delete until the bounded tombstone retention policy prunes it.
 
 ## Required Coordinator APIs
 
@@ -56,6 +62,12 @@ lock helpers for:
 - metadata/session PG finalize lock orchestration
 - transactional finalize that commits metadata and removes staging rows together
 
+For multipart completion ordering, use:
+
+- `SharedStorageNode::lock_multipart_completion_bucket(...)`
+- `Coordinator::next_completed_multipart_upload_order_for_bucket(...)`
+- `Coordinator::prune_completed_multipart_uploads_for_bucket_with_limit(...)`
+
 Do not open-code this pattern in object paths:
 
 - `get_pg(meta)` then `get_pg(shard)`
@@ -64,6 +76,9 @@ Do not open-code this pattern in object paths:
 - lock-holding network reads in streaming paths
 - shard-file visibility that bypasses metadata publication
 - shard-file writes while holding a PG mutex unless the code is intentionally changing the write visibility model
+- allocating multipart completion order before the multipart-completion bucket lock is held
+- taking a bucket/object PG lock and then calling `next_completed_multipart_upload_order_for_bucket(...)` if that path can reach the same bucket PG
+- using `completed_at` timestamps or upload IDs as the authoritative prune order
 
 ## Why These Rules Exist
 
@@ -78,6 +93,8 @@ Do not open-code this pattern in object paths:
   treating orphan files as live payload.
 - Without transactional finalize cleanup, stale staging rows can leak or race
   with retries/recovery.
+- Without a dedicated multipart-completion serialization point, concurrent completes in one bucket can publish tombstones out of order and immediately prune the wrong just-completed upload.
+- Without taking the multipart-completion lock before bucket/object PG locks, same-PG bucket/object paths can self-deadlock during completion-order allocation.
 
 ## PR Checklist (Object Paths)
 
@@ -94,7 +111,9 @@ Do not open-code this pattern in object paths:
 7. Are external ETag/checksum semantics unchanged?
 8. For streamed writes, is the visibility boundary still metadata publication rather than raw shard-file presence?
 9. For bucket+object mixed operations, is lock order explicit and ascending by PG ID?
-10. Did you run:
+10. For `CompleteMultipartUpload`, is tombstone publication serialized with `lock_multipart_completion_bucket(...)`, with completion order allocated inside that critical section before any relevant PG lock is taken?
+11. For bounded completed-upload retention, does prune order come from the durable bucket-global completion order rather than timestamp or upload-ID tie breakers?
+12. Did you run:
    - `cargo clippy --workspace -- -D warnings`
    - `cargo test -p server-http --lib`
    - `cargo test -p s3-tests`

@@ -1596,6 +1596,105 @@ impl PgStore {
         )?;
         Ok(())
     }
+
+    pub fn next_completed_multipart_upload_order_for_bucket(
+        &self,
+        bucket: &str,
+    ) -> Result<u64, MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets \
+                 SET completed_multipart_upload_sequence = completed_multipart_upload_sequence + 1 \
+                 WHERE name = ?1",
+                params![bucket],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "increment completed multipart upload sequence",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(bucket),
+            });
+        }
+        self.conn
+            .query_row(
+                "SELECT completed_multipart_upload_sequence FROM buckets WHERE name = ?1",
+                params![bucket],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "read completed multipart upload sequence",
+                source: e,
+            })?
+            .try_into()
+            .map_err(|_| MetadataError::Db {
+                context: "decode completed multipart upload sequence",
+                source: rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Integer,
+                    Box::from("negative completed multipart upload sequence"),
+                ),
+            })
+    }
+
+    pub fn list_completed_multipart_uploads_for_bucket(
+        &self,
+        bucket: &str,
+    ) -> Result<Vec<(String, u64)>, MetadataError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT upload_id, completion_order \
+                 FROM completed_multipart_uploads \
+                 WHERE bucket = ?1",
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "prepare list completed multipart uploads for bucket",
+                source: e,
+            })?;
+        let rows = stmt
+            .query_map(params![bucket], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "query list completed multipart uploads for bucket",
+                source: e,
+            })?;
+        let mut uploads = Vec::new();
+        for row in rows {
+            let (upload_id, completion_order) = row.map_err(|e| MetadataError::Db {
+                context: "row list completed multipart uploads for bucket",
+                source: e,
+            })?;
+            uploads.push((
+                upload_id,
+                completion_order.try_into().map_err(|_| MetadataError::Db {
+                    context: "decode completed multipart upload completion order",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        Box::from("negative completion order"),
+                    ),
+                })?,
+            ));
+        }
+        Ok(uploads)
+    }
+
+    pub fn delete_completed_multipart_upload(&self, upload_id: &str) -> Result<(), MetadataError> {
+        self.conn
+            .execute(
+                "DELETE FROM completed_multipart_uploads WHERE upload_id = ?1",
+                params![upload_id],
+            )
+            .map(|_| ())
+            .map_err(|e| MetadataError::Db {
+                context: "delete completed multipart upload",
+                source: e,
+            })
+    }
 }
 
 impl PgMetadataStore for PgStore {
@@ -5113,6 +5212,7 @@ impl PgMetadataStore for PgStore {
     fn complete_multipart_commit(
         &self,
         upload_id: &str,
+        completion_order: u64,
         obj: &CommitMultipartReq,
         parts: &[ObjectPartRecord],
     ) -> Result<(), MetadataError> {
@@ -5326,12 +5426,13 @@ impl PgMetadataStore for PgStore {
                 )?;
             self.conn.execute(
                 "INSERT OR REPLACE INTO completed_multipart_uploads \
-                 (upload_id, bucket, key, completed_at, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (upload_id, bucket, key, completion_order, completed_at, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     upload_id,
                     obj.bucket,
                     obj.key,
+                    completion_order as i64,
                     now as i64,
                     obj.owner.principal,
                     obj.owner.canonical_id.as_str(),
