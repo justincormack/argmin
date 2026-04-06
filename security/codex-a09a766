@@ -1,0 +1,246 @@
+Lifecycle sweep bypasses object-lock retention checks
+Link: https://chatgpt.com/codex/security/findings/14c4b0f438dc819187143b4a5708f9fd?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: medium)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: a09a766
+Author: justin@specialbusservice.com
+Created: 01/04/2026, 14:32:26
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+A lifecycle expiration path was added that calls permanent delete / delete-marker helpers without validating the live object's Object Lock state. This bypasses existing delete protections enforced elsewhere in the delete API.
+The background lifecycle sweeper evaluates expiration and then directly deletes current live objects or inserts delete markers without calling the Object Lock validation logic. This means objects under legal hold or retention can be expired and removed by lifecycle rules, bypassing WORM-style protections. A bucket owner (or attacker with equivalent privileges) can configure lifecycle rules to delete data that should be immutable, violating retention guarantees and potentially causing compliance-impacting data loss.
+
+# Reviewer note
+Reviewed against commit `a09a766` and current tree behavior. This does not appear to be a valid security issue.
+
+- In Object Lock buckets, lifecycle expiration of the current version in a versioned bucket creates a delete marker instead of permanently deleting the retained version. That matches the existing `DELETE` without `versionId` behavior and AWS Object Lock semantics.
+- Object Lock buckets cannot be moved to `Suspended` or `Disabled` versioning, so the report's null-version/suspended path is unreachable for valid Object Lock buckets.
+- Non-Object-Lock buckets cannot store object-lock state on writes, so the nonversioned permanent-delete path is not a retained-object bypass either.
+
+Relevant code paths:
+- `crates/server-core/src/coordinator.rs:2557-2637` lifecycle current-expiration path
+- `crates/server-core/src/coordinator.rs:5524-5542` rejects suspending/disabling versioning on Object Lock buckets
+- `crates/server-core/src/coordinator.rs:10734-10768` normal delete without `versionId` inserts a delete marker
+- `crates/server-core/src/coordinator.rs:24890-24919` test coverage showing retained current versions allow delete-marker creation but reject direct version deletion
+- `crates/server-core/src/coordinator.rs:6518-6552` rejects object-lock state on plain buckets
+
+AWS references:
+- Object Lock considerations: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock-managing.html
+  This documents that after enabling Object Lock on a bucket, you cannot suspend versioning for that bucket.
+- Expiring objects: https://docs.aws.amazon.com/AmazonS3/latest/userguide/lifecycle-expire-general-considerations.html
+  This documents that lifecycle `Expiration` in versioning-enabled buckets adds a delete marker, and in versioning-suspended buckets creates a null-version delete marker.
+- Locking objects with Object Lock: https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html
+  This documents that simple `DELETE` without `versionId` on a protected object returns success and inserts a delete marker, while permanent `DELETE` with `versionId` is denied.
+- Troubleshooting Amazon S3 Lifecycle issues: https://docs.aws.amazon.com/AmazonS3/latest/userguide/troubleshoot-lifecycle.html
+  This documents that for objects protected by Object Lock, current versions are not permanently deleted by lifecycle expiration and noncurrent locked versions are preserved.
+
+# Validation
+## Rubric
+- [x] Locate lifecycle expiration deletion path and confirm it executes delete/marker operations without Object Lock checks.
+- [x] Confirm deletion helpers used by the sweeper omit Object Lock validation.
+- [x] Verify normal delete path uses validate_delete_against_object_lock for legal hold/retention.
+- [x] Confirm object_lock state is present in LiveObjectRecord and thus available to the sweeper.
+- [x] Attempt dynamic reproduction (build/test) and record blockers (missing libisal, no valgrind).
+## Report
+Crash attempt: `cargo test -p server-core lifecycle_sweep_expires_nonversioned_current_object -- --nocapture` failed to build because `ec-sys` requires `libisal` (build script panicked: “libisal not found; install intel-isa-l or set PKG_CONFIG_PATH”). Valgrind attempt: `valgrind --version` not found. Debugger attempt: `lldb -b -o "run" -o "bt" -- cargo test ...` stopped at exec and could not proceed to a runnable target; build is blocked by missing libisal.
+
+Code evidence: Lifecycle sweep expiration deletes or hides live objects without Object Lock validation. `expire_current_object_if_due` loads a live record and, once expired, directly calls `permanently_delete_live_object_locked`, `put_delete_marker_locked`, or `expire_current_live_suspended_locked` based on versioning (coordinator.rs:2557-2637). None of these calls validate `record.object_lock`. The deletion helper `permanently_delete_live_object_locked` removes metadata and schedules reclaim without any Object Lock check (coordinator.rs:9177-9245), and `expire_current_live_suspended_locked` inserts a delete marker and deletes stale payload metadata without Object Lock checks (coordinator.rs:9267-9295). In contrast, the normal delete path enforces Object Lock via `validate_delete_against_object_lock` (coordinator.rs:6636-6660) before deleting a live object (coordinator.rs:10637-10652). LiveObjectRecord stores `object_lock`, so the sweeper has access to it (storage/src/types.rs:976-1001) but does not use it. This confirms the lifecycle expiration path can bypass legal hold/retention protections.
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator.rs (L2557 to 2637)
+  Note: Lifecycle sweeper reads the live record and, on expiry, deletes or creates a delete marker without any Object Lock validation.
+```
+    fn expire_current_object_if_due(
+        &self,
+        bucket: &str,
+        key: &str,
+        expected_version_id: VersionId,
+        now_millis: u64,
+    ) -> Result<bool, ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
+        let bucket_pg = self
+            .storage_node
+            .get_pg(self.pg_topology.bucket_pg(bucket))?;
+        let bucket_info = match bucket_pg.head_bucket(bucket) {
+            Ok(info) => info,
+            Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
+            Err(error) => return Err(ServerError::Metadata(error)),
+        };
+        drop(bucket_pg);
+
+        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+            return Ok(false);
+        };
+        let config =
+            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
+                ServerError::InternalError {
+                    reason: format!(
+                    "stored lifecycle configuration for {} failed to parse at expiry time: {error}",
+                    bucket
+                ),
+                }
+            })?;
+
+        let meta_pg = self
+            .storage_node
+            .get_pg(self.pg_topology.object_pg(bucket, key))?;
+        let stored = match meta_pg.get_object_meta(bucket, key) {
+            Ok(stored) => stored,
+            Err(storage::MetadataError::ObjectNotFound) => return Ok(false),
+            Err(error) => return Err(ServerError::Metadata(error)),
+        };
+        let record = match stored {
+            StoredObject::Live(record) => record,
+            StoredObject::DeleteMarker(_) => return Ok(false),
+        };
+        if record.version_id != expected_version_id {
+            return Ok(false);
+        }
+
+        let tags = match record.tags.as_deref() {
+            Some(tags_xml) => Coordinator::parse_serialized_tag_set(tags_xml)?,
+            None => Vec::new(),
+        };
+        let Some(expiration) = Coordinator::evaluate_current_object_lifecycle_expiration(
+            &config,
+            key,
+            &tags,
+            record.size,
+            record.last_modified,
+        ) else {
+            return Ok(false);
+        };
+        if expiration.expiry_time_millis > now_millis {
+            return Ok(false);
+        }
+
+        let owner = OwnerIdentity::new(
+            bucket_info.owner_principal.clone(),
+            bucket_info.owner_canonical_id.clone(),
+        );
+        let reclaim = match bucket_info.versioning {
+            BucketVersioningState::Disabled => {
+                Coordinator::permanently_delete_live_object_locked(&meta_pg, bucket, key, &record)?
+            }
+            BucketVersioningState::Enabled => {
+                let marker_vid = meta_pg.next_version_id(bucket, key)?;
+                Coordinator::put_delete_marker_locked(&meta_pg, bucket, key, marker_vid, owner)?;
+                None
+            }
+            BucketVersioningState::Suspended => Coordinator::expire_current_live_suspended_locked(
+                &meta_pg, bucket, key, &record, owner,
+            )?,
+        };
+```
+
+/workspace/argmin/crates/server-core/src/coordinator.rs (L9177 to 9245)
+  Note: Permanent deletion helper removes metadata and schedules payload reclaim with no checks for record.object_lock retention or legal hold.
+```
+    fn permanently_delete_live_object_locked(
+        meta_pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        record: &LiveObjectRecord,
+    ) -> Result<Option<DeletedLiveObjectReclaim>, ServerError> {
+        let reclaim = if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
+            let obj_parts = meta_pg
+                .get_object_parts(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+            let mut streaming_segments: Vec<MultipartPartSegmentRecord> = Vec::new();
+            for part in &obj_parts {
+                if part.part_okh == [0u8; 16] {
+                    let segments = meta_pg
+                        .get_multipart_part_segments(
+                            bucket,
+                            key,
+                            record.version_id,
+                            part.part_number,
+                        )
+                        .map_err(ServerError::Metadata)?;
+                    streaming_segments.extend(segments);
+                }
+            }
+            Self::enqueue_multipart_reclaim(
+                meta_pg,
+                bucket,
+                key,
+                record.generation_id,
+                &obj_parts,
+                &streaming_segments,
+            )?;
+            if !streaming_segments.is_empty() {
+                meta_pg
+                    .delete_multipart_part_segments(bucket, key, record.version_id)
+                    .map_err(ServerError::Metadata)?;
+            }
+            meta_pg.delete_object_parts(bucket, key, record.version_id)?;
+            Some(DeletedLiveObjectReclaim {
+                generation_id: record.generation_id,
+                kind: DeletedLiveObjectKind::Multipart,
+            })
+        } else {
+            let segments = meta_pg
+                .get_object_segments(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+            Self::enqueue_object_segments_reclaim(
+                meta_pg,
+                bucket,
+                key,
+                record.generation_id,
+                &segments,
+            )?;
+            meta_pg
+                .delete_object_segments(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+            Some(DeletedLiveObjectReclaim {
+                generation_id: record.generation_id,
+                kind: DeletedLiveObjectKind::Segments,
+            })
+        };
+
+        if record.version_id.is_null() {
+            meta_pg.delete_object_meta(bucket, key)?;
+        } else {
+            meta_pg
+                .delete_object_version(bucket, key, record.version_id)
+                .map_err(ServerError::Metadata)?;
+        }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Impact is significant for data integrity/compliance (Object Lock bypass), but exploitation requires privileged bucket-owner credentials and lifecycle configuration, reducing likelihood. This aligns with a medium severity rather than high/critical.
+## Likelihood
+low - Requires bucket-owner-level credentials and a configured lifecycle expiration; not reachable by unauthenticated users.
+## Impact
+medium - Allows removal of objects that should be immutable under legal hold or retention, causing integrity and availability loss for protected data.
+## Assumptions
+- Lifecycle configuration APIs are exposed to authenticated bucket owners in normal deployments.
+- The lifecycle sweeper is enabled in production builds and runs against configured buckets.
+- The service is reachable over its configured listen address (default 127.0.0.1:9000; operators may bind 0.0.0.0).
+- Bucket owner or equivalent credentials to set lifecycle rules
+- Bucket lifecycle configuration with expiration rules enabled
+- Target objects are under Object Lock retention/legal hold
+## Path
+n1 -> n2 -> n3 -> n4 -> n5
+## Path evidence
+- `crates/server-core/src/coordinator.rs:2557-2637` - Lifecycle sweeper expiration deletes or creates delete markers without invoking Object Lock validation.
+- `crates/server-core/src/coordinator.rs:9177-9247` - Permanent delete helper removes metadata and schedules reclaim with no Object Lock checks.
+- `crates/server-core/src/coordinator.rs:10637-10651` - Normal delete path enforces Object Lock via validate_delete_against_object_lock.
+- `crates/storage/src/types.rs:990-1001` - LiveObjectRecord stores object_lock state that is available to the sweeper.
+- `crates/argmin-s3/src/config.rs:52-60` - Default listen address is 127.0.0.1:9000, indicating configurable network exposure.
+## Narrative
+The lifecycle expiration path loads live object records and, when expired, directly deletes or inserts delete markers without invoking Object Lock validation. In expire_current_object_if_due, once expiration is met, the code calls permanently_delete_live_object_locked, put_delete_marker_locked, or expire_current_live_suspended_locked without any object_lock checks (coordinator.rs:2557-2637). The permanent delete helper itself removes metadata and schedules reclaim with no Object Lock validation (coordinator.rs:9177-9247). By contrast, the normal delete path explicitly calls validate_delete_against_object_lock before deleting live objects (coordinator.rs:10637-10651). LiveObjectRecord includes the object_lock field (types.rs:990-1000), so the sweeper has access to the required state but does not use it. This enables a bucket owner (or attacker with equivalent credentials) to configure lifecycle rules that remove objects even when legal hold or retention should block deletion, violating retention guarantees.
+## Controls
+- SigV4 authentication
+- Bucket policy authorization checks
+- Object Lock validation in normal delete path
+## Blindspots
+- No runtime validation due to build/test limitations (missing libisal); reachability is based on static code paths.
+- Deployment exposure (public vs internal) depends on operator configuration of ARGMIN_LISTEN_ADDR.
