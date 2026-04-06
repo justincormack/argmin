@@ -293,31 +293,65 @@ fn parse_iso8601(s: &str) -> Option<u64> {
     if date_parts.len() != 3 || time_parts.len() != 3 {
         return None;
     }
+
+    // Keep the accepted format narrow and bounded so malformed inputs are
+    // rejected before conversion and cannot trigger panics or huge loops.
+    if date_parts[0].len() != 4
+        || date_parts[1].len() != 2
+        || date_parts[2].len() != 2
+        || time_parts[0].len() != 2
+        || time_parts[1].len() != 2
+        || time_parts[2].len() != 2
+    {
+        return None;
+    }
+
     let year: u64 = date_parts[0].parse().ok()?;
     let month: u64 = date_parts[1].parse().ok()?;
     let day: u64 = date_parts[2].parse().ok()?;
     let hour: u64 = time_parts[0].parse().ok()?;
     let min: u64 = time_parts[1].parse().ok()?;
     let sec: u64 = time_parts[2].parse().ok()?;
-    Some(date_to_epoch(year, month, day, hour, min, sec))
+
+    if !(1..=12).contains(&month) || hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap(year) => 29,
+        2 => 28,
+        _ => unreachable!("month range checked above"),
+    };
+    if day == 0 || day > max_day {
+        return None;
+    }
+
+    date_to_epoch(year, month, day, hour, min, sec)
 }
 
-/// Convert a date to approximate epoch seconds.
-fn date_to_epoch(year: u64, month: u64, day: u64, hour: u64, min: u64, sec: u64) -> u64 {
-    // Days from epoch (1970-01-01) using a simplified calculation
-    let mut days: i64 = 0;
-    for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
-    }
-    let month_days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    for m in 1..month {
-        days += month_days[m as usize] as i64;
-        if m == 2 && is_leap(year) {
-            days += 1;
-        }
-    }
-    days += day as i64 - 1;
-    (days as u64) * 86400 + hour * 3600 + min * 60 + sec
+/// Convert a validated UTC date to epoch seconds.
+fn date_to_epoch(year: u64, month: u64, day: u64, hour: u64, min: u64, sec: u64) -> Option<u64> {
+    let year = i64::try_from(year).ok()?;
+    let month = u32::try_from(month).ok()?;
+    let day = u32::try_from(day).ok()?;
+
+    let adjust = if month <= 2 { 1 } else { 0 };
+    let y = year.checked_sub(adjust)?;
+    let era = if y >= 0 { y } else { y.checked_sub(399)? } / 400;
+    let yoe = y - era * 400;
+    let month_i = i64::from(month);
+    let day_i = i64::from(day);
+    let doy = (153 * (month_i + if month > 2 { -3 } else { 9 }) + 2) / 5 + day_i - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let days = u64::try_from(days).ok()?;
+
+    days.checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(min.checked_mul(60)?)?
+        .checked_add(sec)
 }
 
 fn is_leap(year: u64) -> bool {
@@ -361,6 +395,38 @@ mod tests {
     fn check_expiration_invalid_format() {
         assert!(matches!(
             check_expiration("2020-01-01 00:00:00+00:00", 0),
+            Err(PostPolicyError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn check_expiration_invalid_month_rejected() {
+        assert!(matches!(
+            check_expiration("2025-14-01T00:00:00Z", 0),
+            Err(PostPolicyError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn check_expiration_invalid_day_rejected() {
+        assert!(matches!(
+            check_expiration("2025-02-29T00:00:00Z", 0),
+            Err(PostPolicyError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn check_expiration_invalid_time_rejected() {
+        assert!(matches!(
+            check_expiration("2025-01-01T24:00:00Z", 0),
+            Err(PostPolicyError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn check_expiration_unbounded_year_rejected() {
+        assert!(matches!(
+            check_expiration("12345-01-01T00:00:00Z", 0),
             Err(PostPolicyError::Malformed(_))
         ));
     }
@@ -1043,6 +1109,11 @@ mod tests {
         assert!(parse_iso8601("abcd-ef-ghTij:kl:mnZ").is_none());
     }
 
+    #[test]
+    fn parse_iso8601_rejects_pre_epoch_year() {
+        assert!(parse_iso8601("1969-12-31T23:59:59Z").is_none());
+    }
+
     // ── find_field ────────────────────────────────────────────────────
 
     #[test]
@@ -1109,7 +1180,7 @@ mod tests {
     #[test]
     fn date_to_epoch_leap_year() {
         // 2000-03-01 (2000 is a leap year divisible by 400)
-        let epoch = date_to_epoch(2000, 3, 1, 0, 0, 0);
+        let epoch = date_to_epoch(2000, 3, 1, 0, 0, 0).unwrap();
         // 2000-01-01 = day 10957 from 1970-01-01
         // Jan: 31, Feb: 29 (leap), so Mar 1 = 10957 + 31 + 29 = 11017
         assert_eq!(epoch, 11017 * 86400);

@@ -1,0 +1,271 @@
+POST policy expiration parser can panic on invalid month
+Link: https://chatgpt.com/codex/security/findings/65b5b7992fe081918f7e5257493a938b?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: medium)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 33d8271
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 23:20:56
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced denial-of-service risk: invalid or huge expiration dates in POST policies can panic or spin the server during date_to_epoch conversion.
+The newly added POST policy validation parses ISO-8601 dates manually and converts them to epoch seconds without validating the ranges of year/month/day. The conversion loop iterates from 1970 to the provided year and indexes a fixed month-day table using the unvalidated month. A policy expiration such as month 14 triggers an out-of-bounds index panic, and an extremely large year forces a massive loop. Because the server processes requests serially and does not catch panics, an authenticated POST Object request with a malicious policy can crash the process or consume CPU.
+
+# Validation
+## Rubric
+- [x] Trace expiration validation path from validate_post_policy to parse_iso8601 in crates/auth/src/post.rs.
+- [x] Verify parse_iso8601/date_to_epoch lack range checks and unsafe month_days indexing.
+- [x] Attempt crash reproduction with invalid month (standalone build due to offline deps).
+- [ ] Reproduce CPU exhaustion with an extremely large year input.
+- [ ] Build full workspace binary and trigger crash via validate_post_policy.
+## Report
+Attempted to build/run a workspace PoC with cargo, but offline dependency resolution failed: `cargo run -p auth --bin poc` errored with `failed to get tiny_http as a dependency of package server` due to crates.io access being blocked. Code path shows untrusted policy expiration parsing: `validate_post_policy` calls `check_expiration` (crates/auth/src/post.rs:108-114), which calls `parse_iso8601` and then `date_to_epoch` (post.rs:235-271). `parse_iso8601` parses year/month/day without range checks, and `date_to_epoch` indexes `month_days[m as usize]` for `m in 1..month` (post.rs:263-266), so month > 13 panics; the year loop `for y in 1970..year` (post.rs:260-261) can also be extremely large. To demonstrate the crash despite build constraints, I compiled a standalone PoC (poc_iso.rs) containing the same parsing code and executed it with an invalid month `2025-14-01T00:00:00Z`. This produced a panic: `index out of bounds: the len is 13 but the index is 13` in `date_to_epoch`, confirming the DoS vector via crafted expiration.
+
+# Evidence
+/workspace/argmin/crates/auth/src/post.rs (L235 to 271)
+  Note: parse_iso8601 accepts unvalidated year/month/day and date_to_epoch loops over the year and indexes month_days by month without range checks, enabling panic or CPU exhaustion on crafted expiration dates.
+```
+/// Parse an ISO 8601 date to epoch seconds.
+/// Accepts "YYYY-MM-DDTHH:MM:SSZ" or "YYYY-MM-DDTHH:MM:SS.sssZ".
+fn parse_iso8601(s: &str) -> Option<u64> {
+    // Must end with 'Z' (UTC)
+    let s = s.strip_suffix('Z')?;
+    let s = s.split('.').next().unwrap_or(s); // Strip fractional seconds
+    let (date, time) = s.split_once('T')?;
+    let date_parts: Vec<&str> = date.split('-').collect();
+    let time_parts: Vec<&str> = time.split(':').collect();
+    if date_parts.len() != 3 || time_parts.len() != 3 {
+        return None;
+    }
+    let year: u64 = date_parts[0].parse().ok()?;
+    let month: u64 = date_parts[1].parse().ok()?;
+    let day: u64 = date_parts[2].parse().ok()?;
+    let hour: u64 = time_parts[0].parse().ok()?;
+    let min: u64 = time_parts[1].parse().ok()?;
+    let sec: u64 = time_parts[2].parse().ok()?;
+    Some(date_to_epoch(year, month, day, hour, min, sec))
+}
+
+/// Convert a date to approximate epoch seconds.
+fn date_to_epoch(year: u64, month: u64, day: u64, hour: u64, min: u64, sec: u64) -> u64 {
+    // Days from epoch (1970-01-01) using a simplified calculation
+    let mut days: i64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+    let month_days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    for m in 1..month {
+        days += month_days[m as usize] as i64;
+        if m == 2 && is_leap(year) {
+            days += 1;
+        }
+    }
+    days += day as i64 - 1;
+    (days as u64) * 86400 + hour * 3600 + min * 60 + sec
+```
+
+Proposed patch:
+diff --git a/crates/auth/src/post.rs b/crates/auth/src/post.rs
+index 239fa7401d07c0b034709c2c06a08b95220a558f..882153b6c82b019282c1755b9c43fdaa60aaeb6e 100644
+--- a/crates/auth/src/post.rs
++++ b/crates/auth/src/post.rs
+@@ -270,56 +270,89 @@ fn find_field<'a>(fields: &[(&'a str, &'a str)], name: &str) -> Option<&'a str>
+ /// Check if a policy expiration timestamp is still valid.
+ /// Accepts ISO 8601 format: "2025-12-30T12:00:00Z" or "2025-12-30T12:00:00.000Z"
+ ///
+ /// Returns `Err(Malformed)` for unparseable dates, `Err(Expired)` for past dates.
+ fn check_expiration(expiration: &str, now_epoch_secs: u64) -> Result<(), PostPolicyError> {
+     let epoch = parse_iso8601(expiration)
+         .ok_or(PostPolicyError::Malformed("invalid expiration date format"))?;
+     if now_epoch_secs > epoch {
+         return Err(PostPolicyError::Expired);
+     }
+     Ok(())
+ }
+ 
+ /// Parse an ISO 8601 date to epoch seconds.
+ /// Accepts "YYYY-MM-DDTHH:MM:SSZ" or "YYYY-MM-DDTHH:MM:SS.sssZ".
+ fn parse_iso8601(s: &str) -> Option<u64> {
+     // Must end with 'Z' (UTC)
+     let s = s.strip_suffix('Z')?;
+     let s = s.split('.').next().unwrap_or(s); // Strip fractional seconds
+     let (date, time) = s.split_once('T')?;
+     let date_parts: Vec<&str> = date.split('-').collect();
+     let time_parts: Vec<&str> = time.split(':').collect();
+     if date_parts.len() != 3 || time_parts.len() != 3 {
+         return None;
+     }
++
++    // Require fixed-width components to reject unbounded years.
++    if date_parts[0].len() != 4
++        || date_parts[1].len() != 2
++        || date_parts[2].len() != 2
++        || time_parts[0].len() != 2
++        || time_parts[1].len() != 2
++        || time_parts[2].len() != 2
++    {
++        return None;
++    }
++
+     let year: u64 = date_parts[0].parse().ok()?;
+     let month: u64 = date_parts[1].parse().ok()?;
+     let day: u64 = date_parts[2].parse().ok()?;
+     let hour: u64 = time_parts[0].parse().ok()?;
+     let min: u64 = time_parts[1].parse().ok()?;
+     let sec: u64 = time_parts[2].parse().ok()?;
++
++    // Validate ranges before conversion.
++    if !(1..=12).contains(&month) || hour > 23 || min > 59 || sec > 59 {
++        return None;
++    }
++    let max_day = match month {
++        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
++        4 | 6 | 9 | 11 => 30,
++        2 => {
++            if is_leap(year) {
++                29
++            } else {
++                28
++            }
++        }
++        _ => unreachable!(),
++    };
++    if day == 0 || day > max_day {
++        return None;
++    }
++
+     Some(date_to_epoch(year, month, day, hour, min, sec))
+ }
+ 
+ /// Convert a date to approximate epoch seconds.
+ fn date_to_epoch(year: u64, month: u64, day: u64, hour: u64, min: u64, sec: u64) -> u64 {
+     // Days from epoch (1970-01-01) using a simplified calculation
+     let mut days: i64 = 0;
+     for y in 1970..year {
+         days += if is_leap(y) { 366 } else { 365 };
+     }
+     let month_days = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+     for m in 1..month {
+         days += month_days[m as usize] as i64;
+         if m == 2 && is_leap(year) {
+             days += 1;
+         }
+     }
+     days += day as i64 - 1;
+     (days as u64) * 86400 + hour * 3600 + min * 60 + sec
+ }
+ 
+ fn is_leap(year: u64) -> bool {
+     (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+ }
+ 
+@@ -341,50 +374,74 @@ mod tests {
+     fn check_expiration_future() {
+         assert!(check_expiration("2099-12-31T23:59:59Z", 0).is_ok());
+     }
+ 
+     #[test]
+     fn check_expiration_past() {
+         assert!(matches!(
+             check_expiration("2020-01-01T00:00:00Z", 1700000000),
+             Err(PostPolicyError::Expired)
+         ));
+     }
+ 
+     #[test]
+     fn check_expiration_with_millis() {
+         assert!(check_expiration("2099-12-31T23:59:59.000Z", 0).is_ok());
+     }
+ 
+     #[test]
+     fn check_expiration_invalid_format() {
+         assert!(matches!(
+             check_expiration("2020-01-01 00:00:00+00:00", 0),
+             Err(PostPolicyError::Malformed(_))
+         ));
+     }
+ 
++    #[test]
++    fn check_expiration_invalid_month_rejected() {
++        assert!(matches!(
++            check_expiration("2025-14-01T00:00:00Z", 0),
++            Err(PostPolicyError::Malformed(_))
++        ));
++    }
++
++    #[test]
++    fn check_expiration_invalid_day_rejected() {
++        assert!(matches!(
++            check_expiration("2025-02-29T00:00:00Z", 0),
++            Err(PostPolicyError::Malformed(_))
++        ));
++    }
++
++    #[test]
++    fn check_expiration_unbounded_year_rejected() {
++        assert!(matches!(
++            check_expiration("12345-01-01T00:00:00Z", 0),
++            Err(PostPolicyError::Malformed(_))
++        ));
++    }
++
+     #[test]
+     fn sigv4_post_valid() {
+         let store = test_store();
+         let policy_b64 = "eyJleHBpcmF0aW9uIjoiMjAzMC0wMS0wMVQwMDowMDowMFoiLCJjb25kaXRpb25zIjpbXX0=";
+         let date = "20250101T000000Z";
+         let credential = "testAccessKey123/20250101/us-east-1/s3/aws4_request";
+ 
+         // Compute expected signature
+         let signing_key = crate::sigv4::derive_signing_key(
+             &SecretKey::new("testSecretKey456".to_string()),
+             "20250101",
+             "us-east-1",
+             "s3",
+         );
+         let sig = crate::sigv4::hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes());
+         let sig_hex = crate::sigv4::hex_encode(sig.as_ref());
+ 
+         let ctx = authenticate_post_sigv4(
+             "AWS4-HMAC-SHA256",
+             credential,
+             date,
+             policy_b64,
+             &sig_hex,
+             &store,
+         )
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The issue is a real availability bug on the main S3 POST Object path (validate_post_policy -> parse_iso8601/date_to_epoch) and can crash or stall the single-threaded server. However, exploitation requires valid credentials to sign the policy and has no confidentiality/integrity impact, so medium severity is appropriate rather than high/critical.
+## Likelihood
+high - Requires valid access key/secret to sign the malicious policy; unauthenticated users cannot reach the vulnerable path, but any credentialed user can trigger it with a single request. | Remote network vector
+## Impact
+medium - A crafted authenticated POST policy can panic the date parser or consume CPU in the conversion loop, crashing or stalling the single-threaded server process (availability impact only).
+## Assumptions
+- Service is deployed with ARGMIN_LISTEN_ADDR reachable by the attacker (e.g., bound to 0.0.0.0 or exposed behind a proxy).
+- Attacker possesses valid access key/secret or otherwise can sign a POST policy to pass authenticate_post.
+- Valid access key/secret to sign a POST policy (SigV2 form auth)
+- Ability to send a POST Object multipart/form-data request with a policy field
+## Path
+n1 -> n2 -> n3 -> n4 -> n5
+## Path evidence
+- `crates/server/src/http/mod.rs:412-490` - POST Object request handling parses multipart form and calls validate_post_policy on the policy field.
+- `crates/auth/src/post.rs:235-266` - parse_iso8601/date_to_epoch lack range checks and index month_days by month, enabling panic or long loops with crafted dates.
+- `crates/auth/src/post.rs:17-61` - authenticate_post requires access key, policy, and signature, indicating the exploit requires valid credentials.
+- `crates/server/src/config.rs:18-38` - listen address is configurable (default 127.0.0.1:9000), informing exposure assumptions.
+- `crates/server/src/main.rs:83-99` - HTTP server runs in a serial request loop, so a panic or long loop affects the whole service.
+## Narrative
+POST Object handling parses multipart form data and, when a policy field is present, calls validate_post_policy (server/src/http/mod.rs:412-490). The expiration parser parse_iso8601 accepts year/month/day without range checks and passes them to date_to_epoch, which loops from 1970..year and indexes month_days[m as usize] for m in 1..month (auth/src/post.rs:235-266). An invalid month (e.g., >12) can trigger an out-of-bounds panic, and an extremely large year can cause excessive CPU use. Because the server runs a single-threaded request loop (server/src/main.rs:83-99), a panic or long loop can crash or stall the service. Exploitation requires a valid access key/secret to sign the POST policy (auth/src/post.rs:17-61), so the impact is an authenticated availability DoS rather than an auth bypass.
+## Controls
+- SigV2 POST authentication required for policy validation
+- Bucket write authorization check for POST object
+## Blindspots
+- No deployment manifests were available to confirm whether the service is internet-exposed or protected behind internal-only networking.
+- No runtime PoC was executed in this environment; assessment is based on static code analysis only.
+- Unknown whether production deployments use panic recovery or supervision to auto-restart the process after a panic.
