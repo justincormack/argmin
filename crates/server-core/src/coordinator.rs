@@ -4262,6 +4262,14 @@ impl Coordinator {
         acl_grants.allows_all_users(AclPermission::Write)
     }
 
+    fn acl_grants_grant_public_read(acl_grants: &AclGrants) -> bool {
+        acl_grants.allows_public_groups(AclPermission::Read)
+    }
+
+    fn acl_grants_grant_public_write(acl_grants: &AclGrants) -> bool {
+        acl_grants.allows_public_groups(AclPermission::Write)
+    }
+
     fn requester_can_object_write(
         requester: &Requester,
         owner_principal: &str,
@@ -5765,8 +5773,8 @@ impl Coordinator {
                 }
                 Self::ensure_supported_object_acl_grants(acl_grants)?;
                 if Self::blocks_public_acls(bucket.public_access_block.as_deref())
-                    && (Self::acl_grants_public_read(acl_grants)
-                        || Self::acl_grants_public_write(acl_grants))
+                    && (Self::acl_grants_grant_public_read(acl_grants)
+                        || Self::acl_grants_grant_public_write(acl_grants))
                 {
                     return Err(ServerError::AccessDenied);
                 }
@@ -6531,7 +6539,9 @@ impl Coordinator {
                 acl_grants.clone()
             }
         };
-        if Self::acl_grants_public_read(&acl_grants) || Self::acl_grants_public_write(&acl_grants) {
+        if Self::acl_grants_grant_public_read(&acl_grants)
+            || Self::acl_grants_grant_public_write(&acl_grants)
+        {
             return Err(ServerError::InvalidBucketAclWithBlockPublicAccessError);
         }
 
@@ -6723,7 +6733,8 @@ impl Coordinator {
         let public_read = Self::acl_grants_public_read(&acl_grants);
         let public_write = Self::acl_grants_public_write(&acl_grants);
         if Self::blocks_public_acls(bucket.public_access_block.as_deref())
-            && (public_read || public_write)
+            && (Self::acl_grants_grant_public_read(&acl_grants)
+                || Self::acl_grants_grant_public_write(&acl_grants))
         {
             return Err(ServerError::AccessDenied);
         }
@@ -7717,7 +7728,8 @@ impl Coordinator {
         let public_read = Self::acl_grants_public_read(&acl_grants);
         let public_write = Self::acl_grants_public_write(&acl_grants);
         if Self::blocks_public_acls(bucket_info.public_access_block.as_deref())
-            && (public_read || public_write)
+            && (Self::acl_grants_grant_public_read(&acl_grants)
+                || Self::acl_grants_grant_public_write(&acl_grants))
         {
             return Err(ServerError::AccessDenied);
         }
@@ -7789,9 +7801,9 @@ impl Coordinator {
     ) -> Result<VersionId, ServerError> {
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         let public_read = Self::acl_grants_public_read(&acl_grants);
-        let public_write = Self::acl_grants_public_write(&acl_grants);
         if Self::blocks_public_acls(bucket_info.public_access_block.as_deref())
-            && (public_read || public_write)
+            && (Self::acl_grants_grant_public_read(&acl_grants)
+                || Self::acl_grants_grant_public_write(&acl_grants))
         {
             return Err(ServerError::AccessDenied);
         }
@@ -22464,6 +22476,33 @@ mod tests {
     }
 
     #[test]
+    fn put_bucket_acl_rejects_authenticated_users_grant_when_block_public_acls_enabled() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_public_access_block_test(&coord,
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                test_helpers::requester("owner-a"), None)
+            .unwrap();
+
+        let err = put_bucket_acl_test(
+            &coord,
+            "bucket",
+            AclGrants::new(vec![AclGrant::new(
+                AclGrantee::AuthenticatedUsers,
+                AclPermission::Read,
+            )]),
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
     fn put_object_rejects_public_acl_when_block_public_acls_enabled() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -22490,6 +22529,75 @@ mod tests {
                 cond: NO_WRITE,
 
                 acl: PutObjectAcl::PublicRead.into(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn put_object_rejects_authenticated_read_acl_when_block_public_acls_enabled() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_public_access_block_test(&coord,
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                test_helpers::requester("owner-a"), None)
+            .unwrap();
+
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: PutObjectAcl::AuthenticatedRead.into(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn put_object_rejects_authenticated_users_grant_when_block_public_acls_enabled() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_public_access_block_test(&coord,
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                test_helpers::requester("owner-a"), None)
+            .unwrap();
+
+        let err = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: PutObjectWriteAcl::Grants(AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::AuthenticatedUsers,
+                    AclPermission::Read,
+                )])),
             },
         )
         .unwrap_err();
@@ -25074,6 +25182,91 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_object_allows_authenticated_read_acl_when_ignore_public_acls_enabled() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"authenticated-read",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: PutObjectAcl::AuthenticatedRead.into(),
+            },
+        )
+        .unwrap();
+
+        let object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(object.body.read_all().unwrap(), b"authenticated-read");
+
+        put_bucket_public_access_block_test(&coord,
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                test_helpers::requester("owner-a"), None)
+            .unwrap();
+
+        let object_after_ignore = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(
+            object_after_ignore.body.read_all().unwrap(),
+            b"authenticated-read"
+        );
+
+        let owner_object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(owner_object.body.read_all().unwrap(), b"authenticated-read");
     }
 
     #[test]

@@ -658,6 +658,11 @@ impl AclGrants {
     }
 
     #[must_use]
+    pub fn allows_public_groups(&self, permission: AclPermission) -> bool {
+        self.allows_all_users(permission) || self.allows_authenticated_users(permission)
+    }
+
+    #[must_use]
     pub fn serialized(&self) -> String {
         let mut out = String::new();
         for grant in &self.0 {

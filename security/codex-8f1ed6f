@@ -1,0 +1,152 @@
+IgnorePublicAcls bypass via AuthenticatedRead object ACLs
+Link: https://chatgpt.com/codex/security/findings/753675c744f08191b101626ac6d98618?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: medium)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 8f1ed6f
+Author: justin@specialbusservice.com
+Created: 02/04/2026, 16:12:47
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+This commit introduces a security bypass: AuthenticatedRead grants are now accepted and enforced, but IgnorePublicAcls is only applied to AllUsers public_read, leaving AuthenticatedUsers grants effective even when public ACLs should be ignored.
+The commit adds support for AuthenticatedUsers ACL grants and wires them into authorization checks. However, public access block handling for IgnorePublicAcls only suppresses the AllUsers-based public_read flag. AuthenticatedUsers grants are checked via requester_has_acl_permission and are not gated by IgnorePublicAcls, so enabling IgnorePublicAcls does not disable AuthenticatedRead object ACLs. This creates an access-control bypass where any authenticated account can read objects that were expected to be inaccessible under IgnorePublicAcls.
+
+# Validation
+## Rubric
+- [x] Attempted dynamic reproduction (build/test) and recorded failure reasons.
+- [x] Checked where AuthenticatedUsers grants are created for authenticated-read ACL.
+- [x] Verified permission checks accept AuthenticatedUsers grants for authenticated requesters.
+- [x] Verified IgnorePublicAcls is only applied to AllUsers/public_read, not AuthenticatedUsers.
+- [x] Reasoned end-to-end access scenario demonstrating bypass.
+## Report
+Dynamic attempts (required):
+- Crash attempt: `cargo test -p server-core put_object_accepts_bucket_owner_read_acl_for_same_owner -- --nocapture` failed to build because `ec-sys` requires `libisal` (error: "libisal not found; install intel-isa-l or set PKG_CONFIG_PATH").
+- ASAN attempt: `RUSTFLAGS='-Z sanitizer=address' cargo test ...` failed because `-Z` requires a nightly toolchain.
+- Valgrind attempt: `valgrind cargo test ...` failed (`valgrind: command not found`).
+- Debugger attempt: `gdb -q -batch ...` failed (`gdb: command not found`).
+
+Code evidence of bypass:
+- `PutObjectAcl::AuthenticatedRead` now adds an `AuthenticatedUsers` READ grant (crates/server-core/src/coordinator.rs:5429-5451).
+- `AclGrants::allows_authenticated_users` accepts those grants for permission checks (crates/s3-types/src/lib.rs:483-488).
+- `requester_has_acl_permission` uses `allows_authenticated_users` for any requester with a canonical user id (i.e., any authenticated caller) (crates/server-core/src/coordinator.rs:3936-3944).
+- `requester_can_read_object` grants access if `requester_has_acl_permission` succeeds, and only gates the separate `object.public_read` path with `IgnorePublicAcls` (crates/server-core/src/coordinator.rs:3977-3987). The `public_read` flag itself is derived solely from `allows_all_users` (AllUsers grants) (crates/server-core/src/coordinator.rs:3947-3948). `IgnorePublicAcls` is only applied to those public_read/public_write paths (crates/server-core/src/coordinator.rs:4127-4146).
+
+This means an object with the `authenticated-read` ACL (AuthenticatedUsers READ grant) is still readable by any authenticated account even when `IgnorePublicAcls=true`, because that setting never gates `allows_authenticated_users`. This matches the reported access-control bypass.
+
+Rubric checklist:
+- [x] Attempted dynamic reproduction (build/test) and recorded failure reasons.
+- [x] Checked where AuthenticatedUsers grants are created for authenticated-read ACL.
+- [x] Verified permission checks accept AuthenticatedUsers grants for authenticated requesters.
+- [x] Verified IgnorePublicAcls is only applied to AllUsers/public_read, not AuthenticatedUsers.
+- [x] Reasoned end-to-end access scenario demonstrating bypass.
+
+# Evidence
+/workspace/argmin/crates/s3-types/src/lib.rs (L483 to 488)
+  Note: New helper treats AuthenticatedUsers ACL grants as valid for permission checks.
+```
+    #[must_use]
+    pub fn allows_authenticated_users(&self, permission: AclPermission) -> bool {
+        self.0.iter().any(|grant| {
+            matches!(grant.grantee(), AclGrantee::AuthenticatedUsers)
+                && grant.permission().implies(permission)
+        })
+```
+
+/workspace/argmin/crates/server-core/src/coordinator.rs (L3936 to 3944)
+  Note: AuthenticatedUsers grants are now honored for ACL permission checks without considering IgnorePublicAcls.
+```
+    fn requester_has_acl_permission(
+        requester: &Requester,
+        acl_grants: &AclGrants,
+        permission: AclPermission,
+    ) -> bool {
+        requester.canonical_user_id().is_some_and(|id| {
+            acl_grants.allows_canonical_user(id, permission)
+                || acl_grants.allows_authenticated_users(permission)
+        })
+```
+
+/workspace/argmin/crates/server-core/src/coordinator.rs (L3977 to 3987)
+  Note: IgnorePublicAcls only suppresses the public_read (AllUsers) path, not AuthenticatedUsers ACL grants.
+```
+    fn requester_can_read_object(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+    ) -> bool {
+        requester.principal_opt() == Some(object.owner().principal.as_str())
+            || object.acl_grants().is_some_and(|grants| {
+                Self::requester_has_acl_permission(requester, grants, AclPermission::Read)
+            })
+            || (object.public_read()
+                && !Self::ignores_public_acls(bucket.public_access_block.as_deref()))
+```
+
+/workspace/argmin/crates/server-core/src/coordinator.rs (L5438 to 5451)
+  Note: AuthenticatedRead canned ACL now creates an AuthenticatedUsers READ grant.
+```
+        match acl {
+            PutObjectAcl::PublicRead => {
+                grants.push(AclGrant::new(AclGrantee::AllUsers, AclPermission::Read));
+            }
+            PutObjectAcl::PublicReadWrite => {
+                grants.push(AclGrant::new(AclGrantee::AllUsers, AclPermission::Read));
+                grants.push(AclGrant::new(AclGrantee::AllUsers, AclPermission::Write));
+            }
+            PutObjectAcl::AuthenticatedRead => {
+                grants.push(AclGrant::new(
+                    AclGrantee::AuthenticatedUsers,
+                    AclPermission::Read,
+                ));
+            }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: low | Policy adjusted: low
+## Rationale
+Authorization bypass is real in runtime code and affects object confidentiality across accounts, but it requires specific ACL configuration and authenticated access. Impact is significant but not catastrophic in the typical single-node deployment model; thus medium severity is appropriate.
+## Likelihood
+medium - Requires AuthenticatedRead ACLs and IgnorePublicAcls to be enabled; exploitation is straightforward for any authenticated account once these conditions hold.
+## Impact
+medium - Confidentiality impact: objects intended to be inaccessible when IgnorePublicAcls is enabled can be read by any authenticated account if AuthenticatedRead ACLs are set.
+## Assumptions
+- No deployment manifests were found; exposure depends on runtime configuration (ARGMIN_LISTEN_ADDR can bind beyond localhost).
+- Bucket/object ACLs are used in deployment, and IgnorePublicAcls is relied upon to disable public ACLs.
+- Multiple authenticated accounts can exist in the same deployment (cross-account read is meaningful).
+- Object has AuthenticatedRead ACL (AuthenticatedUsers READ grant).
+- Bucket public access block has IgnorePublicAcls=true.
+- Attacker has a valid authenticated account (canonical user id).
+## Path
+n1 -> n2 -> n3 -> n4
+## Path evidence
+- `crates/server-core/src/coordinator.rs:3930-3988` - requester_has_acl_permission accepts AuthenticatedUsers grants and requester_can_read_object does not gate that path with IgnorePublicAcls.
+- `crates/server-core/src/coordinator.rs:4119-4152` - IgnorePublicAcls is only checked for public_read/public_write paths.
+- `crates/server-core/src/coordinator.rs:5418-5453` - AuthenticatedRead canned ACL adds AuthenticatedUsers READ grant.
+- `crates/s3-types/src/lib.rs:472-494` - allows_authenticated_users treats AuthenticatedUsers grants as valid for permission checks.
+- `crates/argmin-s3/src/config.rs:55-70` - Default listen address is 127.0.0.1:9000 but can be overridden via ARGMIN_LISTEN_ADDR (exposure depends on runtime config).
+## Narrative
+The coordinator authorizes object reads via requester_has_acl_permission, which now accepts AuthenticatedUsers grants. requester_can_read_object only applies IgnorePublicAcls to the public_read (AllUsers) path, so AuthenticatedUsers grants remain effective even when IgnorePublicAcls=true. This allows any authenticated account to read objects with AuthenticatedRead ACLs despite public ACLs being configured to be ignored.
+## Controls
+- SigV4 authentication
+- ACL enforcement
+- Public access block (IgnorePublicAcls)
+## Blindspots
+- No deployment/IaC manifests to confirm internet exposure or multi-tenant use.
+- No runtime PoC executed due to build/tooling limitations; conclusions are based on static code paths.
+
+# Follow-up note
+Subsequent AWS validation showed the main `IgnorePublicAcls` conclusion in this finding was incorrect for S3 parity. On AWS, an alternate authenticated account can still read an object protected by the `authenticated-read` canned ACL after `IgnorePublicAcls=true`; that setting suppresses the anonymous `AllUsers` path but does not disable `AuthenticatedUsers` ACL access. As a result, the reported `IgnorePublicAcls` bypass is not an AWS-behavior bug in Argmin.
+
+A separate `BlockPublicAcls` question was validated independently against AWS and does behave differently: write-time validation should treat `AuthenticatedRead` / `AuthenticatedUsers` as public ACLs. Focused AWS-backed tests confirmed that `BlockPublicAcls=true` rejects:
+- canned `authenticated-read`
+- explicit `AuthenticatedUsers` bucket ACL XML grants
+- explicit `AuthenticatedUsers` object ACL XML grants
+- `x-amz-grant-read` headers targeting `AuthenticatedUsers`
+
+So the correct split is:
+- `IgnorePublicAcls` portion of this finding: invalid for AWS parity
+- `BlockPublicAcls` treatment of `AuthenticatedRead` / `AuthenticatedUsers`: valid AWS behavior, but it is a separate issue from the original claim above
