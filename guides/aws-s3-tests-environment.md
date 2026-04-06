@@ -3,6 +3,30 @@
 This guide describes the AWS environment required to run the external
 `crates/s3-tests` suite without silent skips.
 
+## Non-production build modes
+
+The test harness also supports two local build variants that are useful for
+specialized testing:
+
+- `null-ec`
+  - Uses the null EC backend and requires `parity_shards = 0`.
+- `pure-rust`
+  - Uses `null-ec` and the pure-Rust checksum backend, avoiding ISA-L entirely.
+
+Examples:
+
+```bash
+# Local embedded server with null EC.
+cargo test -p s3-tests --no-default-features --features null-ec,isa-l-crc
+
+# Local embedded server with no ISA-L dependency at all.
+cargo test -p s3-tests --no-default-features --features pure-rust
+```
+
+These are test-only configurations. They are useful for mock-server scenarios,
+restricted build environments, and certain harnesses, but they are not intended
+or supported as production deployments.
+
 ## Required environment variables
 
 Use `eval "$(grep = .env)"` to read `.env` without exporting `AWS_ACCESS_KEY`

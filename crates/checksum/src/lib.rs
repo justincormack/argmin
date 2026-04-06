@@ -10,6 +10,9 @@
     clippy::unreadable_literal
 )]
 
+#[cfg(not(any(feature = "isa-l", feature = "pure-rust")))]
+compile_error!("enable either the `isa-l` or `pure-rust` feature for crate `checksum`");
+
 pub mod crc32;
 pub mod crc32c;
 pub mod crc64;

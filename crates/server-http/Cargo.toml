@@ -8,20 +8,22 @@ name = "server_http"
 path = "src/lib.rs"
 
 [features]
-default = ["real-ec"]
+default = ["real-ec", "isa-l-crc"]
 real-ec = ["ec/real-backend", "server-core/real-ec"]
 null-ec = ["ec/null-backend", "server-core/null-ec"]
+isa-l-crc = ["checksum/isa-l", "server-core/isa-l-crc", "storage/isa-l-crc"]
+pure-rust-crc = ["checksum/pure-rust", "server-core/pure-rust-crc", "storage/pure-rust-crc"]
+pure-rust = ["null-ec", "pure-rust-crc"]
 
 [dependencies]
 auth = { path = "../auth" }
-checksum = { path = "../checksum" }
+checksum = { path = "../checksum", default-features = false }
 ec = { path = "../ec", default-features = false }
 observability = { path = "../observability" }
 server-core = { path = "../server-core", default-features = false }
 s3-types = { path = "../s3-types" }
-storage = { path = "../storage" }
+storage = { path = "../storage", default-features = false }
 base64 = "0.22"
-ec-sys = { path = "../ec-sys" }
 ring = "0.17"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }

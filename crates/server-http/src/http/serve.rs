@@ -33,7 +33,7 @@ const TRACE_TARGET: &str = "server_http";
 /// payload during streaming, then finalized to a base64 string for comparison
 /// with the trailer value.
 enum TrailingChecksumHasher {
-    Crc32(u32),
+    Crc32(checksum::crc32::Hasher),
     Crc32c(checksum::crc32c::Hasher),
     Crc64(checksum::crc64::Hasher),
     Sha256(ring::digest::Context),
@@ -46,7 +46,7 @@ impl TrailingChecksumHasher {
     /// Matches case-insensitively since HTTP header names are case-insensitive.
     fn from_trailer_header(header: &str) -> Option<Self> {
         match header.to_ascii_lowercase().as_str() {
-            "x-amz-checksum-crc32" => Some(Self::Crc32(0)),
+            "x-amz-checksum-crc32" => Some(Self::Crc32(checksum::crc32::Hasher::new())),
             "x-amz-checksum-crc32c" => Some(Self::Crc32c(checksum::crc32c::Hasher::new())),
             "x-amz-checksum-crc64nvme" => Some(Self::Crc64(checksum::crc64::Hasher::new())),
             "x-amz-checksum-sha256" => Some(Self::Sha256(ring::digest::Context::new(
@@ -61,9 +61,7 @@ impl TrailingChecksumHasher {
 
     fn update(&mut self, data: &[u8]) {
         match self {
-            Self::Crc32(crc) => {
-                *crc = unsafe { ec_sys::crc32_gzip_refl(*crc, data.as_ptr(), data.len() as u64) };
-            }
+            Self::Crc32(h) => h.update(data),
             Self::Crc32c(h) => {
                 h.update(data);
             }
@@ -77,7 +75,9 @@ impl TrailingChecksumHasher {
     /// Finalize and return a validated `RawChecksum`.
     fn finalize_raw(self) -> RawChecksum {
         match self {
-            Self::Crc32(crc) => RawChecksum::new(ChecksumAlgorithm::Crc32, crc.to_be_bytes()),
+            Self::Crc32(h) => {
+                RawChecksum::new(ChecksumAlgorithm::Crc32, h.finalize().to_be_bytes())
+            }
             Self::Crc32c(h) => {
                 RawChecksum::new(ChecksumAlgorithm::Crc32c, h.finalize().to_be_bytes())
             }

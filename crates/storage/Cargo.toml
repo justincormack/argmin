@@ -3,8 +3,13 @@ name = "storage"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["isa-l-crc"]
+isa-l-crc = ["checksum/isa-l"]
+pure-rust-crc = ["checksum/pure-rust"]
+
 [dependencies]
-checksum = { path = "../checksum" }
+checksum = { path = "../checksum", default-features = false }
 observability = { path = "../observability" }
 s3-types = { path = "../s3-types" }
 rapidhash = "1"

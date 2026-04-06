@@ -1,7 +1,7 @@
 //! CRC-64/NVME (= CRC-64/Rocksoft) checksum.
 //!
-//! Wraps ISA-L's `crc64_rocksoft_refl`, which auto-selects the fastest
-//! implementation at runtime (table-based, CLMUL, or AVX-512).
+//! Uses ISA-L when the `isa-l` feature is enabled and a pure-Rust table-based
+//! implementation when the `pure-rust` feature is enabled.
 //!
 //! # Examples
 //!
@@ -30,13 +30,55 @@
 /// CRC-64/NVME reflected polynomial (bit-reversal of 0xAD93D23594C93659).
 const POLY: u64 = 0x9A6C9329AC4BC9B5;
 
+#[cfg(feature = "pure-rust")]
+const TABLE: [u64; 256] = build_table();
+
+#[cfg(feature = "pure-rust")]
+const fn build_table() -> [u64; 256] {
+    let mut table = [0u64; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u64;
+        let mut bit = 0u8;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ POLY
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+#[inline]
+fn extend(crc: u64, data: &[u8]) -> u64 {
+    #[cfg(feature = "pure-rust")]
+    {
+        let mut state = !crc;
+        for &byte in data {
+            let idx = ((state as u8) ^ byte) as usize;
+            state = TABLE[idx] ^ (state >> 8);
+        }
+        !state
+    }
+
+    #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
+    {
+        // SAFETY: we pass a valid pointer and exact length. ISA-L reads
+        // only within [buf, buf+len). For empty slices the pointer is
+        // never dereferenced (len=0).
+        unsafe { ec_sys::crc64_rocksoft_refl(crc, data.as_ptr(), data.len() as u64) }
+    }
+}
+
 /// Compute CRC-64/NVME over the entire buffer.
 #[inline]
 pub fn checksum(data: &[u8]) -> u64 {
-    // SAFETY: we pass a valid pointer and exact length. ISA-L reads
-    // only within [buf, buf+len). For empty slices the pointer is
-    // never dereferenced (len=0).
-    unsafe { ec_sys::crc64_rocksoft_refl(0, data.as_ptr(), data.len() as u64) }
+    extend(0, data)
 }
 
 /// Combine two independently computed CRC-64/NVME checksums.
@@ -142,9 +184,7 @@ impl Hasher {
     /// Feed more data into the hasher.
     #[inline]
     pub fn update(&mut self, data: &[u8]) {
-        // SAFETY: same as `checksum` — valid pointer and length.
-        self.crc =
-            unsafe { ec_sys::crc64_rocksoft_refl(self.crc, data.as_ptr(), data.len() as u64) };
+        self.crc = extend(self.crc, data);
     }
 
     /// Return the CRC-64/NVME checksum of all data fed so far.

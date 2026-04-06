@@ -1,7 +1,8 @@
-//! CRC-32 (IEEE / gzip) checksum with hardware-accelerated combine.
+//! CRC-32 (IEEE / gzip) checksum with combine support.
 //!
-//! Wraps ISA-L's `crc32_gzip_refl` for one-shot computation and provides
-//! GF(2) matrix exponentiation for combining independently computed checksums.
+//! Uses ISA-L when the `isa-l` feature is enabled and a pure-Rust table-based
+//! implementation when the `pure-rust` feature is enabled. Also provides GF(2)
+//! matrix exponentiation for combining independently computed checksums.
 //!
 //! # Examples
 //!
@@ -21,13 +22,55 @@
 /// CRC-32 reflected polynomial.
 const POLY: u32 = 0xEDB88320;
 
+#[cfg(feature = "pure-rust")]
+const TABLE: [u32; 256] = build_table();
+
+#[cfg(feature = "pure-rust")]
+const fn build_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0u8;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ POLY
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+#[inline]
+fn extend(crc: u32, data: &[u8]) -> u32 {
+    #[cfg(feature = "pure-rust")]
+    {
+        let mut state = !crc;
+        for &byte in data {
+            let idx = ((state as u8) ^ byte) as usize;
+            state = TABLE[idx] ^ (state >> 8);
+        }
+        !state
+    }
+
+    #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
+    {
+        // SAFETY: we pass a valid pointer and exact length. ISA-L reads
+        // only within [buf, buf+len). For empty slices the pointer is
+        // never dereferenced (len=0).
+        unsafe { ec_sys::crc32_gzip_refl(crc, data.as_ptr(), data.len() as u64) }
+    }
+}
+
 /// Compute CRC-32 (gzip/IEEE) over the entire buffer.
 #[inline]
 pub fn checksum(data: &[u8]) -> u32 {
-    // SAFETY: we pass a valid pointer and exact length. ISA-L reads
-    // only within [buf, buf+len). For empty slices the pointer is
-    // never dereferenced (len=0).
-    unsafe { ec_sys::crc32_gzip_refl(0, data.as_ptr(), data.len() as u64) }
+    extend(0, data)
 }
 
 /// Streaming CRC-32 (gzip/IEEE) hasher.
@@ -49,7 +92,7 @@ impl Hasher {
     /// Feed more data into the hasher.
     #[inline]
     pub fn update(&mut self, data: &[u8]) {
-        self.crc = unsafe { ec_sys::crc32_gzip_refl(self.crc, data.as_ptr(), data.len() as u64) };
+        self.crc = extend(self.crc, data);
     }
 
     /// Return the CRC-32 checksum of all data fed so far.

@@ -3,8 +3,13 @@ name = "checksum"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = ["isa-l"]
+isa-l = ["dep:ec-sys"]
+pure-rust = []
+
 [dependencies]
-ec-sys = { path = "../ec-sys" }
+ec-sys = { path = "../ec-sys", optional = true }
 
 [dev-dependencies]
 proptest = "1"

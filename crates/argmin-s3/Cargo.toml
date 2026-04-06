@@ -8,16 +8,19 @@ name = "argmin-s3"
 path = "src/main.rs"
 
 [features]
-default = ["real-ec"]
+default = ["real-ec", "isa-l-crc"]
 real-ec = ["ec/real-backend", "server-core/real-ec", "server-http/real-ec"]
 null-ec = ["ec/null-backend", "server-core/null-ec", "server-http/null-ec"]
+isa-l-crc = ["server-core/isa-l-crc", "server-http/isa-l-crc", "storage/isa-l-crc"]
+pure-rust-crc = ["server-core/pure-rust-crc", "server-http/pure-rust-crc", "storage/pure-rust-crc"]
+pure-rust = ["null-ec", "pure-rust-crc"]
 
 [dependencies]
 auth = { path = "../auth" }
 ec = { path = "../ec", default-features = false }
 server-core = { path = "../server-core", default-features = false }
 server-http = { path = "../server-http", default-features = false }
-storage = { path = "../storage" }
+storage = { path = "../storage", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }

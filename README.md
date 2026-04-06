@@ -30,6 +30,32 @@ cargo build --release
 
 The binary is at `target/release/argmin-s3`.
 
+## Test-Only Build Variants
+
+Two non-default build modes exist for testing and mock-server use:
+
+- `null-ec`
+  - Replaces the ISA-L erasure-coding backend with the minimal null backend.
+  - This backend only supports `parity_shards = 0`.
+- `pure-rust`
+  - Implies `null-ec` and also switches CRC32, CRC32C, and CRC64 to the pure-Rust checksum backend.
+  - This avoids linking against ISA-L entirely.
+
+Examples:
+
+```bash
+# Null EC backend, but still using ISA-L-backed checksums.
+cargo build -p argmin-s3 --release --no-default-features --features null-ec,isa-l-crc
+
+# Fully pure-Rust test build.
+cargo build -p argmin-s3 --release --no-default-features --features pure-rust
+```
+
+These modes are for test harnesses, mock-server usage, and environments where
+linking ISA-L is undesirable. They are not production configurations. Production
+builds should continue using the default ISA-L-backed erasure-coding and
+checksum path.
+
 ## Run
 
 The server is configured via environment variables:
@@ -205,6 +231,19 @@ or trailing hyphens, no consecutive periods, and not formatted as an IP address.
 ```bash
 cargo test --workspace
 ```
+
+For local testing there are also non-production build variants:
+
+```bash
+# Run the embedded server tests with the null EC backend.
+cargo test -p s3-tests --no-default-features --features null-ec,isa-l-crc
+
+# Run the embedded server tests with the fully pure-Rust build.
+cargo test -p s3-tests --no-default-features --features pure-rust
+```
+
+These variants exist for testing only. They are not representative of the
+intended production build.
 
 To run `s3-tests` against an external endpoint such as AWS S3:
 

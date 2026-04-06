@@ -1,7 +1,8 @@
-//! CRC-32C (Castagnoli / iSCSI) checksum with hardware-accelerated combine.
+//! CRC-32C (Castagnoli / iSCSI) checksum with combine support.
 //!
-//! Wraps ISA-L's `crc32_iscsi` for one-shot computation and provides
-//! GF(2) matrix exponentiation for combining independently computed checksums.
+//! Uses ISA-L when the `isa-l` feature is enabled and a pure-Rust table-based
+//! implementation when the `pure-rust` feature is enabled. Also provides GF(2)
+//! matrix exponentiation for combining independently computed checksums.
 //!
 //! # Examples
 //!
@@ -21,25 +22,68 @@
 /// CRC-32C (Castagnoli) reflected polynomial.
 const POLY: u32 = 0x82F63B78;
 
+#[cfg(feature = "pure-rust")]
+const TABLE: [u32; 256] = build_table();
+
+#[cfg(feature = "pure-rust")]
+const fn build_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0u8;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ POLY
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+#[inline]
+fn update_internal(mut crc: u32, data: &[u8]) -> u32 {
+    #[cfg(feature = "pure-rust")]
+    {
+        for &byte in data {
+            let idx = ((crc as u8) ^ byte) as usize;
+            crc = TABLE[idx] ^ (crc >> 8);
+        }
+        crc
+    }
+
+    #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
+    {
+        // Unlike crc32_gzip_refl, crc32_iscsi does NOT handle
+        // init=0xFFFFFFFF / final XOR internally, so we do it here.
+        //
+        // crc32_iscsi takes len as c_int, so we process in chunks to
+        // avoid truncation for buffers larger than i32::MAX.
+        const CHUNK: usize = std::ffi::c_int::MAX as usize;
+        let mut remaining = data;
+        while !remaining.is_empty() {
+            let n = remaining.len().min(CHUNK);
+            // SAFETY: pointer is valid for n bytes. The cast to *mut is
+            // safe because ISA-L does not mutate the buffer.
+            crc = unsafe {
+                ec_sys::crc32_iscsi(remaining.as_ptr() as *mut _, n as std::ffi::c_int, crc)
+            };
+            remaining = &remaining[n..];
+        }
+        crc
+    }
+}
+
 /// Compute CRC-32C over the entire buffer.
 #[inline]
 pub fn checksum(data: &[u8]) -> u32 {
-    // Unlike crc32_gzip_refl, crc32_iscsi does NOT handle
-    // init=0xFFFFFFFF / final XOR internally, so we do it here.
-    //
-    // crc32_iscsi takes len as c_int, so we process in chunks to
-    // avoid truncation for buffers larger than i32::MAX.
-    const CHUNK: usize = std::ffi::c_int::MAX as usize;
     let mut crc = !0u32;
-    let mut remaining = data;
-    while !remaining.is_empty() {
-        let n = remaining.len().min(CHUNK);
-        // SAFETY: pointer is valid for n bytes. The cast to *mut is
-        // safe because ISA-L does not mutate the buffer.
-        crc =
-            unsafe { ec_sys::crc32_iscsi(remaining.as_ptr() as *mut _, n as std::ffi::c_int, crc) };
-        remaining = &remaining[n..];
-    }
+    crc = update_internal(crc, data);
     crc ^ !0u32
 }
 
@@ -142,15 +186,7 @@ impl Hasher {
     /// Feed more data into the hasher.
     #[inline]
     pub fn update(&mut self, data: &[u8]) {
-        const CHUNK: usize = std::ffi::c_int::MAX as usize;
-        let mut remaining = data;
-        while !remaining.is_empty() {
-            let n = remaining.len().min(CHUNK);
-            self.crc = unsafe {
-                ec_sys::crc32_iscsi(remaining.as_ptr() as *mut _, n as std::ffi::c_int, self.crc)
-            };
-            remaining = &remaining[n..];
-        }
+        self.crc = update_internal(self.crc, data);
     }
 
     /// Return the CRC-32C checksum of all data fed so far.
