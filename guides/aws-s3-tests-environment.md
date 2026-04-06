@@ -125,6 +125,14 @@ For account-regional bucket namespace tests, generated bucket names must still
 begin with `S3_TEST_BUCKET_PREFIX` so the same IAM policy resource pattern
 continues to authorize `CreateBucket`.
 
+AWS announced on April 6, 2026 that SSE-C is being disabled by default for new
+buckets, and later for selected existing buckets, as the rollout reaches each
+Region. The external SSE-C fixtures now call `PutBucketEncryption` with
+`BlockedEncryptionTypes = NONE` after bucket creation so those tests remain
+stable across mixed rollout states. We do not yet assert the new default-blocked
+behavior in AWS-backed tests because the rollout is temporally and regionally
+variable.
+
 If AWS-backed object-lock tests fail immediately with `AccessDenied` on
 `PutBucketObjectLockConfiguration`, re-attach the committed policy after pulling
 the latest version.

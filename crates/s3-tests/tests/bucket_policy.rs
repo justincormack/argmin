@@ -106,6 +106,14 @@ async fn create_bucket_allowing_public_policy(client: &aws_sdk_s3::Client) -> St
     bucket
 }
 
+async fn create_bucket_allowing_sse_c(client: &aws_sdk_s3::Client) -> String {
+    let bucket = unique_bucket();
+    s3_tests::create_bucket_with_sse_c_enabled(client, &bucket)
+        .await
+        .unwrap();
+    bucket
+}
+
 fn bucket_resource(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}")
 }
@@ -404,8 +412,7 @@ fn test_get_bucket_policy_status_nonpublic_bucket_policy() {
 fn test_get_bucket_policy_status_nonpublic_fixed_principal_policy() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = create_bucket_allowing_sse_c(client).await;
         let policy = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -437,8 +444,7 @@ fn test_get_bucket_policy_status_cross_account_allow() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
 
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = create_bucket_allowing_sse_c(client).await;
         let policy = bucket_policy_document(
             principal,
             "Allow",
@@ -472,8 +478,7 @@ fn test_get_bucket_policy_status_cross_account_deny_overrides_allow() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
 
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = create_bucket_allowing_sse_c(client).await;
         let policy = json!({
             "Version": "2012-10-17",
             "Statement": [
@@ -528,8 +533,7 @@ fn test_get_bucket_policy_status_cross_account_deny_overrides_allow() {
 fn test_put_bucket_policy_not_principal_rejected() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = create_bucket_allowing_sse_c(client).await;
         let policy = json!({
             "Version": "2012-10-17",
             "Statement": [{
@@ -561,8 +565,7 @@ fn test_bucket_policy_list_objects_v1() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
 
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = create_bucket_allowing_sse_c(client).await;
         client
             .put_object()
             .bucket(&bucket)
@@ -605,8 +608,7 @@ fn test_bucket_policy_list_objects_v2() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
 
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = create_bucket_allowing_sse_c(client).await;
         client
             .put_object()
             .bucket(&bucket)
@@ -894,8 +896,7 @@ fn test_bucket_policy_copy_object_grant_full_control() {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
 
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = create_bucket_allowing_sse_c(client).await;
         set_object_writer_ownership(&bucket).await;
         let owner_id = canonical_owner_id(client, &bucket).await;
         let full_control_header = format!("id=\"{owner_id}\"");
@@ -992,8 +993,7 @@ fn test_bucket_policy_put_obj_requires_sse_c_algorithm_header() {
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = create_bucket_allowing_sse_c(client).await;
 
         let policy = json!({
             "Version": "2012-10-17",
@@ -1132,8 +1132,7 @@ fn test_bucket_policy_put_obj_sse_c_algorithm_string_not_equals() {
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = create_bucket_allowing_sse_c(client).await;
 
         let policy = json!({
             "Version": "2012-10-17",
@@ -1245,8 +1244,7 @@ fn test_bucket_policy_copy_object_recognizes_destination_sse_c_header() {
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = create_bucket_allowing_sse_c(client).await;
 
         client
             .put_object()
@@ -1387,8 +1385,7 @@ fn test_bucket_policy_complete_multipart_does_not_reuse_destination_sse_c_header
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = create_bucket_allowing_sse_c(client).await;
 
         client
             .put_object()
@@ -1593,8 +1590,7 @@ fn test_bucket_policy_streaming_put_rejects_lowercase_sse_c_algorithm() {
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = create_bucket_allowing_sse_c(client).await;
 
         let customer_key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);

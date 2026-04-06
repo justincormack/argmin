@@ -12,7 +12,9 @@ use aws_sdk_s3::operation::put_bucket_lifecycle_configuration::{
 };
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BucketLifecycleConfiguration, BucketLocationConstraint, CreateBucketConfiguration, Delete,
+    BlockedEncryptionTypes, BucketLifecycleConfiguration, BucketLocationConstraint,
+    CreateBucketConfiguration, Delete, EncryptionType, ServerSideEncryption,
+    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
 use aws_sdk_s3::Client;
 use base64::Engine;
@@ -105,6 +107,65 @@ async fn create_test_bucket(client: &Client, bucket: &str) {
         );
     }
     request.send().await.expect("create bucket");
+}
+
+fn sse_c_enabled_bucket_encryption() -> ServerSideEncryptionConfiguration {
+    let default = ServerSideEncryptionByDefault::builder()
+        .sse_algorithm(ServerSideEncryption::Aes256)
+        .build()
+        .unwrap();
+    ServerSideEncryptionConfiguration::builder()
+        .rules(
+            ServerSideEncryptionRule::builder()
+                .apply_server_side_encryption_by_default(default)
+                .blocked_encryption_types(
+                    BlockedEncryptionTypes::builder()
+                        .encryption_type(EncryptionType::None)
+                        .build(),
+                )
+                .build(),
+        )
+        .build()
+        .unwrap()
+}
+
+/// Explicitly allow SSE-C on a bucket.
+///
+/// AWS announced on April 6, 2026 that new buckets in rolled-out Regions may
+/// block SSE-C by default until `PutBucketEncryption` sets
+/// `BlockedEncryptionTypes = NONE`. External SSE-C fixtures use this helper so
+/// they remain stable throughout the rollout.
+pub async fn enable_bucket_sse_c(client: &Client, bucket: &str) {
+    client
+        .put_bucket_encryption()
+        .bucket(bucket)
+        .server_side_encryption_configuration(sse_c_enabled_bucket_encryption())
+        .send()
+        .await
+        .expect("enable bucket SSE-C");
+}
+
+/// Create a bucket and explicitly allow SSE-C on it.
+pub async fn create_bucket_with_sse_c_enabled(
+    client: &Client,
+    bucket: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut request = client.create_bucket().bucket(bucket);
+    if CTX.region() != "us-east-1" {
+        request = request.create_bucket_configuration(
+            CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                .build(),
+        );
+    }
+    request.send().await?;
+    client
+        .put_bucket_encryption()
+        .bucket(bucket)
+        .server_side_encryption_configuration(sse_c_enabled_bucket_encryption())
+        .send()
+        .await?;
+    Ok(())
 }
 
 /// Create a bucket and populate it with `n` objects named "key0", "key1", ...

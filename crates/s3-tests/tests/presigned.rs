@@ -13,6 +13,15 @@ async fn setup_bucket() -> String {
     bucket
 }
 
+async fn setup_sse_c_bucket() -> String {
+    let client = CTX.client();
+    let bucket = unique_bucket();
+    s3_tests::create_bucket_with_sse_c_enabled(client, &bucket)
+        .await
+        .unwrap();
+    bucket
+}
+
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> ureq::Agent {
     s3_tests::test_agent()
@@ -189,7 +198,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
 fn test_presigned_get_object() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = setup_bucket().await;
+        let bucket = setup_sse_c_bucket().await;
         let body = b"presigned get content";
 
         client
@@ -226,7 +235,7 @@ fn test_presigned_get_object() {
 fn test_presigned_get_object_nonexistent() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = setup_bucket().await;
+        let bucket = setup_sse_c_bucket().await;
 
         let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
         let presigned = client
@@ -255,7 +264,7 @@ fn test_presigned_get_object_nonexistent() {
 fn test_presigned_put_object() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = setup_bucket().await;
+        let bucket = setup_sse_c_bucket().await;
         let body = b"presigned put content";
 
         let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
@@ -357,7 +366,7 @@ fn test_presigned_sse_c_put_object() {
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = setup_bucket().await;
+        let bucket = setup_sse_c_bucket().await;
         let body = b"presigned sse-c put content";
         let customer_key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);

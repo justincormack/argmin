@@ -15,6 +15,15 @@ async fn setup_bucket() -> String {
     bucket
 }
 
+async fn setup_sse_c_bucket() -> String {
+    let client = CTX.client();
+    let bucket = unique_bucket();
+    s3_tests::create_bucket_with_sse_c_enabled(client, &bucket)
+        .await
+        .unwrap();
+    bucket
+}
+
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> ureq::Agent {
     s3_tests::test_agent()
@@ -317,7 +326,7 @@ fn assert_error_code(body: &str, code: &str) {
 fn test_post_object_authenticated_request() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = setup_bucket().await;
+        let bucket = setup_sse_c_bucket().await;
         let key = "post-test-key";
         let file_data = b"hello from POST";
 
@@ -356,7 +365,7 @@ fn test_post_object_authenticated_request() {
 fn test_post_object_ignores_expected_bucket_owner() {
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = setup_bucket().await;
+        let bucket = setup_sse_c_bucket().await;
         let key = "post-expected-owner";
         let file_data = b"hello from POST expected owner";
 
@@ -401,7 +410,7 @@ fn test_post_object_sse_c_round_trip() {
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = setup_bucket().await;
+        let bucket = setup_sse_c_bucket().await;
         let key = "post-sse-c";
         let file_data = b"hello from POST with SSE-C";
         let customer_key = test_sse_c_key();
