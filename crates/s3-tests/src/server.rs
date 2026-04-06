@@ -114,7 +114,7 @@ impl TestServer {
             storage::SharedStorageNode::open(&data_path, &pg_ids).expect("open storage node"),
         );
         let control_coordinator = {
-            let ec_config = ec::EcConfig::new(4, 2).expect("EC config");
+            let ec_config = ec::EcConfig::default();
             let sse_c_validator = server_core::sse::SseCustomerValidatorConfig::from_base64(
                 1,
                 TEST_SSE_C_VALIDATOR_KEY_B64,
@@ -138,7 +138,7 @@ impl TestServer {
 
         let frontends: Vec<server_http::http::HttpFrontend> = (0..POOL_SIZE)
             .map(|_| {
-                let ec_config = ec::EcConfig::new(4, 2).expect("EC config");
+                let ec_config = ec::EcConfig::default();
                 let sse_c_validator = server_core::sse::SseCustomerValidatorConfig::from_base64(
                     1,
                     TEST_SSE_C_VALIDATOR_KEY_B64,

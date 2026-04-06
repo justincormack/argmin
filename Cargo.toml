@@ -3,6 +3,8 @@ resolver = "2"
 members = [
     "crates/observability",
     "crates/ec-sys",
+    "crates/ec-real",
+    "crates/ec-null",
     "crates/ec",
     "crates/checksum",
     "crates/s3-types",

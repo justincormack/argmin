@@ -7,11 +7,16 @@ edition = "2021"
 name = "argmin-s3"
 path = "src/main.rs"
 
+[features]
+default = ["real-ec"]
+real-ec = ["ec/real-backend", "server-core/real-ec", "server-http/real-ec"]
+null-ec = ["ec/null-backend", "server-core/null-ec", "server-http/null-ec"]
+
 [dependencies]
 auth = { path = "../auth" }
-ec = { path = "../ec" }
-server-core = { path = "../server-core" }
-server-http = { path = "../server-http" }
+ec = { path = "../ec", default-features = false }
+server-core = { path = "../server-core", default-features = false }
+server-http = { path = "../server-http", default-features = false }
 storage = { path = "../storage" }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
 tokio-rustls = "0.26"

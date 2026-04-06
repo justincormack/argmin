@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 auth = { path = "../auth" }
 checksum = { path = "../checksum" }
-ec = { path = "../ec" }
+ec = { path = "../ec", default-features = false }
 observability = { path = "../observability" }
 storage = { path = "../storage" }
 s3-types = { path = "../s3-types" }
@@ -17,6 +17,9 @@ subtle = "2"
 thiserror = "2"
 
 [features]
+default = ["real-ec"]
+real-ec = ["ec/real-backend"]
+null-ec = ["ec/null-backend"]
 test-utils = []
 
 [dev-dependencies]

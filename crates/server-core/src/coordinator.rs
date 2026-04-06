@@ -14141,7 +14141,7 @@ mod tests {
     fn setup_coordinator_in_region(dir: &Path, region: &str) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-        let ec_config = EcConfig::new(4, 2).unwrap();
+        let ec_config = EcConfig::default();
         Coordinator::new_with_managed_key_provider(
             storage_node,
             ec_config,
@@ -14155,7 +14155,7 @@ mod tests {
     fn setup_coordinator_with_pg_count(dir: &Path, pg_count: u32) -> Coordinator {
         let pg_ids: Vec<u32> = (0..pg_count).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-        let ec_config = EcConfig::new(4, 2).unwrap();
+        let ec_config = EcConfig::default();
         Coordinator::new_with_managed_key_provider(
             storage_node,
             ec_config,
@@ -14169,14 +14169,14 @@ mod tests {
     fn setup_coordinator_without_managed_key_provider(dir: &Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-        let ec_config = EcConfig::new(4, 2).unwrap();
+        let ec_config = EcConfig::default();
         Coordinator::new(storage_node, ec_config, "us-east-1".to_string(), None).unwrap()
     }
 
     fn setup_coordinator_without_lifecycle_sweeper(dir: &Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-        let ec_config = EcConfig::new(4, 2).unwrap();
+        let ec_config = EcConfig::default();
         Coordinator::new_with_lifecycle_sweeper_factory(
             storage_node,
             ec_config,
@@ -14189,7 +14189,7 @@ mod tests {
     }
 
     fn setup_coordinator_with_shared_storage(storage_node: Arc<SharedStorageNode>) -> Coordinator {
-        let ec_config = EcConfig::new(4, 2).unwrap();
+        let ec_config = EcConfig::default();
         Coordinator::new_with_managed_key_provider(
             storage_node,
             ec_config,
@@ -14218,7 +14218,7 @@ mod tests {
 
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-        let ec_config = EcConfig::new(4, 2).unwrap();
+        let ec_config = EcConfig::default();
         let validator = SseCustomerValidatorConfig::from_base64(
             1,
             &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
@@ -14232,6 +14232,10 @@ mod tests {
             test_sse_s3_provider(),
         )
         .unwrap()
+    }
+
+    fn backend_supports_parity_recovery() -> bool {
+        EcConfig::default().parity_shards > 0
     }
 
     #[test]
@@ -20184,6 +20188,9 @@ mod tests {
 
     #[test]
     fn ec_reconstruction_after_shard_loss() {
+        if !backend_supports_parity_recovery() {
+            return;
+        }
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
@@ -20236,6 +20243,9 @@ mod tests {
 
     #[test]
     fn ec_drop_one_data_shard_get() {
+        if !backend_supports_parity_recovery() {
+            return;
+        }
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
@@ -20286,6 +20296,9 @@ mod tests {
 
     #[test]
     fn ec_degraded_read_reuses_reconstruction_scratch() {
+        if !backend_supports_parity_recovery() {
+            return;
+        }
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
@@ -20355,6 +20368,9 @@ mod tests {
 
     #[test]
     fn ec_drop_m_shards_at_limit() {
+        if !backend_supports_parity_recovery() {
+            return;
+        }
         // Config: k=4, m=2. Dropping exactly m=2 shards should still recover.
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -20463,6 +20479,9 @@ mod tests {
 
     #[test]
     fn ec_corrupt_one_data_shard_recovery() {
+        if !backend_supports_parity_recovery() {
+            return;
+        }
         // Corrupt shard 0 on disk. PgStore detects CRC mismatch, EC reconstructs.
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -20514,6 +20533,9 @@ mod tests {
 
     #[test]
     fn ec_range_get_with_missing_shard() {
+        if !backend_supports_parity_recovery() {
+            return;
+        }
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
@@ -20567,6 +20589,9 @@ mod tests {
 
     #[test]
     fn ec_drop_parity_shard_data_still_works() {
+        if !backend_supports_parity_recovery() {
+            return;
+        }
         // Delete parity shard (index k=4). Only data shards needed for normal read.
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -20619,6 +20644,9 @@ mod tests {
 
     #[test]
     fn ec_healthy_read_skips_corrupt_parity_shards() {
+        if !backend_supports_parity_recovery() {
+            return;
+        }
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
@@ -20686,6 +20714,9 @@ mod tests {
 
     #[test]
     fn ec_reconstruction_stops_after_first_needed_parity_shard() {
+        if !backend_supports_parity_recovery() {
+            return;
+        }
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
@@ -36563,7 +36594,7 @@ mod tests {
     #[test]
     fn segment_list_reader_next_chunk_moves_whole_loaded_segment() {
         let dir = test_util::tempdir();
-        let ec_config = EcConfig::new(4, 2).unwrap();
+        let ec_config = EcConfig::default();
         let runtime = ReadRuntime {
             storage_node: Arc::new(SharedStorageNode::open(dir.path(), &[0]).unwrap()),
             ec_codec: Arc::new(ErasureCodec::new(ec_config).unwrap()),
@@ -36940,7 +36971,7 @@ mod tests {
 
     #[test]
     fn encode_parity_scratch_covers_max_sse_c_segment() {
-        let ec_config = EcConfig::new(4, 2).unwrap();
+        let ec_config = EcConfig::default();
         let k = ec_config.data_shards as usize;
         let m = ec_config.parity_shards as usize;
         let padded = (INTERNAL_SEGMENT_SIZE + SSE_C_SEGMENT_TAG_LEN).div_ceil(k) * k;

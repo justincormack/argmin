@@ -1,0 +1,11 @@
+[package]
+name = "ec-null"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+observability = { path = "../observability" }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"

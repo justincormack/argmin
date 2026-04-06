@@ -7,12 +7,17 @@ edition = "2021"
 name = "server_http"
 path = "src/lib.rs"
 
+[features]
+default = ["real-ec"]
+real-ec = ["ec/real-backend", "server-core/real-ec"]
+null-ec = ["ec/null-backend", "server-core/null-ec"]
+
 [dependencies]
 auth = { path = "../auth" }
 checksum = { path = "../checksum" }
-ec = { path = "../ec" }
+ec = { path = "../ec", default-features = false }
 observability = { path = "../observability" }
-server-core = { path = "../server-core" }
+server-core = { path = "../server-core", default-features = false }
 s3-types = { path = "../s3-types" }
 storage = { path = "../storage" }
 base64 = "0.22"
@@ -30,4 +35,4 @@ tokio-rustls = "0.26"
 
 [dev-dependencies]
 test-util = { path = "../test-util" }
-server-core = { path = "../server-core", features = ["test-utils"] }
+server-core = { path = "../server-core", default-features = false, features = ["test-utils"] }

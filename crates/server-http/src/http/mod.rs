@@ -5054,7 +5054,7 @@ mod tests {
     fn setup_frontend_with_sse_s3(dir: &std::path::Path) -> HttpFrontend {
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
-        let ec_config = EcConfig::new(4, 2).unwrap();
+        let ec_config = EcConfig::default();
         let sse_s3_provider = StaticManagedKeyProvider::single(
             ManagedWrappingKeyConfig::from_base64(1, TEST_SSE_S3_WRAPPING_KEY_B64).unwrap(),
         );

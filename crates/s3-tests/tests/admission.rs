@@ -47,7 +47,7 @@ async fn start_server(
 
     let frontends: Vec<server_http::http::HttpFrontend> = (0..pool_size)
         .map(|_| {
-            let ec_config = ec::EcConfig::new(4, 2).unwrap();
+            let ec_config = ec::EcConfig::default();
             let sse_s3_provider = ManagedWrappingKeyConfig::from_base64(
                 1,
                 s3_tests::server::TEST_SSE_S3_WRAPPING_KEY_B64,
