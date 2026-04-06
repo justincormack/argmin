@@ -15,6 +15,11 @@ Signals: Security, Validated, Attack-path
 Introduces a metadata growth/DoS risk by persisting completed multipart upload tombstones without any expiry or cleanup outside bucket deletion.
 The commit adds a completed_multipart_uploads table and writes a tombstone for every completed multipart upload. AbortMultipartUpload now returns success for completed uploads without deleting the tombstone, and the only cleanup path is during bucket deletion. This means a client with upload permissions can repeatedly complete multipart uploads (optionally deleting the resulting objects) and cause unbounded growth of the metadata DB, leading to potential disk exhaustion or performance degradation.
 
+# Reviewer note
+This report was valid.
+
+It was fixed in commit `03639e6` (`Bound completed multipart tombstone retention`), which adds bounded per-bucket retention for completed multipart tombstones and prunes older rows after multipart completion while preserving AWS-compatible `AbortMultipartUpload` idempotence for recent completed uploads.
+
 # Validation
 ## Rubric
 - [x] Confirm completed multipart uploads are persisted on completion (pg_store.rs:5302-5325)
