@@ -211,6 +211,129 @@ pub fn string_to_sign(timestamp: &str, scope: &str, canonical_request_hash: &str
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Iso8601UtcOptions {
+    pub trim_whitespace: bool,
+    pub require_fixed_width_fields: bool,
+}
+
+pub fn parse_iso8601_utc_seconds_with_options(
+    value: &str,
+    options: Iso8601UtcOptions,
+) -> Option<u64> {
+    let value = if options.trim_whitespace {
+        value.trim()
+    } else {
+        value
+    };
+
+    let datetime = value.strip_suffix('Z')?;
+    let (datetime, fractional) = datetime
+        .split_once('.')
+        .map_or((datetime, None), |(prefix, suffix)| (prefix, Some(suffix)));
+    if fractional.is_some_and(|part| !part.bytes().all(|b| b.is_ascii_digit())) {
+        return None;
+    }
+
+    let (date, time) = datetime.split_once('T')?;
+    let (year, month, day) = parse_iso8601_date(date, options.require_fixed_width_fields)?;
+    let (hour, minute, second) = parse_iso8601_time(time, options.require_fixed_width_fields)?;
+    date_time_to_epoch_seconds(year, month, day, hour, minute, second)
+}
+
+fn parse_iso8601_date(date: &str, require_fixed_width_fields: bool) -> Option<(i64, u32, u32)> {
+    let mut parts = date.split('-');
+    let year_part = parts.next()?;
+    let month_part = parts.next()?;
+    let day_part = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    if require_fixed_width_fields
+        && (year_part.len() != 4 || month_part.len() != 2 || day_part.len() != 2)
+    {
+        return None;
+    }
+
+    let year = year_part.parse::<i64>().ok()?;
+    let month = month_part.parse::<u32>().ok()?;
+    let day = day_part.parse::<u32>().ok()?;
+    Some((year, month, day))
+}
+
+fn parse_iso8601_time(time: &str, require_fixed_width_fields: bool) -> Option<(u32, u32, u32)> {
+    let mut parts = time.split(':');
+    let hour_part = parts.next()?;
+    let minute_part = parts.next()?;
+    let second_part = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    if require_fixed_width_fields
+        && (hour_part.len() != 2 || minute_part.len() != 2 || second_part.len() != 2)
+    {
+        return None;
+    }
+
+    let hour = hour_part.parse::<u32>().ok()?;
+    let minute = minute_part.parse::<u32>().ok()?;
+    let second = second_part.parse::<u32>().ok()?;
+    Some((hour, minute, second))
+}
+
+fn date_time_to_epoch_seconds(
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+) -> Option<u64> {
+    let max_day = days_in_month_i64(year, month)?;
+    if day == 0 || day > max_day || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+
+    let days = date_to_days_i64(year, month, day);
+    if days < 0 {
+        return None;
+    }
+
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour) * 3_600)?
+        .checked_add(i64::from(minute) * 60)?
+        .checked_add(i64::from(second))?;
+    u64::try_from(seconds).ok()
+}
+
+fn days_in_month_i64(year: i64, month: u32) -> Option<u32> {
+    Some(match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_i64(year) => 29,
+        2 => 28,
+        _ => return None,
+    })
+}
+
+fn date_to_days_i64(year: i64, month: u32, day: u32) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = i64::from(month);
+    let day = i64::from(day);
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+fn is_leap_i64(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
 /// Parse an ISO 8601 SigV4 timestamp ("YYYYMMDDTHHMMSSz") into Unix epoch seconds.
 /// Returns None if the format is invalid.
 pub fn parse_amz_date(ts: &str) -> Option<u64> {
@@ -449,6 +572,60 @@ mod tests {
     fn parse_amz_date_with_time() {
         let epoch = parse_amz_date("20130524T120000Z").unwrap();
         assert_eq!(epoch, 1369353600 + 12 * 3600);
+    }
+
+    #[test]
+    fn parse_iso8601_utc_seconds_strict_fixed_width() {
+        let epoch = parse_iso8601_utc_seconds_with_options(
+            "2025-01-01T00:00:00.123Z",
+            Iso8601UtcOptions {
+                trim_whitespace: false,
+                require_fixed_width_fields: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(epoch, 1735689600);
+        assert!(parse_iso8601_utc_seconds_with_options(
+            "2025-1-1T0:0:0Z",
+            Iso8601UtcOptions {
+                trim_whitespace: false,
+                require_fixed_width_fields: true,
+            },
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_iso8601_utc_seconds_permissive_trimmed() {
+        let epoch = parse_iso8601_utc_seconds_with_options(
+            " 2025-1-1T0:0:0Z ",
+            Iso8601UtcOptions {
+                trim_whitespace: true,
+                require_fixed_width_fields: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(epoch, 1735689600);
+    }
+
+    #[test]
+    fn parse_iso8601_utc_seconds_rejects_invalid_fractional_and_pre_epoch() {
+        assert!(parse_iso8601_utc_seconds_with_options(
+            "2025-01-01T00:00:00.xyzZ",
+            Iso8601UtcOptions {
+                trim_whitespace: false,
+                require_fixed_width_fields: true,
+            },
+        )
+        .is_none());
+        assert!(parse_iso8601_utc_seconds_with_options(
+            "1969-12-31T23:59:59Z",
+            Iso8601UtcOptions {
+                trim_whitespace: false,
+                require_fixed_width_fields: true,
+            },
+        )
+        .is_none());
     }
 
     #[test]

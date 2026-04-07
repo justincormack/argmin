@@ -2457,31 +2457,6 @@ fn days_to_date(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
-fn date_to_days(year: i64, month: u32, day: u32) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let yoe = year - era * 400;
-    let month = i64::from(month);
-    let day = i64::from(day);
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
-}
-
-fn is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
-}
-
-fn days_in_month(year: i64, month: u32) -> Option<u32> {
-    Some(match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap_year(year) => 29,
-        2 => 28,
-        _ => return None,
-    })
-}
-
 pub(crate) fn format_object_lock_timestamp(unix_seconds: u64) -> String {
     format_timestamp(unix_seconds.saturating_mul(1000))
 }
@@ -2490,71 +2465,14 @@ fn parse_object_lock_timestamp_secs_with<F>(raw: &str, invalid: F) -> Result<u64
 where
     F: Fn() -> ServerError,
 {
-    let raw = raw.trim();
-    let datetime = raw.strip_suffix('Z').ok_or_else(&invalid)?;
-    let (date, time) = datetime.split_once('T').ok_or_else(&invalid)?;
-    let mut date_parts = date.split('-');
-    let year: i64 = date_parts
-        .next()
-        .ok_or_else(&invalid)?
-        .parse()
-        .map_err(|_| invalid())?;
-    let month: u32 = date_parts
-        .next()
-        .ok_or_else(&invalid)?
-        .parse()
-        .map_err(|_| invalid())?;
-    let day: u32 = date_parts
-        .next()
-        .ok_or_else(&invalid)?
-        .parse()
-        .map_err(|_| invalid())?;
-    if date_parts.next().is_some() {
-        return Err(invalid());
-    }
-
-    let (hms, fractional) = time
-        .split_once('.')
-        .map_or((time, None), |(h, f)| (h, Some(f)));
-    if fractional.is_some_and(|part| !part.chars().all(|c| c.is_ascii_digit())) {
-        return Err(invalid());
-    }
-    let mut time_parts = hms.split(':');
-    let hour: u32 = time_parts
-        .next()
-        .ok_or_else(&invalid)?
-        .parse()
-        .map_err(|_| invalid())?;
-    let minute: u32 = time_parts
-        .next()
-        .ok_or_else(&invalid)?
-        .parse()
-        .map_err(|_| invalid())?;
-    let second: u32 = time_parts
-        .next()
-        .ok_or_else(&invalid)?
-        .parse()
-        .map_err(|_| invalid())?;
-    if time_parts.next().is_some() {
-        return Err(invalid());
-    }
-
-    let max_day = days_in_month(year, month).ok_or_else(&invalid)?;
-    if day == 0 || day > max_day || hour > 23 || minute > 59 || second > 59 {
-        return Err(invalid());
-    }
-
-    let days = date_to_days(year, month, day);
-    if days < 0 {
-        return Err(invalid());
-    }
-    let secs = days
-        .checked_mul(86_400)
-        .and_then(|v| v.checked_add(i64::from(hour) * 3_600))
-        .and_then(|v| v.checked_add(i64::from(minute) * 60))
-        .and_then(|v| v.checked_add(i64::from(second)))
-        .ok_or_else(&invalid)?;
-    u64::try_from(secs).map_err(|_| invalid())
+    auth::canonical::parse_iso8601_utc_seconds_with_options(
+        raw,
+        auth::canonical::Iso8601UtcOptions {
+            trim_whitespace: true,
+            require_fixed_width_fields: false,
+        },
+    )
+    .ok_or_else(invalid)
 }
 
 fn parse_object_lock_timestamp_secs(raw: &str) -> Result<u64, ServerError> {

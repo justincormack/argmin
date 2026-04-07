@@ -276,78 +276,13 @@ fn check_expiration(expiration: &str, now_epoch_secs: u64) -> Result<(), PostPol
 /// Parse an ISO 8601 date to epoch seconds.
 /// Accepts "YYYY-MM-DDTHH:MM:SSZ" or "YYYY-MM-DDTHH:MM:SS.sssZ".
 fn parse_iso8601(s: &str) -> Option<u64> {
-    // Must end with 'Z' (UTC)
-    let s = s.strip_suffix('Z')?;
-    let s = s.split('.').next().unwrap_or(s); // Strip fractional seconds
-    let (date, time) = s.split_once('T')?;
-    let date_parts: Vec<&str> = date.split('-').collect();
-    let time_parts: Vec<&str> = time.split(':').collect();
-    if date_parts.len() != 3 || time_parts.len() != 3 {
-        return None;
-    }
-
-    // Keep the accepted format narrow and bounded so malformed inputs are
-    // rejected before conversion and cannot trigger panics or huge loops.
-    if date_parts[0].len() != 4
-        || date_parts[1].len() != 2
-        || date_parts[2].len() != 2
-        || time_parts[0].len() != 2
-        || time_parts[1].len() != 2
-        || time_parts[2].len() != 2
-    {
-        return None;
-    }
-
-    let year: u64 = date_parts[0].parse().ok()?;
-    let month: u64 = date_parts[1].parse().ok()?;
-    let day: u64 = date_parts[2].parse().ok()?;
-    let hour: u64 = time_parts[0].parse().ok()?;
-    let min: u64 = time_parts[1].parse().ok()?;
-    let sec: u64 = time_parts[2].parse().ok()?;
-
-    if !(1..=12).contains(&month) || hour > 23 || min > 59 || sec > 59 {
-        return None;
-    }
-
-    let max_day = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if is_leap(year) => 29,
-        2 => 28,
-        _ => unreachable!("month range checked above"),
-    };
-    if day == 0 || day > max_day {
-        return None;
-    }
-
-    date_to_epoch(year, month, day, hour, min, sec)
-}
-
-/// Convert a validated UTC date to epoch seconds.
-fn date_to_epoch(year: u64, month: u64, day: u64, hour: u64, min: u64, sec: u64) -> Option<u64> {
-    let year = i64::try_from(year).ok()?;
-    let month = u32::try_from(month).ok()?;
-    let day = u32::try_from(day).ok()?;
-
-    let adjust = if month <= 2 { 1 } else { 0 };
-    let y = year.checked_sub(adjust)?;
-    let era = if y >= 0 { y } else { y.checked_sub(399)? } / 400;
-    let yoe = y - era * 400;
-    let month_i = i64::from(month);
-    let day_i = i64::from(day);
-    let doy = (153 * (month_i + if month > 2 { -3 } else { 9 }) + 2) / 5 + day_i - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    let days = u64::try_from(days).ok()?;
-
-    days.checked_mul(86_400)?
-        .checked_add(hour.checked_mul(3_600)?)?
-        .checked_add(min.checked_mul(60)?)?
-        .checked_add(sec)
-}
-
-fn is_leap(year: u64) -> bool {
-    (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400)
+    crate::canonical::parse_iso8601_utc_seconds_with_options(
+        s,
+        crate::canonical::Iso8601UtcOptions {
+            trim_whitespace: false,
+            require_fixed_width_fields: true,
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1197,26 +1132,5 @@ mod tests {
             serde_json::json!("just a string"),
         ]);
         validate_post_policy(&b64, &[], 0, "b", 0).unwrap();
-    }
-
-    // ── date_to_epoch and is_leap coverage ────────────────────────────
-
-    #[test]
-    fn date_to_epoch_leap_year() {
-        // 2000-03-01 (2000 is a leap year divisible by 400)
-        let epoch = date_to_epoch(2000, 3, 1, 0, 0, 0).unwrap();
-        // 2000-01-01 = day 10957 from 1970-01-01
-        // Jan: 31, Feb: 29 (leap), so Mar 1 = 10957 + 31 + 29 = 11017
-        assert_eq!(epoch, 11017 * 86400);
-    }
-
-    #[test]
-    fn date_to_epoch_non_leap_century() {
-        // 1900 is divisible by 100 but not 400, so not a leap year
-        // Test via is_leap directly
-        assert!(!is_leap(1900));
-        assert!(is_leap(2000));
-        assert!(is_leap(2024));
-        assert!(!is_leap(2023));
     }
 }
