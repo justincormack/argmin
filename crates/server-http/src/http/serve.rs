@@ -1,7 +1,7 @@
 /// Async hyper HTTP server loop with frontend pool and backpressure.
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -206,6 +206,10 @@ struct SegmentBufferPool {
     cached: Mutex<Vec<Vec<u8>>>,
 }
 
+fn lock_mutex_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
+
 struct PooledSegmentBuffer {
     state: Arc<ServerState>,
     buf: Option<Vec<u8>>,
@@ -224,10 +228,7 @@ impl SegmentBufferPool {
     }
 
     fn checkout(&self) -> Vec<u8> {
-        let mut buf = self
-            .cached
-            .lock()
-            .unwrap()
+        let mut buf = lock_mutex_unpoisoned(&self.cached)
             .pop()
             .unwrap_or_else(|| Vec::with_capacity(crate::coordinator::INTERNAL_SEGMENT_SIZE));
         buf.clear();
@@ -239,7 +240,7 @@ impl SegmentBufferPool {
             return;
         }
         buf.clear();
-        let mut cached = self.cached.lock().unwrap();
+        let mut cached = lock_mutex_unpoisoned(&self.cached);
         if cached.len() < self.max_cached {
             cached.push(buf);
         }
@@ -2876,6 +2877,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream as StdTcpStream};
+    use std::panic::AssertUnwindSafe;
     use std::sync::{atomic::AtomicUsize, Arc};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2900,6 +2902,23 @@ mod tests {
         fn drop(&mut self) {
             self.0.abort();
         }
+    }
+
+    #[test]
+    fn segment_buffer_pool_recovers_from_poisoned_lock() {
+        let pool = SegmentBufferPool::new(4);
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = pool.cached.lock().unwrap();
+            panic!("poison segment buffer pool");
+        }));
+
+        let mut buf = pool.checkout();
+        buf.extend_from_slice(b"data");
+        pool.recycle(buf);
+
+        let recycled = pool.checkout();
+        assert!(recycled.capacity() >= crate::coordinator::INTERNAL_SEGMENT_SIZE);
+        assert!(recycled.is_empty());
     }
 
     /// Build a minimal `http::request::Parts` for testing `is_streaming_write`.

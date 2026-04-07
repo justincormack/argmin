@@ -1,7 +1,9 @@
 /// Coordinator: orchestrates S3 operations across EC, storage, and metadata layers.
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock, Weak};
+use std::sync::{
+    Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
+};
 use std::thread::JoinHandle;
 
 use checksum::{
@@ -38,6 +40,18 @@ use crate::conditional::{
     check_write_conditions, DeleteCondition, ReadCondition, WriteCondition,
 };
 use crate::error::ServerError;
+
+fn lock_mutex_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|err| err.into_inner())
+}
+
+fn read_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|err| err.into_inner())
+}
+
+fn write_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|err| err.into_inner())
+}
 use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::metadata_blob::MetadataBlob;
 use crate::pg::{object_key_hash, part_key_hash, stream_segment_key_hash, PgTopology};
@@ -486,7 +500,7 @@ impl PayloadBufferPool {
 
     fn checkout(self: &Arc<Self>, required_capacity: usize) -> PooledPayloadBuffer {
         let min_capacity = required_capacity.max(self.default_capacity);
-        let mut cached = self.cached.lock().unwrap();
+        let mut cached = lock_mutex_unpoisoned(&self.cached);
         let maybe_idx = cached
             .iter()
             .rposition(|buf| buf.capacity() >= min_capacity);
@@ -511,7 +525,7 @@ impl PayloadBufferPool {
             return;
         }
         buf.clear();
-        let mut cached = self.cached.lock().unwrap();
+        let mut cached = lock_mutex_unpoisoned(&self.cached);
         if cached.len() < self.max_cached {
             cached.push(buf);
         }
@@ -620,7 +634,9 @@ impl EncodeScratchPool {
     }
 
     fn checkout(&self) -> EncodeScratch<'_> {
-        let buf = self.cached.lock().unwrap().pop().unwrap_or_else(|| {
+        let buf = lock_mutex_unpoisoned(&self.cached)
+            .pop()
+            .unwrap_or_else(|| {
             #[cfg(test)]
             self.allocations.fetch_add(1, Ordering::Relaxed);
             vec![0u8; self.scratch_len]
@@ -654,7 +670,7 @@ impl Drop for EncodeScratch<'_> {
         let Some(buf) = self.buf.take() else {
             return;
         };
-        let mut cached = self.pool.cached.lock().unwrap();
+        let mut cached = lock_mutex_unpoisoned(&self.pool.cached);
         if cached.len() < self.pool.max_cached {
             cached.push(buf);
         }
@@ -2657,7 +2673,7 @@ impl Drop for ReclaimSweeper {
 impl Drop for LifecycleSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.handle.lock().unwrap().take() {
+        if let Some(handle) = lock_mutex_unpoisoned(&self.handle).take() {
             let _ = handle.join();
         }
     }
@@ -2669,7 +2685,7 @@ impl LifecycleSweeper {
         runtime: ReadRuntime,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = LIFECYCLE_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut registry = registry.lock().unwrap();
+        let mut registry = lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
         let key = Arc::as_ptr(storage_node) as usize;
@@ -2704,7 +2720,7 @@ impl LifecycleSweeper {
             .map_err(|e| ServerError::InternalError {
                 reason: format!("failed to start lifecycle worker: {e}"),
             })?;
-        *sweeper.handle.lock().unwrap() = Some(handle);
+        *lock_mutex_unpoisoned(&sweeper.handle) = Some(handle);
         Ok(sweeper)
     }
 
@@ -4596,10 +4612,7 @@ impl Coordinator {
             return Ok(None);
         }
 
-        if let Some(cached) = self
-            .bucket_policy_cache
-            .read()
-            .unwrap()
+        if let Some(cached) = read_rwlock_unpoisoned(&self.bucket_policy_cache)
             .get(&bucket.name)
             .cloned()
         {
@@ -4642,14 +4655,14 @@ impl Coordinator {
     }
 
     fn cache_bucket_policy(&self, bucket: &str, generation: u64, policy: Arc<auth::BucketPolicy>) {
-        self.bucket_policy_cache.write().unwrap().insert(
+        write_rwlock_unpoisoned(&self.bucket_policy_cache).insert(
             bucket.to_string(),
             CachedBucketPolicy { generation, policy },
         );
     }
 
     fn clear_bucket_policy_cache(&self, bucket: &str) {
-        self.bucket_policy_cache.write().unwrap().remove(bucket);
+        write_rwlock_unpoisoned(&self.bucket_policy_cache).remove(bucket);
     }
 
     fn cached_bucket_lifecycle(
@@ -4660,10 +4673,7 @@ impl Coordinator {
             return Ok(None);
         }
 
-        if let Some(cached) = self
-            .bucket_lifecycle_cache
-            .read()
-            .unwrap()
+        if let Some(cached) = read_rwlock_unpoisoned(&self.bucket_lifecycle_cache)
             .get(&bucket.name)
             .cloned()
         {
@@ -4712,14 +4722,14 @@ impl Coordinator {
         generation: u64,
         config: Arc<BucketLifecycleConfiguration>,
     ) {
-        self.bucket_lifecycle_cache.write().unwrap().insert(
+        write_rwlock_unpoisoned(&self.bucket_lifecycle_cache).insert(
             bucket.to_string(),
             CachedBucketLifecycle { generation, config },
         );
     }
 
     fn clear_bucket_lifecycle_cache(&self, bucket: &str) {
-        self.bucket_lifecycle_cache.write().unwrap().remove(bucket);
+        write_rwlock_unpoisoned(&self.bucket_lifecycle_cache).remove(bucket);
     }
 
     fn current_object_lifecycle_expiration(
@@ -14155,6 +14165,7 @@ mod tests {
         ManagedWrappingKeyConfig, StaticManagedKeyProvider, SSE_CUSTOMER_ALGORITHM,
         SSE_C_CUSTOMER_KEY_LEN,
     };
+    use std::panic::AssertUnwindSafe;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::Barrier;
@@ -14232,6 +14243,34 @@ mod tests {
             test_sse_s3_provider(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn lock_mutex_unpoisoned_recovers_after_panic() {
+        let lock = Mutex::new(vec![1usize]);
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = lock.lock().unwrap();
+            panic!("poison mutex");
+        }));
+
+        lock_mutex_unpoisoned(&lock).push(2);
+        assert_eq!(*lock_mutex_unpoisoned(&lock), vec![1, 2]);
+    }
+
+    #[test]
+    fn rwlock_helpers_recover_after_panic() {
+        let lock = RwLock::new(HashMap::from([("bucket".to_string(), 1usize)]));
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let mut guard = lock.write().unwrap();
+            guard.insert("poisoned".to_string(), 2);
+            panic!("poison rwlock");
+        }));
+
+        write_rwlock_unpoisoned(&lock).insert("ok".to_string(), 3);
+        let guard = read_rwlock_unpoisoned(&lock);
+        assert_eq!(guard.get("bucket"), Some(&1));
+        assert_eq!(guard.get("poisoned"), Some(&2));
+        assert_eq!(guard.get("ok"), Some(&3));
     }
 
     fn setup_coordinator_with_pg_count(dir: &Path, pg_count: u32) -> Coordinator {

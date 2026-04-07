@@ -4,7 +4,7 @@ use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, RwLock};
+use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
 use crate::error::StoreError;
@@ -13,6 +13,14 @@ use crate::traits::{ShardStore, StorageNode};
 use crate::types::{BucketFastPathInfo, GenerationId, ShardKey, WriteAck};
 
 const TRACE_TARGET: &str = "storage";
+
+fn read_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|err| err.into_inner())
+}
+
+fn write_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|err| err.into_inner())
+}
 
 struct PgDataPaths {
     shards_dir: PathBuf,
@@ -223,14 +231,14 @@ impl SharedStorageNode {
 
     /// Return the cached active-bucket fast-path metadata for `bucket`.
     pub fn get_bucket_fast_path(&self, bucket: &str) -> Option<BucketFastPathInfo> {
-        self.bucket_fast_path.read().unwrap().get(bucket).cloned()
+        read_rwlock_unpoisoned(&self.bucket_fast_path)
+            .get(bucket)
+            .cloned()
     }
 
     /// Insert or replace the cached active-bucket fast-path metadata.
     pub fn upsert_bucket_fast_path(&self, info: BucketFastPathInfo) {
-        self.bucket_fast_path
-            .write()
-            .unwrap()
+        write_rwlock_unpoisoned(&self.bucket_fast_path)
             .insert(info.name.to_string(), info);
     }
 
@@ -240,14 +248,14 @@ impl SharedStorageNode {
         bucket: &str,
         update: impl FnOnce(&mut BucketFastPathInfo),
     ) {
-        if let Some(info) = self.bucket_fast_path.write().unwrap().get_mut(bucket) {
+        if let Some(info) = write_rwlock_unpoisoned(&self.bucket_fast_path).get_mut(bucket) {
             update(info);
         }
     }
 
     /// Remove cached fast-path metadata for `bucket`.
     pub fn remove_bucket_fast_path(&self, bucket: &str) {
-        self.bucket_fast_path.write().unwrap().remove(bucket);
+        write_rwlock_unpoisoned(&self.bucket_fast_path).remove(bucket);
     }
 
     /// Lock a bucket-scoped stripe mutex.
@@ -635,6 +643,7 @@ impl SharedStorageNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::panic::AssertUnwindSafe;
 
     #[test]
     fn data_dir_accessor() {
@@ -692,6 +701,49 @@ mod tests {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
         assert_eq!(node.data_dir(), tmp.path());
+    }
+
+    #[test]
+    fn shared_node_bucket_fast_path_recovers_from_poisoned_lock() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            let _guard = node.bucket_fast_path.write().unwrap();
+            panic!("poison bucket fast path lock");
+        }));
+
+        let info = BucketFastPathInfo {
+            name: crate::types::BucketName::from("bucket"),
+            owner_principal: "owner".to_string(),
+            owner_canonical_id: s3_types::CanonicalUserId::from_principal("owner"),
+            created_at: 0,
+            state: crate::types::BucketState::Active,
+            versioning: s3_types::BucketVersioningState::Disabled,
+            object_lock: s3_types::BucketObjectLockConfig {
+                enabled: false,
+                default_retention: None,
+            },
+            acl_grants: s3_types::AclGrants::new(vec![]),
+            public_read: false,
+            public_write: false,
+            public_access_block: None,
+            ownership_controls: None,
+            bucket_policy_present: false,
+            bucket_policy_public: false,
+            bucket_policy_generation: 0,
+            bucket_lifecycle_present: false,
+            bucket_lifecycle_generation: 0,
+            encryption: crate::types::EffectiveBucketEncryptionConfig::default(),
+        };
+        node.upsert_bucket_fast_path(info);
+        assert_eq!(
+            node.get_bucket_fast_path("bucket")
+                .as_ref()
+                .map(|entry| entry.name.as_str()),
+            Some("bucket")
+        );
+        node.remove_bucket_fast_path("bucket");
+        assert!(node.get_bucket_fast_path("bucket").is_none());
     }
 
     #[test]
