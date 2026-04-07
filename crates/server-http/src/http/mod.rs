@@ -1514,8 +1514,6 @@ impl HttpFrontend {
                     &body_xml,
                     result.last_modified,
                     result.version_id,
-                    result.managed_encryption,
-                    result.sse_customer.as_ref(),
                 ))
             }
             S3Operation::DeleteObjects { bucket } => {

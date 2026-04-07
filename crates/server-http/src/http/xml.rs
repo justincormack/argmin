@@ -2443,12 +2443,12 @@ pub fn copy_object_result_xml(
 pub fn copy_part_result_xml(etag: &str, last_modified: u64) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <CopyPartResult>\
-         <ETag>{}</ETag>\
+         <CopyPartResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <LastModified>{}</LastModified>\
+         <ETag>{}</ETag>\
          </CopyPartResult>",
-        xml_escape(etag),
         format_timestamp(last_modified),
+        etag,
     )
 }
 
@@ -3219,98 +3219,99 @@ pub fn get_object_attributes_xml(
 ) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <GetObjectAttributesResponse>",
+         <GetObjectAttributesResponse xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
     );
 
-    for &attr in requested {
-        match attr {
-            "ETag" => {
-                // Strip surrounding quotes from etag
-                let unquoted = etag.trim_matches('"');
-                xml.push_str("<ETag>");
-                xml.push_str(&xml_escape(unquoted));
-                xml.push_str("</ETag>");
+    let wants_etag = requested.contains(&"ETag");
+    let wants_checksum = requested.contains(&"Checksum");
+    let wants_object_parts = requested.contains(&"ObjectParts");
+    let wants_storage_class = requested.contains(&"StorageClass");
+    let wants_object_size = requested.contains(&"ObjectSize");
+
+    if wants_etag {
+        // Strip surrounding quotes from etag
+        let unquoted = etag.trim_matches('"');
+        xml.push_str("<ETag>");
+        xml.push_str(&xml_escape(unquoted));
+        xml.push_str("</ETag>");
+    }
+
+    if wants_checksum && !checksum_entries.is_empty() {
+        xml.push_str("<Checksum>");
+        for &(header_key, value) in checksum_entries {
+            if header_key == "x-amz-checksum-type" {
+                xml.push_str("<ChecksumType>");
+                xml.push_str(&xml_escape(value));
+                xml.push_str("</ChecksumType>");
+            } else if let Some(xml_tag) = checksum_header_to_xml_tag(header_key) {
+                // Strip the composite "-N" suffix (part count) from checksum
+                // values. GetObjectAttributes uses ChecksumType to convey
+                // composite vs full-object; the hash itself has no suffix.
+                let bare = strip_composite_suffix(value);
+                xml.push('<');
+                xml.push_str(xml_tag);
+                xml.push('>');
+                xml.push_str(&xml_escape(bare));
+                xml.push_str("</");
+                xml.push_str(xml_tag);
+                xml.push('>');
             }
-            "Checksum" => {
-                if !checksum_entries.is_empty() {
-                    xml.push_str("<Checksum>");
-                    for &(header_key, value) in checksum_entries {
-                        if header_key == "x-amz-checksum-type" {
-                            xml.push_str("<ChecksumType>");
-                            xml.push_str(&xml_escape(value));
-                            xml.push_str("</ChecksumType>");
-                        } else if let Some(xml_tag) = checksum_header_to_xml_tag(header_key) {
-                            // Strip the composite "-N" suffix (part count) from checksum
-                            // values. GetObjectAttributes uses ChecksumType to convey
-                            // composite vs full-object; the hash itself has no suffix.
-                            let bare = strip_composite_suffix(value);
-                            xml.push('<');
-                            xml.push_str(xml_tag);
-                            xml.push('>');
-                            xml.push_str(&xml_escape(bare));
-                            xml.push_str("</");
-                            xml.push_str(xml_tag);
-                            xml.push('>');
-                        }
-                    }
-                    xml.push_str("</Checksum>");
-                }
-            }
-            "StorageClass" => {
-                xml.push_str("<StorageClass>STANDARD</StorageClass>");
-            }
-            "ObjectSize" => {
-                xml.push_str("<ObjectSize>");
-                xml.push_str(&size.to_string());
-                xml.push_str("</ObjectSize>");
-            }
-            "ObjectParts" => {
-                if let Some(parts_info) = object_parts {
-                    xml.push_str("<ObjectParts>");
-                    xml.push_str("<PartsCount>");
-                    xml.push_str(&parts_info.total_parts_count.to_string());
-                    xml.push_str("</PartsCount>");
-                    if parts_info.has_detail {
-                        xml.push_str("<PartNumberMarker>");
-                        xml.push_str(&parts_info.part_number_marker.to_string());
-                        xml.push_str("</PartNumberMarker>");
-                        xml.push_str("<MaxParts>");
-                        xml.push_str(&parts_info.max_parts.to_string());
-                        xml.push_str("</MaxParts>");
-                        xml.push_str("<IsTruncated>");
-                        xml.push_str(if parts_info.is_truncated {
-                            "true"
-                        } else {
-                            "false"
-                        });
-                        xml.push_str("</IsTruncated>");
-                        if let Some(next) = parts_info.next_part_number_marker {
-                            xml.push_str("<NextPartNumberMarker>");
-                            xml.push_str(&next.to_string());
-                            xml.push_str("</NextPartNumberMarker>");
-                        }
-                        for part in &parts_info.parts {
-                            xml.push_str("<Part>");
-                            xml.push_str("<PartNumber>");
-                            xml.push_str(&part.part_number.to_string());
-                            xml.push_str("</PartNumber>");
-                            xml.push_str("<Size>");
-                            xml.push_str(&part.size.to_string());
-                            xml.push_str("</Size>");
-                            if let (Some(algo), Some(ref val)) =
-                                (checksum_algorithm, &part.checksum)
-                            {
-                                let elem = algo.xml_element_name();
-                                xml.push_str(&format!("<{elem}>{}</{elem}>", xml_escape(val)));
-                            }
-                            xml.push_str("</Part>");
-                        }
-                    }
-                    xml.push_str("</ObjectParts>");
-                }
-            }
-            _ => {}
         }
+        xml.push_str("</Checksum>");
+    }
+
+    if wants_object_parts {
+        if let Some(parts_info) = object_parts {
+            xml.push_str("<ObjectParts>");
+            xml.push_str("<PartsCount>");
+            xml.push_str(&parts_info.total_parts_count.to_string());
+            xml.push_str("</PartsCount>");
+            if parts_info.has_detail {
+                xml.push_str("<PartNumberMarker>");
+                xml.push_str(&parts_info.part_number_marker.to_string());
+                xml.push_str("</PartNumberMarker>");
+                if let Some(next) = parts_info.next_part_number_marker {
+                    xml.push_str("<NextPartNumberMarker>");
+                    xml.push_str(&next.to_string());
+                    xml.push_str("</NextPartNumberMarker>");
+                }
+                xml.push_str("<MaxParts>");
+                xml.push_str(&parts_info.max_parts.to_string());
+                xml.push_str("</MaxParts>");
+                xml.push_str("<IsTruncated>");
+                xml.push_str(if parts_info.is_truncated {
+                    "true"
+                } else {
+                    "false"
+                });
+                xml.push_str("</IsTruncated>");
+                for part in &parts_info.parts {
+                    xml.push_str("<Part>");
+                    xml.push_str("<PartNumber>");
+                    xml.push_str(&part.part_number.to_string());
+                    xml.push_str("</PartNumber>");
+                    xml.push_str("<Size>");
+                    xml.push_str(&part.size.to_string());
+                    xml.push_str("</Size>");
+                    if let (Some(algo), Some(ref val)) = (checksum_algorithm, &part.checksum) {
+                        let elem = algo.xml_element_name();
+                        xml.push_str(&format!("<{elem}>{}</{elem}>", xml_escape(val)));
+                    }
+                    xml.push_str("</Part>");
+                }
+            }
+            xml.push_str("</ObjectParts>");
+        }
+    }
+
+    if wants_storage_class {
+        xml.push_str("<StorageClass>STANDARD</StorageClass>");
+    }
+
+    if wants_object_size {
+        xml.push_str("<ObjectSize>");
+        xml.push_str(&size.to_string());
+        xml.push_str("</ObjectSize>");
     }
 
     xml.push_str("</GetObjectAttributesResponse>");
@@ -5371,7 +5372,9 @@ mod tests {
             None,
             None,
         );
-        assert!(xml.contains("<GetObjectAttributesResponse>"));
+        assert!(xml.contains(
+            "<GetObjectAttributesResponse xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
+        ));
         assert!(xml.contains("<ETag>abc123</ETag>"));
         assert!(xml.contains("<StorageClass>STANDARD</StorageClass>"));
         assert!(xml.contains("<ObjectSize>1024</ObjectSize>"));
@@ -5460,6 +5463,50 @@ mod tests {
         assert!(xml.contains("<Part><PartNumber>1</PartNumber><Size>5242880</Size></Part>"));
         assert!(xml.contains("<Part><PartNumber>2</PartNumber><Size>1024</Size></Part>"));
         assert!(xml.contains("</ObjectParts>"));
+    }
+
+    #[test]
+    fn get_object_attributes_uses_aws_element_order() {
+        use crate::coordinator::{ObjectPartEntry, ObjectPartsInfo};
+        let parts_info = ObjectPartsInfo {
+            total_parts_count: 2,
+            has_detail: true,
+            parts: vec![
+                ObjectPartEntry {
+                    part_number: 1,
+                    size: 5242880,
+                    checksum: Some("QoZTGg==".to_string()),
+                },
+                ObjectPartEntry {
+                    part_number: 2,
+                    size: 22,
+                    checksum: Some("d7wqew==".to_string()),
+                },
+            ],
+            is_truncated: false,
+            next_part_number_marker: Some(2),
+            max_parts: 1000,
+            part_number_marker: 0,
+        };
+        let xml = get_object_attributes_xml(
+            &["Checksum", "ObjectParts", "ObjectSize", "StorageClass"],
+            "\"x\"",
+            5242902,
+            &[
+                ("x-amz-checksum-crc32", "1wbLhg==-2"),
+                ("x-amz-checksum-type", "COMPOSITE"),
+            ],
+            Some(&parts_info),
+            Some(ChecksumAlgorithm::Crc32),
+        );
+        assert_eq!(
+            xml,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+<GetObjectAttributesResponse xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+<Checksum><ChecksumCRC32>1wbLhg==</ChecksumCRC32><ChecksumType>COMPOSITE</ChecksumType></Checksum>\
+<ObjectParts><PartsCount>2</PartsCount><PartNumberMarker>0</PartNumberMarker><NextPartNumberMarker>2</NextPartNumberMarker><MaxParts>1000</MaxParts><IsTruncated>false</IsTruncated><Part><PartNumber>1</PartNumber><Size>5242880</Size><ChecksumCRC32>QoZTGg==</ChecksumCRC32></Part><Part><PartNumber>2</PartNumber><Size>22</Size><ChecksumCRC32>d7wqew==</ChecksumCRC32></Part></ObjectParts>\
+<StorageClass>STANDARD</StorageClass><ObjectSize>5242902</ObjectSize></GetObjectAttributesResponse>"
+        );
     }
 
     #[test]

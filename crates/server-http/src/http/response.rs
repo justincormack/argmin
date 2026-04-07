@@ -438,15 +438,21 @@ impl S3Response {
     }
 
     /// Build a response for `HeadObject` with partNumber.
-    /// Returns 200 with Content-Length of the part and x-amz-mp-parts-count.
     #[must_use]
     pub fn head_object_part(result: &HeadObjectPartResult) -> Self {
-        let mut resp = Self::new(200)
+        let mut resp = Self::new(206)
             .header("ETag", &result.etag)
             .header("Content-Length", &result.part_size.to_string())
             .header("Last-Modified", &format_http_date(result.last_modified))
             .header("Accept-Ranges", "bytes")
             .header("x-amz-mp-parts-count", &result.parts_count.to_string());
+        if result.part_size != 0 {
+            let content_range = format!(
+                "bytes {}-{}/{}",
+                result.part_start, result.part_end, result.total_size
+            );
+            resp = resp.header("Content-Range", &content_range);
+        }
         if result.version_id.is_versioned() {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
@@ -909,17 +915,16 @@ impl S3Response {
         body_xml: &str,
         last_modified: u64,
         version_id: VersionId,
-        managed_encryption: Option<ManagedEncryptionAlgorithm>,
-        sse_customer: Option<&SseCustomerResponseHeaders>,
     ) -> Self {
-        let mut resp = Self::new(200)
-            .xml_body(body_xml.to_string())
-            .header("Last-Modified", &format_http_date(last_modified));
+        let mut resp = Self::new(200);
+        resp.body = body_xml.as_bytes().to_vec();
+        resp.headers
+            .push(("Content-Length".to_string(), resp.body.len().to_string()));
+        resp = resp.header("Last-Modified", &format_http_date(last_modified));
         if version_id.is_versioned() {
             resp = resp.header("x-amz-version-id", &format_version_id(version_id));
         }
-        resp.apply_managed_encryption_headers(managed_encryption)
-            .apply_sse_customer_headers(sse_customer)
+        resp
     }
 
     /// Build a response for `PutBucketAcl` (200 OK, no body).
@@ -1507,6 +1512,29 @@ mod tests {
         assert_eq!(
             find_header(&resp, "x-amz-checksum-type"),
             Some("FULL_OBJECT")
+        );
+    }
+
+    #[test]
+    fn get_object_attributes_response_matches_aws_header_shape() {
+        let resp = S3Response::get_object_attributes(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<GetObjectAttributesResponse xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></GetObjectAttributesResponse>",
+            1_705_321_845_000,
+            VersionId::Null,
+        );
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "Content-Length"), Some("146"));
+        assert_eq!(
+            find_header(&resp, "Last-Modified"),
+            Some("Mon, 15 Jan 2024 12:30:45 GMT")
+        );
+        assert_eq!(find_header(&resp, "Content-Type"), None);
+        assert_eq!(find_header(&resp, "x-amz-server-side-encryption"), None);
+        assert_eq!(
+            std::str::from_utf8(&resp.body).ok(),
+            Some(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<GetObjectAttributesResponse xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></GetObjectAttributesResponse>"
+            )
         );
     }
 

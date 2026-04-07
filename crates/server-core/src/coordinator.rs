@@ -1197,6 +1197,8 @@ pub struct HeadObjectPartResult {
     pub object_lock: ObjectLockState,
     pub etag: String,
     pub part_size: u64,
+    pub part_start: u64,
+    pub part_end: u64,
     pub total_size: u64,
     pub last_modified: u64,
     pub parts_count: u32,
@@ -11739,10 +11741,13 @@ impl Coordinator {
                 None
             };
 
-            let part = obj_parts
+            let part_index = obj_parts
                 .iter()
-                .find(|p| p.part_number == part_number)
+                .position(|p| p.part_number == part_number)
                 .ok_or(ServerError::InvalidPart { part_number })?;
+            let part = &obj_parts[part_index];
+            let part_start = obj_parts[..part_index].iter().map(|p| p.size).sum::<u64>();
+            let part_end = part_start + part.size.saturating_sub(1);
 
             let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
             let system_metadata = self.deserialize_visible_system_metadata(
@@ -11775,6 +11780,8 @@ impl Coordinator {
                 object_lock: record.object_lock,
                 etag: etag_str,
                 part_size: part.size,
+                part_start,
+                part_end,
                 total_size: record.size,
                 last_modified: record.last_modified,
                 parts_count: obj_parts.len() as u32,
@@ -11817,6 +11824,8 @@ impl Coordinator {
                 object_lock: record.object_lock,
                 etag: etag_str,
                 part_size: record.size,
+                part_start: 0,
+                part_end: record.size.saturating_sub(1),
                 total_size: record.size,
                 last_modified: record.last_modified,
                 parts_count: 1,
