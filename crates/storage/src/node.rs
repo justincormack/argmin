@@ -238,8 +238,7 @@ impl SharedStorageNode {
 
     /// Insert or replace the cached active-bucket fast-path metadata.
     pub fn upsert_bucket_fast_path(&self, info: BucketFastPathInfo) {
-        write_rwlock_unpoisoned(&self.bucket_fast_path)
-            .insert(info.name.to_string(), info);
+        write_rwlock_unpoisoned(&self.bucket_fast_path).insert(info.name.to_string(), info);
     }
 
     /// Mutate the cached fast-path metadata if present.
