@@ -26,8 +26,23 @@ use super::s3_response_to_hyper;
 use super::{HttpFrontend, S3HyperBody};
 use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
+use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
 
 const TRACE_TARGET: &str = "server_http";
+const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
+const MAX_STREAMING_POST_NON_FILE_FORM_BYTES: usize = MAX_BUFFERED_CONTROL_BODY_SIZE;
+const MAX_STREAMING_POST_DEFAULT_FIELD_BYTES: usize = 8 * 1024;
+const MAX_STREAMING_POST_KEY_FIELD_BYTES: usize = 2 * 1024;
+const MAX_STREAMING_POST_POLICY_FIELD_BYTES: usize = 256 * 1024;
+const MAX_STREAMING_POST_TAGGING_FIELD_BYTES: usize = 16 * 1024;
+const MAX_STREAMING_POST_SIGNATURE_FIELD_BYTES: usize = 256;
+const MAX_STREAMING_POST_DATE_FIELD_BYTES: usize = 64;
+const MAX_STREAMING_POST_CREDENTIAL_FIELD_BYTES: usize = 2 * 1024;
+const MAX_STREAMING_POST_ALGORITHM_FIELD_BYTES: usize = 64;
+const MAX_STREAMING_POST_ACL_FIELD_BYTES: usize = 128;
+const MAX_STREAMING_POST_STATUS_FIELD_BYTES: usize = 16;
+const MAX_STREAMING_POST_CHECKSUM_FIELD_BYTES: usize = 128;
+const MAX_STREAMING_POST_SSE_FIELD_BYTES: usize = 4 * 1024;
 
 /// Incremental hasher for validating trailing checksums in streaming uploads.
 ///
@@ -826,6 +841,87 @@ enum PostMultipartState {
     Done,
 }
 
+fn streaming_post_field_value_limit(name: &str) -> usize {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("x-amz-meta-") {
+        return USER_METADATA_SIZE_LIMIT;
+    }
+
+    match lower.as_str() {
+        "key" => MAX_STREAMING_POST_KEY_FIELD_BYTES,
+        "policy" => MAX_STREAMING_POST_POLICY_FIELD_BYTES,
+        "tagging" => MAX_STREAMING_POST_TAGGING_FIELD_BYTES,
+        "x-amz-signature" => MAX_STREAMING_POST_SIGNATURE_FIELD_BYTES,
+        "x-amz-date" => MAX_STREAMING_POST_DATE_FIELD_BYTES,
+        "x-amz-credential" => MAX_STREAMING_POST_CREDENTIAL_FIELD_BYTES,
+        "x-amz-algorithm" => MAX_STREAMING_POST_ALGORITHM_FIELD_BYTES,
+        "acl" => MAX_STREAMING_POST_ACL_FIELD_BYTES,
+        "success_action_status" => MAX_STREAMING_POST_STATUS_FIELD_BYTES,
+        "x-amz-checksum-sha256" => MAX_STREAMING_POST_CHECKSUM_FIELD_BYTES,
+        "x-amz-server-side-encryption"
+        | "x-amz-server-side-encryption-aws-kms-key-id"
+        | "x-amz-server-side-encryption-customer-algorithm"
+        | "x-amz-server-side-encryption-customer-key"
+        | "x-amz-server-side-encryption-customer-key-md5" => MAX_STREAMING_POST_SSE_FIELD_BYTES,
+        _ => MAX_STREAMING_POST_DEFAULT_FIELD_BYTES,
+    }
+}
+
+fn streaming_post_field_too_large(name: &str, limit: usize) -> ServerError {
+    ServerError::InvalidRequest {
+        reason: format!("multipart form field '{name}' exceeds maximum size of {limit} bytes"),
+    }
+}
+
+fn streaming_post_form_too_large(limit: usize) -> ServerError {
+    ServerError::InvalidRequest {
+        reason: format!("multipart form fields exceed maximum total size of {limit} bytes"),
+    }
+}
+
+fn is_streaming_post_metadata_field(name: &str) -> bool {
+    name.as_bytes()
+        .get(..11)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"x-amz-meta-"))
+}
+
+#[derive(Default)]
+struct StreamingPostFieldBudget {
+    total_bytes: usize,
+    metadata_bytes: usize,
+}
+
+impl StreamingPostFieldBudget {
+    fn record(&mut self, name: &str, value: &str) -> Result<(), ServerError> {
+        let field_bytes = name
+            .len()
+            .checked_add(value.len())
+            .ok_or_else(|| streaming_post_form_too_large(MAX_STREAMING_POST_NON_FILE_FORM_BYTES))?;
+
+        self.total_bytes = self
+            .total_bytes
+            .checked_add(field_bytes)
+            .ok_or_else(|| streaming_post_form_too_large(MAX_STREAMING_POST_NON_FILE_FORM_BYTES))?;
+        if self.total_bytes > MAX_STREAMING_POST_NON_FILE_FORM_BYTES {
+            return Err(streaming_post_form_too_large(
+                MAX_STREAMING_POST_NON_FILE_FORM_BYTES,
+            ));
+        }
+
+        if is_streaming_post_metadata_field(name) {
+            self.metadata_bytes = self
+                .metadata_bytes
+                .checked_add(field_bytes)
+                .ok_or(ServerError::MetadataTooLarge)?;
+            if self.metadata_bytes > USER_METADATA_SIZE_LIMIT {
+                return Err(ServerError::MetadataTooLarge);
+            }
+        }
+
+        Ok(())
+    }
+}
+
 struct PostMultipartParser {
     boundary: Vec<u8>,
     delimiter: Vec<u8>,
@@ -887,8 +983,24 @@ impl PostMultipartParser {
                 }
                 PostMultipartState::Headers => {
                     let Some(end) = find_subslice(&self.buf, b"\r\n\r\n") else {
+                        if self.buf.len().saturating_sub(3) > MAX_STREAMING_POST_PART_HEADER_BYTES {
+                            return Err(ServerError::InvalidRequest {
+                                reason: format!(
+                                    "multipart part headers exceed maximum size of {} bytes",
+                                    MAX_STREAMING_POST_PART_HEADER_BYTES
+                                ),
+                            });
+                        }
                         break;
                     };
+                    if end > MAX_STREAMING_POST_PART_HEADER_BYTES {
+                        return Err(ServerError::InvalidRequest {
+                            reason: format!(
+                                "multipart part headers exceed maximum size of {} bytes",
+                                MAX_STREAMING_POST_PART_HEADER_BYTES
+                            ),
+                        });
+                    }
                     let header_block = self.buf.split_to(end + 4);
                     let header_bytes = &header_block[..end];
                     let header_str = std::str::from_utf8(header_bytes).map_err(|_| {
@@ -913,6 +1025,10 @@ impl PostMultipartParser {
                             }
                             events.push(PostMultipartEvent::FileEnd);
                         } else {
+                            let limit = streaming_post_field_value_limit(name);
+                            if content.len() > limit {
+                                return Err(streaming_post_field_too_large(name, limit));
+                            }
                             let value = std::str::from_utf8(&content).map_err(|_| {
                                 ServerError::InvalidRequest {
                                     reason: format!("invalid UTF-8 in form field '{name}'"),
@@ -938,6 +1054,14 @@ impl PostMultipartParser {
                             }
                             continue;
                         }
+                    }
+                    let limit = streaming_post_field_value_limit(name);
+                    let buffered_value_len = self
+                        .buf
+                        .len()
+                        .saturating_sub(self.delimiter.len().saturating_sub(1));
+                    if buffered_value_len > limit {
+                        return Err(streaming_post_field_too_large(name, limit));
                     }
                     break;
                 }
@@ -1015,6 +1139,7 @@ async fn handle_streaming_post_object(
 
     let mut parser = PostMultipartParser::new(boundary);
     let mut fields: Vec<(String, String)> = Vec::new();
+    let mut field_budget = StreamingPostFieldBudget::default();
     let mut ctx: Option<Arc<super::StreamingPostContext>> = None;
     let mut seen_file = false;
     let mut file_ended = false;
@@ -1050,6 +1175,12 @@ async fn handle_streaming_post_object(
                                         reason: "file field must be the final multipart part"
                                             .to_string(),
                                     });
+                                }
+                                if let Err(err) = field_budget.record(&name, &value) {
+                                    if let Some(ref c) = ctx {
+                                        abort_streaming_post_object(&state, c).await;
+                                    }
+                                    return error_response(&err);
                                 }
                                 fields.push((name, value));
                             }
@@ -3434,6 +3565,81 @@ mod tests {
         assert!(saw_end);
         assert_eq!(reconstructed, file_data);
         assert!(parser.is_done());
+    }
+
+    #[test]
+    fn post_multipart_parser_rejects_oversized_part_headers() {
+        let boundary = "BoundaryZ";
+        let mut parser = PostMultipartParser::new(boundary);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"");
+        body.extend(std::iter::repeat_n(
+            b'h',
+            MAX_STREAMING_POST_PART_HEADER_BYTES,
+        ));
+
+        let err = parser.feed(&body).unwrap_err();
+        match err {
+            ServerError::InvalidRequest { reason } => {
+                assert!(reason.contains("multipart part headers exceed maximum size"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn post_multipart_parser_rejects_oversized_non_file_field_without_boundary() {
+        let boundary = "BoundaryField";
+        let mut parser = PostMultipartParser::new(boundary);
+
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(b"Content-Disposition: form-data; name=\"x-amz-date\"\r\n\r\n");
+        body.extend(std::iter::repeat_n(
+            b'0',
+            MAX_STREAMING_POST_DATE_FIELD_BYTES + parser.delimiter.len(),
+        ));
+
+        let err = parser.feed(&body).unwrap_err();
+        match err {
+            ServerError::InvalidRequest { reason } => {
+                assert!(reason.contains("multipart form field 'x-amz-date' exceeds maximum size"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn streaming_post_field_budget_rejects_metadata_over_limit() {
+        let mut budget = StreamingPostFieldBudget::default();
+        let name = "x-amz-meta-limit";
+        let value = "m".repeat(USER_METADATA_SIZE_LIMIT - name.len());
+
+        budget.record(name, &value).unwrap();
+
+        let err = budget.record(name, "x").unwrap_err();
+        assert!(matches!(err, ServerError::MetadataTooLarge));
+    }
+
+    #[test]
+    fn streaming_post_field_budget_rejects_total_non_file_bytes_over_limit() {
+        let mut budget = StreamingPostFieldBudget::default();
+        let value = "r".repeat(MAX_STREAMING_POST_DEFAULT_FIELD_BYTES);
+        let field_bytes = "redirect".len() + value.len();
+        while budget.total_bytes + field_bytes <= MAX_STREAMING_POST_NON_FILE_FORM_BYTES {
+            budget.record("redirect", &value).unwrap();
+        }
+
+        let overflow = "o".repeat(MAX_STREAMING_POST_NON_FILE_FORM_BYTES - budget.total_bytes + 1);
+        let err = budget.record("redirect", &overflow).unwrap_err();
+        match err {
+            ServerError::InvalidRequest { reason } => {
+                assert!(reason.contains("multipart form fields exceed maximum total size"));
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
     }
 
     // ── Regression tests for P0–P2 security fixes ────────────────────

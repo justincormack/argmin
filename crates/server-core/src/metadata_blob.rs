@@ -16,7 +16,7 @@ use crate::error::ServerError;
 const FORMAT_VERSION: u8 = 1;
 /// Minimum blob size: 4 (len) + 1 (version) + 2 (count) = 7 bytes
 const MIN_BLOB_SIZE: usize = 7;
-const USER_METADATA_SIZE_LIMIT: usize = 2 * 1024;
+pub const USER_METADATA_SIZE_LIMIT: usize = 2 * 1024;
 
 /// A single metadata key-value entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
