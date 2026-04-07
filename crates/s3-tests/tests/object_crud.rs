@@ -1026,11 +1026,10 @@ fn test_object_default_content_type() {
             .send()
             .await
             .unwrap();
-        let ct = resp.content_type().unwrap_or("");
-        assert!(
-            ct == "application/octet-stream" || ct.is_empty(),
-            "unexpected content-type: {}",
-            ct
+        assert_eq!(
+            resp.content_type(),
+            Some("application/octet-stream"),
+            "unexpected content-type"
         );
 
         client
