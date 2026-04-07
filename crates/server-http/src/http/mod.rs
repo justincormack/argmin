@@ -2614,6 +2614,23 @@ impl HttpFrontend {
         Ok(auth)
     }
 
+    fn require_content_sha256_for_sigv4_header_auth(req: &S3Request) -> Result<(), ServerError> {
+        if req.header("x-amz-content-sha256").is_some() {
+            return Ok(());
+        }
+        if req.header_count("authorization") == 1
+            && req
+                .header("authorization")
+                .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256"))
+        {
+            return Err(ServerError::InvalidRequest {
+                reason: "Missing required header for this request: x-amz-content-sha256"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
     fn should_defer_region_check(&self, operation: &S3Operation) -> bool {
         operation.bucket_name().is_some()
     }
@@ -3240,6 +3257,7 @@ impl HttpFrontend {
             bucket,
             key
         );
+        Self::require_content_sha256_for_sigv4_header_auth(req)?;
         let auth = self.authenticate_with_payload_check(req, false, true)?;
         self.enforce_bucket_region(bucket, &auth)?;
         reject_directory_bucket_only_object_features(req)?;
@@ -3578,6 +3596,7 @@ impl HttpFrontend {
             upload_id,
             part_number
         );
+        Self::require_content_sha256_for_sigv4_header_auth(req)?;
         let auth = self.authenticate_with_payload_check(req, false, true)?;
         self.enforce_bucket_region(bucket, &auth)?;
 
@@ -6928,6 +6947,37 @@ mod tests {
     }
 
     #[test]
+    fn prepare_streaming_part_sigv4_header_auth_requires_content_sha256() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![
+                (
+                    "authorization".to_string(),
+                    "AWS4-HMAC-SHA256 Credential=test/20260318/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef".to_string(),
+                ),
+                ("x-amz-date".to_string(), "20260318T000000Z".to_string()),
+            ],
+            b"hello world".to_vec(),
+        );
+        match fe.prepare_streaming_part(&req, "mybucket", "mykey", "upload-id", 1) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(
+                    reason,
+                    "Missing required header for this request: x-amz-content-sha256"
+                );
+            }
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
     fn put_object_invalid_content_md5_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
@@ -7510,6 +7560,37 @@ mod tests {
                 assert_eq!(
                     reason,
                     "Content-MD5 OR x-amz-checksum- HTTP header is required for Put Object requests with Object Lock parameters"
+                );
+            }
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn prepare_streaming_put_sigv4_header_auth_requires_content_sha256() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![
+                (
+                    "authorization".to_string(),
+                    "AWS4-HMAC-SHA256 Credential=test/20260318/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef".to_string(),
+                ),
+                ("x-amz-date".to_string(), "20260318T000000Z".to_string()),
+            ],
+            b"hello world".to_vec(),
+        );
+        match fe.prepare_streaming_put(&req, "mybucket", "mykey", false) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(
+                    reason,
+                    "Missing required header for this request: x-amz-content-sha256"
                 );
             }
             Err(e) => panic!("expected InvalidRequest, got {e:?}"),

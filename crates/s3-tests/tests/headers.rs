@@ -135,11 +135,13 @@ struct SignedHeaders {
 struct Signer {
     method: String,
     path: String,
+    query: String,
     access_key: String,
     secret_key: String,
     region: String,
     service: String,
     body_hash: Option<String>,
+    include_content_sha256: bool,
     timestamp: Option<u64>,
 }
 
@@ -148,11 +150,13 @@ impl Signer {
         Self {
             method: method.to_string(),
             path: path.to_string(),
+            query: String::new(),
             access_key: CTX.access_key().to_string(),
             secret_key: CTX.secret_key().to_string(),
             region: CTX.region().to_string(),
             service: "s3".to_string(),
             body_hash: None,
+            include_content_sha256: true,
             timestamp: None,
         }
     }
@@ -177,8 +181,18 @@ impl Signer {
         self
     }
 
+    fn query(mut self, query: &str) -> Self {
+        self.query = query.to_string();
+        self
+    }
+
     fn body_hash(mut self, hash: &str) -> Self {
         self.body_hash = Some(hash.to_string());
+        self
+    }
+
+    fn omit_content_sha256_header(mut self) -> Self {
+        self.include_content_sha256 = false;
         self
     }
 
@@ -209,15 +223,24 @@ impl Signer {
         let content_sha256 = self.body_hash.unwrap_or_else(|| sha256_hex(b""));
 
         let host_val = host();
-        let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-        let canonical_headers = format!(
-            "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
-            host_val, content_sha256, date_long
-        );
+        let (signed_headers, canonical_headers) = if self.include_content_sha256 {
+            (
+                "host;x-amz-content-sha256;x-amz-date",
+                format!(
+                    "host:{}\nx-amz-content-sha256:{}\nx-amz-date:{}\n",
+                    host_val, content_sha256, date_long
+                ),
+            )
+        } else {
+            (
+                "host;x-amz-date",
+                format!("host:{}\nx-amz-date:{}\n", host_val, date_long),
+            )
+        };
 
         let canonical_request = format!(
-            "{}\n{}\n\n{}\n{}\n{}",
-            self.method, self.path, canonical_headers, signed_headers, content_sha256
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            self.method, self.path, self.query, canonical_headers, signed_headers, content_sha256
         );
 
         let canonical_hash = sha256_hex(canonical_request.as_bytes());
@@ -648,6 +671,88 @@ fn test_put_wrong_secret_key() {
         let rbody = resp.body_mut().read_to_string().unwrap();
         assert_eq!(status, 403, "expected 403, got {}", status);
         assert_error_code(&rbody, "SignatureDoesNotMatch");
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_put_missing_content_sha256_header_rejected() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let actual_body = b"body sent without x-amz-content-sha256";
+        let path = format!("/{}/obj", bucket);
+        let s = Signer::new("PUT", &path)
+            .body_hash(&sha256_hex(b""))
+            .omit_content_sha256_header()
+            .sign();
+        let url = format!("{}{}", CTX.endpoint(), path);
+        let mut resp = agent()
+            .put(&url)
+            .header("Authorization", &s.authorization)
+            .header("x-amz-date", &s.amz_date)
+            .send(actual_body.as_ref())
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let rbody = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 400, "expected 400, got {} body: {}", status, rbody);
+        assert_error_code(&rbody, "InvalidRequest");
+        assert!(
+            rbody.contains("Missing required header for this request: x-amz-content-sha256"),
+            "expected missing x-amz-content-sha256 message, got: {}",
+            rbody
+        );
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_upload_part_missing_content_sha256_header_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "missing-content-sha256-part";
+        let actual_body = b"multipart body sent without x-amz-content-sha256";
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+        let query = format!(
+            "partNumber=1&uploadId={}",
+            url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect::<String>()
+        );
+        let path = format!("/{bucket}/{key}");
+        let url = format!("{}{}?{}", CTX.endpoint(), path, query);
+        let signed = Signer::new("PUT", &path)
+            .query(&query)
+            .body_hash(&sha256_hex(b""))
+            .omit_content_sha256_header()
+            .sign();
+        let mut resp = agent()
+            .put(&url)
+            .header("Authorization", &signed.authorization)
+            .header("x-amz-date", &signed.amz_date)
+            .send(actual_body.as_ref())
+            .expect("transport error");
+        let status = resp.status().as_u16();
+        let rbody = resp.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(status, 400, "expected 400, got {} body: {}", status, rbody);
+        assert_error_code(&rbody, "InvalidRequest");
+        assert!(
+            rbody.contains("Missing required header for this request: x-amz-content-sha256"),
+            "expected missing x-amz-content-sha256 message, got: {}",
+            rbody
+        );
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
         cleanup(&bucket, &[]).await;
     });
 }
