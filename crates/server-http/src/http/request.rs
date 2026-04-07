@@ -65,6 +65,31 @@ impl HeaderSource for RequestHeaderSource<'_> {
     }
 }
 
+pub(crate) fn query_pairs(query_string: &str) -> impl Iterator<Item = (&str, &str)> {
+    query_string
+        .split('&')
+        .filter(|segment| !segment.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((key, value)) => (key, value),
+            None => (pair, ""),
+        })
+}
+
+#[must_use]
+pub(crate) fn query_has_key(query_string: &str, name: &str) -> bool {
+    query_pairs(query_string).any(|(key, _)| key == name)
+}
+
+#[must_use]
+pub(crate) fn query_has_param(query_string: &str, name: &str, value: &str) -> bool {
+    query_pairs(query_string).any(|(key, candidate)| key == name && candidate == value)
+}
+
+#[must_use]
+pub(crate) fn query_param_raw<'a>(query_string: &'a str, name: &str) -> Option<&'a str> {
+    query_pairs(query_string).find_map(|(key, value)| (key == name).then_some(value))
+}
+
 impl S3Request {
     /// Parse hyper request parts and collected body into an `S3Request`.
     ///
@@ -269,19 +294,7 @@ impl S3Request {
 
 #[must_use]
 pub(crate) fn query_param_lossy<'a>(query_string: &'a str, name: &str) -> Option<Cow<'a, str>> {
-    query_string
-        .split('&')
-        .filter(|s| !s.is_empty())
-        .find_map(|pair| {
-            let mut parts = pair.splitn(2, '=');
-            let key = parts.next()?;
-            let val = parts.next().unwrap_or("");
-            if key == name {
-                Some(percent_decode_lossy(val))
-            } else {
-                None
-            }
-        })
+    query_param_raw(query_string, name).map(percent_decode_lossy)
 }
 
 pub(crate) fn parse_part_number(value: &str) -> Result<u32, ServerError> {
@@ -363,10 +376,7 @@ pub(crate) fn parse_copy_source(
     let (s, version_id) = match s.find('?') {
         Some(pos) => {
             let query = &s[pos + 1..];
-            let vid = query
-                .split('&')
-                .find_map(|param| param.strip_prefix("versionId="))
-                .map(std::string::ToString::to_string);
+            let vid = query_param_raw(query, "versionId").map(std::string::ToString::to_string);
             (&s[..pos], vid)
         }
         None => (s, None),
@@ -467,6 +477,20 @@ mod tests {
     }
 
     #[test]
+    fn query_helpers_handle_flags_and_first_match() {
+        assert!(query_has_key("flag&&other=1", "flag"));
+        assert!(!query_has_key("flag&&other=1", "missing"));
+        assert!(query_has_param("list-type=1&list-type=2", "list-type", "2"));
+        assert!(!query_has_param(
+            "list-type=1&list-type=3",
+            "list-type",
+            "2"
+        ));
+        assert_eq!(query_param_raw("flag&other=1&other=2", "flag"), Some(""));
+        assert_eq!(query_param_raw("flag&other=1&other=2", "other"), Some("1"));
+    }
+
+    #[test]
     fn parse_part_number_rejects_zero_and_non_numeric() {
         assert!(matches!(
             parse_part_number("0"),
@@ -495,6 +519,18 @@ mod tests {
             Err(ServerError::InvalidArgument { reason })
                 if reason == "partNumber must be a positive integer"
         ));
+    }
+
+    #[test]
+    fn parse_copy_source_extracts_raw_version_id_via_shared_query_parser() {
+        assert_eq!(
+            parse_copy_source("/bucket/key?partNumber=1&versionId=abc%2Fdef").unwrap(),
+            (
+                "bucket".to_string(),
+                "key".to_string(),
+                Some("abc%2Fdef".to_string())
+            )
+        );
     }
 
     #[test]

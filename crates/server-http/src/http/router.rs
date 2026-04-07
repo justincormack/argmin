@@ -1,5 +1,6 @@
 /// S3 operation routing from HTTP method + path + query.
 use crate::error::ServerError;
+use crate::http::request::{query_has_key, query_has_param};
 
 /// Recognized S3 operations.
 #[derive(Debug, PartialEq, Eq)]
@@ -219,14 +220,6 @@ fn validate_object_key(key: &str) -> Result<(), ServerError> {
     Ok(())
 }
 
-/// Check if a bare query parameter key is present (e.g. "delete" in "?delete").
-fn has_query_key(query: &str, target: &str) -> bool {
-    query.split('&').filter(|s| !s.is_empty()).any(|pair| {
-        let key = pair.split('=').next().unwrap_or("");
-        key == target
-    })
-}
-
 /// Route an HTTP request to an S3 operation.
 ///
 /// Path-style addressing only: `/<bucket>` or `/<bucket>/<key...>`.
@@ -269,78 +262,78 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         }),
 
         // Bucket-level operations (no key)
-        ("PUT", None) if has_query_key(query, "versioning") => {
+        ("PUT", None) if query_has_key(query, "versioning") => {
             Ok(S3Operation::PutBucketVersioning {
                 bucket: bucket.to_string(),
             })
         }
-        ("PUT", None) if has_query_key(query, "object-lock") => {
+        ("PUT", None) if query_has_key(query, "object-lock") => {
             Ok(S3Operation::PutBucketObjectLockConfiguration {
                 bucket: bucket.to_string(),
             })
         }
-        ("PUT", None) if has_query_key(query, "encryption") => {
+        ("PUT", None) if query_has_key(query, "encryption") => {
             Ok(S3Operation::PutBucketEncryption {
                 bucket: bucket.to_string(),
             })
         }
-        ("PUT", None) if has_query_key(query, "cors") => Ok(S3Operation::PutBucketCors {
+        ("PUT", None) if query_has_key(query, "cors") => Ok(S3Operation::PutBucketCors {
             bucket: bucket.to_string(),
         }),
-        ("PUT", None) if has_query_key(query, "tagging") => Ok(S3Operation::PutBucketTagging {
+        ("PUT", None) if query_has_key(query, "tagging") => Ok(S3Operation::PutBucketTagging {
             bucket: bucket.to_string(),
         }),
-        ("PUT", None) if has_query_key(query, "lifecycle") => Ok(S3Operation::PutBucketLifecycle {
+        ("PUT", None) if query_has_key(query, "lifecycle") => Ok(S3Operation::PutBucketLifecycle {
             bucket: bucket.to_string(),
         }),
-        ("PUT", None) if has_query_key(query, "publicAccessBlock") => {
+        ("PUT", None) if query_has_key(query, "publicAccessBlock") => {
             Ok(S3Operation::PutBucketPublicAccessBlock {
                 bucket: bucket.to_string(),
             })
         }
-        ("PUT", None) if has_query_key(query, "acl") => Ok(S3Operation::PutBucketAcl {
+        ("PUT", None) if query_has_key(query, "acl") => Ok(S3Operation::PutBucketAcl {
             bucket: bucket.to_string(),
         }),
-        ("PUT", None) if has_query_key(query, "ownershipControls") => {
+        ("PUT", None) if query_has_key(query, "ownershipControls") => {
             Ok(S3Operation::PutBucketOwnershipControls {
                 bucket: bucket.to_string(),
             })
         }
-        ("PUT", None) if has_query_key(query, "policy") => Ok(S3Operation::PutBucketPolicy {
+        ("PUT", None) if query_has_key(query, "policy") => Ok(S3Operation::PutBucketPolicy {
             bucket: bucket.to_string(),
         }),
         ("PUT", None) => Ok(S3Operation::CreateBucket {
             bucket: bucket.to_string(),
         }),
-        ("DELETE", None) if has_query_key(query, "cors") => Ok(S3Operation::DeleteBucketCors {
+        ("DELETE", None) if query_has_key(query, "cors") => Ok(S3Operation::DeleteBucketCors {
             bucket: bucket.to_string(),
         }),
-        ("DELETE", None) if has_query_key(query, "encryption") => {
+        ("DELETE", None) if query_has_key(query, "encryption") => {
             Ok(S3Operation::DeleteBucketEncryption {
                 bucket: bucket.to_string(),
             })
         }
-        ("DELETE", None) if has_query_key(query, "publicAccessBlock") => {
+        ("DELETE", None) if query_has_key(query, "publicAccessBlock") => {
             Ok(S3Operation::DeleteBucketPublicAccessBlock {
                 bucket: bucket.to_string(),
             })
         }
-        ("DELETE", None) if has_query_key(query, "ownershipControls") => {
+        ("DELETE", None) if query_has_key(query, "ownershipControls") => {
             Ok(S3Operation::DeleteBucketOwnershipControls {
                 bucket: bucket.to_string(),
             })
         }
-        ("DELETE", None) if has_query_key(query, "tagging") => {
+        ("DELETE", None) if query_has_key(query, "tagging") => {
             Ok(S3Operation::DeleteBucketTagging {
                 bucket: bucket.to_string(),
             })
         }
-        ("DELETE", None) if has_query_key(query, "lifecycle") => {
+        ("DELETE", None) if query_has_key(query, "lifecycle") => {
             Ok(S3Operation::DeleteBucketLifecycle {
                 bucket: bucket.to_string(),
             })
         }
-        ("DELETE", None) if has_query_key(query, "policy") => Ok(S3Operation::DeleteBucketPolicy {
+        ("DELETE", None) if query_has_key(query, "policy") => Ok(S3Operation::DeleteBucketPolicy {
             bucket: bucket.to_string(),
         }),
         ("DELETE", None) => Ok(S3Operation::DeleteBucket {
@@ -350,95 +343,90 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             bucket: bucket.to_string(),
         }),
         ("GET", None) => {
-            if has_query_key(query, "location") {
+            if query_has_key(query, "location") {
                 return Ok(S3Operation::GetBucketLocation {
                     bucket: bucket.to_string(),
                 });
             }
             // Check for ?uploads → ListMultipartUploads
-            if has_query_key(query, "uploads") {
+            if query_has_key(query, "uploads") {
                 return Ok(S3Operation::ListMultipartUploads {
                     bucket: bucket.to_string(),
                 });
             }
             // Check for ?ownershipControls → GetBucketOwnershipControls
-            if has_query_key(query, "ownershipControls") {
+            if query_has_key(query, "ownershipControls") {
                 return Ok(S3Operation::GetBucketOwnershipControls {
                     bucket: bucket.to_string(),
                 });
             }
             // Check for ?publicAccessBlock → GetBucketPublicAccessBlock
-            if has_query_key(query, "publicAccessBlock") {
+            if query_has_key(query, "publicAccessBlock") {
                 return Ok(S3Operation::GetBucketPublicAccessBlock {
                     bucket: bucket.to_string(),
                 });
             }
             // Check for ?cors → GetBucketCors
-            if has_query_key(query, "cors") {
+            if query_has_key(query, "cors") {
                 return Ok(S3Operation::GetBucketCors {
                     bucket: bucket.to_string(),
                 });
             }
             // Check for ?tagging → GetBucketTagging
-            if has_query_key(query, "tagging") {
+            if query_has_key(query, "tagging") {
                 return Ok(S3Operation::GetBucketTagging {
                     bucket: bucket.to_string(),
                 });
             }
-            if has_query_key(query, "lifecycle") {
+            if query_has_key(query, "lifecycle") {
                 return Ok(S3Operation::GetBucketLifecycle {
                     bucket: bucket.to_string(),
                 });
             }
             // Check for ?policy → GetBucketPolicy
-            if has_query_key(query, "policy") {
+            if query_has_key(query, "policy") {
                 return Ok(S3Operation::GetBucketPolicy {
                     bucket: bucket.to_string(),
                 });
             }
             // Check for ?policyStatus → GetBucketPolicyStatus
-            if has_query_key(query, "policyStatus") {
+            if query_has_key(query, "policyStatus") {
                 return Ok(S3Operation::GetBucketPolicyStatus {
                     bucket: bucket.to_string(),
                 });
             }
             // Check for ?acl → GetBucketAcl
-            if has_query_key(query, "acl") {
+            if query_has_key(query, "acl") {
                 return Ok(S3Operation::GetBucketAcl {
                     bucket: bucket.to_string(),
                 });
             }
             // Check for ?versioning → GetBucketVersioning
-            if has_query_key(query, "versioning") {
+            if query_has_key(query, "versioning") {
                 return Ok(S3Operation::GetBucketVersioning {
                     bucket: bucket.to_string(),
                 });
             }
             // Check for ?object-lock → GetBucketObjectLockConfiguration
-            if has_query_key(query, "object-lock") {
+            if query_has_key(query, "object-lock") {
                 return Ok(S3Operation::GetBucketObjectLockConfiguration {
                     bucket: bucket.to_string(),
                 });
             }
             // Check for ?encryption → GetBucketEncryption
-            if has_query_key(query, "encryption") {
+            if query_has_key(query, "encryption") {
                 return Ok(S3Operation::GetBucketEncryption {
                     bucket: bucket.to_string(),
                 });
             }
             // Check for ?versions → ListObjectVersions
-            if has_query_key(query, "versions") {
+            if query_has_key(query, "versions") {
                 return Ok(S3Operation::ListObjectVersions {
                     bucket: bucket.to_string(),
                 });
             }
             // Check for list-type=2 → V2, otherwise → V1
-            let is_v2 = query.split('&').filter(|s| !s.is_empty()).any(|pair| {
-                let mut parts = pair.splitn(2, '=');
-                let key = parts.next().unwrap_or("");
-                let val = parts.next().unwrap_or("");
-                key == "list-type" && val == "2"
-            });
+            let is_v2 = query_has_param(query, "list-type", "2");
             if is_v2 {
                 Ok(S3Operation::ListObjectsV2 {
                     bucket: bucket.to_string(),
@@ -450,7 +438,7 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             }
         }
         ("POST", None) => {
-            if has_query_key(query, "delete") {
+            if query_has_key(query, "delete") {
                 Ok(S3Operation::DeleteObjects {
                     bucket: bucket.to_string(),
                 })
@@ -462,51 +450,51 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         }
 
         // Object-level tagging (must appear before catch-all)
-        ("PUT", Some(key)) if has_query_key(query, "tagging") => {
+        ("PUT", Some(key)) if query_has_key(query, "tagging") => {
             Ok(S3Operation::PutObjectTagging {
                 bucket: bucket.to_string(),
                 key,
             })
         }
-        ("PUT", Some(key)) if has_query_key(query, "acl") => Ok(S3Operation::PutObjectAcl {
+        ("PUT", Some(key)) if query_has_key(query, "acl") => Ok(S3Operation::PutObjectAcl {
             bucket: bucket.to_string(),
             key,
         }),
-        ("GET", Some(key)) if has_query_key(query, "tagging") => {
+        ("GET", Some(key)) if query_has_key(query, "tagging") => {
             Ok(S3Operation::GetObjectTagging {
                 bucket: bucket.to_string(),
                 key,
             })
         }
-        ("GET", Some(key)) if has_query_key(query, "acl") => Ok(S3Operation::GetObjectAcl {
+        ("GET", Some(key)) if query_has_key(query, "acl") => Ok(S3Operation::GetObjectAcl {
             bucket: bucket.to_string(),
             key,
         }),
-        ("DELETE", Some(key)) if has_query_key(query, "tagging") => {
+        ("DELETE", Some(key)) if query_has_key(query, "tagging") => {
             Ok(S3Operation::DeleteObjectTagging {
                 bucket: bucket.to_string(),
                 key,
             })
         }
-        ("PUT", Some(key)) if has_query_key(query, "retention") => {
+        ("PUT", Some(key)) if query_has_key(query, "retention") => {
             Ok(S3Operation::PutObjectRetention {
                 bucket: bucket.to_string(),
                 key,
             })
         }
-        ("GET", Some(key)) if has_query_key(query, "retention") => {
+        ("GET", Some(key)) if query_has_key(query, "retention") => {
             Ok(S3Operation::GetObjectRetention {
                 bucket: bucket.to_string(),
                 key,
             })
         }
-        ("PUT", Some(key)) if has_query_key(query, "legal-hold") => {
+        ("PUT", Some(key)) if query_has_key(query, "legal-hold") => {
             Ok(S3Operation::PutObjectLegalHold {
                 bucket: bucket.to_string(),
                 key,
             })
         }
-        ("GET", Some(key)) if has_query_key(query, "legal-hold") => {
+        ("GET", Some(key)) if query_has_key(query, "legal-hold") => {
             Ok(S3Operation::GetObjectLegalHold {
                 bucket: bucket.to_string(),
                 key,
@@ -514,7 +502,7 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         }
 
         // GetObjectAttributes (must appear before catch-all GET)
-        ("GET", Some(key)) if has_query_key(query, "attributes") => {
+        ("GET", Some(key)) if query_has_key(query, "attributes") => {
             Ok(S3Operation::GetObjectAttributes {
                 bucket: bucket.to_string(),
                 key,
@@ -522,29 +510,29 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         }
 
         // Multipart upload operations (must appear before catch-all object operations)
-        ("POST", Some(key)) if has_query_key(query, "uploads") => {
+        ("POST", Some(key)) if query_has_key(query, "uploads") => {
             Ok(S3Operation::CreateMultipartUpload {
                 bucket: bucket.to_string(),
                 key,
             })
         }
-        ("POST", Some(key)) if has_query_key(query, "uploadId") => {
+        ("POST", Some(key)) if query_has_key(query, "uploadId") => {
             Ok(S3Operation::CompleteMultipartUpload {
                 bucket: bucket.to_string(),
                 key,
             })
         }
-        ("PUT", Some(key)) if has_query_key(query, "partNumber") => Ok(S3Operation::UploadPart {
+        ("PUT", Some(key)) if query_has_key(query, "partNumber") => Ok(S3Operation::UploadPart {
             bucket: bucket.to_string(),
             key,
         }),
-        ("DELETE", Some(key)) if has_query_key(query, "uploadId") => {
+        ("DELETE", Some(key)) if query_has_key(query, "uploadId") => {
             Ok(S3Operation::AbortMultipartUpload {
                 bucket: bucket.to_string(),
                 key,
             })
         }
-        ("GET", Some(key)) if has_query_key(query, "uploadId") => Ok(S3Operation::ListParts {
+        ("GET", Some(key)) if query_has_key(query, "uploadId") => Ok(S3Operation::ListParts {
             bucket: bucket.to_string(),
             key,
         }),
@@ -664,6 +652,16 @@ mod tests {
     fn list_objects_v2_with_other_params() {
         assert_eq!(
             route("GET", "/mybucket", "list-type=2&prefix=foo&max-keys=10").unwrap(),
+            S3Operation::ListObjectsV2 {
+                bucket: "mybucket".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn list_objects_v2_when_duplicate_list_type_contains_two() {
+        assert_eq!(
+            route("GET", "/mybucket", "list-type=1&list-type=2").unwrap(),
             S3Operation::ListObjectsV2 {
                 bucket: "mybucket".to_string()
             }

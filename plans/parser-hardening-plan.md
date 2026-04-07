@@ -171,11 +171,22 @@ Current progress:
 - shared `UploadPart` query parsing now validates `uploadId`/`partNumber` for
   both streaming and buffered paths in `server-http`, removing a fallback path
   where malformed streaming `UploadPart` queries could bypass early validation
+- repeated request-derived integer parsing in `server-http/http/mod.rs` now
+  goes through shared helpers instead of local ad hoc parsing at each call site
+- raw query walking for routing and copy-source `versionId` extraction now goes
+  through shared `server-http/http/request.rs` helpers, removing the remaining
+  duplicated `split('&')` / `splitn('=')` parsers on live router paths
 
 Success criteria:
 - remaining raw string manipulations are either:
   - obviously safe after prior validation, or
   - localized inside parser helpers with tests
+
+Phase 3 status:
+- completed for the original hotspot sweep scope in `auth` and `server-http`
+- no remaining high-risk request parser sites were found in the final router /
+  query pass; remaining parser work, if any, is maintenance-oriented rather
+  than tied to a known bug class from this plan
 
 ## Implementation Notes
 
