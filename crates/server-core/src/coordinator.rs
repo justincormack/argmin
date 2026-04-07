@@ -4297,9 +4297,11 @@ impl Coordinator {
         bucket: &BucketSummary,
         object: &StoredObject,
     ) -> bool {
-        (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
-            && Self::requester_is_bucket_owner_account(requester, bucket))
-            || requester.principal_opt() == Some(object.owner().principal.as_str())
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+            return Self::requester_is_bucket_owner_account(requester, bucket);
+        }
+
+        requester.principal_opt() == Some(object.owner().principal.as_str())
             || object.acl_grants().is_some_and(|grants| {
                 Self::requester_has_acl_permission(requester, grants, AclPermission::Read)
             })
@@ -5768,7 +5770,12 @@ impl Coordinator {
             }
             PutObjectWriteAcl::Canned(acl) => Self::ensure_put_object_acl_supported(bucket, *acl),
             PutObjectWriteAcl::Grants(acl_grants) => {
-                if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+                if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+                    && !Self::acl_grants_owner_full_control_only(
+                        &bucket.owner_canonical_id,
+                        acl_grants,
+                    )
+                {
                     return Err(ServerError::AccessControlListNotSupported);
                 }
                 Self::ensure_supported_object_acl_grants(acl_grants)?;
@@ -22966,6 +22973,54 @@ mod tests {
     }
 
     #[test]
+    fn put_object_allows_bucket_owner_full_control_grant_on_bucket_owner_enforced_bucket() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::new(
+            "owner-a",
+            CanonicalUserId::from_principal("owner-boe-grants-canonical"),
+            "Owner A",
+        );
+        let owner_requester = Requester::authenticated(owner.clone());
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: owner_requester,
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::authenticated(owner.clone()),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: PutObjectWriteAcl::Grants(AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::CanonicalUser(owner.canonical_user_id().clone()),
+                    AclPermission::FullControl,
+                )])),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn get_object_tags_rejects_non_owner_requester() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -25174,6 +25229,75 @@ mod tests {
                 "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
                 test_helpers::requester("owner-a"), None)
             .unwrap();
+
+        let err = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    Requester::anonymous(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_object_bucket_owner_enforced_disables_legacy_public_read_acl() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"public",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: PutObjectAcl::PublicRead.into(),
+            },
+        )
+        .unwrap();
+
+        let obj = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    Requester::anonymous(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(obj.body.read_all().unwrap(), b"public");
+
+        put_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
 
         let err = coord
             .get_object(&GetObjectRequest {

@@ -4,7 +4,10 @@ use aws_sdk_s3::types::{
     CreateBucketConfiguration, Grant, ObjectCannedAcl, ObjectOwnership, OwnershipControls,
     OwnershipControlsRule, Permission,
 };
-use s3_tests::{assert_s3_err_code, create_public_write_bucket, err_status, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, create_public_write_bucket, disable_bucket_public_access_block, err_status,
+    unique_bucket, CTX,
+};
 use serde_json::json;
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
@@ -1027,6 +1030,32 @@ async fn cleanup_keys(bucket: &str, keys: &[&str]) {
     cleanup(bucket).await;
 }
 
+async fn alt_get_object_eventually(
+    bucket: &str,
+    key: &str,
+) -> aws_sdk_s3::operation::get_object::GetObjectOutput {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match CTX
+            .alt_client()
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!("alternate GetObject failed unexpectedly: {err:?}"),
+        }
+    }
+
+    unreachable!()
+}
+
 async fn run_cross_account_object_ownership_matrix(
     ownership: ObjectOwnership,
     expected_no_acl_owner_is_bucket_owner: bool,
@@ -1383,6 +1412,285 @@ fn test_bucket_owner_enforced_acl_read_and_restore_semantics() {
         assert_s3_err_code(&result, "AccessDenied");
 
         cleanup_keys(&bucket, &["pre-boe", "during-boe"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_owner_enforced_disables_legacy_public_read_object_acl() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket_request(client, &bucket)
+            .object_ownership(ObjectOwnership::ObjectWriter)
+            .send()
+            .await
+            .unwrap();
+        disable_bucket_public_access_block(client, &bucket).await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("pre-boe-public")
+            .acl(ObjectCannedAcl::PublicRead)
+            .body(ByteStream::from_static(b"public"))
+            .send()
+            .await
+            .unwrap();
+
+        let object_url = format!("{}/{}/pre-boe-public", CTX.endpoint(), bucket);
+
+        let mut before = agent().get(&object_url).call().expect("transport error");
+        assert_eq!(
+            before.status().as_u16(),
+            200,
+            "expected anonymous GET before BOE to succeed"
+        );
+        let before_body = before.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(before_body, "public");
+
+        set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
+
+        let mut after = agent().get(&object_url).call().expect("transport error");
+        assert_eq!(
+            after.status().as_u16(),
+            403,
+            "expected anonymous GET after BOE to be denied"
+        );
+        let after_body = after.body_mut().read_to_string().unwrap_or_default();
+        assert!(
+            after_body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied after BOE, got {after_body}"
+        );
+
+        cleanup_keys(&bucket, &["pre-boe-public"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_owner_enforced_disables_legacy_explicit_grantee_read_acl() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_owner = canonical_owner_id(CTX.alt_client()).await;
+        let bucket = unique_bucket();
+        s3_tests::create_bucket_request(client, &bucket)
+            .object_ownership(ObjectOwnership::ObjectWriter)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("pre-boe-grant-read")
+            .body(ByteStream::from_static(b"granted"))
+            .customize()
+            .mutate_request({
+                let alt_owner = alt_owner.clone();
+                move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-read", format!("id=\"{alt_owner}\""));
+                }
+            })
+            .send()
+            .await
+            .unwrap();
+
+        let body = alt_get_object_eventually(&bucket, "pre-boe-grant-read")
+            .await
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(&body[..], b"granted");
+
+        set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
+
+        let result = CTX
+            .alt_client()
+            .get_object()
+            .bucket(&bucket)
+            .key("pre-boe-grant-read")
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
+        assert_s3_err_code(&result, "AccessDenied");
+
+        cleanup_keys(&bucket, &["pre-boe-grant-read"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_owner_enforced_retains_bucket_policy_get_object_access() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_with_alt_object_access(ObjectOwnership::ObjectWriter).await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("policy-read")
+            .body(ByteStream::from_static(b"policy"))
+            .send()
+            .await
+            .unwrap();
+
+        let before = alt_get_object_eventually(&bucket, "policy-read").await;
+        let before_body = before.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&before_body[..], b"policy");
+
+        set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
+
+        let after = alt_get_object_eventually(&bucket, "policy-read").await;
+        let after_body = after.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&after_body[..], b"policy");
+
+        cleanup_keys(&bucket, &["policy-read"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_owner_enforced_allows_bucket_owner_full_control_equivalent_grant_headers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt = CTX.alt_client();
+        let bucket =
+            create_bucket_with_alt_object_access(ObjectOwnership::BucketOwnerEnforced).await;
+        let bucket_owner = bucket_owner_id(&bucket).await;
+        let full_control_header = format!("id=\"{bucket_owner}\"");
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("src")
+            .body(ByteStream::from_static(b"src"))
+            .send()
+            .await
+            .unwrap();
+
+        alt.put_object()
+            .bucket(&bucket)
+            .key("put-grant-full-control")
+            .body(ByteStream::from_static(b"put"))
+            .customize()
+            .mutate_request({
+                let full_control_header = full_control_header.clone();
+                move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-full-control", full_control_header.clone());
+                }
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            object_owner_id(client, &bucket, "put-grant-full-control").await,
+            bucket_owner
+        );
+
+        alt.copy_object()
+            .bucket(&bucket)
+            .key("copy-grant-full-control")
+            .copy_source(format!("{bucket}/src"))
+            .customize()
+            .mutate_request({
+                let full_control_header = full_control_header.clone();
+                move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-full-control", full_control_header.clone());
+                }
+            })
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            object_owner_id(client, &bucket, "copy-grant-full-control").await,
+            bucket_owner
+        );
+
+        let upload = alt
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("mpu-grant-full-control")
+            .customize()
+            .mutate_request({
+                let full_control_header = full_control_header.clone();
+                move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-full-control", full_control_header.clone());
+                }
+            })
+            .send()
+            .await
+            .unwrap();
+        alt.abort_multipart_upload()
+            .bucket(&bucket)
+            .key("mpu-grant-full-control")
+            .upload_id(upload.upload_id().expect("expected upload id"))
+            .send()
+            .await
+            .unwrap();
+
+        cleanup_keys(
+            &bucket,
+            &["src", "put-grant-full-control", "copy-grant-full-control"],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_bucket_owner_enforced_restores_legacy_explicit_grantee_read_acl() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_owner = canonical_owner_id(CTX.alt_client()).await;
+        let bucket = unique_bucket();
+        s3_tests::create_bucket_request(client, &bucket)
+            .object_ownership(ObjectOwnership::ObjectWriter)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("pre-boe-grant-read")
+            .body(ByteStream::from_static(b"granted"))
+            .customize()
+            .mutate_request({
+                let alt_owner = alt_owner.clone();
+                move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-read", format!("id=\"{alt_owner}\""));
+                }
+            })
+            .send()
+            .await
+            .unwrap();
+
+        let before = alt_get_object_eventually(&bucket, "pre-boe-grant-read").await;
+        let before_body = before.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&before_body[..], b"granted");
+
+        set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
+
+        let during_boe = CTX
+            .alt_client()
+            .get_object()
+            .bucket(&bucket)
+            .key("pre-boe-grant-read")
+            .send()
+            .await;
+        assert_eq!(err_status(&during_boe), 403);
+        assert_s3_err_code(&during_boe, "AccessDenied");
+
+        delete_bucket_ownership(&bucket).await;
+
+        let after = alt_get_object_eventually(&bucket, "pre-boe-grant-read").await;
+        let after_body = after.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&after_body[..], b"granted");
+
+        cleanup_keys(&bucket, &["pre-boe-grant-read"]).await;
     });
 }
 
