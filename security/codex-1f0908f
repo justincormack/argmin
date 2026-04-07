@@ -1,0 +1,337 @@
+Race in stream segment append can delete committed shards
+Link: https://chatgpt.com/codex/security/findings/23f0220f9ae881918e873ef2b807d1c7?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: ignore)
+Status: new
+Criticality notes: race conditions and data loss/corruption are more serious
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 1f0908f
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 22:09:45
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced a TOCTOU race in append_stream_segment: concurrent duplicate segment uploads can cause cleanup to delete shards that another request already committed, resulting in data loss/corruption.
+The refactor moves shard file writes outside the PG mutex and delays metadata publication. In append_stream_segment, the code first checks for duplicate segment indexes, writes shard files, then re-checks for duplicates and cleans up on failure. If two concurrent requests append the same segment index, the winner registers shards and records the segment. The loser then hits the duplicate check and calls cleanup_stream_shards_locked, which deletes shards by key via PgStore::delete_shard. Because the shard keys are identical for a given session/segment index, this cleanup removes the already-registered shards and metadata for the winning request, corrupting the stored segment and causing read failures. This race did not exist for same-PG sessions before the commit.
+
+# Validation
+## Rubric
+- [ ] Dynamic reproduction of duplicate-segment race (cargo test PoC) — build failed due to missing libisal.
+- [x] append_stream_segment does pre-write duplicate check, writes shards without PG locks, then re-checks duplicates (coordinator.rs:3515-3750).
+- [x] stream_segment_key_hash uses session_id/segment_index, making duplicate uploads share shard keys (pg.rs:112-121; coordinator.rs:3672-3678).
+- [x] cleanup_stream_shards_locked deletes shards by key via delete_shard (coordinator.rs:3618-3621; pg_store.rs:663-700).
+- [x] duplicate check failure triggers cleanup on written shards, enabling deletion of winner’s shards (coordinator.rs:3734-3738).
+## Report
+Rubric-driven steps: attempted dynamic reproduction first. Ran `cargo test -p server-core race_duplicate_segment_cleanup_can_delete_committed_shards -- --nocapture` (PoC added) but build failed because ec-sys requires libisal: build.rs panicked with “libisal not found; install intel-isa-l or set PKG_CONFIG_PATH” (cargo output). Valgrind and gdb are not installed in the container (`valgrind --version` and `gdb --version` both not found), so crash/valgrind/debugger validation could not proceed. 
+
+Code analysis confirms the TOCTOU race: append_stream_segment performs an initial duplicate check under the metadata PG lock, then releases the lock and writes shard files without holding any PG mutex (comment at coordinator.rs:3643-3649) via write_stream_segment_shards (coordinator.rs:3515-3615). After writing, it reacquires locks and repeats the duplicate check (coordinator.rs:3734-3738); on duplicate, it calls cleanup_stream_shards_locked (coordinator.rs:3618-3621), which invokes PgStore::delete_shard to unlink shard files and delete their SQLite records (pg_store.rs:663-700). Shard keys are derived solely from session_id + segment_index via stream_segment_key_hash (pg.rs:112-121, used at coordinator.rs:3672-3678), so concurrent uploads of the same session/segment share identical shard keys. Thus, the losing request’s cleanup can delete shards already registered by the winner, leaving committed metadata pointing to missing shards and causing data loss/corruption.
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator.rs (L3515 to 3615)
+  Note: Shard files are written without holding PG locks, enabling concurrent duplicate writes to the same shard keys.
+```
+    fn write_stream_segment_shards(
+        &self,
+        shard_pg_id: u32,
+        segment_okh: &[u8; 16],
+        segment_vid: GenerationId,
+        data: &[u8],
+    ) -> Result<Vec<WrittenShard>, ServerError> {
+        let k = self.ec_config.data_shards as usize;
+        let m = self.ec_config.parity_shards as usize;
+        let remainder = data.len() % k;
+        let mut padded = Vec::new();
+        let shard_source: &[u8] = if remainder == 0 {
+            data
+        } else {
+            padded.reserve_exact(data.len() + (k - remainder));
+            padded.extend_from_slice(data);
+            padded.resize(data.len() + (k - remainder), 0);
+            &padded
+        };
+
+        let shard_size = shard_source.len() / k;
+        let data_shards: Vec<&[u8]> = (0..k)
+            .map(|i| &shard_source[i * shard_size..(i + 1) * shard_size])
+            .collect();
+        let mut written_shards: Vec<WrittenShard> = Vec::with_capacity(k + m);
+        let write_result: Result<(), ServerError> = if shard_size == 0 {
+            let mut parity_bufs: Vec<Vec<u8>> = (0..m).map(|_| Vec::new()).collect();
+            let mut parity_refs: Vec<&mut [u8]> = parity_bufs
+                .iter_mut()
+                .map(std::vec::Vec::as_mut_slice)
+                .collect();
+            self.ec_codec.encode(&data_shards, &mut parity_refs)?;
+            (|| {
+                for (i, shard_data) in data_shards.iter().enumerate() {
+                    let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
+                    let ack =
+                        self.storage_node
+                            .write_shard_file(shard_pg_id, &shard_key, shard_data)?;
+                    written_shards.push(WrittenShard {
+                        key: shard_key,
+                        ack,
+                    });
+                }
+                for (parity_index, shard_data) in parity_bufs.iter().enumerate() {
+                    let shard_key =
+                        ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8);
+                    let ack =
+                        self.storage_node
+                            .write_shard_file(shard_pg_id, &shard_key, shard_data)?;
+                    written_shards.push(WrittenShard {
+                        key: shard_key,
+                        ack,
+                    });
+                }
+                Ok(())
+            })()
+        } else {
+            let parity_len =
+                m.checked_mul(shard_size)
+                    .ok_or_else(|| ServerError::InternalError {
+                        reason: "parity scratch length overflow".to_string(),
+                    })?;
+            let mut scratch = self.encode_scratch_pool.checkout();
+            {
+                let parity = scratch.as_mut_slice(parity_len);
+                let mut parity_refs: Vec<&mut [u8]> = parity.chunks_exact_mut(shard_size).collect();
+                self.ec_codec.encode(&data_shards, &mut parity_refs)?;
+            }
+            let parity = scratch.as_slice(parity_len);
+            (|| {
+                for (i, shard_data) in data_shards.iter().enumerate() {
+                    let shard_key = ShardKey::new(segment_okh, segment_vid.get(), i as u8);
+                    let ack =
+                        self.storage_node
+                            .write_shard_file(shard_pg_id, &shard_key, shard_data)?;
+                    written_shards.push(WrittenShard {
+                        key: shard_key,
+                        ack,
+                    });
+                }
+                for (parity_index, shard_data) in parity.chunks_exact(shard_size).enumerate() {
+                    let shard_key =
+                        ShardKey::new(segment_okh, segment_vid.get(), (k + parity_index) as u8);
+                    let ack =
+                        self.storage_node
+                            .write_shard_file(shard_pg_id, &shard_key, shard_data)?;
+                    written_shards.push(WrittenShard {
+                        key: shard_key,
+                        ack,
+                    });
+                }
+                Ok(())
+            })()
+        };
+
+        if let Err(err) = write_result {
+            self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
+            return Err(err);
+        }
+
+        Ok(written_shards)
+```
+
+/workspace/argmin/crates/server-core/src/coordinator.rs (L3692 to 3738)
+  Note: Duplicate check happens before and after writing; on a duplicate error, cleanup deletes shards by key, which can remove shards committed by another concurrent request.
+```
+        {
+            let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
+            let session = meta_guard.get_stream_upload(session_id)?;
+            Self::validate_stream_session_binding(&session, bucket, key)?;
+            Self::emit_stream_segment_layout(
+                &session.target,
+                bucket,
+                key,
+                session_id,
+                segment_index,
+                data.len(),
+            );
+            Self::reject_duplicate_stream_segment_index(&meta_guard, session_id, segment_index)?;
+        }
+
+        let written_shards =
+            self.write_stream_segment_shards(shard_pg_id, &segment_okh, segment_vid, data)?;
+
+        let (meta_guard, shard_guard_opt) =
+            match self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id) {
+                Ok(guards) => guards,
+                Err(err) => {
+                    self.best_effort_delete_stream_shards(shard_pg_id, &written_shards);
+                    return Err(ServerError::Store(err));
+                }
+            };
+        let shard_guard: &storage::PgStore = match shard_guard_opt.as_ref() {
+            Some(pg) => pg,
+            None => &meta_guard,
+        };
+
+        let session = match meta_guard.get_stream_upload(session_id) {
+            Ok(session) => session,
+            Err(err) => {
+                Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+                return Err(ServerError::Metadata(err));
+            }
+        };
+        if let Err(err) = Self::validate_stream_session_binding(&session, bucket, key) {
+            Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+            return Err(err);
+        }
+        if let Err(err) =
+            Self::reject_duplicate_stream_segment_index(&meta_guard, session_id, segment_index)
+        {
+            Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+            return Err(err);
+```
+
+/workspace/argmin/crates/storage/src/pg_store.rs (L663 to 700)
+  Note: delete_shard removes shard files and metadata entries, so cleanup after a duplicate can delete already-registered shards.
+```
+    fn delete_shard(&self, key: &ShardKey) -> Result<(), StoreError> {
+        // Mark as deleting in SQLite.
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE shards SET status = ?1 WHERE shard_key = ?2",
+                params![ShardStatus::Deleting as u8, key.as_bytes().as_slice()],
+            )
+            .map_err(|e| StoreError::Db {
+                context: "mark shard deleting",
+                source: e,
+            })?;
+
+        // Unlink the file (ignore ENOENT for idempotency).
+        let shard_path = self.shard_path(key);
+        match fs::remove_file(&shard_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(StoreError::Io {
+                    context: "unlink shard file",
+                    source: e,
+                });
+            }
+        }
+
+        // Remove the SQLite record.
+        if updated > 0 {
+            self.conn
+                .execute(
+                    "DELETE FROM shards WHERE shard_key = ?1",
+                    params![key.as_bytes().as_slice()],
+                )
+                .map_err(|e| StoreError::Db {
+                    context: "delete shard record",
+                    source: e,
+                })?;
+        }
+```
+
+Proposed patch:
+diff --git a/crates/server-core/src/coordinator.rs b/crates/server-core/src/coordinator.rs
+index a07508e1c96a63e619527d3e4380b977a7c8d432..9e4da60633327702e95709aa24691cdcc2537819 100644
+--- a/crates/server-core/src/coordinator.rs
++++ b/crates/server-core/src/coordinator.rs
+@@ -3704,51 +3704,54 @@ impl Coordinator {
+                 }
+             };
+         let shard_guard: &storage::PgStore = match shard_guard_opt.as_ref() {
+             Some(pg) => pg,
+             None => &meta_guard,
+         };
+         let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
+             .iter()
+             .map(|written| (&written.key, written.ack))
+             .collect();
+ 
+         let session = match meta_guard.get_stream_upload(session_id) {
+             Ok(session) => session,
+             Err(err) => {
+                 Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+                 return Err(ServerError::Metadata(err));
+             }
+         };
+         if let Err(err) = Self::validate_stream_session_binding(&session, bucket, key) {
+             Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+             return Err(err);
+         }
+         if let Err(err) =
+             Self::reject_duplicate_stream_segment_index(&meta_guard, session_id, segment_index)
+         {
+-            Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
++            // Another concurrent append for the same session/segment index may
++            // have already committed these shard keys. Do not delete by key on
++            // duplicate here, or we can remove committed shards from the
++            // winning request.
+             return Err(err);
+         }
+ 
+         if shard_guard_opt.is_none() {
+             if let Err(err) = meta_guard
+                 .register_written_shards_and_append_stream_segment(&shard_batch, &segment_record)
+             {
+                 Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+                 return Err(ServerError::Metadata(err));
+             }
+             return Ok(());
+         }
+ 
+         if let Err(err) = shard_guard.register_written_shards_batch(&shard_batch) {
+             Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+             return Err(ServerError::Store(err));
+         }
+         if let Err(err) = meta_guard.append_stream_segment(&segment_record) {
+             Self::cleanup_stream_shards_locked(shard_guard, &written_shards);
+             return Err(ServerError::Metadata(err));
+         }
+ 
+         Ok(())
+     }
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Although the race is real and can corrupt data, it is only reachable by authenticated users acting within their own upload session. An attacker who can write the object can already overwrite or delete it, and no authorization boundary is crossed. This makes the issue primarily a reliability defect rather than a security vulnerability.
+## Likelihood
+low - Exploitation requires authenticated access plus a timing race between concurrent duplicate segment uploads, which is feasible but not typical.
+## Impact
+low - The race can corrupt or make unreadable the object being uploaded, but only within the attacker’s own authorized session/object; there is no demonstrated cross-tenant impact.
+## Assumptions
+- No deployment manifests or ingress configuration were present; exposure is inferred from README/config defaults.
+- An attacker can obtain valid S3 access keys to initiate a streaming PutObject/UploadPart session.
+- Session IDs are not guessable; exploitation is limited to the attacker’s own session or credentials.
+- Valid S3 credentials with permission to write to the target bucket/key
+- Ability to issue concurrent append requests using the same session_id and segment_index
+## Path
+HTTP PutObject -> append_stream_segment (write shards) -> duplicate check + cleanup -> delete_shard -> missing shards/corruption
+## Path evidence
+- `README.md:3-7` - Describes argmin2 as an S3-compatible object store with SigV4 auth (service mapping).
+- `crates/argmin-s3/src/config.rs:22-47` - Configuration uses access key/secret env vars and defaults to 127.0.0.1:9000 (exposure/identity).
+- `crates/server-http/src/http/mod.rs:780-816` - PutObject handling creates a stream session and calls append_stream_segment for request body chunks (remote entrypoint).
+- `crates/server-core/src/coordinator.rs:3643-3708` - append_stream_segment writes shard files without PG locks after an initial duplicate check.
+- `crates/server-core/src/coordinator.rs:3734-3738` - A second duplicate check triggers cleanup_stream_shards_locked on error.
+- `crates/server-core/src/coordinator.rs:3618-3621` - cleanup_stream_shards_locked deletes shard entries for written shards.
+- `crates/storage/src/pg_store.rs:663-701` - delete_shard unlinks shard files and removes SQLite records.
+- `crates/server-core/src/pg.rs:112-121` - stream_segment_key_hash derives shard keys from session_id and segment_index, so duplicates share identical keys.
+## Narrative
+The S3 HTTP handler streams PutObject data into append_stream_segment, which explicitly writes shard files without holding PG locks and performs a duplicate segment check before and after writing. If a duplicate is detected after the write, cleanup_stream_shards_locked calls PgStore::delete_shard to unlink files and delete SQLite records. Because shard keys are derived solely from session_id and segment_index, concurrent duplicate uploads for the same session/segment can cause the losing request to delete shards already committed by the winning request, resulting in corrupted or unreadable objects. This is reachable by an authenticated client but affects only objects that the same credentials can already write, so it is primarily a reliability/integrity issue rather than a cross-tenant security break.
+## Controls
+- SigV4 authentication required for S3 requests (documented in README).
+- validate_stream_session_binding verifies session/bucket/key binding before writes.
+- Duplicate segment index checks before and after shard write.
+## Blindspots
+- No deployment manifests to confirm actual exposure (public vs localhost).
+- No executable PoC due to missing ISA-L dependency in the environment.
+- Session ID generation/entropy was not reviewed for guessability.
+
+## Review note
+Current status: fixed in `f87869e` (`server-core: isolate staged stream segment shards`).
+
+The remediation assigns each staged stream segment append attempt a unique per-session `segment_vid` instead of reusing a shared sentinel generation for all writes to the same `(session_id, segment_index)`. That unique `segment_vid` is now allocated while the metadata PG is locked and is threaded through staged segment records, shard PG placement, and physical shard keys. As a result, if a concurrent duplicate append loses the second duplicate check, cleanup only deletes that losing attempt's shard set and can no longer remove the winner's committed shards.
+
+Regression coverage was added for both the direct invariant and the end-to-end race:
+- loser cleanup only deletes shards matching its own `segment_vid`
+- concurrent duplicate segment appends preserve the winning payload on both same-PG and cross-PG paths
