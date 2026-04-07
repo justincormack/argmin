@@ -70,15 +70,50 @@ fn current_trace_context() -> observability::TraceContext {
 /// or `Err` if the value is present but not a valid version ID.
 /// Parse a version-id string into a typed `VersionId`.
 fn parse_version_id_str(v: &str) -> Result<VersionId, ServerError> {
+    parse_version_id_str_with_label(v, "versionId")
+}
+
+fn parse_version_id_str_with_label(v: &str, label: &str) -> Result<VersionId, ServerError> {
     if v == "null" {
         Ok(VersionId::Null)
     } else {
         v.parse::<u64>()
             .map(VersionId::from_u64)
             .map_err(|_| ServerError::InvalidArgument {
-                reason: format!("invalid versionId: {v}"),
+                reason: format!("invalid {label}: {v}"),
             })
     }
+}
+
+fn parse_optional_version_id<S: AsRef<str>>(
+    raw: Option<S>,
+    label: &str,
+) -> Result<Option<VersionId>, ServerError> {
+    raw.map(|value| parse_version_id_str_with_label(value.as_ref(), label))
+        .transpose()
+}
+
+fn parse_optional_u32<S: AsRef<str>>(
+    raw: Option<S>,
+    invalid_reason: &str,
+) -> Result<Option<u32>, ServerError> {
+    raw.map(|value| {
+        value
+            .as_ref()
+            .parse::<u32>()
+            .map_err(|_| ServerError::InvalidArgument {
+                reason: invalid_reason.to_string(),
+            })
+    })
+    .transpose()
+}
+
+fn parse_u32_or_default<S: AsRef<str>>(
+    raw: Option<S>,
+    default: u32,
+    invalid_reason: &str,
+) -> Result<u32, ServerError> {
+    Ok(parse_optional_u32(raw, invalid_reason)?.unwrap_or(default))
 }
 
 fn parse_request_metadata<'a, I>(headers: I) -> Result<(MetadataBlob, SystemMetadata), ServerError>
@@ -93,10 +128,7 @@ where
 }
 
 fn parse_version_id(req: &S3Request) -> Result<Option<VersionId>, ServerError> {
-    match req.query_param_lossy("versionId") {
-        None => Ok(None),
-        Some(v) => parse_version_id_str(&v).map(Some),
-    }
+    parse_optional_version_id(req.query_param_lossy("versionId"), "versionId")
 }
 
 fn ensure_lifecycle_rule_ids(
@@ -972,15 +1004,8 @@ impl HttpFrontend {
                     // CopyObject path
                     let (src_bucket, src_key, src_version_id_str) =
                         request::parse_copy_source(copy_source)?;
-                    let src_version_id = match src_version_id_str {
-                        None => None,
-                        Some(v) if v == "null" => Some(VersionId::Null),
-                        Some(v) => Some(VersionId::from_u64(v.parse::<u64>().map_err(|_| {
-                            ServerError::InvalidArgument {
-                                reason: format!("invalid versionId in copy source: {v}"),
-                            }
-                        })?)),
-                    };
+                    let src_version_id =
+                        parse_optional_version_id(src_version_id_str, "versionId in copy source")?;
                     let requester = Self::requester_from_auth(auth);
                     let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                     let dst_sse_customer = parse_sse_customer_request(req)?;
@@ -1445,20 +1470,15 @@ impl HttpFrontend {
                     }
                 }
                 let want_parts = requested.contains(&"ObjectParts");
-                let max_parts: u32 = match req.header("x-amz-max-parts") {
-                    None => 1000,
-                    Some(v) => v.parse().map_err(|_| ServerError::InvalidArgument {
-                        reason: "invalid x-amz-max-parts".to_string(),
-                    })?,
-                };
-                let part_number_marker: Option<u32> = req
-                    .header("x-amz-part-number-marker")
-                    .map(|v| {
-                        v.parse().map_err(|_| ServerError::InvalidArgument {
-                            reason: "x-amz-part-number-marker must be an integer".to_string(),
-                        })
-                    })
-                    .transpose()?;
+                let max_parts = parse_u32_or_default(
+                    req.header("x-amz-max-parts"),
+                    1000,
+                    "invalid x-amz-max-parts",
+                )?;
+                let part_number_marker = parse_optional_u32(
+                    req.header("x-amz-part-number-marker"),
+                    "x-amz-part-number-marker must be an integer",
+                )?;
 
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
@@ -2285,15 +2305,8 @@ impl HttpFrontend {
 
                 let (src_bucket, src_key, src_version_id_str) =
                     request::parse_copy_source(copy_source)?;
-                let src_version_id = match src_version_id_str {
-                    None => None,
-                    Some(v) if v == "null" => Some(VersionId::Null),
-                    Some(v) => Some(VersionId::from_u64(v.parse::<u64>().map_err(|_| {
-                        ServerError::InvalidArgument {
-                            reason: format!("invalid versionId in copy source: {v}"),
-                        }
-                    })?)),
-                };
+                let src_version_id =
+                    parse_optional_version_id(src_version_id_str, "versionId in copy source")?;
                 let requester = Self::requester_from_auth(auth);
                 let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                 let sse_customer = parse_sse_customer_request(req)?;
@@ -2387,12 +2400,11 @@ impl HttpFrontend {
                 let prefix = req.query_param_lossy("prefix");
                 let key_marker = req.query_param_lossy("key-marker");
                 let upload_id_marker = req.query_param_lossy("upload-id-marker");
-                let max_uploads: u32 = match req.query_param_lossy("max-uploads") {
-                    None => 1000,
-                    Some(s) => s.parse().map_err(|_| ServerError::InvalidArgument {
-                        reason: "invalid max-uploads".to_string(),
-                    })?,
-                };
+                let max_uploads = parse_u32_or_default(
+                    req.query_param_lossy("max-uploads"),
+                    1000,
+                    "invalid max-uploads",
+                )?;
                 let requester = Self::requester_from_auth(auth);
                 let result = self.coordinator.list_multipart_uploads(
                     &crate::coordinator::ListMultipartUploadsRequest {
@@ -2419,20 +2431,15 @@ impl HttpFrontend {
                         reason: "missing uploadId query parameter".to_string(),
                     }
                 })?;
-                let part_number_marker: Option<u32> = req
-                    .query_param_lossy("part-number-marker")
-                    .map(|s| {
-                        s.parse().map_err(|_| ServerError::InvalidArgument {
-                            reason: "part-number-marker must be an integer".to_string(),
-                        })
-                    })
-                    .transpose()?;
-                let max_parts: u32 = match req.query_param_lossy("max-parts") {
-                    None => 1000,
-                    Some(s) => s.parse().map_err(|_| ServerError::InvalidArgument {
-                        reason: "invalid max-parts".to_string(),
-                    })?,
-                };
+                let part_number_marker = parse_optional_u32(
+                    req.query_param_lossy("part-number-marker"),
+                    "part-number-marker must be an integer",
+                )?;
+                let max_parts = parse_u32_or_default(
+                    req.query_param_lossy("max-parts"),
+                    1000,
+                    "invalid max-parts",
+                )?;
                 let requester = Self::requester_from_auth(auth);
                 let result =
                     self.coordinator
@@ -2463,19 +2470,11 @@ impl HttpFrontend {
             S3Operation::ListObjectVersions { bucket } => {
                 let prefix = req.query_param_lossy("prefix");
                 let key_marker = req.query_param_lossy("key-marker");
-                let version_id_marker = match req.query_param_lossy("version-id-marker") {
-                    None => None,
-                    Some(v) if v == "null" => Some(VersionId::Null),
-                    Some(v) => Some(VersionId::from_u64(v.parse::<u64>().map_err(|_| {
-                        ServerError::InvalidArgument {
-                            reason: format!("invalid version-id-marker: {v}"),
-                        }
-                    })?)),
-                };
-                let max_keys: u32 = req
-                    .query_param_lossy("max-keys")
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(1000);
+                let version_id_marker = parse_optional_version_id(
+                    req.query_param_lossy("version-id-marker"),
+                    "version-id-marker",
+                )?;
+                let max_keys = parse_max_keys(req.query_param_lossy("max-keys"))?;
                 let requester = Self::requester_from_auth(auth);
 
                 let result = self.coordinator.list_object_versions(
@@ -3953,15 +3952,7 @@ pub fn s3_response_to_hyper(
 }
 
 fn parse_max_keys<S: AsRef<str>>(raw: Option<S>) -> Result<u32, ServerError> {
-    match raw {
-        None => Ok(1000),
-        Some(s) => s
-            .as_ref()
-            .parse::<u32>()
-            .map_err(|_| ServerError::InvalidArgument {
-                reason: "invalid max-keys".to_string(),
-            }),
-    }
+    parse_u32_or_default(raw, 1000, "invalid max-keys")
 }
 
 /// Apply response-* query parameter overrides to a GET response.
@@ -7982,6 +7973,40 @@ mod tests {
 
         let req = make_req("uploads&max-uploads=abc");
         let op = S3Operation::ListMultipartUploads {
+            bucket: "mybucket".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn list_object_versions_invalid_max_keys() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = make_req("versions&max-keys=abc");
+        let op = S3Operation::ListObjectVersions {
+            bucket: "mybucket".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn list_object_versions_invalid_version_id_marker() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = make_req("versions&version-id-marker=abc");
+        let op = S3Operation::ListObjectVersions {
             bucket: "mybucket".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
