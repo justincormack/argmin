@@ -1,0 +1,240 @@
+Streaming PUTs without content hash bypass payload integrity
+Link: https://chatgpt.com/codex/security/findings/eb078011155c8191a02ba79ae00cc909?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: low)
+Status: new
+Criticality notes: This bypasses authorization
+
+# Metadata
+Repo: justincormack/argmin
+Commit: f6004f1
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 22:43:46
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced: streaming routing now accepts PUT/UploadPart without x-amz-content-sha256 and authenticates using an empty-body hash, so the payload is no longer covered by SigV4 for such requests.
+The commit changes routing so all PUT/UploadPart requests (except copy-source) use the streaming path, regardless of whether x-amz-content-sha256 is present. For requests missing this header, parse_chunked_mode returns ChunkedMode::None and the streaming handler builds an S3Request from headers only. Authentication then uses a SHA-256 of the empty body, and no later payload hash check occurs because no hash was claimed. This allows a signed request to be accepted even though the signature is not bound to the actual payload, enabling body tampering or unsigned uploads when the content hash header is omitted.
+
+# Validation
+## Rubric
+- [x] Confirm PUT/UploadPart requests without x-amz-content-sha256 are routed to streaming path.
+- [x] Verify streaming path constructs S3Request with empty body and body_hash uses empty hash when header missing.
+- [x] Verify authentication uses body_hash from S3Request and streaming prepare disables payload hash verification.
+- [x] Verify streaming loop only checks payload hash when a claimed x-amz-content-sha256 is present.
+- [ ] Demonstrate runtime PoC acceptance of mismatched body (blocked by missing libisal build dependency).
+## Report
+Attempted dynamic validation: `cargo build -p argmin-s3` failed because `ec-sys` requires libisal (build.rs panic: missing libisal.pc), so no runnable binary; `valgrind` and `gdb` are not installed in the environment. Code review shows: (1) all PUT/UploadPart requests without x-amz-copy-source are routed into the streaming path via `is_streaming_write` regardless of x-amz-content-sha256, and missing header yields `ChunkedMode::None` (crates/server-http/src/http/serve.rs:287-402). (2) Streaming handlers build `S3Request` from headers only (`from_hyper_headers`), so body is empty (crates/server-http/src/http/serve.rs:486-489). `body_hash` falls back to sha256 of `req.body` when x-amz-content-sha256 is missing (crates/server-http/src/http/request.rs:75-104). Authentication computes body_hash from header or sha256(body) when header missing (crates/auth/src/request.rs:114-119); thus in streaming path it uses the empty-body hash. (3) Streaming prepare uses `authenticate_with_payload_check(req, false)` (crates/server-http/src/http/mod.rs:1750-1757), so no payload hash recheck. The streaming loop only verifies payload hash when a fixed `x-amz-content-sha256` is supplied; `claimed_payload_sha256_from_parts` returns None when the header is absent and the mismatch check is skipped (crates/server-http/src/http/serve.rs:635-643, 1165-1176). Therefore a client can sign an empty payload and omit x-amz-content-sha256, yet send a non-empty body that is accepted, matching the reported vulnerability.
+
+# Evidence
+/workspace/argmin/crates/server-http/src/http/request.rs (L75 to 104)
+  Note: from_hyper_headers uses an empty body and body_hash falls back to hashing req.body when x-amz-content-sha256 is missing, yielding the hash of an empty payload.
+```
+    /// Parse hyper request parts into an `S3Request` with an empty body.
+    ///
+    /// Used by the streaming write path where the body is consumed frame-by-frame
+    /// rather than collected upfront. Auth works because the `x-amz-content-sha256`
+    /// header provides the body hash (typically `UNSIGNED-PAYLOAD`).
+    pub fn from_hyper_headers(parts: &http::request::Parts) -> Result<Self, ServerError> {
+        Self::from_hyper(parts, bytes::Bytes::new())
+    }
+
+    /// Get a header value by lowercase name.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Get the body hash for `SigV4` canonical request.
+    ///
+    /// If the client sends `x-amz-content-sha256: UNSIGNED-PAYLOAD`, the literal
+    /// string "UNSIGNED-PAYLOAD" is used in the canonical request (not the actual
+    /// body hash). Otherwise, use the provided hash or compute from body.
+    #[must_use]
+    pub fn body_hash(&self) -> String {
+        match self.header("x-amz-content-sha256") {
+            Some("UNSIGNED-PAYLOAD") => "UNSIGNED-PAYLOAD".to_string(),
+            Some(hash) => hash.to_string(),
+            None => auth::canonical::sha256_hex(&self.body),
+        }
+```
+
+/workspace/argmin/crates/server-http/src/http/serve.rs (L287 to 317)
+  Note: All PUT/UploadPart requests that match is_streaming_write are routed to streaming handling without collecting the body first.
+```
+    // Check if this request should use the streaming write path.
+    if let Some(op) = is_streaming_write(&parts) {
+        let chunked = match parse_chunked_mode(&parts) {
+            Ok(mode) => mode,
+            Err(err) => return Ok(s3_response_to_hyper(S3Response::error(&err, ""))),
+        };
+        let resp = match op {
+            StreamingWriteOp::PutObject { bucket, key } => {
+                handle_streaming_put(Arc::clone(&state), parts, body, bucket, key, chunked).await
+            }
+            StreamingWriteOp::UploadPart {
+                bucket,
+                key,
+                upload_id,
+                part_number,
+            } => {
+                handle_streaming_part(
+                    Arc::clone(&state),
+                    parts,
+                    body,
+                    bucket,
+                    key,
+                    upload_id,
+                    part_number,
+                    chunked,
+                )
+                .await
+            }
+        };
+        return Ok(s3_response_to_hyper(resp));
+    }
+```
+
+/workspace/argmin/crates/server-http/src/http/serve.rs (L352 to 402)
+  Note: is_streaming_write no longer checks x-amz-content-sha256; parse_chunked_mode returns ChunkedMode::None when the header is missing, so headerless PUTs still use streaming.
+```
+/// Check if a PUT request should use the streaming write path.
+///
+/// Returns a `StreamingWriteOp` target for `PutObject` and `UploadPart`
+/// requests that are not `CopyObject` (no `x-amz-copy-source` header).
+///
+fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> {
+    if parts.method != http::Method::PUT {
+        return None;
+    }
+
+    // Check headers via hyper types (not yet parsed into S3Request).
+    let has_copy_source = parts.headers.contains_key("x-amz-copy-source");
+    if has_copy_source {
+        return None;
+    }
+
+    let path = parts.uri.path();
+    let query = parts.uri.query().unwrap_or("");
+    let method = parts.method.as_str();
+
+    let op = route(method, path, query).ok()?;
+    match op {
+        S3Operation::PutObject { bucket, key } => Some(StreamingWriteOp::PutObject { bucket, key }),
+        S3Operation::UploadPart { bucket, key } => {
+            let upload_id = extract_query_param(query, "uploadId")?;
+            let part_number: u32 =
+                extract_query_param(query, "partNumber").and_then(|s| s.parse().ok())?;
+            Some(StreamingWriteOp::UploadPart {
+                bucket,
+                key,
+                upload_id,
+                part_number,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Parse aws-chunked mode from request headers.
+///
+/// Returns `ChunkedMode::None` for plain PUT bodies (including missing
+/// `x-amz-content-sha256`, `UNSIGNED-PAYLOAD`, and fixed SHA256 hashes).
+fn parse_chunked_mode(parts: &http::request::Parts) -> Result<ChunkedMode, ServerError> {
+    let content_sha256 = parts
+        .headers
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok());
+
+    let Some(content_sha256) = content_sha256 else {
+        return Ok(ChunkedMode::None);
+    };
+```
+
+/workspace/argmin/crates/server-http/src/http/serve.rs (L486 to 489)
+  Note: Streaming handler parses only headers via from_hyper_headers, so authentication sees an empty body.
+```
+    // 1. Parse headers (no body) and prepare streaming session.
+    let s3req = match S3Request::from_hyper_headers(&parts) {
+        Ok(req) => req,
+        Err(err) => return S3Response::error(&err, ""),
+```
+
+Proposed patch:
+diff --git a/crates/server-http/src/http/serve.rs b/crates/server-http/src/http/serve.rs
+index 0b4447e58a93448f84c619526f1952ba2e297154..84ebd6d658f0be70c22eefe39ae177eca4bac02e 100644
+--- a/crates/server-http/src/http/serve.rs
++++ b/crates/server-http/src/http/serve.rs
+@@ -537,50 +537,57 @@ async fn handle(
+             &ServerError::InvalidRequest {
+                 reason: "internal error".to_string(),
+             },
+             "",
+         )
+     });
+ 
+     Ok(s3_response_to_hyper(
+         resp,
+         Some(req_permit),
+         state.config.stream_read_chunk_size,
+         response_trace,
+     ))
+ }
+ 
+ /// Check if a PUT request should use the streaming write path.
+ ///
+ /// Returns a `StreamingWriteOp` target for `PutObject` and `UploadPart`
+ /// requests that are not `CopyObject` (no `x-amz-copy-source` header).
+ ///
+ fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> {
+     if parts.method != http::Method::PUT {
+         return None;
+     }
+ 
++    // Streaming auth is header-driven, so keep requests that omit
++    // x-amz-content-sha256 on the buffered path where the canonical payload
++    // hash is computed from the actual body bytes.
++    if !parts.headers.contains_key("x-amz-content-sha256") {
++        return None;
++    }
++
+     // Check headers via hyper types (not yet parsed into S3Request).
+     let has_copy_source = parts.headers.contains_key("x-amz-copy-source");
+     if has_copy_source {
+         return None;
+     }
+ 
+     let path = parts.uri.path();
+     let query = parts.uri.query().unwrap_or("");
+     let method = parts.method.as_str();
+ 
+     let op = route(method, path, query).ok()?;
+     match op {
+         S3Operation::PutObject { bucket, key } => Some(StreamingWriteOp::PutObject { bucket, key }),
+         S3Operation::UploadPart { bucket, key } => {
+             let upload_id = extract_query_param(query, "uploadId")?;
+             let part_number: u32 =
+                 extract_query_param(query, "partNumber").and_then(|s| s.parse().ok())?;
+             Some(StreamingWriteOp::UploadPart {
+                 bucket,
+                 key,
+                 upload_id,
+                 part_number,
+             })
+         }
+         _ => None,
+
+# Note
+The report was directionally correct that commit `f6004f1` introduced a real security-relevant conformance bug, but the exact AWS behavior is different from the writeup above.
+
+AWS rejects SigV4 header-authenticated `PutObject` and `UploadPart` requests that omit `x-amz-content-sha256` with `400 InvalidRequest` and the message `Missing required header for this request: x-amz-content-sha256`. The real issue in our server was that the new streaming path accepted those requests and returned success, because streaming auth operated on headers with an empty body and did not reject the missing required header.
+
+So the bug was not "AWS allows the request but our payload integrity check is bypassed"; the bug was "our server accepted a request shape that AWS rejects". That still mattered because it let clients perform signed object writes that should have been rejected outright under AWS S3 semantics.
+
+Fixed by commit `e596965` (`server-http: require x-amz-content-sha256 for sigv4 writes`). That fix:
+- rejects SigV4 header-authenticated streaming `PutObject`/`UploadPart` requests missing `x-amz-content-sha256`
+- preserves the existing non-SigV4/anonymous behavior
+- adds native `s3-tests` coverage for both `PutObject` and `UploadPart`
