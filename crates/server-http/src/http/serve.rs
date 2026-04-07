@@ -17,7 +17,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
-use super::request::{S3Request, TransportSecurity, MAX_BUFFERED_CONTROL_BODY_SIZE};
+use super::request::{
+    parse_upload_part_query, S3Request, TransportSecurity, MAX_BUFFERED_CONTROL_BODY_SIZE,
+};
 use super::response::S3Response;
 use super::router::{route, S3Operation};
 use super::s3_response_to_hyper;
@@ -495,7 +497,18 @@ async fn handle(
     let (parts, body) = req.into_parts();
 
     // Check if this request should use the streaming write path.
-    if let Some(op) = is_streaming_write(&parts) {
+    let streaming_op = match is_streaming_write(&parts) {
+        Ok(op) => op,
+        Err(err) => {
+            return Ok(s3_response_to_hyper(
+                S3Response::error(&err, ""),
+                Some(req_permit),
+                state.config.stream_read_chunk_size,
+                response_trace,
+            ))
+        }
+    };
+    if let Some(op) = streaming_op {
         let s3req = match S3Request::from_hyper_headers(parts, transport_security) {
             Ok(req) => req,
             Err(err) => {
@@ -700,36 +713,40 @@ async fn append_actual_cors_headers(
 /// Returns a `StreamingWriteOp` target for `PutObject` and `UploadPart`
 /// requests that are not `CopyObject` (no `x-amz-copy-source` header).
 ///
-fn is_streaming_write(parts: &http::request::Parts) -> Option<StreamingWriteOp> {
+fn is_streaming_write(
+    parts: &http::request::Parts,
+) -> Result<Option<StreamingWriteOp>, ServerError> {
     if parts.method != http::Method::PUT {
-        return None;
+        return Ok(None);
     }
 
     // Check headers via hyper types (not yet parsed into S3Request).
     let has_copy_source = parts.headers.contains_key("x-amz-copy-source");
     if has_copy_source {
-        return None;
+        return Ok(None);
     }
 
     let path = parts.uri.path();
     let query = parts.uri.query().unwrap_or("");
     let method = parts.method.as_str();
 
-    let op = route(method, path, query).ok()?;
+    let Some(op) = route(method, path, query).ok() else {
+        return Ok(None);
+    };
     match op {
-        S3Operation::PutObject { bucket, key } => Some(StreamingWriteOp::PutObject { bucket, key }),
+        S3Operation::PutObject { bucket, key } => {
+            Ok(Some(StreamingWriteOp::PutObject { bucket, key }))
+        }
         S3Operation::UploadPart { bucket, key } => {
-            let upload_id = extract_query_param(query, "uploadId")?;
-            let part_number: u32 =
-                extract_query_param(query, "partNumber").and_then(|s| s.parse().ok())?;
-            Some(StreamingWriteOp::UploadPart {
+            let (upload_id, part_number) = parse_upload_part_query(query)?;
+            Ok(Some(StreamingWriteOp::UploadPart {
                 bucket,
                 key,
                 upload_id,
                 part_number,
-            })
+            }))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -1220,18 +1237,6 @@ async fn handle_streaming_post_object(
             internal_error_response()
         }
     }
-}
-
-/// Extract a query parameter value from a query string.
-fn extract_query_param(query: &str, name: &str) -> Option<String> {
-    for pair in query.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == name {
-                return Some(v.to_string());
-            }
-        }
-    }
-    None
 }
 
 /// Handle a streaming `PutObject`: read body frame-by-frame, feed chunks to
@@ -3019,7 +3024,7 @@ mod tests {
         let result = is_streaming_write(&parts);
         assert!(matches!(
             result,
-            Some(StreamingWriteOp::PutObject { ref bucket, ref key, .. })
+            Ok(Some(StreamingWriteOp::PutObject { ref bucket, ref key, .. }))
             if bucket == "mybucket" && key == "mykey"
         ));
     }
@@ -3031,7 +3036,7 @@ mod tests {
             "/mybucket/mykey",
             &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
         );
-        assert_eq!(is_streaming_write(&parts), None);
+        assert!(matches!(is_streaming_write(&parts), Ok(None)));
     }
 
     #[test]
@@ -3041,7 +3046,7 @@ mod tests {
             "/mybucket/mykey",
             &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
         );
-        assert_eq!(is_streaming_write(&parts), None);
+        assert!(matches!(is_streaming_write(&parts), Ok(None)));
     }
 
     #[test]
@@ -3054,7 +3059,7 @@ mod tests {
                 ("x-amz-copy-source", "/src-bucket/src-key"),
             ],
         );
-        assert_eq!(is_streaming_write(&parts), None);
+        assert!(matches!(is_streaming_write(&parts), Ok(None)));
     }
 
     #[test]
@@ -3070,7 +3075,7 @@ mod tests {
         let result = is_streaming_write(&parts);
         assert!(matches!(
             result,
-            Some(StreamingWriteOp::PutObject { ref bucket, ref key, .. })
+            Ok(Some(StreamingWriteOp::PutObject { ref bucket, ref key, .. }))
             if bucket == "mybucket" && key == "mykey"
         ));
     }
@@ -3081,7 +3086,7 @@ mod tests {
         let result = is_streaming_write(&parts);
         assert!(matches!(
             result,
-            Some(StreamingWriteOp::PutObject { ref bucket, ref key, .. })
+            Ok(Some(StreamingWriteOp::PutObject { ref bucket, ref key, .. }))
             if bucket == "mybucket" && key == "mykey"
         ));
     }
@@ -3203,7 +3208,7 @@ mod tests {
             "/mybucket?versioning",
             &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
         );
-        assert_eq!(is_streaming_write(&parts), None);
+        assert!(matches!(is_streaming_write(&parts), Ok(None)));
     }
 
     #[test]
@@ -3214,7 +3219,7 @@ mod tests {
             "/mybucket/mykey?retention",
             &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
         );
-        assert_eq!(is_streaming_write(&parts), None);
+        assert!(matches!(is_streaming_write(&parts), Ok(None)));
     }
 
     #[test]
@@ -3227,7 +3232,7 @@ mod tests {
         let result = is_streaming_write(&parts);
         assert!(matches!(
             result,
-            Some(StreamingWriteOp::PutObject { ref bucket, ref key, .. })
+            Ok(Some(StreamingWriteOp::PutObject { ref bucket, ref key, .. }))
             if bucket == "mybucket" && key == "path/to/deep/key.txt"
         ));
     }
@@ -3242,13 +3247,13 @@ mod tests {
         let result = is_streaming_write(&parts);
         assert!(matches!(
             result,
-            Some(StreamingWriteOp::UploadPart {
+            Ok(Some(StreamingWriteOp::UploadPart {
                 ref bucket,
                 ref key,
                 ref upload_id,
                 part_number: 3,
                 ..
-            }) if bucket == "mybucket" && key == "mykey" && upload_id == "abc123"
+            })) if bucket == "mybucket" && key == "mykey" && upload_id == "abc123"
         ));
     }
 
@@ -3265,33 +3270,55 @@ mod tests {
         let result = is_streaming_write(&parts);
         assert!(matches!(
             result,
-            Some(StreamingWriteOp::UploadPart {
+            Ok(Some(StreamingWriteOp::UploadPart {
                 ref bucket,
                 ref key,
                 ref upload_id,
                 part_number: 3,
-            }) if bucket == "mybucket" && key == "mykey" && upload_id == "abc123"
+            })) if bucket == "mybucket" && key == "mykey" && upload_id == "abc123"
         ));
     }
 
     #[test]
-    fn streaming_upload_part_missing_upload_id_falls_back() {
+    fn streaming_upload_part_missing_upload_id_rejected() {
         let parts = make_parts(
             "PUT",
             "/mybucket/mykey?partNumber=3",
             &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
         );
-        assert_eq!(is_streaming_write(&parts), None);
+        assert!(matches!(
+            is_streaming_write(&parts),
+            Err(ServerError::InvalidRequest { reason })
+                if reason == "missing uploadId query parameter"
+        ));
     }
 
     #[test]
-    fn streaming_upload_part_invalid_part_number_falls_back() {
+    fn streaming_upload_part_invalid_part_number_rejected() {
         let parts = make_parts(
             "PUT",
             "/mybucket/mykey?partNumber=abc&uploadId=abc123",
             &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
         );
-        assert_eq!(is_streaming_write(&parts), None);
+        assert!(matches!(
+            is_streaming_write(&parts),
+            Err(ServerError::InvalidArgument { reason })
+                if reason == "partNumber must be a positive integer"
+        ));
+    }
+
+    #[test]
+    fn streaming_upload_part_zero_part_number_rejected() {
+        let parts = make_parts(
+            "PUT",
+            "/mybucket/mykey?partNumber=0&uploadId=abc123",
+            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+        );
+        assert!(matches!(
+            is_streaming_write(&parts),
+            Err(ServerError::InvalidArgument { reason })
+                if reason == "partNumber must be >= 1"
+        ));
     }
 
     #[test]
@@ -3304,7 +3331,7 @@ mod tests {
                 ("x-amz-copy-source", "/src/key"),
             ],
         );
-        assert!(is_streaming_write(&parts).is_none());
+        assert!(matches!(is_streaming_write(&parts), Ok(None)));
     }
 
     #[test]

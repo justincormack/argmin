@@ -1176,15 +1176,7 @@ impl HttpFrontend {
                                     .to_string(),
                         });
                     }
-                    let part_number: u32 =
-                        pn_str.parse().map_err(|_| ServerError::InvalidArgument {
-                            reason: "partNumber must be a positive integer".into(),
-                        })?;
-                    if part_number == 0 {
-                        return Err(ServerError::InvalidArgument {
-                            reason: "partNumber must be >= 1".into(),
-                        });
-                    }
+                    let part_number = request::parse_part_number(pn_str.as_ref())?;
                     let _ = observability::event_in_context(
                         &trace,
                         TRACE_TARGET,
@@ -1357,15 +1349,7 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 let trace = current_trace_context();
                 if let Some(pn_str) = req.query_param_lossy("partNumber") {
-                    let part_number: u32 =
-                        pn_str.parse().map_err(|_| ServerError::InvalidArgument {
-                            reason: "partNumber must be a positive integer".into(),
-                        })?;
-                    if part_number == 0 {
-                        return Err(ServerError::InvalidArgument {
-                            reason: "partNumber must be >= 1".into(),
-                        });
-                    }
+                    let part_number = request::parse_part_number(pn_str.as_ref())?;
                     let _ = observability::event_in_context(
                         &trace,
                         TRACE_TARGET,
@@ -2288,20 +2272,8 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::UploadPart { bucket, key } => {
-                let upload_id = req.query_param_lossy("uploadId").ok_or_else(|| {
-                    ServerError::InvalidRequest {
-                        reason: "missing uploadId query parameter".to_string(),
-                    }
-                })?;
-                let part_number: u32 = req
-                    .query_param_lossy("partNumber")
-                    .ok_or_else(|| ServerError::InvalidRequest {
-                        reason: "missing partNumber query parameter".to_string(),
-                    })?
-                    .parse()
-                    .map_err(|_| ServerError::InvalidArgument {
-                        reason: "partNumber must be a positive integer".to_string(),
-                    })?;
+                let (upload_id, part_number) =
+                    request::parse_upload_part_query(req.query_string())?;
                 // Normal UploadPart requests are intercepted in serve.rs and
                 // streamed before they reach dispatch_routed(). Only copy-source
                 // variants should remain on this buffered path.

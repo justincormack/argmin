@@ -167,6 +167,11 @@ Deliver:
 - replace the high-risk cases with validated helpers
 - add regression tests for each bug class found
 
+Current progress:
+- shared `UploadPart` query parsing now validates `uploadId`/`partNumber` for
+  both streaming and buffered paths in `server-http`, removing a fallback path
+  where malformed streaming `UploadPart` queries could bypass early validation
+
 Success criteria:
 - remaining raw string manipulations are either:
   - obviously safe after prior validation, or

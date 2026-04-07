@@ -220,19 +220,7 @@ impl S3Request {
 
     #[must_use]
     pub fn query_param_lossy(&self, name: &str) -> Option<Cow<'_, str>> {
-        self.query_string()
-            .split('&')
-            .filter(|s| !s.is_empty())
-            .find_map(|pair| {
-                let mut parts = pair.splitn(2, '=');
-                let key = parts.next()?;
-                let val = parts.next().unwrap_or("");
-                if key == name {
-                    Some(percent_decode_lossy(val))
-                } else {
-                    None
-                }
-            })
+        query_param_lossy(self.query_string(), name)
     }
 
     #[cfg(test)]
@@ -277,6 +265,52 @@ impl S3Request {
             transport_security,
         }
     }
+}
+
+#[must_use]
+pub(crate) fn query_param_lossy<'a>(query_string: &'a str, name: &str) -> Option<Cow<'a, str>> {
+    query_string
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .find_map(|pair| {
+            let mut parts = pair.splitn(2, '=');
+            let key = parts.next()?;
+            let val = parts.next().unwrap_or("");
+            if key == name {
+                Some(percent_decode_lossy(val))
+            } else {
+                None
+            }
+        })
+}
+
+pub(crate) fn parse_part_number(value: &str) -> Result<u32, ServerError> {
+    let part_number = value.parse().map_err(|_| ServerError::InvalidArgument {
+        reason: "partNumber must be a positive integer".to_string(),
+    })?;
+    if part_number == 0 {
+        return Err(ServerError::InvalidArgument {
+            reason: "partNumber must be >= 1".to_string(),
+        });
+    }
+    Ok(part_number)
+}
+
+pub(crate) fn parse_upload_part_query(query_string: &str) -> Result<(String, u32), ServerError> {
+    let upload_id =
+        query_param_lossy(query_string, "uploadId").ok_or_else(|| ServerError::InvalidRequest {
+            reason: "missing uploadId query parameter".to_string(),
+        })?;
+    let part_number = query_param_lossy(query_string, "partNumber").ok_or_else(|| {
+        ServerError::InvalidRequest {
+            reason: "missing partNumber query parameter".to_string(),
+        }
+    })?;
+
+    Ok((
+        upload_id.into_owned(),
+        parse_part_number(part_number.as_ref())?,
+    ))
 }
 
 /// Percent-decode a string (RFC 3986) into raw bytes. Does NOT treat + as space.
@@ -417,6 +451,50 @@ mod tests {
         assert_eq!(req.query_param("prefix"), Some("photos/".to_string()));
         assert_eq!(req.query_param("max-keys"), Some("10".to_string()));
         assert_eq!(req.query_param("missing"), None);
+    }
+
+    #[test]
+    fn query_param_lossy_raw_lookup() {
+        assert_eq!(
+            query_param_lossy("list-type=2&prefix=photos%2F&max-keys=10", "prefix").as_deref(),
+            Some("photos/")
+        );
+        assert_eq!(
+            query_param_lossy("flag&other=1", "flag").as_deref(),
+            Some("")
+        );
+        assert_eq!(query_param_lossy("a=1", "missing").as_deref(), None);
+    }
+
+    #[test]
+    fn parse_part_number_rejects_zero_and_non_numeric() {
+        assert!(matches!(
+            parse_part_number("0"),
+            Err(ServerError::InvalidArgument { reason }) if reason == "partNumber must be >= 1"
+        ));
+        assert!(matches!(
+            parse_part_number("abc"),
+            Err(ServerError::InvalidArgument { reason })
+                if reason == "partNumber must be a positive integer"
+        ));
+    }
+
+    #[test]
+    fn parse_upload_part_query_validates_required_fields() {
+        assert_eq!(
+            parse_upload_part_query("partNumber=3&uploadId=abc123").unwrap(),
+            ("abc123".to_string(), 3)
+        );
+        assert!(matches!(
+            parse_upload_part_query("uploadId=abc123"),
+            Err(ServerError::InvalidRequest { reason })
+                if reason == "missing partNumber query parameter"
+        ));
+        assert!(matches!(
+            parse_upload_part_query("partNumber=abc&uploadId=abc123"),
+            Err(ServerError::InvalidArgument { reason })
+                if reason == "partNumber must be a positive integer"
+        ));
     }
 
     #[test]
