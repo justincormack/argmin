@@ -796,6 +796,73 @@ fn test_post_object_sse_c_requires_complete_form_fields() {
 }
 
 #[test]
+fn test_post_object_sse_c_headers_without_form_fields_are_ignored() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_sse_c_bucket().await;
+        let key = "post-sse-c-headers-only";
+        let file_data = b"hello from POST with header-only SSE-C";
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        let fields = sigv4_fields(&bucket, key, &[]);
+        let field_refs: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+
+        let headers = [
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+            (
+                "x-amz-server-side-encryption-customer-key",
+                key_b64.as_str(),
+            ),
+            (
+                "x-amz-server-side-encryption-customer-key-md5",
+                key_md5_b64.as_str(),
+            ),
+        ];
+        let (status, body) =
+            post_object_with_headers(&bucket, &field_refs, file_data, "test.txt", &headers);
+        assert_eq!(status, 204, "expected 204, got {} body={}", status, body);
+
+        let head = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.content_length(), Some(file_data.len() as i64));
+        assert_eq!(head.sse_customer_algorithm(), None);
+        assert_eq!(head.sse_customer_key_md5(), None);
+
+        let get = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(get.sse_customer_algorithm(), None);
+        assert_eq!(get.sse_customer_key_md5(), None);
+        let data = get.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], file_data);
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
 fn test_post_object_authenticated_no_content_type() {
     s3_tests::run(async {
         let client = CTX.client();

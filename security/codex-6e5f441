@@ -1,0 +1,109 @@
+POST object ignores SSE‑C headers, storing data unencrypted
+Link: https://chatgpt.com/codex/security/findings/59c56ea35998819183ccaf1a6e483b60?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: low)
+Status: new
+Criticality notes: bypasses encryption that is expected
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 6e5f441
+Author: justin@specialbusservice.com
+Created: 27/03/2026, 21:08:41
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: SSE‑C headers on POST are no longer rejected and are ignored because POST only parses SSE‑C form fields.
+The new SSE‑C POST implementation derives the encryption context exclusively from multipart form fields. The previous explicit rejection of SSE‑C headers on POST has been removed, but no header parsing was added for POST. As a result, POST requests that supply SSE‑C via headers (common for S3 clients) are accepted and stored with ObjectEncryption::None. This can silently drop at‑rest encryption for clients expecting SSE‑C, leading to plaintext storage and potential confidentiality exposure.
+
+# Validation
+## Rubric
+- [x] Confirm POST path no longer rejects SSE-C headers (commit diff removed ensure_sse_customer_not_requested from POST handling).
+- [x] Verify POST uses parse_sse_customer_form_fields only (mod.rs:2180-2183).
+- [x] Verify encryption defaults to ObjectEncryption::None when no SSE-C form fields (mod.rs:2188-2197).
+- [x] Verify header-based SSE-C parsing exists separately (mod.rs:3039-3064).
+- [ ] Runtime PoC: POST with SSE-C headers only + GET without SSE-C succeeds (blocked by missing libisal build dependency).
+## Report
+Attempted dynamic reproduction by adding a PoC test (crates/s3-tests/tests/post_object_sse_c_headers.rs) and running `cargo test -p s3-tests --test post_object_sse_c_headers -- --nocapture`, but the build failed because the ec-sys crate requires libisal: `libisal not found; install intel-isa-l or set PKG_CONFIG_PATH` (see /workspace/validation_artifacts/post_object_sse_c_headers_output.txt). Valgrind and gdb are unavailable in this environment (`valgrind: command not found`, `gdb: command not found`), so crash/valgrind/debugger validation could not proceed. Code inspection confirms the regression: the streaming POST path derives SSE-C only from form fields (`parse_sse_customer_form_fields(form_fields)` in prepare_streaming_post_object, then sets encryption to ObjectEncryption::None when absent; mod.rs:2180-2197). The SSE-C form-field parser only reads multipart fields (mod.rs:3134-3141), and no POST path consults request headers. Header-based SSE-C parsing exists separately for other operations (`parse_sse_customer_request_with_names` uses req.header; mod.rs:3039-3064), so header-only SSE-C on POST is ignored. The commit diff also shows removal of `ensure_sse_customer_not_requested` from POST handling, so SSE-C headers are no longer rejected. This matches the finding: POST requests that supply SSE-C headers but no form fields will be accepted and stored unencrypted.
+
+# Evidence
+/workspace/argmin/crates/server-http/src/http/mod.rs (L2180 to 2197)
+  Note: POST Object SSE‑C context is derived only from multipart form fields; request headers are not consulted, so SSE‑C headers are ignored and encryption is not applied.
+```
+        let sse_customer_request = parse_sse_customer_form_fields(form_fields)?;
+        let sse_customer = self
+            .coordinator
+            .prepare_sse_customer_write_context(sse_customer_request.as_ref())?;
+
+        let requester =
+            crate::coordinator::Requester::from_principal(effective_auth.principal.as_deref());
+        let acl = parse_put_object_acl(field("acl"));
+        let session_id = self.coordinator.begin_stream_put(&BeginStreamPutRequest {
+            bucket,
+            key: &key,
+            requester,
+            acl,
+            encryption: sse_customer
+                .as_ref()
+                .map_or(storage::ObjectEncryption::None, |ctx| {
+                    ctx.encryption().clone()
+                }),
+```
+
+/workspace/argmin/crates/server-http/src/http/mod.rs (L3134 to 3145)
+  Note: SSE‑C parsing for POST reads only from form fields, confirming that SSE‑C headers on POST are not handled.
+```
+fn parse_sse_customer_form_fields(
+    form_fields: &[(String, String)],
+) -> Result<Option<SseCustomerRequest>, ServerError> {
+    use base64::Engine;
+
+    let algorithm = parse_form_field_once(form_fields, SSE_C_ALGORITHM_HEADER)?;
+    let customer_key = parse_form_field_once(form_fields, SSE_C_KEY_HEADER)?;
+    let customer_key_md5 = parse_form_field_once(form_fields, SSE_C_KEY_MD5_HEADER)?;
+
+    let Some((algorithm, customer_key, customer_key_md5)) =
+        require_complete_sse_customer_fields(algorithm, customer_key, customer_key_md5)?
+    else {
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+While the bug is real and reachable in the POST upload path, it does not enable unauthorized access or privilege escalation. It silently skips requested SSE-C encryption only for header-based POST requests, and the threat model already assumes no built-in at-rest encryption. This lowers impact and exploitability compared to a typical data exposure issue, warranting a downgrade from medium to low.
+## Likelihood
+low - Requires clients to use POST Object with SSE-C headers instead of form fields and to rely on SSE-C for confidentiality; no direct attacker benefit without additional disk/host compromise.
+## Impact
+low - Objects uploaded via POST with SSE-C headers may be stored without customer-provided encryption, reducing at-rest confidentiality for those uploads. This does not directly grant an attacker new access but undermines a security control for data at rest.
+## Assumptions
+- argmin-s3 is deployed with ARGMIN_LISTEN_ADDR bound to a non-loopback address or behind a proxy, making the HTTP API reachable by clients
+- Clients use POST Object with SSE-C headers (not multipart form fields) as in common S3 tooling
+- SSE-C is intended by operators to provide at-rest encryption guarantees for uploaded objects
+- Ability to submit authenticated or presigned POST Object requests
+- SSE-C parameters provided only in HTTP headers (not form fields)
+## Path
+Client -> POST Object -> parse_sse_customer_form_fields -> ObjectEncryption::None -> Stored unencrypted
+## Path evidence
+- `crates/server-http/src/http/mod.rs:2180-2197` - POST Object uses parse_sse_customer_form_fields and defaults to ObjectEncryption::None when absent
+- `crates/server-http/src/http/mod.rs:3134-3141` - SSE-C parsing for POST reads only multipart form fields (no header handling)
+- `crates/argmin-s3/src/config.rs:23-49` - Listen address and defaults show HTTP exposure is configurable via ARGMIN_LISTEN_ADDR
+## Narrative
+In the POST Object streaming path, SSE-C context is derived only from multipart form fields, and encryption defaults to ObjectEncryption::None when those fields are absent. As a result, POST requests that include SSE-C only via headers are accepted but stored unencrypted. This affects clients relying on header-based SSE-C for POST uploads, leading to silent loss of at-rest encryption expectations.
+## Controls
+- SigV4 authentication / POST policy validation
+- Bucket ACL enforcement in coordinator
+- Request validation and size limits
+## Blindspots
+- No deployment manifests to confirm actual public exposure or ingress configuration
+- Runtime PoC could not be executed due to missing libisal build dependency
+- SSE-C semantics for POST vs form fields could vary across clients
+
+## Reviewer note
+This finding is not valid.
+
+AWS-backed validation shows that header-only SSE-C on `POST Object` is accepted and ignored by AWS itself. A regression test was added in `crates/s3-tests/tests/post_object.rs` (`test_post_object_sse_c_headers_without_form_fields_are_ignored`) and run against both AWS and the local server. The test demonstrates that:
+- the POST succeeds with `204`
+- the resulting object is readable without SSE-C headers
+- `HeadObject`/`GetObject` return no SSE-C response metadata
+
+That matches the current argmin behavior and shows the report’s premise was wrong: for `POST Object`, SSE-C is not required to be honored from request headers, and header-only SSE-C does not indicate a silent encryption regression relative to AWS.
