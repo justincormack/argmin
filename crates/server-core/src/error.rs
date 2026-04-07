@@ -61,6 +61,12 @@ pub enum ServerError {
     #[error("invalid bucket name: {reason}")]
     InvalidBucketName { reason: String },
 
+    #[error("key too long: {size} bytes (max {max_size_allowed})")]
+    KeyTooLongError {
+        size: usize,
+        max_size_allowed: usize,
+    },
+
     #[error("invalid bucket namespace: {reason}")]
     InvalidBucketNamespace {
         reason: String,
@@ -254,6 +260,7 @@ impl ServerError {
             Self::InvalidArgument { .. } => "InvalidArgument",
             Self::InvalidURI { .. } => "InvalidURI",
             Self::InvalidBucketName { .. } => "InvalidBucketName",
+            Self::KeyTooLongError { .. } => "KeyTooLongError",
             Self::InvalidBucketNamespace { .. } => "InvalidBucketNamespace",
             Self::MetadataBlobError { .. } => "InternalError",
             Self::ObjectTooLarge { .. } => "EntityTooLarge",
@@ -334,6 +341,7 @@ impl ServerError {
             | Self::InvalidArgument { .. }
             | Self::InvalidURI { .. }
             | Self::InvalidBucketName { .. }
+            | Self::KeyTooLongError { .. }
             | Self::InvalidBucketNamespace { .. }
             | Self::BadDigest
             | Self::InvalidDigest

@@ -58,6 +58,24 @@ pub fn error_xml(code: &str, message: &str, resource: &str, request_id: &str) ->
     )
 }
 
+/// Format an S3 `KeyTooLongError` response.
+#[must_use]
+pub fn key_too_long_error_xml(size: usize, max_size_allowed: usize, request_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>KeyTooLongError</Code>\
+         <Message>Your key is too long</Message>\
+         <Size>{}</Size>\
+         <MaxSizeAllowed>{}</MaxSizeAllowed>\
+         <RequestId>{}</RequestId>\
+         </Error>",
+        size,
+        max_size_allowed,
+        xml_escape(request_id),
+    )
+}
+
 /// Format an S3 error response XML with an extra `<Region>` element.
 #[must_use]
 pub fn error_xml_with_region(
@@ -831,6 +849,12 @@ pub fn parse_delete_objects_xml(
                     let key = current_key
                         .take()
                         .ok_or_else(|| malformed_delete_xml("Object missing <Key> element"))?;
+                    if key.len() > 1024 {
+                        return Err(ServerError::KeyTooLongError {
+                            size: key.len(),
+                            max_size_allowed: 1024,
+                        });
+                    }
                     validate_object_key(&key)?;
                     entries.push(DeleteObjectEntry {
                         etag: current_etag.take(),
@@ -4309,10 +4333,14 @@ mod tests {
         let key = "a".repeat(1025);
         let xml = format!("<Delete><Object><Key>{key}</Key></Object></Delete>");
         match parse_delete_objects_xml(xml.as_bytes()) {
-            Err(ServerError::InvalidRequest { reason }) => {
-                assert_eq!(reason, "object key must be 1-1024 bytes, got 1025");
+            Err(ServerError::KeyTooLongError {
+                size,
+                max_size_allowed,
+            }) => {
+                assert_eq!(size, 1025);
+                assert_eq!(max_size_allowed, 1024);
             }
-            other => panic!("expected InvalidRequest, got {other:?}"),
+            other => panic!("expected KeyTooLongError, got {other:?}"),
         }
     }
 

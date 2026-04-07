@@ -279,11 +279,10 @@ fn test_delete_objects_oversized_key_rejected() {
         let body = format!("<Delete><Object><Key>{key}</Key></Object></Delete>");
         let (status, body_text) = signed_post_with_checksum(&url, body.as_bytes(), &[]);
         assert_eq!(status, 400, "body: {body_text}");
-        assert_error_code(&body_text, "InvalidRequest");
-        assert!(
-            body_text.contains("<Message>object key must be 1-1024 bytes, got 1025</Message>"),
-            "unexpected body: {body_text}"
-        );
+        assert_error_code(&body_text, "KeyTooLongError");
+        assert!(body_text.contains("<Message>Your key is too long</Message>"));
+        assert!(body_text.contains("<Size>1025</Size>"));
+        assert!(body_text.contains("<MaxSizeAllowed>1024</MaxSizeAllowed>"));
         cleanup(&bucket).await;
     });
 }

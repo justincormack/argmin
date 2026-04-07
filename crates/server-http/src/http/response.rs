@@ -1253,6 +1253,13 @@ impl S3Response {
                 );
                 return Self::new(400).xml_body(body);
             }
+            ServerError::KeyTooLongError {
+                size,
+                max_size_allowed,
+            } => {
+                let body = xml::key_too_long_error_xml(*size, *max_size_allowed, "request-id");
+                return Self::new(400).xml_body(body);
+            }
             _ => {}
         }
 
