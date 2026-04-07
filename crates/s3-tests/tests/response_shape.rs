@@ -1,10 +1,15 @@
 use std::collections::BTreeMap;
 
-use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{
+    BucketLocationConstraint, BucketVersioningStatus, CreateBucketConfiguration,
+    VersioningConfiguration,
+};
 use aws_sdk_s3::Client;
 use s3_tests::{
-    build_client_with_ca, delete_all_and_bucket, send_signed_request_with_credentials,
-    unique_bucket, RawResponse, SignedRequestCredentials, TestServer, CTX,
+    build_client_with_ca, cleanup_versioned_bucket, delete_all_and_bucket,
+    send_signed_request_with_credentials, unique_bucket, RawResponse, SignedRequestCredentials,
+    TestServer, CTX,
 };
 use s3_types::is_legacy_create_bucket_region;
 
@@ -149,9 +154,24 @@ async fn create_bucket_in_region(client: &Client, bucket: &str, region: &str) {
     request.send().await.expect("create bucket");
 }
 
+async fn enable_bucket_versioning(client: &Client, bucket: &str) {
+    client
+        .put_bucket_versioning()
+        .bucket(bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .expect("enable bucket versioning");
+}
+
 fn normalized_headers(
     headers: &[(String, String)],
     ignored_headers: &[&str],
+    presence_only_headers: &[&str],
 ) -> BTreeMap<String, Vec<String>> {
     let mut normalized = BTreeMap::new();
     for (name, value) in headers {
@@ -162,7 +182,9 @@ fn normalized_headers(
         if ignored_headers.contains(&name.as_str()) {
             continue;
         }
-        let value = if IGNORE_VALUE_RESPONSE_HEADERS.contains(&name.as_str()) {
+        let value = if IGNORE_VALUE_RESPONSE_HEADERS.contains(&name.as_str())
+            || presence_only_headers.contains(&name.as_str())
+        {
             "<present>".to_string()
         } else {
             value.clone()
@@ -180,23 +202,60 @@ fn assert_response_shape_matches(
     aws: &RawResponse,
     local: &RawResponse,
     ignored_headers: &[&str],
+    presence_only_headers: &[&str],
 ) {
     assert_eq!(
         local.status, aws.status,
         "{operation}: status mismatch\naws: {aws:?}\nlocal: {local:?}"
     );
     assert_eq!(
-        normalized_headers(&local.headers, ignored_headers),
-        normalized_headers(&aws.headers, ignored_headers),
+        normalized_headers(&local.headers, ignored_headers, presence_only_headers),
+        normalized_headers(&aws.headers, ignored_headers, presence_only_headers),
         "{operation}: normalized header mismatch\naws headers: {:?}\nlocal headers: {:?}",
-        normalized_headers(&aws.headers, ignored_headers),
-        normalized_headers(&local.headers, ignored_headers),
+        normalized_headers(&aws.headers, ignored_headers, presence_only_headers),
+        normalized_headers(&local.headers, ignored_headers, presence_only_headers),
     );
     assert_eq!(
         local.body, aws.body,
         "{operation}: body mismatch\naws body: {}\nlocal body: {}",
         aws.body, local.body
     );
+}
+
+fn assert_response_headers_match(
+    operation: &str,
+    aws: &RawResponse,
+    local: &RawResponse,
+    ignored_headers: &[&str],
+    presence_only_headers: &[&str],
+) {
+    assert_eq!(
+        local.status, aws.status,
+        "{operation}: status mismatch\naws: {aws:?}\nlocal: {local:?}"
+    );
+    assert_eq!(
+        normalized_headers(&local.headers, ignored_headers, presence_only_headers),
+        normalized_headers(&aws.headers, ignored_headers, presence_only_headers),
+        "{operation}: normalized header mismatch\naws headers: {:?}\nlocal headers: {:?}",
+        normalized_headers(&aws.headers, ignored_headers, presence_only_headers),
+        normalized_headers(&local.headers, ignored_headers, presence_only_headers),
+    );
+}
+
+fn xml_tag_text<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = body.find(&start_tag)? + start_tag.len();
+    let end = body[start..].find(&end_tag)? + start;
+    Some(&body[start..end])
+}
+
+fn response_header_value<'a>(response: &'a RawResponse, name: &str) -> Option<&'a str> {
+    response
+        .headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
 #[test]
@@ -241,6 +300,7 @@ fn test_put_get_head_object_response_shape_matches_aws() {
             &aws_put,
             &local_put,
             KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
         );
 
         let aws_get = env.send_external(
@@ -264,6 +324,7 @@ fn test_put_get_head_object_response_shape_matches_aws() {
             &aws_get,
             &local_get,
             KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
         );
 
         let aws_head = env.send_external(
@@ -287,6 +348,7 @@ fn test_put_get_head_object_response_shape_matches_aws() {
             &aws_head,
             &local_head,
             KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
         );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
@@ -325,6 +387,7 @@ fn test_range_and_override_response_shape_matches_aws() {
             &aws_put,
             &local_put,
             KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
         );
 
         let aws_range = env.send_external(
@@ -348,6 +411,7 @@ fn test_range_and_override_response_shape_matches_aws() {
             &aws_range,
             &local_range,
             KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
         );
 
         let override_query = concat!(
@@ -375,6 +439,7 @@ fn test_range_and_override_response_shape_matches_aws() {
             &aws_override,
             &local_override,
             KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
         );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
@@ -410,9 +475,409 @@ fn test_head_bucket_response_shape_matches_aws_when_regions_match() {
             b"",
             std::iter::empty::<(&str, &str)>(),
         );
-        assert_response_shape_matches("HeadBucket", &aws_head, &local_head, &[]);
+        assert_response_shape_matches("HeadBucket", &aws_head, &local_head, &[], &[]);
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
         delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_checksum_mode_object_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-checksum-mode.txt";
+        let body = b"checksum-mode-body";
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            None,
+            body,
+            [("Content-Type", "application/octet-stream")],
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            None,
+            body,
+            [("Content-Type", "application/octet-stream")],
+        );
+        assert_response_shape_matches(
+            "PutObjectChecksumFixture",
+            &aws_put,
+            &local_put,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
+        );
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            key,
+            None,
+            b"",
+            [("x-amz-checksum-mode", "ENABLED")],
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            key,
+            None,
+            b"",
+            [("x-amz-checksum-mode", "ENABLED")],
+        );
+        assert_response_shape_matches(
+            "GetObjectChecksumMode",
+            &aws_get,
+            &local_get,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
+        );
+
+        let aws_head = env.send_external(
+            "HEAD",
+            &external_bucket,
+            key,
+            None,
+            b"",
+            [("x-amz-checksum-mode", "ENABLED")],
+        );
+        let local_head = env.send_local(
+            "HEAD",
+            &local_bucket,
+            key,
+            None,
+            b"",
+            [("x-amz-checksum-mode", "ENABLED")],
+        );
+        assert_response_shape_matches(
+            "HeadObjectChecksumMode",
+            &aws_head,
+            &local_head,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_versioned_object_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        enable_bucket_versioning(&env.external_client, &external_bucket).await;
+        enable_bucket_versioning(&env.local_client, &local_bucket).await;
+
+        let key = "shape-versioned.txt";
+        let body = b"versioned-body";
+        let external_put = env
+            .external_client
+            .put_object()
+            .bucket(&external_bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .expect("put external versioned object");
+        let local_put = env
+            .local_client
+            .put_object()
+            .bucket(&local_bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .expect("put local versioned object");
+        let external_version = external_put
+            .version_id()
+            .expect("external version id")
+            .to_string();
+        let local_version = local_put
+            .version_id()
+            .expect("local version id")
+            .to_string();
+
+        let aws_current_get = env.send_external(
+            "GET",
+            &external_bucket,
+            key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_current_get = env.send_local(
+            "GET",
+            &local_bucket,
+            key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_shape_matches(
+            "GetObjectVersionedCurrent",
+            &aws_current_get,
+            &local_current_get,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &["x-amz-version-id"],
+        );
+
+        let aws_version_get = env.send_external(
+            "GET",
+            &external_bucket,
+            key,
+            Some(&format!("versionId={external_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_version_get = env.send_local(
+            "GET",
+            &local_bucket,
+            key,
+            Some(&format!("versionId={local_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_shape_matches(
+            "GetObjectExplicitVersion",
+            &aws_version_get,
+            &local_version_get,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &["x-amz-version-id"],
+        );
+
+        let aws_version_head = env.send_external(
+            "HEAD",
+            &external_bucket,
+            key,
+            Some(&format!("versionId={external_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_version_head = env.send_local(
+            "HEAD",
+            &local_bucket,
+            key,
+            Some(&format!("versionId={local_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_shape_matches(
+            "HeadObjectExplicitVersion",
+            &aws_version_head,
+            &local_version_head,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &["x-amz-version-id"],
+        );
+
+        cleanup_versioned_bucket(&env.external_client, &external_bucket).await;
+        cleanup_versioned_bucket(&env.local_client, &local_bucket).await;
+    });
+}
+
+#[test]
+fn test_copy_object_response_headers_match_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let src_key = "copy-source.txt";
+        let dst_key = "copy-dest.txt";
+        let body = b"copy source body";
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            src_key,
+            None,
+            body,
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            src_key,
+            None,
+            body,
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_shape_matches(
+            "CopySourceFixture",
+            &aws_put,
+            &local_put,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
+        );
+
+        let aws_copy = env.send_external(
+            "PUT",
+            &external_bucket,
+            dst_key,
+            None,
+            b"",
+            [("x-amz-copy-source", format!("{external_bucket}/{src_key}"))],
+        );
+        let local_copy = env.send_local(
+            "PUT",
+            &local_bucket,
+            dst_key,
+            None,
+            b"",
+            [("x-amz-copy-source", format!("{local_bucket}/{src_key}"))],
+        );
+        assert_response_headers_match(
+            "CopyObject",
+            &aws_copy,
+            &local_copy,
+            &["content-length"],
+            &[],
+        );
+
+        delete_all_and_bucket(
+            &env.external_client,
+            &external_bucket,
+            &[src_key.to_string(), dst_key.to_string()],
+        )
+        .await;
+        delete_all_and_bucket(
+            &env.local_client,
+            &local_bucket,
+            &[src_key.to_string(), dst_key.to_string()],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_multipart_response_headers_match_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-multipart.txt";
+        let part_body = b"multipart-part-body";
+
+        let aws_create = env.send_external(
+            "POST",
+            &external_bucket,
+            key,
+            Some("uploads="),
+            b"",
+            [("x-amz-checksum-algorithm", "CRC64NVME")],
+        );
+        let local_create = env.send_local(
+            "POST",
+            &local_bucket,
+            key,
+            Some("uploads="),
+            b"",
+            [("x-amz-checksum-algorithm", "CRC64NVME")],
+        );
+        assert_response_headers_match(
+            "CreateMultipartUpload",
+            &aws_create,
+            &local_create,
+            &[],
+            &[],
+        );
+        let external_upload_id = xml_tag_text(&aws_create.body, "UploadId")
+            .expect("external raw create upload id")
+            .to_string();
+        let local_upload_id = xml_tag_text(&local_create.body, "UploadId")
+            .expect("local raw create upload id")
+            .to_string();
+
+        let aws_upload_part = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            Some(&format!("partNumber=1&uploadId={external_upload_id}")),
+            part_body,
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_upload_part = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            Some(&format!("partNumber=1&uploadId={local_upload_id}")),
+            part_body,
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_headers_match(
+            "UploadPart",
+            &aws_upload_part,
+            &local_upload_part,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
+        );
+        let external_part_etag =
+            response_header_value(&aws_upload_part, "etag").expect("external upload part etag");
+        let local_part_etag =
+            response_header_value(&local_upload_part, "etag").expect("local upload part etag");
+
+        let aws_list_parts = env.send_external(
+            "GET",
+            &external_bucket,
+            key,
+            Some(&format!("uploadId={external_upload_id}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_list_parts = env.send_local(
+            "GET",
+            &local_bucket,
+            key,
+            Some(&format!("uploadId={local_upload_id}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_headers_match("ListParts", &aws_list_parts, &local_list_parts, &[], &[]);
+
+        let complete_body_external = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+            external_part_etag
+        );
+        let complete_body_local = format!(
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+            local_part_etag
+        );
+        let aws_complete = env.send_external(
+            "POST",
+            &external_bucket,
+            key,
+            Some(&format!("uploadId={external_upload_id}")),
+            complete_body_external.as_bytes(),
+            [("Content-Type", "application/xml")],
+        );
+        let local_complete = env.send_local(
+            "POST",
+            &local_bucket,
+            key,
+            Some(&format!("uploadId={local_upload_id}")),
+            complete_body_local.as_bytes(),
+            [("Content-Type", "application/xml")],
+        );
+        assert_response_headers_match(
+            "CompleteMultipartUpload",
+            &aws_complete,
+            &local_complete,
+            &[],
+            &[],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
     });
 }

@@ -4,7 +4,7 @@ use aws_sdk_s3::types::{
     ObjectAttributes,
 };
 use ring::hmac;
-use s3_tests::{assert_s3_err_code, err_status, unique_bucket, CTX};
+use s3_tests::{assert_s3_err_code, err_status, send_signed_request, unique_bucket, CTX};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -22,6 +22,13 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
     client.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+fn response_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
 }
 
 fn assert_error_code(body: &str, code: &str) {
@@ -902,6 +909,61 @@ async fn run_multipart_checksum_test(tc: &MultipartChecksumTestCase) {
     cleanup(&bucket, &[key]).await;
 }
 
+#[test]
+fn test_upload_part_uses_multipart_checksum_algorithm_without_part_checksum_header() {
+    s3_tests::run(async {
+        use base64::Engine;
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "mpu-upload-part-implicit-checksum";
+        let part_body = b"raw-upload-part-without-checksum-header";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .checksum_algorithm(ChecksumAlgorithm::Crc64Nvme)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let encoded_upload_id: String =
+            url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect();
+        let url = format!(
+            "{}/{}/{}?partNumber=1&uploadId={encoded_upload_id}",
+            CTX.endpoint(),
+            bucket,
+            key
+        );
+        let upload_part =
+            send_signed_request("PUT", &url, part_body, std::iter::empty::<(&str, &str)>());
+        assert_eq!(
+            upload_part.status, 200,
+            "upload part failed: {}",
+            upload_part.body
+        );
+
+        let checksum_header = response_header(&upload_part.headers, "x-amz-checksum-crc64nvme")
+            .expect("expected UploadPart checksum header");
+        let expected_checksum = base64::engine::general_purpose::STANDARD
+            .encode(checksum::crc64::checksum(part_body).to_be_bytes());
+        assert_eq!(checksum_header, expected_checksum);
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
 // ── test_multipart_checksum_sha256 ───────────────────────────────────
 
 /// Tests bad checksum rejection and missing part checksum rejection on
@@ -985,7 +1047,7 @@ fn test_multipart_checksum_sha256() {
             .await
             .unwrap();
 
-        // CompleteMultipartUpload without per-part checksum should fail
+        // CompleteMultipartUpload without per-part checksum should succeed.
         let result2 = client
             .complete_multipart_upload()
             .bucket(&bucket)
@@ -1003,8 +1065,25 @@ fn test_multipart_checksum_sha256() {
                     .build(),
             )
             .send()
-            .await;
-        assert_eq!(err_status(&result2), 400);
+            .await
+            .unwrap();
+        assert!(
+            result2.checksum_sha256().is_some(),
+            "expected complete response checksum"
+        );
+        let head2 = client
+            .head_object()
+            .bucket(&bucket)
+            .key(key2)
+            .checksum_mode(ChecksumMode::Enabled)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head2.checksum_type(), Some(&ChecksumType::Composite));
+        assert!(
+            head2.checksum_sha256().is_some(),
+            "expected completed object checksum"
+        );
 
         // -- successful COMPOSITE SHA-256 upload --
         let key3 = "mymultipart3";
@@ -1081,7 +1160,7 @@ fn test_multipart_checksum_sha256() {
             .upload_id(upload_id2)
             .send()
             .await;
-        cleanup(&bucket, &[key3]).await;
+        cleanup(&bucket, &[key2, key3]).await;
     });
 }
 

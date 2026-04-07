@@ -148,6 +148,17 @@ impl S3Response {
         self
     }
 
+    fn chunked_body(mut self, body: Vec<u8>) -> Self {
+        self.body = Vec::new();
+        self.stream = Some(ReadHandle::from_buffered_bytes(body));
+        self
+    }
+
+    fn chunked_xml_body(self, xml: String) -> Self {
+        self.header("Content-Type", "application/xml")
+            .chunked_body(xml.into_bytes())
+    }
+
     fn json_body(mut self, json: String) -> Self {
         self.body = json.into_bytes();
         self.stream = None;
@@ -339,7 +350,11 @@ impl S3Response {
     /// Build a response for a successful `CopyObject`.
     #[must_use]
     pub fn copy_object(result: &CopyObjectResult) -> Self {
-        let body = xml::copy_object_result_xml(&result.etag, result.last_modified);
+        let body = xml::copy_object_result_xml(
+            &result.etag,
+            result.last_modified,
+            &result.system_metadata,
+        );
         let mut resp = Self::new(200).xml_body(body);
         if result.version_id.is_versioned() {
             let vid = format_version_id(result.version_id);
@@ -970,9 +985,14 @@ impl S3Response {
             ctx.checksum_algorithm.map(ChecksumAlgorithm::as_str),
             ctx.checksum_type.map(ChecksumType::as_str),
         );
-        Self::new(200)
-            .xml_body(body)
-            .apply_lifecycle_abort_headers(ctx.lifecycle_abort)
+        let mut resp = Self::new(200).chunked_body(body.into_bytes());
+        if let Some(algo) = ctx.checksum_algorithm {
+            resp = resp.header("x-amz-checksum-algorithm", algo.as_str());
+        }
+        if let Some(checksum_type) = ctx.checksum_type {
+            resp = resp.header("x-amz-checksum-type", checksum_type.as_str());
+        }
+        resp.apply_lifecycle_abort_headers(ctx.lifecycle_abort)
             .apply_managed_encryption_headers(ctx.managed_encryption)
             .apply_sse_customer_headers(ctx.sse_customer)
     }
@@ -1022,17 +1042,12 @@ impl S3Response {
             key,
             &result.etag,
             result.checksum_algorithm,
+            result.checksum_type,
             result.checksum_value.as_deref(),
         );
-        let mut resp = Self::new(200).xml_body(body);
+        let mut resp = Self::new(200).chunked_xml_body(body);
         if result.version_id.is_versioned() {
             resp = resp.header("x-amz-version-id", &format_version_id(result.version_id));
-        }
-        if let Some(algo) = result.checksum_algorithm {
-            resp = resp.header("x-amz-checksum-algorithm", algo.as_str());
-        }
-        if let Some(ct) = result.checksum_type {
-            resp = resp.header("x-amz-checksum-type", ct.as_str());
         }
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
             .apply_managed_encryption_headers(result.managed_encryption)
@@ -1084,7 +1099,7 @@ impl S3Response {
             result,
         );
         Self::new(200)
-            .xml_body(body)
+            .chunked_xml_body(body)
             .apply_lifecycle_abort_headers(result.lifecycle_abort.as_ref())
     }
 
@@ -2270,6 +2285,16 @@ mod tests {
             find_header(&resp, "x-amz-abort-rule-id"),
             Some("abort%20upload")
         );
+        assert_eq!(find_header(&resp, "Content-Type"), None);
+        assert_eq!(find_header(&resp, "Content-Length"), None);
+        assert_eq!(
+            find_header(&resp, "x-amz-checksum-algorithm"),
+            Some("SHA256")
+        );
+        assert_eq!(
+            find_header(&resp, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
     }
 
     #[test]
@@ -2320,6 +2345,8 @@ mod tests {
             find_header(&resp, "x-amz-abort-rule-id"),
             Some("abort%20upload")
         );
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        assert_eq!(find_header(&resp, "Content-Length"), None);
     }
 
     #[test]
@@ -2344,6 +2371,10 @@ mod tests {
             find_header(&resp, "x-amz-expiration"),
             Some("expiry-date=\"Mon, 15 Jan 2024 12:30:45 GMT\", rule-id=\"complete\"")
         );
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        assert_eq!(find_header(&resp, "Content-Length"), None);
+        assert_eq!(find_header(&resp, "x-amz-checksum-algorithm"), None);
+        assert_eq!(find_header(&resp, "x-amz-checksum-type"), None);
     }
 
     #[test]

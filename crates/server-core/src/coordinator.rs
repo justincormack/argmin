@@ -2358,6 +2358,7 @@ pub struct FinalizeStreamPartRequest<'a> {
 pub struct CopyObjectResult {
     pub etag: String,
     pub last_modified: u64,
+    pub system_metadata: SystemMetadata,
     pub version_id: VersionId,
     pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
     pub sse_customer: Option<SseCustomerResponseHeaders>,
@@ -9976,15 +9977,7 @@ impl Coordinator {
                 });
             }
             (Some(algo), Some(_)) => Some(algo),
-            // AWS rejects parts without a checksum when the upload requires one.
-            (Some(upload_algo), None) => {
-                return Err(ServerError::InvalidRequest {
-                    reason: format!(
-                        "Checksum Type mismatch occurred, expected checksum Type: {}, actual checksum Type: null",
-                        upload_algo.as_str().to_lowercase()
-                    ),
-                });
-            }
+            (Some(upload_algo), None) => Some(upload_algo),
             (None, Some(part_algo)) => Some(part_algo),
             (None, None) => None,
         };
@@ -10624,6 +10617,7 @@ impl Coordinator {
             Ok(CopyObjectResult {
                 etag: put_result.etag,
                 last_modified: result_last_modified,
+                system_metadata: put_result.system_metadata.clone(),
                 version_id: put_result.version_id,
                 managed_encryption: put_result.managed_encryption,
                 sse_customer: dst_response_sse_customer,
@@ -13512,12 +13506,6 @@ impl Coordinator {
                 if stored_etag != cp.etag {
                     return Err(ServerError::InvalidPart {
                         part_number: cp.part_number,
-                    });
-                }
-
-                if checksum_algo.is_some() && cp.checksum.is_none() {
-                    return Err(ServerError::InvalidRequest {
-                        reason: format!("part {} missing required checksum", cp.part_number),
                     });
                 }
 
@@ -36213,6 +36201,134 @@ mod tests {
         let expected_crc = checksum::crc64::checksum(&full_data);
         let expected = b64.encode(expected_crc.to_be_bytes());
         assert_eq!(result.checksum_value.unwrap(), expected);
+    }
+
+    #[test]
+    fn upload_part_without_checksum_claim_uses_upload_checksum_algorithm() {
+        use base64::Engine;
+
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request("bucket", "key", test_requester()),
+                metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: Some(
+                    MultipartChecksumConfig::new(
+                        ChecksumAlgorithm::Crc64nvme,
+                        Some(ChecksumType::FullObject),
+                    )
+                    .unwrap(),
+                ),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let data = b"upload-part-without-claim";
+        let result = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
+                upload: multipart_object_request(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                ),
+                part_number: 1,
+                data,
+                claimed_checksum: None,
+                sse_customer: None,
+            },
+        )
+        .unwrap();
+
+        let checksum = result.checksum.expect("expected computed part checksum");
+        assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Crc64nvme);
+        assert_eq!(
+            b64.encode(checksum.bytes()),
+            b64.encode(checksum::crc64::checksum(data).to_be_bytes())
+        );
+    }
+
+    #[test]
+    fn complete_multipart_allows_missing_part_checksum_elements() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request("bucket", "key", test_requester()),
+                metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: Some(
+                    MultipartChecksumConfig::new(ChecksumAlgorithm::Crc64nvme, None).unwrap(),
+                ),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let part = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
+                upload: multipart_object_request(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                ),
+                part_number: 1,
+                data: b"complete-without-part-checksum",
+                claimed_checksum: None,
+                sse_customer: None,
+            },
+        )
+        .unwrap();
+
+        let result = coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &[CompletePart {
+                    part_number: 1,
+                    etag: part.etag,
+                    checksum: None,
+                }],
+                claimed_checksum: None,
+                cond: &WriteCondition::default(),
+                sse_customer: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            result.checksum_algorithm,
+            Some(ChecksumAlgorithm::Crc64nvme)
+        );
+        assert_eq!(result.checksum_type, Some(ChecksumType::FullObject));
+        assert!(result.checksum_value.is_some());
     }
 
     #[test]

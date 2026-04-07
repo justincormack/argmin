@@ -58,6 +58,20 @@ enum TrailingChecksumHasher {
 }
 
 impl TrailingChecksumHasher {
+    fn from_algorithm(algorithm: ChecksumAlgorithm) -> Self {
+        match algorithm {
+            ChecksumAlgorithm::Crc32 => Self::Crc32(checksum::crc32::Hasher::new()),
+            ChecksumAlgorithm::Crc32c => Self::Crc32c(checksum::crc32c::Hasher::new()),
+            ChecksumAlgorithm::Crc64nvme => Self::Crc64(checksum::crc64::Hasher::new()),
+            ChecksumAlgorithm::Sha256 => {
+                Self::Sha256(ring::digest::Context::new(&ring::digest::SHA256))
+            }
+            ChecksumAlgorithm::Sha1 => Self::Sha1(ring::digest::Context::new(
+                &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
+            )),
+        }
+    }
+
     /// Create a hasher from a trailer header name (e.g. `x-amz-checksum-crc32`).
     ///
     /// Matches case-insensitively since HTTP header names are case-insensitive.
@@ -1416,7 +1430,6 @@ async fn handle_streaming_put(
         Ok(Err(err)) => return error_response(&err),
         Err(_) => return internal_error_response(),
     };
-
     // Build chunked decoder if needed.
     let mut decoder = make_chunked_decoder(&chunked, ctx.streaming_signing.as_ref());
     let mut payload_sha256_hasher = claimed_payload_sha256
@@ -2064,6 +2077,11 @@ async fn handle_streaming_part(
         Ok(Err(err)) => return error_response(&err),
         Err(_) => return internal_error_response(),
     };
+    if trailing_hasher.is_none() {
+        if let Some(upload_algorithm) = ctx.checksum.upload_checksum_algorithm {
+            trailing_hasher = Some(TrailingChecksumHasher::from_algorithm(upload_algorithm));
+        }
+    }
 
     // Build chunked decoder if needed.
     let mut decoder = make_chunked_decoder(&chunked, ctx.streaming_signing.as_ref());

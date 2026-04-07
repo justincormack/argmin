@@ -2284,8 +2284,8 @@ impl HttpFrontend {
                     &result.upload_id,
                     crate::http::response::CreateMultipartUploadResponseContext {
                         managed_encryption: result.managed_encryption,
-                        checksum_algorithm,
-                        checksum_type,
+                        checksum_algorithm: checksum.map(MultipartChecksumConfig::algorithm),
+                        checksum_type: checksum.map(MultipartChecksumConfig::checksum_type),
                         lifecycle_abort: result.lifecycle_abort.as_ref(),
                         sse_customer: sse_customer_headers.as_ref(),
                     },
@@ -5110,7 +5110,7 @@ fn parse_put_object_acl(value: Option<&str>) -> crate::coordinator::PutObjectAcl
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::coordinator::Coordinator;
+    use crate::coordinator::{Coordinator, INTERNAL_SEGMENT_SIZE};
     use ec::EcConfig;
     use server_core::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider};
     use std::sync::Arc;
@@ -5366,6 +5366,22 @@ mod tests {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    fn response_body(resp: S3Response) -> Vec<u8> {
+        match resp.stream {
+            Some(mut stream) => {
+                let mut body = Vec::new();
+                while let Some(chunk) = stream
+                    .next_chunk(INTERNAL_SEGMENT_SIZE)
+                    .expect("read streamed response body")
+                {
+                    body.extend_from_slice(&chunk);
+                }
+                body
+            }
+            None => resp.body,
+        }
     }
 
     #[test]
@@ -6741,7 +6757,8 @@ mod tests {
             Some("abort-stale")
         );
 
-        let body = std::str::from_utf8(&create_resp.body).unwrap();
+        let create_body = response_body(create_resp);
+        let body = std::str::from_utf8(&create_body).unwrap();
         let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
         let end = start + body[start..].find("</UploadId>").unwrap();
         let upload_id = &body[start..end];
@@ -8204,7 +8221,8 @@ mod tests {
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
         assert_eq!(resp.status_code, 200);
-        let body = std::str::from_utf8(&resp.body).unwrap();
+        let body_bytes = response_body(resp);
+        let body = std::str::from_utf8(&body_bytes).unwrap();
         // Extract upload_id from <UploadId>...</UploadId>
         let uid_start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
         let uid_end = uid_start + body[uid_start..].find("</UploadId>").unwrap();
@@ -8240,7 +8258,8 @@ mod tests {
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
         assert_eq!(resp.status_code, 200);
-        let body = std::str::from_utf8(&resp.body).unwrap();
+        let body_bytes = response_body(resp);
+        let body = std::str::from_utf8(&body_bytes).unwrap();
         assert!(
             body.contains("<CompleteMultipartUploadResult"),
             "missing result element: {body}"
@@ -8460,7 +8479,8 @@ mod tests {
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
         assert_eq!(resp.status_code, 200);
-        let body = std::str::from_utf8(&resp.body).unwrap();
+        let body_bytes = response_body(resp);
+        let body = std::str::from_utf8(&body_bytes).unwrap();
         assert!(
             body.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"),
             "missing ChecksumAlgorithm: {body}"
@@ -8493,7 +8513,8 @@ mod tests {
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
         assert_eq!(resp.status_code, 200);
-        let body = std::str::from_utf8(&resp.body).unwrap();
+        let body_bytes = response_body(resp);
+        let body = std::str::from_utf8(&body_bytes).unwrap();
         assert!(
             body.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"),
             "missing ChecksumAlgorithm: {body}"
@@ -8523,15 +8544,15 @@ mod tests {
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
         assert_eq!(resp.status_code, 200);
-        let body = std::str::from_utf8(&resp.body).unwrap();
+        let body_bytes = response_body(resp);
+        let body = std::str::from_utf8(&body_bytes).unwrap();
         assert!(
             body.contains("<ChecksumAlgorithm>SHA256</ChecksumAlgorithm>"),
             "missing ChecksumAlgorithm: {body}"
         );
-        // When no type specified, no ChecksumType element emitted.
         assert!(
-            !body.contains("ChecksumType"),
-            "unexpected ChecksumType: {body}"
+            body.contains("<ChecksumType>COMPOSITE</ChecksumType>"),
+            "missing ChecksumType: {body}"
         );
     }
 
@@ -8554,7 +8575,8 @@ mod tests {
             key: key.to_string(),
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
-        let body = std::str::from_utf8(&resp.body).unwrap();
+        let body_bytes = response_body(resp);
+        let body = std::str::from_utf8(&body_bytes).unwrap();
         let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
         let end = start + body[start..].find("</UploadId>").unwrap();
         body[start..end].to_string()

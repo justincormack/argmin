@@ -6,7 +6,7 @@ use crate::coordinator::{
 };
 use crate::error::ServerError;
 use auth::canonical::uri_encode_path;
-use checksum::ChecksumAlgorithm;
+use checksum::{ChecksumAlgorithm, ChecksumType};
 use quick_xml::{escape::unescape, events::Event, Reader};
 #[cfg(test)]
 use s3_types::VersionId;
@@ -15,6 +15,7 @@ use s3_types::{
     CanonicalUserId, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention,
     RetentionPeriod,
 };
+use server_core::system_metadata::SystemMetadata;
 use storage::{
     BucketEncryptionConfig, BucketLifecycleConfiguration, EffectiveBucketEncryptionConfig,
     ManagedEncryptionAlgorithm,
@@ -2401,15 +2402,39 @@ fn decode_tagging_text(bytes: &[u8]) -> Result<String, ServerError> {
 
 /// Format a `CopyObjectResult` XML response.
 #[must_use]
-pub fn copy_object_result_xml(etag: &str, last_modified: u64) -> String {
+pub fn copy_object_result_xml(
+    etag: &str,
+    last_modified: u64,
+    system_metadata: &SystemMetadata,
+) -> String {
+    let mut checksum_xml = String::new();
+    if let Some(checksum_type) = system_metadata.checksum_type() {
+        checksum_xml.push_str("<ChecksumType>");
+        checksum_xml.push_str(checksum_type.as_str());
+        checksum_xml.push_str("</ChecksumType>");
+    }
+    for (header, value) in system_metadata.checksum_header_pairs() {
+        let Some(tag) = checksum_header_to_xml_tag(header) else {
+            continue;
+        };
+        checksum_xml.push('<');
+        checksum_xml.push_str(tag);
+        checksum_xml.push('>');
+        checksum_xml.push_str(&xml_escape(value));
+        checksum_xml.push_str("</");
+        checksum_xml.push_str(tag);
+        checksum_xml.push('>');
+    }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <CopyObjectResult>\
+         <CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <ETag>{}</ETag>\
          <LastModified>{}</LastModified>\
+         {}\
          </CopyObjectResult>",
         xml_escape(etag),
         format_timestamp(last_modified),
+        checksum_xml,
     )
 }
 
@@ -3386,6 +3411,7 @@ pub fn complete_multipart_upload_xml(
     key: &str,
     etag: &str,
     checksum_algorithm: Option<ChecksumAlgorithm>,
+    checksum_type: Option<ChecksumType>,
     checksum_value: Option<&str>,
 ) -> String {
     // Location uses path-style: http://s3.amazonaws.com/<bucket>/<key>
@@ -3397,7 +3423,13 @@ pub fn complete_multipart_upload_xml(
     let checksum_xml = match (checksum_algorithm, checksum_value) {
         (Some(algo), Some(val)) => {
             let elem = algo.xml_element_name();
-            format!("<{elem}>{}</{elem}>", xml_escape(val))
+            let mut xml = format!("<{elem}>{}</{elem}>", xml_escape(val));
+            if let Some(checksum_type) = checksum_type {
+                xml.push_str("<ChecksumType>");
+                xml.push_str(checksum_type.as_str());
+                xml.push_str("</ChecksumType>");
+            }
+            xml
         }
         _ => String::new(),
     };
@@ -4456,11 +4488,21 @@ mod tests {
 
     #[test]
     fn copy_object_result_xml_format() {
-        let xml = copy_object_result_xml("\"abcdef1234567890\"", 1705321845000);
+        let mut system_metadata = SystemMetadata::new();
+        system_metadata.set_checksum(
+            ChecksumAlgorithm::Crc64nvme,
+            Some(checksum::ChecksumType::FullObject),
+            "AAAAAA==",
+        );
+        let xml = copy_object_result_xml("\"abcdef1234567890\"", 1705321845000, &system_metadata);
         assert!(xml.contains("<?xml"));
-        assert!(xml.contains("<CopyObjectResult>"));
+        assert!(
+            xml.contains("<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">")
+        );
         assert!(xml.contains("<ETag>&quot;abcdef1234567890&quot;</ETag>"));
         assert!(xml.contains("<LastModified>2024-01-15T12:30:45.000Z</LastModified>"));
+        assert!(xml.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"));
+        assert!(xml.contains("<ChecksumCRC64NVME>AAAAAA==</ChecksumCRC64NVME>"));
         assert!(xml.contains("</CopyObjectResult>"));
     }
 
@@ -5559,7 +5601,8 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_xml_format() {
-        let xml = complete_multipart_upload_xml("mybucket", "mykey", "\"etag123\"", None, None);
+        let xml =
+            complete_multipart_upload_xml("mybucket", "mykey", "\"etag123\"", None, None, None);
         assert!(xml.contains("<Location>http://s3.amazonaws.com/mybucket/mykey</Location>"));
         assert!(xml.contains("<Bucket>mybucket</Bucket>"));
         assert!(xml.contains("<Key>mykey</Key>"));
@@ -5569,14 +5612,16 @@ mod tests {
 
     #[test]
     fn complete_multipart_upload_xml_location_encodes_key() {
-        let xml = complete_multipart_upload_xml("mybucket", "path/to/my key", "\"e\"", None, None);
+        let xml =
+            complete_multipart_upload_xml("mybucket", "path/to/my key", "\"e\"", None, None, None);
         assert!(xml.contains("mybucket/path/to/my%20key"));
     }
 
     #[test]
     fn complete_multipart_upload_xml_location_encodes_literal_percent() {
         // A key containing literal %20 should encode the % as %25
-        let xml = complete_multipart_upload_xml("mybucket", "key%20name", "\"e\"", None, None);
+        let xml =
+            complete_multipart_upload_xml("mybucket", "key%20name", "\"e\"", None, None, None);
         assert!(xml.contains("mybucket/key%2520name"));
     }
 
@@ -5587,11 +5632,16 @@ mod tests {
             "mykey",
             "\"etag\"",
             Some(ChecksumAlgorithm::Sha256),
+            Some(ChecksumType::FullObject),
             Some("abc123=="),
         );
         assert!(
             xml.contains("<ChecksumSHA256>abc123==</ChecksumSHA256>"),
             "missing checksum element: {xml}"
+        );
+        assert!(
+            xml.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"),
+            "missing checksum type: {xml}"
         );
     }
 
