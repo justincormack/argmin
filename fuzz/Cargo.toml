@@ -1,0 +1,46 @@
+[package]
+name = "argmin-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+auth = { path = "../crates/auth" }
+base64 = "0.22"
+libfuzzer-sys = "0.4"
+serde_json = "1"
+server-http = { path = "../crates/server-http", default-features = false, features = ["pure-rust"] }
+
+[[bin]]
+name = "auth_dates"
+path = "fuzz_targets/auth_dates.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_post"
+path = "fuzz_targets/auth_post.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_request"
+path = "fuzz_targets/auth_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_parsers"
+path = "fuzz_targets/server_http_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

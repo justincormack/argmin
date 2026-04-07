@@ -188,6 +188,49 @@ Phase 3 status:
   query pass; remaining parser work, if any, is maintenance-oriented rather
   than tied to a known bug class from this plan
 
+### Phase 4: Parser fuzzing
+
+Targets:
+- `crates/auth`
+- `crates/server-http`
+
+Focus areas:
+- SigV4 date and timestamp parsing
+- SigV4 credential scope parsing
+- POST policy expiration parsing
+- presigned request query parsing
+- shared query parameter parsing
+- copy-source parsing
+- multipart form field parsing
+- XML timestamp and numeric field parsing used by Object Lock and related APIs
+
+Deliver:
+- add fuzz targets for parser helpers and narrow parser entry points rather
+  than trying to fuzz the whole HTTP server end-to-end
+- seed fuzz corpora with malformed UTF-8-adjacent ASCII, oversized numeric
+  fields, invalid ranges, duplicate query parameters, and delimiter edge cases
+- assert parser-level invariants such as:
+  - no panics
+  - no unbounded or pathological work from oversized numeric inputs
+  - malformed inputs map to bounded parser/auth/request errors rather than
+    internal errors
+
+Success criteria:
+- the parser surfaces involved in the earlier security findings all have
+  dedicated fuzz targets
+- fuzzing exercises malformed structural input beyond the current regression
+  tests
+- any newly discovered parser panic or pathological-work case feeds back into
+  the shared helper set and regression suite
+
+Current progress:
+- added a `cargo-fuzz` harness under `fuzz/`
+- initial fuzz targets cover:
+  - auth date/timestamp parsing
+  - auth POST SigV4 and POST policy parsing
+  - auth request/presigned request parsing entry points
+  - server-http routing and URL-encoded tag parsing
+
 ## Implementation Notes
 
 Recommended order:
