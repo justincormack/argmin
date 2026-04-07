@@ -1,0 +1,31 @@
+#!/bin/env bash
+
+set -euo pipefail
+
+if ! command -v rg >/dev/null 2>&1; then
+    echo "error: rg is required for scripts/check-parser-hotspots" >&2
+    exit 1
+fi
+
+targets=(
+    "crates/auth/src"
+    "crates/server-http/src"
+)
+
+show_matches() {
+    local label=$1
+    local pattern=$2
+
+    echo
+    echo "== $label =="
+    rg -n --color=never "$pattern" "${targets[@]}" || true
+}
+
+echo "Parser hotspot sweep"
+echo "This is an advisory review helper, not a correctness proof."
+echo "Matches may be safe after prior validation and still require human review."
+
+show_matches "byte slicing and split_at" '\[\.\.|split_at\('
+show_matches "split-based parser sites" 'splitn\(|split_once\('
+show_matches "loops over parsed request values" 'for .* in .*(year|month|day|hour|min|sec|len|count|index|idx|number|part|marker|max)'
+show_matches "direct indexing with parsed-looking values" '\[[[:space:]]*[A-Za-z_][A-Za-z0-9_]*(?:_idx|_index|idx|index|month|day|part|number|marker|max)[[:space:]]*\]'

@@ -147,6 +147,33 @@ than the backing allocation is UB in Rust even if no bytes are accessed —
 the entire span is required to be valid memory. A `pub(crate)` helper is
 zero overhead, clearly testable, and eliminates the UB entirely.
 
+### Review request parsers for unsafe string and numeric assumptions
+
+Recent auth and HTTP hardening bugs had the same basic shape: request-derived
+protocol fields were kept as raw `&str`, then later sliced by byte offset,
+split with unchecked positional assumptions, indexed by parsed numbers, or
+used to drive loops before the input had been converted into a validated
+domain type.
+
+Use these review rules for request/auth boundary code:
+
+- parse wire-format fields once into validated types or shared helpers
+- treat ASCII protocol formats as ASCII bytes before positional access
+- reject invalid ranges before indexing arrays or doing derived arithmetic
+- do not add new ad hoc parsers when a shared helper already exists
+
+Patterns that require explicit justification in review:
+
+- `&str[..n]` or `split_at(n)` on request-derived input
+- `splitn` / `split_once` followed by positional assumptions in parser code
+- array indexing from parsed request values
+- loops whose bounds come from parsed request values
+
+The repository includes `scripts/check-parser-hotspots` as a lightweight
+manual sweep for these patterns. It is intentionally advisory rather than a
+CI gate, because some matches are safe after prior validation and still need
+human review.
+
 ---
 
 ## Storage System Specifics
