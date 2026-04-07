@@ -35,6 +35,33 @@ fn agent() -> ureq::Agent {
     s3_tests::test_agent()
 }
 
+fn anonymous_get_status(url: &str) -> u16 {
+    let mut resp = agent().get(url).call().expect("transport error");
+    let status = resp.status().as_u16();
+    let _ = resp.body_mut().read_to_string();
+    status
+}
+
+async fn anonymous_get_status_eventually(url: &str, expected_status: u16, description: &str) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let status = anonymous_get_status(url);
+        if status == expected_status {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "{description} did not converge to HTTP {expected_status} for {url}, last status {status}"
+        );
+    }
+
+    unreachable!()
+}
+
 /// Cleanup helper.
 async fn cleanup(bucket: &str) {
     let client = CTX.client();
@@ -88,6 +115,65 @@ async fn object_owner_id(bucket: &str, key: &str) -> String {
         .id()
         .expect("expected owner ID in GetObjectAcl")
         .to_string()
+}
+
+async fn alt_get_object_access_denied_eventually(bucket: &str, key: &str) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .alt_client()
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        if result.is_err() && err_status(&result) == 403 && {
+            assert_s3_err_code(&result, "AccessDenied");
+            true
+        } {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "alternate GetObject did not converge to AccessDenied for {bucket}/{key}: {:?}",
+            result
+        );
+    }
+
+    unreachable!()
+}
+
+async fn alt_list_bucket_access_denied_eventually(bucket: &str) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .alt_client()
+            .list_objects_v2()
+            .bucket(bucket)
+            .send()
+            .await;
+        if result.is_err() && err_status(&result) == 403 && {
+            assert_s3_err_code(&result, "AccessDenied");
+            true
+        } {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "alternate ListObjectsV2 did not converge to AccessDenied for {bucket}: {:?}",
+            result
+        );
+    }
+
+    unreachable!()
 }
 
 fn authenticated_users_group_grant(permission: Permission) -> Grant {
@@ -460,22 +546,20 @@ fn test_ignore_public_acls() {
             .unwrap();
 
         // Anonymous list_objects should now fail (public ACL is ignored)
-        let mut list_resp2 = agent().get(&list_url).call().expect("transport error");
-        let _ = list_resp2.body_mut().read_to_string();
-        assert_eq!(
-            list_resp2.status().as_u16(),
+        anonymous_get_status_eventually(
+            &list_url,
             403,
-            "expected anonymous list_objects to fail when IgnorePublicAcls is set"
-        );
+            "anonymous list_objects after IgnorePublicAcls",
+        )
+        .await;
 
         // Anonymous GET object should also fail
-        let mut get_resp2 = agent().get(&get_url).call().expect("transport error");
-        let _ = get_resp2.body_mut().read_to_string();
-        assert_eq!(
-            get_resp2.status().as_u16(),
+        anonymous_get_status_eventually(
+            &get_url,
             403,
-            "expected anonymous get_object to fail when IgnorePublicAcls is set"
-        );
+            "anonymous get_object after IgnorePublicAcls",
+        )
+        .await;
 
         // Authenticated owner access should still work
         let info = client.head_bucket().bucket(&bucket).send().await;
@@ -508,7 +592,7 @@ fn test_ignore_public_acls() {
 }
 
 #[test]
-fn test_ignore_public_acls_does_not_disable_authenticated_read_object_acl() {
+fn test_ignore_public_acls_disables_authenticated_read_object_acl() {
     s3_tests::run(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
@@ -545,15 +629,7 @@ fn test_ignore_public_acls_does_not_disable_authenticated_read_object_acl() {
             .await
             .unwrap();
 
-        let after = alt_client
-            .get_object()
-            .bucket(&bucket)
-            .key("key1")
-            .send()
-            .await
-            .unwrap();
-        let after_body = after.body.collect().await.unwrap().into_bytes();
-        assert_eq!(&after_body[..], b"abcde");
+        alt_get_object_access_denied_eventually(&bucket, "key1").await;
 
         client
             .delete_object()
@@ -567,7 +643,7 @@ fn test_ignore_public_acls_does_not_disable_authenticated_read_object_acl() {
 }
 
 #[test]
-fn test_ignore_public_acls_does_not_disable_authenticated_read_bucket_acl() {
+fn test_ignore_public_acls_disables_authenticated_read_bucket_acl() {
     s3_tests::run(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
@@ -614,18 +690,7 @@ fn test_ignore_public_acls_does_not_disable_authenticated_read_bucket_acl() {
             .await
             .unwrap();
 
-        let after = alt_client
-            .list_objects_v2()
-            .bucket(&bucket)
-            .send()
-            .await
-            .unwrap();
-        let after_keys: Vec<&str> = after
-            .contents()
-            .iter()
-            .filter_map(|obj| obj.key())
-            .collect();
-        assert_eq!(after_keys, vec!["key1"]);
+        alt_list_bucket_access_denied_eventually(&bucket).await;
 
         client
             .delete_object()
@@ -639,7 +704,7 @@ fn test_ignore_public_acls_does_not_disable_authenticated_read_bucket_acl() {
 }
 
 #[test]
-fn test_ignore_public_acls_does_not_disable_authenticated_read_put_object_acl() {
+fn test_ignore_public_acls_disables_authenticated_read_put_object_acl() {
     s3_tests::run(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
@@ -684,15 +749,7 @@ fn test_ignore_public_acls_does_not_disable_authenticated_read_put_object_acl() 
             .await
             .unwrap();
 
-        let after = alt_client
-            .get_object()
-            .bucket(&bucket)
-            .key("key1")
-            .send()
-            .await
-            .unwrap();
-        let after_body = after.body.collect().await.unwrap().into_bytes();
-        assert_eq!(&after_body[..], b"abcde");
+        alt_get_object_access_denied_eventually(&bucket, "key1").await;
 
         client
             .delete_object()
