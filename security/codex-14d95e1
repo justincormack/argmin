@@ -1,0 +1,264 @@
+Malformed x-amz-date can panic time-skew parsing
+Link: https://chatgpt.com/codex/security/findings/3362979b05348191b3057567f2ea79c4?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: low)
+Status: new
+Criticality notes: this is a crash, the other crashes were also rated as medium
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 14d95e1
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 23:32:05
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Bug introduced in this commit: parse_amz_date lacks safe ASCII validation while the time-skew check calls it on requests.
+parse_amz_date assumes ASCII and slices the timestamp at fixed byte offsets (e.g., ts[0..4], ts[4..6]). For a 16‑byte UTF‑8 string containing multibyte characters that do not align with those offsets, Rust will panic due to invalid UTF‑8 boundaries. Because authenticate() calls parse_amz_date on every signed request, an authenticated client can send a crafted x-amz-date header that triggers a panic and terminates the server process, resulting in a denial of service.
+
+# Reviewer note
+This report was valid for the historical `14d95e1` implementation, but it is already fixed in the current tree.
+
+The fix landed in commit `05c8412` (`auth: start request parser hardening`), which replaced the raw `str[..]` timestamp slicing with byte-oriented ASCII parsing in `parse_amz_date` and added regression coverage for malformed multibyte input.
+
+# Validation
+## Rubric
+- [x] Locate parse_amz_date slicing of fixed byte ranges without ASCII boundary validation (crates/auth/src/canonical.rs:180-192).
+- [x] Confirm authenticate() invokes parse_amz_date on x-amz-date for signed requests (crates/server/src/http/mod.rs:140-156).
+- [x] Demonstrate a runtime panic with a 16-byte UTF-8 header value containing a multibyte character at a slice boundary.
+- [ ] Reproduce the panic via a full server HTTP request (blocked by offline dependency resolution).
+- [x] Capture crash output/backtrace proving the UTF-8 boundary panic.
+## Report
+Rubric-driven validation:
+1) Attempted to compile/run a direct crate test with `cargo test -p auth --test amz_date_panic`, but Cargo failed to resolve dependencies offline (tiny_http download blocked), so full-crate execution wasn’t possible in this environment.
+2) Used a minimal Rust PoC that copies `parse_amz_date` and its helpers from `crates/auth/src/canonical.rs` to demonstrate the panic condition without external deps.
+3) The PoC uses a 16‑byte UTF‑8 string `"12345678T€ABCZ"` where byte 11 is inside the multibyte `€`. Running the PoC panics with “byte index 11 is not a char boundary,” showing the slicing panic (crash output captured).
+4) Code review confirms `parse_amz_date` slices fixed byte ranges without ASCII validation (canonical.rs:180‑192) and `authenticate()` calls it on `x-amz-date` (server/src/http/mod.rs:140‑156), so a crafted header value can trigger the panic and crash the server process.
+
+Key evidence:
+- `parse_amz_date` uses `ts[0..4]`, `ts[9..11]`, etc. after only `len()` and `as_bytes()` checks (crates/auth/src/canonical.rs:180‑192).
+- `authenticate()` calls `parse_amz_date(amz_date)` for `x-amz-date` on signed requests (crates/server/src/http/mod.rs:140‑156).
+- PoC crash: `byte index 11 is not a char boundary; it is inside '€' (bytes 9..12)` (see crash_output.txt).
+
+Valgrind/debugger were not needed after a direct crash reproduction succeeded.
+
+# Evidence
+/workspace/argmin/crates/auth/src/canonical.rs (L180 to 192)
+  Note: parse_amz_date slices the UTF‑8 string at fixed byte offsets without ensuring ASCII digit boundaries, which can panic on malformed 16‑byte values.
+```
+/// Parse an ISO 8601 SigV4 timestamp ("YYYYMMDDTHHMMSSz") into Unix epoch seconds.
+/// Returns None if the format is invalid.
+pub fn parse_amz_date(ts: &str) -> Option<u64> {
+    // Expected format: "20130524T000000Z" (exactly 16 chars)
+    if ts.len() != 16 || ts.as_bytes()[8] != b'T' || ts.as_bytes()[15] != b'Z' {
+        return None;
+    }
+    let year: u32 = ts[0..4].parse().ok()?;
+    let month: u32 = ts[4..6].parse().ok()?;
+    let day: u32 = ts[6..8].parse().ok()?;
+    let hour: u32 = ts[9..11].parse().ok()?;
+    let min: u32 = ts[11..13].parse().ok()?;
+    let sec: u32 = ts[13..15].parse().ok()?;
+```
+
+/workspace/argmin/crates/server/src/http/mod.rs (L140 to 156)
+  Note: authenticate() invokes parse_amz_date on x-amz-date for every signed request, so a panic here crashes the server.
+```
+        // Enforce ±15 minute time skew on x-amz-date to prevent replay attacks.
+        if let Some(amz_date) = req.header("x-amz-date") {
+            if let Some(request_epoch) = parse_amz_date(amz_date) {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let skew = if now > request_epoch {
+                    now - request_epoch
+                } else {
+                    request_epoch - now
+                };
+                if skew > 15 * 60 {
+                    return Err(ServerError::Auth(auth::AuthError::RequestExpired));
+                }
+            }
+        }
+```
+
+Proposed patch:
+diff --git a/crates/auth/src/canonical.rs b/crates/auth/src/canonical.rs
+index f23ca6bc4f662b47e3c8b096488e9ef6042a91f3..04b0960988ab2a35523f063447f2ae2cd4517e33 100644
+--- a/crates/auth/src/canonical.rs
++++ b/crates/auth/src/canonical.rs
+@@ -192,70 +192,80 @@ fn percent_decode(s: &str) -> String {
+ fn hex_val(b: u8) -> Option<u8> {
+     match b {
+         b'0'..=b'9' => Some(b - b'0'),
+         b'a'..=b'f' => Some(b - b'a' + 10),
+         b'A'..=b'F' => Some(b - b'A' + 10),
+         _ => None,
+     }
+ }
+ 
+ /// Build the string-to-sign per SigV4 spec.
+ ///
+ /// Parameters:
+ /// - `timestamp`: ISO 8601 timestamp (e.g. "20130524T000000Z")
+ /// - `scope`: Credential scope string (e.g. "20130524/us-east-1/s3/aws4_request")
+ /// - `canonical_request_hash`: SHA-256 hex hash of the canonical request
+ pub fn string_to_sign(timestamp: &str, scope: &str, canonical_request_hash: &str) -> String {
+     format!(
+         "AWS4-HMAC-SHA256\n{}\n{}\n{}",
+         timestamp, scope, canonical_request_hash
+     )
+ }
+ 
+ /// Parse an ISO 8601 SigV4 timestamp ("YYYYMMDDTHHMMSSz") into Unix epoch seconds.
+ /// Returns None if the format is invalid.
+ pub fn parse_amz_date(ts: &str) -> Option<u64> {
++    let bytes = ts.as_bytes();
+     // Expected format: "20130524T000000Z" (exactly 16 chars)
+-    if ts.len() != 16 || ts.as_bytes()[8] != b'T' || ts.as_bytes()[15] != b'Z' {
++    if bytes.len() != 16 || bytes[8] != b'T' || bytes[15] != b'Z' {
+         return None;
+     }
+-    let year: u32 = ts[0..4].parse().ok()?;
+-    let month: u32 = ts[4..6].parse().ok()?;
+-    let day: u32 = ts[6..8].parse().ok()?;
+-    let hour: u32 = ts[9..11].parse().ok()?;
+-    let min: u32 = ts[11..13].parse().ok()?;
+-    let sec: u32 = ts[13..15].parse().ok()?;
++    let year = parse_ascii_digits(&bytes[0..4])?;
++    let month = parse_ascii_digits(&bytes[4..6])?;
++    let day = parse_ascii_digits(&bytes[6..8])?;
++    let hour = parse_ascii_digits(&bytes[9..11])?;
++    let min = parse_ascii_digits(&bytes[11..13])?;
++    let sec = parse_ascii_digits(&bytes[13..15])?;
+ 
+     if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
+         return None;
+     }
+ 
+     // Days from epoch (1970-01-01) to the given date
+     let days = days_since_epoch(year, month, day)?;
+     Some(days as u64 * 86400 + hour as u64 * 3600 + min as u64 * 60 + sec as u64)
+ }
+ 
++fn parse_ascii_digits(bytes: &[u8]) -> Option<u32> {
++    bytes.iter().try_fold(0u32, |acc, &b| {
++        if !b.is_ascii_digit() {
++            return None;
++        }
++        Some(acc * 10 + (b - b'0') as u32)
++    })
++}
++
+ /// Days from 1970-01-01 to the given date.
+ fn days_since_epoch(year: u32, month: u32, day: u32) -> Option<u64> {
+     if year < 1970 {
+         return None;
+     }
+     // Cumulative days before each month (non-leap)
+     const MONTH_DAYS: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+ 
+     let mut days: u64 = 0;
+     // Full years
+     for y in 1970..year {
+         days += if is_leap(y) { 366 } else { 365 };
+     }
+     // Months in current year
+     days += MONTH_DAYS[(month - 1) as usize] as u64;
+     // Leap day adjustment
+     if month > 2 && is_leap(year) {
+         days += 1;
+     }
+     days += (day - 1) as u64;
+     Some(days)
+ }
+ 
+ fn is_leap(y: u32) -> bool {
+     y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400))
+@@ -405,50 +415,55 @@ mod tests {
+     }
+ 
+     #[test]
+     fn parse_amz_date_with_time() {
+         let epoch = parse_amz_date("20130524T120000Z").unwrap();
+         assert_eq!(epoch, 1369353600 + 12 * 3600);
+     }
+ 
+     #[test]
+     fn parse_amz_date_invalid_format() {
+         assert!(parse_amz_date("").is_none());
+         assert!(parse_amz_date("2013-05-24T00:00:00Z").is_none());
+         assert!(parse_amz_date("not-a-timestamp").is_none());
+         assert!(parse_amz_date("20130524T000000").is_none()); // missing Z
+         assert!(parse_amz_date("20130524X000000Z").is_none()); // bad separator
+         assert!(parse_amz_date("20130524T000000X").is_none()); // bad suffix
+     }
+ 
+     #[test]
+     fn parse_amz_date_invalid_values() {
+         assert!(parse_amz_date("20131324T000000Z").is_none()); // month 13
+         assert!(parse_amz_date("20130532T000000Z").is_none()); // day 32
+         assert!(parse_amz_date("20130524T250000Z").is_none()); // hour 25
+     }
+ 
++    #[test]
++    fn parse_amz_date_non_ascii_rejected_without_panic() {
++        assert!(parse_amz_date("12345678T€ABCZ").is_none());
++    }
++
+     // ── Property-based tests ────────────────────────────────────────
+ 
+     fn normalize_value_ref(value: &str) -> String {
+         let trimmed = value.trim();
+         let mut result = String::with_capacity(trimmed.len());
+         let mut prev_was_space = false;
+         for ch in trimmed.chars() {
+             if ch.is_ascii_whitespace() {
+                 if !prev_was_space {
+                     result.push(' ');
+                     prev_was_space = true;
+                 }
+             } else {
+                 result.push(ch);
+                 prev_was_space = false;
+             }
+         }
+         result
+     }
+ 
+     fn parse_canonical_headers(s: &str) -> Vec<(String, Vec<String>)> {
+         let mut out: Vec<(String, Vec<String>)> = Vec::new();
+         for line in s.split('\n') {
+             if line.is_empty() {
+                 continue;
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Although the bug is a real panic reachable via the HTTP authentication path, it requires valid SigV4 credentials and only impacts availability. The project is single-tenant by design and defaults to localhost listening, reducing realistic attacker reach. Therefore, the risk is lowered from medium to low.
+## Likelihood
+high - Exploitation requires valid credentials and a crafted UTF-8 header; default listening on localhost reduces exposure unless reconfigured. | Remote network vector
+## Impact
+medium - A panic in the request authentication path terminates the single-process HTTP server, causing service-wide unavailability until restart.
+## Assumptions
+- The server is reachable over the network (ARGMIN_LISTEN_ADDR not restricted to localhost in deployment).
+- An attacker can obtain valid SigV4 credentials (ARGMIN_ACCESS_KEY_ID/ARGMIN_SECRET_ACCESS_KEY) or abuse leaked credentials.
+- tiny_http accepts UTF-8 header values containing multibyte characters without rejecting them.
+- Valid SigV4 credentials to pass verify_request
+- Ability to send a signed request with a 16-byte UTF-8 x-amz-date header containing multibyte characters
+## Path
+attacker -> HTTP endpoint -> authenticate(parse_amz_date) -> panic -> server down
+## Path evidence
+- `crates/auth/src/canonical.rs:180-192` - parse_amz_date slices fixed byte offsets on a UTF-8 string without ASCII validation, which can panic on multibyte boundaries.
+- `crates/server/src/http/mod.rs:121-156` - authenticate() calls parse_amz_date on x-amz-date for every signed request.
+- `crates/server/src/config.rs:19-34` - Default listen address is 127.0.0.1:9000, configurable via ARGMIN_LISTEN_ADDR.
+## Narrative
+The HTTP frontend authenticates every request and enforces time-skew using parse_amz_date on the x-amz-date header. parse_amz_date slices the header string at fixed byte offsets without ensuring ASCII boundaries, which can panic for valid UTF-8 strings with multibyte characters. Because authenticate() runs for every signed request, an attacker with valid credentials can craft a 16-byte UTF-8 x-amz-date to trigger a panic and terminate the server process, causing a denial of service.
+## Controls
+- SigV4 authentication required (Authorization header)
+- Request body size limits enforced in request parsing
+## Blindspots
+- No deployment manifests found to confirm actual network exposure.
+- tiny_http header validation behavior not verified at runtime in this analysis.
+- No dynamic test of the full server request path due to offline build constraints.
