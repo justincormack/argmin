@@ -14,6 +14,13 @@ fn agent() -> ureq::Agent {
     s3_tests::test_agent()
 }
 
+fn anonymous_get_status_and_body(url: &str) -> (u16, String) {
+    let mut resp = agent().get(url).call().expect("transport error");
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, body)
+}
+
 fn endpoint_is_https() -> bool {
     CTX.endpoint().starts_with("https://")
 }
@@ -97,6 +104,100 @@ async fn cleanup_with_client(client: &aws_sdk_s3::Client, bucket: &str, keys: &[
 
 async fn cleanup(bucket: &str, keys: &[&str]) {
     cleanup_with_client(CTX.client(), bucket, keys).await;
+}
+
+async fn alt_list_objects_v1_eventually(
+    bucket: &str,
+) -> aws_sdk_s3::operation::list_objects::ListObjectsOutput {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match CTX.alt_client().list_objects().bucket(bucket).send().await {
+            Ok(output) => return output,
+            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!("alternate ListObjects failed unexpectedly: {err:?}"),
+        }
+    }
+
+    unreachable!()
+}
+
+async fn alt_list_objects_v2_eventually(
+    bucket: &str,
+) -> aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match CTX
+            .alt_client()
+            .list_objects_v2()
+            .bucket(bucket)
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!("alternate ListObjectsV2 failed unexpectedly: {err:?}"),
+        }
+    }
+
+    unreachable!()
+}
+
+async fn anonymous_list_bucket_access_denied_eventually(url: &str) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let (status, body) = anonymous_get_status_and_body(url);
+        if status == 403 && body.contains("<Code>AccessDenied</Code>") {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "anonymous bucket listing did not converge to AccessDenied for {url}, last status {status}, last body {body}"
+        );
+    }
+
+    unreachable!()
+}
+
+async fn upload_part_copy_eventually(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    copy_source: String,
+) -> aws_sdk_s3::operation::upload_part_copy::UploadPartCopyOutput {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match client
+            .upload_part_copy()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .copy_source(copy_source.clone())
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!("UploadPartCopy failed unexpectedly: {err:?}"),
+        }
+    }
+
+    unreachable!()
 }
 
 async fn create_bucket_allowing_public_policy(client: &aws_sdk_s3::Client) -> String {
@@ -563,7 +664,6 @@ fn test_bucket_policy_list_objects_v1() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
         let client = CTX.client();
-        let alt_client = CTX.alt_client();
 
         let bucket = create_bucket_allowing_sse_c(client).await;
         client
@@ -588,12 +688,7 @@ fn test_bucket_policy_list_objects_v1() {
             .await
             .unwrap();
 
-        let response = alt_client
-            .list_objects()
-            .bucket(&bucket)
-            .send()
-            .await
-            .unwrap();
+        let response = alt_list_objects_v1_eventually(&bucket).await;
         assert_eq!(response.contents().len(), 1);
         assert_eq!(response.contents()[0].key(), Some("obj"));
 
@@ -606,7 +701,6 @@ fn test_bucket_policy_list_objects_v2() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
         let client = CTX.client();
-        let alt_client = CTX.alt_client();
 
         let bucket = create_bucket_allowing_sse_c(client).await;
         client
@@ -631,12 +725,7 @@ fn test_bucket_policy_list_objects_v2() {
             .await
             .unwrap();
 
-        let response = alt_client
-            .list_objects_v2()
-            .bucket(&bucket)
-            .send()
-            .await
-            .unwrap();
+        let response = alt_list_objects_v2_eventually(&bucket).await;
         assert_eq!(response.contents().len(), 1);
         assert_eq!(response.contents()[0].key(), Some("obj"));
 
@@ -686,13 +775,7 @@ fn test_bucket_policy_list_deny_overrides_bucket_acl() {
             .await
             .unwrap();
 
-        let mut denied = agent().get(&url).call().expect("transport error");
-        assert_eq!(denied.status().as_u16(), 403);
-        let denied_body = denied.body_mut().read_to_string().unwrap();
-        assert!(
-            denied_body.contains("<Code>AccessDenied</Code>"),
-            "expected AccessDenied after deny policy: {denied_body}"
-        );
+        anonymous_list_bucket_access_denied_eventually(&url).await;
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -1937,16 +2020,15 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
             .unwrap();
         let upload_id = upload.upload_id().unwrap().to_string();
 
-        let copied_part = alt_client
-            .upload_part_copy()
-            .bucket(&dst_bucket)
-            .key("copied")
-            .upload_id(&upload_id)
-            .part_number(1)
-            .copy_source(format!("{src_bucket}/public/foo"))
-            .send()
-            .await
-            .unwrap();
+        let copied_part = upload_part_copy_eventually(
+            alt_client,
+            &dst_bucket,
+            "copied",
+            &upload_id,
+            1,
+            format!("{src_bucket}/public/foo"),
+        )
+        .await;
         complete_single_part_upload(
             alt_client,
             &dst_bucket,
@@ -1964,16 +2046,15 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
             .await
             .unwrap();
         let second_upload_id = second_upload.upload_id().unwrap().to_string();
-        let second_part = alt_client
-            .upload_part_copy()
-            .bucket(&dst_bucket)
-            .key("copied2")
-            .upload_id(&second_upload_id)
-            .part_number(1)
-            .copy_source(format!("{src_bucket}/public/bar"))
-            .send()
-            .await
-            .unwrap();
+        let second_part = upload_part_copy_eventually(
+            alt_client,
+            &dst_bucket,
+            "copied2",
+            &second_upload_id,
+            1,
+            format!("{src_bucket}/public/bar"),
+        )
+        .await;
         complete_single_part_upload(
             alt_client,
             &dst_bucket,

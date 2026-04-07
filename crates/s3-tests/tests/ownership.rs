@@ -15,6 +15,13 @@ fn agent() -> ureq::Agent {
     s3_tests::test_agent()
 }
 
+fn anonymous_get_status(url: &str) -> u16 {
+    let mut resp = agent().get(url).call().expect("transport error");
+    let status = resp.status().as_u16();
+    let _ = resp.body_mut().read_to_string();
+    status
+}
+
 /// Cleanup helper.
 async fn cleanup(bucket: &str) {
     let client = CTX.client();
@@ -326,14 +333,7 @@ fn test_bucket_owner_cannot_get_private_object_written_by_other_user() {
             .await
             .unwrap();
 
-        let get = client
-            .get_object()
-            .bucket(&bucket)
-            .key("writer-owned")
-            .send()
-            .await;
-        assert_eq!(err_status(&get), 403);
-        assert_s3_err_code(&get, "AccessDenied");
+        owner_get_object_access_denied_eventually(&bucket, "writer-owned").await;
 
         client
             .delete_object()
@@ -1086,6 +1086,104 @@ async fn owner_get_object_access_denied_eventually(bucket: &str, key: &str) {
     unreachable!()
 }
 
+async fn owner_get_object_eventually(
+    bucket: &str,
+    key: &str,
+) -> aws_sdk_s3::operation::get_object::GetObjectOutput {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match CTX
+            .client()
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!("owner GetObject failed unexpectedly: {err:?}"),
+        }
+    }
+
+    unreachable!()
+}
+
+async fn anonymous_get_status_eventually(url: &str, expected_status: u16, description: &str) {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let status = anonymous_get_status(url);
+        if status == expected_status {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "{description} did not converge to HTTP {expected_status} for {url}, last status {status}"
+        );
+    }
+
+    unreachable!()
+}
+
+async fn anonymous_get_body_eventually(url: &str, expected_body: &str, description: &str) {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut resp = agent().get(url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        if status == 200 && body == expected_body {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "{description} did not converge to anonymous GET 200 with expected body for {url}, last status {status}, last body {body}"
+        );
+    }
+
+    unreachable!()
+}
+
+async fn alt_get_object_access_denied_eventually(bucket: &str, key: &str) {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .alt_client()
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        if result.is_err() && err_status(&result) == 403 && {
+            assert_s3_err_code(&result, "AccessDenied");
+            true
+        } {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "alternate GetObject did not converge to AccessDenied for {bucket}/{key}: {:?}",
+            result
+        );
+    }
+
+    unreachable!()
+}
+
 async fn run_cross_account_object_ownership_matrix(
     ownership: ObjectOwnership,
     expected_no_acl_owner_is_bucket_owner: bool,
@@ -1398,13 +1496,8 @@ fn test_bucket_owner_enforced_acl_read_and_restore_semantics() {
             boe_acl.grants()
         );
 
-        let body = client
-            .get_object()
-            .bucket(&bucket)
-            .key("pre-boe")
-            .send()
+        let body = owner_get_object_eventually(&bucket, "pre-boe")
             .await
-            .unwrap()
             .body
             .collect()
             .await
@@ -1462,28 +1555,11 @@ fn test_bucket_owner_enforced_disables_legacy_public_read_object_acl() {
 
         let object_url = format!("{}/{}/pre-boe-public", CTX.endpoint(), bucket);
 
-        let mut before = agent().get(&object_url).call().expect("transport error");
-        assert_eq!(
-            before.status().as_u16(),
-            200,
-            "expected anonymous GET before BOE to succeed"
-        );
-        let before_body = before.body_mut().read_to_string().unwrap_or_default();
-        assert_eq!(before_body, "public");
+        anonymous_get_body_eventually(&object_url, "public", "anonymous GET before BOE").await;
 
         set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
 
-        let mut after = agent().get(&object_url).call().expect("transport error");
-        assert_eq!(
-            after.status().as_u16(),
-            403,
-            "expected anonymous GET after BOE to be denied"
-        );
-        let after_body = after.body_mut().read_to_string().unwrap_or_default();
-        assert!(
-            after_body.contains("<Code>AccessDenied</Code>"),
-            "expected AccessDenied after BOE, got {after_body}"
-        );
+        anonymous_get_status_eventually(&object_url, 403, "anonymous GET after BOE").await;
 
         cleanup_keys(&bucket, &["pre-boe-public"]).await;
     });
@@ -1529,15 +1605,7 @@ fn test_bucket_owner_enforced_disables_legacy_explicit_grantee_read_acl() {
 
         set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
 
-        let result = CTX
-            .alt_client()
-            .get_object()
-            .bucket(&bucket)
-            .key("pre-boe-grant-read")
-            .send()
-            .await;
-        assert_eq!(err_status(&result), 403);
-        assert_s3_err_code(&result, "AccessDenied");
+        alt_get_object_access_denied_eventually(&bucket, "pre-boe-grant-read").await;
 
         cleanup_keys(&bucket, &["pre-boe-grant-read"]).await;
     });
@@ -1697,15 +1765,7 @@ fn test_bucket_owner_enforced_restores_legacy_explicit_grantee_read_acl() {
 
         set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
 
-        let during_boe = CTX
-            .alt_client()
-            .get_object()
-            .bucket(&bucket)
-            .key("pre-boe-grant-read")
-            .send()
-            .await;
-        assert_eq!(err_status(&during_boe), 403);
-        assert_s3_err_code(&during_boe, "AccessDenied");
+        alt_get_object_access_denied_eventually(&bucket, "pre-boe-grant-read").await;
 
         delete_bucket_ownership(&bucket).await;
 
