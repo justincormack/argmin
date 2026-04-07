@@ -1,0 +1,438 @@
+Unvalidated response-* overrides can inject response headers
+Link: https://chatgpt.com/codex/security/findings/2aad595ee3c081918023b14b86ba8bee?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=low
+Criticality: low (attack path: low)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 30ada09
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 23:22:41
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+A security-relevant bug is introduced: response header values derived from query parameters are not validated for control characters before being emitted as headers.
+The commit adds apply_response_overrides for GetObject responses. It takes attacker-controlled query parameters (response-content-type, response-content-disposition, etc.) and inserts them directly into response headers. These values are percent-decoded without any validation or filtering of control characters, unlike stored metadata which is validated elsewhere. If the HTTP header builder accepts CR/LF or other control bytes, an attacker could craft a URL with %0d%0a to inject arbitrary headers or split responses, enabling cache poisoning or client-side attacks. This path is new to the commit and does not enforce the existing invalid-header-byte checks.
+
+# Validation
+## Rubric
+- [ ] Build debug server and run a crafted GetObject request to observe header injection at runtime (cargo build failed due to crates.io 403).
+- [ ] Run under valgrind/asan or debugger to confirm behavior (tools not installed).
+- [x] Confirm response-* overrides flow from query params into response headers without validation.
+- [x] Confirm query_param percent-decodes raw bytes without filtering control characters.
+- [x] Compare to metadata header validation to show missing control-byte checks on this path.
+## Report
+Rubric/checklist:
+- [ ] Build debug server and run a crafted GetObject request to observe header injection at runtime (cargo build failed due to crates.io 403).
+- [ ] Run under valgrind/asan or debugger to confirm behavior (tools not installed).
+- [x] Confirm response-* overrides flow from query params into response headers without validation.
+- [x] Confirm query_param percent-decodes raw bytes without filtering control characters.
+- [x] Compare to metadata header validation to show missing control-byte checks on this path.
+
+Crash/valgrind/debugger attempts:
+- `cargo build -p server` failed because crates.io access is blocked (CONNECT tunnel 403), so no runtime PoC could be executed.
+- `valgrind --version` and `gdb --version` are not available in the container.
+
+Code evidence:
+- GetObject path calls `apply_response_overrides` for non-range responses (crates/server/src/http/mod.rs:230-250), meaning attacker-controlled query params can influence headers.
+- `apply_response_overrides` maps response-* query params to header names and directly pushes the value into `resp.headers` without any validation (crates/server/src/http/mod.rs:431-445).
+- `query_param` returns `percent_decode(val)` and `percent_decode` decodes raw bytes via `percent_decode_bytes` without filtering control bytes (crates/server/src/http/request.rs:126-173). This allows `%0d%0a` or other control bytes to survive decoding.
+- By contrast, stored metadata headers are explicitly checked for invalid header bytes using `has_invalid_header_bytes` and rejected if they contain control bytes or non-ASCII (crates/server/src/metadata_blob.rs:43-73), showing a missing check on the response override path.
+- Response emission uses `tiny_http::Header::from_bytes` and silently drops invalid headers if parsing fails (crates/server/src/http/mod.rs:408-415). If `tiny_http` accepts control bytes, this path can enable header injection/response splitting; if it rejects them, the override is dropped. The code itself does not validate, so the risk depends on `tiny_http` behavior.
+
+Conclusion: The commit introduces a new path where response header values derived from query parameters are not validated for control characters before being emitted. This matches the suspected finding, but runtime confirmation could not be performed due to build/network restrictions and missing debugging tools.
+
+# Evidence
+/workspace/argmin/crates/server/src/http/mod.rs (L431 to 445)
+  Note: apply_response_overrides inserts query parameter values directly into response headers without validating control bytes.
+```
+/// Apply response-* query parameter overrides to a GET response.
+fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
+    let overrides: &[(&str, &str)] = &[
+        ("response-content-type", "Content-Type"),
+        ("response-content-disposition", "Content-Disposition"),
+        ("response-content-encoding", "Content-Encoding"),
+        ("response-content-language", "Content-Language"),
+        ("response-cache-control", "Cache-Control"),
+        ("response-expires", "Expires"),
+    ];
+    for &(param, header_name) in overrides {
+        if let Some(value) = req.query_param(param) {
+            resp.headers.retain(|(k, _)| !k.eq_ignore_ascii_case(header_name));
+            resp.headers.push((header_name.to_string(), value));
+        }
+```
+
+/workspace/argmin/crates/server/src/http/request.rs (L126 to 160)
+  Note: query_param percent-decodes raw bytes without filtering control characters, allowing CR/LF or other invalid header bytes to flow into response headers.
+```
+    /// Get query parameter by name.
+    pub fn query_param(&self, name: &str) -> Option<String> {
+        self.query_string
+            .split('&')
+            .filter(|s| !s.is_empty())
+            .find_map(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                let key = parts.next()?;
+                let val = parts.next().unwrap_or("");
+                if key == name {
+                    Some(percent_decode(val))
+                } else {
+                    None
+                }
+            })
+    }
+}
+
+/// Percent-decode a string (RFC 3986) into raw bytes. Does NOT treat + as space.
+pub(crate) fn percent_decode_bytes(s: &str) -> Vec<u8> {
+    let mut result = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                result.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    result
+```
+
+Proposed patch:
+diff --git a/crates/server-http/src/http/mod.rs b/crates/server-http/src/http/mod.rs
+index df11ab1c828f07fe36d13cbd9a685d9f95f11c3c..f8c9e3ac24936759e866e3f84949000a9697ee41 100644
+--- a/crates/server-http/src/http/mod.rs
++++ b/crates/server-http/src/http/mod.rs
+@@ -856,51 +856,51 @@ impl HttpFrontend {
+                         TRACE_TARGET,
+                         "get_object_part_request",
+                         Some(format_args!(
+                             "bucket={} key={} version_id={:?} part_number={}",
+                             bucket, key, vid, part_number
+                         )),
+                     );
+                     let result = self
+                         .coordinator
+                         .get_object_part(&crate::coordinator::GetObjectPartRequest {
+                             bucket: &bucket,
+                             key: &key,
+                             version_id: vid,
+                             part_number,
+                             cond: &cond,
+                             requester,
+                         })
+                         .map_err(|e| match e {
+                             ServerError::InvalidPart { .. } => {
+                                 ServerError::InvalidRange { total_size: 0 }
+                             }
+                             other => other,
+                         })?;
+                     let tags = result.tags.clone();
+                     let mut resp = S3Response::get_object_part(result);
+-                    apply_response_overrides(&mut resp, req);
++                    apply_response_overrides(&mut resp, req)?;
+                     if let Some(tags_xml) = tags {
+                         add_tagging_count_header(&mut resp, &tags_xml)?;
+                     }
+                     Ok(resp)
+                 } else if let Some(range_header) = req.header("range") {
+                     match crate::range::ByteRange::parse(range_header) {
+                         Ok(byte_range) => {
+                             let _ = observability::event_in_context(
+                                 &trace,
+                                 TRACE_TARGET,
+                                 "get_object_range_request",
+                                 Some(format_args!(
+                                     "bucket={} key={} version_id={:?} raw_range={} parsed_range={}",
+                                     bucket, key, vid, range_header, byte_range
+                                 )),
+                             );
+                             match self.coordinator.get_object_range(
+                                 &crate::coordinator::GetObjectRangeRequest {
+                                     bucket: &bucket,
+                                     key: &key,
+                                     version_id: vid,
+                                     range: byte_range,
+                                     cond: &cond,
+                                     requester,
+                                 },
+@@ -922,71 +922,71 @@ impl HttpFrontend {
+                         Err(_) => {
+                             let _ = observability::event_in_context(
+                                 &trace,
+                                 TRACE_TARGET,
+                                 "get_object_range_ignored",
+                                 Some(format_args!(
+                                     "bucket={} key={} version_id={:?} raw_range={} reason=invalid_header",
+                                     bucket,
+                                     key,
+                                     vid,
+                                     range_header
+                                 )),
+                             );
+                             let result = self.coordinator.get_object(
+                                 &crate::coordinator::GetObjectRequest {
+                                     bucket: &bucket,
+                                     key: &key,
+                                     version_id: vid,
+                                     cond: &cond,
+                                     requester,
+                                 },
+                             )?;
+                             let checksum_mode = req.header("x-amz-checksum-mode");
+                             let tags = result.tags.clone();
+                             let mut resp = S3Response::get_object(result, checksum_mode);
+-                            apply_response_overrides(&mut resp, req);
++                            apply_response_overrides(&mut resp, req)?;
+                             if let Some(tags_xml) = tags {
+                                 add_tagging_count_header(&mut resp, &tags_xml)?;
+                             }
+                             Ok(resp)
+                         }
+                     }
+                 } else {
+                     let result =
+                         self.coordinator
+                             .get_object(&crate::coordinator::GetObjectRequest {
+                                 bucket: &bucket,
+                                 key: &key,
+                                 version_id: vid,
+                                 cond: &cond,
+                                 requester,
+                             })?;
+                     let checksum_mode = req.header("x-amz-checksum-mode");
+                     let tags = result.tags.clone();
+                     let mut resp = S3Response::get_object(result, checksum_mode);
+-                    apply_response_overrides(&mut resp, req);
++                    apply_response_overrides(&mut resp, req)?;
+                     // Add x-amz-tagging-count if the object has tags
+                     if let Some(tags_xml) = tags {
+                         add_tagging_count_header(&mut resp, &tags_xml)?;
+                     }
+                     Ok(resp)
+                 }
+             }
+             S3Operation::DeleteObject { bucket, key } => {
+                 let cond = delete_condition_from_headers(req)?;
+                 let vid = parse_version_id(req)?;
+                 let requester =
+                     crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+                 let result =
+                     self.coordinator
+                         .delete_object(&crate::coordinator::DeleteObjectRequest {
+                             bucket: &bucket,
+                             key: &key,
+                             version_id: vid,
+                             cond: &cond,
+                             requester,
+                         })?;
+                 Ok(S3Response::delete_object(&result))
+             }
+             S3Operation::HeadObject { bucket, key } => {
+                 let cond = read_condition_from_headers(req);
+@@ -2963,67 +2963,77 @@ fn extract_checksum_header(req: &S3Request) -> Result<Option<ChecksumClaim>, Ser
+ 
+ /// Compute an inline checksum value for the given algorithm and data.
+ fn compute_checksum(algo: checksum::ChecksumAlgorithm, data: &[u8]) -> checksum::RawChecksum {
+     match algo {
+         checksum::ChecksumAlgorithm::Crc32 => {
+             checksum::RawChecksum::new(algo, checksum::crc32::checksum(data).to_be_bytes())
+         }
+         checksum::ChecksumAlgorithm::Crc32c => {
+             checksum::RawChecksum::new(algo, checksum::crc32c::checksum(data).to_be_bytes())
+         }
+         checksum::ChecksumAlgorithm::Crc64nvme => {
+             checksum::RawChecksum::new(algo, checksum::crc64::checksum(data).to_be_bytes())
+         }
+         checksum::ChecksumAlgorithm::Sha256 => checksum::RawChecksum::new(
+             algo,
+             ring::digest::digest(&ring::digest::SHA256, data).as_ref(),
+         ),
+         checksum::ChecksumAlgorithm::Sha1 => checksum::RawChecksum::new(
+             algo,
+             ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data).as_ref(),
+         ),
+     }
+     .expect("checksum helper produces bytes matching the requested algorithm")
+ }
+ 
+-fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
++fn has_invalid_header_bytes(s: &str) -> bool {
++    s.bytes().any(|b| b < 0x20 || b == 0x7f)
++}
++
++fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) -> Result<(), ServerError> {
+     let overrides: &[(&str, &str)] = &[
+         ("response-content-type", "Content-Type"),
+         ("response-content-disposition", "Content-Disposition"),
+         ("response-content-encoding", "Content-Encoding"),
+         ("response-content-language", "Content-Language"),
+         ("response-cache-control", "Cache-Control"),
+         ("response-expires", "Expires"),
+     ];
+     for &(param, header_name) in overrides {
+         if let Some(value) = req.query_param_lossy(param) {
++            if has_invalid_header_bytes(&value) {
++                return Err(ServerError::InvalidRequest {
++                    reason: format!("{param} contains invalid header bytes"),
++                });
++            }
+             resp.headers
+                 .retain(|(k, _)| !k.eq_ignore_ascii_case(header_name));
+             resp.headers
+                 .push((header_name.to_string(), value.into_owned()));
+         }
+     }
++    Ok(())
+ }
+ 
+ fn add_tagging_count_header(resp: &mut S3Response, tags_xml: &str) -> Result<(), ServerError> {
+     let count = xml::count_tags_in_xml(tags_xml).map_err(|err| ServerError::InternalError {
+         reason: format!("invalid stored object tags: {err}"),
+     })?;
+     if count > 0 {
+         resp.headers
+             .push(("x-amz-tagging-count".to_string(), count.to_string()));
+     }
+     Ok(())
+ }
+ 
+ fn parse_bucket_acl(req: &S3Request) -> Result<crate::coordinator::BucketAcl, ServerError> {
+     match req.header("x-amz-acl") {
+         None | Some("private") => Ok(crate::coordinator::BucketAcl::Private),
+         Some("public-read") => Ok(crate::coordinator::BucketAcl::PublicRead),
+         Some("public-read-write") => Ok(crate::coordinator::BucketAcl::PublicReadWrite),
+         Some("authenticated-read") => Ok(crate::coordinator::BucketAcl::AuthenticatedRead),
+         Some(other) => Err(ServerError::InvalidArgument {
+             reason: format!("unsupported x-amz-acl value: {other}"),
+         }),
+     }
+ }
+ 
+@@ -4488,50 +4498,77 @@ mod tests {
+             &[(1, part1), (2, part2)],
+             Some("CRC32"),
+         );
+ 
+         // GET partNumber=1 — checksum always emitted for part GETs
+         let req = make_req("partNumber=1");
+         let op = S3Operation::GetObject {
+             bucket: "mybucket".to_string(),
+             key: "k".to_string(),
+         };
+         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+         assert_eq!(resp.status_code, 206);
+ 
+         // Should have per-part checksum header (always, not just with ENABLED)
+         let has_checksum = resp
+             .headers
+             .iter()
+             .any(|(k, _)| k == "x-amz-checksum-crc32");
+         assert!(has_checksum, "expected x-amz-checksum-crc32 header");
+ 
+         // Should also have checksum-type header
+         let has_type = resp.headers.iter().any(|(k, _)| k == "x-amz-checksum-type");
+         assert!(has_type, "expected x-amz-checksum-type header");
+     }
+ 
++    #[test]
++    fn get_object_response_override_rejects_control_bytes() {
++        let tmp = test_util::tempdir();
++        let fe = setup_frontend(tmp.path());
++        fe.coordinator
++            .create_bucket_for_owner("testuser", "mybucket", false)
++            .unwrap();
++
++        let put_req = new_req(http::Method::GET, "", "", vec![], b"hello".to_vec());
++        let put_op = S3Operation::PutObject {
++            bucket: "mybucket".to_string(),
++            key: "k".to_string(),
++        };
++        fe.dispatch_routed(&put_req, &test_auth(), put_op).unwrap();
++
++        let req = make_req("response-content-type=text%0d%0ainjected");
++        let op = S3Operation::GetObject {
++            bucket: "mybucket".to_string(),
++            key: "k".to_string(),
++        };
++        match fe.dispatch_routed(&req, &test_auth(), op) {
++            Err(ServerError::InvalidRequest { .. }) => {}
++            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
++            Ok(_) => panic!("expected error, got Ok"),
++        }
++    }
++
+     // ── aws-chunked decode edge cases ──────────────────────────────────
+ 
+     #[test]
+     fn signed_streaming_without_context_returns_signature_mismatch() {
+         let tmp = test_util::tempdir();
+         let fe = setup_frontend(tmp.path());
+ 
+         // Auth context claims signed streaming but has no streaming context.
+         let auth = auth::AuthContext {
+             mode: auth::AuthMode::HeaderSigV4,
+             access_key_id: Some("AKID".to_string()),
+             principal: Some("testuser".to_string()),
+             request_epoch_secs: Some(0),
+             streaming: None, // missing!
+         };
+ 
+         let req = new_req(
+             http::Method::PUT,
+             "/mybucket/key",
+             "",
+             vec![
+                 (
+                     "x-amz-content-sha256".to_string(),
+                     "STREAMING-AWS4-HMAC-SHA256-PAYLOAD".to_string(),
+                 ),
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Although the code path is reachable via GET object responses, exploitability hinges on tiny_http accepting control bytes; otherwise the injected header is dropped. The attack also requires access to a readable object and typically victim interaction. Given the uncertain sink behavior and limited impact (header injection/caching risks rather than direct data compromise), the likelihood and impact are both lower than medium.
+## Likelihood
+high - Requires a readable object and a victim or client to request a crafted URL; exploitability also depends on tiny_http header validation behavior. | Remote network vector
+## Impact
+low - If control bytes are accepted by tiny_http, an attacker can inject/split response headers, potentially enabling cache poisoning or client-side header confusion. Impact is limited to clients consuming object responses and does not directly expose server-side secrets or data beyond what is already readable.
+## Assumptions
+- Service is deployed with ARGMIN_LISTEN_ADDR exposed beyond localhost (e.g., 0.0.0.0:9000).
+- An attacker can access or induce access to a GET object request (public-read bucket or valid credentials/presigned URL).
+- tiny_http::Header::from_bytes does not strictly reject CR/LF in header values; if it does, the injected header is dropped.
+- GET /<bucket>/<key> reachable with response-* query parameters
+- Object is readable (public-read bucket or valid auth/presigned URL)
+## Path
+client -> GET with response-* -> apply_response_overrides -> Header::from_bytes -> client/proxy
+## Path evidence
+- `crates/server/src/http/mod.rs:230-250` - GetObject path applies response overrides to the response.
+- `crates/server/src/http/mod.rs:431-445` - apply_response_overrides pushes query parameter values into response headers without validation.
+- `crates/server/src/http/request.rs:126-173` - query_param percent-decodes raw bytes and does not filter control characters.
+- `crates/server/src/http/mod.rs:408-415` - Headers are added via tiny_http::Header::from_bytes; invalid headers are dropped if parsing fails.
+- `crates/server/src/metadata_blob.rs:43-71` - Stored metadata headers explicitly reject invalid header bytes, showing validation is expected elsewhere.
+- `crates/server/src/authz.rs:10-21` - Public-read buckets allow anonymous reads, making GET requests potentially unauthenticated.
+- `crates/server/src/config.rs:16-39` - Default listen address is 127.0.0.1:9000; exposure depends on deployment.
+## Narrative
+GetObject responses call apply_response_overrides, which maps response-* query parameters directly into response headers. query_param uses percent_decode on raw bytes without filtering control characters, allowing CR/LF to survive decoding. These values are then added to resp.headers and passed to tiny_http::Header::from_bytes; if the library accepts control bytes, this can enable response header injection/splitting. Metadata header handling elsewhere explicitly rejects invalid header bytes, highlighting a missing validation path here. Public-read buckets allow anonymous GETs, so an attacker can craft a URL to influence response headers for objects they can read.
+## Controls
+- SigV4 authentication for private buckets
+- Public-read ACL gating for anonymous access
+- tiny_http::Header::from_bytes may reject invalid header bytes
+## Blindspots
+- No runtime testing in this environment; tiny_http header validation behavior was not verified.
+- Deployment exposure (public vs localhost) is operator-controlled and not specified in repo manifests.
+
+## Review note
+This finding is no longer valid on the current codebase. It was addressed by commit `ad0e2d4` (`server-http: match aws response override handling`).
+
+The original report correctly identified that `response-*` query parameters were flowing into response headers without validation, but the current `server-http` path now sanitizes all six override values by replacing CR/LF with spaces before applying them, then validates the sanitized value with `http::header::HeaderValue::from_str`. That matches the AWS behavior verified in native `s3-tests`.
+
+In addition, `s3_response_to_hyper` was hardened so that even if an unexpected invalid header somehow reaches response construction, the server returns an internal error response instead of panicking.
+
+The report's code references are also stale: it points at the old `crates/server/...` tree, while the active implementation lives under `crates/server-http/...`.
