@@ -1,0 +1,313 @@
+Unvalidated response override headers can panic hyper responses
+Link: https://chatgpt.com/codex/security/findings/0949824c0c608191b2bee67a7c9420d9?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=low
+Criticality: low (attack path: low)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 36005f5
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 23:26:47
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+The commit switched response building to hyper and now panics on invalid header values. Because response override query parameters are not validated, a crafted request can induce a panic, resulting in a denial-of-service for the connection (and potentially the process depending on panic settings).
+The new hyper-based response conversion unconditionally applies response header overrides from query parameters and then calls `http::Response::builder().header(...)` for each header. Query parameters are percent-decoded without filtering control characters, so an attacker who can issue a GET with `response-*` parameters can inject invalid header bytes (e.g., CR/LF). Hyper treats these as invalid and stores an error in the builder; the subsequent `.body(...).expect(...)` panics. This panic aborts the request task (and could terminate the process if built with panic=abort), making a remotely triggerable availability issue. Previously, the tiny_http response builder ignored invalid headers instead of panicking, so the crash is newly introduced.
+
+# Validation
+## Rubric
+- [x] Verify query_param percent-decoding allows CR/LF in values (request.rs:92-139)
+- [x] Verify response override inserts query values into headers without validation (mod.rs:561-576)
+- [x] Verify s3_response_to_hyper panics on invalid header via expect (mod.rs:541-549)
+- [x] Build and run PoC that crafts CRLF header and reaches s3_response_to_hyper
+- [x] Observe panic with InvalidHeaderValue in runtime output
+## Report
+Built a minimal PoC binary (crates/server/src/bin/panic_header.rs) that percent-decodes a response-content-type query parameter containing %0d%0a, sets it as Content-Type, and calls s3_response_to_hyper. The code path shows query_param uses percent_decode without filtering control characters (crates/server/src/http/request.rs:92-139), apply_response_overrides inserts query values into headers without validation (crates/server/src/http/mod.rs:561-576), and s3_response_to_hyper iterates headers then calls .expect(...) on the response builder (crates/server/src/http/mod.rs:541-549). Because the build requires libisal, I used a fake libisal via PKG_CONFIG_PATH to compile. Running the PoC triggered a panic with http::Error(InvalidHeaderValue), confirming the DoS via invalid header value.
+
+# Evidence
+/workspace/argmin/crates/server/src/http/mod.rs (L541 to 549)
+  Note: Hyper response builder sets headers and then calls `.expect(...)`, which will panic if any header value is invalid.
+```
+/// Convert an S3Response into a hyper-compatible HTTP response.
+pub fn s3_response_to_hyper(resp: S3Response) -> http::Response<Full<Bytes>> {
+    let mut builder = http::Response::builder().status(resp.status_code);
+    for (name, value) in &resp.headers {
+        builder = builder.header(name.as_str(), value.as_str());
+    }
+    builder
+        .body(Full::new(Bytes::from(resp.body)))
+        .expect("response builder should not fail")
+```
+
+/workspace/argmin/crates/server/src/http/mod.rs (L561 to 576)
+  Note: Response override query parameters are inserted directly into response headers without validation, enabling invalid values to reach the builder.
+```
+/// Apply response-* query parameter overrides to a GET response.
+fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
+    let overrides: &[(&str, &str)] = &[
+        ("response-content-type", "Content-Type"),
+        ("response-content-disposition", "Content-Disposition"),
+        ("response-content-encoding", "Content-Encoding"),
+        ("response-content-language", "Content-Language"),
+        ("response-cache-control", "Cache-Control"),
+        ("response-expires", "Expires"),
+    ];
+    for &(param, header_name) in overrides {
+        if let Some(value) = req.query_param(param) {
+            resp.headers
+                .retain(|(k, _)| !k.eq_ignore_ascii_case(header_name));
+            resp.headers.push((header_name.to_string(), value));
+        }
+```
+
+/workspace/argmin/crates/server/src/http/request.rs (L92 to 139)
+  Note: Query parameters are percent-decoded without filtering control characters, allowing CR/LF or other invalid bytes into response override values.
+```
+    /// Get query parameter by name.
+    pub fn query_param(&self, name: &str) -> Option<String> {
+        self.query_string
+            .split('&')
+            .filter(|s| !s.is_empty())
+            .find_map(|pair| {
+                let mut parts = pair.splitn(2, '=');
+                let key = parts.next()?;
+                let val = parts.next().unwrap_or("");
+                if key == name {
+                    Some(percent_decode(val))
+                } else {
+                    None
+                }
+            })
+    }
+}
+
+/// Percent-decode a string (RFC 3986) into raw bytes. Does NOT treat + as space.
+pub(crate) fn percent_decode_bytes(s: &str) -> Vec<u8> {
+    let mut result = Vec::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                result.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+    result
+}
+
+/// Percent-decode a string (RFC 3986) into UTF-8, rejecting invalid sequences.
+pub(crate) fn percent_decode_strict(s: &str) -> Result<String, ServerError> {
+    let bytes = percent_decode_bytes(s);
+    String::from_utf8(bytes).map_err(|_| ServerError::InvalidRequest {
+        reason: "Couldn't parse the specified URI.".to_string(),
+    })
+}
+
+/// Percent-decode a string (RFC 3986). Does NOT treat + as space.
+pub(crate) fn percent_decode(s: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(s)).to_string()
+```
+
+Proposed patch:
+diff --git a/crates/server-http/src/http/mod.rs b/crates/server-http/src/http/mod.rs
+index df11ab1c828f07fe36d13cbd9a685d9f95f11c3c..7d24319c094335b0e26a21f4d2610b6f56a33585 100644
+--- a/crates/server-http/src/http/mod.rs
++++ b/crates/server-http/src/http/mod.rs
+@@ -2974,50 +2974,53 @@ fn compute_checksum(algo: checksum::ChecksumAlgorithm, data: &[u8]) -> checksum:
+             checksum::RawChecksum::new(algo, checksum::crc64::checksum(data).to_be_bytes())
+         }
+         checksum::ChecksumAlgorithm::Sha256 => checksum::RawChecksum::new(
+             algo,
+             ring::digest::digest(&ring::digest::SHA256, data).as_ref(),
+         ),
+         checksum::ChecksumAlgorithm::Sha1 => checksum::RawChecksum::new(
+             algo,
+             ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, data).as_ref(),
+         ),
+     }
+     .expect("checksum helper produces bytes matching the requested algorithm")
+ }
+ 
+ fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
+     let overrides: &[(&str, &str)] = &[
+         ("response-content-type", "Content-Type"),
+         ("response-content-disposition", "Content-Disposition"),
+         ("response-content-encoding", "Content-Encoding"),
+         ("response-content-language", "Content-Language"),
+         ("response-cache-control", "Cache-Control"),
+         ("response-expires", "Expires"),
+     ];
+     for &(param, header_name) in overrides {
+         if let Some(value) = req.query_param_lossy(param) {
++            if http::header::HeaderValue::from_str(value.as_ref()).is_err() {
++                continue;
++            }
+             resp.headers
+                 .retain(|(k, _)| !k.eq_ignore_ascii_case(header_name));
+             resp.headers
+                 .push((header_name.to_string(), value.into_owned()));
+         }
+     }
+ }
+ 
+ fn add_tagging_count_header(resp: &mut S3Response, tags_xml: &str) -> Result<(), ServerError> {
+     let count = xml::count_tags_in_xml(tags_xml).map_err(|err| ServerError::InternalError {
+         reason: format!("invalid stored object tags: {err}"),
+     })?;
+     if count > 0 {
+         resp.headers
+             .push(("x-amz-tagging-count".to_string(), count.to_string()));
+     }
+     Ok(())
+ }
+ 
+ fn parse_bucket_acl(req: &S3Request) -> Result<crate::coordinator::BucketAcl, ServerError> {
+     match req.header("x-amz-acl") {
+         None | Some("private") => Ok(crate::coordinator::BucketAcl::Private),
+         Some("public-read") => Ok(crate::coordinator::BucketAcl::PublicRead),
+         Some("public-read-write") => Ok(crate::coordinator::BucketAcl::PublicReadWrite),
+         Some("authenticated-read") => Ok(crate::coordinator::BucketAcl::AuthenticatedRead),
+@@ -3083,50 +3086,90 @@ mod tests {
+             access_key_id: Some("AKID".to_string()),
+             principal: Some("testuser".to_string()),
+             request_epoch_secs: Some(0),
+             streaming: None,
+         }
+     }
+ 
+     fn make_req(query: &str) -> S3Request {
+         S3Request::new_for_test(http::Method::GET, "/", query, test_headers(vec![]), vec![])
+     }
+ 
+     fn new_req(
+         method: http::Method,
+         path: &str,
+         query: &str,
+         headers: Vec<(String, String)>,
+         body: Vec<u8>,
+     ) -> S3Request {
+         S3Request::new_for_test(method, path, query, test_headers(headers), body)
+     }
+ 
+     fn test_headers(headers: Vec<(String, String)>) -> http::HeaderMap {
+         request::header_map_from_owned(headers)
+     }
+ 
++    #[test]
++    fn response_override_ignores_invalid_header_value() {
++        let req = make_req("response-content-type=text%2Fplain%0D%0AInjected%3A%20x");
++        let mut resp = S3Response::new(200);
++        resp.headers.push((
++            "Content-Type".to_string(),
++            "application/octet-stream".to_string(),
++        ));
++
++        apply_response_overrides(&mut resp, &req);
++
++        assert_eq!(
++            resp.headers
++                .iter()
++                .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
++                .map(|(_, v)| v.as_str()),
++            Some("application/octet-stream")
++        );
++    }
++
++    #[test]
++    fn response_override_applies_valid_header_value() {
++        let req = make_req("response-content-type=text%2Fplain");
++        let mut resp = S3Response::new(200);
++        resp.headers.push((
++            "Content-Type".to_string(),
++            "application/octet-stream".to_string(),
++        ));
++
++        apply_response_overrides(&mut resp, &req);
++
++        assert_eq!(
++            resp.headers
++                .iter()
++                .find(|(k, _)| k.eq_ignore_ascii_case("Content-Type"))
++                .map(|(_, v)| v.as_str()),
++            Some("text/plain")
++        );
++    }
++
+     // ── UploadPart validation ────────────────────────────────────────
+ 
+     #[test]
+     fn upload_part_missing_upload_id() {
+         let tmp = test_util::tempdir();
+         let fe = setup_frontend(tmp.path());
+         fe.coordinator
+             .create_bucket_for_owner("testuser", "mybucket", false)
+             .unwrap();
+ 
+         let req = make_req("partNumber=1");
+         let op = S3Operation::UploadPart {
+             bucket: "mybucket".to_string(),
+             key: "mykey".to_string(),
+         };
+         match fe.dispatch_routed(&req, &test_auth(), op) {
+             Err(ServerError::InvalidRequest { .. }) => {}
+             Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+             Ok(_) => panic!("expected error, got Ok"),
+         }
+     }
+ 
+     #[test]
+     fn upload_part_invalid_part_number() {
+         let tmp = test_util::tempdir();
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The bug is real and reachable in the normal GET-object path, but impact is limited to availability of the request/connection and requires bucket read access. No data exposure or auth bypass is shown, and the default panic=unwind behavior limits blast radius. This aligns with low severity.
+## Likelihood
+high - An attacker with read access can trivially craft response-* query parameters; exploitability is straightforward but requires access to readable buckets. | Remote network vector
+## Impact
+low - Invalid header bytes in response overrides can panic the response builder, aborting the request/task; no confidentiality or integrity impact is evident.
+## Assumptions
+- Service is deployed with ARGMIN_LISTEN_ADDR bound to an interface reachable by the attacker (not just 127.0.0.1).
+- Attacker has bucket read access via valid credentials or the bucket is public-read.
+- Build uses Rust’s default panic=unwind (no evidence of panic=abort in Cargo.toml).
+- GET object request reaches apply_response_overrides
+- response-* query parameter supplied
+- bucket readable (public-read or authenticated)
+## Path
+[GET response-* param] -> [percent_decode] -> [apply_response_overrides] -> [builder.expect panic]
+## Path evidence
+- `crates/server/src/http/mod.rs:222-242` - GET object handler applies response overrides before returning the response.
+- `crates/server/src/http/mod.rs:561-576` - response-* query parameters are inserted into response headers without validation.
+- `crates/server/src/http/request.rs:92-139` - query_param uses percent_decode, which allows control characters in decoded values.
+- `crates/server/src/http/mod.rs:541-549` - s3_response_to_hyper builds headers then calls .expect, which panics on invalid header values.
+- `crates/server/src/http/mod.rs:373-384` - authorize_bucket_read enforces read access or public-read ACLs for GET.
+- `crates/server/src/config.rs:20-43` - listen address defaults to 127.0.0.1:9000 unless configured.
+## Narrative
+GET object responses call apply_response_overrides, which inserts response-* query values directly into headers without validation. query_param percent-decodes the query string and does not filter control characters. s3_response_to_hyper then iterates headers and calls .expect("response builder should not fail"), which panics if any header value is invalid. This creates a request-triggerable panic on the response path; impact is availability-only and limited to the request/task unless built with panic=abort.
+## Controls
+- SigV4 authentication and bucket ACL checks for read access
+- Connection and request semaphores limit concurrency
+- Header read and body idle timeouts
+## Blindspots
+- No deployment manifests were found to confirm public exposure of the listener.
+- No explicit panic=abort configuration was found; impact would be higher if enabled.
+- Runtime behavior (whether panic kills only the task vs. process) not verified in this analysis.
+
+## Review note
+This finding was fixed in commit `ad0e2d4` (`server-http: match aws response override handling`).
+
+The original report was directionally right that response override query parameters needed hardening, but the final AWS-conformant behavior is narrower than "reject invalid values". AWS normalizes embedded CR/LF in the six `response-*` override parameters into spaces and still applies the override when the resulting value is a valid HTTP header value. In particular, AWS also accepts non-date `response-expires` values and returns them as the `Expires` header.
+
+The fix therefore made three changes:
+- sanitize `response-content-type`, `response-content-disposition`, `response-content-encoding`, `response-content-language`, `response-cache-control`, and `response-expires` by replacing CR/LF with spaces before applying them
+- validate the sanitized value as an HTTP header value before insertion
+- harden `s3_response_to_hyper` so an unexpected invalid header can no longer panic the response builder and instead yields an internal error response
+
+Native `s3-tests` coverage was added alongside the fix to verify all six override headers, the CR/LF sanitization behavior, and the non-panicking fallback path.
