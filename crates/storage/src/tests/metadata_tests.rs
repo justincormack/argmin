@@ -4138,6 +4138,60 @@ fn stream_upload_upload_part_kind() {
 }
 
 #[test]
+fn stream_upload_segment_vid_allocation_is_monotonic() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sess-vid".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+            target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
+        })
+        .unwrap();
+
+    assert_eq!(
+        store.allocate_stream_segment_vid("sess-vid").unwrap(),
+        GenerationId::new(1).unwrap()
+    );
+    assert_eq!(
+        store.allocate_stream_segment_vid("sess-vid").unwrap(),
+        GenerationId::new(2).unwrap()
+    );
+    assert_eq!(
+        store.allocate_stream_segment_vid("sess-vid").unwrap(),
+        GenerationId::new(3).unwrap()
+    );
+}
+
+#[test]
+fn stream_upload_segment_vid_allocation_requires_in_progress_session() {
+    let (_dir, store) = make_pg_store();
+
+    store
+        .create_stream_upload(&CreateStreamUploadReq {
+            session_id: "sess-vid-state".into(),
+            bucket: "b".into(),
+            key: "k".into(),
+            target: StreamUploadTarget::PutObject,
+            encryption: ObjectEncryption::None,
+        })
+        .unwrap();
+    store
+        .set_stream_upload_state("sess-vid-state", StreamUploadState::Completing)
+        .unwrap();
+
+    let err = store
+        .allocate_stream_segment_vid("sess-vid-state")
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::StreamSessionNotInProgress { .. }
+    ));
+}
+
+#[test]
 fn stream_segment_append_and_list() {
     let (_dir, store) = make_pg_store();
 

@@ -5659,6 +5659,57 @@ impl PgMetadataStore for PgStore {
             })
     }
 
+    fn allocate_stream_segment_vid(&self, session_id: &str) -> Result<GenerationId, MetadataError> {
+        let (state, next_segment_vid): (u8, i64) = self
+            .conn
+            .query_row(
+                "SELECT state, next_segment_vid FROM stream_uploads WHERE session_id = ?1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get next stream segment vid",
+                source: e,
+            })?
+            .ok_or_else(|| MetadataError::StreamSessionNotFound {
+                session_id: SessionId::from(session_id),
+            })?;
+
+        if state != StreamUploadState::InProgress as u8 {
+            return Err(MetadataError::StreamSessionNotInProgress { state });
+        }
+
+        let segment_vid = Self::parse_generation_id(next_segment_vid, 1, "next_segment_vid")
+            .map_err(|e| MetadataError::Db {
+                context: "parse next stream segment vid",
+                source: e,
+            })?;
+        let next_segment_vid =
+            next_segment_vid
+                .checked_add(1)
+                .ok_or_else(|| MetadataError::Db {
+                    context: "stream segment vid overflow",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Integer,
+                        Box::from("next_segment_vid overflow"),
+                    ),
+                })?;
+
+        self.conn
+            .execute(
+                "UPDATE stream_uploads SET next_segment_vid = ?1 WHERE session_id = ?2",
+                params![next_segment_vid, session_id],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "advance next stream segment vid",
+                source: e,
+            })?;
+
+        Ok(segment_vid)
+    }
+
     fn append_stream_segment(
         &self,
         segment: &StreamUploadSegmentRecord,

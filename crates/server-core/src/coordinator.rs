@@ -637,10 +637,10 @@ impl EncodeScratchPool {
         let buf = lock_mutex_unpoisoned(&self.cached)
             .pop()
             .unwrap_or_else(|| {
-            #[cfg(test)]
-            self.allocations.fetch_add(1, Ordering::Relaxed);
-            vec![0u8; self.scratch_len]
-        });
+                #[cfg(test)]
+                self.allocations.fetch_add(1, Ordering::Relaxed);
+                vec![0u8; self.scratch_len]
+            });
         EncodeScratch {
             pool: self,
             buf: Some(buf),
@@ -2595,6 +2595,16 @@ struct ReclamationTestHooks {
 static RECLAMATION_TEST_HOOKS: OnceLock<Mutex<ReclamationTestHooks>> = OnceLock::new();
 #[cfg(test)]
 static RECLAMATION_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+#[cfg(test)]
+#[derive(Default, Clone)]
+struct StreamAppendTestHooks {
+    target: Option<(String, u32)>,
+    after_prepare: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+#[cfg(test)]
+static STREAM_APPEND_TEST_HOOKS: OnceLock<Mutex<StreamAppendTestHooks>> = OnceLock::new();
+#[cfg(test)]
+static STREAM_APPEND_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<LifecycleSweeper>>>> =
     OnceLock::new();
 
@@ -2607,6 +2617,18 @@ impl Drop for ReclamationTestHookGuard {
         let hooks =
             RECLAMATION_TEST_HOOKS.get_or_init(|| Mutex::new(ReclamationTestHooks::default()));
         *hooks.lock().unwrap() = ReclamationTestHooks::default();
+    }
+}
+
+#[cfg(test)]
+struct StreamAppendTestHookGuard;
+
+#[cfg(test)]
+impl Drop for StreamAppendTestHookGuard {
+    fn drop(&mut self) {
+        let hooks =
+            STREAM_APPEND_TEST_HOOKS.get_or_init(|| Mutex::new(StreamAppendTestHooks::default()));
+        *hooks.lock().unwrap() = StreamAppendTestHooks::default();
     }
 }
 
@@ -2757,6 +2779,14 @@ fn install_reclamation_test_hooks(hooks: ReclamationTestHooks) -> ReclamationTes
 }
 
 #[cfg(test)]
+fn install_stream_append_test_hooks(hooks: StreamAppendTestHooks) -> StreamAppendTestHookGuard {
+    let slot =
+        STREAM_APPEND_TEST_HOOKS.get_or_init(|| Mutex::new(StreamAppendTestHooks::default()));
+    *slot.lock().unwrap() = hooks;
+    StreamAppendTestHookGuard
+}
+
+#[cfg(test)]
 fn maybe_run_multipart_snapshot_hook(bucket: &str, key: &str) {
     let hooks = RECLAMATION_TEST_HOOKS
         .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
@@ -2787,6 +2817,24 @@ fn maybe_run_multipart_delete_metadata_hook(bucket: &str, key: &str) {
         .is_some_and(|(b, k)| b == bucket && k == key)
     {
         if let Some(hook) = hooks.after_multipart_delete_metadata {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_stream_append_prepare_hook(session_id: &str, segment_index: u32) {
+    let hooks = STREAM_APPEND_TEST_HOOKS
+        .get_or_init(|| Mutex::new(StreamAppendTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target
+        .as_ref()
+        .is_some_and(|(session, index)| session == session_id && *index == segment_index)
+    {
+        if let Some(hook) = hooks.after_prepare {
             hook();
         }
     }
@@ -9529,12 +9577,6 @@ impl Coordinator {
 
         // Derive stream segment shard placement.
         let segment_okh = stream_segment_key_hash(session_id, segment_index);
-        let segment_vid = GenerationId::MIN;
-        let shard_pg_id = self.shard_pg_id_raw(
-            &format!("segment/{session_id}"),
-            &segment_index.to_string(),
-            segment_vid.get(),
-        );
 
         let segment_record = {
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
@@ -9553,6 +9595,14 @@ impl Coordinator {
                     logical_len as u64
                 }
             };
+            let segment_vid = meta_guard
+                .allocate_stream_segment_vid(session_id)
+                .map_err(ServerError::Metadata)?;
+            let shard_pg_id = self.shard_pg_id_raw(
+                &format!("segment/{session_id}"),
+                &segment_index.to_string(),
+                segment_vid.get(),
+            );
             let segment_record = StreamUploadSegmentRecord {
                 session_id: SessionId::from(session_id),
                 segment_index,
@@ -9576,17 +9626,26 @@ impl Coordinator {
             segment_record
         };
 
-        let written_shards =
-            self.write_segment_shards(shard_pg_id, &segment_okh, segment_vid, data)?;
+        #[cfg(test)]
+        maybe_run_stream_append_prepare_hook(session_id, segment_index);
 
-        let (meta_guard, shard_guard_opt) =
-            match self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id) {
-                Ok(guards) => guards,
-                Err(err) => {
-                    self.best_effort_delete_written_shards(shard_pg_id, &written_shards);
-                    return Err(ServerError::Store(err));
-                }
-            };
+        let written_shards = self.write_segment_shards(
+            segment_record.shard_pg_id,
+            &segment_okh,
+            segment_record.segment_vid,
+            data,
+        )?;
+
+        let (meta_guard, shard_guard_opt) = match self
+            .storage_node
+            .lock_two_pgs(meta_pg_id, segment_record.shard_pg_id)
+        {
+            Ok(guards) => guards,
+            Err(err) => {
+                self.best_effort_delete_written_shards(segment_record.shard_pg_id, &written_shards);
+                return Err(ServerError::Store(err));
+            }
+        };
         let shard_guard: &storage::PgStore = match shard_guard_opt.as_ref() {
             Some(pg) => pg,
             None => &meta_guard,
@@ -15219,6 +15278,152 @@ mod tests {
             _serial_guard: serial,
             _guard: guard,
         }
+    }
+
+    struct StreamAppendRaceSync {
+        prepared_barrier: Arc<Barrier>,
+        _serial_guard: MutexGuard<'static, ()>,
+        _guard: StreamAppendTestHookGuard,
+    }
+
+    fn install_stream_append_race_hooks(
+        session_id: &str,
+        segment_index: u32,
+    ) -> StreamAppendRaceSync {
+        let serial = STREAM_APPEND_TEST_SERIAL
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let prepared_barrier = Arc::new(Barrier::new(3));
+        let prepared_barrier_hook = Arc::clone(&prepared_barrier);
+        let guard = install_stream_append_test_hooks(StreamAppendTestHooks {
+            target: Some((session_id.to_string(), segment_index)),
+            after_prepare: Some(Arc::new(move || {
+                prepared_barrier_hook.wait();
+            })),
+        });
+        StreamAppendRaceSync {
+            prepared_barrier,
+            _serial_guard: serial,
+            _guard: guard,
+        }
+    }
+
+    fn begin_stream_put_with_segment_path(
+        coord: &Coordinator,
+        bucket: &str,
+        key_prefix: &str,
+        require_cross_pg: bool,
+    ) -> (String, String) {
+        for suffix in 0..256 {
+            let key = format!("{key_prefix}-{suffix}");
+            let session_id = begin_stream_put_test(coord, bucket, &key).unwrap();
+            let meta_pg_id = coord.object_pg_id(bucket, &key);
+            let first_vid_pg = coord.shard_pg_id_raw(&format!("segment/{session_id}"), "0", 1);
+            let second_vid_pg = coord.shard_pg_id_raw(&format!("segment/{session_id}"), "0", 2);
+            let has_cross_pg = first_vid_pg != meta_pg_id || second_vid_pg != meta_pg_id;
+            if has_cross_pg == require_cross_pg {
+                return (key, session_id);
+            }
+            coord.abort_stream_put(bucket, &key, &session_id).unwrap();
+        }
+        panic!(
+            "failed to find stream session for require_cross_pg={require_cross_pg} after 256 attempts"
+        );
+    }
+
+    fn run_stream_put_duplicate_segment_race_test(pg_count: u32, require_cross_pg: bool) {
+        let dir = test_util::tempdir();
+        let pg_ids: Vec<u32> = (0..pg_count).collect();
+        let storage_node = Arc::new(SharedStorageNode::open(dir.path(), &pg_ids).unwrap());
+        let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+        let writer_a = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+        let writer_b = setup_coordinator_with_shared_storage(storage_node);
+        admin
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let (key, session_id) =
+            begin_stream_put_with_segment_path(&admin, "bucket", "stream-race", require_cross_pg);
+        let meta_pg_id = admin.object_pg_id("bucket", &key);
+        let first_vid_pg = admin.shard_pg_id_raw(&format!("segment/{session_id}"), "0", 1);
+        let second_vid_pg = admin.shard_pg_id_raw(&format!("segment/{session_id}"), "0", 2);
+        if require_cross_pg {
+            assert!(first_vid_pg != meta_pg_id || second_vid_pg != meta_pg_id);
+        } else {
+            assert_eq!(first_vid_pg, meta_pg_id);
+            assert_eq!(second_vid_pg, meta_pg_id);
+        }
+
+        let sync = install_stream_append_race_hooks(&session_id, 0);
+        let data_a = b"first-segment".to_vec();
+        let data_b = b"second-segment".to_vec();
+        let key_a = key.clone();
+        let key_b = key.clone();
+        let session_a = session_id.clone();
+        let session_b = session_id.clone();
+        let t_a = thread::spawn(move || {
+            writer_a
+                .append_plaintext_stream_segment_for_test("bucket", &key_a, &session_a, 0, &data_a)
+        });
+        let t_b = thread::spawn(move || {
+            writer_b
+                .append_plaintext_stream_segment_for_test("bucket", &key_b, &session_b, 0, &data_b)
+        });
+
+        sync.prepared_barrier.wait();
+
+        let result_a = t_a.join().unwrap();
+        let result_b = t_b.join().unwrap();
+        let winner = match (&result_a, &result_b) {
+            (Ok(()), Err(ServerError::InvalidRequest { .. })) => b"first-segment".as_slice(),
+            (Err(ServerError::InvalidRequest { .. }), Ok(())) => b"second-segment".as_slice(),
+            _ => panic!(
+                "expected exactly one successful append and one duplicate rejection, got {result_a:?} and {result_b:?}"
+            ),
+        };
+
+        let meta_pg = admin.storage_node.get_pg(meta_pg_id).unwrap();
+        let staged = meta_pg.list_stream_segments(&session_id).unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(staged[0].segment_index, 0);
+        assert!(
+            staged[0].segment_vid == GenerationId::new(1).unwrap()
+                || staged[0].segment_vid == GenerationId::new(2).unwrap()
+        );
+        drop(meta_pg);
+
+        admin
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                object: object_request("bucket", &key, test_requester()),
+                session_id: &session_id,
+                crc64: checksum::crc64::checksum(winner),
+                total_size: winner.len() as u64,
+                metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                write_encryption: ActiveWriteEncryptionRef::None,
+                tags: None,
+                cond: &WriteCondition::default(),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
+            })
+            .unwrap();
+
+        let object = admin
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    &key,
+                    None,
+                    test_requester(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(object.body.read_all().unwrap(), winner);
     }
 
     struct ObjectSegmentsDeleteRaceSync {
@@ -37179,9 +37384,15 @@ mod tests {
             .unwrap();
 
         // Record shard keys before abort for verification.
-        let segment_okh = crate::pg::stream_segment_key_hash(&session_id, 0);
-        let shard_pg_id =
-            coord.shard_pg_id(&format!("segment/{session_id}"), "0", GenerationId::MIN);
+        let meta_pg = coord
+            .storage_node
+            .get_pg(coord.object_pg_id("bucket", "key"))
+            .unwrap();
+        let segments = meta_pg.list_stream_segments(&session_id).unwrap();
+        assert_eq!(segments.len(), 1);
+        let segment = segments[0].clone();
+        let shard_pg_id = segment.shard_pg_id;
+        drop(meta_pg);
 
         coord
             .abort_stream_put("bucket", "key", &session_id)
@@ -37191,7 +37402,7 @@ mod tests {
         let pg = coord.storage_node.get_pg(shard_pg_id).unwrap();
         for i in 0..6 {
             // k=4, m=2
-            let shard_key = ShardKey::new(&segment_okh, 0, i);
+            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i);
             let result = pg.read_shard(&shard_key);
             assert!(result.is_err(), "shard {i} should have been deleted");
         }
@@ -38421,6 +38632,83 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn stream_segment_cleanup_only_deletes_matching_segment_vid() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+        let segment_okh = crate::pg::stream_segment_key_hash(&session_id, 0);
+        let winner_vid = GenerationId::new(1).unwrap();
+        let loser_vid = GenerationId::new(2).unwrap();
+        let winner_pg_id =
+            coord.shard_pg_id_raw(&format!("segment/{session_id}"), "0", winner_vid.get());
+        let loser_pg_id =
+            coord.shard_pg_id_raw(&format!("segment/{session_id}"), "0", loser_vid.get());
+        let winner_shards = coord
+            .write_segment_shards(winner_pg_id, &segment_okh, winner_vid, b"winner-data")
+            .unwrap();
+        let loser_shards = coord
+            .write_segment_shards(loser_pg_id, &segment_okh, loser_vid, b"loser-data")
+            .unwrap();
+        let winner_batch: Vec<(&ShardKey, storage::WriteAck)> = winner_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        let loser_batch: Vec<(&ShardKey, storage::WriteAck)> = loser_shards
+            .iter()
+            .map(|written| (&written.key, written.ack))
+            .collect();
+        coord
+            .storage_node
+            .get_pg(winner_pg_id)
+            .unwrap()
+            .register_written_shards_batch(&winner_batch)
+            .unwrap();
+        coord
+            .storage_node
+            .get_pg(loser_pg_id)
+            .unwrap()
+            .register_written_shards_batch(&loser_batch)
+            .unwrap();
+
+        let loser_pg = coord.storage_node.get_pg(loser_pg_id).unwrap();
+        Coordinator::cleanup_written_shards_locked(&loser_pg, &loser_shards);
+        drop(loser_pg);
+
+        let winner_pg = coord.storage_node.get_pg(winner_pg_id).unwrap();
+        for written in &winner_shards {
+            assert!(
+                winner_pg.read_shard(&written.key).is_ok(),
+                "winner shard {:?} should remain after loser cleanup",
+                written.key
+            );
+        }
+        drop(winner_pg);
+
+        let loser_pg = coord.storage_node.get_pg(loser_pg_id).unwrap();
+        for written in &loser_shards {
+            assert!(
+                loser_pg.read_shard(&written.key).is_err(),
+                "loser shard {:?} should be deleted by cleanup",
+                written.key
+            );
+        }
+    }
+
+    #[test]
+    fn stream_put_concurrent_duplicate_segment_index_same_pg_preserves_winner() {
+        run_stream_put_duplicate_segment_race_test(1, false);
+    }
+
+    #[test]
+    fn stream_put_concurrent_duplicate_segment_index_cross_pg_preserves_winner() {
+        run_stream_put_duplicate_segment_race_test(4, true);
     }
 
     #[test]
