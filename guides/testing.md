@@ -1,0 +1,285 @@
+# Testing Guide
+
+This guide collects the main testing workflows for the repository:
+
+- targeted crate tests
+- workspace and integration coverage
+- AWS-backed compatibility runs
+- HTTP-only and local-only test crates
+- parser fuzzing
+
+## Quick reference
+
+Common commands:
+
+```bash
+# Targeted crate tests while changing auth or HTTP parsing.
+cargo test -p auth -- --nocapture
+cargo test -p server-http -- --nocapture
+
+# Broad local verification.
+cargo test --workspace --no-fail-fast
+cargo clippy --all-targets --all-features -- -D warnings
+
+# Integration coverage.
+./scripts/coverage
+
+# Local-only S3 behavior tests.
+cargo test -p s3-local-tests
+```
+
+## AWS-backed `s3-tests`
+
+This repo uses `crates/s3-tests` for AWS compatibility checks. External runs
+now fail fast if the AWS-specific environment is incomplete, rather than
+silently skipping coverage.
+
+### Non-production build modes
+
+The test harness supports two local build variants that are useful for
+specialized testing:
+
+- `null-ec`
+  - Uses the null EC backend and requires `parity_shards = 0`.
+- `pure-rust`
+  - Uses `null-ec` and the pure-Rust checksum backend, avoiding ISA-L entirely.
+
+Examples:
+
+```bash
+# Local embedded server with null EC.
+cargo test -p s3-tests --no-default-features --features null-ec,isa-l-crc
+
+# Local embedded server with no ISA-L dependency at all.
+cargo test -p s3-tests --no-default-features --features pure-rust
+```
+
+These are test-only configurations. They are useful for mock-server scenarios,
+restricted build environments, and certain harnesses, but they are not intended
+or supported as production deployments.
+
+### Required environment variables
+
+Use `eval "$(grep = .env)"` to read `.env` without exporting `AWS_ACCESS_KEY`
+and `AWS_SECRET_KEY` into the process environment.
+
+The external `s3-tests` harness hard-fails if any of these are missing:
+
+- `S3_TEST_ENDPOINT`
+  - Prefer `https://...` for full coverage.
+  - `http://...` is allowed for partial runs, but tests that explicitly require
+    HTTPS will fail.
+- `S3_TEST_ACCESS_KEY`
+- `S3_TEST_SECRET_KEY`
+- `S3_TEST_ACCOUNT_ID`
+- `S3_TEST_ALT_ACCESS_KEY`
+- `S3_TEST_ALT_SECRET_KEY`
+- `S3_TEST_ALT_ACCOUNT_ID`
+- `S3_TEST_BUCKET_PREFIX`
+  - Required for external runs. The committed IAM policy below assumes
+    `claude-s3-`.
+
+Recommended command:
+
+```bash
+eval "$(grep = .env)" && \
+S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
+S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
+S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
+S3_TEST_ACCOUNT_ID="$AWS_ACCOUNT_ID" \
+S3_TEST_ALT_ACCESS_KEY="$AWS_ALT_ACCESS_KEY" \
+S3_TEST_ALT_SECRET_KEY="$AWS_ALT_SECRET_KEY" \
+S3_TEST_ALT_ACCOUNT_ID="$AWS_ALT_ACCOUNT_ID" \
+S3_TEST_REGION=us-east-1 \
+S3_TEST_BUCKET_PREFIX=claude-s3- \
+S3_TEST_TIMEOUT_SECS=30 \
+cargo test -p s3-tests --no-fail-fast
+```
+
+When `S3_TEST_ENDPOINT` is set, `s3-tests` defaults to a 30 second client
+timeout instead of the local 5 second timeout, and disables the AWS SDK
+stalled-stream watchdog. This keeps slower remote runs from failing with
+`ThroughputBelowMinimum` while preserving the stricter local defaults for the
+embedded server.
+
+### HTTP-only transport checks
+
+HTTP-only transport checks live in `crates/s3-http-tests`. They reuse the same
+credentials and bucket prefix, but talk to an `http://` endpoint instead:
+
+- If `S3_TEST_HTTP_ENDPOINT` is set, it must be `http://...` and is used as-is.
+- Otherwise `s3-http-tests` derives `http://...` from `S3_TEST_ENDPOINT`.
+
+Recommended command:
+
+```bash
+eval "$(grep = .env)" && \
+S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
+S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
+S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
+S3_TEST_REGION=us-east-1 \
+S3_TEST_BUCKET_PREFIX=claude-s3- \
+S3_TEST_TIMEOUT_SECS=30 \
+cargo test -p s3-http-tests --no-fail-fast
+```
+
+### Local-only tests
+
+The local-only `s3-local-tests` crate currently contains:
+
+- `bucket_naming`
+- `test_list_buckets_anonymous`
+
+Run it locally with the embedded server:
+
+```bash
+cargo test -p s3-local-tests
+```
+
+### Cleanup helper
+
+Failed AWS-backed runs can leave behind versioned test buckets, delete markers,
+legal holds, or governance-retained objects under the `claude-s3-` prefix. For
+that case, [`scripts/cleanup.sh`](../scripts/cleanup.sh) provides a manual
+cleanup pass for leftover test buckets.
+
+It currently:
+
+- lists buckets with names starting `claude-s3-`
+- removes object versions and delete markers
+- attempts to disable legal holds and bypass governance retention
+- deletes the bucket once it is empty
+
+The script requires `aws`, `jq`, and AWS credentials in the environment that
+are allowed to delete those buckets and objects. It is intended as an
+after-failure cleanup tool, not part of the normal test invocation.
+
+### Cross-account requirements
+
+- The alternate credentials must belong to a different AWS account.
+- A second IAM user in the same AWS account is not sufficient.
+- The harness probes S3 canonical owner IDs during setup and fails fast if the
+  primary and alternate credentials resolve to the same owner.
+
+### IAM policy
+
+Attach [`crates/s3-tests/aws/test-user-policy.json`](../crates/s3-tests/aws/test-user-policy.json)
+to both test IAM users.
+
+The committed policy assumes:
+
+- buckets are created under the `claude-s3-` prefix
+- both users can create and delete prefixed buckets
+- both users can perform the bucket/object operations exercised by `s3-tests`
+- lifecycle validation requires:
+  - `s3:GetLifecycleConfiguration`
+  - `s3:PutLifecycleConfiguration`
+  - `DeleteBucketLifecycle` uses `s3:PutLifecycleConfiguration`
+- object-lock validation requires:
+  - `s3:PutBucketObjectLockConfiguration`
+  - `s3:GetBucketObjectLockConfiguration`
+  - `s3:PutObjectRetention`
+  - `s3:GetObjectRetention`
+  - `s3:PutObjectLegalHold`
+  - `s3:GetObjectLegalHold`
+  - `s3:BypassGovernanceRetention`
+
+If you change `S3_TEST_BUCKET_PREFIX`, update the policy resource ARNs to
+match.
+
+AWS announced on April 6, 2026 that SSE-C is being disabled by default for new
+buckets, and later for selected existing buckets, as the rollout reaches each
+Region. The external SSE-C fixtures now call `PutBucketEncryption` with
+`BlockedEncryptionTypes = NONE` after bucket creation so those tests remain
+stable across mixed rollout states. We do not yet assert the new
+default-blocked behavior in AWS-backed tests because the rollout is temporally
+and regionally variable.
+
+If AWS-backed object-lock tests fail immediately with `AccessDenied` on
+`PutBucketObjectLockConfiguration`, re-attach the committed policy after
+pulling the latest version.
+
+### Account-level S3 settings
+
+The external suite expects account-level S3 Block Public Access to allow public
+ACL and public policy coverage. For the primary account, and preferably the
+alternate account as well, these must all be `false` or absent:
+
+- `BlockPublicAcls`
+- `IgnorePublicAcls`
+- `BlockPublicPolicy`
+- `RestrictPublicBuckets`
+
+If any of these are enabled, tests that need public-read, public-read-write, or
+public bucket policies will fail instead of skipping.
+
+New AWS buckets still start with bucket-level public access block enabled by
+default. The test suite clears bucket-level public access block on buckets that
+need public ACL or public policy coverage. That means the AWS environment must
+allow `PutPublicAccessBlock` on those test buckets, but you do not need to
+manually pre-clear bucket-level settings before running the suite.
+
+Also ensure there is no SCP, permission boundary, or other org/account policy
+that denies bucket ACL, bucket policy, ownership-controls, or public-access
+block operations needed by the suite.
+
+## Coverage
+
+Use [`scripts/coverage`](../scripts/coverage) to measure integration coverage.
+This is the main coverage number the repo currently optimizes for, rather than
+unit-test line coverage.
+
+Current command:
+
+```bash
+./scripts/coverage
+```
+
+That script runs integration coverage against `s3-tests`, so it is best used
+after targeted local testing has already narrowed down any failures.
+
+## Fuzzing
+
+Parser hardening work now has a dedicated `cargo-fuzz` harness under `fuzz/`.
+This is aimed at parser/helper-level targets rather than trying to fuzz the
+entire HTTP server end-to-end.
+
+Current targets:
+
+- `auth_dates`
+- `auth_post`
+- `auth_request`
+- `server_http_parsers`
+
+Useful commands:
+
+```bash
+# List targets.
+cd fuzz
+cargo fuzz list
+
+# Run a short session.
+cargo +nightly fuzz run auth_dates -- -max_total_time=30
+
+# Reproduce a saved crash artifact.
+cargo +nightly fuzz run auth_dates artifacts/auth_dates/<artifact>
+```
+
+Notes:
+
+- `cargo-fuzz` requires nightly for sanitizer instrumentation.
+- corpora live under `fuzz/corpus/`
+- crashes and minimized artifacts live under `fuzz/artifacts/`
+- these targets are for "must not panic / must reject malformed input cleanly"
+  style parser invariants, not AWS behavior compatibility by themselves
+
+## Choosing the right test type
+
+As a rough rule:
+
+- use targeted crate tests while implementing parser/auth/http changes
+- use `s3-local-tests` for local embedded-server behavior that does not need AWS
+- use `s3-http-tests` for plain-HTTP transport behavior
+- use AWS-backed `s3-tests` when compatibility depends on real AWS behavior
+- use `./scripts/coverage` when checking integration coverage movement
+- use `cargo-fuzz` for malformed-input robustness and panic discovery

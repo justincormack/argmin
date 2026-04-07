@@ -275,7 +275,7 @@ Full AWS environment setup, including the committed IAM policy, required
 account-level S3 Block Public Access settings, the separate HTTP-only
 `s3-http-tests` crate, and the local-only `s3-local-tests` crate, is
 documented in
-[`guides/aws-s3-tests-environment.md`](guides/aws-s3-tests-environment.md).
+[`guides/testing.md`](guides/testing.md).
 
 For local `s3-tests`, the embedded test server also supports trace helpers:
 

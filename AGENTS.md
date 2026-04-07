@@ -69,7 +69,7 @@ cargo test -p s3-tests --no-fail-fast
 resolution, causing `AuthorizationHeaderMalformed` errors. Use `eval "$(grep = .env)"`
 instead to read the values without exporting them.
 
-See [`guides/aws-s3-tests-environment.md`](guides/aws-s3-tests-environment.md)
+See [`guides/testing.md`](guides/testing.md)
 for the committed IAM policy, required account-level S3 Block Public Access
 settings, the separate HTTP-only `s3-http-tests` crate, and the separate
 local-only `s3-local-tests` crate.
