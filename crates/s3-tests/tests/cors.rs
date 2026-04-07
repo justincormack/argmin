@@ -2,11 +2,79 @@ use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CorsConfiguration, CorsRule, ObjectCannedAcl};
 use s3_tests::{unique_bucket, CTX};
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> ureq::Agent {
     s3_tests::test_agent()
+}
+
+struct PreflightSnapshot {
+    status: u16,
+    headers: HashMap<String, String>,
+}
+
+fn preflight_snapshot(
+    url: &str,
+    origin: Option<&str>,
+    request_method: Option<&str>,
+    request_headers: Option<&str>,
+) -> PreflightSnapshot {
+    let mut req = agent().options(url);
+    if let Some(origin) = origin {
+        req = req.header("Origin", origin);
+    }
+    if let Some(request_method) = request_method {
+        req = req.header("Access-Control-Request-Method", request_method);
+    }
+    if let Some(request_headers) = request_headers {
+        req = req.header("Access-Control-Request-Headers", request_headers);
+    }
+
+    let mut resp = req.call().expect("transport error");
+    let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_string(), value.to_string()))
+        })
+        .collect();
+    let _ = resp.body_mut().read_to_string();
+
+    PreflightSnapshot { status, headers }
+}
+
+async fn preflight_status_eventually(
+    url: &str,
+    origin: Option<&str>,
+    request_method: Option<&str>,
+    request_headers: Option<&str>,
+    expected_status: u16,
+    description: &str,
+) -> PreflightSnapshot {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let snapshot = preflight_snapshot(url, origin, request_method, request_headers);
+        if snapshot.status == expected_status {
+            return snapshot;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "{description} did not converge to HTTP {expected_status} for {url}, last status {}",
+            snapshot.status
+        );
+    }
+
+    unreachable!()
 }
 
 /// Create a bucket and set a CORS config on it.
@@ -260,22 +328,22 @@ fn test_cors_preflight_basic() {
         let bucket = setup_cors_bucket(vec![rule]).await;
 
         let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let mut resp = agent()
-            .options(&url)
-            .header("Origin", "http://example.com")
-            .header("Access-Control-Request-Method", "GET")
-            .call()
-            .expect("transport error");
-        let _ = resp.body_mut().read_to_string();
-
-        assert_eq!(resp.status().as_u16(), 200);
+        let resp = preflight_status_eventually(
+            &url,
+            Some("http://example.com"),
+            Some("GET"),
+            None,
+            200,
+            "basic CORS preflight",
+        )
+        .await;
         assert_eq!(
-            resp.headers()
-                .get("Access-Control-Allow-Origin")
-                .map(|h| h.to_str().unwrap()),
+            resp.headers
+                .get("access-control-allow-origin")
+                .map(String::as_str),
             Some("http://example.com")
         );
-        assert!(resp.headers().get("Access-Control-Allow-Methods").is_some());
+        assert!(resp.headers.contains_key("access-control-allow-methods"));
 
         cleanup(&bucket, &[]).await;
     });
@@ -288,15 +356,17 @@ fn test_cors_preflight_no_match() {
         let bucket = setup_cors_bucket(vec![rule]).await;
 
         let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let mut resp = agent()
-            .options(&url)
-            .header("Origin", "http://other.com")
-            .header("Access-Control-Request-Method", "GET")
-            .call()
-            .expect("transport error");
-        let _ = resp.body_mut().read_to_string();
+        let resp = preflight_status_eventually(
+            &url,
+            Some("http://other.com"),
+            Some("GET"),
+            None,
+            403,
+            "non-matching CORS preflight",
+        )
+        .await;
 
-        assert_eq!(resp.status().as_u16(), 403);
+        assert_eq!(resp.status, 403);
 
         cleanup(&bucket, &[]).await;
     });
@@ -365,20 +435,18 @@ fn test_cors_preflight_with_headers() {
         let bucket = setup_cors_bucket(vec![rule]).await;
 
         let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let mut resp = agent()
-            .options(&url)
-            .header("Origin", "http://example.com")
-            .header("Access-Control-Request-Method", "GET")
-            .header(
-                "Access-Control-Request-Headers",
-                "x-custom-header, content-type",
-            )
-            .call()
-            .expect("transport error");
-        let _ = resp.body_mut().read_to_string();
+        let resp = preflight_status_eventually(
+            &url,
+            Some("http://example.com"),
+            Some("GET"),
+            Some("x-custom-header, content-type"),
+            200,
+            "CORS preflight with headers",
+        )
+        .await;
 
-        assert_eq!(resp.status().as_u16(), 200);
-        assert!(resp.headers().get("Access-Control-Allow-Headers").is_some());
+        assert_eq!(resp.status, 200);
+        assert!(resp.headers.contains_key("access-control-allow-headers"));
 
         cleanup(&bucket, &[]).await;
     });
@@ -391,26 +459,27 @@ fn test_cors_preflight_wildcard_origin() {
         let bucket = setup_cors_bucket(vec![rule]).await;
 
         let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let mut resp = agent()
-            .options(&url)
-            .header("Origin", "http://anything.com")
-            .header("Access-Control-Request-Method", "GET")
-            .call()
-            .expect("transport error");
-        let _ = resp.body_mut().read_to_string();
+        let resp = preflight_status_eventually(
+            &url,
+            Some("http://anything.com"),
+            Some("GET"),
+            None,
+            200,
+            "wildcard-origin CORS preflight",
+        )
+        .await;
 
-        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.status, 200);
         assert_eq!(
-            resp.headers()
-                .get("Access-Control-Allow-Origin")
-                .map(|h| h.to_str().unwrap()),
+            resp.headers
+                .get("access-control-allow-origin")
+                .map(String::as_str),
             Some("*")
         );
         // Wildcard origin should NOT set Allow-Credentials
-        assert!(resp
-            .headers()
-            .get("Access-Control-Allow-Credentials")
-            .is_none());
+        assert!(!resp
+            .headers
+            .contains_key("access-control-allow-credentials"));
 
         cleanup(&bucket, &[]).await;
     });
@@ -428,16 +497,17 @@ fn test_cors_preflight_wildcard_headers() {
         let bucket = setup_cors_bucket(vec![rule]).await;
 
         let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let mut resp = agent()
-            .options(&url)
-            .header("Origin", "http://example.com")
-            .header("Access-Control-Request-Method", "GET")
-            .header("Access-Control-Request-Headers", "x-anything, x-whatever")
-            .call()
-            .expect("transport error");
-        let _ = resp.body_mut().read_to_string();
+        let resp = preflight_status_eventually(
+            &url,
+            Some("http://example.com"),
+            Some("GET"),
+            Some("x-anything, x-whatever"),
+            200,
+            "wildcard-header CORS preflight",
+        )
+        .await;
 
-        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(resp.status, 200);
 
         cleanup(&bucket, &[]).await;
     });
@@ -455,18 +525,19 @@ fn test_cors_preflight_rejects_disallowed_request_headers() {
         let bucket = setup_cors_bucket(vec![rule]).await;
 
         let url = format!("{}/{}/missing", CTX.endpoint(), bucket);
-        let mut resp = agent()
-            .options(&url)
-            .header("Origin", "http://example.com")
-            .header("Access-Control-Request-Method", "GET")
-            .header("Access-Control-Request-Headers", "x-amz-meta-header2")
-            .call()
-            .expect("transport error");
-        let _ = resp.body_mut().read_to_string();
+        let resp = preflight_status_eventually(
+            &url,
+            Some("http://example.com"),
+            Some("GET"),
+            Some("x-amz-meta-header2"),
+            403,
+            "disallowed-header CORS preflight",
+        )
+        .await;
 
-        assert_eq!(resp.status().as_u16(), 403);
-        assert!(resp.headers().get("Access-Control-Allow-Origin").is_none());
-        assert!(resp.headers().get("Access-Control-Allow-Methods").is_none());
+        assert_eq!(resp.status, 403);
+        assert!(!resp.headers.contains_key("access-control-allow-origin"));
+        assert!(!resp.headers.contains_key("access-control-allow-methods"));
 
         cleanup(&bucket, &[]).await;
     });
