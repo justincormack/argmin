@@ -269,6 +269,8 @@ The main DoS claim is stale for the current implementation:
 So the claimed "unbounded key sizes/entries cause medium-severity authenticated DoS" is not supported in the current codebase.
 
 There is still a narrower validation inconsistency: routed object operations apply `validate_object_key`, while `DeleteObjects` XML parsing does not currently reuse that validator for `<Key>` contents. That looks like a conformance/consistency gap, not an established availability issue under the current body and entry limits.
+
+Follow-up: that consistency gap has now been addressed as well. Commit `d8af264` (`server-http: validate delete-objects keys`) makes `DeleteObjects` reuse the same object-key validator as routed object operations and adds coverage for invalid delete keys.
  
      #[test]
      fn parse_delete_objects_quiet_mode() {
