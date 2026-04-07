@@ -1,10 +1,13 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    ChecksumAlgorithm, ChecksumMode, ChecksumType, CompletedMultipartUpload, CompletedPart,
-    ObjectAttributes,
+    BucketVersioningStatus, ChecksumAlgorithm, ChecksumMode, ChecksumType,
+    CompletedMultipartUpload, CompletedPart, ObjectAttributes, VersioningConfiguration,
 };
 use ring::hmac;
-use s3_tests::{assert_s3_err_code, err_status, send_signed_request, unique_bucket, CTX};
+use s3_tests::{
+    assert_s3_err_code, cleanup_versioned_bucket, err_status, send_signed_request, unique_bucket,
+    CTX,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -13,6 +16,24 @@ async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
     s3_tests::create_bucket(client, &bucket).await.unwrap();
+    bucket
+}
+
+async fn setup_versioned_bucket() -> String {
+    let client = CTX.client();
+    let bucket = unique_bucket();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
+    client
+        .put_bucket_versioning()
+        .bucket(&bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
     bucket
 }
 
@@ -1047,7 +1068,7 @@ fn test_multipart_checksum_sha256() {
             .await
             .unwrap();
 
-        // CompleteMultipartUpload without per-part checksum should succeed.
+        // CompleteMultipartUpload without per-part checksum should fail.
         let result2 = client
             .complete_multipart_upload()
             .bucket(&bucket)
@@ -1065,25 +1086,9 @@ fn test_multipart_checksum_sha256() {
                     .build(),
             )
             .send()
-            .await
-            .unwrap();
-        assert!(
-            result2.checksum_sha256().is_some(),
-            "expected complete response checksum"
-        );
-        let head2 = client
-            .head_object()
-            .bucket(&bucket)
-            .key(key2)
-            .checksum_mode(ChecksumMode::Enabled)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(head2.checksum_type(), Some(&ChecksumType::Composite));
-        assert!(
-            head2.checksum_sha256().is_some(),
-            "expected completed object checksum"
-        );
+            .await;
+        assert_eq!(err_status(&result2), 400);
+        assert_s3_err_code(&result2, "InvalidRequest");
 
         // -- successful COMPOSITE SHA-256 upload --
         let key3 = "mymultipart3";
@@ -1367,6 +1372,51 @@ fn test_get_object_part_with_checksum() {
         }
 
         cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_list_object_versions_includes_full_object_checksum_type_for_single_part_put() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "versioned-single-part-checksum";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"hi"))
+            .checksum_algorithm(ChecksumAlgorithm::Crc32)
+            .send()
+            .await
+            .unwrap();
+
+        let versions = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .prefix(key)
+            .send()
+            .await
+            .unwrap();
+        let version = versions
+            .versions()
+            .iter()
+            .find(|version| version.key() == Some(key))
+            .expect("expected uploaded version");
+
+        assert_eq!(
+            version.checksum_algorithm(),
+            &[ChecksumAlgorithm::Crc32],
+            "ListObjectVersions checksum algorithm mismatch"
+        );
+        assert_eq!(
+            version.checksum_type(),
+            Some(&ChecksumType::FullObject),
+            "ListObjectVersions checksum type mismatch"
+        );
+
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 

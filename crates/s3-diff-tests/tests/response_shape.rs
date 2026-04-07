@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use aws_sdk_s3::types::{
     BucketLocationConstraint, BucketVersioningStatus, CreateBucketConfiguration,
-    VersioningConfiguration,
+    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, VersioningConfiguration,
 };
 use aws_sdk_s3::Client;
 use s3_tests::{
@@ -155,6 +156,21 @@ async fn create_bucket_in_region(client: &Client, bucket: &str, region: &str) {
     request.send().await.expect("create bucket");
 }
 
+async fn create_object_lock_bucket_in_region(client: &Client, bucket: &str, region: &str) {
+    let mut request = client
+        .create_bucket()
+        .bucket(bucket)
+        .object_lock_enabled_for_bucket(true);
+    if !is_legacy_create_bucket_region(region) {
+        request = request.create_bucket_configuration(
+            CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(region))
+                .build(),
+        );
+    }
+    request.send().await.expect("create object lock bucket");
+}
+
 async fn enable_bucket_versioning(client: &Client, bucket: &str) {
     client
         .put_bucket_versioning()
@@ -167,6 +183,101 @@ async fn enable_bucket_versioning(client: &Client, bucket: &str) {
         .send()
         .await
         .expect("enable bucket versioning");
+}
+
+async fn create_object_lock_bucket_pair(env: &ComparisonEnv) -> (String, String) {
+    let external_bucket = unique_bucket();
+    let local_bucket = unique_bucket();
+    create_object_lock_bucket_in_region(
+        &env.external_client,
+        &external_bucket,
+        &env.external_region,
+    )
+    .await;
+    create_object_lock_bucket_in_region(
+        &env.local_client,
+        &local_bucket,
+        s3_tests::server::TEST_REGION,
+    )
+    .await;
+    (external_bucket, local_bucket)
+}
+
+fn future_datetime(seconds_from_now: u64) -> DateTime {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_secs() as i64;
+    DateTime::from_secs(now + seconds_from_now as i64)
+}
+
+fn object_lock_legal_hold(status: ObjectLockLegalHoldStatus) -> ObjectLockLegalHold {
+    ObjectLockLegalHold::builder().status(status).build()
+}
+
+async fn cleanup_object_lock_bucket(client: &Client, bucket: &str) {
+    loop {
+        let versions = client
+            .list_object_versions()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("list object lock bucket versions");
+
+        if versions.versions().is_empty() && versions.delete_markers().is_empty() {
+            client
+                .delete_bucket()
+                .bucket(bucket)
+                .send()
+                .await
+                .expect("delete object lock bucket");
+            return;
+        }
+
+        for marker in versions.delete_markers() {
+            client
+                .delete_object()
+                .bucket(bucket)
+                .key(marker.key().expect("delete marker key"))
+                .version_id(marker.version_id().expect("delete marker version id"))
+                .send()
+                .await
+                .expect("delete object lock delete marker");
+        }
+
+        for version in versions.versions() {
+            let key = version.key().expect("version key");
+            let version_id = version.version_id().expect("version id");
+            let head = client
+                .head_object()
+                .bucket(bucket)
+                .key(key)
+                .version_id(version_id)
+                .send()
+                .await
+                .expect("head object lock version");
+            if head.object_lock_legal_hold_status() == Some(&ObjectLockLegalHoldStatus::On) {
+                client
+                    .put_object_legal_hold()
+                    .bucket(bucket)
+                    .key(key)
+                    .version_id(version_id)
+                    .legal_hold(object_lock_legal_hold(ObjectLockLegalHoldStatus::Off))
+                    .send()
+                    .await
+                    .expect("disable legal hold for cleanup");
+            }
+            client
+                .delete_object()
+                .bucket(bucket)
+                .key(key)
+                .version_id(version_id)
+                .bypass_governance_retention(true)
+                .send()
+                .await
+                .expect("delete object lock version");
+        }
+    }
 }
 
 fn normalized_headers(
@@ -1406,5 +1517,543 @@ fn test_get_object_attributes_response_shape_matches_aws() {
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
         delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_object_lock_read_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = create_object_lock_bucket_pair(&env).await;
+        let locked_key = "shape-object-lock.txt";
+        let plain_key = "shape-object-lock-plain.txt";
+        let retain_until = future_datetime(24 * 60 * 60);
+
+        let external_locked_put = env
+            .external_client
+            .put_object()
+            .bucket(&external_bucket)
+            .key(locked_key)
+            .body(ByteStream::from_static(b"object-lock-body"))
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(retain_until)
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+            .send()
+            .await
+            .expect("put external object lock object");
+        let local_locked_put = env
+            .local_client
+            .put_object()
+            .bucket(&local_bucket)
+            .key(locked_key)
+            .body(ByteStream::from_static(b"object-lock-body"))
+            .object_lock_mode(ObjectLockMode::Governance)
+            .object_lock_retain_until_date(retain_until)
+            .object_lock_legal_hold_status(ObjectLockLegalHoldStatus::On)
+            .send()
+            .await
+            .expect("put local object lock object");
+        let external_locked_version = external_locked_put
+            .version_id()
+            .expect("external locked version id")
+            .to_string();
+        let local_locked_version = local_locked_put
+            .version_id()
+            .expect("local locked version id")
+            .to_string();
+
+        env.external_client
+            .put_object()
+            .bucket(&external_bucket)
+            .key(plain_key)
+            .body(ByteStream::from_static(b"plain-object-lock-body"))
+            .send()
+            .await
+            .expect("put external plain object lock fixture");
+        env.local_client
+            .put_object()
+            .bucket(&local_bucket)
+            .key(plain_key)
+            .body(ByteStream::from_static(b"plain-object-lock-body"))
+            .send()
+            .await
+            .expect("put local plain object lock fixture");
+
+        let aws_locked_get = env.send_external(
+            "GET",
+            &external_bucket,
+            locked_key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_locked_get = env.send_local(
+            "GET",
+            &local_bucket,
+            locked_key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_shape_matches(
+            "GetObjectObjectLock",
+            &aws_locked_get,
+            &local_locked_get,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &["x-amz-version-id"],
+        );
+
+        let aws_locked_head = env.send_external(
+            "HEAD",
+            &external_bucket,
+            locked_key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_locked_head = env.send_local(
+            "HEAD",
+            &local_bucket,
+            locked_key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_shape_matches(
+            "HeadObjectObjectLock",
+            &aws_locked_head,
+            &local_locked_head,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &["x-amz-version-id"],
+        );
+
+        let aws_locked_attributes = env.send_external(
+            "GET",
+            &external_bucket,
+            locked_key,
+            Some("attributes="),
+            b"",
+            [("x-amz-object-attributes", "ObjectSize")],
+        );
+        let local_locked_attributes = env.send_local(
+            "GET",
+            &local_bucket,
+            locked_key,
+            Some("attributes="),
+            b"",
+            [("x-amz-object-attributes", "ObjectSize")],
+        );
+        assert_response_shape_matches(
+            "GetObjectAttributesObjectLock",
+            &aws_locked_attributes,
+            &local_locked_attributes,
+            &[],
+            &["x-amz-version-id"],
+        );
+
+        let aws_locked_version_get = env.send_external(
+            "GET",
+            &external_bucket,
+            locked_key,
+            Some(&format!("versionId={external_locked_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_locked_version_get = env.send_local(
+            "GET",
+            &local_bucket,
+            locked_key,
+            Some(&format!("versionId={local_locked_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_shape_matches(
+            "GetObjectObjectLockExplicitVersion",
+            &aws_locked_version_get,
+            &local_locked_version_get,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &["x-amz-version-id"],
+        );
+
+        let aws_locked_version_head = env.send_external(
+            "HEAD",
+            &external_bucket,
+            locked_key,
+            Some(&format!("versionId={external_locked_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_locked_version_head = env.send_local(
+            "HEAD",
+            &local_bucket,
+            locked_key,
+            Some(&format!("versionId={local_locked_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_shape_matches(
+            "HeadObjectObjectLockExplicitVersion",
+            &aws_locked_version_head,
+            &local_locked_version_head,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &["x-amz-version-id"],
+        );
+
+        let aws_plain_head = env.send_external(
+            "HEAD",
+            &external_bucket,
+            plain_key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_plain_head = env.send_local(
+            "HEAD",
+            &local_bucket,
+            plain_key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_shape_matches(
+            "HeadObjectObjectLockBucketPlainObject",
+            &aws_plain_head,
+            &local_plain_head,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &["x-amz-version-id"],
+        );
+
+        cleanup_object_lock_bucket(&env.external_client, &external_bucket).await;
+        cleanup_object_lock_bucket(&env.local_client, &local_bucket).await;
+    });
+}
+
+#[test]
+fn test_delete_object_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        enable_bucket_versioning(&env.external_client, &external_bucket).await;
+        enable_bucket_versioning(&env.local_client, &local_bucket).await;
+
+        let key = "shape-delete.txt";
+        env.external_client
+            .put_object()
+            .bucket(&external_bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"delete-shape"))
+            .send()
+            .await
+            .expect("put external delete fixture");
+        env.local_client
+            .put_object()
+            .bucket(&local_bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"delete-shape"))
+            .send()
+            .await
+            .expect("put local delete fixture");
+
+        let aws_delete_current = env.send_external(
+            "DELETE",
+            &external_bucket,
+            key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_delete_current = env.send_local(
+            "DELETE",
+            &local_bucket,
+            key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_shape_matches(
+            "DeleteObjectCurrentVersion",
+            &aws_delete_current,
+            &local_delete_current,
+            &[],
+            &["x-amz-version-id"],
+        );
+
+        let external_delete_marker_version =
+            response_header_value(&aws_delete_current, "x-amz-version-id")
+                .expect("external delete marker version id")
+                .to_string();
+        let local_delete_marker_version =
+            response_header_value(&local_delete_current, "x-amz-version-id")
+                .expect("local delete marker version id")
+                .to_string();
+
+        let aws_delete_marker = env.send_external(
+            "DELETE",
+            &external_bucket,
+            key,
+            Some(&format!("versionId={external_delete_marker_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_delete_marker = env.send_local(
+            "DELETE",
+            &local_bucket,
+            key,
+            Some(&format!("versionId={local_delete_marker_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_shape_matches(
+            "DeleteObjectDeleteMarkerVersion",
+            &aws_delete_marker,
+            &local_delete_marker,
+            &[],
+            &["x-amz-version-id"],
+        );
+
+        cleanup_versioned_bucket(&env.external_client, &external_bucket).await;
+        cleanup_versioned_bucket(&env.local_client, &local_bucket).await;
+    });
+}
+
+#[test]
+fn test_list_object_versions_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        enable_bucket_versioning(&env.external_client, &external_bucket).await;
+        enable_bucket_versioning(&env.local_client, &local_bucket).await;
+
+        env.external_client
+            .put_object()
+            .bucket(&external_bucket)
+            .key("versions-a.txt")
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await
+            .expect("put external version fixture a1");
+        env.local_client
+            .put_object()
+            .bucket(&local_bucket)
+            .key("versions-a.txt")
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await
+            .expect("put local version fixture a1");
+        env.external_client
+            .put_object()
+            .bucket(&external_bucket)
+            .key("versions-a.txt")
+            .body(ByteStream::from_static(b"v2"))
+            .send()
+            .await
+            .expect("put external version fixture a2");
+        env.local_client
+            .put_object()
+            .bucket(&local_bucket)
+            .key("versions-a.txt")
+            .body(ByteStream::from_static(b"v2"))
+            .send()
+            .await
+            .expect("put local version fixture a2");
+        env.external_client
+            .put_object()
+            .bucket(&external_bucket)
+            .key("versions-b.txt")
+            .body(ByteStream::from_static(b"vb"))
+            .send()
+            .await
+            .expect("put external version fixture b1");
+        env.local_client
+            .put_object()
+            .bucket(&local_bucket)
+            .key("versions-b.txt")
+            .body(ByteStream::from_static(b"vb"))
+            .send()
+            .await
+            .expect("put local version fixture b1");
+        env.external_client
+            .delete_object()
+            .bucket(&external_bucket)
+            .key("versions-a.txt")
+            .send()
+            .await
+            .expect("delete external version fixture current");
+        env.local_client
+            .delete_object()
+            .bucket(&local_bucket)
+            .key("versions-a.txt")
+            .send()
+            .await
+            .expect("delete local version fixture current");
+
+        let aws_list_versions = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("versions=&max-keys=2"),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_list_versions = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("versions=&max-keys=2"),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_xml_response_shape_matches(
+            "ListObjectVersions",
+            &aws_list_versions,
+            &local_list_versions,
+            &["content-length"],
+            &[],
+            &[
+                "Name",
+                "VersionId",
+                "NextVersionIdMarker",
+                "LastModified",
+                "ETag",
+                "ID",
+                "DisplayName",
+            ],
+        );
+
+        cleanup_versioned_bucket(&env.external_client, &external_bucket).await;
+        cleanup_versioned_bucket(&env.local_client, &local_bucket).await;
+    });
+}
+
+#[test]
+fn test_list_multipart_uploads_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+
+        let external_upload_a = env
+            .external_client
+            .create_multipart_upload()
+            .bucket(&external_bucket)
+            .key("mpu-a.txt")
+            .send()
+            .await
+            .expect("create external multipart upload a");
+        let local_upload_a = env
+            .local_client
+            .create_multipart_upload()
+            .bucket(&local_bucket)
+            .key("mpu-a.txt")
+            .send()
+            .await
+            .expect("create local multipart upload a");
+        let external_upload_b = env
+            .external_client
+            .create_multipart_upload()
+            .bucket(&external_bucket)
+            .key("mpu-b.txt")
+            .send()
+            .await
+            .expect("create external multipart upload b");
+        let local_upload_b = env
+            .local_client
+            .create_multipart_upload()
+            .bucket(&local_bucket)
+            .key("mpu-b.txt")
+            .send()
+            .await
+            .expect("create local multipart upload b");
+
+        let aws_list_uploads = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("uploads=&max-uploads=1"),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_list_uploads = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("uploads=&max-uploads=1"),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_xml_response_shape_matches(
+            "ListMultipartUploads",
+            &aws_list_uploads,
+            &local_list_uploads,
+            &["content-length"],
+            &[],
+            &[
+                "Bucket",
+                "UploadId",
+                "NextUploadIdMarker",
+                "Initiated",
+                "ID",
+                "DisplayName",
+            ],
+        );
+
+        env.external_client
+            .abort_multipart_upload()
+            .bucket(&external_bucket)
+            .key("mpu-a.txt")
+            .upload_id(
+                external_upload_a
+                    .upload_id()
+                    .expect("external multipart upload id a"),
+            )
+            .send()
+            .await
+            .expect("abort external multipart upload a");
+        env.external_client
+            .abort_multipart_upload()
+            .bucket(&external_bucket)
+            .key("mpu-b.txt")
+            .upload_id(
+                external_upload_b
+                    .upload_id()
+                    .expect("external multipart upload id b"),
+            )
+            .send()
+            .await
+            .expect("abort external multipart upload b");
+        env.local_client
+            .abort_multipart_upload()
+            .bucket(&local_bucket)
+            .key("mpu-a.txt")
+            .upload_id(
+                local_upload_a
+                    .upload_id()
+                    .expect("local multipart upload id a"),
+            )
+            .send()
+            .await
+            .expect("abort local multipart upload a");
+        env.local_client
+            .abort_multipart_upload()
+            .bucket(&local_bucket)
+            .key("mpu-b.txt")
+            .upload_id(
+                local_upload_b
+                    .upload_id()
+                    .expect("local multipart upload id b"),
+            )
+            .send()
+            .await
+            .expect("abort local multipart upload b");
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
     });
 }

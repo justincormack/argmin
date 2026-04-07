@@ -203,6 +203,7 @@ pub struct RenderedAclGrant {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedCanonicalUser {
     pub canonical_id: CanonicalUserId,
+    pub display_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +230,13 @@ fn append_canonical_owner_xml(xml: &mut String, element: &str, owner: &RenderedC
     xml.push_str(element);
     xml.push_str("><ID>");
     xml.push_str(&xml_escape(owner.canonical_id.as_str()));
-    xml.push_str("</ID></");
+    xml.push_str("</ID>");
+    if let Some(display_name) = &owner.display_name {
+        xml.push_str("<DisplayName>");
+        xml.push_str(&xml_escape(display_name));
+        xml.push_str("</DisplayName>");
+    }
+    xml.push_str("</");
     xml.push_str(element);
     xml.push('>');
 }
@@ -1980,31 +1987,19 @@ pub fn list_object_versions_xml(
     xml.push_str(&xml_escape(bucket));
     xml.push_str("</Name>");
 
+    xml.push_str("<Prefix>");
     if let Some(p) = prefix {
-        xml.push_str("<Prefix>");
         xml.push_str(&xml_escape(p));
-        xml.push_str("</Prefix>");
-    } else {
-        xml.push_str("<Prefix/>");
     }
+    xml.push_str("</Prefix>");
 
+    xml.push_str("<KeyMarker>");
     if let Some(km) = key_marker {
-        xml.push_str("<KeyMarker>");
         xml.push_str(&xml_escape(km));
-        xml.push_str("</KeyMarker>");
-    } else {
-        xml.push_str("<KeyMarker/>");
     }
+    xml.push_str("</KeyMarker>");
 
-    xml.push_str("<VersionIdMarker/>");
-
-    xml.push_str("<MaxKeys>");
-    xml.push_str(&max_keys.to_string());
-    xml.push_str("</MaxKeys>");
-
-    xml.push_str("<IsTruncated>");
-    xml.push_str(if result.is_truncated { "true" } else { "false" });
-    xml.push_str("</IsTruncated>");
+    xml.push_str("<VersionIdMarker></VersionIdMarker>");
 
     if let Some(ref nkm) = result.next_key_marker {
         xml.push_str("<NextKeyMarker>");
@@ -2017,6 +2012,14 @@ pub fn list_object_versions_xml(
         xml.push_str(&format_version_id(nvm));
         xml.push_str("</NextVersionIdMarker>");
     }
+
+    xml.push_str("<MaxKeys>");
+    xml.push_str(&max_keys.to_string());
+    xml.push_str("</MaxKeys>");
+
+    xml.push_str("<IsTruncated>");
+    xml.push_str(if result.is_truncated { "true" } else { "false" });
+    xml.push_str("</IsTruncated>");
 
     let owner_id = result.owner_canonical_id.as_str();
 
@@ -2059,13 +2062,23 @@ pub fn list_object_versions_xml(
             xml.push_str("<ETag>");
             xml.push_str(&xml_escape(&entry.etag));
             xml.push_str("</ETag>");
+            if let Some(checksum_algorithm) = entry.checksum_algorithm {
+                xml.push_str("<ChecksumAlgorithm>");
+                xml.push_str(checksum_algorithm.as_str());
+                xml.push_str("</ChecksumAlgorithm>");
+            }
+            if let Some(checksum_type) = entry.checksum_type {
+                xml.push_str("<ChecksumType>");
+                xml.push_str(checksum_type.as_str());
+                xml.push_str("</ChecksumType>");
+            }
             xml.push_str("<Size>");
             xml.push_str(&entry.size.to_string());
             xml.push_str("</Size>");
-            xml.push_str("<StorageClass>STANDARD</StorageClass>");
             xml.push_str("<Owner><ID>");
             xml.push_str(&xml_escape(owner_id));
             xml.push_str("</ID></Owner>");
+            xml.push_str("<StorageClass>STANDARD</StorageClass>");
             xml.push_str("</Version>");
         }
     }
@@ -2485,7 +2498,13 @@ fn days_to_date(days: i64) -> (i64, u32, u32) {
 }
 
 pub(crate) fn format_object_lock_timestamp(unix_seconds: u64) -> String {
-    format_timestamp(unix_seconds.saturating_mul(1000))
+    let days_since_epoch = unix_seconds / 86400;
+    let time_of_day = unix_seconds % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+    let (year, month, day) = days_to_date(days_since_epoch as i64);
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
 fn parse_object_lock_timestamp_secs_with<F>(raw: &str, invalid: F) -> Result<u64, ServerError>
@@ -3469,27 +3488,17 @@ pub fn list_multipart_uploads_xml(
     );
     if let Some(p) = prefix {
         xml.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(p)));
-    } else {
-        xml.push_str("<Prefix/>");
     }
+    xml.push_str("<KeyMarker>");
     if let Some(km) = key_marker {
-        xml.push_str(&format!("<KeyMarker>{}</KeyMarker>", xml_escape(km)));
-    } else {
-        xml.push_str("<KeyMarker/>");
+        xml.push_str(&xml_escape(km));
     }
+    xml.push_str("</KeyMarker>");
+    xml.push_str("<UploadIdMarker>");
     if let Some(um) = upload_id_marker {
-        xml.push_str(&format!(
-            "<UploadIdMarker>{}</UploadIdMarker>",
-            xml_escape(um)
-        ));
-    } else {
-        xml.push_str("<UploadIdMarker/>");
+        xml.push_str(&xml_escape(um));
     }
-    xml.push_str(&format!("<MaxUploads>{max_uploads}</MaxUploads>"));
-    xml.push_str(&format!(
-        "<IsTruncated>{}</IsTruncated>",
-        result.is_truncated
-    ));
+    xml.push_str("</UploadIdMarker>");
     if let Some(ref nkm) = result.next_key_marker {
         xml.push_str(&format!(
             "<NextKeyMarker>{}</NextKeyMarker>",
@@ -3502,8 +3511,25 @@ pub fn list_multipart_uploads_xml(
             xml_escape(num)
         ));
     }
+    xml.push_str(&format!("<MaxUploads>{max_uploads}</MaxUploads>"));
+    xml.push_str(&format!(
+        "<IsTruncated>{}</IsTruncated>",
+        result.is_truncated
+    ));
     for upload in &result.uploads {
         xml.push_str("<Upload>");
+        xml.push_str(&format!("<Key>{}</Key>", xml_escape(&upload.key)));
+        xml.push_str(&format!(
+            "<UploadId>{}</UploadId>",
+            xml_escape(&upload.upload_id)
+        ));
+        append_canonical_owner_xml(&mut xml, "Initiator", &upload.initiator);
+        append_canonical_owner_xml(&mut xml, "Owner", &upload.owner);
+        xml.push_str("<StorageClass>STANDARD</StorageClass>");
+        xml.push_str(&format!(
+            "<Initiated>{}</Initiated>",
+            format_timestamp(upload.initiated)
+        ));
         if let Some(algo) = upload.checksum_algorithm {
             xml.push_str(&format!(
                 "<ChecksumAlgorithm>{}</ChecksumAlgorithm>",
@@ -3516,18 +3542,6 @@ pub fn list_multipart_uploads_xml(
                 checksum_type.as_str()
             ));
         }
-        xml.push_str(&format!(
-            "<Initiated>{}</Initiated>",
-            format_timestamp(upload.initiated)
-        ));
-        append_canonical_owner_xml(&mut xml, "Initiator", &upload.initiator);
-        xml.push_str(&format!("<Key>{}</Key>", xml_escape(&upload.key)));
-        append_canonical_owner_xml(&mut xml, "Owner", &upload.owner);
-        xml.push_str("<StorageClass>STANDARD</StorageClass>");
-        xml.push_str(&format!(
-            "<UploadId>{}</UploadId>",
-            xml_escape(&upload.upload_id)
-        ));
         xml.push_str("</Upload>");
     }
     xml.push_str("</ListMultipartUploadsResult>");
@@ -4389,6 +4403,8 @@ mod tests {
                 etag: "\"abc123\"".to_string(),
                 last_modified: 1685000000000,
                 is_delete_marker: false,
+                checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
+                checksum_type: Some(checksum::ChecksumType::FullObject),
             }],
             is_truncated: false,
             next_key_marker: None,
@@ -4402,13 +4418,15 @@ mod tests {
         assert!(xml.contains("<Key>my-key</Key>"));
         assert!(xml.contains("<VersionId>null</VersionId>"));
         assert!(xml.contains("<IsLatest>true</IsLatest>"));
+        assert!(xml.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"));
+        assert!(xml.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"));
         assert!(xml.contains("<Size>42</Size>"));
         assert!(xml.contains(&format!(
             "<Owner><ID>{}</ID></Owner>",
             result.owner_canonical_id.as_str()
         )));
         assert!(!xml.contains("<DisplayName>"));
-        assert!(xml.contains("<KeyMarker/>"));
+        assert!(xml.contains("<KeyMarker></KeyMarker>"));
         assert!(!xml.contains("<KeyCount>"));
     }
 
@@ -4456,6 +4474,8 @@ mod tests {
                 etag: String::new(),
                 last_modified: 1685000000000,
                 is_delete_marker: true,
+                checksum_algorithm: None,
+                checksum_type: None,
             }],
             is_truncated: false,
             next_key_marker: None,
@@ -4717,7 +4737,7 @@ mod tests {
         let xml = br#"
             <ObjectLockRetention>
               <Mode>COMPLIANCE</Mode>
-              <RetainUntilDate>2026-04-01T00:00:00.000Z</RetainUntilDate>
+              <RetainUntilDate>2026-04-01T00:00:00Z</RetainUntilDate>
             </ObjectLockRetention>
         "#;
         assert_eq!(
@@ -4751,7 +4771,7 @@ mod tests {
         }));
         assert!(xml.contains("<Retention"));
         assert!(xml.contains("<Mode>GOVERNANCE</Mode>"));
-        assert!(xml.contains("<RetainUntilDate>2026-04-01T00:00:00.000Z</RetainUntilDate>"));
+        assert!(xml.contains("<RetainUntilDate>2026-04-01T00:00:00Z</RetainUntilDate>"));
     }
 
     #[test]
@@ -5787,9 +5807,9 @@ mod tests {
         };
         let xml = list_multipart_uploads_xml("mybucket", None, None, None, 1000, &result);
         assert!(xml.contains("<Bucket>mybucket</Bucket>"));
-        assert!(xml.contains("<Prefix/>"));
-        assert!(xml.contains("<KeyMarker/>"));
-        assert!(xml.contains("<UploadIdMarker/>"));
+        assert!(!xml.contains("<Prefix"));
+        assert!(xml.contains("<KeyMarker></KeyMarker>"));
+        assert!(xml.contains("<UploadIdMarker></UploadIdMarker>"));
         assert!(xml.contains("<MaxUploads>1000</MaxUploads>"));
         assert!(xml.contains("<IsTruncated>false</IsTruncated>"));
         assert!(!xml.contains("<Upload>"));
@@ -5807,9 +5827,11 @@ mod tests {
                     initiated: 1700000000000,
                     owner: RenderedCanonicalUser {
                         canonical_id: CanonicalUserId::from_principal("owner-1"),
+                        display_name: None,
                     },
                     initiator: RenderedCanonicalUser {
                         canonical_id: CanonicalUserId::from_principal("owner-1"),
+                        display_name: Some("owner-1".to_string()),
                     },
                     checksum_algorithm: None,
                     checksum_type: None,
@@ -5820,9 +5842,11 @@ mod tests {
                     initiated: 1700000001000,
                     owner: RenderedCanonicalUser {
                         canonical_id: CanonicalUserId::from_principal("owner-2"),
+                        display_name: None,
                     },
                     initiator: RenderedCanonicalUser {
                         canonical_id: CanonicalUserId::from_principal("writer-2"),
+                        display_name: Some("writer-2".to_string()),
                     },
                     checksum_algorithm: Some(ChecksumAlgorithm::Sha256),
                     checksum_type: Some(checksum::ChecksumType::Composite),
@@ -5841,10 +5865,11 @@ mod tests {
         assert!(xml.contains("<Initiated>"));
         assert!(xml.contains("<Owner><ID>"));
         assert!(xml.contains("<Initiator><ID>"));
+        assert!(xml.contains("<DisplayName>owner-1</DisplayName>"));
+        assert!(xml.contains("<DisplayName>writer-2</DisplayName>"));
         assert!(xml.contains("<StorageClass>STANDARD</StorageClass>"));
         assert!(xml.contains("<ChecksumAlgorithm>SHA256</ChecksumAlgorithm>"));
         assert!(xml.contains("<ChecksumType>COMPOSITE</ChecksumType>"));
-        assert!(!xml.contains("<DisplayName>"));
     }
 
     #[test]
@@ -5856,9 +5881,11 @@ mod tests {
                 initiated: 0,
                 owner: RenderedCanonicalUser {
                     canonical_id: CanonicalUserId::from_principal("owner-1"),
+                    display_name: None,
                 },
                 initiator: RenderedCanonicalUser {
                     canonical_id: CanonicalUserId::from_principal("owner-1"),
+                    display_name: Some("owner-1".to_string()),
                 },
                 checksum_algorithm: None,
                 checksum_type: None,
@@ -5892,9 +5919,11 @@ mod tests {
                 initiated: 0,
                 owner: RenderedCanonicalUser {
                     canonical_id: CanonicalUserId::from_principal("owner&<>"),
+                    display_name: None,
                 },
                 initiator: RenderedCanonicalUser {
                     canonical_id: CanonicalUserId::from_principal("owner&<>"),
+                    display_name: Some("owner&<>".to_string()),
                 },
                 checksum_algorithm: None,
                 checksum_type: None,
@@ -5907,7 +5936,7 @@ mod tests {
         assert!(xml.contains("<Key>key&amp;&lt;&gt;</Key>"));
         assert!(xml.contains("<UploadId>id&quot;'</UploadId>"));
         assert!(xml.contains("<Owner><ID>"));
-        assert!(!xml.contains("<DisplayName>"));
+        assert!(xml.contains("<DisplayName>owner&amp;&lt;&gt;</DisplayName>"));
     }
 
     // ── ListParts XML tests ──────────────────────────────────────────

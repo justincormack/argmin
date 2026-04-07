@@ -751,7 +751,7 @@ impl S3Response {
         result: &ListObjectVersionsResult,
     ) -> Self {
         let body = xml::list_object_versions_xml(bucket, prefix, key_marker, max_keys, result);
-        Self::new(200).xml_body(body)
+        Self::new(200).chunked_xml_body(body)
     }
 
     /// Build a 304 Not Modified response with `ETag` and Last-Modified headers, no body.
@@ -1082,7 +1082,7 @@ impl S3Response {
             max_uploads,
             result,
         );
-        Self::new(200).xml_body(body)
+        Self::new(200).chunked_xml_body(body)
     }
 
     /// Build a response for `ListParts` (200 OK, XML body).
@@ -1831,7 +1831,7 @@ mod tests {
         );
         assert_eq!(
             find_header(&resp, "x-amz-object-lock-retain-until-date"),
-            Some("2026-04-01T00:00:00.000Z")
+            Some("2026-04-01T00:00:00Z")
         );
         assert_eq!(
             find_header(&resp, "x-amz-object-lock-legal-hold"),
@@ -2028,7 +2028,7 @@ mod tests {
         );
         assert_eq!(
             find_header(&resp, "x-amz-object-lock-retain-until-date"),
-            Some("2026-04-01T00:00:00.000Z")
+            Some("2026-04-01T00:00:00Z")
         );
         assert_eq!(find_header(&resp, "x-amz-object-lock-legal-hold"), None);
     }
@@ -2592,6 +2592,8 @@ mod tests {
                 etag: "\"etag1\"".into(),
                 last_modified: 0,
                 is_delete_marker: false,
+                checksum_algorithm: None,
+                checksum_type: None,
             }],
             is_truncated: false,
             next_key_marker: None,
@@ -2601,10 +2603,10 @@ mod tests {
         };
         let resp = S3Response::list_object_versions("bucket", None, None, 1000, &result);
         assert_eq!(resp.status_code, 200);
-        let body = String::from_utf8(resp.body).unwrap();
-        assert!(body.contains("ListVersionsResult"));
-        assert!(body.contains("<VersionId>null</VersionId>"));
-        assert!(body.contains(result.owner_canonical_id.as_str()));
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        assert_eq!(find_header(&resp, "Content-Length"), None);
+        assert!(resp.body.is_empty());
+        assert!(resp.stream.is_some());
     }
 
     // ── parse_http_date ────────────────────────────────────────────

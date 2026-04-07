@@ -2397,6 +2397,8 @@ pub struct VersionEntry {
     pub etag: String,
     pub last_modified: u64,
     pub is_delete_marker: bool,
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    pub checksum_type: Option<ChecksumType>,
 }
 
 /// Result of a ListObjectVersions operation.
@@ -8555,17 +8557,25 @@ impl Coordinator {
         write_encryption: &ActiveWriteEncryption,
         crc64: u64,
     ) -> SystemMetadata {
+        let mut normalized_system_metadata = system_metadata.clone();
+        if let Some(checksum) = normalized_system_metadata.take_checksum() {
+            normalized_system_metadata.set_checksum(
+                checksum.algorithm(),
+                checksum.checksum_type().or(Some(ChecksumType::FullObject)),
+                checksum.value(),
+            );
+        }
         let can_store_checksum = matches!(
             write_encryption,
             ActiveWriteEncryption::None
                 | ActiveWriteEncryption::SseCustomer { write: Some(_), .. }
                 | ActiveWriteEncryption::Managed { write: Some(_), .. }
         );
-        if system_metadata.checksum().is_some() || !can_store_checksum {
-            return system_metadata.clone();
+        if normalized_system_metadata.checksum().is_some() || !can_store_checksum {
+            return normalized_system_metadata;
         }
         use base64::Engine;
-        let mut system_metadata = system_metadata.clone();
+        let mut system_metadata = normalized_system_metadata;
         let checksum = base64::engine::general_purpose::STANDARD.encode(crc64.to_be_bytes());
         system_metadata.set_checksum(
             ChecksumAlgorithm::Crc64nvme,
@@ -12907,9 +12917,21 @@ impl Coordinator {
                 last_key = Some(obj_key);
             }
 
-            let (size, etag) = match obj.as_live() {
-                Some(record) => (record.size, record.etag.format()),
-                None => (0, String::new()),
+            let (size, etag, checksum_algorithm, checksum_type) = match obj.as_live() {
+                Some(record) => {
+                    let system_metadata = self.deserialize_visible_system_metadata(
+                        record.system_metadata_blob.as_ref(),
+                        &record.encryption,
+                        None,
+                    )?;
+                    (
+                        record.size,
+                        record.etag.format(),
+                        system_metadata.checksum_algorithm(),
+                        system_metadata.checksum_type(),
+                    )
+                }
+                None => (0, String::new(), None, None),
             };
 
             versions.push(VersionEntry {
@@ -12920,6 +12942,8 @@ impl Coordinator {
                 etag,
                 last_modified: obj.last_modified(),
                 is_delete_marker: obj.is_delete_marker(),
+                checksum_algorithm,
+                checksum_type,
             });
         }
 
@@ -13499,6 +13523,17 @@ impl Coordinator {
 
             let mut part_records: Vec<MultipartPartRecord> = Vec::with_capacity(parts.len());
             for cp in parts {
+                if let (Some(upload_algo), Some(ChecksumType::Composite), None) =
+                    (checksum_algo, checksum_type, cp.checksum.as_ref())
+                {
+                    return Err(ServerError::InvalidRequest {
+                        reason: format!(
+                            "The upload was created using a {} checksum. The complete request must include the checksum for each part. It was missing for part {} in the request.",
+                            upload_algo.as_str(),
+                            cp.part_number
+                        ),
+                    });
+                }
                 let part = match meta_pg.get_multipart_part(upload_id, cp.part_number) {
                     Ok(p) => p,
                     Err(storage::MetadataError::PartNotFound { .. }) => {
@@ -36294,7 +36329,6 @@ mod tests {
                 policy_context: PutObjectPolicyContext::default(),
             })
             .unwrap();
-
         let part = test_helpers::upload_part(
             &coord,
             &UploadPartRequest {
@@ -36338,6 +36372,79 @@ mod tests {
         );
         assert_eq!(result.checksum_type, Some(ChecksumType::FullObject));
         assert!(result.checksum_value.is_some());
+    }
+
+    #[test]
+    fn complete_multipart_composite_rejects_missing_part_checksum_elements() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request("bucket", "key", test_requester()),
+                metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: Some(
+                    MultipartChecksumConfig::new(ChecksumAlgorithm::Sha256, None).unwrap(),
+                ),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let data = b"complete-without-part-checksum";
+        let checksum = {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .encode(compute_checksum(ChecksumAlgorithm::Sha256, data).bytes())
+        };
+        let claimed_checksum =
+            ChecksumClaim::from_base64(ChecksumAlgorithm::Sha256, &checksum).unwrap();
+        let part = test_helpers::upload_part(
+            &coord,
+            &UploadPartRequest {
+                upload: multipart_object_request(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                ),
+                part_number: 1,
+                data,
+                claimed_checksum: Some(&claimed_checksum),
+                sse_customer: None,
+            },
+        )
+        .unwrap();
+
+        let err = coord
+            .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_requester(),
+                    None,
+                ),
+                parts: &[CompletePart {
+                    part_number: 1,
+                    etag: part.etag,
+                    checksum: None,
+                }],
+                claimed_checksum: None,
+                cond: &WriteCondition::default(),
+                sse_customer: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
 
     #[test]
@@ -36824,6 +36931,68 @@ mod tests {
         assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Crc64nvme);
         assert_eq!(checksum.checksum_type(), Some(ChecksumType::FullObject));
         assert_eq!(checksum.value(), expected.as_str());
+    }
+
+    #[test]
+    fn list_object_versions_defaults_explicit_single_part_checksum_type_to_full_object() {
+        use base64::Engine;
+
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let body = b"hi";
+        let checksum = base64::engine::general_purpose::STANDARD
+            .encode(checksum::crc32::checksum(body).to_be_bytes());
+        let mut system_metadata = SystemMetadata::new();
+        system_metadata.set_checksum(ChecksumAlgorithm::Crc32, None, checksum);
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "obj", test_requester(), None),
+                data: body,
+                metadata: &MetadataBlob::new(),
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let versions = coord
+            .list_object_versions(&ListObjectVersionsRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 100,
+            })
+            .unwrap();
+
+        assert_eq!(versions.versions.len(), 1);
+        assert_eq!(
+            versions.versions[0].checksum_algorithm,
+            Some(ChecksumAlgorithm::Crc32)
+        );
+        assert_eq!(
+            versions.versions[0].checksum_type,
+            Some(ChecksumType::FullObject)
+        );
     }
 
     #[test]
