@@ -1,0 +1,101 @@
+BucketOwnerEnforced does not disable public-read object ACLs
+Link: https://chatgpt.com/codex/security/findings/3e9f6ac35cd081918705a57b6323e112?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: medium)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 7acfc72
+Author: justin@specialbusservice.com
+Created: 28/03/2026, 13:50:15
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Bug introduced: BucketOwnerEnforced only affects ACL acceptance on writes, but read authorization still honors public-read ACLs, allowing legacy public objects to remain accessible.
+The commit introduces object-level public-read ACLs but the read-authorization path (`requester_can_read_object`) only checks the object's `public_read` flag and the public access block ignore flag. It never checks whether bucket ownership controls are set to BucketOwnerEnforced. While BucketOwnerEnforced blocks new public ACLs via `ensure_put_object_acl_supported`, existing public-read objects created before enabling ownership enforcement remain accessible to unauthenticated users. This is inconsistent with the expected semantics of BucketOwnerEnforced, which should disable ACLs entirely, and results in unintended information disclosure after administrators attempt to lock down a bucket.
+
+# Validation
+## Rubric
+- [x] Attempt debug build to enable runtime repro (failed due to missing libisal dependency).
+- [x] Trace object read authorization flow and check for ownership-controls gating.
+- [x] Verify write-time ACL enforcement for BucketOwnerEnforced and contrast with read-time checks.
+- [x] Confirm ownership-controls update path does not clear existing object public_read metadata.
+## Report
+Attempted to build a debug binary for crash/ASan/valgrind reproduction with `cargo build -p server-core`, but the build fails because `ec-sys` requires libisal (see build_log in artifacts). Without a built binary, valgrind/asan/debugger runs were not possible.
+
+Code review shows the read path uses `lock_object_for_authorized_read` which gates access via `requester_can_read_object` (crates/server-core/src/coordinator.rs:2808-2833). `requester_can_read_object` grants access if the requester owns the object or if `object.public_read()` and public ACLs are not ignored; it does not check bucket ownership controls (crates/server-core/src/coordinator.rs:2575-2587). BucketOwnerEnforced is only enforced on writes in `ensure_put_object_acl_supported`, which blocks unsupported ACLs during put (crates/server-core/src/coordinator.rs:2677-2685). Enabling ownership controls just stores the config and does not clear existing object ACLs (crates/server-core/src/coordinator.rs:3722-3741). This means legacy public-read objects remain readable even after BucketOwnerEnforced is set, matching the reported disclosure.
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator.rs (L2575 to 2587)
+  Note: Read authorization grants access based solely on object.public_read and ignores bucket ownership controls, so public ACLs still allow reads.
+```
+    fn requester_can_read_object(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+    ) -> bool {
+        #[cfg(test)]
+        if requester.is_system {
+            return true;
+        }
+
+        requester.principal_opt() == Some(object.owner().principal.as_str())
+            || (object.public_read()
+                && !Self::ignores_public_acls(bucket.public_access_block.as_deref()))
+```
+
+/workspace/argmin/crates/server-core/src/coordinator.rs (L2677 to 2684)
+  Note: BucketOwnerEnforced only blocks new ACLs on write; there is no corresponding read-time suppression of existing public ACLs.
+```
+    fn ensure_put_object_acl_supported(
+        bucket: &BucketSummary,
+        acl: PutObjectAcl<'_>,
+    ) -> Result<(), ServerError> {
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+            && !acl.is_supported_with_bucket_owner_enforced()
+        {
+            return Err(ServerError::AccessControlListNotSupported);
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The bug is real and reachable through the normal HTTP read path, enabling unauthorized reads after ownership enforcement. Impact is limited to objects that were already public prior to enforcement and requires knowledge of object keys, so medium severity is appropriate despite lack of a runtime PoC.
+## Likelihood
+high - Exploitation is plausible if a bucket previously had public_read objects and the attacker can guess or learn object keys; no additional authentication is required for those objects. | Remote network vector
+## Impact
+medium - Unauthenticated clients can continue reading objects that were expected to become private after enabling BucketOwnerEnforced, resulting in unintended data disclosure of legacy public objects.
+## Assumptions
+- Deployments may set ARGMIN_LISTEN_ADDR to a non-loopback address, exposing the HTTP service to remote clients.
+- Buckets can enable BucketOwnerEnforced after objects with public_read ACLs already exist.
+- Attackers can guess or learn object keys for previously public objects.
+- Bucket ownership controls set to BucketOwnerEnforced after legacy public_read objects exist
+- Attacker can reach the HTTP endpoint and knows an object key
+## Path
+client -> GET object -> requester_can_read_object (public_read && !IgnorePublicAcls) -> data
+## Path evidence
+- `crates/server-core/src/coordinator.rs:2575-2588` - requester_can_read_object grants access for object.public_read and ignores ownership controls
+- `crates/server-core/src/coordinator.rs:2605-2628` - BucketOwnerEnforced detection exists but is not applied in read authorization; ignores_public_acls is the only gating check
+- `crates/server-core/src/coordinator.rs:2677-2685` - BucketOwnerEnforced is enforced only on PutObject ACLs (write-time)
+- `crates/server-core/src/coordinator.rs:2810-2833` - Object reads flow through requester_can_read_object for authorization
+- `crates/argmin-s3/src/config.rs:25-52` - HTTP listener and credentials are configured via environment variables; default listen addr is 127.0.0.1:9000
+## Narrative
+Read authorization in server-core allows access when object.public_read is set and IgnorePublicAcls is not enabled, but it never checks bucket ownership controls. BucketOwnerEnforced is only enforced at write time for ACLs, so legacy public-read objects remain anonymously readable after enforcement, creating unintended data exposure.
+## Controls
+- SigV4 authentication for non-public requests
+- Public access block IgnorePublicAcls/BlockPublicAcls
+- Bucket ownership controls enforced on PutObject ACLs
+## Blindspots
+- No runtime PoC due to build limitations (libisal dependency).
+- Deployment exposure (public vs private listener) is not defined in repo artifacts.
+- Object key guessability and operator ACL usage patterns are unknown.
+
+## Reviewer note
+This finding was valid and was fixed in commit `adf07c4` (`ownership: harden BOE ACL semantics`).
+
+The shipped fix disables legacy object ACL read effects under `BucketOwnerEnforced`, so anonymous/public-read and explicit grantee object ACLs no longer authorize `GetObject` once BOE is enabled. It also preserves the AWS-observed exceptions and transitions that still need to work: bucket-policy `GetObject` allows continue to function under BOE, the bucket-owner-full-control equivalent grant-header form is accepted on BOE writes, and preexisting explicit object ACL grants are restored if ownership controls are later removed.
+
+Regression coverage added:
+- AWS-backed BOE transition tests in `crates/s3-tests/tests/ownership.rs`
+- local coordinator regression coverage in `crates/server-core/src/coordinator.rs`
