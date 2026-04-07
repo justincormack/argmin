@@ -5,6 +5,7 @@ This guide collects the main testing workflows for the repository:
 - targeted crate tests
 - workspace and integration coverage
 - AWS-backed compatibility runs
+- AWS-vs-local differential response-shape runs
 - HTTP-only and local-only test crates
 - parser fuzzing
 
@@ -26,6 +27,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 # Local-only S3 behavior tests.
 cargo test -p s3-local-tests
+
+# Differential AWS-vs-local response-shape tests.
+cargo test -p s3-diff-tests --test response_shape
 ```
 
 ## AWS-backed `s3-tests`
@@ -123,6 +127,38 @@ S3_TEST_TIMEOUT_SECS=30 \
 cargo test -p s3-http-tests --no-fail-fast
 ```
 
+### Differential AWS-vs-local response-shape checks
+
+Differential response-shape checks live in `crates/s3-diff-tests`. Each test
+in `crates/s3-diff-tests/tests/response_shape.rs` sends the same request to
+real AWS and to the embedded local server, then compares the response status,
+headers, and body shape.
+
+This is different from the other dedicated test crates:
+
+- unlike `s3-local-tests`, it is not local-only
+- unlike ordinary AWS-backed `s3-tests`, it is not exercising only one backend
+- it always needs the full AWS-backed `s3-tests` environment, including both
+  AWS credential sets and the bucket prefix, because the local response is
+  only half of the comparison
+
+Recommended command:
+
+```bash
+eval "$(grep = .env)" && \
+S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
+S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
+S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
+S3_TEST_ACCOUNT_ID="$AWS_ACCOUNT_ID" \
+S3_TEST_ALT_ACCESS_KEY="$AWS_ALT_ACCESS_KEY" \
+S3_TEST_ALT_SECRET_KEY="$AWS_ALT_SECRET_KEY" \
+S3_TEST_ALT_ACCOUNT_ID="$AWS_ALT_ACCOUNT_ID" \
+S3_TEST_REGION=us-east-1 \
+S3_TEST_BUCKET_PREFIX=claude-s3- \
+S3_TEST_TIMEOUT_SECS=30 \
+cargo test -p s3-diff-tests --test response_shape -- --nocapture
+```
+
 ### Local-only tests
 
 The local-only `s3-local-tests` crate currently contains:
@@ -135,6 +171,8 @@ Run it locally with the embedded server:
 ```bash
 cargo test -p s3-local-tests
 ```
+
+Use this crate for embedded-server behavior that should not require AWS.
 
 ### Cleanup helper
 
@@ -281,5 +319,7 @@ As a rough rule:
 - use `s3-local-tests` for local embedded-server behavior that does not need AWS
 - use `s3-http-tests` for plain-HTTP transport behavior
 - use AWS-backed `s3-tests` when compatibility depends on real AWS behavior
+- use `s3-diff-tests` when the contract being checked is "AWS response shape vs
+  our response shape for the same request"
 - use `./scripts/coverage` when checking integration coverage movement
 - use `cargo-fuzz` for malformed-input robustness and panic discovery

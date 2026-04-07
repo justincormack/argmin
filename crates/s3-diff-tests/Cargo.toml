@@ -1,0 +1,15 @@
+[package]
+name = "s3-diff-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+s3-tests = { path = "../s3-tests" }
+aws-sdk-s3 = "1"
+s3-types = { path = "../s3-types" }
+
+[dev-dependencies]
+base64 = "0.22"
+checksum = { path = "../checksum", default-features = false }
+ring = "0.17"
