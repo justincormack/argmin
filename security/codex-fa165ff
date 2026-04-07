@@ -1,0 +1,416 @@
+Unbounded multipart field buffering in streaming POST causes DoS
+Link: https://chatgpt.com/codex/security/findings/bda93ebccbb48191b675331742e5e348?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: medium)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: fa165ff
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 22:40:02
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced a denial-of-service risk: POST Object requests are now streamed without the previous body size limit, and the parser buffers non-file fields without any cap. This enables unbounded memory growth for large or malformed multipart fields.
+The commit routes all POST Object requests to a new streaming handler before the normal body collection (which enforces MAX_BODY_SIZE). The streaming multipart parser accumulates non-file field data in an internal buffer until a boundary is found, with no size checks. An unauthenticated client can send a multipart request with a huge field (or omit the next boundary) and continuously stream data, causing the buffer to grow unbounded and potentially crash the server or exhaust memory.
+
+# Validation
+## Rubric
+- [x] Confirm streaming POST Object path bypasses MAX_BODY_SIZE body collection (serve.rs:287-325; request.rs:4-6).
+- [x] Confirm multipart parser buffers non-file field data without a size cap when no boundary is seen (serve.rs:520-608).
+- [x] Confirm non-file fields are stored as full strings with no limit (serve.rs:582-590, 702-715).
+- [x] Confirm authentication happens after form-field parsing, allowing unauthenticated buffering (http/mod.rs:1746-1784).
+- [ ] Achieve dynamic reproduction (blocked: build fails due to missing libisal; valgrind/gdb not available).
+## Report
+Attempted dynamic reproduction first: `cargo build -p argmin-s3` fails because the `libisal` system library is missing (see build_fail.log in artifacts), so the server binary cannot be built to run a crash test. Valgrind and gdb are not installed in the container (`valgrind --version` / `gdb --version` both not found), so valgrind/debugger reproduction was not possible. Code review shows the issue: the request handler routes POST Object requests to `handle_streaming_post_object` before the non-streaming `collect_body` call, so the MAX_BODY_SIZE cap used for normal requests is bypassed for POST Object streaming (serve.rs:287-325; MAX_BODY_SIZE in request.rs:4-6). In the streaming multipart parser, `feed` unconditionally appends incoming bytes to `self.buf`, and for non-file parts it only drains the buffer when a delimiter is found; if the boundary is missing or delayed, the buffer grows without any size check (serve.rs:520-608). When a non-file field is eventually parsed, the entire field value is converted to a `String` and stored in the `fields` vector without any size cap (serve.rs:582-590, 702-715). Authentication for POST Object relies on these form fields and occurs after field parsing (`prepare_streaming_post_object` uses form fields to authenticate; http/mod.rs:1746-1784), so an unauthenticated client can stream an unbounded non-file field and force memory growth before any auth rejection. This matches the reported DoS risk.
+
+# Evidence
+/workspace/argmin/crates/server-http/src/http/serve.rs (L287 to 326)
+  Note: POST Object requests are routed to the streaming handler before collect_body(), bypassing the MAX_BODY_SIZE limit that previously bounded memory usage.
+```
+    // Check if this request should use the streaming write path.
+    if let Some(op) = is_streaming_write(&parts) {
+        let chunked = match parse_chunked_mode(&parts) {
+            Ok(mode) => mode,
+            Err(err) => return Ok(s3_response_to_hyper(S3Response::error(&err, ""))),
+        };
+        let resp = match op {
+            StreamingWriteOp::PutObject { bucket, key } => {
+                handle_streaming_put(Arc::clone(&state), parts, body, bucket, key, chunked).await
+            }
+            StreamingWriteOp::UploadPart {
+                bucket,
+                key,
+                upload_id,
+                part_number,
+            } => {
+                handle_streaming_part(
+                    Arc::clone(&state),
+                    parts,
+                    body,
+                    bucket,
+                    key,
+                    upload_id,
+                    part_number,
+                    chunked,
+                )
+                .await
+            }
+        };
+        return Ok(s3_response_to_hyper(resp));
+    }
+
+    if let Some(bucket) = post_object_bucket(&parts) {
+        let resp = handle_streaming_post_object(Arc::clone(&state), parts, body, bucket).await;
+        return Ok(s3_response_to_hyper(resp));
+    }
+
+    // Non-streaming path: collect full body, parse, dispatch.
+    let body_bytes = match collect_body(body, state.config.body_idle_timeout).await {
+        Ok(bytes) => bytes,
+```
+
+/workspace/argmin/crates/server-http/src/http/serve.rs (L517 to 606)
+  Note: The streaming multipart parser appends all incoming data to an internal buffer and only flushes for file parts; non-file fields are buffered in full without any size limit, allowing unbounded memory growth.
+```
+    fn feed(&mut self, data: &[u8]) -> Result<Vec<PostMultipartEvent>, ServerError> {
+        self.buf.extend_from_slice(data);
+        let mut events = Vec::new();
+
+        loop {
+            match &mut self.state {
+                PostMultipartState::Start => {
+                    let Some(pos) = find_subslice(&self.buf, &self.boundary) else {
+                        // Keep a small suffix to detect boundary across chunk splits.
+                        if self.buf.len() > self.boundary.len() {
+                            let drop_len = self.buf.len() - self.boundary.len();
+                            let _ = self.buf.split_to(drop_len);
+                        }
+                        break;
+                    };
+                    if pos > 0 {
+                        let _ = self.buf.split_to(pos);
+                    }
+                    if self.buf.len() < self.boundary.len() + 2 {
+                        break;
+                    }
+                    let _ = self.buf.split_to(self.boundary.len());
+                    if self.buf.starts_with(b"--") {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "empty multipart form".to_string(),
+                        });
+                    }
+                    if self.buf.starts_with(b"\r\n") {
+                        let _ = self.buf.split_to(2);
+                        self.state = PostMultipartState::Headers;
+                        continue;
+                    }
+                    return Err(ServerError::InvalidRequest {
+                        reason: "malformed multipart: boundary not followed by CRLF".to_string(),
+                    });
+                }
+                PostMultipartState::Headers => {
+                    let Some(end) = find_subslice(&self.buf, b"\r\n\r\n") else {
+                        break;
+                    };
+                    let header_block = self.buf.split_to(end + 4);
+                    let header_bytes = &header_block[..end];
+                    let header_str = std::str::from_utf8(header_bytes).map_err(|_| {
+                        ServerError::InvalidRequest {
+                            reason: "invalid UTF-8 in multipart headers".to_string(),
+                        }
+                    })?;
+                    let (name, file_name) =
+                        super::multipart::parse_content_disposition(header_str)?;
+                    let is_file = name.eq_ignore_ascii_case("file");
+                    if is_file {
+                        events.push(PostMultipartEvent::FileStart { file_name });
+                    }
+                    self.state = PostMultipartState::Data { name, is_file };
+                    continue;
+                }
+                PostMultipartState::Data { name, is_file } => {
+                    if let Some(idx) = find_subslice(&self.buf, &self.delimiter) {
+                        let content = self.buf.split_to(idx).freeze();
+                        if *is_file {
+                            if !content.is_empty() {
+                                events.push(PostMultipartEvent::FileChunk(content));
+                            }
+                            events.push(PostMultipartEvent::FileEnd);
+                        } else {
+                            let value = std::str::from_utf8(&content).map_err(|_| {
+                                ServerError::InvalidRequest {
+                                    reason: format!("invalid UTF-8 in form field '{name}'"),
+                                }
+                            })?;
+                            events.push(PostMultipartEvent::Field {
+                                name: name.clone(),
+                                value: value.to_string(),
+                            });
+                        }
+                        let _ = self.buf.split_to(self.delimiter.len());
+                        self.state = PostMultipartState::AfterBoundary;
+                        continue;
+                    }
+
+                    if *is_file {
+                        let keep = self.delimiter.len().saturating_sub(1);
+                        if self.buf.len() > keep {
+                            let flush_len = self.buf.len() - keep;
+                            let chunk = self.buf.split_to(flush_len).freeze();
+                            if !chunk.is_empty() {
+                                events.push(PostMultipartEvent::FileChunk(chunk));
+                            }
+                            continue;
+                        }
+```
+
+Proposed patch:
+diff --git a/crates/server-http/src/http/serve.rs b/crates/server-http/src/http/serve.rs
+index 0b4447e58a93448f84c619526f1952ba2e297154..4aa9ea6ae8ba2a4752934cee6bc2d07c960afcf2 100644
+--- a/crates/server-http/src/http/serve.rs
++++ b/crates/server-http/src/http/serve.rs
+@@ -714,50 +714,55 @@ impl PostMultipartParser {
+                         break;
+                     };
+                     if pos > 0 {
+                         let _ = self.buf.split_to(pos);
+                     }
+                     if self.buf.len() < self.boundary.len() + 2 {
+                         break;
+                     }
+                     let _ = self.buf.split_to(self.boundary.len());
+                     if self.buf.starts_with(b"--") {
+                         return Err(ServerError::InvalidRequest {
+                             reason: "empty multipart form".to_string(),
+                         });
+                     }
+                     if self.buf.starts_with(b"\r\n") {
+                         let _ = self.buf.split_to(2);
+                         self.state = PostMultipartState::Headers;
+                         continue;
+                     }
+                     return Err(ServerError::InvalidRequest {
+                         reason: "malformed multipart: boundary not followed by CRLF".to_string(),
+                     });
+                 }
+                 PostMultipartState::Headers => {
+                     let Some(end) = find_subslice(&self.buf, b"\r\n\r\n") else {
++                        if self.buf.len() > MAX_BUFFERED_CONTROL_BODY_SIZE {
++                            return Err(ServerError::InvalidRequest {
++                                reason: "multipart headers exceed maximum allowed size".to_string(),
++                            });
++                        }
+                         break;
+                     };
+                     let header_block = self.buf.split_to(end + 4);
+                     let header_bytes = &header_block[..end];
+                     let header_str = std::str::from_utf8(header_bytes).map_err(|_| {
+                         ServerError::InvalidRequest {
+                             reason: "invalid UTF-8 in multipart headers".to_string(),
+                         }
+                     })?;
+                     let (name, file_name) =
+                         super::multipart::parse_content_disposition(header_str)?;
+                     let is_file = name.eq_ignore_ascii_case("file");
+                     if is_file {
+                         events.push(PostMultipartEvent::FileStart { file_name });
+                     }
+                     self.state = PostMultipartState::Data { name, is_file };
+                 }
+                 PostMultipartState::Data { name, is_file } => {
+                     if let Some(idx) = find_subslice(&self.buf, &self.delimiter) {
+                         let content = self.buf.split_to(idx).freeze();
+                         if *is_file {
+                             if !content.is_empty() {
+                                 events.push(PostMultipartEvent::FileChunk(content));
+                             }
+                             events.push(PostMultipartEvent::FileEnd);
+@@ -765,50 +770,56 @@ impl PostMultipartParser {
+                             let value = std::str::from_utf8(&content).map_err(|_| {
+                                 ServerError::InvalidRequest {
+                                     reason: format!("invalid UTF-8 in form field '{name}'"),
+                                 }
+                             })?;
+                             events.push(PostMultipartEvent::Field {
+                                 name: name.clone(),
+                                 value: value.to_string(),
+                             });
+                         }
+                         let _ = self.buf.split_to(self.delimiter.len());
+                         self.state = PostMultipartState::AfterBoundary;
+                         continue;
+                     }
+ 
+                     if *is_file {
+                         let keep = self.delimiter.len().saturating_sub(1);
+                         if self.buf.len() > keep {
+                             let flush_len = self.buf.len() - keep;
+                             let chunk = self.buf.split_to(flush_len).freeze();
+                             if !chunk.is_empty() {
+                                 events.push(PostMultipartEvent::FileChunk(chunk));
+                             }
+                             continue;
+                         }
++                    } else if self.buf.len() > MAX_BUFFERED_CONTROL_BODY_SIZE {
++                        return Err(ServerError::InvalidRequest {
++                            reason: format!(
++                                "multipart form field '{name}' exceeds maximum allowed size"
++                            ),
++                        });
+                     }
+                     break;
+                 }
+                 PostMultipartState::AfterBoundary => {
+                     if self.buf.len() < 2 {
+                         break;
+                     }
+                     if self.buf.starts_with(b"--") {
+                         let _ = self.buf.split_to(2);
+                         self.state = PostMultipartState::Done;
+                         continue;
+                     }
+                     if self.buf.starts_with(b"\r\n") {
+                         let _ = self.buf.split_to(2);
+                         self.state = PostMultipartState::Headers;
+                         continue;
+                     }
+                     return Err(ServerError::InvalidRequest {
+                         reason: "malformed multipart: bad boundary terminator".to_string(),
+                     });
+                 }
+                 PostMultipartState::Done => break,
+             }
+         }
+ 
+@@ -2824,50 +2835,87 @@ mod tests {
+         let mut parser = PostMultipartParser::new(boundary);
+         let ev1 = parser.feed(&body[..split_at]).unwrap();
+         let ev2 = parser.feed(&body[split_at..]).unwrap();
+ 
+         let mut saw_start = false;
+         let mut saw_end = false;
+         let mut reconstructed = Vec::new();
+         for ev in ev1.into_iter().chain(ev2) {
+             match ev {
+                 PostMultipartEvent::FileStart { file_name } => {
+                     saw_start = true;
+                     assert_eq!(file_name.as_deref(), Some("blob.bin"));
+                 }
+                 PostMultipartEvent::FileChunk(bytes) => reconstructed.extend_from_slice(&bytes),
+                 PostMultipartEvent::FileEnd => saw_end = true,
+                 PostMultipartEvent::Field { .. } => panic!("unexpected field event"),
+             }
+         }
+ 
+         assert!(saw_start);
+         assert!(saw_end);
+         assert_eq!(reconstructed, file_data);
+         assert!(parser.is_done());
+     }
+ 
++    #[test]
++    fn post_multipart_parser_rejects_oversized_non_file_field() {
++        let boundary = "BoundaryZ";
++        let mut parser = PostMultipartParser::new(boundary);
++
++        let mut body = Vec::new();
++        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
++        body.extend_from_slice(b"Content-Disposition: form-data; name=\"policy\"\r\n\r\n");
++        body.extend(std::iter::repeat_n(
++            b'a',
++            MAX_BUFFERED_CONTROL_BODY_SIZE + 1,
++        ));
++
++        let err = parser.feed(&body).unwrap_err();
++        assert!(
++            matches!(err, ServerError::InvalidRequest { reason } if reason.contains("exceeds maximum allowed size"))
++        );
++    }
++
++    #[test]
++    fn post_multipart_parser_rejects_oversized_header_block() {
++        let boundary = "BoundaryH";
++        let mut parser = PostMultipartParser::new(boundary);
++
++        let mut body = Vec::new();
++        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
++        body.extend(std::iter::repeat_n(
++            b'h',
++            MAX_BUFFERED_CONTROL_BODY_SIZE + 1,
++        ));
++
++        let err = parser.feed(&body).unwrap_err();
++        assert!(
++            matches!(err, ServerError::InvalidRequest { reason } if reason.contains("headers exceed maximum allowed size"))
++        );
++    }
++
+     // ── Regression tests for P0–P2 security fixes ────────────────────
+ 
+     #[test]
+     fn extract_checksum_trailers_rejects_duplicates() {
+         // P0: Duplicate trailer names must be rejected to prevent bypass.
+         let trailers = vec![
+             ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
+             ("x-amz-checksum-crc32".to_string(), "BBBBBB==".to_string()),
+         ];
+         let err = extract_checksum_trailers(&trailers).unwrap_err();
+         assert!(matches!(err, ServerError::InvalidRequest { .. }));
+     }
+ 
+     #[test]
+     fn extract_checksum_trailers_rejects_mixed_case_duplicates() {
+         // P0: Case-insensitive dedup — mixed-case duplicates are rejected.
+         let trailers = vec![
+             ("x-amz-checksum-crc32".to_string(), "AAAAAA==".to_string()),
+             ("X-Amz-Checksum-CRC32".to_string(), "BBBBBB==".to_string()),
+         ];
+         let err = extract_checksum_trailers(&trailers).unwrap_err();
+         assert!(matches!(err, ServerError::InvalidRequest { .. }));
+     }
+ 
+     #[test]
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The flaw is a real, unauthenticated memory-exhaustion DoS in a core HTTP path, but it impacts availability of a single service instance without demonstrated data compromise or privilege escalation. Default config binds to localhost, and exposure depends on deployment settings, so downgrading from high to medium better reflects probability × impact.
+## Likelihood
+high - If the HTTP listener is exposed, an unauthenticated client can send a large or malformed multipart field to trigger the issue without special privileges. | Remote network vector
+## Impact
+medium - Unbounded buffering of multipart fields can exhaust memory and crash or stall the service instance, causing availability loss.
+## Assumptions
+- argmin-s3 is deployed with ARGMIN_LISTEN_ADDR bound to an interface reachable by the attacker (e.g., 0.0.0.0 or behind a proxy).
+- No upstream reverse proxy enforces a stricter body size limit on POST multipart requests.
+- Attackers can send unauthenticated POST Object multipart requests to the HTTP endpoint.
+- Network access to the argmin-s3 HTTP listener
+- Ability to send multipart/form-data POST Object requests
+## Path
+n1 -> n2 -> n3 -> n4
+## Path evidence
+- `crates/server-http/src/http/serve.rs:287-325` - POST Object requests are routed to handle_streaming_post_object before collect_body(), bypassing the standard body size limit.
+- `crates/server-http/src/http/serve.rs:517-590` - PostMultipartParser::feed appends to self.buf and buffers non-file fields into memory without size checks.
+- `crates/server-http/src/http/serve.rs:676-735` - Multipart fields are accumulated into the fields vector and only later used to prepare the streaming POST context.
+- `crates/server-http/src/http/mod.rs:1746-1783` - prepare_streaming_post_object authenticates using form_fields, confirming auth occurs after field parsing.
+- `crates/server-http/src/http/serve.rs:1674-1699` - collect_body_with_limit enforces MAX_BODY_SIZE for non-streaming requests, which is skipped by the streaming POST path.
+- `crates/argmin-s3/src/config.rs:20-43` - Server listens on ARGMIN_LISTEN_ADDR (default 127.0.0.1:9000), indicating exposure depends on deployment config.
+## Narrative
+The HTTP handler routes POST Object requests to handle_streaming_post_object before the standard collect_body path that enforces MAX_BODY_SIZE. The streaming multipart parser appends all incoming data to an in-memory buffer and only drains it when a boundary is found; for non-file fields it converts the full buffered content to a String with no size cap. Authentication for POST Object relies on these form fields and occurs after they are parsed. As a result, an unauthenticated client can stream an oversized or boundary-less non-file field and drive unbounded memory growth, leading to a denial-of-service if the endpoint is reachable.
+## Controls
+- request semaphore limits inflight requests
+- body idle timeout on frame reads
+- MAX_BODY_SIZE enforcement for non-streaming bodies
+- max_connections configuration
+## Blindspots
+- No runtime PoC due to build dependency constraints (libisal missing).
+- No deployment manifests to confirm external exposure or upstream body-size limits.
+- Actual operational rate limiting or proxy buffering controls are unknown.
+
+## Reviewer note
+Valid. Fixed in commit `6d78835` (`server-http: bound streaming post form fields`).
+
+The shipped fix is narrower and more AWS-aligned than the draft patch in this report. The streaming multipart parser now rejects oversized part headers, enforces field-specific size limits on non-file parts while they are still buffered waiting for the next boundary, and keeps the delimiter-split handling needed for valid streaming uploads. The streaming POST handler also tracks aggregate non-file form bytes and applies the existing 2 KiB `x-amz-meta-*` budget before authentication, so an unauthenticated client can no longer force unbounded pre-auth memory growth with one huge control field or many individually valid control fields.
+
+Regression coverage was added in `crates/server-http/src/http/serve.rs` for oversized multipart headers, oversized undelimited non-file fields, metadata budget overflow, and aggregate non-file form budget overflow.
