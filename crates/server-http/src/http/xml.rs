@@ -21,6 +21,7 @@ use storage::{
 };
 
 use super::response::format_version_id;
+use super::router::validate_object_key;
 
 /// Format a POST Object 201 response XML.
 #[must_use]
@@ -822,6 +823,7 @@ pub fn parse_delete_objects_xml(
                     let key = current_key
                         .take()
                         .ok_or_else(|| malformed_delete_xml("Object missing <Key> element"))?;
+                    validate_object_key(&key)?;
                     entries.push(DeleteObjectEntry {
                         etag: current_etag.take(),
                         key,
@@ -4253,6 +4255,40 @@ mod tests {
     fn parse_delete_objects_missing_key_rejected() {
         let xml = b"<Delete><Object><VersionId>v1</VersionId></Object></Delete>";
         assert!(parse_delete_objects_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_delete_objects_oversized_key_rejected() {
+        let key = "a".repeat(1025);
+        let xml = format!("<Delete><Object><Key>{key}</Key></Object></Delete>");
+        match parse_delete_objects_xml(xml.as_bytes()) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(reason, "object key must be 1-1024 bytes, got 1025");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_delete_objects_nul_key_rejected() {
+        let xml = b"<Delete><Object><Key>bad\0key</Key></Object></Delete>";
+        match parse_delete_objects_xml(xml) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(reason, "object key must not contain null bytes");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_delete_objects_control_character_key_rejected() {
+        let xml = b"<Delete><Object><Key>bad\x7fkey</Key></Object></Delete>";
+        match parse_delete_objects_xml(xml) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(reason, "Couldn't parse the specified URI.");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
     }
 
     // ── delete_objects_result_xml ────────────────────────────────────

@@ -270,6 +270,24 @@ fn test_delete_objects_missing_key() {
     });
 }
 
+#[test]
+fn test_delete_objects_oversized_key_rejected() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let url = format!("{}/{}?delete", CTX.endpoint(), bucket);
+        let key = "a".repeat(1025);
+        let body = format!("<Delete><Object><Key>{key}</Key></Object></Delete>");
+        let (status, body_text) = signed_post_with_checksum(&url, body.as_bytes(), &[]);
+        assert_eq!(status, 400, "body: {body_text}");
+        assert_error_code(&body_text, "InvalidRequest");
+        assert!(
+            body_text.contains("<Message>object key must be 1-1024 bytes, got 1025</Message>"),
+            "unexpected body: {body_text}"
+        );
+        cleanup(&bucket).await;
+    });
+}
+
 // ── parse_versioning_config_xml error paths ──────────────────────────
 
 /// Versioning config XML missing the <Status> element.

@@ -198,7 +198,7 @@ fn validate_bucket_name(name: &str) -> Result<(), ServerError> {
 
 /// Validate an S3 object key.
 /// 1-1024 bytes, no null bytes.
-fn validate_object_key(key: &str) -> Result<(), ServerError> {
+pub(crate) fn validate_object_key(key: &str) -> Result<(), ServerError> {
     if key.is_empty() || key.len() > 1024 {
         return Err(ServerError::InvalidRequest {
             reason: format!("object key must be 1-1024 bytes, got {}", key.len()),

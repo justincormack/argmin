@@ -1,0 +1,373 @@
+Batch delete skips key validation enabling authenticated DoS
+Link: https://chatgpt.com/codex/security/findings/6d5a9a1513848191a344c092f1947df7?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: medium)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 7ef29a6
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 23:31:37
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced DoS risk: batch delete bypasses existing object-key validation and processes unbounded key sizes/entries in one request, amplifying CPU/memory usage and blocking the server loop.
+The new DeleteObjects handler parses XML keys into DeleteObjectEntry without applying the standard object-key validation (1–1024 bytes, no nulls). The coordinator then clones and processes these unvalidated keys for each deletion. Because request bodies can be large and the server handles requests serially, a single authenticated request containing extremely large keys or many entries can cause excessive hashing/DB work and large response construction, resulting in a denial of service.
+
+# Validation
+## Rubric
+- [x] Identify object-key validation rules and where they are enforced for URL-based operations (router.rs:59-114).
+- [x] Verify DeleteObjects XML parser accepts <Key> contents without length/NUL validation (xml.rs:214-263).
+- [x] Confirm DeleteObjects request path bypasses validator and feeds parsed keys directly to coordinator (http/mod.rs:145-148; coordinator.rs:604-633).
+- [x] Check response generation embeds keys, allowing large outputs with many entries (xml.rs:275-304).
+- [ ] Dynamic reproduction (build + run/ASan/valgrind/debugger) completed; blocked by missing crates.io dependencies and lack of valgrind/gdb.
+## Report
+Build-based validation was attempted but blocked by missing dependencies. `cargo build -p server --bin delete_poc` failed because crates.io access is blocked (tiny_http download 403), and `cargo build --offline` reported no matching package. Valgrind and gdb are not installed (`valgrind: command not found`, `gdb: command not found`), so crash/valgrind/debugger validation could not proceed.
+
+Code review confirms the DoS risk: the object-key validator enforces 1–1024 bytes/no NULs in the router (crates/server/src/http/router.rs:59-72) and is only applied to URL keys (router.rs:111-114). The DeleteObjects handler bypasses this and directly parses body XML without validating key length or NULs (crates/server/src/http/xml.rs:214-263) and the HTTP dispatch path calls it directly (crates/server/src/http/mod.rs:145-148). The coordinator then iterates entries, clones each key into DeletedObject/DeleteError results (crates/server/src/coordinator.rs:604-633), and the response builder embeds the keys into XML (crates/server/src/http/xml.rs:275-304), so large keys/many entries inflate CPU/memory usage. The main server loop is explicitly serial (crates/server/src/main.rs:97-99), which increases the availability impact of a single heavy request. These code paths support the finding that unbounded DeleteObjects requests can cause a DoS via oversized or numerous keys.
+
+# Evidence
+/workspace/argmin/crates/server/src/coordinator.rs (L604 to 629)
+  Note: Batch delete uses entry.key directly, cloning and processing unvalidated keys for deletion/response generation.
+```
+    /// Batch-delete objects.
+    pub fn delete_objects(
+        &self,
+        bucket: &str,
+        entries: &[crate::http::xml::DeleteObjectEntry],
+    ) -> Result<DeleteObjectsResult, ServerError> {
+        self.head_bucket(bucket)?;
+
+        let mut deleted = Vec::new();
+        let mut errors = Vec::new();
+
+        for entry in entries {
+            match self.delete_object(bucket, &entry.key) {
+                Ok(()) => {
+                    deleted.push(DeletedObject {
+                        key: entry.key.clone(),
+                        version_id: "null".to_string(),
+                    });
+                }
+                Err(e) => {
+                    errors.push(DeleteError {
+                        key: entry.key.clone(),
+                        code: e.s3_error_code().to_string(),
+                        message: e.to_string(),
+                    });
+                }
+```
+
+/workspace/argmin/crates/server/src/http/router.rs (L59 to 72)
+  Note: Existing object-key validation (1–1024 bytes, no nulls) that other operations enforce but DeleteObjects bypasses.
+```
+/// Validate an S3 object key.
+/// 1-1024 bytes, no null bytes.
+fn validate_object_key(key: &str) -> Result<(), ServerError> {
+    if key.is_empty() || key.len() > 1024 {
+        return Err(ServerError::InvalidRequest {
+            reason: format!("object key must be 1-1024 bytes, got {}", key.len()),
+        });
+    }
+    if key.as_bytes().contains(&0) {
+        return Err(ServerError::InvalidRequest {
+            reason: "object key must not contain null bytes".to_string(),
+        });
+    }
+    Ok(())
+```
+
+/workspace/argmin/crates/server/src/http/xml.rs (L214 to 258)
+  Note: DeleteObjects XML parsing accepts Key contents without any length/null-byte validation and stores them directly.
+```
+/// Parse a DeleteObjects XML request body.
+///
+/// Returns the list of object entries and the quiet flag.
+pub fn parse_delete_objects_xml(
+    data: &[u8],
+) -> Result<(Vec<DeleteObjectEntry>, bool), ServerError> {
+    let text = std::str::from_utf8(data).map_err(|_| ServerError::InvalidRequest {
+        reason: "invalid UTF-8 in delete XML body".to_string(),
+    })?;
+
+    // Require <Delete> wrapper
+    if !text.contains("<Delete") {
+        return Err(ServerError::InvalidRequest {
+            reason: "missing <Delete> element".to_string(),
+        });
+    }
+
+    // Detect quiet mode
+    let quiet = extract_tag_content(text, "Quiet")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    // Parse <Object> blocks
+    let mut entries = Vec::new();
+    let mut search_from = 0;
+    while let Some(start) = text[search_from..].find("<Object>") {
+        let abs_start = search_from + start + "<Object>".len();
+        let end = text[abs_start..]
+            .find("</Object>")
+            .ok_or_else(|| ServerError::InvalidRequest {
+                reason: "unclosed <Object> element".to_string(),
+            })?;
+        let block = &text[abs_start..abs_start + end];
+
+        let key = extract_tag_content(block, "Key").ok_or_else(|| {
+            ServerError::InvalidRequest {
+                reason: "Object missing <Key> element".to_string(),
+            }
+        })?;
+        let version_id = extract_tag_content(block, "VersionId").map(|s| s.to_string());
+
+        entries.push(DeleteObjectEntry {
+            key: key.to_string(),
+            version_id,
+        });
+```
+
+Proposed patch:
+diff --git a/crates/server-http/src/http/xml.rs b/crates/server-http/src/http/xml.rs
+index c0b650ac2eb8c6598a76e37708d6d1a0b6a16783..b12ecf9f98042ecdf105732179f629011cf974b3 100644
+--- a/crates/server-http/src/http/xml.rs
++++ b/crates/server-http/src/http/xml.rs
+@@ -370,50 +370,64 @@ pub struct DeleteObjectEntry {
+ }
+ 
+ /// Parse a `DeleteObjects` XML request body.
+ ///
+ /// Returns the list of object entries and the quiet flag.
+ pub fn parse_delete_objects_xml(
+     data: &[u8],
+ ) -> Result<(Vec<DeleteObjectEntry>, bool), ServerError> {
+     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+     enum State {
+         Start,
+         InDelete,
+         InObject,
+         InKey,
+         InVersionId,
+         InQuiet,
+         Done,
+     }
+ 
+     fn malformed_delete_xml(reason: &str) -> ServerError {
+         ServerError::MalformedXML {
+             reason: reason.to_string(),
+         }
+     }
+ 
++    fn validate_object_key(key: &str) -> Result<(), ServerError> {
++        if key.is_empty() || key.len() > 1024 {
++            return Err(ServerError::InvalidRequest {
++                reason: format!("object key must be 1-1024 bytes, got {}", key.len()),
++            });
++        }
++        if key.as_bytes().contains(&0) {
++            return Err(ServerError::InvalidRequest {
++                reason: "object key must not contain null bytes".to_string(),
++            });
++        }
++        Ok(())
++    }
++
+     let mut reader = Reader::from_reader(data);
+     let mut buf = Vec::new();
+     let mut state = State::Start;
+     let mut entries = Vec::new();
+     let mut quiet = false;
+     let mut current_key: Option<String> = None;
+     let mut current_version_id: Option<String> = None;
+     let mut current_text = String::new();
+ 
+     loop {
+         match reader.read_event_into(&mut buf) {
+             Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+                 (State::Start, b"Delete") => state = State::InDelete,
+                 (State::InDelete, b"Object") => {
+                     current_key = None;
+                     current_version_id = None;
+                     state = State::InObject;
+                 }
+                 (State::InDelete, b"Quiet") => {
+                     current_text.clear();
+                     state = State::InQuiet;
+                 }
+                 (State::InObject, b"Key") => {
+                     current_text.clear();
+                     state = State::InKey;
+@@ -426,50 +440,51 @@ pub fn parse_delete_objects_xml(
+             },
+             Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+                 (State::Start, b"Delete") => state = State::Done,
+                 (State::InDelete, b"Object") => {
+                     return Err(malformed_delete_xml("Object missing <Key> element"));
+                 }
+                 (State::InDelete, b"Quiet") => {}
+                 (State::InObject, b"Key") => {
+                     return Err(malformed_delete_xml("Object missing <Key> element"));
+                 }
+                 (State::InObject, b"VersionId") => {
+                     current_version_id = Some(String::new());
+                 }
+                 _ => {
+                     return Err(malformed_delete_xml(
+                         "unexpected empty element in delete XML",
+                     ))
+                 }
+             },
+             Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+                 (State::InDelete, b"Delete") => state = State::Done,
+                 (State::InObject, b"Object") => {
+                     let key = current_key
+                         .take()
+                         .ok_or_else(|| malformed_delete_xml("Object missing <Key> element"))?;
++                    validate_object_key(&key)?;
+                     entries.push(DeleteObjectEntry {
+                         key,
+                         version_id: current_version_id.take(),
+                     });
+                     if entries.len() > 1000 {
+                         return Err(malformed_delete_xml(
+                             "delete objects list too large (max 1000)",
+                         ));
+                     }
+                     state = State::InDelete;
+                 }
+                 (State::InKey, b"Key") => {
+                     current_key = Some(std::mem::take(&mut current_text));
+                     state = State::InObject;
+                 }
+                 (State::InVersionId, b"VersionId") => {
+                     current_version_id = Some(std::mem::take(&mut current_text));
+                     state = State::InObject;
+                 }
+                 (State::InQuiet, b"Quiet") => {
+                     quiet = current_text == "true";
+                     current_text.clear();
+                     state = State::InDelete;
+                 }
+                 _ => {
+@@ -2776,50 +2791,72 @@ mod tests {
+     #[test]
+     fn parse_delete_objects_with_version_id() {
+         let xml = b"<Delete><Object><Key>key1</Key><VersionId>v1</VersionId></Object></Delete>";
+         let (entries, _) = parse_delete_objects_xml(xml).unwrap();
+         assert_eq!(entries[0].version_id.as_deref(), Some("v1"));
+     }
+
+# Review note
+Reviewed against the current `server-http` / `server-core` tree: this report is no longer valid as written.
+
+The main DoS claim is stale for the current implementation:
+- `DeleteObjects` uses the buffered control-plane path, and buffered control bodies are capped at 10 MiB.
+- `parse_delete_objects_xml` now enforces the AWS 1000-object maximum.
+- the current server is not the old single-threaded `crates/server` implementation referenced in the note.
+
+So the claimed "unbounded key sizes/entries cause medium-severity authenticated DoS" is not supported in the current codebase.
+
+There is still a narrower validation inconsistency: routed object operations apply `validate_object_key`, while `DeleteObjects` XML parsing does not currently reuse that validator for `<Key>` contents. That looks like a conformance/consistency gap, not an established availability issue under the current body and entry limits.
+ 
+     #[test]
+     fn parse_delete_objects_quiet_mode() {
+         let xml = b"<Delete><Quiet>true</Quiet><Object><Key>key1</Key></Object></Delete>";
+         let (_, quiet) = parse_delete_objects_xml(xml).unwrap();
+         assert!(quiet);
+     }
+ 
+     #[test]
+     fn parse_delete_objects_empty_body_rejected() {
+         assert!(parse_delete_objects_xml(b"").is_err());
+     }
+ 
+     #[test]
+     fn parse_delete_objects_missing_key_rejected() {
+         let xml = b"<Delete><Object><VersionId>v1</VersionId></Object></Delete>";
+         assert!(parse_delete_objects_xml(xml).is_err());
+     }
+ 
++    #[test]
++    fn parse_delete_objects_rejects_empty_key() {
++        let xml = b"<Delete><Object><Key></Key></Object></Delete>";
++        let err = parse_delete_objects_xml(xml).unwrap_err();
++        assert!(matches!(err, ServerError::InvalidRequest { .. }));
++    }
++
++    #[test]
++    fn parse_delete_objects_rejects_too_long_key() {
++        let key = "a".repeat(1025);
++        let xml = format!("<Delete><Object><Key>{key}</Key></Object></Delete>");
++        let err = parse_delete_objects_xml(xml.as_bytes()).unwrap_err();
++        assert!(matches!(err, ServerError::InvalidRequest { .. }));
++    }
++
++    #[test]
++    fn parse_delete_objects_rejects_null_byte_in_key() {
++        let xml = b"<Delete><Object><Key>a\0b</Key></Object></Delete>";
++        let err = parse_delete_objects_xml(xml).unwrap_err();
++        assert!(matches!(err, ServerError::InvalidRequest { .. }));
++    }
++
+     // ── delete_objects_result_xml ────────────────────────────────────
+ 
+     #[test]
+     fn delete_result_xml_with_deletions_and_errors() {
+         use crate::coordinator::{DeleteError, DeletedObject};
+         let deleted = vec![DeletedObject {
+             key: "key1".to_string(),
+             version_id: VersionId::Null,
+             delete_marker: false,
+         }];
+         let errors = vec![DeleteError {
+             key: "key2".to_string(),
+             code: "AccessDenied".to_string(),
+             message: "Access Denied".to_string(),
+         }];
+         let xml = delete_objects_result_xml(&deleted, &errors, false);
+         assert!(xml.contains("<Deleted><Key>key1</Key>"));
+         assert!(xml.contains("<Error><Key>key2</Key>"));
+         assert!(xml.contains("<Code>AccessDenied</Code>"));
+         assert!(xml.contains("DeleteResult"));
+     }
+ 
+     #[test]
+     fn delete_result_xml_quiet_mode_omits_deleted() {
+         use crate::coordinator::DeletedObject;
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The issue is a real, reachable DoS in the main HTTP service: DeleteObjects XML keys bypass validation and are processed in a serial request loop, enabling an authenticated client to consume CPU/memory. The body size cap (~256MB) and requirement for valid SigV4 credentials reduce blast radius and ease, so impact is availability-only and bounded to a single instance. This aligns with medium severity rather than high/critical.
+## Likelihood
+high - Requires valid credentials and a large request body; achievable by any authenticated client if the service is network-reachable and no stricter proxy limits exist. | Remote network vector
+## Impact
+medium - Availability impact: large authenticated DeleteObjects requests can monopolize CPU/memory and block the single-threaded server loop, degrading service for all clients on that instance.
+## Assumptions
+- The argmin-s3 service is deployed with ARGMIN_LISTEN_ADDR bound to a network-reachable address (not only 127.0.0.1).
+- Attacker can obtain valid SigV4 credentials (access key/secret) for the service.
+- No external reverse proxy enforces stricter request body or per-request object limits than the server itself.
+- Valid SigV4 credentials (access key/secret)
+- Network reachability to the HTTP listener
+- Ability to submit a large POST /<bucket>?delete request body (<=256MB)
+## Path
+n1 -> n2 -> n3 -> n4 -> n5 (DoS)
+## Path evidence
+- `crates/server/src/http/router.rs:59-114` - Object-key validation exists (1–1024 bytes, no NULs) and is applied to URL path keys only.
+- `crates/server/src/http/xml.rs:214-258` - DeleteObjects XML parser extracts <Key> values without any length or NUL validation.
+- `crates/server/src/http/mod.rs:46-148` - All requests are authenticated, then DeleteObjects dispatch directly calls parse_delete_objects_xml and coordinator.delete_objects.
+- `crates/server/src/coordinator.rs:604-629` - delete_objects iterates entries and clones each key into DeletedObject/DeleteError results.
+- `crates/server/src/http/request.rs:6-88` - Request body size is capped at ~256MB, limiting total XML size but not per-key or per-entry counts.
+- `crates/server/src/main.rs:97-99` - Server handles requests serially, so a heavy DeleteObjects request blocks other clients.
+- `crates/server/src/config.rs:19-41` - Listen address and credentials are configured via environment; default bind is 127.0.0.1:9000 and requires access key/secret.
+## Narrative
+The DeleteObjects handler parses XML <Key> values without enforcing the existing 1–1024 byte/no-NUL object-key validation used for URL keys, then passes these entries directly to coordinator.delete_objects, which iterates and clones each key for deletion and response construction. With a single-threaded request loop, an authenticated client can submit a large DeleteObjects body (up to the 256MB body limit) containing oversized or many keys, causing excessive CPU/memory work and blocking other requests, resulting in a service-level DoS. Authentication is required, and a body size cap exists, but there is no per-entry limit or key-length validation in this path.
+## Controls
+- SigV4 authentication required for all requests
+- Request body size cap (~256MB)
+- URL object-key validation (not applied to DeleteObjects body)
+## Blindspots
+- No dynamic testing of performance impact; actual CPU/memory saturation depends on runtime environment and request sizes.
+- Deployment exposure is configuration-dependent; if bound to localhost or protected by a proxy with strict limits, exploitability is reduced.
+- Unknown whether operational rate limiting or WAF rules are applied in real deployments.
