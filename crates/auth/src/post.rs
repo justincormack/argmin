@@ -2,7 +2,7 @@
 ///
 /// SigV4 uses form fields: `x-amz-algorithm`, `x-amz-credential`, `x-amz-date`,
 /// `policy`, `x-amz-signature`
-use crate::credential::CredentialStore;
+use crate::credential::{parse_credential_scope_ref, CredentialStore};
 use crate::error::AuthError;
 use crate::request::{AuthContext, AuthMode};
 use crate::sigv4;
@@ -33,38 +33,27 @@ pub fn authenticate_post_sigv4(
         return Err(AuthError::MalformedAuth);
     }
 
-    // Parse credential: AKID/YYYYMMDD/region/service/aws4_request
-    let parts: Vec<&str> = credential.splitn(5, '/').collect();
-    if parts.len() != 5 || parts[4] != "aws4_request" {
-        return Err(AuthError::MalformedAuth);
-    }
-    let access_key_id = parts[0];
-    if access_key_id.is_empty() {
-        return Err(AuthError::MalformedAuth);
-    }
-    let cred_date = parts[1];
-    let region = parts[2];
-    let service = parts[3];
+    let credential = parse_credential_scope_ref(credential).ok_or(AuthError::MalformedAuth)?;
 
-    // Parse and validate the AWS timestamp before extracting the short date.
-    // This keeps POST auth aligned with the shared SigV4 timestamp parser and
-    // avoids byte-slicing untrusted UTF-8 form fields.
-    if crate::parse_amz_date(date).is_none()
-        || date.as_bytes().get(..8) != Some(cred_date.as_bytes())
-    {
+    if !crate::canonical::amz_date_matches_date_stamp(date, credential.date) {
         return Err(AuthError::MalformedAuth);
     }
 
     // Look up the secret key
     let record = store
-        .get_record(access_key_id)
+        .get_record(credential.access_key_id)
         .ok_or(AuthError::UnknownAccessKey)?;
     if !record.enabled {
         return Err(AuthError::UnknownAccessKey);
     }
 
     // Derive signing key and compute expected signature
-    let signing_key = sigv4::derive_signing_key(&record.secret_key, cred_date, region, service);
+    let signing_key = sigv4::derive_signing_key(
+        &record.secret_key,
+        credential.date,
+        credential.region,
+        credential.service,
+    );
     let expected_sig = sigv4::hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes());
     let expected_hex = sigv4::hex_encode(expected_sig.as_ref());
 
@@ -75,10 +64,10 @@ pub fn authenticate_post_sigv4(
 
     Ok(AuthContext {
         mode: AuthMode::HeaderSigV4,
-        access_key_id: Some(access_key_id.to_string()),
+        access_key_id: Some(credential.access_key_id.to_string()),
         account: Some(record.account.clone()),
         request_epoch_secs: None,
-        signing_region: Some(region.to_string()),
+        signing_region: Some(credential.region.to_string()),
         streaming: None,
     })
 }
@@ -1038,6 +1027,23 @@ mod tests {
         let err = authenticate_post_sigv4(
             "AWS4-HMAC-SHA256",
             "/20250101/us-east-1/s3/aws4_request",
+            "20250101T000000Z",
+            "policy",
+            "sig",
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::MalformedAuth));
+    }
+
+    #[test]
+    fn sigv4_post_credential_too_long() {
+        let store = test_store();
+        let access_key = "A".repeat(crate::MAX_ACCESS_KEY_ID_LEN + 1);
+        let credential = format!("{access_key}/20250101/us-east-1/s3/aws4_request");
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            &credential,
             "20250101T000000Z",
             "policy",
             "sig",

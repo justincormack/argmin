@@ -5,27 +5,18 @@ use ring::hmac;
 use s3_types::AccountIdentity;
 
 use crate::canonical::{
-    canonical_headers, canonical_query_string, canonical_request, parse_amz_date, sha256_hex,
-    string_to_sign,
+    amz_date_matches_date_stamp, canonical_headers, canonical_query_string, canonical_request,
+    parse_amz_date, sha256_hex, string_to_sign,
 };
-use crate::credential::CredentialStore;
+use crate::credential::{parse_credential_scope_ref, CredentialStore};
 use crate::error::AuthError;
 use crate::sigv4::{derive_signing_key, parse_auth_header, verify_request_record};
 use crate::{
-    MAX_ACCESS_KEY_ID_LEN, MAX_AUTHORIZATION_HEADER_LEN, MAX_CREDENTIAL_LEN,
-    MAX_PRESIGNED_QUERY_LEN, MAX_SESSION_TOKEN_LEN, MAX_SIGNED_HEADERS_LEN,
-    MAX_SIGNED_HEADER_COUNT,
+    MAX_AUTHORIZATION_HEADER_LEN, MAX_PRESIGNED_QUERY_LEN, MAX_SESSION_TOKEN_LEN,
+    MAX_SIGNED_HEADERS_LEN, MAX_SIGNED_HEADER_COUNT,
 };
 
 const TRACE_TARGET: &str = "auth";
-
-#[derive(Clone, Copy)]
-struct CredentialScopeRef<'a> {
-    access_key_id: &'a str,
-    date: &'a str,
-    region: &'a str,
-    service: &'a str,
-}
 
 /// Authentication mode used by the incoming request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,12 +384,11 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
             param: "X-Amz-Credential",
         },
     )?;
-    if credential_raw.is_empty() || credential_raw.len() > MAX_CREDENTIAL_LEN {
-        return Err(AuthError::InvalidQueryParam {
+    let credential = parse_credential_scope_ref(credential_raw.as_ref()).ok_or(
+        AuthError::InvalidQueryParam {
             param: "X-Amz-Credential",
-        });
-    }
-    let credential = parse_credential_scope_ref(credential_raw.as_ref())?;
+        },
+    )?;
     if expected_region.is_some_and(|region| credential.region != region) {
         return Err(AuthError::InvalidQueryParam {
             param: "X-Amz-Credential",
@@ -438,6 +428,11 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         parse_amz_date(request_date.as_ref()).ok_or(AuthError::InvalidQueryParam {
             param: "X-Amz-Date",
         })?;
+    if !amz_date_matches_date_stamp(request_date.as_ref(), credential.date) {
+        return Err(AuthError::InvalidQueryParam {
+            param: "X-Amz-Credential",
+        });
+    }
 
     let expires = query_param_lossy(query_string, "X-Amz-Expires")
         .ok_or(AuthError::MissingQueryParam {
@@ -525,31 +520,6 @@ fn authenticate_presigned<H: HeaderSource + ?Sized>(
         request_epoch_secs: Some(request_epoch),
         signing_region: Some(credential.region.to_owned()),
         streaming: None,
-    })
-}
-
-fn parse_credential_scope_ref(value: &str) -> Result<CredentialScopeRef<'_>, AuthError> {
-    if value.is_empty() || value.len() > MAX_CREDENTIAL_LEN {
-        return Err(AuthError::InvalidQueryParam {
-            param: "X-Amz-Credential",
-        });
-    }
-    let parts: Vec<&str> = value.splitn(5, '/').collect();
-    if parts.len() != 5 || parts[4] != "aws4_request" {
-        return Err(AuthError::InvalidQueryParam {
-            param: "X-Amz-Credential",
-        });
-    }
-    if parts[0].is_empty() || parts[0].len() > MAX_ACCESS_KEY_ID_LEN {
-        return Err(AuthError::InvalidQueryParam {
-            param: "X-Amz-Credential",
-        });
-    }
-    Ok(CredentialScopeRef {
-        access_key_id: parts[0],
-        date: parts[1],
-        region: parts[2],
-        service: parts[3],
     })
 }
 
@@ -1081,6 +1051,56 @@ mod tests {
     fn presigned_credential_scope_wrong_terminator() {
         let store = example_store();
         let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240201%2Fus-east-1%2Fs3%2Fnot_aws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request(
+            "GET",
+            "/",
+            query,
+            &headers,
+            b"",
+            &store,
+            "us-east-1",
+            "s3",
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::InvalidQueryParam {
+                param: "X-Amz-Credential"
+            }
+        ));
+    }
+
+    #[test]
+    fn presigned_credential_scope_invalid_date() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F2024020X%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let headers = [("host", "example.com")];
+        let err = authenticate_request(
+            "GET",
+            "/",
+            query,
+            &headers,
+            b"",
+            &store,
+            "us-east-1",
+            "s3",
+            0,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            AuthError::InvalidQueryParam {
+                param: "X-Amz-Credential"
+            }
+        ));
+    }
+
+    #[test]
+    fn presigned_credential_scope_date_mismatch() {
+        let store = example_store();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20240202%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20240201T120000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let headers = [("host", "example.com")];
         let err = authenticate_request(
             "GET",

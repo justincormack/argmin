@@ -30,12 +30,59 @@ pub struct CredentialRecord {
 }
 
 /// Parsed credential scope from the Authorization header.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CredentialScope {
     pub access_key_id: String,
     pub date: String, // YYYYMMDD
     pub region: String,
     pub service: String, // "s3"
+}
+
+/// Borrowed credential scope parsed from a request wire format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CredentialScopeRef<'a> {
+    pub access_key_id: &'a str,
+    pub date: &'a str,
+    pub region: &'a str,
+    pub service: &'a str,
+}
+
+impl From<CredentialScopeRef<'_>> for CredentialScope {
+    fn from(value: CredentialScopeRef<'_>) -> Self {
+        Self {
+            access_key_id: value.access_key_id.to_string(),
+            date: value.date.to_string(),
+            region: value.region.to_string(),
+            service: value.service.to_string(),
+        }
+    }
+}
+
+pub(crate) fn parse_credential_scope_ref(value: &str) -> Option<CredentialScopeRef<'_>> {
+    if value.is_empty() || value.len() > crate::MAX_CREDENTIAL_LEN {
+        return None;
+    }
+
+    let mut parts = value.split('/');
+    let access_key_id = parts.next()?;
+    let date = parts.next()?;
+    let region = parts.next()?;
+    let service = parts.next()?;
+    let terminator = parts.next()?;
+    if terminator != "aws4_request" || parts.next().is_some() {
+        return None;
+    }
+    if access_key_id.is_empty() || access_key_id.len() > crate::MAX_ACCESS_KEY_ID_LEN {
+        return None;
+    }
+    crate::canonical::parse_amz_date_stamp(date)?;
+
+    Some(CredentialScopeRef {
+        access_key_id,
+        date,
+        region,
+        service,
+    })
 }
 
 /// Static in-memory credential store. Maps access_key_id to credential record.
@@ -149,5 +196,50 @@ mod tests {
     fn default_is_empty() {
         let store = CredentialStore::default();
         assert!(store.get_record("anything").is_none());
+    }
+
+    #[test]
+    fn parse_credential_scope_ref_round_trip() {
+        let scope = parse_credential_scope_ref("AKID/20250101/us-east-1/s3/aws4_request").unwrap();
+        assert_eq!(
+            scope,
+            CredentialScopeRef {
+                access_key_id: "AKID",
+                date: "20250101",
+                region: "us-east-1",
+                service: "s3",
+            }
+        );
+        assert_eq!(
+            CredentialScope::from(scope),
+            CredentialScope {
+                access_key_id: "AKID".to_string(),
+                date: "20250101".to_string(),
+                region: "us-east-1".to_string(),
+                service: "s3".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_credential_scope_ref_rejects_bad_suffix() {
+        assert!(parse_credential_scope_ref("AKID/20250101/us-east-1/s3/not-aws4").is_none());
+    }
+
+    #[test]
+    fn parse_credential_scope_ref_rejects_extra_segments() {
+        assert!(
+            parse_credential_scope_ref("AKID/20250101/us-east-1/s3/aws4_request/extra").is_none()
+        );
+    }
+
+    #[test]
+    fn parse_credential_scope_ref_rejects_empty_access_key() {
+        assert!(parse_credential_scope_ref("/20250101/us-east-1/s3/aws4_request").is_none());
+    }
+
+    #[test]
+    fn parse_credential_scope_ref_rejects_invalid_date_stamp() {
+        assert!(parse_credential_scope_ref("AKID/2025010X/us-east-1/s3/aws4_request").is_none());
     }
 }

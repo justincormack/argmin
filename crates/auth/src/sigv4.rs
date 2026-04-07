@@ -2,15 +2,15 @@
 use ring::hmac;
 
 use crate::canonical::{
-    canonical_headers, canonical_query_string, canonical_request, sha256_hex, string_to_sign,
+    amz_date_matches_date_stamp, canonical_headers, canonical_query_string, canonical_request,
+    sha256_hex, string_to_sign,
 };
-use crate::credential::{CredentialRecord, CredentialScope, CredentialStore, SecretKey};
+use crate::credential::{
+    parse_credential_scope_ref, CredentialRecord, CredentialScope, CredentialStore, SecretKey,
+};
 use crate::error::AuthError;
 use crate::request::HeaderSource;
-use crate::{
-    is_lower_hex, MAX_ACCESS_KEY_ID_LEN, MAX_CREDENTIAL_LEN, MAX_SIGNED_HEADERS_LEN,
-    MAX_SIGNED_HEADER_COUNT, SIGNATURE_HEX_LEN,
-};
+use crate::{is_lower_hex, MAX_SIGNED_HEADERS_LEN, MAX_SIGNED_HEADER_COUNT, SIGNATURE_HEX_LEN};
 
 /// Parsed AWS SigV4 Authorization header.
 #[derive(Debug, Clone)]
@@ -55,9 +55,6 @@ pub fn parse_auth_header(value: &str) -> Result<SigV4Auth, AuthError> {
     let signed_headers_str = signed_headers_str.ok_or(AuthError::MalformedAuth)?;
     let signature_str = signature_str.ok_or(AuthError::MalformedAuth)?;
 
-    if credential_str.is_empty() || credential_str.len() > MAX_CREDENTIAL_LEN {
-        return Err(AuthError::MalformedAuth);
-    }
     if signed_headers_str.is_empty() || signed_headers_str.len() > MAX_SIGNED_HEADERS_LEN {
         return Err(AuthError::MalformedAuth);
     }
@@ -65,21 +62,9 @@ pub fn parse_auth_header(value: &str) -> Result<SigV4Auth, AuthError> {
         return Err(AuthError::MalformedAuth);
     }
 
-    // Parse credential: AKID/date/region/service/aws4_request
-    let cred_parts: Vec<&str> = credential_str.splitn(5, '/').collect();
-    if cred_parts.len() != 5 || cred_parts[4] != "aws4_request" {
-        return Err(AuthError::MalformedAuth);
-    }
-    if cred_parts[0].is_empty() || cred_parts[0].len() > MAX_ACCESS_KEY_ID_LEN {
-        return Err(AuthError::MalformedAuth);
-    }
-
-    let credential = CredentialScope {
-        access_key_id: cred_parts[0].to_string(),
-        date: cred_parts[1].to_string(),
-        region: cred_parts[2].to_string(),
-        service: cred_parts[3].to_string(),
-    };
+    let credential = CredentialScope::from(
+        parse_credential_scope_ref(credential_str).ok_or(AuthError::MalformedAuth)?,
+    );
 
     let signed_headers: Vec<String> = signed_headers_str
         .split(';')
@@ -216,6 +201,9 @@ pub(crate) fn verify_request_record<'a, H: HeaderSource + ?Sized>(
         .ok_or(AuthError::MissingSignedHeader {
             header: "x-amz-date".to_string(),
         })?;
+    if !amz_date_matches_date_stamp(timestamp, &auth.credential.date) {
+        return Err(AuthError::MalformedAuth);
+    }
 
     let scope = format!(
         "{}/{}/{}/aws4_request",
@@ -308,6 +296,12 @@ mod tests {
     #[test]
     fn parse_auth_header_bad_credential_format() {
         let header = "AWS4-HMAC-SHA256 Credential=AKID/bad, SignedHeaders=host, Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        assert!(parse_auth_header(header).is_err());
+    }
+
+    #[test]
+    fn parse_auth_header_invalid_credential_date() {
+        let header = "AWS4-HMAC-SHA256 Credential=AKID/2013052X/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         assert!(parse_auth_header(header).is_err());
     }
 
@@ -592,6 +586,35 @@ mod tests {
             result,
             Err(AuthError::MissingSignedHeader { header }) if header == "x-amz-content-sha256"
         ));
+    }
+
+    #[test]
+    fn verify_request_rejects_credential_date_mismatch() {
+        let store = example_store();
+        let auth_header = "AWS4-HMAC-SHA256 \
+            Credential=AKIAIOSFODNN7EXAMPLE/20130525/us-east-1/s3/aws4_request, \
+            SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, \
+            Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41";
+        let auth = parse_auth_header(auth_header).unwrap();
+        let headers = [
+            ("host", "examplebucket.s3.amazonaws.com"),
+            ("range", "bytes=0-9"),
+            (
+                "x-amz-content-sha256",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            ),
+            ("x-amz-date", "20130524T000000Z"),
+        ];
+        let result = verify_request(
+            "GET",
+            "/test.txt",
+            "",
+            &headers,
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            &auth,
+            &store,
+        );
+        assert!(matches!(result, Err(AuthError::MalformedAuth)));
     }
 
     #[test]

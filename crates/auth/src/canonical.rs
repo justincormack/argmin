@@ -219,20 +219,37 @@ pub fn parse_amz_date(ts: &str) -> Option<u64> {
     if bytes.len() != 16 || bytes[8] != b'T' || bytes[15] != b'Z' {
         return None;
     }
-    let year = parse_fixed_width_u32_ascii(&bytes[0..4])?;
-    let month = parse_fixed_width_u32_ascii(&bytes[4..6])?;
-    let day = parse_fixed_width_u32_ascii(&bytes[6..8])?;
+    let days = parse_yyyymmdd_ascii(&bytes[0..8])?;
     let hour = parse_fixed_width_u32_ascii(&bytes[9..11])?;
     let min = parse_fixed_width_u32_ascii(&bytes[11..13])?;
     let sec = parse_fixed_width_u32_ascii(&bytes[13..15])?;
 
-    if !(1..=12).contains(&month) || hour > 23 || min > 59 || sec > 59 {
+    if hour > 23 || min > 59 || sec > 59 {
         return None;
     }
 
-    // Days from epoch (1970-01-01) to the given date
-    let days = days_since_epoch(year, month, day)?;
     Some(days as u64 * 86400 + hour as u64 * 3600 + min as u64 * 60 + sec as u64)
+}
+
+pub(crate) fn parse_amz_date_stamp(date_stamp: &str) -> Option<u64> {
+    parse_yyyymmdd_ascii(date_stamp.as_bytes())
+}
+
+pub(crate) fn amz_date_matches_date_stamp(timestamp: &str, date_stamp: &str) -> bool {
+    parse_amz_date(timestamp).is_some()
+        && parse_amz_date_stamp(date_stamp).is_some()
+        && timestamp.as_bytes().get(..8) == Some(date_stamp.as_bytes())
+}
+
+fn parse_yyyymmdd_ascii(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() != 8 {
+        return None;
+    }
+
+    let year = parse_fixed_width_u32_ascii(&bytes[0..4])?;
+    let month = parse_fixed_width_u32_ascii(&bytes[4..6])?;
+    let day = parse_fixed_width_u32_ascii(&bytes[6..8])?;
+    days_since_epoch(year, month, day)
 }
 
 /// Days from 1970-01-01 to the given date.
@@ -432,6 +449,27 @@ mod tests {
     fn parse_amz_date_with_time() {
         let epoch = parse_amz_date("20130524T120000Z").unwrap();
         assert_eq!(epoch, 1369353600 + 12 * 3600);
+    }
+
+    #[test]
+    fn parse_amz_date_stamp_valid() {
+        assert_eq!(parse_amz_date_stamp("20130524"), Some(15849));
+    }
+
+    #[test]
+    fn parse_amz_date_stamp_invalid() {
+        assert!(parse_amz_date_stamp("2013052").is_none());
+        assert!(parse_amz_date_stamp("2013052X").is_none());
+        assert!(parse_amz_date_stamp("20131324").is_none());
+        assert!(parse_amz_date_stamp("20130431").is_none());
+    }
+
+    #[test]
+    fn amz_date_matches_date_stamp_requires_valid_and_matching_inputs() {
+        assert!(amz_date_matches_date_stamp("20130524T000000Z", "20130524"));
+        assert!(!amz_date_matches_date_stamp("20130524T000000Z", "20130525"));
+        assert!(!amz_date_matches_date_stamp("20130524T000000Z", "2013052X"));
+        assert!(!amz_date_matches_date_stamp("bad", "20130524"));
     }
 
     #[test]

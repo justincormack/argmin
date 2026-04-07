@@ -141,6 +141,7 @@ Targets:
 Deliver:
 - a small shared set of parser helpers for:
   - AWS basic timestamp/date forms
+  - SigV4 credential scope strings
   - bounded ASCII token extraction where needed
 - eliminate duplicate date/timestamp parsing logic where formats are the same
 
