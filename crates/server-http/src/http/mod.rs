@@ -3937,6 +3937,29 @@ pub fn s3_response_to_hyper(
     stream_read_chunk_size: usize,
     trace_meta: ResponseTraceMeta,
 ) -> http::Response<S3HyperBody> {
+    fn internal_error_response(
+        reason: String,
+        permit: Option<OwnedSemaphorePermit>,
+        trace_meta: ResponseTraceMeta,
+    ) -> http::Response<S3HyperBody> {
+        let resp = S3Response::error(&ServerError::InternalError { reason }, "");
+        let status = http::StatusCode::from_u16(resp.status_code)
+            .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
+        let trace =
+            ResponseBodyTrace::new(trace_meta, resp.status_code, resp.body.len() as u64, false);
+        let mut response = http::Response::new(S3HyperBody::buffered(resp.body, permit, trace));
+        *response.status_mut() = status;
+        for (name, value) in resp.headers {
+            if let (Ok(name), Ok(value)) = (
+                http::header::HeaderName::from_bytes(name.as_bytes()),
+                http::header::HeaderValue::from_str(&value),
+            ) {
+                response.headers_mut().insert(name, value);
+            }
+        }
+        response
+    }
+
     let body_len = if resp.stream.is_some() {
         resp.headers
             .iter()
@@ -3946,16 +3969,46 @@ pub fn s3_response_to_hyper(
     } else {
         resp.body.len() as u64
     };
+    let status = match http::StatusCode::from_u16(resp.status_code) {
+        Ok(status) => status,
+        Err(err) => {
+            return internal_error_response(
+                format!("invalid response status code {}: {err}", resp.status_code),
+                permit,
+                trace_meta,
+            )
+        }
+    };
+    let mut validated_headers = Vec::with_capacity(resp.headers.len());
+    for (name, value) in &resp.headers {
+        let parsed_name = match http::header::HeaderName::from_bytes(name.as_bytes()) {
+            Ok(name) => name,
+            Err(err) => {
+                return internal_error_response(
+                    format!("invalid response header name {name:?}: {err}"),
+                    permit,
+                    trace_meta,
+                )
+            }
+        };
+        let parsed_value = match http::header::HeaderValue::from_str(value) {
+            Ok(value) => value,
+            Err(err) => {
+                return internal_error_response(
+                    format!("invalid response header value for {name}: {err}"),
+                    permit,
+                    trace_meta,
+                )
+            }
+        };
+        validated_headers.push((parsed_name, parsed_value));
+    }
     let trace = ResponseBodyTrace::new(
         trace_meta,
         resp.status_code,
         body_len,
         resp.stream.is_some(),
     );
-    let mut builder = http::Response::builder().status(resp.status_code);
-    for (name, value) in &resp.headers {
-        builder = builder.header(name.as_str(), value.as_str());
-    }
     let body = match resp.stream {
         Some(stream) => S3HyperBody::streaming(
             stream,
@@ -3965,9 +4018,12 @@ pub fn s3_response_to_hyper(
         ),
         None => S3HyperBody::buffered(resp.body, permit, trace),
     };
-    builder
-        .body(body)
-        .expect("response builder should not fail")
+    let mut response = http::Response::new(body);
+    *response.status_mut() = status;
+    for (name, value) in validated_headers {
+        response.headers_mut().insert(name, value);
+    }
+    response
 }
 
 fn parse_max_keys<S: AsRef<str>>(raw: Option<S>) -> Result<u32, ServerError> {
@@ -4622,6 +4678,37 @@ fn extract_checksum_header(req: &S3Request) -> Result<Option<ChecksumClaim>, Ser
 }
 
 fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
+    fn sanitize_override_value(value: &str) -> std::borrow::Cow<'_, str> {
+        if !value.contains(['\r', '\n']) {
+            return std::borrow::Cow::Borrowed(value);
+        }
+        std::borrow::Cow::Owned(
+            value
+                .chars()
+                .map(|ch| match ch {
+                    '\r' | '\n' => ' ',
+                    _ => ch,
+                })
+                .collect(),
+        )
+    }
+
+    fn validated_override_value(header_name: &str, value: &str) -> Option<String> {
+        let sanitized = sanitize_override_value(value);
+        if http::header::HeaderValue::from_str(sanitized.as_ref()).is_err() {
+            return None;
+        }
+        match header_name {
+            "Content-Type"
+            | "Content-Disposition"
+            | "Content-Encoding"
+            | "Content-Language"
+            | "Cache-Control"
+            | "Expires" => Some(sanitized.into_owned()),
+            _ => None,
+        }
+    }
+
     let overrides: &[(&str, &str)] = &[
         ("response-content-type", "Content-Type"),
         ("response-content-disposition", "Content-Disposition"),
@@ -4632,10 +4719,12 @@ fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
     ];
     for &(param, header_name) in overrides {
         if let Some(value) = req.query_param_lossy(param) {
+            let Some(value) = validated_override_value(header_name, value.as_ref()) else {
+                continue;
+            };
             resp.headers
                 .retain(|(k, _)| !k.eq_ignore_ascii_case(header_name));
-            resp.headers
-                .push((header_name.to_string(), value.into_owned()));
+            resp.headers.push((header_name.to_string(), value));
         }
     }
 }
@@ -5277,6 +5366,122 @@ mod tests {
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(name))
             .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn response_overrides_apply_valid_values() {
+        let cases = [
+            (
+                "response-content-type=text%2Fplain",
+                "Content-Type",
+                "text/plain",
+            ),
+            (
+                "response-content-disposition=attachment%3B%20filename%3D%22test.txt%22",
+                "Content-Disposition",
+                "attachment; filename=\"test.txt\"",
+            ),
+            ("response-content-encoding=gzip", "Content-Encoding", "gzip"),
+            (
+                "response-content-language=en-US",
+                "Content-Language",
+                "en-US",
+            ),
+            (
+                "response-cache-control=max-age%3D60",
+                "Cache-Control",
+                "max-age=60",
+            ),
+            (
+                "response-expires=Mon%2C%2015%20Jan%202024%2012%3A30%3A45%20GMT",
+                "Expires",
+                "Mon, 15 Jan 2024 12:30:45 GMT",
+            ),
+        ];
+
+        for (query, header_name, expected) in cases {
+            let req = make_req(query);
+            let mut resp = S3Response {
+                status_code: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+                stream: None,
+            };
+            apply_response_overrides(&mut resp, &req);
+            assert_eq!(find_header(&resp, header_name), Some(expected));
+        }
+    }
+
+    #[test]
+    fn response_overrides_sanitize_or_ignore_invalid_values() {
+        let cases = [
+            (
+                "response-content-type=text%2Fplain%0D%0AInjected%3A%20x",
+                "Content-Type",
+                Some("text/plain  Injected: x"),
+            ),
+            (
+                "response-content-disposition=attachment%0D%0AInjected%3A%20x",
+                "Content-Disposition",
+                Some("attachment  Injected: x"),
+            ),
+            (
+                "response-content-encoding=gzip%0D%0AInjected%3A%20x",
+                "Content-Encoding",
+                Some("gzip  Injected: x"),
+            ),
+            (
+                "response-content-language=en-US%0D%0AInjected%3A%20x",
+                "Content-Language",
+                Some("en-US  Injected: x"),
+            ),
+            (
+                "response-cache-control=max-age%3D60%0D%0AInjected%3A%20x",
+                "Cache-Control",
+                Some("max-age=60  Injected: x"),
+            ),
+            ("response-expires=not-a-date", "Expires", Some("not-a-date")),
+        ];
+
+        for (query, header_name, expected) in cases {
+            let req = make_req(query);
+            let mut resp = S3Response {
+                status_code: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+                stream: None,
+            };
+            if header_name == "Content-Type" {
+                resp.headers.push((
+                    "Content-Type".to_string(),
+                    "application/octet-stream".to_string(),
+                ));
+            }
+            apply_response_overrides(&mut resp, &req);
+            assert_eq!(find_header(&resp, header_name), expected);
+        }
+    }
+
+    #[test]
+    fn s3_response_to_hyper_invalid_header_returns_internal_error() {
+        let mut resp = S3Response {
+            status_code: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            stream: None,
+        };
+        resp.headers.push((
+            "Content-Type".to_string(),
+            "text/plain\r\nInjected: x".to_string(),
+        ));
+
+        let hyper_resp = s3_response_to_hyper(
+            resp,
+            None,
+            8192,
+            ResponseTraceMeta::new(observability::TraceContext::new_request(), "GET", "/", ""),
+        );
+        assert_eq!(hyper_resp.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]

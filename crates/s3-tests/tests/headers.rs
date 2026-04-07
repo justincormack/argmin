@@ -1,5 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use auth::canonical::{canonical_query_string, uri_encode};
 use aws_sdk_s3::primitives::ByteStream;
 use base64::Engine;
 use ring::{digest, hmac};
@@ -238,9 +239,15 @@ impl Signer {
             )
         };
 
+        let canonical_query = canonical_query_string(&self.query);
         let canonical_request = format!(
             "{}\n{}\n{}\n{}\n{}\n{}",
-            self.method, self.path, self.query, canonical_headers, signed_headers, content_sha256
+            self.method,
+            self.path,
+            canonical_query,
+            canonical_headers,
+            signed_headers,
+            content_sha256
         );
 
         let canonical_hash = sha256_hex(canonical_request.as_bytes());
@@ -291,6 +298,49 @@ fn signed_put(bucket: &str, key: &str, body: &[u8]) -> (u16, String) {
     let status = resp.status().as_u16();
     let body_str = resp.body_mut().read_to_string().unwrap_or_default();
     (status, body_str)
+}
+
+fn signed_get(bucket: &str, key: &str, query: &str) -> (u16, Vec<(String, String)>, String) {
+    let path = format!("/{}/{}", bucket, key);
+    let url = if query.is_empty() {
+        format!("{}{}", CTX.endpoint(), path)
+    } else {
+        format!("{}{}?{}", CTX.endpoint(), path, query)
+    };
+    let s = Signer::new("GET", &path)
+        .query(query)
+        .body_hash(&sha256_hex(b""))
+        .sign();
+    let mut resp = agent()
+        .get(&url)
+        .header("Authorization", &s.authorization)
+        .header("x-amz-date", &s.amz_date)
+        .header("x-amz-content-sha256", &s.amz_content_sha256)
+        .call()
+        .expect("transport error");
+    let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .expect("response header is valid utf-8")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, headers, body)
+}
+
+fn response_header(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
 }
 
 // ── Group 1: Checksum Headers ───────────────────────────────────────────
@@ -754,6 +804,103 @@ fn test_upload_part_missing_content_sha256_header_rejected() {
             .send()
             .await;
         cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_response_override_headers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let expires = "Mon, 15 Jan 2024 12:30:45 GMT";
+        let cases = [
+            (
+                "response-content-type=text%2Fplain".to_string(),
+                "Content-Type",
+                "text/plain".to_string(),
+            ),
+            (
+                "response-content-disposition=attachment%3B%20filename%3D%22test.txt%22"
+                    .to_string(),
+                "Content-Disposition",
+                "attachment; filename=\"test.txt\"".to_string(),
+            ),
+            (
+                "response-content-encoding=custom-encoding".to_string(),
+                "Content-Encoding",
+                "custom-encoding".to_string(),
+            ),
+            (
+                "response-content-language=en-US".to_string(),
+                "Content-Language",
+                "en-US".to_string(),
+            ),
+            (
+                "response-cache-control=max-age%3D60".to_string(),
+                "Cache-Control",
+                "max-age=60".to_string(),
+            ),
+            (
+                format!("response-expires={}", uri_encode(expires)),
+                "Expires",
+                expires.to_string(),
+            ),
+        ];
+
+        for (query, header_name, expected) in cases {
+            let (status, headers, body) = signed_get(&bucket, "obj", &query);
+            assert_eq!(status, 200);
+            assert_eq!(response_header(&headers, header_name), Some(expected));
+            assert_eq!(body, "data");
+        }
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_get_invalid_response_override_headers_sanitized_or_ignored() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let (status, headers, _body) = signed_get(
+            &bucket,
+            "obj",
+            "response-content-type=text%2Fplain%0D%0AInjected%3A%20x",
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            response_header(&headers, "Content-Type"),
+            Some("text/plain  Injected: x".to_string())
+        );
+        assert!(response_header(&headers, "Injected").is_none());
+
+        let (status, headers, _body) = signed_get(&bucket, "obj", "response-expires=not-a-date");
+        assert_eq!(status, 200);
+        assert_eq!(
+            response_header(&headers, "Expires"),
+            Some("not-a-date".to_string())
+        );
+
+        cleanup(&bucket, &["obj"]).await;
     });
 }
 
