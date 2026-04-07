@@ -46,9 +46,12 @@ pub fn authenticate_post_sigv4(
     let region = parts[2];
     let service = parts[3];
 
-    // Validate date in credential matches the short date from x-amz-date
-    // x-amz-date is YYYYMMDDTHHMMSSZ, short date is first 8 chars
-    if date.len() < 8 || &date[..8] != cred_date {
+    // Parse and validate the AWS timestamp before extracting the short date.
+    // This keeps POST auth aligned with the shared SigV4 timestamp parser and
+    // avoids byte-slicing untrusted UTF-8 form fields.
+    if crate::parse_amz_date(date).is_none()
+        || date.as_bytes().get(..8) != Some(cred_date.as_bytes())
+    {
         return Err(AuthError::MalformedAuth);
     }
 
@@ -1051,6 +1054,21 @@ mod tests {
             "AWS4-HMAC-SHA256",
             "testAccessKey123/20250101/us-east-1/s3/aws4_request",
             "short",
+            "policy",
+            "sig",
+            &store,
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::MalformedAuth));
+    }
+
+    #[test]
+    fn sigv4_post_date_invalid_char_boundary() {
+        let store = test_store();
+        let err = authenticate_post_sigv4(
+            "AWS4-HMAC-SHA256",
+            "testAccessKey123/20250101/us-east-1/s3/aws4_request",
+            "2025010éT000000Z",
             "policy",
             "sig",
             &store,

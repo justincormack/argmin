@@ -1,0 +1,207 @@
+POST SigV4 auth panics on malformed UTF-8 date input
+Link: https://chatgpt.com/codex/security/findings/9b5cdf05fbb88191ae709b385aa0546d?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: medium)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 058e075
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 23:23:05
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+This commit introduces SigV4 POST authentication and adds an unchecked string slice on untrusted input. The crash is new to this code path and can be triggered remotely via multipart form fields.
+The newly added authenticate_post_sigv4() validates the x-amz-date field by comparing its first eight bytes to the credential date using &date[..8]. Because x-amz-date is taken directly from multipart form fields and only validated as UTF-8, a malicious client can send a multibyte UTF-8 string where byte index 8 falls inside a codepoint (e.g., seven ASCII bytes followed by a 2‑byte character). Rust string slicing at a non‑character boundary panics, so this input can crash the request handler and potentially take down the server process, yielding a denial‑of‑service vector over the network.
+
+# Validation
+## Rubric
+- [x] Locate user-controlled x-amz-date flow into authenticate_post_sigv4 (crates/server/src/http/mod.rs:418-443)
+- [x] Identify fixed-byte slice on date without UTF-8 boundary checks (crates/auth/src/post.rs:98-101)
+- [x] Produce a crashing PoC with multibyte UTF-8 date at byte index 8
+- [x] Capture panic/backtrace showing crash at authenticate_post_sigv4
+## Report
+Rubric-guided validation: (1) Confirmed attacker-controlled x-amz-date flows from multipart form into SigV4 POST auth (crates/server/src/http/mod.rs:418-443). (2) Identified unsafe fixed-byte slice on date in authenticate_post_sigv4 (crates/auth/src/post.rs:98-101). (3) Built a PoC test to pass a multibyte UTF-8 date where byte 8 is inside a codepoint. Running `RUST_BACKTRACE=1 cargo test -p auth panic_on_nonchar_boundary_date -- --nocapture` triggers a panic at post.rs:100:31 (“byte index 8 is not a char boundary”). (4) Captured backtrace in panic_output.txt confirming the panic originates in authenticate_post_sigv4. Valgrind was not available (`valgrind: command not found`). Debugger attempt with lldb ran the test but did not stop (no breakpoint hit), so I relied on the Rust backtrace for stack evidence.
+
+# Evidence
+/workspace/argmin/crates/auth/src/post.rs (L98 to 101)
+  Note: User-controlled x-amz-date is sliced at a fixed byte index without UTF-8 boundary checks; malformed multibyte input can panic.
+```
+    // Validate date in credential matches the short date from x-amz-date
+    // x-amz-date is YYYYMMDDTHHMMSSZ, short date is first 8 chars
+    if date.len() < 8 || &date[..8] != cred_date {
+        return Err(AuthError::MalformedAuth);
+```
+
+/workspace/argmin/crates/server/src/http/mod.rs (L430 to 442)
+  Note: x-amz-date is read from multipart form fields and passed directly into authenticate_post_sigv4, making it attacker-controlled.
+```
+                    }
+                })?,
+                form.field("policy").ok_or_else(|| {
+                    ServerError::InvalidRequest {
+                        reason: "missing policy".to_string(),
+                    }
+                })?,
+                form.field("x-amz-signature").ok_or_else(|| {
+                    ServerError::InvalidRequest {
+                        reason: "missing x-amz-signature".to_string(),
+                    }
+                })?,
+                &self.credentials,
+```
+
+Proposed patch:
+diff --git a/crates/auth/src/post.rs b/crates/auth/src/post.rs
+index 239fa7401d07c0b034709c2c06a08b95220a558f..e8363fef4d00121532b7213b2a0468ac20d78402 100644
+--- a/crates/auth/src/post.rs
++++ b/crates/auth/src/post.rs
+@@ -26,51 +26,51 @@ pub fn authenticate_post_sigv4(
+         "authenticate_post_sigv4",
+         "algorithm={} credential={}",
+         algorithm,
+         credential
+     );
+     // Validate algorithm
+     if algorithm != "AWS4-HMAC-SHA256" {
+         return Err(AuthError::MalformedAuth);
+     }
+ 
+     // Parse credential: AKID/YYYYMMDD/region/service/aws4_request
+     let parts: Vec<&str> = credential.splitn(5, '/').collect();
+     if parts.len() != 5 || parts[4] != "aws4_request" {
+         return Err(AuthError::MalformedAuth);
+     }
+     let access_key_id = parts[0];
+     if access_key_id.is_empty() {
+         return Err(AuthError::MalformedAuth);
+     }
+     let cred_date = parts[1];
+     let region = parts[2];
+     let service = parts[3];
+ 
+     // Validate date in credential matches the short date from x-amz-date
+     // x-amz-date is YYYYMMDDTHHMMSSZ, short date is first 8 chars
+-    if date.len() < 8 || &date[..8] != cred_date {
++    if date.get(..8) != Some(cred_date) {
+         return Err(AuthError::MalformedAuth);
+     }
+ 
+     // Look up the secret key
+     let record = store
+         .get_record(access_key_id)
+         .ok_or(AuthError::UnknownAccessKey)?;
+     if !record.enabled {
+         return Err(AuthError::UnknownAccessKey);
+     }
+ 
+     // Derive signing key and compute expected signature
+     let signing_key = sigv4::derive_signing_key(&record.secret_key, cred_date, region, service);
+     let expected_sig = sigv4::hmac_sha256(signing_key.as_ref(), policy_b64.as_bytes());
+     let expected_hex = sigv4::hex_encode(expected_sig.as_ref());
+ 
+     // Constant-time comparison to prevent timing attacks on signature values.
+     if !crate::constant_time_eq(expected_hex.as_bytes(), signature_hex.as_bytes()) {
+         return Err(AuthError::SignatureMismatch);
+     }
+ 
+     Ok(AuthContext {
+         mode: AuthMode::HeaderSigV4,
+         access_key_id: Some(access_key_id.to_string()),
+         principal: Some(record.principal.clone()),
+@@ -969,50 +969,65 @@ mod tests {
+             "/20250101/us-east-1/s3/aws4_request",
+             "20250101T000000Z",
+             "policy",
+             "sig",
+             &store,
+         )
+         .unwrap_err();
+         assert!(matches!(err, AuthError::MalformedAuth));
+     }
+ 
+     #[test]
+     fn sigv4_post_date_too_short() {
+         let store = test_store();
+         let err = authenticate_post_sigv4(
+             "AWS4-HMAC-SHA256",
+             "testAccessKey123/20250101/us-east-1/s3/aws4_request",
+             "short",
+             "policy",
+             "sig",
+             &store,
+         )
+         .unwrap_err();
+         assert!(matches!(err, AuthError::MalformedAuth));
+     }
+ 
++    #[test]
++    fn sigv4_post_date_invalid_char_boundary() {
++        let store = test_store();
++        let err = authenticate_post_sigv4(
++            "AWS4-HMAC-SHA256",
++            "testAccessKey123/20250101/us-east-1/s3/aws4_request",
++            "2025010éT000000Z",
++            "policy",
++            "sig",
++            &store,
++        )
++        .unwrap_err();
++        assert!(matches!(err, AuthError::MalformedAuth));
++    }
++
+     #[test]
+     fn sigv4_post_disabled_key() {
+         let mut store = CredentialStore::new();
+         store.add_record(crate::credential::CredentialRecord {
+             access_key_id: "AKID".to_string(),
+             secret_key: SecretKey::new("secret".to_string()),
+             principal: "p".to_string(),
+             session_token: None,
+             expires_at_epoch_secs: None,
+             enabled: false,
+         });
+         let err = authenticate_post_sigv4(
+             "AWS4-HMAC-SHA256",
+             "AKID/20250101/us-east-1/s3/aws4_request",
+             "20250101T000000Z",
+             "policy",
+             "sig",
+             &store,
+         )
+         .unwrap_err();
+         assert!(matches!(err, AuthError::UnknownAccessKey));
+     }
+ 
+     // ── parse_iso8601 edge cases ──────────────────────────────────────
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The issue is a real panic reachable from the public POST Object path and affects availability only. While the server does not appear to crash outright (panics are contained to request handling), repeated triggers can still degrade service. This aligns with a medium availability impact rather than high/critical.
+## Likelihood
+high - If the HTTP endpoint is exposed, sending a multipart POST with a malformed UTF-8 x-amz-date is trivial and does not require valid credentials. | Remote network vector
+## Impact
+medium - Panic on crafted UTF-8 input can fail requests and potentially poison worker locks, causing a denial of service; no confidentiality or integrity impact is evident.
+## Assumptions
+- The S3 HTTP endpoint is reachable by an attacker (e.g., ARGMIN_LISTEN_ADDR bound to a non-localhost interface or exposed via a reverse proxy).
+- Panics in authenticate_post_sigv4 are not explicitly caught within the auth path (default Rust panic behavior).
+- Reachable POST Object (multipart/form-data) endpoint
+- Attacker can send x-amz-algorithm, x-amz-credential, x-amz-date, policy, and x-amz-signature fields
+## Path
+attacker -> POST multipart/form-data -> parse_multipart -> authenticate_post_sigv4 (date[..8]) -> panic -> request failure/DoS
+## Path evidence
+- `crates/server/src/http/mod.rs:418-431` - x-amz-date is read from multipart form fields and passed into authenticate_post_sigv4, making it attacker-controlled.
+- `crates/auth/src/post.rs:98-101` - date[..8] slices user input without UTF-8 boundary checks, which can panic on malformed multibyte input.
+- `crates/server/src/config.rs:20-43` - listen address is configurable via ARGMIN_LISTEN_ADDR with default 127.0.0.1:9000, affecting exposure.
+- `crates/server/src/http/serve.rs:193-218` - request handling runs in spawn_blocking; panics result in a generic internal error response, indicating request-level failure rather than explicit recovery.
+## Narrative
+The POST Object handler reads multipart form fields from the request body and passes x-amz-date directly into authenticate_post_sigv4. In authenticate_post_sigv4, the code slices date[..8] without validating UTF-8 character boundaries, so a multibyte character crossing byte index 8 will panic. This path is reachable pre-auth via POST multipart/form-data, enabling a remote attacker (if the HTTP endpoint is exposed) to trigger a panic and cause failed requests; repeated triggers can degrade availability.
+## Controls
+- SigV4 authentication flow
+- Multipart parser enforces UTF-8 for form fields
+- Connection/request concurrency limits (max_connections, request semaphore)
+## Blindspots
+- No deployment manifests are available to confirm real-world exposure (public vs localhost-only).
+- Runtime behavior of mutex poisoning and operational mitigations (supervisors, restarts) cannot be verified statically.

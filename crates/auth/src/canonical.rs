@@ -214,18 +214,19 @@ pub fn string_to_sign(timestamp: &str, scope: &str, canonical_request_hash: &str
 /// Parse an ISO 8601 SigV4 timestamp ("YYYYMMDDTHHMMSSz") into Unix epoch seconds.
 /// Returns None if the format is invalid.
 pub fn parse_amz_date(ts: &str) -> Option<u64> {
-    // Expected format: "20130524T000000Z" (exactly 16 chars)
-    if ts.len() != 16 || ts.as_bytes()[8] != b'T' || ts.as_bytes()[15] != b'Z' {
+    let bytes = ts.as_bytes();
+    // Expected format: "20130524T000000Z" (exactly 16 ASCII bytes)
+    if bytes.len() != 16 || bytes[8] != b'T' || bytes[15] != b'Z' {
         return None;
     }
-    let year: u32 = ts[0..4].parse().ok()?;
-    let month: u32 = ts[4..6].parse().ok()?;
-    let day: u32 = ts[6..8].parse().ok()?;
-    let hour: u32 = ts[9..11].parse().ok()?;
-    let min: u32 = ts[11..13].parse().ok()?;
-    let sec: u32 = ts[13..15].parse().ok()?;
+    let year = parse_fixed_width_u32_ascii(&bytes[0..4])?;
+    let month = parse_fixed_width_u32_ascii(&bytes[4..6])?;
+    let day = parse_fixed_width_u32_ascii(&bytes[6..8])?;
+    let hour = parse_fixed_width_u32_ascii(&bytes[9..11])?;
+    let min = parse_fixed_width_u32_ascii(&bytes[11..13])?;
+    let sec = parse_fixed_width_u32_ascii(&bytes[13..15])?;
 
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
+    if !(1..=12).contains(&month) || hour > 23 || min > 59 || sec > 59 {
         return None;
     }
 
@@ -239,8 +240,20 @@ fn days_since_epoch(year: u32, month: u32, day: u32) -> Option<u64> {
     if year < 1970 {
         return None;
     }
+    if !(1..=12).contains(&month) {
+        return None;
+    }
     // Cumulative days before each month (non-leap)
     const MONTH_DAYS: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    const DAYS_PER_MONTH: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+    let mut max_day = DAYS_PER_MONTH[(month - 1) as usize];
+    if month == 2 && is_leap(year) {
+        max_day += 1;
+    }
+    if day == 0 || day > max_day {
+        return None;
+    }
 
     let mut days: u64 = 0;
     // Full years
@@ -259,6 +272,17 @@ fn days_since_epoch(year: u32, month: u32, day: u32) -> Option<u64> {
 
 fn is_leap(y: u32) -> bool {
     y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400))
+}
+
+fn parse_fixed_width_u32_ascii(bytes: &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    for &b in bytes {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u32::from(b - b'0'))?;
+    }
+    Some(value)
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -424,7 +448,13 @@ mod tests {
     fn parse_amz_date_invalid_values() {
         assert!(parse_amz_date("20131324T000000Z").is_none()); // month 13
         assert!(parse_amz_date("20130532T000000Z").is_none()); // day 32
+        assert!(parse_amz_date("20130431T000000Z").is_none()); // Apr 31
         assert!(parse_amz_date("20130524T250000Z").is_none()); // hour 25
+    }
+
+    #[test]
+    fn parse_amz_date_rejects_non_ascii_boundary_case() {
+        assert!(parse_amz_date("2025010éT000000Z").is_none());
     }
 
     // ── Property-based tests ────────────────────────────────────────
