@@ -293,7 +293,8 @@ impl S3Response {
             let vid = format_version_id(result.version_id);
             resp = resp.header("x-amz-version-id", &vid);
         }
-        resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
+        resp.apply_checksum_mode_headers(&result.system_metadata)
+            .apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
             .apply_managed_encryption_headers(result.managed_encryption)
     }
 
@@ -1426,6 +1427,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -1441,6 +1443,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            system_metadata: SystemMetadata::EMPTY,
             managed_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
             lifecycle_expiration: None,
         };
@@ -1456,6 +1459,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::from_u64(42),
+            system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -1466,10 +1470,37 @@ mod tests {
     }
 
     #[test]
+    fn put_object_response_includes_checksum_headers() {
+        let mut system_metadata = SystemMetadata::EMPTY;
+        system_metadata.set_checksum(
+            ChecksumAlgorithm::Crc64nvme,
+            Some(ChecksumType::FullObject),
+            "AAAAAA==".to_string(),
+        );
+        let result = PutObjectResult {
+            etag: "\"abc123\"".to_string(),
+            version_id: VersionId::Null,
+            system_metadata,
+            managed_encryption: None,
+            lifecycle_expiration: None,
+        };
+        let resp = S3Response::put_object(&result);
+        assert_eq!(
+            find_header(&resp, "x-amz-checksum-crc64nvme"),
+            Some("AAAAAA==")
+        );
+        assert_eq!(
+            find_header(&resp, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+    }
+
+    #[test]
     fn post_object_response_redirects_with_success_query_params() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -1496,6 +1527,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            system_metadata: SystemMetadata::EMPTY,
             managed_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
             lifecycle_expiration: None,
         };
@@ -1511,6 +1543,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -1535,6 +1568,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
             lifecycle_expiration: None,
         };
@@ -1555,6 +1589,7 @@ mod tests {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
             version_id: VersionId::Null,
+            system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
             lifecycle_expiration: Some(LifecycleExpirationHeader {
                 expiry_time_millis: 1_705_321_845_000,

@@ -21,7 +21,7 @@ use base64::Engine;
 use md5_legacy::Digest;
 use ring::hmac;
 
-use crate::{test_agent, CTX};
+use crate::{server::TestServer, CTX};
 
 static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -364,9 +364,19 @@ pub fn delete_objects_with_md5(
 }
 
 /// Minimal response data for raw signed HTTP test requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawResponse {
     pub status: u16,
+    pub headers: Vec<(String, String)>,
     pub body: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SignedRequestCredentials<'a> {
+    pub access_key: &'a str,
+    pub secret_key: &'a str,
+    pub region: &'a str,
+    pub tls_ca_pem: Option<&'a [u8]>,
 }
 
 /// Build a `Content-MD5` header pair for the request body.
@@ -394,8 +404,40 @@ where
     V: AsRef<str>,
     I: IntoIterator<Item = (K, V)>,
 {
-    let agent = test_agent();
+    send_signed_request_with_credentials(
+        method,
+        url_str,
+        body,
+        extra_headers,
+        SignedRequestCredentials {
+            access_key: CTX.access_key(),
+            secret_key: CTX.secret_key(),
+            region: CTX.region(),
+            tls_ca_pem: CTX._server.as_ref().and_then(TestServer::tls_ca_pem),
+        },
+    )
+}
+
+/// Send a raw signed S3 request using explicit endpoint credentials.
+pub fn send_signed_request_with_credentials<K, V, I>(
+    method: &str,
+    url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+    credentials: SignedRequestCredentials<'_>,
+) -> RawResponse
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
     let parsed = url::Url::parse(url_str).expect("parse URL");
+    let endpoint = parsed.origin().ascii_serialization();
+    let agent = crate::build_test_agent(
+        &endpoint,
+        credentials.tls_ca_pem,
+        crate::configured_test_timeout(),
+    );
     let path = parsed.path();
     let query = normalize_query(parsed.query().unwrap_or(""));
 
@@ -440,16 +482,16 @@ where
     let canonical_request =
         format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
 
-    let scope = format!("{date_stamp}/{}/s3/aws4_request", CTX.region());
+    let scope = format!("{date_stamp}/{}/s3/aws4_request", credentials.region);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         sha256_hex(canonical_request.as_bytes())
     );
     let k_date = hmac_sha256(
-        format!("AWS4{}", CTX.secret_key()).as_bytes(),
+        format!("AWS4{}", credentials.secret_key).as_bytes(),
         date_stamp.as_bytes(),
     );
-    let k_region = hmac_sha256(&k_date, CTX.region().as_bytes());
+    let k_region = hmac_sha256(&k_date, credentials.region.as_bytes());
     let k_service = hmac_sha256(&k_region, b"s3");
     let k_signing = hmac_sha256(&k_service, b"aws4_request");
     let signature: String = hmac_sha256(&k_signing, string_to_sign.as_bytes())
@@ -458,7 +500,7 @@ where
         .collect();
     let authorization = format!(
         "AWS4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
-        CTX.access_key()
+        credentials.access_key
     );
 
     const MAX_SLOWDOWN_RETRIES: u32 = 4;
@@ -518,8 +560,22 @@ where
             attempt += 1;
             continue;
         }
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value
+                        .to_str()
+                        .expect("response header is valid utf-8")
+                        .to_string(),
+                )
+            })
+            .collect();
         return RawResponse {
             status,
+            headers,
             body: body_text,
         };
     }

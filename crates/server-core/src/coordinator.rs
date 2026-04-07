@@ -170,6 +170,7 @@ const MAX_LIST_RECORDS: usize = 100_000;
 pub struct PutObjectResult {
     pub etag: String,
     pub version_id: VersionId,
+    pub system_metadata: SystemMetadata,
     pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
     pub lifecycle_expiration: Option<LifecycleExpirationHeader>,
 }
@@ -9178,6 +9179,7 @@ impl Coordinator {
             Ok(PutObjectResult {
                 etag: format_etag(object_crc64),
                 version_id: prepared.version_id,
+                system_metadata,
                 managed_encryption: prepared.encryption.managed_encryption_algorithm(),
                 lifecycle_expiration,
             })
@@ -9878,6 +9880,7 @@ impl Coordinator {
             Ok(PutObjectResult {
                 etag: format_etag(crc64),
                 version_id: prepared.version_id,
+                system_metadata,
                 managed_encryption: prepared.encryption.managed_encryption_algorithm(),
                 lifecycle_expiration,
             })
