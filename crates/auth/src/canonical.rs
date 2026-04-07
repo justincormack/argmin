@@ -296,7 +296,7 @@ fn date_time_to_epoch_seconds(
         return None;
     }
 
-    let days = date_to_days_i64(year, month, day);
+    let days = date_to_days_i64(year, month, day)?;
     if days < 0 {
         return None;
     }
@@ -319,15 +319,27 @@ fn days_in_month_i64(year: i64, month: u32) -> Option<u32> {
     })
 }
 
-fn date_to_days_i64(year: i64, month: u32, day: u32) -> i64 {
-    let year = year - i64::from(month <= 2);
+fn date_to_days_i64(year: i64, month: u32, day: u32) -> Option<i64> {
+    let year = year.checked_sub(i64::from(month <= 2))?;
     let era = if year >= 0 { year } else { year - 399 } / 400;
-    let yoe = year - era * 400;
+    let yoe = year.checked_sub(era.checked_mul(400)?)?;
     let month = i64::from(month);
     let day = i64::from(day);
-    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+    let month_offset = month.checked_add(if month > 2 { -3 } else { 9 })?;
+    let doy = month_offset
+        .checked_mul(153)?
+        .checked_add(2)?
+        .checked_div(5)?
+        .checked_add(day)?
+        .checked_sub(1)?;
+    let doe = yoe
+        .checked_mul(365)?
+        .checked_add(yoe / 4)?
+        .checked_sub(yoe / 100)?
+        .checked_add(doy)?;
+    era.checked_mul(146097)?
+        .checked_add(doe)?
+        .checked_sub(719468)
 }
 
 fn is_leap_i64(year: i64) -> bool {
@@ -626,6 +638,19 @@ mod tests {
             },
         )
         .is_none());
+    }
+
+    #[test]
+    fn parse_iso8601_utc_seconds_rejects_overflowing_year_math() {
+        assert!(parse_iso8601_utc_seconds_with_options(
+            "72000020000000000-2-2T0:0:0Z",
+            Iso8601UtcOptions {
+                trim_whitespace: true,
+                require_fixed_width_fields: false,
+            },
+        )
+        .is_none());
+        assert!(date_to_days_i64(72_000_020_000_000_000, 2, 2).is_none());
     }
 
     #[test]
