@@ -20,6 +20,8 @@ This report was valid.
 
 It was fixed in commit `2afedac` (`fix: harden post policy expiration parsing`), which tightened ISO-8601 expiration parsing, rejected invalid month/day/time and oversized years, rejected pre-epoch dates, and replaced the unchecked epoch conversion with a bounded checked conversion path plus regression tests.
 
+That fix was later folded into the broader parser-hardening work. Commit `3731c23` (`auth: share iso8601 utc parser logic`) moved the risky ISO-8601 UTC parsing and epoch conversion into a shared helper used by both POST policy expiration and Object Lock XML/header parsing, so the original bug fix now sits on the common date-parsing path rather than a one-off local implementation.
+
 # Validation
 ## Rubric
 - [x] Trace expiration validation path from validate_post_policy to parse_iso8601 in crates/auth/src/post.rs.

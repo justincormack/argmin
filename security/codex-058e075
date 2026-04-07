@@ -15,6 +15,13 @@ Signals: Security, Validated, Patch generated, Attack-path
 This commit introduces SigV4 POST authentication and adds an unchecked string slice on untrusted input. The crash is new to this code path and can be triggered remotely via multipart form fields.
 The newly added authenticate_post_sigv4() validates the x-amz-date field by comparing its first eight bytes to the credential date using &date[..8]. Because x-amz-date is taken directly from multipart form fields and only validated as UTF-8, a malicious client can send a multibyte UTF-8 string where byte index 8 falls inside a codepoint (e.g., seven ASCII bytes followed by a 2‑byte character). Rust string slicing at a non‑character boundary panics, so this input can crash the request handler and potentially take down the server process, yielding a denial‑of‑service vector over the network.
 
+# Reviewer note
+This report was valid.
+
+The immediate panic was fixed in commit `05c8412` (`auth: start request parser hardening`), which removed the raw `[..8]` slice from POST SigV4 auth and switched that path to validated date parsing with regression coverage for malformed multibyte input.
+
+That change was then generalized by commit `c937a53` (`auth: harden shared sigv4 parser helpers`), which moved the same validation style onto the shared SigV4 helpers and aligned header, presigned, and POST SigV4 parsing around validated timestamp and credential-scope handling instead of ad hoc string operations.
+
 # Validation
 ## Rubric
 - [x] Locate user-controlled x-amz-date flow into authenticate_post_sigv4 (crates/server/src/http/mod.rs:418-443)
