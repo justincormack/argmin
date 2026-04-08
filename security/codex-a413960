@@ -1,0 +1,208 @@
+SQLite error details now leak in S3 error responses
+Link: https://chatgpt.com/codex/security/findings/124bd12da9188191a1de388ca50dc6c7?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=low
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: a413960
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 23:25:45
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced an information disclosure: DB errors now expose the rusqlite source text in client-visible error responses.
+The commit changes StoreError::Db and MetadataError::Db to include the underlying rusqlite::Error in their Display output. HTTP error responses embed err.to_string() directly into the XML body, so any database failure now leaks internal error strings (e.g., file paths, schema/constraint names) to authenticated clients. This increases information disclosure compared to the prior generic message.
+
+Update: fixed in commit `b0dab49` (`Sanitize internal error responses`).
+The fix was applied in the HTTP error translation layer rather than the storage
+error types: detailed `StoreError`, `MetadataError`, `Ec`, `IntegrityError`,
+`MetadataBlobError`, and `InternalError` strings are still preserved internally
+for debugging/logging, but `S3Response::error` now maps those `InternalError`-class
+responses to a generic client-visible message:
+`We encountered an internal error. Please try again.`
+Regression tests were added to ensure internal details are not exposed in the
+XML `<Message>` field for `StoreError`, `InternalError { reason }`, and
+`MetadataBlobError`.
+
+# Validation
+## Rubric
+- [x] Confirm StoreError::Db / MetadataError::Db include rusqlite::Error in Display output (storage error.rs).
+- [x] Confirm ServerError wraps those errors and preserves their Display text (server error.rs).
+- [x] Confirm HTTP error responses embed err.to_string() in XML <Message> (response.rs + xml.rs).
+- [x] Identify DB contexts that surface internal details (bucket_db.rs open/init contexts).
+- [ ] Reproduce an HTTP response containing a rusqlite error at runtime (blocked by build/dependency constraints).
+## Report
+Dynamic attempts were blocked by environment constraints: `cargo build -p server` failed due to crates.io access being blocked (tiny_http download 403), so no debug binary could be produced for a crash run. `cargo build -p storage --offline` also failed during workspace resolution because tiny_http was unavailable. Valgrind is not installed (`valgrind --version` -> command not found). LLDB is present but could not run since `target/debug/argmin-s3` does not exist (lldb error: target does not exist). 
+
+Code-level validation shows the disclosure: `StoreError::Db` and `MetadataError::Db` include `{source}` in their Display strings (crates/storage/src/error.rs:24-29, 47-52), which means the rusqlite error text is appended to the message. `ServerError` wraps these errors with Display formatting (`storage error: {0}` / `metadata error: {0}`; crates/server/src/error.rs:18-22), and HTTP responses embed `err.to_string()` into XML via `Response::error` (crates/server/src/http/response.rs:272-280) and `xml::error_xml` places that message in the `<Message>` field (crates/server/src/http/xml.rs:7-18). DB operations add context strings such as "open bucket database" (crates/storage/src/bucket_db.rs:21-30), so a failing DB open will yield a message like `database error: open bucket database: <rusqlite error>`, which is then returned to authenticated clients in XML. This confirms the information disclosure risk introduced by the commit.
+
+# Evidence
+/workspace/argmin/crates/server/src/http/response.rs (L272 to 280)
+  Note: HTTP error responses include err.to_string() directly in XML, exposing the expanded DB error messages to clients.
+```
+    /// Build an error response.
+    pub fn error(err: &ServerError, resource: &str) -> Self {
+        let body = xml::error_xml(
+            err.s3_error_code(),
+            &err.to_string(),
+            resource,
+            "request-id",
+        );
+        Self::new(err.http_status()).xml_body(body)
+```
+
+/workspace/argmin/crates/storage/src/error.rs (L17 to 29)
+  Note: StoreError::Db now includes the underlying rusqlite::Error in Display output, expanding the error message content.
+```
+    #[error("IO error: {context}")]
+    Io {
+        context: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("database error: {context}: {source}")]
+    Db {
+        context: &'static str,
+        #[source]
+        source: rusqlite::Error,
+    },
+```
+
+/workspace/argmin/crates/storage/src/error.rs (L44 to 52)
+  Note: MetadataError::Db similarly embeds the rusqlite error source in the Display string.
+```
+    #[error("object not found")]
+    ObjectNotFound,
+
+    #[error("database error: {context}: {source}")]
+    Db {
+        context: &'static str,
+        #[source]
+        source: rusqlite::Error,
+    },
+```
+
+Proposed patch:
+diff --git a/crates/storage/src/error.rs b/crates/storage/src/error.rs
+index 4b791575bd3b23d88d35f5f0a41ad7f43af83ea3..3215cc34ba3808d78db807a4ac49da4a80d082ac 100644
+--- a/crates/storage/src/error.rs
++++ b/crates/storage/src/error.rs
+@@ -1,49 +1,49 @@
+ /// Storage layer error types.
+ /// Shard-level storage errors.
+ #[derive(Debug, thiserror::Error)]
+ pub enum StoreError {
+     #[error("shard not found")]
+     NotFound,
+ 
+     #[error("integrity error: expected CRC {expected:#018X}, got {actual:#018X}")]
+     IntegrityError { expected: u64, actual: u64 },
+ 
+     #[error("PG {pg_id} not found on this node")]
+     PgNotFound { pg_id: u32 },
+ 
+     #[error("invalid shard key length: {len} (expected {expected})")]
+     InvalidKeyLength { len: usize, expected: usize },
+ 
+     #[error("IO error: {context}")]
+     Io {
+         context: &'static str,
+         #[source]
+         source: std::io::Error,
+     },
+ 
+-    #[error("database error: {context}: {source}")]
++    #[error("database error: {context}")]
+     Db {
+         context: &'static str,
+         #[source]
+         source: rusqlite::Error,
+     },
+ }
+ 
+ /// Metadata-level errors (object records, bucket operations).
+ #[derive(Debug, thiserror::Error)]
+ pub enum MetadataError {
+     #[error("bucket not found: {name}")]
+     BucketNotFound { name: crate::types::BucketName },
+ 
+     #[error("bucket already exists")]
+     BucketAlreadyExists,
+ 
+     #[error("bucket not empty")]
+     BucketNotEmpty,
+ 
+     #[error("object not found")]
+     ObjectNotFound,
+ 
+     #[error("method not allowed on delete marker")]
+     MethodNotAllowedOnDeleteMarker,
+ 
+@@ -52,32 +52,32 @@ pub enum MetadataError {
+         from: crate::types::BucketVersioningState,
+         to: crate::types::BucketVersioningState,
+     },
+ 
+     #[error("multipart upload not found: {upload_id}")]
+     NoSuchUpload { upload_id: crate::types::UploadId },
+ 
+     #[error("upload not in InProgress state (current: {state})")]
+     UploadNotInProgress { state: u8 },
+ 
+     #[error("multipart part not found: upload={upload_id} part={part_number}")]
+     PartNotFound {
+         upload_id: crate::types::UploadId,
+         part_number: u32,
+     },
+ 
+     #[error("stream session not found: {session_id}")]
+     StreamSessionNotFound { session_id: crate::types::SessionId },
+ 
+     #[error("stream session not in InProgress state (current: {state})")]
+     StreamSessionNotInProgress { state: u8 },
+ 
+     #[error("not implemented: {context}")]
+     NotImplemented { context: &'static str },
+ 
+-    #[error("database error: {context}: {source}")]
++    #[error("database error: {context}")]
+     Db {
+         context: &'static str,
+         #[source]
+         source: rusqlite::Error,
+     },
+ }
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The issue is a real information disclosure in an in-scope HTTP error path, but the leaked data is limited to internal DB error strings and requires a DB error to occur. No direct data access or privilege escalation is enabled, and exposure is limited to the requesting client. Probability × impact remains low.
+## Likelihood
+low - Requires an authenticated/public request and a triggered database error (e.g., lock, corruption, I/O failure), which is possible but not guaranteed.
+## Impact
+low - Discloses internal SQLite error details but does not expose object data or credentials; impact is limited to additional debugging information for the requester.
+## Assumptions
+- The S3 HTTP server is deployed with a listen address reachable by intended clients (ARGMIN_LISTEN_ADDR may be changed from the loopback default).
+- The attacker can make authenticated S3 requests (valid access key/secret) or access a public bucket.
+- A SQLite/rusqlite error can be triggered during normal request handling (e.g., lock, corruption, I/O error).
+- authenticated or public-bucket HTTP request
+- a rusqlite/SQLite error during a metadata/store operation
+## Path
+[HTTP request] -> [DB error includes rusqlite source] -> [XML error response] -> [Info disclosure]
+## Path evidence
+- `crates/storage/src/error.rs:24-29` - StoreError::Db includes the rusqlite::Error source in its Display output.
+- `crates/storage/src/error.rs:47-52` - MetadataError::Db includes the rusqlite::Error source in its Display output.
+- `crates/server/src/http/response.rs:272-280` - Response::error uses err.to_string() to build the XML error body.
+- `crates/server/src/http/xml.rs:7-18` - error_xml places the message into the <Message> field of the XML response.
+## Narrative
+StoreError::Db and MetadataError::Db include the rusqlite::Error source in their Display strings, and ServerError formatting is inserted directly into the XML <Message> field returned to clients. As a result, any SQLite failure encountered during a request can surface internal error details (e.g., database path, constraint names, lock state) to the requester. This is a low-impact information disclosure reachable through the normal HTTP S3 API when a database error occurs.
+## Controls
+- SigV4 authentication and access key requirements
+- XML escaping for response fields
+## Blindspots
+- No deployment manifests to confirm actual network exposure (listen address may be loopback or public).
+- No runtime validation due to build restrictions; analysis is static-only.
+- Unknown operational logging/monitoring which might already capture or suppress detailed errors.
