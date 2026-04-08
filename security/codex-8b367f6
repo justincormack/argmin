@@ -1,0 +1,155 @@
+AuthenticatedUsers ACLs bypass BlockPublicAcls enforcement
+Link: https://chatgpt.com/codex/security/findings/7d389359944c8191bdde01241d2d4c66?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=low
+Criticality: low (attack path: low)
+Status: stale
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 8b367f6
+Author: justin@specialbusservice.com
+Created: 03/04/2026, 16:04:40
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced a security control bypass: AuthenticatedUsers ACL grants are now accepted and grant access to all authenticated users, yet BlockPublicAcls enforcement still only checks AllUsers-based public flags. Explicit grants can therefore bypass public access blocking and expose data to any authenticated account.
+The commit enables AuthenticatedUsers ACL grants and uses them in authorization checks, but the public ACL detection helpers still only consider AllUsers grants. When BlockPublicAcls is enabled, bucket and object ACL updates are rejected only if `public_read`/`public_write` are set. Because AuthenticatedUsers grants do not set those flags, an ACL XML/header grant can still be accepted and then authorize any authenticated account to read data. This undermines the public access block control for authenticated-user exposure.
+
+Update: this report is stale against current `main`.
+The current implementation treats `AuthenticatedUsers` as a public group for
+`BlockPublicAcls` enforcement via `AclGrants::allows_public_groups(...)`, and
+bucket/object ACL writes are rejected when explicit grants target either
+`AllUsers` or `AuthenticatedUsers`.
+
+Current references:
+- `crates/s3-types/src/lib.rs`: `AclGrants::allows_public_groups`
+- `crates/server-core/src/coordinator.rs`: `acl_grants_grant_public_read/write`
+  and the `BlockPublicAcls` checks in bucket/object ACL persistence
+- `crates/server-core/src/coordinator.rs` tests:
+  `put_bucket_acl_rejects_authenticated_users_grant_when_block_public_acls_enabled`
+  and `put_object_rejects_authenticated_users_grant_when_block_public_acls_enabled`
+- `crates/s3-tests/tests/public_access_block.rs` AWS-backed tests covering
+  `x-amz-grant-read` and XML `AuthenticatedUsers` grants under
+  `BlockPublicAcls`
+
+# Validation
+## Rubric
+- [x] Identify AuthenticatedUsers grants in the ACL model and how they are evaluated (AclGrantee::AuthenticatedUsers, AclGrants::allows_authenticated_users).
+- [x] Confirm authorization uses allows_authenticated_users when requester is authenticated (requester_has_acl_permission + Requester.canonical_user_id).
+- [x] Confirm public ACL detection only checks AllUsers (acl_grants_public_read/write).
+- [x] Confirm BlockPublicAcls enforcement relies solely on public_read/public_write derived from those helpers for bucket/object ACL updates.
+- [x] Confirm explicit grant path does not treat AuthenticatedUsers as public (ensure_supported_bucket_acl_grants is a no-op), enabling bypass.
+## Report
+Attempted dynamic validation: `cargo test -p server-core put_bucket_acl_rejects_block_public_acls -- --nocapture` failed because the ec-sys build requires libisal (intel-isa-l) which is not installed in the container; valgrind and gdb are also unavailable. Code review shows: AuthenticatedUsers grants are modeled (AclGrantee::AuthenticatedUsers) and evaluated via AclGrants::allows_authenticated_users (crates/s3-types/src/lib.rs:368-487). Authorization uses requester_has_acl_permission, which accepts authenticated requesters (Requester.canonical_user_id present) and grants access if allows_authenticated_users is true (crates/server-core/src/coordinator.rs:4236-4244; Requester canonical_user_id at 1547-1583). Public ACL detection only checks AllUsers via acl_grants_public_read/write (coordinator.rs:4247-4252). BlockPublicAcls enforcement in bucket/object ACL updates only consults public_read/public_write derived from those helpers (coordinator.rs:7491-7522, 7561-7567). Explicit grant validation is a no-op (ensure_supported_bucket_acl_grants returns Ok at coordinator.rs:5795-5796), so AuthenticatedUsers grants can be set even when BlockPublicAcls is enabled, and then any authenticated requester is authorized—confirming the bypass. Canned AuthenticatedRead is blocked because BucketAcl::is_public includes AuthenticatedRead (coordinator.rs:1666-1678, 5622-5630), highlighting the gap for explicit grants.
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator.rs (L4236 to 4253)
+  Note: AuthenticatedUsers grants are treated as sufficient for ACL permissions, but public ACL detection only checks AllUsers, so AuthenticatedUsers are not considered public.
+```
+    fn requester_has_acl_permission(
+        requester: &Requester,
+        acl_grants: &AclGrants,
+        permission: AclPermission,
+    ) -> bool {
+        requester.canonical_user_id().is_some_and(|id| {
+            acl_grants.allows_canonical_user(id, permission)
+                || acl_grants.allows_authenticated_users(permission)
+        })
+    }
+
+    fn acl_grants_public_read(acl_grants: &AclGrants) -> bool {
+        acl_grants.allows_all_users(AclPermission::Read)
+    }
+
+    fn acl_grants_public_write(acl_grants: &AclGrants) -> bool {
+        acl_grants.allows_all_users(AclPermission::Write)
+    }
+```
+
+/workspace/argmin/crates/server-core/src/coordinator.rs (L7491 to 7521)
+  Note: Bucket ACL updates enforce BlockPublicAcls only via public_read/public_write flags derived from acl_grants_public_read/write, which ignore AuthenticatedUsers.
+```
+    fn resolve_put_bucket_acl_update(
+        &self,
+        req: &PutBucketAclRequest<'_>,
+    ) -> Result<ResolvedBucketAclUpdate, ServerError> {
+        let bucket_info =
+            self.active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
+        if !Self::requester_can_write_bucket_acl(&req.bucket.requester, &bucket_info) {
+            return Err(ServerError::AccessDenied);
+        }
+        let acl_grants = match &req.acl {
+            PutBucketAclInput::Canned(acl) => {
+                Self::ensure_put_bucket_acl_supported(&bucket_info, *acl)?;
+                Self::bucket_acl_grants_from_canned(
+                    &Self::bucket_owner_identity(&bucket_info),
+                    *acl,
+                )?
+            }
+            PutBucketAclInput::Grants(acl_grants) => {
+                if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
+                    return Err(ServerError::AccessControlListNotSupported);
+                }
+                Self::ensure_supported_bucket_acl_grants(acl_grants)?;
+                acl_grants.clone()
+            }
+        };
+        let public_read = Self::acl_grants_public_read(&acl_grants);
+        let public_write = Self::acl_grants_public_write(&acl_grants);
+        if Self::blocks_public_acls(bucket_info.public_access_block.as_deref())
+            && (public_read || public_write)
+        {
+            return Err(ServerError::AccessDenied);
+```
+
+/workspace/argmin/crates/server-core/src/coordinator.rs (L7561 to 7567)
+  Note: Object ACL persistence also blocks only when public_read/public_write are true, allowing AuthenticatedUsers grants to bypass BlockPublicAcls.
+```
+        let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        let public_read = Self::acl_grants_public_read(&acl_grants);
+        let public_write = Self::acl_grants_public_write(&acl_grants);
+        if Self::blocks_public_acls(bucket_info.public_access_block.as_deref())
+            && (public_read || public_write)
+        {
+            return Err(ServerError::AccessDenied);
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Although the code path allows AuthenticatedUsers grants to bypass BlockPublicAcls checks, the default deployment is single-tenant with one configured account/credential. That means authenticated users are already treated as the owner principal, so the bypass does not meaningfully broaden access in typical deployments. The issue remains a policy enforcement gap but with low real-world impact and low likelihood of abuse without multi-principal configurations.
+## Likelihood
+low - Requires an authenticated client with ACL write permission and a deployment that recognizes multiple authenticated principals; default configuration uses a single account and access key.
+## Impact
+low - If multiple authenticated principals exist, AuthenticatedUsers grants can expose bucket/object data to any authenticated requester despite BlockPublicAcls. In the default single-tenant configuration, this does not materially expand access beyond the owner account.
+## Assumptions
+- BlockPublicAcls is enabled on the target bucket/object.
+- The deployment allows more than one authenticated principal (multiple credentials or accounts) or treats AuthenticatedUsers exposure as a security concern.
+- The service is reachable over the network (ARGMIN_LISTEN_ADDR may be configured to a non-localhost bind).
+- Authenticated request capability (valid SigV4 credentials)
+- Permission to write bucket/object ACLs
+- ACL grants including AuthenticatedUsers
+## Path
+Attacker(authenticated)
+  -> Put*Acl(AuthUsers)
+  -> BlockPublicAcls checks AllUsers only
+  -> ACL stored
+  -> allows_authenticated_users()
+  -> Authenticated read access
+## Path evidence
+- `crates/server-core/src/coordinator.rs:4236-4252` - Authorization allows AuthenticatedUsers, but public ACL detection only checks AllUsers.
+- `crates/server-core/src/coordinator.rs:7491-7522` - Bucket ACL updates enforce BlockPublicAcls only when public_read/public_write are set.
+- `crates/server-core/src/coordinator.rs:7561-7567` - Object ACL persistence also blocks only on public_read/public_write.
+- `crates/s3-types/src/lib.rs:368-488` - AclGrantee includes AuthenticatedUsers and allows_authenticated_users checks for it.
+- `crates/argmin-s3/src/main.rs:132-142` - Default runtime loads a single account/credential, limiting multi-tenant impact.
+- `crates/argmin-s3/src/config.rs:61-62` - Default listen address is 127.0.0.1:9000; exposure depends on configuration.
+## Narrative
+ACL grants now include AuthenticatedUsers and authorization explicitly allows authenticated users via allows_authenticated_users(). However, public ACL detection only checks AllUsers, and BlockPublicAcls enforcement during bucket/object ACL updates rejects updates only when public_read/public_write (AllUsers) are set. This allows AuthenticatedUsers grants to be persisted even when BlockPublicAcls is enabled, letting any authenticated requester pass ACL checks. In this repo’s default single-account configuration, all authenticated requests map to the same account, which limits cross-tenant impact and reduces severity.
+## Controls
+- SigV4 authentication
+- ACL authorization checks
+- PublicAccessBlock (BlockPublicAcls)
+## Blindspots
+- No deployment manifests provided; actual exposure (public bind/LB) is unknown.
+- No runtime evidence of multi-account credential configuration beyond static code review.
+- PoC was described but not executed due to build dependency limitations.
