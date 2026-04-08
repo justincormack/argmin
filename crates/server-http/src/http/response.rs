@@ -114,6 +114,9 @@ pub struct CreateMultipartUploadResponseContext<'a> {
 }
 
 impl S3Response {
+    const TEST_REQUEST_ID: &'static str = "request-id";
+    const TEST_HOST_ID: &'static str = "host-id";
+
     fn new(status_code: u16) -> Self {
         Self {
             status_code,
@@ -557,7 +560,7 @@ impl S3Response {
             "",
             "request-id",
         );
-        Self::new(416).xml_body(body)
+        Self::new(416).chunked_xml_body(body)
     }
 
     /// Build a response for `DeleteObject` (204 No Content).
@@ -788,7 +791,7 @@ impl S3Response {
             "",
             "request-id",
         );
-        Self::new(412).xml_body(body)
+        Self::new(412).chunked_xml_body(body)
     }
 
     /// Build a response for `PutBucketCors` (200 OK, no body).
@@ -1134,8 +1137,13 @@ impl S3Response {
     /// Build a 403 Forbidden response.
     #[must_use]
     pub fn forbidden() -> Self {
-        let body = xml::error_xml("AccessDenied", "Access Denied", "", "request-id");
-        Self::new(403).xml_body(body)
+        let body = xml::error_xml_with_host_id(
+            "AccessDenied",
+            "Access Denied",
+            Self::TEST_REQUEST_ID,
+            Self::TEST_HOST_ID,
+        );
+        Self::new(403).chunked_xml_body(body)
     }
 
     /// Build an error response.
@@ -1145,6 +1153,27 @@ impl S3Response {
 
         // Special cases that need extra XML elements
         match err {
+            ServerError::BucketNotFound { name } => {
+                let body =
+                    xml::no_such_bucket_error_xml(name, Self::TEST_REQUEST_ID, Self::TEST_HOST_ID);
+                return Self::new(404).chunked_xml_body(body);
+            }
+            ServerError::ObjectNotFound { key, .. } | ServerError::DeleteMarkerHit { key, .. } => {
+                let body =
+                    xml::no_such_key_error_xml(key, Self::TEST_REQUEST_ID, Self::TEST_HOST_ID);
+                return Self::new(404).chunked_xml_body(body);
+            }
+            ServerError::AccessDenied
+            | ServerError::Auth(auth::AuthError::MissingAuth)
+            | ServerError::Auth(auth::AuthError::AccessDenied) => {
+                let body = xml::error_xml_with_host_id(
+                    "AccessDenied",
+                    "Access Denied",
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                return Self::new(403).chunked_xml_body(body);
+            }
             ServerError::XAmzContentSHA256Mismatch {
                 client_hash,
                 server_hash,
@@ -1157,13 +1186,16 @@ impl S3Response {
                      <ClientComputedContentSHA256>{}</ClientComputedContentSHA256>\
                      <S3ComputedContentSHA256>{}</S3ComputedContentSHA256>\
                      <Resource>{}</Resource>\
-                     <RequestId>request-id</RequestId>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
                      </Error>",
                     xml::xml_escape(client_hash),
                     xml::xml_escape(server_hash),
                     xml::xml_escape(resource),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
                 );
-                return Self::new(400).xml_body(body);
+                return Self::new(400).chunked_xml_body(body);
             }
             ServerError::Auth(auth::AuthError::UnsignedHeaders { headers }) => {
                 let headers_str = headers.join(";");
@@ -1174,12 +1206,15 @@ impl S3Response {
                      <Message>There were headers present in the request which were not signed</Message>\
                      <HeadersNotSigned>{}</HeadersNotSigned>\
                      <Resource>{}</Resource>\
-                     <RequestId>request-id</RequestId>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
                      </Error>",
                     xml::xml_escape(&headers_str),
                     xml::xml_escape(resource),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
                 );
-                return Self::new(403).xml_body(body);
+                return Self::new(403).chunked_xml_body(body);
             }
             ServerError::Auth(auth::AuthError::UnexpectedSecurityToken { token }) => {
                 let body = format!(
@@ -1188,20 +1223,26 @@ impl S3Response {
                      <Code>InvalidToken</Code>\
                      <Message>The provided token is malformed or otherwise invalid.</Message>\
                      <Token-0>{}</Token-0>\
-                     <RequestId>request-id</RequestId>\
-                     <HostId>host-id</HostId>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
                      </Error>",
                     xml::xml_escape(token),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
                 );
-                return Self::new(400).xml_body(body);
+                return Self::new(400).chunked_xml_body(body);
             }
             ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader) => {
-                let body = xml::header_not_implemented_xml("Authorization", resource, "request-id");
-                return Self::new(501).xml_body(body);
+                let body = xml::header_not_implemented_xml(
+                    "Authorization",
+                    resource,
+                    Self::TEST_REQUEST_ID,
+                );
+                return Self::new(501).chunked_xml_body(body);
             }
             ServerError::HeaderNotImplemented { ref header } => {
-                let body = xml::header_not_implemented_xml(header, resource, "request-id");
-                return Self::new(501).xml_body(body);
+                let body = xml::header_not_implemented_xml(header, resource, Self::TEST_REQUEST_ID);
+                return Self::new(501).chunked_xml_body(body);
             }
             ServerError::QueryParameterNotImplemented {
                 ref query_parameter,
@@ -1209,9 +1250,9 @@ impl S3Response {
                 let body = xml::query_parameter_not_implemented_xml(
                     query_parameter,
                     resource,
-                    "request-id",
+                    Self::TEST_REQUEST_ID,
                 );
-                return Self::new(501).xml_body(body);
+                return Self::new(501).chunked_xml_body(body);
             }
             ServerError::InvalidSseCustomerKeyMd5 => {
                 let body = format!(
@@ -1221,11 +1262,14 @@ impl S3Response {
                      <Message>The calculated MD5 hash of the key did not match the hash that was provided.</Message>\
                      <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
                      <Resource>{}</Resource>\
-                     <RequestId>request-id</RequestId>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
                      </Error>",
                     xml::xml_escape(resource),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
                 );
-                return Self::new(400).xml_body(body);
+                return Self::new(400).chunked_xml_body(body);
             }
             ServerError::InvalidEncryptionAlgorithmError { value } => {
                 let body = format!(
@@ -1236,12 +1280,15 @@ impl S3Response {
                      <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
                      <ArgumentValue>{}</ArgumentValue>\
                      <Resource>{}</Resource>\
-                     <RequestId>request-id</RequestId>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
                      </Error>",
                     xml::xml_escape(value),
                     xml::xml_escape(resource),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
                 );
-                return Self::new(400).xml_body(body);
+                return Self::new(400).chunked_xml_body(body);
             }
             ServerError::WrongRegion {
                 provided_region,
@@ -1253,12 +1300,12 @@ impl S3Response {
                         "The authorization header is malformed; the region '{provided_region}' is wrong; expecting '{expected_region}'"
                     ),
                     resource,
-                    "request-id",
+                    Self::TEST_REQUEST_ID,
                     expected_region,
                 );
                 return Self::new(400)
                     .header("x-amz-bucket-region", expected_region)
-                    .xml_body(body);
+                    .chunked_xml_body(body);
             }
             ServerError::InvalidBucketNamespace {
                 reason,
@@ -1268,16 +1315,17 @@ impl S3Response {
                     "InvalidBucketNamespace",
                     reason,
                     bucket_namespace,
-                    "request-id",
+                    Self::TEST_REQUEST_ID,
                 );
-                return Self::new(400).xml_body(body);
+                return Self::new(400).chunked_xml_body(body);
             }
             ServerError::KeyTooLongError {
                 size,
                 max_size_allowed,
             } => {
-                let body = xml::key_too_long_error_xml(*size, *max_size_allowed, "request-id");
-                return Self::new(400).xml_body(body);
+                let body =
+                    xml::key_too_long_error_xml(*size, *max_size_allowed, Self::TEST_REQUEST_ID);
+                return Self::new(400).chunked_xml_body(body);
             }
             _ => {}
         }
@@ -1305,8 +1353,13 @@ impl S3Response {
                 fallback.as_str()
             }
         };
-        let body = xml::error_xml(err.s3_error_code(), message, resource, "request-id");
-        let resp = Self::new(err.http_status()).xml_body(body);
+        let body = xml::error_xml(
+            err.s3_error_code(),
+            message,
+            resource,
+            Self::TEST_REQUEST_ID,
+        );
+        let resp = Self::new(err.http_status()).chunked_xml_body(body);
         if matches!(err, ServerError::SlowDown) {
             resp.header("Retry-After", "1")
         } else {
@@ -2223,7 +2276,7 @@ mod tests {
         let resp = S3Response::error(&err, "/bucket/key");
         assert_eq!(resp.status_code, 400);
         assert_eq!(find_header(&resp, "x-amz-bucket-region"), Some("us-west-2"));
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<Code>AuthorizationHeaderMalformed</Code>"));
         assert!(body.contains("<Region>us-west-2</Region>"));
         assert!(body.contains("expecting 'us-west-2'"));
@@ -2237,7 +2290,7 @@ mod tests {
         };
         let resp = S3Response::error(&err, "/bucket");
         assert_eq!(resp.status_code, 400);
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<Code>InvalidBucketNamespace</Code>"));
         assert!(body.contains("<Message>namespace mismatch</Message>"));
         assert!(
@@ -2252,7 +2305,7 @@ mod tests {
         });
         let resp = S3Response::error(&err, "/bucket/key");
         assert_eq!(resp.status_code, 400);
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<Code>InvalidToken</Code>"));
         assert!(body
             .contains("<Message>The provided token is malformed or otherwise invalid.</Message>"));
@@ -2574,7 +2627,9 @@ mod tests {
         let err = ServerError::BucketNotFound { name: "b".into() };
         let resp = S3Response::error(&err, "/b");
         assert_eq!(resp.status_code, 404);
-        let body = String::from_utf8(resp.body).unwrap();
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        assert_eq!(find_header(&resp, "Content-Length"), None);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("NoSuchBucket"));
     }
 
@@ -2583,7 +2638,9 @@ mod tests {
         let err = ServerError::Auth(auth::AuthError::MissingAuth);
         let resp = S3Response::error(&err, "/");
         assert_eq!(resp.status_code, 403);
-        let body = String::from_utf8(resp.body).unwrap();
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        assert_eq!(find_header(&resp, "Content-Length"), None);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("AccessDenied"));
     }
 
@@ -2592,7 +2649,9 @@ mod tests {
         let err = ServerError::Store(storage::StoreError::NotFound);
         let resp = S3Response::error(&err, "/x");
         assert_eq!(resp.status_code, 500);
-        let body = String::from_utf8(resp.body).unwrap();
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        assert_eq!(find_header(&resp, "Content-Length"), None);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("InternalError"));
         assert!(body.contains("We encountered an internal error. Please try again."));
         assert!(!body.contains("shard not found"));
@@ -2605,7 +2664,7 @@ mod tests {
         };
         let resp = S3Response::error(&err, "/x");
         assert_eq!(resp.status_code, 500);
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("InternalError"));
         assert!(body.contains("We encountered an internal error. Please try again."));
         assert!(!body.contains("/tmp/secret.db"));
@@ -2618,7 +2677,7 @@ mod tests {
         };
         let resp = S3Response::error(&err, "/x");
         assert_eq!(resp.status_code, 500);
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("InternalError"));
         assert!(body.contains("We encountered an internal error. Please try again."));
         assert!(!body.contains("0xFF"));
@@ -2629,7 +2688,8 @@ mod tests {
         let resp = S3Response::error(&ServerError::SlowDown, "/");
         assert_eq!(resp.status_code, 503);
         assert_eq!(find_header(&resp, "Retry-After"), Some("1"));
-        let body = String::from_utf8(resp.body).unwrap();
+        assert_eq!(find_header(&resp, "Content-Length"), None);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("SlowDown"));
     }
 
@@ -2638,6 +2698,8 @@ mod tests {
         let err = ServerError::MethodNotAllowed;
         let resp = S3Response::error(&err, "/");
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        assert_eq!(find_header(&resp, "Content-Length"), None);
+        assert!(resp.stream.is_some());
     }
 
     // ── delete_objects ───────────────────────────────────────────────

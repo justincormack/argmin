@@ -8,7 +8,7 @@ use aws_sdk_s3::types::{
 };
 use aws_sdk_s3::Client;
 use s3_tests::{
-    build_client_with_ca, cleanup_versioned_bucket, delete_all_and_bucket,
+    build_client_with_ca, build_test_agent, cleanup_versioned_bucket, delete_all_and_bucket,
     send_signed_request_with_credentials, unique_bucket, RawResponse, SignedRequestCredentials,
     TestServer, CTX,
 };
@@ -137,6 +137,39 @@ fn object_url(endpoint: &str, bucket: &str, key: &str, query: Option<&str>) -> S
     match query {
         Some(query) => format!("{path}?{query}"),
         None => path,
+    }
+}
+
+fn send_anonymous_get(
+    endpoint: &str,
+    tls_ca_pem: Option<&[u8]>,
+    bucket: &str,
+    key: &str,
+    query: Option<&str>,
+) -> RawResponse {
+    let url = object_url(endpoint, bucket, key, query);
+    let agent = build_test_agent(endpoint, tls_ca_pem, std::time::Duration::from_secs(30));
+    let mut response = agent
+        .get(&url)
+        .call()
+        .expect("anonymous GET transport error");
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .expect("response header is valid utf-8")
+                    .to_string(),
+            )
+        })
+        .collect();
+    RawResponse {
+        status: response.status().as_u16(),
+        headers,
+        body: response.body_mut().read_to_string().unwrap_or_default(),
     }
 }
 
@@ -863,6 +896,129 @@ fn test_head_bucket_response_shape_matches_aws_when_regions_match() {
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
         delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_list_objects_v2_no_such_bucket_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+
+        let missing_bucket = unique_bucket();
+        let aws_error = env.send_external(
+            "GET",
+            &missing_bucket,
+            "",
+            Some("list-type=2"),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_error = env.send_local(
+            "GET",
+            &missing_bucket,
+            "",
+            Some("list-type=2"),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_xml_response_shape_matches(
+            "ListObjectsV2NoSuchBucket",
+            &aws_error,
+            &local_error,
+            &[],
+            &[],
+            &["RequestId", "HostId"],
+        );
+    });
+}
+
+#[test]
+fn test_get_object_no_such_key_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let aws_error = env.send_external(
+            "GET",
+            &external_bucket,
+            "missing-key.txt",
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_error = env.send_local(
+            "GET",
+            &local_bucket,
+            "missing-key.txt",
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_xml_response_shape_matches(
+            "GetObjectNoSuchKey",
+            &aws_error,
+            &local_error,
+            &[],
+            &[],
+            &["RequestId", "HostId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_object_access_denied_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "private.txt";
+        let body = b"secret";
+
+        env.external_client
+            .put_object()
+            .bucket(&external_bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .expect("put external private object");
+        env.local_client
+            .put_object()
+            .bucket(&local_bucket)
+            .key(key)
+            .body(ByteStream::from_static(body))
+            .send()
+            .await
+            .expect("put local private object");
+
+        let aws_error = send_anonymous_get(CTX.endpoint(), None, &external_bucket, key, None);
+        let local_error = send_anonymous_get(
+            env.local_server.endpoint(),
+            env.local_server.tls_ca_pem(),
+            &local_bucket,
+            key,
+            None,
+        );
+        assert_xml_response_shape_matches(
+            "GetObjectAccessDenied",
+            &aws_error,
+            &local_error,
+            &[],
+            &[],
+            &["RequestId", "HostId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
     });
 }
 

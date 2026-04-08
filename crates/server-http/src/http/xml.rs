@@ -57,6 +57,65 @@ pub fn error_xml(code: &str, message: &str, resource: &str, request_id: &str) ->
     )
 }
 
+/// Format an S3 error response XML with a `HostId`.
+#[must_use]
+pub fn error_xml_with_host_id(
+    code: &str,
+    message: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>{}</Code>\
+         <Message>{}</Message>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(code),
+        xml_escape(message),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format an S3 `NoSuchBucket` error response.
+#[must_use]
+pub fn no_such_bucket_error_xml(bucket_name: &str, request_id: &str, host_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>NoSuchBucket</Code>\
+         <Message>The specified bucket does not exist</Message>\
+         <BucketName>{}</BucketName>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(bucket_name),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format an S3 `NoSuchKey` error response.
+#[must_use]
+pub fn no_such_key_error_xml(key: &str, request_id: &str, host_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>NoSuchKey</Code>\
+         <Message>The specified key does not exist.</Message>\
+         <Key>{}</Key>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(key),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
 /// Format an S3 `KeyTooLongError` response.
 #[must_use]
 pub fn key_too_long_error_xml(size: usize, max_size_allowed: usize, request_id: &str) -> String {
