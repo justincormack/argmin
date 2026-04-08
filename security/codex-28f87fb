@@ -1,0 +1,61 @@
+Control characters now allowed in keys enable log injection
+Link: https://chatgpt.com/codex/security/findings/7befaa9607ec819195495c6b6fc64edf?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: low
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 28f87fb
+Author: justin@specialbusservice.com
+Created: 08/04/2026, 16:08:32
+Assignee: Unassigned
+Signals: Security
+
+# Summary
+Introduced: object-key validation no longer blocks control characters, but log emission still formats keys directly, enabling log injection/forgery.
+The commit removes the control-character rejection in object keys, only forbidding NUL. Keys are then used directly in trace logging strings (e.g., streaming PUT events) and written verbatim to log sinks. With this change, an attacker can store objects whose keys contain CR/LF or escape characters, causing log forging or terminal escape sequences in observability logs. This is a security-relevant integrity issue for audit logs and monitoring output, especially in environments that enable tracing.
+
+# Evidence
+/workspace/argmin/crates/observability/src/lib.rs (L256 to 263)
+  Note: Trace log lines are written verbatim to sinks, so control characters in keys can inject newlines or terminal escapes.
+```
+fn write_trace_line(args: fmt::Arguments<'_>) {
+    match trace_sink() {
+        TraceSink::Stderr => write_stderr_line(args),
+        TraceSink::AsyncFile(file) => file.write_line(args),
+        TraceSink::SyncFile(file) => {
+            let mut file = file.lock().unwrap_or_else(|err| err.into_inner());
+            let _ = writeln!(file, "{args}");
+        }
+```
+
+/workspace/argmin/crates/server-http/src/http/router.rs (L200 to 212)
+  Note: Object-key validation now only rejects NUL bytes, allowing other control characters to pass through.
+```
+/// 1-1024 bytes, no null bytes.
+pub(crate) fn validate_object_key(key: &str) -> Result<(), ServerError> {
+    if key.is_empty() || key.len() > 1024 {
+        return Err(ServerError::InvalidRequest {
+            reason: format!("object key must be 1-1024 bytes, got {}", key.len()),
+        });
+    }
+    if key.as_bytes().contains(&0) {
+        return Err(ServerError::InvalidRequest {
+            reason: "object key must not contain null bytes".to_string(),
+        });
+    }
+    Ok(())
+```
+
+/workspace/argmin/crates/server-http/src/http/serve.rs (L1528 to 1535)
+  Note: Trace log message formats and emits the object key directly into log fields without sanitization.
+```
+    emit_streaming_put_event(
+        &ctx,
+        "streaming_put_body_read_complete",
+        format_args!(
+            "bucket={} key={} session_id={} body_bytes_received={} full_segments_flushed={} buffered_tail_bytes={} data_frames={} frame_wait_us={} decode_us={} ingest_local_us={} append_wait_us={}",
+            ctx.bucket,
+            ctx.key,
+            streaming_put_session_label(session_id.as_deref()),
+```

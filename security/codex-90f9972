@@ -1,0 +1,310 @@
+Tracing logs presigned URL queries and credentials
+Link: https://chatgpt.com/codex/security/findings/f1f14bcef8bc8191baadb0b09b414ed8?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: low (attack path: low)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 90f9972
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 22:12:38
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced an information disclosure risk by logging full query strings and SigV4 credential fields during request authentication and request start tracing.
+The commit adds request tracing that prints user-controlled request metadata (method/path/query) and SigV4 POST credentials directly to stderr. For presigned URLs, the query string contains X-Amz-Signature/X-Amz-Credential parameters that function as bearer tokens for the duration of the URL. Writing them to logs risks credential/token disclosure to anyone with log access or to log aggregation systems. This information leak is introduced by the new observability instrumentation when ARGMIN_TRACE is enabled.
+
+# Validation
+## Rubric
+- [x] Confirm request_start tracing logs method/path/query (serve.rs:294-313)
+- [x] Confirm authenticate_request trace logs raw query_string (auth/request.rs:66-73)
+- [x] Confirm POST SigV4 trace logs credential field (auth/post.rs:24-30)
+- [x] Confirm tracing is enabled by ARGMIN_TRACE and logs to stderr (observability/lib.rs:52-67, 179-188, 245-255)
+- [x] Establish that presigned SigV4 uses query parameters that would be logged (auth/request.rs:104-110 checks for X-Amz-Algorithm in query string)
+## Report
+Crash/valgrind/debugger attempts: `cargo build -p argmin-s3` failed because `libisal` was missing (ec-sys build.rs: "libisal not found; install intel-isa-l or set PKG_CONFIG_PATH"), so no runtime reproduction possible. `valgrind` and `gdb` are not installed in the container. Code inspection confirms the info leak: server HTTP request handling logs the raw query string in `request_start` (crates/server-http/src/http/serve.rs:294-313). Authentication traces log raw query strings during request auth (crates/auth/src/request.rs:66-73) and log the SigV4 credential field during POST auth (crates/auth/src/post.rs:24-30). Tracing is enabled by `ARGMIN_TRACE` and emitted to stderr via `eprintln!` in the tracing infrastructure (crates/observability/src/lib.rs:52-67, 179-188, 245-255). Therefore, when tracing is enabled, full query strings (including presigned `X-Amz-*` parameters) and SigV4 credential identifiers are written to logs, matching the suspected information disclosure.
+
+# Evidence
+/workspace/argmin/crates/auth/src/post.rs (L24 to 30)
+  Note: POST authentication trace logs the SigV4 credential field, exposing access key identifiers in logs.
+```
+    observability::trace_scope!(
+        TRACE_TARGET,
+        "authenticate_post_sigv4",
+        "algorithm={} credential={}",
+        algorithm,
+        credential
+    );
+```
+
+/workspace/argmin/crates/auth/src/request.rs (L66 to 73)
+  Note: Authentication trace logs raw query_string, which includes sensitive presigned SigV4 parameters.
+```
+    observability::trace_scope!(
+        TRACE_TARGET,
+        "authenticate_request",
+        "method={} path={} query={}",
+        method,
+        path,
+        query_string
+    );
+```
+
+/workspace/argmin/crates/server-http/src/http/serve.rs (L294 to 312)
+  Note: Logs method/path/query for every request start; the query string can include presigned URL signatures and credentials.
+```
+    let trace = observability::TraceContext::new_request();
+    let query = req.uri().query().unwrap_or("");
+    let range_suffix = req
+        .headers()
+        .get(http::header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| format!(" range={value}"))
+        .unwrap_or_default();
+    let _ = observability::event_in_context(
+        &trace,
+        TRACE_TARGET,
+        "request_start",
+        Some(format_args!(
+            "method={} path={} query={}{}",
+            req.method(),
+            req.uri().path(),
+            query,
+            range_suffix
+        )),
+```
+
+Proposed patch:
+diff --git a/crates/auth/src/post.rs b/crates/auth/src/post.rs
+index 239fa7401d07c0b034709c2c06a08b95220a558f..ffe99bf20eaac6cfbb4f9bcf98362d19a392658d 100644
+--- a/crates/auth/src/post.rs
++++ b/crates/auth/src/post.rs
+@@ -2,53 +2,53 @@
+ ///
+ /// SigV4 uses form fields: `x-amz-algorithm`, `x-amz-credential`, `x-amz-date`,
+ /// `policy`, `x-amz-signature`
+ use crate::credential::CredentialStore;
+ use crate::error::AuthError;
+ use crate::request::{AuthContext, AuthMode};
+ use crate::sigv4;
+ 
+ const TRACE_TARGET: &str = "auth";
+ 
+ /// Authenticate a POST Object request using SigV4 form fields.
+ ///
+ /// SigV4 POST signs the base64-encoded policy directly (no canonical request).
+ /// Returns `Ok(AuthContext)` on success.
+ pub fn authenticate_post_sigv4(
+     algorithm: &str,
+     credential: &str,
+     date: &str,
+     policy_b64: &str,
+     signature_hex: &str,
+     store: &CredentialStore,
+ ) -> Result<AuthContext, AuthError> {
+     observability::trace_scope!(
+         TRACE_TARGET,
+         "authenticate_post_sigv4",
+-        "algorithm={} credential={}",
++        "algorithm={} credential_present={}",
+         algorithm,
+-        credential
++        !credential.is_empty()
+     );
+     // Validate algorithm
+     if algorithm != "AWS4-HMAC-SHA256" {
+         return Err(AuthError::MalformedAuth);
+     }
+ 
+     // Parse credential: AKID/YYYYMMDD/region/service/aws4_request
+     let parts: Vec<&str> = credential.splitn(5, '/').collect();
+     if parts.len() != 5 || parts[4] != "aws4_request" {
+         return Err(AuthError::MalformedAuth);
+     }
+     let access_key_id = parts[0];
+     if access_key_id.is_empty() {
+         return Err(AuthError::MalformedAuth);
+     }
+     let cred_date = parts[1];
+     let region = parts[2];
+     let service = parts[3];
+ 
+     // Validate date in credential matches the short date from x-amz-date
+     // x-amz-date is YYYYMMDDTHHMMSSZ, short date is first 8 chars
+     if date.len() < 8 || &date[..8] != cred_date {
+         return Err(AuthError::MalformedAuth);
+     }
+ 
+
+
+diff --git a/crates/auth/src/request.rs b/crates/auth/src/request.rs
+index bb60437b44a7ec8c781020efa1a24e66867f4e20..6d7e7fa4f2262589cfa9613527a46872e330e71f 100644
+--- a/crates/auth/src/request.rs
++++ b/crates/auth/src/request.rs
+@@ -121,54 +121,54 @@ impl HeaderSource for [(String, String)] {
+     {
+         for (name, value) in self {
+             f(name.as_str(), value.as_str());
+         }
+     }
+ }
+ 
+ /// Authenticate a request and return identity context.
+ ///
+ /// Phase 1 behavior: header-based SigV4 only.
+ #[allow(clippy::too_many_arguments)]
+ pub fn authenticate_request<H: HeaderSource + ?Sized>(
+     method: &str,
+     path: &str,
+     query_string: &str,
+     headers: &H,
+     body: &[u8],
+     store: &CredentialStore,
+     expected_region: &str,
+     expected_service: &str,
+     now_epoch_secs: u64,
+ ) -> Result<AuthContext, AuthError> {
+     observability::trace_scope!(
+         TRACE_TARGET,
+         "authenticate_request",
+-        "method={} path={} query={}",
++        "method={} path={} has_query={}",
+         method,
+         path,
+-        query_string
++        !query_string.is_empty()
+     );
+     let mut authorization_header = None;
+     let mut authorization_count = 0usize;
+     headers.visit(|name, value| {
+         if name == "authorization" {
+             authorization_count += 1;
+             if authorization_count == 1 {
+                 authorization_header = Some(value);
+             }
+         }
+     });
+     if authorization_count > 1 {
+         return Err(AuthError::DuplicateAuthorizationHeader);
+     }
+ 
+     if let Some(auth_header) = authorization_header {
+         // Empty Authorization header → AccessDenied (AWS behavior)
+         if auth_header.trim().is_empty() {
+             return Err(AuthError::AccessDenied);
+         }
+         if auth_header.len() > MAX_AUTHORIZATION_HEADER_LEN {
+             return Err(AuthError::MalformedAuth);
+         }
+         return authenticate_header(
+             method,
+
+
+diff --git a/crates/server-http/src/http/serve.rs b/crates/server-http/src/http/serve.rs
+index 0b4447e58a93448f84c619526f1952ba2e297154..fc29d46e6ec06566696e532d9a94761456c695ae 100644
+--- a/crates/server-http/src/http/serve.rs
++++ b/crates/server-http/src/http/serve.rs
+@@ -353,64 +353,65 @@ pub async fn serve(
+                         let state = Arc::clone(&state);
+                         async move { handle(state, req).await }
+                     }),
+                 )
+                 .await;
+         });
+     }
+ }
+ 
+ /// Handle a single HTTP request: parse, route streaming writes, or buffer body
+ /// for control-plane dispatch.
+ ///
+ /// For `PutObject`/`UploadPart` (except copy-source variants), body frames are
+ /// consumed incrementally and fed to coordinator segment appends. All other
+ /// requests collect the full body first.
+ ///
+ /// Errors are always converted to S3 XML error responses.
+ async fn handle(
+     state: Arc<ServerState>,
+     req: Request<Incoming>,
+ ) -> Result<http::Response<S3HyperBody>, Infallible> {
+     let trace = observability::TraceContext::new_request();
+     let method = req.method().to_string();
+     let path = req.uri().path().to_string();
+     let query = req.uri().query().unwrap_or("").to_string();
++    let has_query = !query.is_empty();
+     let response_trace = crate::http::ResponseTraceMeta::new(trace.clone(), &method, &path, &query);
+     let range_suffix = req
+         .headers()
+         .get(http::header::RANGE)
+         .and_then(|value| value.to_str().ok())
+         .map(|value| format!(" range={value}"))
+         .unwrap_or_default();
+     let _ = observability::event_in_context(
+         &trace,
+         TRACE_TARGET,
+         "request_start",
+         Some(format_args!(
+-            "method={} path={} query={}{}",
+-            method, path, query, range_suffix
++            "method={} path={} has_query={}{}",
++            method, path, has_query, range_suffix
+         )),
+     );
+ 
+     // Acquire request permit before body collection to bound memory.
+     let req_permit = if let Ok(Ok(permit)) = tokio::time::timeout(
+         state.config.request_wait_timeout,
+         Arc::clone(&state.request_semaphore).acquire_owned(),
+     )
+     .await
+     {
+         permit
+     } else {
+         let resp = S3Response::error(&ServerError::SlowDown, "");
+         return Ok(s3_response_to_hyper(
+             resp,
+             None,
+             state.config.stream_read_chunk_size,
+             response_trace,
+         ));
+     };
+ 
+     let (parts, body) = req.into_parts();
+ 
+     // Check if this request should use the streaming write path.
+     if let Some(op) = is_streaming_write(&parts) {
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The code does log attacker-controlled query strings and credential fields when ARGMIN_TRACE is enabled, but this is opt-in and requires log access. The leaked data is transient (presigned tokens) or identifier-level (credential field), so overall impact and likelihood remain low.
+## Likelihood
+low - Requires tracing to be enabled and an attacker or unintended party to access logs, making exploitation less likely in typical deployments.
+## Impact
+low - Leakage is limited to logs; presigned URL signatures are short-lived and POST credential fields reveal identifiers rather than secrets. Exposure depends on log access.
+## Assumptions
+- ARGMIN_TRACE is enabled in the deployment environment
+- Attackers can send HTTP requests to the argmin-s3 endpoint
+- Logs (stderr or aggregated logs) are accessible to someone other than the requester
+- Presigned URL or SigV4 POST flows are in use so sensitive query/form fields appear in requests
+- ARGMIN_TRACE enabled
+- HTTP request reaches server
+- Log access by a different principal
+## Path
+n1 -> n2 -> n3 -> n4
+## Path evidence
+- `crates/server-http/src/http/serve.rs:294-312` - request_start trace logs method, path, and full query string
+- `crates/auth/src/request.rs:66-73` - authenticate_request trace logs raw query_string
+- `crates/auth/src/post.rs:24-30` - POST authentication trace logs the SigV4 credential field
+- `crates/observability/src/lib.rs:50-68` - ARGMIN_TRACE environment variable enables tracing
+- `crates/observability/src/lib.rs:245-255` - trace events are emitted via eprintln! to stderr
+- `crates/auth/src/request.rs:104-111` - presigned query parameters (X-Amz-Algorithm) are parsed from query_string
+## Narrative
+ARGMIN_TRACE enables request tracing that prints request method/path/query and SigV4 POST credential fields to stderr. This includes attacker-controlled query strings and credential identifiers, which can contain presigned URL tokens (X-Amz-*) or POST credentials. Anyone with log access could recover these values while they remain valid. Tracing is opt-in and log access is an additional precondition, so impact and likelihood are limited.
+## Controls
+- SigV4 authentication
+- ARGMIN_TRACE opt-in logging
+- Trace filter configuration (ARGMIN_TRACE_FILTER)
+## Blindspots
+- No deployment manifests or logging pipeline configuration available to assess who can access stderr/log aggregation.
+- Static-only analysis; unable to run PoC due to build dependency (libisal) missing.
