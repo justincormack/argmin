@@ -36,6 +36,8 @@ Implemented changes:
   second caller-controlled copy
 - `CopyObject` destination writes now finalize from the authorized write token
   instead of rebuilding auth-sensitive state at commit time
+- the old raw streamed `PutObject` start helper was removed, keeping the
+  production and test code on the same authorized-token contract
 - regressions cover early denial and token-bound direct/streamed commit state
 
 The plan remains open because adjacent write paths should still be reviewed
@@ -104,7 +106,7 @@ Follow-up checks:
 - avoid widening helper signatures to re-accept bucket/key/requester/ACL/tag/
   object-lock inputs after authorization
 - prefer making invalid combinations unrepresentable in API shape
-- keep raw lower-level finalize helpers internal when they bypass the safe
+- keep raw lower-level helpers internal or test-only when they bypass the safe
   token contract
 
 ### 2. Audit adjacent single-request write paths

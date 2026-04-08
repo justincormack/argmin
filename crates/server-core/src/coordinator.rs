@@ -2151,16 +2151,6 @@ pub struct CompleteMultipartUploadRequest<'a> {
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
-/// Request for beginning a streaming PutObject session.
-#[derive(Debug)]
-pub struct BeginStreamPutRequest<'a> {
-    pub object: ObjectRequest<'a>,
-    pub acl: PutObjectWriteAcl<'a>,
-    pub policy: PutObjectPolicyContext<'a>,
-    pub encryption: WriteEncryptionRequest<'a>,
-    pub object_lock: ObjectLockState,
-}
-
 /// Request for beginning a streaming UploadPart session.
 #[derive(Debug)]
 pub struct BeginStreamPartRequest<'a> {
@@ -2421,19 +2411,6 @@ impl<'a> GetObjectAttributesRequest<'a> {
 impl<'a> CompleteMultipartUploadRequest<'a> {
     fn expected_bucket_owner(&self) -> Option<&str> {
         self.upload.expected_bucket_owner()
-    }
-}
-
-impl<'a> BeginStreamPutRequest<'a> {
-    fn expected_bucket_owner(&self) -> Option<&str> {
-        self.object.expected_bucket_owner()
-    }
-
-    fn effective_policy_context(&self) -> PutObjectPolicyContext<'a> {
-        self.encryption.with_policy_context(
-            self.policy
-                .with_default_canned_acl(self.acl.policy_condition_value()),
-        )
     }
 }
 
@@ -9460,35 +9437,6 @@ impl Coordinator {
 
     // ── Streaming upload session API ──────────────────────────────────
 
-    /// Begin a streaming PutObject upload session.
-    ///
-    /// Creates a session on the metadata PG for `(bucket, key)`. The caller
-    /// feeds segments via `append_stream_segment` and commits via
-    /// `finalize_stream_put`.
-    pub fn begin_stream_put(&self, req: &BeginStreamPutRequest<'_>) -> Result<String, ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::begin_stream_put",
-            "bucket={:?} key={:?}",
-            req.object.bucket_name(),
-            req.object.key
-        );
-        let authorized = self.authorize_put_object_write(&AuthorizePutObjectRequest {
-            object: ObjectRequest::new(
-                req.object.bucket_name(),
-                req.object.key(),
-                req.object.requester().clone(),
-                req.expected_bucket_owner(),
-            ),
-            acl: req.acl.clone(),
-            policy_context: req.effective_policy_context(),
-            object_lock: req.object_lock,
-            tags: None,
-            encryption: req.encryption,
-        })?;
-        self.create_stream_put_session_for_authorized_write(&authorized)
-    }
-
     pub fn begin_stream_put_from_authorized_write(
         &self,
         authorized: &AuthorizedPutObjectWrite,
@@ -14917,27 +14865,19 @@ mod tests {
     #[test]
     fn begin_stream_put_effective_policy_context_uses_request_encryption() {
         let sse_customer = test_sse_customer_request();
-        let request = BeginStreamPutRequest {
-            object: ObjectRequest::new("bucket", "key", test_requester(), None),
-            acl: PutObjectWriteAcl::None,
-            policy: PutObjectPolicyContext::default()
+        let cleared = WriteEncryptionRequest::none().with_policy_context(
+            PutObjectPolicyContext::default()
                 .with_managed_encryption(Some(ManagedEncryptionAlgorithm::Aes256))
-                .with_sse_customer_algorithm(Some("AES256")),
-            encryption: WriteEncryptionRequest::none(),
-            object_lock: ObjectLockState::default(),
-        };
-        let cleared = request.effective_policy_context();
+                .with_sse_customer_algorithm(Some("AES256"))
+                .with_default_canned_acl(PutObjectWriteAcl::None.policy_condition_value()),
+        );
         assert_eq!(cleared.managed_encryption, None);
         assert_eq!(cleared.sse_customer_algorithm, None);
 
-        let request = BeginStreamPutRequest {
-            object: ObjectRequest::new("bucket", "key", test_requester(), None),
-            acl: PutObjectWriteAcl::None,
-            policy: PutObjectPolicyContext::default(),
-            encryption: WriteEncryptionRequest::sse_customer(&sse_customer),
-            object_lock: ObjectLockState::default(),
-        };
-        let sse_c = request.effective_policy_context();
+        let sse_c = WriteEncryptionRequest::sse_customer(&sse_customer).with_policy_context(
+            PutObjectPolicyContext::default()
+                .with_default_canned_acl(PutObjectWriteAcl::None.policy_condition_value()),
+        );
         assert_eq!(sse_c.managed_encryption, None);
         assert_eq!(sse_c.sse_customer_algorithm, Some(SSE_CUSTOMER_ALGORITHM));
     }
@@ -15564,13 +15504,40 @@ mod tests {
         bucket: &str,
         key: &str,
     ) -> Result<String, ServerError> {
-        coord.begin_stream_put(&BeginStreamPutRequest {
-            object: object_request(bucket, key, test_requester()),
-            acl: NO_PUT_OBJECT_ACL.into(),
-            policy: PutObjectPolicyContext::default(),
-            encryption: WriteEncryptionRequest::none(),
-            object_lock: ObjectLockState::default(),
-        })
+        begin_stream_put_with_authorized_request_test(
+            coord,
+            object_request(bucket, key, test_requester()),
+            NO_PUT_OBJECT_ACL.into(),
+            PutObjectPolicyContext::default(),
+            WriteEncryptionRequest::none(),
+            ObjectLockState::default(),
+        )
+    }
+
+    fn begin_stream_put_with_authorized_request_test<'a>(
+        coord: &Coordinator,
+        object: ObjectRequest<'a>,
+        acl: PutObjectWriteAcl<'a>,
+        policy_context: PutObjectPolicyContext<'a>,
+        encryption: WriteEncryptionRequest<'a>,
+        object_lock: ObjectLockState,
+    ) -> Result<String, ServerError> {
+        let authorized = coord.authorize_put_object_write(&AuthorizePutObjectRequest {
+            object: ObjectRequest::new(
+                object.bucket_name(),
+                object.key(),
+                object.requester().clone(),
+                object.expected_bucket_owner(),
+            ),
+            acl: acl.clone(),
+            policy_context: encryption.with_policy_context(
+                policy_context.with_default_canned_acl(acl.policy_condition_value()),
+            ),
+            object_lock,
+            tags: None,
+            encryption,
+        })?;
+        coord.begin_stream_put_from_authorized_write(&authorized)
     }
 
     fn begin_stream_part_test(
@@ -25122,40 +25089,38 @@ mod tests {
                 test_helpers::requester("owner-a"), None)
             .unwrap();
 
-        let private_session = coord
-            .begin_stream_put(&BeginStreamPutRequest {
-                object: object_request_with_expected_owner(
-                    "bucket",
-                    "private-key",
-                    test_helpers::requester("other-user"),
-                    None,
-                ),
-
-                acl: PutObjectAcl::None.into(),
-                policy: PutObjectPolicyContext::default(),
-                encryption: WriteEncryptionRequest::none(),
-                object_lock: ObjectLockState::default(),
-            })
-            .unwrap();
+        let private_session = begin_stream_put_with_authorized_request_test(
+            &coord,
+            object_request_with_expected_owner(
+                "bucket",
+                "private-key",
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            PutObjectAcl::None.into(),
+            PutObjectPolicyContext::default(),
+            WriteEncryptionRequest::none(),
+            ObjectLockState::default(),
+        )
+        .unwrap();
         coord
             .abort_stream_put("bucket", "private-key", &private_session)
             .unwrap();
 
-        let err = coord
-            .begin_stream_put(&BeginStreamPutRequest {
-                object: object_request_with_expected_owner(
-                    "bucket",
-                    "public-key",
-                    test_helpers::requester("other-user"),
-                    None,
-                ),
-
-                acl: PutObjectAcl::PublicRead.into(),
-                policy: PutObjectPolicyContext::default(),
-                encryption: WriteEncryptionRequest::none(),
-                object_lock: ObjectLockState::default(),
-            })
-            .unwrap_err();
+        let err = begin_stream_put_with_authorized_request_test(
+            &coord,
+            object_request_with_expected_owner(
+                "bucket",
+                "public-key",
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            PutObjectAcl::PublicRead.into(),
+            PutObjectPolicyContext::default(),
+            WriteEncryptionRequest::none(),
+            ObjectLockState::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -27166,21 +27131,20 @@ mod tests {
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
 
-        let err = coord
-            .begin_stream_put(&BeginStreamPutRequest {
-                object: object_request_with_expected_owner(
-                    "bucket",
-                    "key",
-                    test_helpers::requester("other-user"),
-                    None,
-                ),
-
-                acl: NO_PUT_OBJECT_ACL.into(),
-                policy: PutObjectPolicyContext::default(),
-                encryption: WriteEncryptionRequest::none(),
-                object_lock: ObjectLockState::default(),
-            })
-            .unwrap_err();
+        let err = begin_stream_put_with_authorized_request_test(
+            &coord,
+            object_request_with_expected_owner(
+                "bucket",
+                "key",
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            NO_PUT_OBJECT_ACL.into(),
+            PutObjectPolicyContext::default(),
+            WriteEncryptionRequest::none(),
+            ObjectLockState::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -27192,15 +27156,15 @@ mod tests {
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
 
-        let err = coord
-            .begin_stream_put(&BeginStreamPutRequest {
-                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
-                acl: NO_PUT_OBJECT_ACL.into(),
-                policy: PutObjectPolicyContext::default(),
-                encryption: WriteEncryptionRequest::managed(ManagedEncryptionAlgorithm::Aes256),
-                object_lock: ObjectLockState::default(),
-            })
-            .unwrap_err();
+        let err = begin_stream_put_with_authorized_request_test(
+            &coord,
+            object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            NO_PUT_OBJECT_ACL.into(),
+            PutObjectPolicyContext::default(),
+            WriteEncryptionRequest::managed(ManagedEncryptionAlgorithm::Aes256),
+            ObjectLockState::default(),
+        )
+        .unwrap_err();
         assert!(matches!(
             err,
             ServerError::NotImplemented { ref feature }
@@ -27266,21 +27230,20 @@ mod tests {
                 test_helpers::requester("owner-a"), None)
             .unwrap();
 
-        let err = coord
-            .begin_stream_put(&BeginStreamPutRequest {
-                object: object_request_with_expected_owner(
-                    "bucket",
-                    "key",
-                    test_helpers::requester("owner-a"),
-                    None,
-                ),
-
-                acl: PutObjectAcl::PublicRead.into(),
-                policy: PutObjectPolicyContext::default(),
-                encryption: WriteEncryptionRequest::none(),
-                object_lock: ObjectLockState::default(),
-            })
-            .unwrap_err();
+        let err = begin_stream_put_with_authorized_request_test(
+            &coord,
+            object_request_with_expected_owner(
+                "bucket",
+                "key",
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            PutObjectAcl::PublicRead.into(),
+            PutObjectPolicyContext::default(),
+            WriteEncryptionRequest::none(),
+            ObjectLockState::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessControlListNotSupported));
     }
 
@@ -27292,19 +27255,18 @@ mod tests {
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
 
-        let err = coord
-            .begin_stream_put(&BeginStreamPutRequest {
-                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
-
-                acl: NO_PUT_OBJECT_ACL.into(),
-                policy: PutObjectPolicyContext::default(),
-                encryption: WriteEncryptionRequest::none(),
-                object_lock: ObjectLockState {
-                    retention: None,
-                    legal_hold: StoredLegalHoldStatus::On,
-                },
-            })
-            .unwrap_err();
+        let err = begin_stream_put_with_authorized_request_test(
+            &coord,
+            object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            NO_PUT_OBJECT_ACL.into(),
+            PutObjectPolicyContext::default(),
+            WriteEncryptionRequest::none(),
+            ObjectLockState {
+                retention: None,
+                legal_hold: StoredLegalHoldStatus::On,
+            },
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
     }
 
@@ -31445,15 +31407,15 @@ mod tests {
 
         let sse_customer = test_sse_customer_request();
 
-        let err = coord
-            .begin_stream_put(&BeginStreamPutRequest {
-                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
-                acl: NO_PUT_OBJECT_ACL.into(),
-                policy: PutObjectPolicyContext::default(),
-                encryption: WriteEncryptionRequest::sse_customer(&sse_customer),
-                object_lock: ObjectLockState::default(),
-            })
-            .unwrap_err();
+        let err = begin_stream_put_with_authorized_request_test(
+            &coord,
+            object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            NO_PUT_OBJECT_ACL.into(),
+            PutObjectPolicyContext::default(),
+            WriteEncryptionRequest::sse_customer(&sse_customer),
+            ObjectLockState::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -38316,15 +38278,15 @@ mod tests {
             .unwrap();
 
         let sse_customer = test_sse_customer_request();
-        let session_id = coord
-            .begin_stream_put(&BeginStreamPutRequest {
-                object: object_request("bucket", "obj", test_requester()),
-                acl: NO_PUT_OBJECT_ACL.into(),
-                policy: PutObjectPolicyContext::default(),
-                encryption: WriteEncryptionRequest::sse_customer(&sse_customer),
-                object_lock: ObjectLockState::default(),
-            })
-            .unwrap();
+        let session_id = begin_stream_put_with_authorized_request_test(
+            &coord,
+            object_request("bucket", "obj", test_requester()),
+            NO_PUT_OBJECT_ACL.into(),
+            PutObjectPolicyContext::default(),
+            WriteEncryptionRequest::sse_customer(&sse_customer),
+            ObjectLockState::default(),
+        )
+        .unwrap();
         let write_encryption = coord
             .load_stream_put_write_encryption("bucket", "obj", &session_id, Some(&sse_customer))
             .unwrap();
@@ -38423,15 +38385,15 @@ mod tests {
         .unwrap();
 
         let writer = test_helpers::requester("writer-a");
-        let session_id = coord
-            .begin_stream_put(&BeginStreamPutRequest {
-                object: object_request_with_expected_owner("bucket", "obj", writer.clone(), None),
-                acl: NO_PUT_OBJECT_ACL.into(),
-                policy: PutObjectPolicyContext::default(),
-                encryption: WriteEncryptionRequest::none(),
-                object_lock: ObjectLockState::default(),
-            })
-            .unwrap();
+        let session_id = begin_stream_put_with_authorized_request_test(
+            &coord,
+            object_request_with_expected_owner("bucket", "obj", writer.clone(), None),
+            NO_PUT_OBJECT_ACL.into(),
+            PutObjectPolicyContext::default(),
+            WriteEncryptionRequest::none(),
+            ObjectLockState::default(),
+        )
+        .unwrap();
         coord
             .append_plaintext_stream_segment_for_test("bucket", "obj", &session_id, 0, b"hello")
             .unwrap();
