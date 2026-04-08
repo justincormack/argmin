@@ -156,6 +156,62 @@ fn test_anon_head_bucket_private_fail() {
     });
 }
 
+#[test]
+fn test_anon_bucket_surfaces_distinguish_private_and_nonexistent_like_aws() {
+    s3_tests::run(async {
+        // AWS does not hide bucket existence from anonymous bucket-surface reads:
+        // an existing private bucket returns 403 AccessDenied, while a missing
+        // bucket returns 404 NoSuchBucket. Keep this paired contract explicit so
+        // future "bucket enumeration" reports do not push us away from AWS.
+        let private_bucket = setup_private_bucket().await;
+        let missing_bucket = unique_bucket();
+
+        let private_head = agent()
+            .head(&format!("{}/{}", CTX.endpoint(), private_bucket))
+            .call()
+            .expect("anonymous private HEAD transport error");
+        assert_eq!(private_head.status().as_u16(), 403);
+
+        let missing_head = agent()
+            .head(&format!("{}/{}", CTX.endpoint(), missing_bucket))
+            .call()
+            .expect("anonymous missing HEAD transport error");
+        assert_eq!(missing_head.status().as_u16(), 404);
+
+        let mut private_list = agent()
+            .get(&format!(
+                "{}/{}?list-type=2",
+                CTX.endpoint(),
+                private_bucket
+            ))
+            .call()
+            .expect("anonymous private list transport error");
+        assert_eq!(private_list.status().as_u16(), 403);
+        let private_body = private_list.body_mut().read_to_string().unwrap();
+        assert!(
+            private_body.contains("<Code>AccessDenied</Code>"),
+            "expected AccessDenied in private bucket body: {private_body}"
+        );
+
+        let mut missing_list = agent()
+            .get(&format!(
+                "{}/{}?list-type=2",
+                CTX.endpoint(),
+                missing_bucket
+            ))
+            .call()
+            .expect("anonymous missing list transport error");
+        assert_eq!(missing_list.status().as_u16(), 404);
+        let missing_body = missing_list.body_mut().read_to_string().unwrap();
+        assert!(
+            missing_body.contains("<Code>NoSuchBucket</Code>"),
+            "expected NoSuchBucket in missing bucket body: {missing_body}"
+        );
+
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
 // ── Anonymous PUT object ────────────────────────────────────────────────
 
 #[test]
