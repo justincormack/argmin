@@ -5158,6 +5158,7 @@ impl Coordinator {
         bucket: &BucketSummary,
         object: &StoredObject,
         action: auth::PolicyAction,
+        request_object_tags_xml: Option<&str>,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<auth::PolicyEvaluation, ServerError> {
         let Some(policy) = policy else {
@@ -5169,7 +5170,19 @@ impl Coordinator {
         } else {
             Vec::new()
         };
-        let request_tags: Vec<auth::PolicyTag<'_>> = existing_tags
+        let existing_tags: Vec<auth::PolicyTag<'_>> = existing_tags
+            .iter()
+            .map(|(key, value)| auth::PolicyTag::new(key, value))
+            .collect();
+        let request_object_tags = if policy.requires_request_object_tags_for_action(action) {
+            match request_object_tags_xml {
+                Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let request_object_tags: Vec<auth::PolicyTag<'_>> = request_object_tags
             .iter()
             .map(|(key, value)| auth::PolicyTag::new(key, value))
             .collect();
@@ -5180,7 +5193,9 @@ impl Coordinator {
             requester.principal_opt(),
             requester.canonical_user_id(),
         );
-        let request = request.with_existing_object_tags(&request_tags);
+        let request = request
+            .with_existing_object_tags(&existing_tags)
+            .with_request_object_tags(&request_object_tags);
         Ok(policy.evaluate(&request))
     }
 
@@ -5315,7 +5330,7 @@ impl Coordinator {
     ) -> Result<bool, ServerError> {
         Ok(
             match Self::bucket_policy_decision_for_object(
-                requester, bucket, object, action, policy,
+                requester, bucket, object, action, None, policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,
                 auth::PolicyEvaluation::ExplicitAllow
@@ -5337,11 +5352,17 @@ impl Coordinator {
         bucket: &BucketSummary,
         object: &StoredObject,
         action: auth::PolicyAction,
+        request_object_tags_xml: Option<&str>,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
         Ok(
             match Self::bucket_policy_decision_for_object(
-                requester, bucket, object, action, policy,
+                requester,
+                bucket,
+                object,
+                action,
+                request_object_tags_xml,
+                policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,
                 auth::PolicyEvaluation::ExplicitAllow
@@ -5367,7 +5388,7 @@ impl Coordinator {
     ) -> Result<bool, ServerError> {
         Ok(
             match Self::bucket_policy_decision_for_object(
-                requester, bucket, object, action, policy,
+                requester, bucket, object, action, None, policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,
                 auth::PolicyEvaluation::ExplicitAllow
@@ -5393,9 +5414,9 @@ impl Coordinator {
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
         let decision = match object {
-            Some(object) => {
-                Self::bucket_policy_decision_for_object(requester, bucket, object, action, policy)?
-            }
+            Some(object) => Self::bucket_policy_decision_for_object(
+                requester, bucket, object, action, None, policy,
+            )?,
             None => Self::bucket_policy_decision_for_key(requester, bucket, key, action, policy),
         };
 
@@ -5428,7 +5449,7 @@ impl Coordinator {
     ) -> Result<bool, ServerError> {
         Ok(
             match Self::bucket_policy_decision_for_object(
-                requester, bucket, object, action, policy,
+                requester, bucket, object, action, None, policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,
                 auth::PolicyEvaluation::ExplicitAllow
@@ -5991,18 +6012,22 @@ impl Coordinator {
 
     fn lock_object_for_authorized_tagging<'a>(
         &'a self,
-        requester: &Requester,
-        bucket: &str,
-        key: &str,
-        version_id: Option<VersionId>,
+        object: &ObjectVersionRequest<'_>,
         policy_action: auth::PolicyAction,
-        expected_bucket_owner: Option<&str>,
+        request_object_tags_xml: Option<&str>,
     ) -> Result<LockedReadObject<'a>, ServerError> {
-        let bucket_info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
-        let can_discover_missing =
-            Self::requester_can_bucket_admin(requester, &bucket_info.owner_principal);
+        let bucket_info = self
+            .active_bucket_summary(object.object.bucket_name(), object.expected_bucket_owner())?;
+        let can_discover_missing = Self::requester_can_bucket_admin(
+            object.object.requester(),
+            &bucket_info.owner_principal,
+        );
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
+        let locked = match self.lock_object_pgs_for_read(
+            object.object.bucket_name(),
+            object.object.key(),
+            object.version_id,
+        ) {
             Ok(locked) => locked,
             Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
                 if !can_discover_missing =>
@@ -6013,10 +6038,11 @@ impl Coordinator {
         };
 
         if Self::requester_can_manage_object_tags_with_bucket_policy(
-            requester,
+            object.object.requester(),
             &bucket_info,
             &locked.record,
             policy_action,
+            request_object_tags_xml,
             bucket_policy.as_deref(),
         )? {
             Ok(locked)
@@ -6136,6 +6162,7 @@ impl Coordinator {
                 bucket,
                 object,
                 auth::PolicyAction::BypassGovernanceRetention,
+                None,
                 policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,
@@ -8213,12 +8240,9 @@ impl Coordinator {
             record: stored,
             pgs,
         } = self.lock_object_for_authorized_tagging(
-            req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key(),
-            req.object.version_id,
+            &req.object,
             Self::put_object_tagging_policy_action(req.object.version_id),
-            req.object.expected_bucket_owner(),
+            Some(req.tags),
         )?;
         if stored.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
@@ -8400,12 +8424,9 @@ impl Coordinator {
             record: stored,
             pgs,
         } = self.lock_object_for_authorized_tagging(
-            req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key,
-            req.version_id,
+            req,
             Self::get_object_tagging_policy_action(req.version_id),
-            req.expected_bucket_owner(),
+            None,
         )?;
         if stored.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
@@ -8431,12 +8452,9 @@ impl Coordinator {
             record: stored,
             pgs,
         } = self.lock_object_for_authorized_tagging(
-            req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key,
-            req.version_id,
+            req,
             Self::delete_object_tagging_policy_action(req.version_id),
-            req.expected_bucket_owner(),
+            None,
         )?;
         if stored.is_delete_marker() {
             return Err(ServerError::MethodNotAllowed);
@@ -23995,6 +24013,164 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(denied, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn put_object_tagging_bucket_policy_request_object_tag_controls_access() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(&coord,
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObjectTagging","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
+                test_helpers::requester("owner-a"), None)
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let public_tags =
+            "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
+        put_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            public_tags,
+            test_helpers::requester("other-user"),
+            None,
+        )
+        .unwrap();
+
+        let denied = put_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+            test_helpers::requester("other-user"),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(denied, ServerError::AccessDenied));
+
+        let tags = get_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap()
+        .expect("expected tags after update");
+        assert!(tags.contains("<Key>security</Key>"));
+        assert!(tags.contains("<Value>public</Value>"));
+    }
+
+    #[test]
+    fn put_object_version_tagging_bucket_policy_request_object_tag_controls_access() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        put_bucket_policy_test(&coord,
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObjectVersionTagging","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
+                test_helpers::requester("owner-a"), None)
+            .unwrap();
+
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let public_tags =
+            "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
+        put_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            public_tags,
+            test_helpers::requester("other-user"),
+            None,
+        )
+        .unwrap();
+
+        let denied = put_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+            test_helpers::requester("other-user"),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(denied, ServerError::AccessDenied));
+
+        let tags = get_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap()
+        .expect("expected version tags after update");
+        assert!(tags.contains("<Key>security</Key>"));
+        assert!(tags.contains("<Value>public</Value>"));
     }
 
     #[test]
