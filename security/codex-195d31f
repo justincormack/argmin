@@ -1,7 +1,7 @@
 ListObjectVersions lacks record cap, enabling memory DoS
 Link: https://chatgpt.com/codex/security/findings/14ea495962ec8191aa3601e241b84725?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: medium)
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin
@@ -31,6 +31,26 @@ Focused validation run locally:
 Both passed, but neither exercises the large `max-keys` path.
 
 One caveat on the generated patch: adding a hard cap is necessary, but truncating the unsorted cross-PG accumulator before global ordering is proven can change pagination order and markers. Any fix should preserve AWS-compatible ordering while bounding memory.
+
+# Resolution
+Fixed in:
+
+- `03a333c` `Fix ListObjectVersions max-keys handling`
+- `7ceb699` `Match ListObjectVersions max-keys response to AWS`
+
+What changed:
+
+- [crates/server-core/src/coordinator.rs](/home/justin/src/github.com/justincormack/argmin/crates/server-core/src/coordinator.rs) no longer materializes all per-PG version rows into one unbounded vector. It now enforces the internal S3 1000-entry effective cap and performs a bounded merge over already-sorted per-PG results, limiting both memory growth and per-request work while preserving pagination order.
+- [crates/server-http/src/http/mod.rs](/home/justin/src/github.com/justincormack/argmin/crates/server-http/src/http/mod.rs) was adjusted so `ListObjectVersions` still echoes the caller's requested `max-keys` value in the XML response, matching AWS, while the coordinator continues to clamp the actual result set internally.
+- [crates/s3-tests/tests/versioning.rs](/home/justin/src/github.com/justincormack/argmin/crates/s3-tests/tests/versioning.rs) now includes conformance tests proving the AWS contract for oversized `max-keys`: AWS echoes the requested value in `<MaxKeys>`, but still returns at most 1000 version/delete-marker entries with truncation markers when more results exist.
+
+Validation after the fix:
+
+- `cargo clippy --all-targets --all-features -- -D warnings`
+- `cargo test -p server-core --lib`
+- `cargo test -p server-http --lib`
+- `cargo test -p s3-tests oversized_max_keys -- --nocapture`
+- AWS-backed `s3-tests` run confirmed that `ListObjectVersions(max-keys=5000)` echoes `5000` in the response while still capping returned entries at 1000.
 
 # Validation
 ## Rubric
