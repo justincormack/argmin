@@ -8106,7 +8106,6 @@ impl Coordinator {
         ServerError,
     > {
         let bucket_info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
-        Self::ensure_object_lock_bucket(&bucket_info)?;
         let can_discover_missing =
             Self::requester_can_bucket_admin(requester, &bucket_info.owner_principal);
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
@@ -8127,6 +8126,7 @@ impl Coordinator {
             policy_action,
             bucket_policy.as_deref(),
         )? {
+            Self::ensure_object_lock_bucket(&bucket_info)?;
             // Return the policy snapshot fetched before taking object locks so
             // later authorization checks do not re-enter bucket metadata and
             // invert the bucket/object lock order.
@@ -29190,6 +29190,91 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fetched, Some(retention));
+    }
+
+    #[test]
+    fn unauthorized_object_lock_calls_do_not_reveal_bucket_lock_configuration() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+        let owner_requester = test_helpers::requester("owner-a");
+        let other_requester = test_helpers::requester("other-user");
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "plain-bucket",
+                requester: Requester::authenticated(owner.clone()),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "lock-bucket",
+                requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "plain-bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "lock-bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let plain_retention =
+            get_object_retention_test(&coord, "plain-bucket", "key", None, other_requester.clone())
+                .unwrap_err();
+        let lock_retention =
+            get_object_retention_test(&coord, "lock-bucket", "key", None, other_requester)
+                .unwrap_err();
+
+        assert!(matches!(plain_retention, ServerError::AccessDenied));
+        assert!(matches!(lock_retention, ServerError::AccessDenied));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::{ByteStream, DateTime, DateTimeFormat};
 use aws_sdk_s3::types::{
     BucketCannedAcl, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
@@ -411,6 +412,28 @@ fn assert_xml_error_code(body: &str, code: &str) {
         body.contains(&expected),
         "expected {expected} in body: {body}",
     );
+}
+
+fn sdk_error_status_and_code<T, E>(
+    result: Result<T, aws_sdk_s3::error::SdkError<E>>,
+) -> (u16, Option<String>)
+where
+    E: std::fmt::Debug + ProvideErrorMetadata,
+{
+    match result {
+        Ok(_) => panic!("expected error, got Ok"),
+        Err(err) => {
+            let status = err
+                .raw_response()
+                .map(|response| response.status().as_u16())
+                .unwrap_or_else(|| panic!("error has no raw HTTP response: {err:?}"));
+            let code = err
+                .as_service_error()
+                .and_then(ProvideErrorMetadata::code)
+                .map(str::to_owned);
+            (status, code)
+        }
+    }
 }
 
 fn md5_b64(data: &[u8]) -> String {
@@ -1586,6 +1609,123 @@ fn test_object_lock_put_obj_retention_invalid_bucket() {
         assert_s3_err_code(&result, "InvalidRequest");
 
         cleanup_plain_bucket(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_object_lock_unauthorized_calls_do_not_reveal_bucket_lock_configuration() {
+    s3_tests::run(async {
+        let alt_client = CTX.alt_client();
+        let plain_bucket = setup_bucket().await;
+        let lock_bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+
+        CTX.client()
+            .put_object()
+            .bucket(&plain_bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"abc"))
+            .send()
+            .await
+            .unwrap();
+        put_object_bytes(&lock_bucket, key, b"abc").await;
+
+        let expected_retention = retention(
+            ObjectLockRetentionMode::Governance,
+            governance_retain_until(),
+        );
+        let expected_legal_hold = legal_hold(ObjectLockLegalHoldStatus::On);
+
+        let plain_get_retention = sdk_error_status_and_code(
+            alt_client
+                .get_object_retention()
+                .bucket(&plain_bucket)
+                .key(key)
+                .send()
+                .await,
+        );
+        let lock_get_retention = sdk_error_status_and_code(
+            alt_client
+                .get_object_retention()
+                .bucket(&lock_bucket)
+                .key(key)
+                .send()
+                .await,
+        );
+        assert_eq!(
+            plain_get_retention, lock_get_retention,
+            "GetObjectRetention leaked bucket lock configuration: plain={plain_get_retention:?}, lock={lock_get_retention:?}"
+        );
+
+        let plain_put_retention = sdk_error_status_and_code(
+            alt_client
+                .put_object_retention()
+                .bucket(&plain_bucket)
+                .key(key)
+                .retention(expected_retention.clone())
+                .send()
+                .await,
+        );
+        let lock_put_retention = sdk_error_status_and_code(
+            alt_client
+                .put_object_retention()
+                .bucket(&lock_bucket)
+                .key(key)
+                .retention(expected_retention)
+                .send()
+                .await,
+        );
+        assert_eq!(
+            plain_put_retention, lock_put_retention,
+            "PutObjectRetention leaked bucket lock configuration: plain={plain_put_retention:?}, lock={lock_put_retention:?}"
+        );
+
+        let plain_get_legal_hold = sdk_error_status_and_code(
+            alt_client
+                .get_object_legal_hold()
+                .bucket(&plain_bucket)
+                .key(key)
+                .send()
+                .await,
+        );
+        let lock_get_legal_hold = sdk_error_status_and_code(
+            alt_client
+                .get_object_legal_hold()
+                .bucket(&lock_bucket)
+                .key(key)
+                .send()
+                .await,
+        );
+        assert_eq!(
+            plain_get_legal_hold, lock_get_legal_hold,
+            "GetObjectLegalHold leaked bucket lock configuration: plain={plain_get_legal_hold:?}, lock={lock_get_legal_hold:?}"
+        );
+
+        let plain_put_legal_hold = sdk_error_status_and_code(
+            alt_client
+                .put_object_legal_hold()
+                .bucket(&plain_bucket)
+                .key(key)
+                .legal_hold(expected_legal_hold.clone())
+                .send()
+                .await,
+        );
+        let lock_put_legal_hold = sdk_error_status_and_code(
+            alt_client
+                .put_object_legal_hold()
+                .bucket(&lock_bucket)
+                .key(key)
+                .legal_hold(expected_legal_hold)
+                .send()
+                .await,
+        );
+        assert_eq!(
+            plain_put_legal_hold, lock_put_legal_hold,
+            "PutObjectLegalHold leaked bucket lock configuration: plain={plain_put_legal_hold:?}, lock={lock_put_legal_hold:?}"
+        );
+
+        cleanup_plain_bucket(&plain_bucket, &[key]).await;
+        cleanup_object_lock_bucket(&lock_bucket).await;
     });
 }
 
