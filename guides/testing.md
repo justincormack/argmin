@@ -9,6 +9,9 @@ This guide collects the main testing workflows for the repository:
 - HTTP-only and local-only test crates
 - parser fuzzing
 
+For the current compatibility target and explicitly documented AWS gaps, see
+[guides/aws-compatibility.md](/home/justin/src/github.com/justincormack/argmin/guides/aws-compatibility.md).
+
 ## Quick reference
 
 Common commands:
