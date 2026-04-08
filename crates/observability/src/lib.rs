@@ -243,6 +243,99 @@ fn normalize_file_path(value: Option<&str>) -> Option<Box<str>> {
         .map(Box::<str>::from)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Escaped<'a> {
+    value: &'a str,
+}
+
+#[must_use]
+pub fn escaped(value: &str) -> Escaped<'_> {
+    Escaped { value }
+}
+
+impl fmt::Display for Escaped<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.value, f)
+    }
+}
+
+impl fmt::Debug for Escaped<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.value, f)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Redacted {
+    label: &'static str,
+}
+
+#[must_use]
+pub fn redacted(label: &'static str) -> Redacted {
+    Redacted { label }
+}
+
+impl fmt::Display for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<redacted:{}>", self.label)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct QuerySummary {
+    has_query: bool,
+    param_count: usize,
+    has_sigv4_params: bool,
+}
+
+#[must_use]
+pub fn query_summary(query: &str) -> QuerySummary {
+    let has_query = !query.is_empty();
+    let param_count = if has_query {
+        query.split('&').filter(|part| !part.is_empty()).count()
+    } else {
+        0
+    };
+    let has_sigv4_params = query
+        .split('&')
+        .filter_map(|part| {
+            let key = part.split_once('=').map_or(part, |(key, _)| key);
+            (!key.is_empty()).then_some(key)
+        })
+        .any(|key| {
+            key.eq_ignore_ascii_case("X-Amz-Algorithm")
+                || key.eq_ignore_ascii_case("X-Amz-Credential")
+                || key.eq_ignore_ascii_case("X-Amz-Signature")
+                || key.eq_ignore_ascii_case("X-Amz-Security-Token")
+                || key.eq_ignore_ascii_case("X-Amz-Date")
+                || key.eq_ignore_ascii_case("X-Amz-Expires")
+                || key.eq_ignore_ascii_case("X-Amz-SignedHeaders")
+        });
+
+    QuerySummary {
+        has_query,
+        param_count,
+        has_sigv4_params,
+    }
+}
+
+impl QuerySummary {
+    #[must_use]
+    pub fn has_query(self) -> bool {
+        self.has_query
+    }
+
+    #[must_use]
+    pub fn param_count(self) -> usize {
+        self.param_count
+    }
+
+    #[must_use]
+    pub fn has_sigv4_params(self) -> bool {
+        self.has_sigv4_params
+    }
+}
+
 pub fn configure(enabled: bool, filter: Option<&str>, file_path: Option<&str>) -> bool {
     TRACE_CONFIG_OVERRIDE
         .set(TraceConfig {
@@ -471,4 +564,52 @@ macro_rules! trace_scope {
         let _argmin_trace_scope =
             $crate::TraceScope::new($target, $name, Some(format_args!($($arg)*)));
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escaped_renders_debug_style_one_line_output() {
+        assert_eq!(
+            format!("{}", escaped("line1\r\nline2\t\u{1b}[31m")),
+            r#""line1\r\nline2\t\u{1b}[31m""#
+        );
+    }
+
+    #[test]
+    fn redacted_never_formats_secret_value() {
+        assert_eq!(
+            format!("{}", redacted("sigv4_credential")),
+            "<redacted:sigv4_credential>"
+        );
+        assert_eq!(
+            format!("{:?}", redacted("sse_c_key")),
+            "Redacted { label: \"sse_c_key\" }"
+        );
+    }
+
+    #[test]
+    fn query_summary_detects_sigv4_queries() {
+        let summary = query_summary(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=abc&X-Amz-Signature=deadbeef",
+        );
+        assert!(summary.has_query());
+        assert_eq!(summary.param_count(), 3);
+        assert!(summary.has_sigv4_params());
+    }
+
+    #[test]
+    fn query_summary_handles_empty_and_non_sigv4_queries() {
+        let empty = query_summary("");
+        assert!(!empty.has_query());
+        assert_eq!(empty.param_count(), 0);
+        assert!(!empty.has_sigv4_params());
+
+        let ordinary = query_summary("prefix=a&delimiter=/");
+        assert!(ordinary.has_query());
+        assert_eq!(ordinary.param_count(), 2);
+        assert!(!ordinary.has_sigv4_params());
+    }
 }

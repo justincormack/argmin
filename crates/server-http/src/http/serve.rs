@@ -490,6 +490,7 @@ async fn handle(
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
     let response_trace = crate::http::ResponseTraceMeta::new(trace.clone(), &method, &path, &query);
+    let query_summary = observability::query_summary(&query);
     let range_suffix = req
         .headers()
         .get(http::header::RANGE)
@@ -501,8 +502,13 @@ async fn handle(
         TRACE_TARGET,
         "request_start",
         Some(format_args!(
-            "method={} path={} query={}{}",
-            method, path, query, range_suffix
+            "method={} path={} has_query={} query_params={} sigv4_query={}{}",
+            method,
+            path,
+            query_summary.has_query(),
+            query_summary.param_count(),
+            query_summary.has_sigv4_params(),
+            range_suffix
         )),
     );
 

@@ -203,13 +203,16 @@ fn authenticate_request_inner<H: HeaderSource + ?Sized>(
     expected_service: &str,
     now_epoch_secs: u64,
 ) -> Result<AuthContext, AuthError> {
+    let query = observability::query_summary(query_string);
     observability::trace_scope!(
         TRACE_TARGET,
         "authenticate_request",
-        "method={} path={} query={}",
+        "method={} path={} has_query={} query_params={} sigv4_query={}",
         method,
         path,
-        query_string
+        query.has_query(),
+        query.param_count(),
+        query.has_sigv4_params()
     );
     let mut authorization_header = None;
     let mut authorization_count = 0usize;

@@ -246,7 +246,7 @@ pub struct ResponseTraceMeta {
     context: observability::TraceContext,
     method: String,
     path: String,
-    query: String,
+    query: observability::QuerySummary,
     started_at: Instant,
 }
 
@@ -258,11 +258,12 @@ impl ResponseTraceMeta {
         path: impl Into<String>,
         query: impl Into<String>,
     ) -> Self {
+        let query = query.into();
         Self {
             context,
             method: method.into(),
             path: path.into(),
-            query: query.into(),
+            query: observability::query_summary(&query),
             started_at: Instant::now(),
         }
     }
@@ -305,11 +306,13 @@ impl ResponseBodyTrace {
             TRACE_TARGET,
             "response_first_chunk",
             Some(format_args!(
-                "status={} method={} path={} query={} streaming={} body_len={} first_chunk_len={} lifetime_us={}",
+                "status={} method={} path={} has_query={} query_params={} sigv4_query={} streaming={} body_len={} first_chunk_len={} lifetime_us={}",
                 self.status_code,
                 self.meta.method,
                 self.meta.path,
-                self.meta.query,
+                self.meta.query.has_query(),
+                self.meta.query.param_count(),
+                self.meta.query.has_sigv4_params(),
                 self.streaming,
                 self.body_len,
                 len,
@@ -335,11 +338,13 @@ impl ResponseBodyTrace {
             TRACE_TARGET,
             "response_body_complete",
             Some(format_args!(
-                "status={} method={} path={} query={} streaming={} body_len={} bytes_sent={} lifetime_us={}",
+                "status={} method={} path={} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={}",
                 self.status_code,
                 self.meta.method,
                 self.meta.path,
-                self.meta.query,
+                self.meta.query.has_query(),
+                self.meta.query.param_count(),
+                self.meta.query.has_sigv4_params(),
                 self.streaming,
                 self.body_len,
                 self.bytes_sent,
@@ -358,11 +363,13 @@ impl ResponseBodyTrace {
             TRACE_TARGET,
             "response_body_error",
             Some(format_args!(
-                "status={} method={} path={} query={} streaming={} body_len={} bytes_sent={} lifetime_us={} error={}",
+                "status={} method={} path={} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} error={}",
                 self.status_code,
                 self.meta.method,
                 self.meta.path,
-                self.meta.query,
+                self.meta.query.has_query(),
+                self.meta.query.param_count(),
+                self.meta.query.has_sigv4_params(),
                 self.streaming,
                 self.body_len,
                 self.bytes_sent,
@@ -382,11 +389,13 @@ impl ResponseBodyTrace {
             TRACE_TARGET,
             "response_body_dropped",
             Some(format_args!(
-                "status={} method={} path={} query={} streaming={} body_len={} bytes_sent={} lifetime_us={}",
+                "status={} method={} path={} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={}",
                 self.status_code,
                 self.meta.method,
                 self.meta.path,
-                self.meta.query,
+                self.meta.query.has_query(),
+                self.meta.query.param_count(),
+                self.meta.query.has_sigv4_params(),
                 self.streaming,
                 self.body_len,
                 self.bytes_sent,
@@ -543,23 +552,28 @@ impl HttpFrontend {
     /// an `S3Request` and converting the `S3Response` back to an HTTP response.
     #[must_use]
     pub fn handle_s3_request(&self, s3req: &S3Request) -> S3Response {
+        let query = observability::query_summary(s3req.query_string());
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::handle_s3_request",
-            "method={} path={} query={}",
+            "method={} path={} has_query={} query_params={} sigv4_query={}",
             s3req.method,
             s3req.path(),
-            s3req.query_string()
+            query.has_query(),
+            query.param_count(),
+            query.has_sigv4_params()
         );
         // Route first to detect OPTIONS requests (which bypass auth).
         let operation = {
             observability::trace_scope!(
                 TRACE_TARGET,
                 "HttpFrontend::route_request",
-                "method={} path={} query={}",
+                "method={} path={} has_query={} query_params={} sigv4_query={}",
                 s3req.method.as_str(),
                 s3req.path(),
-                s3req.query_string()
+                query.has_query(),
+                query.param_count(),
+                query.has_sigv4_params()
             );
             match route(s3req.method.as_str(), s3req.path(), s3req.query_string()) {
                 Ok(op) => op,

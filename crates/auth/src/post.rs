@@ -26,7 +26,7 @@ pub fn authenticate_post_sigv4(
         "authenticate_post_sigv4",
         "algorithm={} credential={}",
         algorithm,
-        credential
+        observability::redacted("sigv4_credential")
     );
     // Validate algorithm
     if algorithm != "AWS4-HMAC-SHA256" {
