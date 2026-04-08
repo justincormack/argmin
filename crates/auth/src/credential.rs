@@ -19,6 +19,12 @@ impl SecretKey {
     }
 }
 
+impl std::fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&observability::redacted("secret_key"), f)
+    }
+}
+
 /// Full credential record used by authentication.
 pub struct CredentialRecord {
     pub access_key_id: String,
@@ -29,8 +35,28 @@ pub struct CredentialRecord {
     pub enabled: bool,
 }
 
+impl std::fmt::Debug for CredentialRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let session_token = self
+            .session_token
+            .as_ref()
+            .map(|_| observability::redacted("session_token"));
+        f.debug_struct("CredentialRecord")
+            .field(
+                "access_key_id",
+                &observability::escaped(&self.access_key_id),
+            )
+            .field("secret_key", &self.secret_key)
+            .field("account", &self.account)
+            .field("session_token", &session_token)
+            .field("expires_at_epoch_secs", &self.expires_at_epoch_secs)
+            .field("enabled", &self.enabled)
+            .finish()
+    }
+}
+
 /// Parsed credential scope from the Authorization header.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CredentialScope {
     pub access_key_id: String,
     pub date: String, // YYYYMMDD
@@ -38,13 +64,38 @@ pub struct CredentialScope {
     pub service: String, // "s3"
 }
 
+impl std::fmt::Debug for CredentialScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialScope")
+            .field(
+                "access_key_id",
+                &observability::escaped(&self.access_key_id),
+            )
+            .field("date", &observability::escaped(&self.date))
+            .field("region", &observability::escaped(&self.region))
+            .field("service", &observability::escaped(&self.service))
+            .finish()
+    }
+}
+
 /// Borrowed credential scope parsed from a request wire format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CredentialScopeRef<'a> {
     pub access_key_id: &'a str,
     pub date: &'a str,
     pub region: &'a str,
     pub service: &'a str,
+}
+
+impl std::fmt::Debug for CredentialScopeRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CredentialScopeRef")
+            .field("access_key_id", &observability::escaped(self.access_key_id))
+            .field("date", &observability::escaped(self.date))
+            .field("region", &observability::escaped(self.region))
+            .field("service", &observability::escaped(self.service))
+            .finish()
+    }
 }
 
 impl From<CredentialScopeRef<'_>> for CredentialScope {
@@ -241,5 +292,38 @@ mod tests {
     #[test]
     fn parse_credential_scope_ref_rejects_invalid_date_stamp() {
         assert!(parse_credential_scope_ref("AKID/2025010X/us-east-1/s3/aws4_request").is_none());
+    }
+
+    #[test]
+    fn debug_redacts_credential_secrets_and_escapes_text() {
+        let secret = SecretKey::new("super-secret".into());
+        assert_eq!(format!("{secret:?}"), "<redacted:secret_key>");
+
+        let record = CredentialRecord {
+            access_key_id: "AK\r\nID".into(),
+            secret_key: SecretKey::new("super-secret".into()),
+            account: AccountIdentity::from_principal("user-123"),
+            session_token: Some("token-value".into()),
+            expires_at_epoch_secs: Some(1234),
+            enabled: true,
+        };
+        let debug = format!("{record:?}");
+        assert!(debug.contains(r#""AK\r\nID""#));
+        assert!(debug.contains("<redacted:secret_key>"));
+        assert!(debug.contains("<redacted:session_token>"));
+        assert!(!debug.contains("super-secret"));
+        assert!(!debug.contains("token-value"));
+
+        let scope = CredentialScope {
+            access_key_id: "AK\nID".into(),
+            date: "20250101".into(),
+            region: "us-\reast-1".into(),
+            service: "s3".into(),
+        };
+        let scope_debug = format!("{scope:?}");
+        assert!(scope_debug.contains(r#""AK\nID""#));
+        assert!(scope_debug.contains(r#""us-\reast-1""#));
+        assert!(!scope_debug.contains('\n'));
+        assert!(!scope_debug.contains('\r'));
     }
 }

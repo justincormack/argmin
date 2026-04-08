@@ -1101,7 +1101,7 @@ impl ReadHandle {
         observability::trace_scope!(
             TRACE_TARGET,
             "ReadHandle::next_chunk",
-            "bucket={} key={} target_size={}",
+            "bucket={:?} key={:?} target_size={}",
             self.bucket,
             self.key,
             target_size
@@ -4210,7 +4210,7 @@ impl SegmentListReader {
                         TRACE_TARGET,
                         "read_segment_layout",
                         Some(format_args!(
-                            "bucket={} key={} part_order={} part_number={} part_object_offset_start={} part_object_offset_len={} part_object_offset_end_exclusive={} segment_index={} segment_size={} segment_object_offset_start={} segment_object_offset_end_exclusive={} read_object_offset_start={} read_object_offset_len={} read_object_offset_end_exclusive={} read_segment_offset_start={} read_segment_offset_len={} read_segment_offset_end_exclusive={} shard_pg_id={} ec_k={} ec_m={}",
+                            "bucket={:?} key={:?} part_order={} part_number={} part_object_offset_start={} part_object_offset_len={} part_object_offset_end_exclusive={} segment_index={} segment_size={} segment_object_offset_start={} segment_object_offset_end_exclusive={} read_object_offset_start={} read_object_offset_len={} read_object_offset_end_exclusive={} read_segment_offset_start={} read_segment_offset_len={} read_segment_offset_end_exclusive={} shard_pg_id={} ec_k={} ec_m={}",
                             self.bucket,
                             self.key,
                             part_order,
@@ -4239,7 +4239,7 @@ impl SegmentListReader {
                         TRACE_TARGET,
                         "read_segment_layout",
                         Some(format_args!(
-                            "bucket={} key={} segment_index={} segment_size={} segment_object_offset_start={} segment_object_offset_end_exclusive={} read_object_offset_start={} read_object_offset_len={} read_object_offset_end_exclusive={} read_segment_offset_start={} read_segment_offset_len={} read_segment_offset_end_exclusive={} shard_pg_id={} ec_k={} ec_m={}",
+                            "bucket={:?} key={:?} segment_index={} segment_size={} segment_object_offset_start={} segment_object_offset_end_exclusive={} read_object_offset_start={} read_object_offset_len={} read_object_offset_end_exclusive={} read_segment_offset_start={} read_segment_offset_len={} read_segment_offset_end_exclusive={} shard_pg_id={} ec_k={} ec_m={}",
                             self.bucket,
                             self.key,
                             slice.segment_index,
@@ -4309,7 +4309,7 @@ impl MultipartReader {
                     TRACE_TARGET,
                     "read_multipart_part_layout",
                     Some(format_args!(
-                        "bucket={} key={} part_order={} part_number={} part_object_offset_start={} part_object_offset_len={} part_object_offset_end_exclusive={} segment_count={}",
+                        "bucket={:?} key={:?} part_order={} part_number={} part_object_offset_start={} part_object_offset_len={} part_object_offset_end_exclusive={} segment_count={}",
                         self.bucket,
                         self.key,
                         part.layout.part_order,
@@ -6683,7 +6683,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::create_bucket",
-            "bucket={} object_lock_enabled={}",
+            "bucket={:?} object_lock_enabled={}",
             req.name,
             req.object_lock_enabled
         );
@@ -6915,7 +6915,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let name = req.name;
@@ -6990,7 +6990,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::head_bucket",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         self.authorize_bucket_read_requester(&req.requester, req.name, req.expected_bucket_owner())
@@ -7000,7 +7000,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::bucket_exists",
-            "bucket={}",
+            "bucket={:?}",
             name
         );
         match self.active_bucket_summary(name, None) {
@@ -7034,7 +7034,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_versioning",
-            "bucket={} state={:?}",
+            "bucket={:?} state={:?}",
             req.bucket.name,
             req.state
         );
@@ -7074,7 +7074,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_versioning",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let info = self.authorize_bucket_read_requester(
@@ -7092,7 +7092,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_object_lock_configuration",
-            "bucket={} enable_requested={} has_default_retention={}",
+            "bucket={:?} enable_requested={} has_default_retention={}",
             req.bucket.name,
             req.config.object_lock_enabled.unwrap_or(false),
             req.config.default_retention.is_some()
@@ -7141,7 +7141,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_object_lock_configuration",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let info = self.active_bucket_summary(req.name, None)?;
@@ -7169,7 +7169,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_encryption",
-            "bucket={} sse_c_blocked={}",
+            "bucket={:?} sse_c_blocked={}",
             req.bucket.name,
             req.config.sse_c_blocked
         );
@@ -7202,7 +7202,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_encryption",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let info = self.authorize_bucket_admin_requester(
@@ -7217,7 +7217,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_encryption",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let _bucket_info = self.authorize_bucket_admin_requester(
@@ -7245,7 +7245,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_cors",
-            "bucket={} bytes={}",
+            "bucket={:?} bytes={}",
             req.bucket.name,
             req.config.len()
         );
@@ -7269,7 +7269,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_cors",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let _bucket_info = self.authorize_bucket_read_requester(
@@ -7284,7 +7284,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_cors",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let _bucket_info = self.authorize_bucket_admin_requester(
@@ -7305,7 +7305,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_tags",
-            "bucket={} bytes={}",
+            "bucket={:?} bytes={}",
             req.bucket.name,
             req.config.len()
         );
@@ -7329,7 +7329,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_tags",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let _bucket_info = self.authorize_bucket_read_requester(
@@ -7350,7 +7350,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_tags",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let _bucket_info = self.authorize_bucket_admin_requester(
@@ -7371,7 +7371,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_policy",
-            "bucket={} bytes={}",
+            "bucket={:?} bytes={}",
             req.bucket.name,
             req.config.len()
         );
@@ -7428,7 +7428,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_policy",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let _bucket_info = self.authorize_bucket_admin_requester(
@@ -7449,7 +7449,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_policy_status",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let bucket_info = self.active_bucket_summary(req.name, None)?;
@@ -7477,7 +7477,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_policy",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let _bucket_info = self.authorize_bucket_admin_requester(
@@ -7512,7 +7512,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_lifecycle",
-            "bucket={} bytes={}",
+            "bucket={:?} bytes={}",
             req.bucket.name,
             req.config.len()
         );
@@ -7572,7 +7572,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_lifecycle",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let _bucket_info = self.authorize_bucket_admin_requester(
@@ -7595,7 +7595,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_lifecycle",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let _bucket_info = self.authorize_bucket_admin_requester(
@@ -7630,7 +7630,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_public_access_block",
-            "bucket={} bytes={}",
+            "bucket={:?} bytes={}",
             req.bucket.name,
             req.config.len()
         );
@@ -7663,7 +7663,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_public_access_block",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let bucket_info = self.active_bucket_summary(req.name, None)?;
@@ -7694,7 +7694,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_public_access_block",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let _bucket_info = self.authorize_bucket_admin_requester(
@@ -7723,7 +7723,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_ownership_controls",
-            "bucket={} bytes={}",
+            "bucket={:?} bytes={}",
             req.bucket.name,
             req.config.len()
         );
@@ -7764,7 +7764,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_ownership_controls",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let _bucket_info = self.authorize_bucket_admin_requester(
@@ -7790,7 +7790,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_bucket_ownership_controls",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let _bucket_info = self.authorize_bucket_admin_requester(
@@ -7819,7 +7819,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_acl",
-            "bucket={}",
+            "bucket={:?}",
             req.name
         );
         let bucket = self.active_bucket_summary(req.name, req.expected_bucket_owner())?;
@@ -7848,7 +7848,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_acl",
-            "bucket={} acl_kind={}",
+            "bucket={:?} acl_kind={}",
             req.bucket.name,
             match &req.acl {
                 PutBucketAclInput::Canned(_) => "canned",
@@ -7944,7 +7944,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::load_bucket_cors_config",
-            "bucket={}",
+            "bucket={:?}",
             name
         );
         let bucket_pg = self.get_bucket_pg(name)?;
@@ -8257,7 +8257,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object_tags",
-            "bucket={} key={} bytes={}",
+            "bucket={:?} key={:?} bytes={}",
             req.object.bucket_name(),
             req.object.key(),
             req.tags.len()
@@ -8290,7 +8290,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object_retention",
-            "bucket={} key={} version_id={:?} mode={:?} bypass={}",
+            "bucket={:?} key={:?} version_id={:?} mode={:?} bypass={}",
             req.object.bucket_name(),
             req.object.key(),
             req.object.version_id,
@@ -8348,7 +8348,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_retention",
-            "bucket={} key={} version_id={:?}",
+            "bucket={:?} key={:?} version_id={:?}",
             req.object.bucket_name(),
             req.object.key,
             req.version_id
@@ -8373,7 +8373,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object_legal_hold",
-            "bucket={} key={} version_id={:?} status={:?}",
+            "bucket={:?} key={:?} version_id={:?} status={:?}",
             req.object.bucket_name(),
             req.object.key(),
             req.object.version_id,
@@ -8417,7 +8417,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_legal_hold",
-            "bucket={} key={} version_id={:?}",
+            "bucket={:?} key={:?} version_id={:?}",
             req.object.bucket_name(),
             req.object.key,
             req.version_id
@@ -8442,7 +8442,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_tags",
-            "bucket={} key={}",
+            "bucket={:?} key={:?}",
             req.object.bucket_name(),
             req.object.key
         );
@@ -8470,7 +8470,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_object_tags",
-            "bucket={} key={}",
+            "bucket={:?} key={:?}",
             req.object.bucket_name(),
             req.object.key
         );
@@ -8501,7 +8501,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_acl",
-            "bucket={} key={} version_id={:?}",
+            "bucket={:?} key={:?} version_id={:?}",
             req.object.bucket_name(),
             req.object.key,
             req.version_id
@@ -8542,7 +8542,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object_acl",
-            "bucket={} key={} version_id={:?} acl_kind={}",
+            "bucket={:?} key={:?} version_id={:?} acl_kind={}",
             req.object.bucket_name(),
             req.object.key(),
             req.object.version_id,
@@ -9033,7 +9033,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object",
-            "bucket={} key={} bytes={}",
+            "bucket={:?} key={:?} bytes={}",
             req.object.bucket_name(),
             req.object.key,
             req.data.len()
@@ -9296,7 +9296,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::begin_stream_put",
-            "bucket={} key={}",
+            "bucket={:?} key={:?}",
             req.object.bucket_name(),
             req.object.key
         );
@@ -9365,7 +9365,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::begin_stream_part",
-            "bucket={} key={} upload_id={} part_number={}",
+            "bucket={:?} key={:?} upload_id={:?} part_number={}",
             req.upload.bucket_name(),
             req.upload.key(),
             req.upload.upload_id,
@@ -9493,7 +9493,7 @@ impl Coordinator {
                     TRACE_TARGET,
                     "stream_put_segment_layout",
                     Some(format_args!(
-                        "bucket={} key={} session_id={} segment_index={} object_offset_start={} object_offset_len={} object_offset_end_exclusive={}",
+                        "bucket={:?} key={:?} session_id={:?} segment_index={} object_offset_start={} object_offset_len={} object_offset_end_exclusive={}",
                         bucket,
                         key,
                         session_id,
@@ -9513,7 +9513,7 @@ impl Coordinator {
                     TRACE_TARGET,
                     "stream_part_segment_layout",
                     Some(format_args!(
-                        "bucket={} key={} upload_id={} part_number={} session_id={} segment_index={} part_offset_start={} part_offset_len={} part_offset_end_exclusive={}",
+                        "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} segment_index={} part_offset_start={} part_offset_len={} part_offset_end_exclusive={}",
                         bucket,
                         key,
                         upload_id,
@@ -9667,7 +9667,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::append_stream_segment",
-            "bucket={} key={} session_id={} segment_index={} bytes={}",
+            "bucket={:?} key={:?} session_id={:?} segment_index={} bytes={}",
             bucket,
             key,
             session_id,
@@ -9811,7 +9811,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::finalize_stream_put",
-            "bucket={} key={} session_id={} bytes={}",
+            "bucket={:?} key={:?} session_id={:?} bytes={}",
             req.object.bucket_name(),
             req.object.key(),
             req.session_id,
@@ -9999,7 +9999,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::finalize_stream_part",
-            "bucket={} key={} upload_id={} part_number={} session_id={} bytes={}",
+            "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} bytes={}",
             req.upload.bucket_name(),
             req.upload.key(),
             req.upload.upload_id(),
@@ -10328,7 +10328,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::copy_object",
-            "src_bucket={} src_key={} dst_bucket={} dst_key={}",
+            "src_bucket={:?} src_key={:?} dst_bucket={:?} dst_key={:?}",
             req.source.bucket,
             req.source.key,
             req.destination.bucket.name,
@@ -11353,7 +11353,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object",
-            "bucket={} key={} version_id={:?}",
+            "bucket={:?} key={:?} version_id={:?}",
             req.object.bucket_name(),
             req.object.key(),
             req.object.version_id
@@ -11536,7 +11536,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_part",
-            "bucket={} key={} part_number={} version_id={:?}",
+            "bucket={:?} key={:?} part_number={} version_id={:?}",
             req.object.bucket_name(),
             req.object.key(),
             req.part_number,
@@ -11760,7 +11760,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::head_object_part",
-            "bucket={} key={} part_number={} version_id={:?}",
+            "bucket={:?} key={:?} part_number={} version_id={:?}",
             req.object.bucket_name(),
             req.object.key(),
             req.part_number,
@@ -11931,7 +11931,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::head_object",
-            "bucket={} key={} version_id={:?}",
+            "bucket={:?} key={:?} version_id={:?}",
             req.object.bucket_name(),
             req.object.key(),
             req.object.version_id
@@ -12022,7 +12022,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_attributes",
-            "bucket={} key={} want_parts={} version_id={:?}",
+            "bucket={:?} key={:?} want_parts={} version_id={:?}",
             req.object.bucket_name(),
             req.object.key(),
             req.want_parts,
@@ -12164,7 +12164,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_object_range",
-            "bucket={} key={} version_id={:?} requested_range={}",
+            "bucket={:?} key={:?} version_id={:?} requested_range={}",
             req.object.bucket_name(),
             req.object.key(),
             req.object.version_id,
@@ -12220,7 +12220,7 @@ impl Coordinator {
                         TRACE_TARGET,
                         "get_object_range_invalid",
                         Some(format_args!(
-                            "bucket={} key={} version_id={:?} requested_range={} object_size={}",
+                            "bucket={:?} key={:?} version_id={:?} requested_range={} object_size={}",
                             bucket, key, version_id, range, record.size
                         )),
                     );
@@ -12236,7 +12236,7 @@ impl Coordinator {
                 TRACE_TARGET,
                 "get_object_range_resolved",
                 Some(format_args!(
-                    "bucket={} key={} version_id={:?} requested_range={} object_size={} resolved_start={} resolved_end={} resolved_len={}",
+                    "bucket={:?} key={:?} version_id={:?} requested_range={} object_size={} resolved_start={} resolved_end={} resolved_len={}",
                     bucket,
                     key,
                     version_id,
@@ -12363,7 +12363,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_object",
-            "bucket={} key={} version_id={:?} bypass={}",
+            "bucket={:?} key={:?} version_id={:?} bypass={}",
             req.object.bucket_name(),
             req.object.key(),
             req.object.version_id,
@@ -12774,7 +12774,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::list_objects_v2",
-            "bucket={} max_keys={}",
+            "bucket={:?} max_keys={}",
             req.bucket.name,
             req.max_keys
         );
@@ -13064,7 +13064,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::list_object_versions",
-            "bucket={} max_keys={}",
+            "bucket={:?} max_keys={}",
             req.bucket.name,
             max_keys
         );
@@ -13217,7 +13217,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::delete_objects",
-            "bucket={} objects={} bypass={}",
+            "bucket={:?} objects={} bypass={}",
             req.bucket.name,
             req.entries.len(),
             req.bypass_governance
@@ -13278,7 +13278,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::create_multipart_upload",
-            "bucket={} key={}",
+            "bucket={:?} key={:?}",
             req.object.bucket_name(),
             req.object.key
         );
@@ -13384,7 +13384,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::upload_part_copy",
-            "src_bucket={} src_key={} dst_bucket={} dst_key={} upload_id={} part_number={}",
+            "src_bucket={:?} src_key={:?} dst_bucket={:?} dst_key={:?} upload_id={:?} part_number={}",
             req.source.bucket,
             req.source.key,
             req.upload.bucket_name(),
@@ -13673,7 +13673,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::complete_multipart_upload",
-            "bucket={} key={} upload_id={} parts={}",
+            "bucket={:?} key={:?} upload_id={:?} parts={}",
             req.upload.bucket_name(),
             req.upload.key(),
             req.upload.upload_id,
@@ -13861,7 +13861,7 @@ impl Coordinator {
                     TRACE_TARGET,
                     "complete_multipart_layout",
                     Some(format_args!(
-                        "bucket={} key={} upload_id={} parts={} total_size={}",
+                        "bucket={:?} key={:?} upload_id={:?} parts={} total_size={}",
                         bucket,
                         key,
                         upload_id,
@@ -13880,7 +13880,7 @@ impl Coordinator {
                         TRACE_TARGET,
                         "complete_multipart_part_layout",
                         Some(format_args!(
-                            "bucket={} key={} upload_id={} part_order={} part_number={} part_size={} object_offset_start={} object_offset_len={} object_offset_end_exclusive={} etag={}",
+                            "bucket={:?} key={:?} upload_id={:?} part_order={} part_number={} part_size={} object_offset_start={} object_offset_len={} object_offset_end_exclusive={} etag={}",
                             bucket,
                             key,
                             upload_id,
@@ -14143,7 +14143,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::abort_multipart_upload",
-            "bucket={} key={} upload_id={}",
+            "bucket={:?} key={:?} upload_id={:?}",
             req.object.bucket_name(),
             req.object.key,
             req.upload_id
@@ -14210,7 +14210,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::list_parts",
-            "bucket={} key={} upload_id={} max_parts={}",
+            "bucket={:?} key={:?} upload_id={:?} max_parts={}",
             req.upload.bucket_name(),
             req.upload.key(),
             req.upload.upload_id,
@@ -14304,7 +14304,7 @@ impl Coordinator {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::list_multipart_uploads",
-            "bucket={} max_uploads={}",
+            "bucket={:?} max_uploads={}",
             req.bucket.name,
             req.max_uploads
         );

@@ -77,15 +77,29 @@ impl SseCustomerRequest {
 impl fmt::Debug for SseCustomerRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SseCustomerRequest")
-            .field("algorithm", &self.algorithm)
-            .field("customer_key_md5_b64", &self.customer_key_md5_b64)
+            .field("algorithm", &observability::escaped(&self.algorithm))
+            .field(
+                "customer_key_md5_b64",
+                &observability::redacted("sse_customer_key_md5"),
+            )
             .finish()
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SseCustomerResponseHeaders {
     pub key_md5_b64: String,
+}
+
+impl fmt::Debug for SseCustomerResponseHeaders {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SseCustomerResponseHeaders")
+            .field(
+                "key_md5_b64",
+                &observability::redacted("sse_customer_key_md5"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -287,7 +301,7 @@ impl fmt::Debug for SseCustomerWriteContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SseCustomerWriteContext")
             .field("request", &self.request)
-            .field("encryption", &self.encryption)
+            .field("encryption", &"sse_customer")
             .finish()
     }
 }
@@ -357,7 +371,7 @@ impl ManagedEncryptionWriteContext {
 impl fmt::Debug for ManagedEncryptionWriteContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ManagedEncryptionWriteContext")
-            .field("encryption", &self.encryption)
+            .field("encryption", &"managed")
             .finish()
     }
 }
@@ -1410,5 +1424,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ServerError::InternalError { .. }));
+    }
+
+    #[test]
+    fn debug_redacts_sse_customer_material() {
+        let request = SseCustomerRequest::new([7u8; SSE_C_CUSTOMER_KEY_LEN], "md5-value".into())
+            .with_algorithm("AES256\n".into());
+        let request_debug = format!("{request:?}");
+        assert!(request_debug.contains(r#""AES256\n""#));
+        assert!(request_debug.contains("<redacted:sse_customer_key_md5>"));
+        assert!(!request_debug.contains("md5-value"));
+
+        let headers = request.response_headers();
+        let headers_debug = format!("{headers:?}");
+        assert!(headers_debug.contains("<redacted:sse_customer_key_md5>"));
+        assert!(!headers_debug.contains("md5-value"));
+
+        let validator = validator();
+        let ctx = prepare_sse_customer_write(&validator, &request).unwrap();
+        let ctx_debug = format!("{ctx:?}");
+        assert!(ctx_debug.contains("SseCustomerWriteContext"));
+        assert!(ctx_debug.contains("sse_customer"));
+        assert!(ctx_debug.contains("<redacted:sse_customer_key_md5>"));
+        assert!(!ctx_debug.contains("wrapped_dek"));
+
+        let provider = managed_key_provider();
+        let managed = prepare_sse_s3_write(&provider).unwrap();
+        let managed_debug = format!("{managed:?}");
+        assert!(managed_debug.contains("ManagedEncryptionWriteContext"));
+        assert!(managed_debug.contains("managed"));
+        assert!(!managed_debug.contains("wrapped_dek"));
     }
 }

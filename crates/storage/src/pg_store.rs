@@ -405,7 +405,7 @@ impl PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::register_written_shards_and_append_stream_segment",
-            "pg_id={} session_id={} segment_index={} shards={}",
+            "pg_id={} session_id={:?} segment_index={} shards={}",
             self.pg_id,
             segment.session_id,
             segment.segment_index,
@@ -1399,7 +1399,7 @@ impl PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::create_bucket_with_config",
-            "pg_id={} bucket={} owner={} versioning={:?} object_lock_enabled={}",
+            "pg_id={} bucket={:?} owner={} versioning={:?} object_lock_enabled={}",
             self.pg_id,
             config.name,
             config.owner_principal,
@@ -1723,7 +1723,7 @@ impl PgMetadataStore for PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::delete_bucket",
-            "pg_id={} bucket={}",
+            "pg_id={} bucket={:?}",
             self.pg_id,
             name
         );
@@ -1775,7 +1775,7 @@ impl PgMetadataStore for PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::head_bucket",
-            "pg_id={} bucket={}",
+            "pg_id={} bucket={:?}",
             self.pg_id,
             name
         );
@@ -2731,7 +2731,7 @@ impl PgMetadataStore for PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::get_object_meta",
-            "pg_id={} bucket={} key={}",
+            "pg_id={} bucket={:?} key={:?}",
             self.pg_id,
             bucket,
             key
@@ -2764,7 +2764,7 @@ impl PgMetadataStore for PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::get_object_version",
-            "pg_id={} bucket={} key={} version_id={}",
+            "pg_id={} bucket={:?} key={:?} version_id={}",
             self.pg_id,
             bucket,
             key,
@@ -2945,7 +2945,7 @@ impl PgMetadataStore for PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::delete_object_meta",
-            "pg_id={} bucket={} key={}",
+            "pg_id={} bucket={:?} key={:?}",
             self.pg_id,
             bucket,
             key
@@ -2971,7 +2971,7 @@ impl PgMetadataStore for PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::delete_object_version",
-            "pg_id={} bucket={} key={} version_id={}",
+            "pg_id={} bucket={:?} key={:?} version_id={}",
             self.pg_id,
             bucket,
             key,
@@ -3035,7 +3035,7 @@ impl PgMetadataStore for PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::list_objects",
-            "pg_id={} bucket={} max_keys={}",
+            "pg_id={} bucket={:?} max_keys={}",
             self.pg_id,
             req.bucket.as_str(),
             req.max_keys
@@ -3142,7 +3142,7 @@ impl PgMetadataStore for PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::list_object_versions",
-            "pg_id={} bucket={} max_keys={}",
+            "pg_id={} bucket={:?} max_keys={}",
             self.pg_id,
             req.bucket.as_str(),
             req.max_keys
@@ -4170,7 +4170,7 @@ impl PgMetadataStore for PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::create_multipart_upload",
-            "pg_id={} upload_id={} bucket={} key={}",
+            "pg_id={} upload_id={:?} bucket={:?} key={:?}",
             self.pg_id,
             req.upload_id.as_str(),
             req.bucket.as_str(),
@@ -4484,7 +4484,7 @@ impl PgMetadataStore for PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::list_multipart_uploads",
-            "pg_id={} bucket={} max_uploads={}",
+            "pg_id={} bucket={:?} max_uploads={}",
             self.pg_id,
             req.bucket.as_str(),
             req.max_uploads
@@ -5510,7 +5510,7 @@ impl PgMetadataStore for PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::create_stream_upload",
-            "pg_id={} session_id={} bucket={} key={}",
+            "pg_id={} session_id={:?} bucket={:?} key={:?}",
             self.pg_id,
             req.session_id.as_str(),
             req.bucket.as_str(),
@@ -5832,7 +5832,7 @@ impl PgMetadataStore for PgStore {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::commit_stream_put",
-            "pg_id={} session_id={} bucket={} key={} segments={}",
+            "pg_id={} session_id={:?} bucket={:?} key={:?} segments={}",
             self.pg_id,
             session_id,
             obj.bucket.as_str(),

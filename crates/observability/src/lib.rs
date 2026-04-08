@@ -265,7 +265,7 @@ impl fmt::Debug for Escaped<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Redacted {
     label: &'static str,
 }
@@ -278,6 +278,12 @@ pub fn redacted(label: &'static str) -> Redacted {
 impl fmt::Display for Redacted {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "<redacted:{}>", self.label)
+    }
+}
+
+impl fmt::Debug for Redacted {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
     }
 }
 
@@ -586,7 +592,7 @@ mod tests {
         );
         assert_eq!(
             format!("{:?}", redacted("sse_c_key")),
-            "Redacted { label: \"sse_c_key\" }"
+            "<redacted:sse_c_key>"
         );
     }
 

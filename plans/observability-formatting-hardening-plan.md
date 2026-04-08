@@ -101,6 +101,54 @@ Then types and trace sites should use those helpers consistently.
 Keep this work focused on the types and helpers most likely to become logging
 surfaces soon.
 
+## Status
+
+### Completed
+
+- Phase 1 is complete.
+  - `observability` now provides shared escaped-text, redacted-value, and
+    query-summary helpers.
+  - `Redacted` now has observability-safe `Debug`, not just safe `Display`.
+  - helper behavior is covered by focused unit tests.
+- The first high-risk trace cleanup slice is complete.
+  - request-start and auth traces no longer log raw query strings or SigV4
+    credential material
+  - request tracing now uses summarized query metadata instead of raw query
+    text
+
+### Complete In Current Worktree
+
+- Phase 2 is complete for the core textual identifier newtypes most likely to
+  appear in traces.
+  - `BucketName`
+  - `ObjectKey`
+  - `UploadId`
+  - `SessionId`
+- Phase 3 has an initial hardening pass complete for obvious secret-bearing
+  auth and SSE types.
+  - auth credential and SigV4 debug output now redacts secret key, session
+    token, signing key, and signature material
+  - SSE-C request, response-header, and write-context debug output now redacts
+    customer-key-derived material
+- Phase 4 has a broad high-risk trace formatting sweep complete across current
+  bucket/key/upload/session trace sites.
+  - these call sites now prefer `{:?}` on hardened types instead of raw `{}`
+    formatting
+  - this covers the main trace surfaces in `server-core`, `server-http`, and
+    `storage`
+
+### Remaining
+
+- complete the Phase 3 audit beyond the obvious auth and SSE types
+  - review remaining managed-encryption, metadata, and request-context debug
+    surfaces for unnecessary disclosure
+- finish the Phase 4 cleanup outside the main high-risk paths
+  - sweep any remaining raw attacker-controlled formatting in less common trace
+    and diagnostic code
+- once the current worktree changes are committed, update
+  `security/codex-28f87fb` and `security/codex-90f9972` with the shipped fix
+  details and residual scope
+
 ### Phase 1: Shared observability-safe formatting primitives
 
 Add reusable wrappers or helper types for:

@@ -45,7 +45,7 @@ impl std::fmt::Display for GenerationId {
 macro_rules! string_newtype {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
         pub struct $name(String);
 
         impl $name {
@@ -72,6 +72,12 @@ macro_rules! string_newtype {
         impl std::fmt::Display for $name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str(&self.0)
+            }
+        }
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Debug::fmt(&observability::escaped(&self.0), f)
             }
         }
 
@@ -2160,6 +2166,19 @@ mod tests {
         let hex = key.hex();
         let hex_bytes = key.hex_bytes();
         assert_eq!(std::str::from_utf8(&hex_bytes).unwrap(), hex);
+    }
+
+    #[test]
+    fn string_newtype_debug_escapes_control_characters() {
+        let bucket = BucketName::from("buck\r\net");
+        let key = ObjectKey::from("obj\t\u{1b}[31m");
+        let upload = UploadId::from("up\nload");
+        let session = SessionId::from("sess\rion");
+
+        assert_eq!(format!("{bucket:?}"), r#""buck\r\net""#);
+        assert_eq!(format!("{key:?}"), r#""obj\t\u{1b}[31m""#);
+        assert_eq!(format!("{upload:?}"), r#""up\nload""#);
+        assert_eq!(format!("{session:?}"), r#""sess\rion""#);
     }
 
     // ── Property-based tests ────────────────────────────────────────

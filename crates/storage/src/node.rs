@@ -44,7 +44,7 @@ impl Drop for BucketLockGuard<'_> {
                 TRACE_TARGET,
                 "bucket_lock_released",
                 Some(format_args!(
-                    "bucket={} stripe={} hold_us={}",
+                    "bucket={:?} stripe={} hold_us={}",
                     self.bucket,
                     self.stripe,
                     self.acquired_at.elapsed().as_micros()
@@ -267,7 +267,7 @@ impl SharedStorageNode {
         observability::trace_scope!(
             TRACE_TARGET,
             "SharedStorageNode::lock_bucket",
-            "bucket={}",
+            "bucket={:?}",
             bucket
         );
         let idx = self.bucket_lock_index(bucket);
@@ -284,7 +284,7 @@ impl SharedStorageNode {
                 TRACE_TARGET,
                 "bucket_lock_acquired",
                 Some(format_args!(
-                    "bucket={} stripe={} wait_us={}",
+                    "bucket={:?} stripe={} wait_us={}",
                     bucket, idx, wait_us
                 )),
             );
@@ -304,7 +304,7 @@ impl SharedStorageNode {
         observability::trace_scope!(
             TRACE_TARGET,
             "SharedStorageNode::lock_multipart_completion_bucket",
-            "bucket={}",
+            "bucket={:?}",
             bucket
         );
         let idx = self.bucket_lock_index(bucket);
@@ -321,7 +321,7 @@ impl SharedStorageNode {
                 TRACE_TARGET,
                 "multipart_completion_bucket_lock_acquired",
                 Some(format_args!(
-                    "bucket={} stripe={} wait_us={}",
+                    "bucket={:?} stripe={} wait_us={}",
                     bucket, idx, wait_us
                 )),
             );

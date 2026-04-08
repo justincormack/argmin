@@ -13,11 +13,26 @@ use crate::request::HeaderSource;
 use crate::{is_lower_hex, MAX_SIGNED_HEADERS_LEN, MAX_SIGNED_HEADER_COUNT, SIGNATURE_HEX_LEN};
 
 /// Parsed AWS SigV4 Authorization header.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SigV4Auth {
     pub credential: CredentialScope,
     pub signed_headers: Vec<String>,
     pub signature: String,
+}
+
+impl std::fmt::Debug for SigV4Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let signed_headers: Vec<_> = self
+            .signed_headers
+            .iter()
+            .map(|header| observability::escaped(header))
+            .collect();
+        f.debug_struct("SigV4Auth")
+            .field("credential", &self.credential)
+            .field("signed_headers", &signed_headers)
+            .field("signature", &observability::redacted("sigv4_signature"))
+            .finish()
+    }
 }
 
 /// Parse an AWS SigV4 Authorization header value.
@@ -765,5 +780,25 @@ mod tests {
             &store,
         );
         assert!(matches!(result, Err(AuthError::UnknownAccessKey)));
+    }
+
+    #[test]
+    fn sigv4_auth_debug_redacts_signature_and_escapes_headers() {
+        let auth = SigV4Auth {
+            credential: CredentialScope {
+                access_key_id: "AK\r\nID".into(),
+                date: "20250101".into(),
+                region: "us-east-1".into(),
+                service: "s3".into(),
+            },
+            signed_headers: vec!["host".into(), "x-amz-meta-\nname".into()],
+            signature: "deadbeef".into(),
+        };
+
+        let debug = format!("{auth:?}");
+        assert!(debug.contains(r#""AK\r\nID""#));
+        assert!(debug.contains(r#""x-amz-meta-\nname""#));
+        assert!(debug.contains("<redacted:sigv4_signature>"));
+        assert!(!debug.contains("deadbeef"));
     }
 }

@@ -648,7 +648,7 @@ impl HttpFrontend {
                 observability::trace_scope!(
                     TRACE_TARGET,
                     "HttpFrontend::apply_actual_cors",
-                    "method={} path={} bucket={}",
+                    "method={} path={} bucket={:?}",
                     s3req.method.as_str(),
                     s3req.path(),
                     bucket
@@ -1229,7 +1229,7 @@ impl HttpFrontend {
                         TRACE_TARGET,
                         "get_object_part_request",
                         Some(format_args!(
-                            "bucket={} key={} version_id={:?} part_number={}",
+                            "bucket={:?} key={:?} version_id={:?} part_number={}",
                             bucket, key, vid, part_number
                         )),
                     );
@@ -1268,7 +1268,7 @@ impl HttpFrontend {
                                 TRACE_TARGET,
                                 "get_object_range_request",
                                 Some(format_args!(
-                                    "bucket={} key={} version_id={:?} raw_range={} parsed_range={}",
+                                    "bucket={:?} key={:?} version_id={:?} raw_range={} parsed_range={}",
                                     bucket, key, vid, range_header, byte_range
                                 )),
                             );
@@ -1306,7 +1306,7 @@ impl HttpFrontend {
                                 TRACE_TARGET,
                                 "get_object_range_ignored",
                                 Some(format_args!(
-                                    "bucket={} key={} version_id={:?} raw_range={} reason=invalid_header",
+                                    "bucket={:?} key={:?} version_id={:?} raw_range={} reason=invalid_header",
                                     bucket,
                                     key,
                                     vid,
@@ -1402,7 +1402,7 @@ impl HttpFrontend {
                         TRACE_TARGET,
                         "head_object_part_request",
                         Some(format_args!(
-                            "bucket={} key={} version_id={:?} part_number={}",
+                            "bucket={:?} key={:?} version_id={:?} part_number={}",
                             bucket, key, vid, part_number
                         )),
                     );
@@ -2870,7 +2870,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::prepare_streaming_post_object",
-            "bucket={} file_name_present={}",
+            "bucket={:?} file_name_present={}",
             bucket,
             file_name.is_some()
         );
@@ -3056,7 +3056,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::finalize_streaming_post_object",
-            "bucket={} key={} bytes={}",
+            "bucket={:?} key={:?} bytes={}",
             ctx.binding.bucket,
             ctx.binding.key,
             total_size
@@ -3186,7 +3186,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::streaming_append_post_segment",
-            "bucket={} key={} segment_index={} bytes={}",
+            "bucket={:?} key={:?} segment_index={} bytes={}",
             ctx.binding.bucket,
             ctx.binding.key,
             segment_index,
@@ -3216,7 +3216,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::abort_streaming_post_object",
-            "bucket={} key={}",
+            "bucket={:?} key={:?}",
             ctx.binding.bucket,
             ctx.binding.key
         );
@@ -3292,7 +3292,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::prepare_streaming_put",
-            "bucket={} key={}",
+            "bucket={:?} key={:?}",
             bucket,
             key
         );
@@ -3412,7 +3412,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::start_streaming_put_session",
-            "bucket={} key={}",
+            "bucket={:?} key={:?}",
             ctx.bucket,
             ctx.key
         );
@@ -3450,7 +3450,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::streaming_append_segment",
-            "bucket={} key={} segment_index={} bytes={}",
+            "bucket={:?} key={:?} segment_index={} bytes={}",
             ctx.bucket,
             ctx.key,
             segment_index,
@@ -3485,7 +3485,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::put_single_segment_object",
-            "bucket={} key={} bytes={} trailer_checksums={}",
+            "bucket={:?} key={:?} bytes={} trailer_checksums={}",
             ctx.bucket,
             ctx.key,
             data.len(),
@@ -3549,7 +3549,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::finalize_streaming_put",
-            "bucket={} key={} bytes={} trailer_checksums={}",
+            "bucket={:?} key={:?} bytes={} trailer_checksums={}",
             ctx.bucket,
             ctx.key,
             total_size,
@@ -3608,7 +3608,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::abort_streaming_put",
-            "bucket={} key={}",
+            "bucket={:?} key={:?}",
             ctx.bucket,
             ctx.key
         );
@@ -3629,7 +3629,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::prepare_streaming_part",
-            "bucket={} key={} upload_id={} part_number={}",
+            "bucket={:?} key={:?} upload_id={:?} part_number={}",
             bucket,
             key,
             upload_id,
@@ -3708,7 +3708,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::streaming_append_part_segment",
-            "bucket={} key={} upload_id={} part_number={} segment_index={} bytes={}",
+            "bucket={:?} key={:?} upload_id={:?} part_number={} segment_index={} bytes={}",
             ctx.binding.object.bucket,
             ctx.binding.object.key,
             ctx.binding.upload_id,
@@ -3752,7 +3752,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::finalize_streaming_part",
-            "bucket={} key={} upload_id={} part_number={} bytes={} trailer_checksums={}",
+            "bucket={:?} key={:?} upload_id={:?} part_number={} bytes={} trailer_checksums={}",
             ctx.binding.object.bucket,
             ctx.binding.object.key,
             ctx.binding.upload_id,
@@ -3841,7 +3841,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::abort_streaming_part",
-            "bucket={} key={} upload_id={} part_number={}",
+            "bucket={:?} key={:?} upload_id={:?} part_number={}",
             ctx.binding.object.bucket,
             ctx.binding.object.key,
             ctx.binding.upload_id,

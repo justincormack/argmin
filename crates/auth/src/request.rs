@@ -27,7 +27,7 @@ pub enum AuthMode {
 }
 
 /// Signing context needed for verifying aws-chunked streaming signatures.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct StreamingSigningContext {
     /// The derived signing key (32 bytes).
     pub signing_key: [u8; 32],
@@ -39,8 +39,22 @@ pub struct StreamingSigningContext {
     pub timestamp: String,
 }
 
+impl std::fmt::Debug for StreamingSigningContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamingSigningContext")
+            .field("signing_key", &observability::redacted("sigv4_signing_key"))
+            .field(
+                "seed_signature",
+                &observability::redacted("sigv4_seed_signature"),
+            )
+            .field("scope", &observability::escaped(&self.scope))
+            .field("timestamp", &observability::escaped(&self.timestamp))
+            .finish()
+    }
+}
+
 /// Authenticated request context shared with higher layers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthContext {
     pub mode: AuthMode,
     pub access_key_id: Option<String>,
@@ -49,6 +63,21 @@ pub struct AuthContext {
     pub signing_region: Option<String>,
     /// Present when the request uses STREAMING-AWS4-HMAC-SHA256-* content hash.
     pub streaming: Option<StreamingSigningContext>,
+}
+
+impl std::fmt::Debug for AuthContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let access_key_id = self.access_key_id.as_deref().map(observability::escaped);
+        let signing_region = self.signing_region.as_deref().map(observability::escaped);
+        f.debug_struct("AuthContext")
+            .field("mode", &self.mode)
+            .field("access_key_id", &access_key_id)
+            .field("account", &self.account)
+            .field("request_epoch_secs", &self.request_epoch_secs)
+            .field("signing_region", &signing_region)
+            .field("streaming", &self.streaming)
+            .finish()
+    }
 }
 
 impl AuthContext {
@@ -2054,5 +2083,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, AuthError::MalformedAuth));
+    }
+
+    #[test]
+    fn auth_context_debug_redacts_streaming_secrets_and_escapes_text() {
+        let ctx = AuthContext {
+            mode: AuthMode::HeaderSigV4,
+            access_key_id: Some("AK\r\nID".into()),
+            account: Some(AccountIdentity::from_principal("user-123")),
+            request_epoch_secs: Some(1234),
+            signing_region: Some("us-\neast-1".into()),
+            streaming: Some(StreamingSigningContext {
+                signing_key: [7u8; 32],
+                seed_signature: "feedface".into(),
+                scope: "20250101/us-east-1/s3/aws4_request".into(),
+                timestamp: "20250101T000000Z".into(),
+            }),
+        };
+
+        let debug = format!("{ctx:?}");
+        assert!(debug.contains(r#""AK\r\nID""#));
+        assert!(debug.contains(r#""us-\neast-1""#));
+        assert!(debug.contains("<redacted:sigv4_signing_key>"));
+        assert!(debug.contains("<redacted:sigv4_seed_signature>"));
+        assert!(!debug.contains("feedface"));
     }
 }
