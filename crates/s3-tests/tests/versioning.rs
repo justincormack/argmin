@@ -1,7 +1,8 @@
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    AccessControlPolicy, BucketVersioningStatus, Delete, Grant, Grantee, ObjectIdentifier, Owner,
-    OwnershipControls, OwnershipControlsRule, Permission, Type, VersioningConfiguration,
+    AccessControlPolicy, BucketVersioningStatus, Delete, EncodingType, Grant, Grantee,
+    ObjectIdentifier, Owner, OwnershipControls, OwnershipControlsRule, Permission, Type,
+    VersioningConfiguration,
 };
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version,
@@ -1227,6 +1228,51 @@ fn test_versioning_list_object_versions_oversized_max_keys_returns_at_most_1000_
         assert_eq!(resp.is_truncated(), Some(true));
         assert!(resp.next_key_marker().is_some());
         assert!(resp.next_version_id_marker().is_some());
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_versioning_list_object_versions_encoding_type_url() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "dir/hello world&plus+";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .encoding_type(EncodingType::Url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.encoding_type(), Some(&EncodingType::Url));
+
+        let url = format!("{}/{bucket}?versions=&encoding-type=url", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response
+                .body
+                .contains("<Key>dir/hello+world%26plus%2B</Key>"),
+            "unexpected body: {}",
+            response.body
+        );
 
         cleanup_versioned_bucket(client, &bucket).await;
     });

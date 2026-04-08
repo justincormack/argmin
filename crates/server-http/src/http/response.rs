@@ -746,10 +746,18 @@ impl S3Response {
         bucket: &str,
         prefix: Option<&str>,
         key_marker: Option<&str>,
+        encoding_type: Option<&str>,
         max_keys: u32,
         result: &ListObjectVersionsResult,
     ) -> Self {
-        let body = xml::list_object_versions_xml(bucket, prefix, key_marker, max_keys, result);
+        let body = xml::list_object_versions_xml(
+            bucket,
+            prefix,
+            key_marker,
+            encoding_type,
+            max_keys,
+            result,
+        );
         Self::new(200).chunked_xml_body(body)
     }
 
@@ -2642,7 +2650,7 @@ mod tests {
             owner_principal: "owner".into(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
-        let resp = S3Response::list_object_versions("bucket", None, None, 1000, &result);
+        let resp = S3Response::list_object_versions("bucket", None, None, None, 1000, &result);
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
         assert_eq!(find_header(&resp, "Content-Length"), None);

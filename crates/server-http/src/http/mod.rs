@@ -2474,6 +2474,7 @@ impl HttpFrontend {
             S3Operation::ListObjectVersions { bucket } => {
                 let prefix = req.query_param_lossy("prefix");
                 let key_marker = req.query_param_lossy("key-marker");
+                let encoding_type = req.query_param_lossy("encoding-type");
                 let version_id_marker = parse_optional_version_id(
                     req.query_param_lossy("version-id-marker"),
                     "version-id-marker",
@@ -2495,6 +2496,7 @@ impl HttpFrontend {
                     &bucket,
                     prefix.as_deref(),
                     key_marker.as_deref(),
+                    encoding_type.as_deref(),
                     requested_max_keys,
                     &result,
                 ))

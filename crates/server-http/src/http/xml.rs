@@ -1999,6 +1999,7 @@ pub fn list_object_versions_xml(
     bucket: &str,
     prefix: Option<&str>,
     key_marker: Option<&str>,
+    encoding_type: Option<&str>,
     max_keys: u32,
     result: &ListObjectVersionsResult,
 ) -> String {
@@ -2013,21 +2014,27 @@ pub fn list_object_versions_xml(
 
     xml.push_str("<Prefix>");
     if let Some(p) = prefix {
-        xml.push_str(&xml_escape(p));
+        xml.push_str(&xml_escape(&encode_list_versions_value(p, encoding_type)));
     }
     xml.push_str("</Prefix>");
 
     xml.push_str("<KeyMarker>");
     if let Some(km) = key_marker {
-        xml.push_str(&xml_escape(km));
+        xml.push_str(&xml_escape(&encode_list_versions_value(km, encoding_type)));
     }
     xml.push_str("</KeyMarker>");
 
     xml.push_str("<VersionIdMarker></VersionIdMarker>");
 
+    if let Some(e) = encoding_type {
+        xml.push_str("<EncodingType>");
+        xml.push_str(&xml_escape(e));
+        xml.push_str("</EncodingType>");
+    }
+
     if let Some(ref nkm) = result.next_key_marker {
         xml.push_str("<NextKeyMarker>");
-        xml.push_str(&xml_escape(nkm));
+        xml.push_str(&xml_escape(&encode_list_versions_value(nkm, encoding_type)));
         xml.push_str("</NextKeyMarker>");
     }
 
@@ -2054,7 +2061,10 @@ pub fn list_object_versions_xml(
         if entry.is_delete_marker {
             xml.push_str("<DeleteMarker>");
             xml.push_str("<Key>");
-            xml.push_str(&xml_escape(&entry.key));
+            xml.push_str(&xml_escape(&encode_list_versions_value(
+                &entry.key,
+                encoding_type,
+            )));
             xml.push_str("</Key>");
             xml.push_str("<VersionId>");
             xml.push_str(&vid);
@@ -2072,7 +2082,10 @@ pub fn list_object_versions_xml(
         } else {
             xml.push_str("<Version>");
             xml.push_str("<Key>");
-            xml.push_str(&xml_escape(&entry.key));
+            xml.push_str(&xml_escape(&encode_list_versions_value(
+                &entry.key,
+                encoding_type,
+            )));
             xml.push_str("</Key>");
             xml.push_str("<VersionId>");
             xml.push_str(&vid);
@@ -2114,6 +2127,25 @@ pub fn list_object_versions_xml(
 fn encode_value(value: &str, encoding_type: Option<&str>) -> String {
     match encoding_type {
         Some("url") => uri_encode_path(value),
+        _ => value.to_string(),
+    }
+}
+
+fn encode_list_versions_value(value: &str, encoding_type: Option<&str>) -> String {
+    match encoding_type {
+        Some("url") => {
+            let mut out = String::with_capacity(value.len());
+            for byte in value.bytes() {
+                match byte {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                        out.push(byte as char)
+                    }
+                    b' ' => out.push('+'),
+                    _ => out.push_str(&format!("%{byte:02X}")),
+                }
+            }
+            out
+        }
         _ => value.to_string(),
     }
 }
@@ -4440,7 +4472,7 @@ mod tests {
             owner_principal: "owner".to_string(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
-        let xml = list_object_versions_xml("bucket", None, None, 1000, &result);
+        let xml = list_object_versions_xml("bucket", None, None, None, 1000, &result);
         assert!(xml.contains("ListVersionsResult"));
         assert!(xml.contains("<Version>"));
         assert!(xml.contains("<Key>my-key</Key>"));
@@ -4469,7 +4501,7 @@ mod tests {
             owner_principal: "owner".to_string(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
-        let xml = list_object_versions_xml("bucket", None, None, 1000, &result);
+        let xml = list_object_versions_xml("bucket", None, None, None, 1000, &result);
         assert!(xml.contains("ListVersionsResult"));
         assert!(!xml.contains("<Version>"));
     }
@@ -4485,7 +4517,8 @@ mod tests {
             owner_principal: "owner".to_string(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
-        let xml = list_object_versions_xml("bucket", Some("photos/"), Some("key1"), 100, &result);
+        let xml =
+            list_object_versions_xml("bucket", Some("photos/"), Some("key1"), None, 100, &result);
         assert!(xml.contains("<Prefix>photos/</Prefix>"));
         assert!(xml.contains("<KeyMarker>key1</KeyMarker>"));
     }
@@ -4511,13 +4544,49 @@ mod tests {
             owner_principal: "owner".to_string(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
-        let xml = list_object_versions_xml("bucket", None, None, 1000, &result);
+        let xml = list_object_versions_xml("bucket", None, None, None, 1000, &result);
         assert!(xml.contains("<DeleteMarker>"));
         assert!(xml.contains(&format!(
             "<Owner><ID>{}</ID></Owner>",
             result.owner_canonical_id.as_str()
         )));
         assert!(!xml.contains("<DisplayName>"));
+    }
+
+    #[test]
+    fn list_object_versions_xml_with_url_encoding() {
+        use crate::coordinator::{ListObjectVersionsResult, VersionEntry};
+        let result = ListObjectVersionsResult {
+            versions: vec![VersionEntry {
+                key: "dir/hello world&plus+".to_string(),
+                version_id: VersionId::Null,
+                is_latest: true,
+                size: 1,
+                etag: "\"abc123\"".to_string(),
+                last_modified: 1685000000000,
+                is_delete_marker: false,
+                checksum_algorithm: None,
+                checksum_type: None,
+            }],
+            is_truncated: true,
+            next_key_marker: Some("dir/next key+".to_string()),
+            next_version_id_marker: Some(VersionId::Null),
+            owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
+        };
+        let xml = list_object_versions_xml(
+            "bucket",
+            Some("dir/prefix here"),
+            Some("dir/key marker+"),
+            Some("url"),
+            1000,
+            &result,
+        );
+        assert!(xml.contains("<EncodingType>url</EncodingType>"));
+        assert!(xml.contains("<Prefix>dir/prefix+here</Prefix>"));
+        assert!(xml.contains("<KeyMarker>dir/key+marker%2B</KeyMarker>"));
+        assert!(xml.contains("<NextKeyMarker>dir/next+key%2B</NextKeyMarker>"));
+        assert!(xml.contains("<Key>dir/hello+world%26plus%2B</Key>"));
     }
 
     #[test]
@@ -6359,7 +6428,7 @@ mod tests {
         assert_eq!(versions_result.versions.len(), 3);
 
         let versions_xml =
-            list_object_versions_xml("test-bucket", None, None, 1000, &versions_result);
+            list_object_versions_xml("test-bucket", None, None, None, 1000, &versions_result);
         assert!(versions_xml.contains("<Key>dir/file1.txt</Key>"));
         assert!(versions_xml.contains("<Key>dir/file2.txt</Key>"));
         assert!(versions_xml.contains("<Key>root.txt</Key>"));
