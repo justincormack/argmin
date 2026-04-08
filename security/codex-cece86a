@@ -1,0 +1,167 @@
+RequestObjectTag policies ignored for PutObjectTagging
+Link: https://chatgpt.com/codex/security/findings/671c398339708191afd6e9c8dd91c388?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=low
+Criticality: low (attack path: low)
+Status: fixed
+
+# Resolution
+Valid issue. Fixed in commit `1b89dda` (`Honor request tag conditions for object tagging`).
+
+We first added AWS-backed `s3-tests` coverage for the real API surface:
+- `test_bucket_policy_put_obj_tagging_request_object_tag`
+- `test_bucket_policy_put_obj_version_tagging_request_object_tag`
+
+Those tests passed against AWS and failed locally before the fix, confirming
+that both `PutObjectTagging` and `PutObjectVersionTagging` must honor
+`s3:RequestObjectTag/...` bucket-policy conditions.
+
+The fix in `1b89dda` threaded request-tag XML through the actual object-tagging
+authorization path, so `lock_object_for_authorized_tagging` now evaluates
+bucket policy with request tags for tagging writes instead of only existing
+object tags. The change also added matching `server-core` regressions for both
+current-object and versioned tagging.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: cece86a
+Author: justin@specialbusservice.com
+Created: 29/03/2026, 17:10:36
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: RequestObjectTag condition evaluation is wired only for PutObject-related flows, leaving PutObjectTagging/PutObjectVersionTagging policy checks unaware of request tags.
+The commit adds RequestObjectTag condition support in the policy engine, but PutObjectTagging authorization still calls bucket_policy_decision_for_object, which only injects ExistingObjectTag values into PolicyRequest. As a result, RequestObjectTag conditions are evaluated against empty request tags for tagging operations. An authenticated client with tagging permission can set arbitrary tags even when a bucket policy is intended to restrict tag values, potentially enabling escalation via ExistingObjectTag-based access rules.
+
+# Validation
+## Rubric
+- [x] Locate PutObjectTagging authorization path and confirm it uses bucket_policy_decision_for_object.
+- [x] Verify bucket_policy_decision_for_object only injects ExistingObjectTag values and never request tags.
+- [x] Confirm RequestObjectTag condition evaluation relies on request_object_tag_value and missing tags return NoMatch.
+- [x] Trace fallback to requester_can_manage_object_tags for NoMatch, allowing bucket/object owners.
+- [ ] Build/run PoC test to demonstrate denial bypass (blocked by missing libisal dependency).
+## Report
+Attempted dynamic reproduction by adding a unit test (patch in artifacts) and running `cargo test -p server-core put_object_tagging_request_object_tag_condition_not_applied -- --nocapture`, but the build failed because `libisal` is missing (ec-sys build.rs error: “libisal not found; install intel-isa-l or set PKG_CONFIG_PATH”). Valgrind and gdb are not installed (commands returned 127). Code inspection shows PutObjectTagging authorization flows through `lock_object_for_authorized_tagging` → `requester_can_manage_object_tags_with_bucket_policy` → `bucket_policy_decision_for_object` (crates/server-core/src/coordinator.rs:4159-4189, 3584-3605). `bucket_policy_decision_for_object` only injects existing object tags and never populates request tags (coordinator.rs:3432-3460), while PutObject-like paths use `bucket_policy_decision_for_put_object_action` which does populate request tags via `with_request_object_tags` (coordinator.rs:3494-3514; crates/auth/src/bucket_policy.rs:263-265). `PolicyRequest::new` initializes `request_object_tags` to empty (bucket_policy.rs:163-180), and RequestObjectTag conditions read `request_object_tag_value` (bucket_policy.rs:969-977, 332-336); for `StringEquals`, missing tags yield `NoMatch` (bucket_policy.rs:1034-1042). As a result, RequestObjectTag conditions do not match PutObjectTagging requests, leading to `PolicyEvaluation::NoMatch` and fallback to `requester_can_manage_object_tags` (coordinator.rs:3584-3605), which allows bucket/object owners (coordinator.rs:3258-3269), enabling tag restriction bypass.
+
+# Evidence
+/workspace/argmin/crates/auth/src/bucket_policy.rs (L969 to 978)
+  Note: RequestObjectTag conditions are evaluated from PolicyRequest.request_object_tag_value, which is never populated for PutObjectTagging requests.
+```
+fn condition_clause_matches_request(
+    clause: &PolicyConditionClause,
+    request: &PolicyRequest<'_>,
+) -> ConditionMatchResult {
+    if let Some(tag_key) = clause.key.strip_prefix("s3:ExistingObjectTag/") {
+        return string_equals_condition_matches(clause, request.existing_object_tag_value(tag_key));
+    }
+    if let Some(tag_key) = clause.key.strip_prefix("s3:RequestObjectTag/") {
+        return string_condition_matches(clause, request.request_object_tag_value(tag_key));
+    }
+```
+
+/workspace/argmin/crates/server-core/src/coordinator.rs (L3432 to 3460)
+  Note: bucket_policy_decision_for_object only builds PolicyRequest with ExistingObjectTag values, leaving RequestObjectTag values unset for tagging actions.
+```
+    fn bucket_policy_decision_for_object(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<auth::PolicyEvaluation, ServerError> {
+        let Some(policy) = policy else {
+            return Ok(auth::PolicyEvaluation::NoMatch);
+        };
+
+        let existing_tags = if policy.requires_existing_object_tags_for_action(action) {
+            Self::parse_policy_existing_object_tags(object)?
+        } else {
+            Vec::new()
+        };
+        let request_tags: Vec<auth::PolicyTag<'_>> = existing_tags
+            .iter()
+            .map(|(key, value)| auth::PolicyTag::new(key, value))
+            .collect();
+        let request = auth::PolicyRequest::new(
+            action,
+            &bucket.name,
+            object.key().as_str(),
+            requester.principal_opt(),
+            requester.canonical_user_id(),
+        );
+        let request = request.with_existing_object_tags(&request_tags);
+        Ok(policy.evaluate(&request))
+```
+
+/workspace/argmin/crates/server-core/src/coordinator.rs (L4159 to 4189)
+  Note: PutObjectTagging authorization flows through requester_can_manage_object_tags_with_bucket_policy, which uses bucket_policy_decision_for_object (no request tags).
+```
+    fn lock_object_for_authorized_tagging<'a>(
+        &'a self,
+        requester: &Requester,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        policy_action: auth::PolicyAction,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<LockedReadObject<'a>, ServerError> {
+        let bucket_info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
+        let can_discover_missing =
+            Self::requester_can_bucket_admin(requester, &bucket_info.owner_principal);
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
+            Ok(locked) => locked,
+            Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
+                if !can_discover_missing =>
+            {
+                return Err(ServerError::AccessDenied);
+            }
+            Err(other) => return Err(other),
+        };
+
+        if Self::requester_can_manage_object_tags_with_bucket_policy(
+            requester,
+            &bucket_info,
+            &locked.record,
+            policy_action,
+            bucket_policy.as_deref(),
+        )? {
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Although the logic flaw is real, the default runtime config provisions a single account/credential (main.rs 118-131) and tag management already requires bucket/object ownership (coordinator.rs 3258-3269). The bypass therefore mainly affects self-imposed policy constraints rather than cross-tenant access, reducing impact and likelihood compared to a multi-tenant S3 environment.
+## Likelihood
+low - Requires valid credentials and a policy that relies on RequestObjectTag; default deployment is single-account and limits exposure.
+## Impact
+low - Policy-based tag-value restrictions are bypassed for owners, which can undermine tag-based access controls but does not enable cross-tenant access in the default single-account design.
+## Assumptions
+- Operators use bucket policies with s3:RequestObjectTag conditions to restrict tag values.
+- Attackers possess valid SigV4 credentials and can call PutObjectTagging/PutObjectVersionTagging.
+- Deployment may expose the HTTP listener beyond localhost via ARGMIN_LISTEN_ADDR.
+- valid SigV4 credentials
+- bucket policy with s3:RequestObjectTag conditions
+- ability to call PutObjectTagging/PutObjectVersionTagging
+## Path
+n1 -> n2 -> n3 -> n4 -> n5
+## Path evidence
+- `crates/server-core/src/coordinator.rs:3432-3460` - PolicyRequest for object actions only includes existing tags; no request tags are added.
+- `crates/auth/src/bucket_policy.rs:969-978` - RequestObjectTag conditions read request.request_object_tag_value.
+- `crates/auth/src/bucket_policy.rs:332-336` - request_object_tag_value reads from request_object_tags, which are empty in tagging path.
+- `crates/auth/src/bucket_policy.rs:1034-1041` - Missing request tag value yields NoMatch for StringEquals.
+- `crates/server-core/src/coordinator.rs:3584-3605` - NoMatch falls back to requester_can_manage_object_tags.
+- `crates/server-core/src/coordinator.rs:3258-3269` - Only bucket or object owner can manage tags by default.
+- `crates/argmin-s3/src/main.rs:118-131` - Single credential record is configured, indicating single-account deployment.
+- `crates/argmin-s3/src/config.rs:52-59` - Default listen address is 127.0.0.1:9000 but is configurable.
+- `crates/argmin-s3/src/main.rs:138-179` - Server binds to listen_addr and serves HTTP(S).
+## Narrative
+PutObjectTagging authorization uses bucket_policy_decision_for_object, which only loads existing object tags and never attaches request tags to the PolicyRequest (coordinator.rs 3432-3460). RequestObjectTag conditions are evaluated via request_object_tag_value (bucket_policy.rs 969-977; 332-336), and missing values result in NoMatch (bucket_policy.rs 1034-1041). The policy decision then falls back to requester_can_manage_object_tags (coordinator.rs 3584-3605), which allows bucket/object owners (coordinator.rs 3258-3269). As a result, tagging requests do not enforce RequestObjectTag constraints, enabling owners to set tag values that policies intended to restrict. The HTTP server binds to a configurable listen address (config.rs 52-59; main.rs 138-179), so the path is reachable via the S3 API in normal deployments.
+## Controls
+- SigV4 authentication
+- Bucket policy evaluation
+- Owner/object-owner tag authorization
+## Blindspots
+- No runtime PoC executed due to missing ISA-L dependency in the environment.
+- Deployment exposure (public vs internal) is operator-configurable and not observable from repo alone.
+- Multiple-credential or multi-tenant extensions are not represented in the current configuration.
