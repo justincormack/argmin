@@ -944,6 +944,7 @@ impl HttpFrontend {
                 )?;
                 Ok(S3Response::list_objects_v1(
                     &bucket,
+                    self.coordinator.region(),
                     prefix.as_deref(),
                     delimiter.as_deref(),
                     marker.as_deref(),
@@ -994,6 +995,7 @@ impl HttpFrontend {
                 )?;
                 Ok(S3Response::list_objects_v2(
                     &bucket,
+                    self.coordinator.region(),
                     prefix.as_deref(),
                     delimiter.as_deref(),
                     encoding_type.as_deref(),

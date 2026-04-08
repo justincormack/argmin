@@ -1,8 +1,8 @@
 /// Hand-formatted XML for S3 responses with lightweight request XML parsing.
 use crate::coordinator::{
     BucketAcl, BucketObjectLockConfigurationUpdate, BucketSummary, ChecksumClaim, CompletePart,
-    DeleteError, DeletedObject, ListObjectVersionsResult, ListObjectsResult, ListPartsResult,
-    ObjectPartsInfo,
+    DeleteError, DeletedObject, ListEntry, ListObjectVersionsResult, ListObjectsResult,
+    ListPartsResult, ObjectPartsInfo,
 };
 use crate::error::ServerError;
 use checksum::{ChecksumAlgorithm, ChecksumType};
@@ -541,13 +541,11 @@ pub fn list_objects_v2_xml(
     xml.push_str(&xml_escape(bucket));
     xml.push_str("</Name>");
 
+    xml.push_str("<Prefix>");
     if let Some(p) = prefix {
-        xml.push_str("<Prefix>");
         xml.push_str(&xml_escape_list_value(&encode_value(p, encoding_type)));
-        xml.push_str("</Prefix>");
-    } else {
-        xml.push_str("<Prefix/>");
     }
+    xml.push_str("</Prefix>");
 
     if let Some(d) = delimiter {
         xml.push_str("<Delimiter>");
@@ -592,34 +590,9 @@ pub fn list_objects_v2_xml(
     }
 
     let owner_id = result.owner_canonical_id.as_str();
-    let owner_name = result.owner_principal.as_str();
 
     for obj in &result.objects {
-        xml.push_str("<Contents>");
-        xml.push_str("<Key>");
-        xml.push_str(&xml_escape_list_value(&encode_value(
-            &obj.key,
-            encoding_type,
-        )));
-        xml.push_str("</Key>");
-        xml.push_str("<LastModified>");
-        xml.push_str(&format_timestamp(obj.last_modified));
-        xml.push_str("</LastModified>");
-        xml.push_str("<ETag>");
-        xml.push_str(&xml_escape(&obj.etag));
-        xml.push_str("</ETag>");
-        xml.push_str("<Size>");
-        xml.push_str(&obj.size.to_string());
-        xml.push_str("</Size>");
-        xml.push_str("<StorageClass>STANDARD</StorageClass>");
-        if fetch_owner {
-            xml.push_str("<Owner><ID>");
-            xml.push_str(&xml_escape(owner_id));
-            xml.push_str("</ID><DisplayName>");
-            xml.push_str(&xml_escape(owner_name));
-            xml.push_str("</DisplayName></Owner>");
-        }
-        xml.push_str("</Contents>");
+        render_list_entry_xml(&mut xml, obj, owner_id, encoding_type, fetch_owner);
     }
 
     for prefix in &result.common_prefixes {
@@ -652,21 +625,17 @@ pub fn list_objects_v1_xml(
     xml.push_str(&xml_escape(bucket));
     xml.push_str("</Name>");
 
+    xml.push_str("<Prefix>");
     if let Some(p) = prefix {
-        xml.push_str("<Prefix>");
         xml.push_str(&xml_escape_list_value(&encode_value(p, encoding_type)));
-        xml.push_str("</Prefix>");
-    } else {
-        xml.push_str("<Prefix/>");
     }
+    xml.push_str("</Prefix>");
 
+    xml.push_str("<Marker>");
     if let Some(m) = marker {
-        xml.push_str("<Marker>");
         xml.push_str(&xml_escape_list_value(&encode_value(m, encoding_type)));
-        xml.push_str("</Marker>");
-    } else {
-        xml.push_str("<Marker/>");
     }
+    xml.push_str("</Marker>");
 
     if let Some(d) = delimiter {
         xml.push_str("<Delimiter>");
@@ -688,7 +657,7 @@ pub fn list_objects_v1_xml(
     xml.push_str(if result.is_truncated { "true" } else { "false" });
     xml.push_str("</IsTruncated>");
 
-    if result.is_truncated {
+    if result.is_truncated && delimiter.is_some() {
         if let Some(ref token) = result.next_continuation_token {
             xml.push_str("<NextMarker>");
             xml.push_str(&xml_escape_list_value(&encode_value(token, encoding_type)));
@@ -697,32 +666,9 @@ pub fn list_objects_v1_xml(
     }
 
     let owner_id = result.owner_canonical_id.as_str();
-    let owner_name = result.owner_principal.as_str();
 
     for obj in &result.objects {
-        xml.push_str("<Contents>");
-        xml.push_str("<Key>");
-        xml.push_str(&xml_escape_list_value(&encode_value(
-            &obj.key,
-            encoding_type,
-        )));
-        xml.push_str("</Key>");
-        xml.push_str("<LastModified>");
-        xml.push_str(&format_timestamp(obj.last_modified));
-        xml.push_str("</LastModified>");
-        xml.push_str("<ETag>");
-        xml.push_str(&xml_escape(&obj.etag));
-        xml.push_str("</ETag>");
-        xml.push_str("<Size>");
-        xml.push_str(&obj.size.to_string());
-        xml.push_str("</Size>");
-        xml.push_str("<StorageClass>STANDARD</StorageClass>");
-        xml.push_str("<Owner><ID>");
-        xml.push_str(&xml_escape(owner_id));
-        xml.push_str("</ID><DisplayName>");
-        xml.push_str(&xml_escape(owner_name));
-        xml.push_str("</DisplayName></Owner>");
-        xml.push_str("</Contents>");
+        render_list_entry_xml(&mut xml, obj, owner_id, encoding_type, true);
     }
 
     for prefix in &result.common_prefixes {
@@ -2181,6 +2127,52 @@ fn xml_escape_list_value(s: &str) -> String {
         }
     }
     out
+}
+
+fn render_list_owner_xml(xml: &mut String, owner_id: &str) {
+    xml.push_str("<Owner><ID>");
+    xml.push_str(&xml_escape(owner_id));
+    xml.push_str("</ID></Owner>");
+}
+
+fn render_list_entry_xml(
+    xml: &mut String,
+    entry: &ListEntry,
+    owner_id: &str,
+    encoding_type: Option<&str>,
+    include_owner: bool,
+) {
+    xml.push_str("<Contents>");
+    xml.push_str("<Key>");
+    xml.push_str(&xml_escape_list_value(&encode_value(
+        &entry.key,
+        encoding_type,
+    )));
+    xml.push_str("</Key>");
+    xml.push_str("<LastModified>");
+    xml.push_str(&format_timestamp(entry.last_modified));
+    xml.push_str("</LastModified>");
+    xml.push_str("<ETag>");
+    xml.push_str(&xml_escape(&entry.etag));
+    xml.push_str("</ETag>");
+    if let Some(checksum_algorithm) = entry.checksum_algorithm {
+        xml.push_str("<ChecksumAlgorithm>");
+        xml.push_str(checksum_algorithm.as_str());
+        xml.push_str("</ChecksumAlgorithm>");
+    }
+    if let Some(checksum_type) = entry.checksum_type {
+        xml.push_str("<ChecksumType>");
+        xml.push_str(checksum_type.as_str());
+        xml.push_str("</ChecksumType>");
+    }
+    xml.push_str("<Size>");
+    xml.push_str(&entry.size.to_string());
+    xml.push_str("</Size>");
+    if include_owner {
+        render_list_owner_xml(xml, owner_id);
+    }
+    xml.push_str("<StorageClass>STANDARD</StorageClass>");
+    xml.push_str("</Contents>");
 }
 
 /// Escape special XML characters.
@@ -4107,6 +4099,8 @@ mod tests {
                 size: 42,
                 etag: "\"abc123\"".to_string(),
                 last_modified: 1685000000000,
+                checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
+                checksum_type: Some(ChecksumType::FullObject),
             }],
             common_prefixes: vec![],
             is_truncated: false,
@@ -4119,9 +4113,11 @@ mod tests {
         assert!(xml.contains("<Size>42</Size>"));
         assert!(xml.contains("ListBucketResult"));
         assert!(xml.contains(&format!(
-            "<Owner><ID>{}</ID><DisplayName>owner</DisplayName></Owner>",
+            "<Owner><ID>{}</ID></Owner>",
             result.owner_canonical_id.as_str()
         )));
+        assert!(xml.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"));
+        assert!(xml.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"));
     }
 
     #[test]
@@ -4132,6 +4128,8 @@ mod tests {
                 size: 100,
                 etag: "\"aabbccdd\"".to_string(),
                 last_modified: 1685000000000,
+                checksum_algorithm: None,
+                checksum_type: None,
             }],
             common_prefixes: vec!["photos/2024/".to_string()],
             is_truncated: true,
@@ -4165,6 +4163,8 @@ mod tests {
                 size: 7,
                 etag: "\"abc123\"".to_string(),
                 last_modified: 1685000000000,
+                checksum_algorithm: None,
+                checksum_type: None,
             }],
             common_prefixes: vec!["dir/prefix here+".to_string()],
             is_truncated: false,
@@ -4198,6 +4198,8 @@ mod tests {
                 size: 10,
                 etag: "\"abc\"".to_string(),
                 last_modified: 0,
+                checksum_algorithm: None,
+                checksum_type: None,
             }],
             common_prefixes: vec!["photos/".to_string(), "docs/".to_string()],
             is_truncated: false,
@@ -4230,9 +4232,9 @@ mod tests {
             owner_principal: "owner".to_string(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
-        // With prefix=None → should produce <Prefix/>
+        // With prefix=None AWS emits an explicit empty Prefix element.
         let xml = list_objects_v2_xml("bucket", None, None, None, None, None, false, 1000, &result);
-        assert!(xml.contains("<Prefix/>"));
+        assert!(xml.contains("<Prefix></Prefix>"));
         assert!(!xml.contains("<Delimiter>"));
         assert!(!xml.contains("<NextContinuationToken>"));
     }
@@ -4245,6 +4247,8 @@ mod tests {
                 size: 42,
                 etag: "\"abc123\"".to_string(),
                 last_modified: 1685000000000,
+                checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
+                checksum_type: Some(ChecksumType::FullObject),
             }],
             common_prefixes: vec![],
             is_truncated: false,
@@ -4254,12 +4258,15 @@ mod tests {
         };
         let xml = list_objects_v1_xml("bucket", None, None, None, None, 1000, &result);
         assert!(xml.contains("<Key>my-key</Key>"));
-        assert!(xml.contains("<Marker/>"));
+        assert!(xml.contains("<Prefix></Prefix>"));
+        assert!(xml.contains("<Marker></Marker>"));
         assert!(xml.contains("ListBucketResult"));
         assert!(xml.contains(&format!(
-            "<Owner><ID>{}</ID><DisplayName>owner</DisplayName></Owner>",
+            "<Owner><ID>{}</ID></Owner>",
             result.owner_canonical_id.as_str()
         )));
+        assert!(xml.contains("<ChecksumAlgorithm>CRC32</ChecksumAlgorithm>"));
+        assert!(xml.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"));
         // V1 should NOT have KeyCount or ContinuationToken
         assert!(!xml.contains("<KeyCount>"));
         assert!(!xml.contains("<ContinuationToken>"));
@@ -4273,6 +4280,8 @@ mod tests {
                 size: 100,
                 etag: "\"aabbccdd\"".to_string(),
                 last_modified: 1685000000000,
+                checksum_algorithm: None,
+                checksum_type: None,
             }],
             common_prefixes: vec!["photos/2024/".to_string()],
             is_truncated: true,
@@ -4311,8 +4320,8 @@ mod tests {
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
         let xml = list_objects_v1_xml("bucket", None, None, None, None, 1000, &result);
-        assert!(xml.contains("<Prefix/>"));
-        assert!(xml.contains("<Marker/>"));
+        assert!(xml.contains("<Prefix></Prefix>"));
+        assert!(xml.contains("<Marker></Marker>"));
         assert!(!xml.contains("<Delimiter>"));
         assert!(!xml.contains("<NextMarker>"));
     }
@@ -4325,6 +4334,8 @@ mod tests {
                 size: 10,
                 etag: "\"etag\"".to_string(),
                 last_modified: 0,
+                checksum_algorithm: None,
+                checksum_type: None,
             }],
             common_prefixes: vec![],
             is_truncated: true,
@@ -4334,8 +4345,8 @@ mod tests {
         };
         let xml = list_objects_v1_xml("bucket", None, None, Some("key1"), None, 1, &result);
         assert!(xml.contains("<Marker>key1</Marker>"));
-        assert!(xml.contains("<NextMarker>key2</NextMarker>"));
         assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        assert!(!xml.contains("<NextMarker>"));
     }
 
     #[test]

@@ -1932,6 +1932,90 @@ fn test_list_object_versions_response_shape_matches_aws() {
 }
 
 #[test]
+fn test_list_objects_v1_without_delimiter_omits_next_marker_like_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        if env.external_region != s3_tests::server::TEST_REGION {
+            return;
+        }
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+
+        for (bucket, client) in [
+            (&external_bucket, &env.external_client),
+            (&local_bucket, &env.local_client),
+        ] {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key("aaa")
+                .body(ByteStream::from_static(b"a"))
+                .send()
+                .await
+                .expect("put first list-objects fixture");
+            client
+                .put_object()
+                .bucket(bucket)
+                .key("zzz")
+                .body(ByteStream::from_static(b"z"))
+                .send()
+                .await
+                .expect("put second list-objects fixture");
+        }
+
+        let aws_list = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("max-keys=1"),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_list = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("max-keys=1"),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "ListObjectsV1WithoutDelimiter",
+            &aws_list,
+            &local_list,
+            &["content-length"],
+            &[],
+            &["Name", "LastModified", "ETag", "ID", "DisplayName"],
+        );
+        assert!(
+            xml_tag_text(&aws_list.body, "NextMarker").is_none(),
+            "aws unexpectedly included NextMarker: {}",
+            aws_list.body
+        );
+        assert!(
+            xml_tag_text(&local_list.body, "NextMarker").is_none(),
+            "local unexpectedly included NextMarker: {}",
+            local_list.body
+        );
+
+        delete_all_and_bucket(
+            &env.external_client,
+            &external_bucket,
+            &["aaa".to_string(), "zzz".to_string()],
+        )
+        .await;
+        delete_all_and_bucket(
+            &env.local_client,
+            &local_bucket,
+            &["aaa".to_string(), "zzz".to_string()],
+        )
+        .await;
+    });
+}
+
+#[test]
 fn test_list_multipart_uploads_response_shape_matches_aws() {
     s3_tests::run(async {
         let Some(env) = ComparisonEnv::setup().await else {

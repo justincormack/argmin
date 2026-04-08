@@ -2375,6 +2375,8 @@ pub struct ListEntry {
     pub size: u64,
     pub etag: String,
     pub last_modified: u64,
+    pub checksum_algorithm: Option<ChecksumAlgorithm>,
+    pub checksum_type: Option<ChecksumType>,
 }
 
 /// Result of a ListObjectsV2 operation.
@@ -12852,11 +12854,18 @@ impl Coordinator {
                         let record = obj
                             .as_live()
                             .expect("list_objects returns only live objects");
+                        let system_metadata = self.deserialize_visible_system_metadata(
+                            record.system_metadata_blob.as_ref(),
+                            &record.encryption,
+                            None,
+                        )?;
                         objects.push(ListEntry {
                             key: obj_key.to_string(),
                             size: record.size,
                             etag: record.etag.format(),
                             last_modified: record.last_modified,
+                            checksum_algorithm: system_metadata.checksum_algorithm(),
+                            checksum_type: system_metadata.checksum_type(),
                         });
                         entry_count += 1;
                         last_entry = Some(obj_key.to_string());
@@ -12875,11 +12884,18 @@ impl Coordinator {
                     let record = obj
                         .as_live()
                         .expect("list_objects returns only live objects");
+                    let system_metadata = self.deserialize_visible_system_metadata(
+                        record.system_metadata_blob.as_ref(),
+                        &record.encryption,
+                        None,
+                    )?;
                     objects.push(ListEntry {
                         key: obj_key.to_string(),
                         size: record.size,
                         etag: record.etag.format(),
                         last_modified: record.last_modified,
+                        checksum_algorithm: system_metadata.checksum_algorithm(),
+                        checksum_type: system_metadata.checksum_type(),
                     });
                     entry_count += 1;
                     last_entry = Some(obj_key.to_string());

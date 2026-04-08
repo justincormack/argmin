@@ -687,6 +687,7 @@ impl S3Response {
     #[must_use]
     pub fn list_objects_v2(
         bucket: &str,
+        region: &str,
         prefix: Option<&str>,
         delimiter: Option<&str>,
         encoding_type: Option<&str>,
@@ -707,13 +708,17 @@ impl S3Response {
             max_keys,
             result,
         );
-        Self::new(200).xml_body(body)
+        Self::new(200)
+            .header("x-amz-bucket-region", region)
+            .chunked_xml_body(body)
     }
 
     /// Build a response for `ListObjects` v1.
+    #[allow(clippy::too_many_arguments)]
     #[must_use]
     pub fn list_objects_v1(
         bucket: &str,
+        region: &str,
         prefix: Option<&str>,
         delimiter: Option<&str>,
         marker: Option<&str>,
@@ -730,7 +735,9 @@ impl S3Response {
             max_keys,
             result,
         );
-        Self::new(200).xml_body(body)
+        Self::new(200)
+            .header("x-amz-bucket-region", region)
+            .chunked_xml_body(body)
     }
 
     /// Build a response for `DeleteObjects` (batch delete).
@@ -2446,6 +2453,8 @@ mod tests {
                 size: 42,
                 etag: "\"etag1\"".into(),
                 last_modified: 0,
+                checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
+                checksum_type: Some(ChecksumType::FullObject),
             }],
             common_prefixes: vec![],
             is_truncated: false,
@@ -2455,6 +2464,7 @@ mod tests {
         };
         let resp = S3Response::list_objects_v2(
             "bucket",
+            "us-east-1",
             Some("pre"),
             None,
             None,
@@ -2465,11 +2475,11 @@ mod tests {
             &result,
         );
         assert_eq!(resp.status_code, 200);
-        let body = String::from_utf8(resp.body).unwrap();
-        assert!(body.contains("ListBucketResult"));
-        assert!(body.contains("key1"));
-        assert!(body.contains("<Size>42</Size>"));
-        assert!(body.contains(result.owner_canonical_id.as_str()));
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        assert_eq!(find_header(&resp, "Content-Length"), None);
+        assert_eq!(find_header(&resp, "x-amz-bucket-region"), Some("us-east-1"));
+        assert!(resp.body.is_empty());
+        assert!(resp.stream.is_some());
     }
 
     // ── list_objects_v1 ───────────────────────────────────────────────
@@ -2482,6 +2492,8 @@ mod tests {
                 size: 42,
                 etag: "\"etag1\"".into(),
                 last_modified: 0,
+                checksum_algorithm: Some(ChecksumAlgorithm::Crc32),
+                checksum_type: Some(ChecksumType::FullObject),
             }],
             common_prefixes: vec![],
             is_truncated: false,
@@ -2489,15 +2501,22 @@ mod tests {
             owner_principal: "owner".into(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
         };
-        let resp =
-            S3Response::list_objects_v1("bucket", Some("pre"), None, None, None, 1000, &result);
+        let resp = S3Response::list_objects_v1(
+            "bucket",
+            "us-east-1",
+            Some("pre"),
+            None,
+            None,
+            None,
+            1000,
+            &result,
+        );
         assert_eq!(resp.status_code, 200);
-        let body = String::from_utf8(resp.body).unwrap();
-        assert!(body.contains("ListBucketResult"));
-        assert!(body.contains("key1"));
-        assert!(body.contains("<Marker/>"));
-        assert!(body.contains(result.owner_canonical_id.as_str()));
-        assert!(!body.contains("<KeyCount>"));
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        assert_eq!(find_header(&resp, "Content-Length"), None);
+        assert_eq!(find_header(&resp, "x-amz-bucket-region"), Some("us-east-1"));
+        assert!(resp.body.is_empty());
+        assert!(resp.stream.is_some());
     }
 
     #[test]
