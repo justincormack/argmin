@@ -1,0 +1,142 @@
+Object lock auth order leaks bucket lock configuration
+Link: https://chatgpt.com/codex/security/findings/c74eddfc6a208191a95790611717414a?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=low
+Criticality: low (attack path: low)
+Status: fixed
+
+# Resolution
+Fixed in commit `a46b324` (`Align object lock auth order with AWS`).
+
+We validated the AWS contract with a normal `s3-tests` integration test rather
+than relying on inference from code inspection alone. The new test in
+`crates/s3-tests/tests/object_lock.rs`
+(`test_object_lock_unauthorized_calls_do_not_reveal_bucket_lock_configuration`)
+compares unauthorized `Get/PutObjectRetention` and `Get/PutObjectLegalHold`
+calls on a plain bucket versus an Object Lock bucket and passed against AWS.
+
+That confirmed the report was valid: unauthorized callers must not be able to
+distinguish the two bucket types. The fix in `a46b324` moves the
+`ensure_object_lock_bucket` check in
+`lock_object_for_authorized_object_lock` to after the authorization decision,
+so unauthorized callers now receive the same `AccessDenied` response on both
+bucket types. The change also added a matching `server-core` regression test.
+
+# Metadata
+Repo: justincormack/argmin
+Commit: bb033e7
+Author: justin@specialbusservice.com
+Created: 30/03/2026, 17:44:50
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced a low-severity information disclosure by moving object-lock configuration validation ahead of authorization checks.
+In lock_object_for_authorized_object_lock the code now calls ensure_object_lock_bucket (which returns an InvalidRequest error when Object Lock is disabled) before it evaluates bucket-policy authorization. This means an unauthenticated or unauthorized requester can probe Get/Put ObjectRetention or LegalHold and observe a different error for buckets without Object Lock enabled, leaking configuration state that previously returned AccessDenied. The pre-commit path authorized the requester first, preventing this disclosure.
+
+# Validation
+## Rubric
+- [ ] Build debug binary and run targeted object-lock operation to observe runtime error difference (blocked: libisal missing).
+- [ ] Attempt sanitizer/valgrind/debugger instrumentation (blocked: stable toolchain/no valgrind/gdb).
+- [x] Confirm ensure_object_lock_bucket returns InvalidRequest when Object Lock is disabled (coordinator.rs:6623-6629).
+- [x] Confirm lock_object_for_authorized_object_lock calls ensure before authorization and only later returns AccessDenied (coordinator.rs:6781-6809).
+- [x] Verify object-lock APIs route through this helper and prior commit authorized before ensure (coordinator.rs:6945-7075; parent coordinator.rs:6633-6644).
+## Report
+Dynamic validation attempts failed due to missing dependencies/tooling. `cargo build -p argmin-s3` and `cargo build -p server-core` both abort in `crates/ec-sys` with `libisal not found; install intel-isa-l or set PKG_CONFIG_PATH` (build-script panic). An ASan attempt with `RUSTFLAGS='-Z sanitizer=address'` failed because the stable toolchain rejects `-Z` nightly flags. `valgrind` and `gdb` are not installed (`command not found`), so valgrind/debugger traces were not possible.
+
+Code analysis confirms the info leak. In the current commit, `ensure_object_lock_bucket` returns `ServerError::InvalidRequest` with reason "Bucket is missing Object Lock Configuration" when Object Lock is disabled (crates/server-core/src/coordinator.rs:6623-6629). `lock_object_for_authorized_object_lock` now calls `ensure_object_lock_bucket` immediately after loading the bucket summary and expected owner check, before bucket-policy authorization; AccessDenied is only returned later after `requester_can_manage_object_lock_with_bucket_policy` (coordinator.rs:6781-6809). The object-lock API handlers (`get_object_retention_for_request`, `put_object_retention_for_request`, `get_object_legal_hold_for_request`, `put_object_legal_hold_for_request`) all route through this helper (coordinator.rs:6945-7075), so an unauthorized caller can distinguish buckets with Object Lock disabled by receiving `InvalidRequest` instead of `AccessDenied`.
+
+The previous commit shows `lock_object_for_authorized_object_lock` authorizing first via `authorize_bucket_admin_requester` and only then calling `ensure_object_lock_bucket` (parent coordinator.rs:6633-6644), which would have masked this configuration detail with `AccessDenied`. This ordering change plausibly introduces the reported information disclosure.
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator.rs (L6623 to 6629)
+  Note: ensure_object_lock_bucket returns InvalidRequest when Object Lock is disabled, which is now observable before auth checks.
+```
+    fn ensure_object_lock_bucket(bucket: &BucketSummary) -> Result<(), ServerError> {
+        if bucket.object_lock.enabled {
+            Ok(())
+        } else {
+            Err(ServerError::InvalidRequest {
+                reason: "Bucket is missing Object Lock Configuration".to_string(),
+            })
+```
+
+/workspace/argmin/crates/server-core/src/coordinator.rs (L6765 to 6809)
+  Note: lock_object_for_authorized_object_lock calls ensure_object_lock_bucket before evaluating bucket-policy authorization, enabling the info leak.
+```
+    fn lock_object_for_authorized_object_lock<'a>(
+        &'a self,
+        requester: &Requester,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        policy_action: auth::PolicyAction,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<
+        (
+            BucketSummary,
+            Option<Arc<auth::BucketPolicy>>,
+            LockedReadObject<'a>,
+        ),
+        ServerError,
+    > {
+        let bucket_info = self.active_bucket_summary(bucket)?;
+        Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
+        Self::ensure_object_lock_bucket(&bucket_info)?;
+        let can_discover_missing =
+            Self::requester_can_bucket_admin(requester, &bucket_info.owner_principal);
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
+            Ok(locked) => locked,
+            Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
+                if !can_discover_missing =>
+            {
+                return Err(ServerError::AccessDenied);
+            }
+            Err(other) => return Err(other),
+        };
+
+        if Self::requester_can_manage_object_lock_with_bucket_policy(
+            requester,
+            &bucket_info,
+            &locked.record,
+            policy_action,
+            bucket_policy.as_deref(),
+        )? {
+            // Return the policy snapshot fetched before taking object locks so
+            // later authorization checks do not re-enter bucket metadata and
+            // invert the bucket/object lock order.
+            Ok((bucket_info, bucket_policy, locked))
+        } else {
+            Err(ServerError::AccessDenied)
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Severity remains low: the bug is a configuration oracle with minimal impact, and strong authorization still protects data and state. Exploitation requires network access to the service, which defaults to localhost (config.rs:58).
+## Likelihood
+high - Exploitation is easy once the service is reachable, but default binding is localhost and the leaked data is low value. | Remote network vector
+## Impact
+low - The issue only discloses whether Object Lock is enabled on a bucket via error differences; it does not expose object data or allow state changes.
+## Assumptions
+- The argmin-s3 HTTP endpoint is reachable by the attacker (e.g., bound to a non-local address or exposed via reverse proxy).
+- The attacker can send unauthenticated or unauthorized requests to the ObjectRetention/ObjectLegalHold APIs for an existing bucket.
+- Running argmin-s3 service with HTTP endpoint reachable
+- Target bucket exists
+- Attacker can issue object lock API requests without required permissions
+## Path
+HTTP object-lock request -> AuthContext::anonymous -> ensure_object_lock_bucket (InvalidRequest if disabled) -> authz check -> error oracle
+## Path evidence
+- `crates/server-core/src/coordinator.rs:6623-6629` - ensure_object_lock_bucket returns InvalidRequest when Object Lock is disabled.
+- `crates/server-core/src/coordinator.rs:6781-6784` - Object Lock configuration check is performed before authorization.
+- `crates/server-core/src/coordinator.rs:6945-7085` - ObjectRetention/LegalHold APIs route through lock_object_for_authorized_object_lock.
+- `crates/server-http/src/http/mod.rs:2397-2412` - Missing authentication yields AuthContext::anonymous, allowing unauth requests to reach authorization logic.
+- `crates/argmin-s3/src/config.rs:52-58` - Secrets are loaded from env and listen address defaults to 127.0.0.1:9000 (private by default).
+## Narrative
+In server-core, ensure_object_lock_bucket returns InvalidRequest when Object Lock is disabled (coordinator.rs:6623-6629). The Object Lock request helper calls this check before evaluating bucket-policy authorization (coordinator.rs:6781-6809), and all ObjectRetention/LegalHold APIs route through this helper (coordinator.rs:6945-7085). Because missing auth is treated as AuthContext::anonymous (server-http/src/http/mod.rs:2397-2412), an unauthenticated or unauthorized caller can observe InvalidRequest vs AccessDenied and infer whether a bucket has Object Lock enabled. This leaks configuration state but does not expose object data or modify state.
+## Controls
+- SigV4 authentication (auth::authenticate_request)
+- Bucket-policy authorization checks
+- Expected bucket owner check
+## Blindspots
+- No runtime validation; unable to confirm behavior with a live server in this environment.
+- Deployment exposure (public vs internal) is unknown and depends on operator configuration.
