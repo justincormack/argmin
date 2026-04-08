@@ -10,6 +10,8 @@ This is a narrow consistency plan:
 - make auth timing explicit and uniform
 - fix paths where a single external request is authorized too late or more
   than once
+- use type/API shape to bind auth-sensitive request state to the authorization
+  decision
 - add regression coverage so future write-path refactors do not silently move
   authorization boundaries
 
@@ -19,56 +21,67 @@ This plan does not cover:
 - changing multipart's per-request authorization model
 - redesigning unrelated concurrency or storage mechanics
 
-## Current mismatches
+## Status
 
-### 1. Streaming `PutObject` can authorize after body ingestion
+The original `PutObject` alignment work is now implemented.
 
-The current HTTP streaming `PutObject` path prepares request context first and
-only reaches `begin_stream_put` after the first internal segment promotion.
+Implemented changes:
 
-That means:
+- streaming `PutObject` now authorizes before meaningful body ingestion
+- direct and streamed `PutObject` now share the same entry-time authorization
+  model
+- same-request re-authorization was removed from streamed finalize
+- multi-phase `PutObject` now carries an explicit authorized token so later
+  phases consume bound auth-sensitive request state rather than accepting a
+  second caller-controlled copy
+- regressions cover early denial and token-bound direct/streamed commit state
 
-- unauthorized large streamed `PutObject` requests can be rejected after the
-  first full segment is buffered
-- unauthorized small streamed `PutObject` requests can be rejected after the
-  entire body is read by the direct single-segment path
+The plan remains open because adjacent write paths should still be reviewed
+against the same rules.
 
-This violates the intended request-entry authorization rule.
+## Implemented pattern
 
-### 2. Streamed `PutObject` re-authorizes at finalize
+For a single external multi-phase write request, the intended pattern is now:
 
-`finalize_stream_put` currently re-checks object write authorization for the
-same external `PutObject` request.
+1. authorize once at request entry in `server-core`
+2. produce an opaque authorized token that binds the auth-sensitive request
+   state used for that decision
+3. let later internal phases consume that token
+4. restrict later phases to commit-time inputs such as body state, checksums,
+   conditional-write data, and session references
+5. keep finalize/commit checks focused on conflicts, validation, and storage
+   invariants rather than re-authorizing the same request
 
-That makes one client request depend on both:
+For `PutObject`, this is the `AuthorizedPutObjectWrite` pattern and the
+follow-on helpers that consume it.
 
-- authorization at stream-session creation time
-- authorization again at finalize time
+## Resolved mismatches
 
-This is inconsistent with the intended "authorize once per external request"
-policy.
+### 1. Streaming `PutObject` authorized after body ingestion
 
-### 3. `PutObject` paths do not share one auth model
+Resolved by adding an explicit entry-time authorization step during streaming
+request preparation.
 
-Today:
+### 2. Streamed `PutObject` re-authorized at finalize
 
-- direct single-segment `put_object` effectively authorizes once near commit
-- buffered large `put_object` authorizes early and then again through
-  `begin_stream_put` and `finalize_stream_put`
-- HTTP streaming `PutObject` currently authorizes later than either of the
-  above
+Resolved by making streamed finalize consume the bound authorized token and by
+limiting finalize checks to commit-time validation and conflict/state checks.
 
-These paths should converge on one request-entry authorization model.
+### 3. `PutObject` paths did not share one auth model
+
+Resolved by converging direct and streamed `PutObject` on the same entry-time
+authorization contract.
 
 ## Target end state
 
-For a single external `PutObject` request:
+For any single external write request that spans multiple internal phases:
 
 1. authorization happens once before meaningful body ingestion
-2. internal streaming/direct-path decisions do not change that boundary
-3. finalize only checks commit-time conflicts, validation, and session/storage
+2. an authorized token binds the auth-sensitive request state for that request
+3. internal streaming/direct-path decisions do not change that boundary
+4. finalize only checks commit-time conflicts, validation, and session/storage
    state
-4. refactors cannot move the auth boundary without failing tests
+5. refactors cannot move the auth boundary without failing tests
 
 Multipart remains per external request:
 
@@ -79,53 +92,45 @@ Multipart remains per external request:
 
 ## Work items
 
-### 1. Add an explicit entry-time write authorization step for streaming `PutObject`
+### 1. Keep `PutObject` token use narrow and explicit
 
-Introduce a header-only/core-side authorization step during streaming
-`PutObject` preparation so unauthorized requests fail before body ingestion.
+Preserve the current pattern that later helpers consume a bound authorized
+token instead of a second auth-sensitive request description.
 
-This step should not require immediate stream-session creation.
+Follow-up checks:
 
-### 2. Carry authorized write intent through streamed `PutObject`
+- avoid widening helper signatures to re-accept bucket/key/requester/ACL/tag/
+  object-lock inputs after authorization
+- prefer making invalid combinations unrepresentable in API shape
+- keep raw lower-level finalize helpers internal when they bypass the safe
+  token contract
 
-Once the request is authorized, internal stream state should represent an
-already-authorized write intent for that request.
+### 2. Audit adjacent single-request write paths
 
-`begin_stream_put` should become session/materialization setup, not a second
-permission boundary for the same request.
+Audit these paths against the same guide and convert them to the same pattern
+where appropriate:
 
-### 3. Remove same-request re-authorization from streamed finalize
-
-Restructure `finalize_stream_put` so it still performs:
-
-- conditional write checks
-- overwrite/versioning/object-lock checks
-- session consistency checks
-- metadata commit checks
-
-but does not re-run the request's write authorization decision.
-
-### 4. Audit adjacent single-request write paths
-
-Audit these paths against the guide and adjust if needed:
-
-- buffered `PutObject`
 - copy destination writes
-- streamed `PostObject`, if it has internal multi-phase write auth boundaries
+- any other future multi-phase single-request write path
 
-The expected result is one clear authorization boundary per external request.
+`PostObject` now follows the safe streamed finalize helper and should stay
+aligned with `PutObject`.
 
-### 5. Add regression coverage
+The expected result is one clear authorization boundary per external request
+and one explicit bound token for any internal multi-phase write.
 
-Add tests that lock in the intended semantics:
+### 3. Keep regression coverage aligned with the contract
+
+Tests should continue to lock in:
 
 - unauthorized streaming `PutObject` is rejected before meaningful body
   ingestion
-- direct and promoted streaming `PutObject` share the same authorization timing
-  semantics
+- direct and streamed `PutObject` share the same authorization timing semantics
+- authorized-token helpers commit the token-bound ACL/tag/object-lock/
+  requester state rather than caller-supplied substitutes
 - mid-request internal promotion does not introduce a second auth boundary
-- finalize can still reject on conflicts/validation without using `AccessDenied`
-  for the same already-authorized request
+- finalize can still reject on conflicts/validation without using
+  `AccessDenied` for the same already-authorized request
 
 ## Validation
 

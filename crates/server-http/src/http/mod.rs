@@ -22,7 +22,6 @@ use bytes::Bytes;
 use hyper::body::{Body, Frame, SizeHint};
 
 use crate::coordinator::BeginStreamPartRequest;
-use crate::coordinator::BeginStreamPutRequest;
 use crate::coordinator::BucketRequest;
 use crate::coordinator::ChecksumClaim;
 use crate::coordinator::Coordinator;
@@ -30,13 +29,13 @@ use crate::coordinator::CopyObjectRequest;
 use crate::coordinator::CopySource;
 use crate::coordinator::EncodedChecksumClaim;
 use crate::coordinator::FinalizeStreamPartRequest;
-use crate::coordinator::FinalizeStreamPutRequest;
 use crate::coordinator::MetadataDirective;
 use crate::coordinator::MultipartObjectRequest;
 use crate::coordinator::ObjectRequest;
 use crate::coordinator::ObjectVersionRequest;
 use crate::coordinator::TaggingDirective;
 use crate::coordinator::UploadPartCopyRequest;
+use crate::coordinator::{AuthorizePutObjectRequest, AuthorizedPutObjectWrite};
 use crate::error::ServerError;
 use crate::metadata_blob::MetadataBlob;
 use checksum::{ChecksumAlgorithm, ChecksumType, MultipartChecksumConfig, RawChecksum};
@@ -2982,23 +2981,32 @@ impl HttpFrontend {
 
         let requester = Self::requester_from_auth(effective_auth);
         let acl = parse_put_object_acl(field("acl"));
-        let session_id = self.coordinator.begin_stream_put(&BeginStreamPutRequest {
-            object: ObjectRequest::new(bucket, &key, requester.clone(), None),
-            acl: acl.into(),
-            policy: crate::coordinator::PutObjectPolicyContext::new(
-                None,
-                None,
-                acl.policy_condition_value(),
-            )
-            .with_managed_encryption(managed_encryption)
-            .with_sse_customer_algorithm(sse_customer.as_ref().map(|ctx| ctx.request().algorithm()))
-            .with_request_object_tags_xml(tags_xml.as_deref()),
-            encryption: crate::coordinator::WriteEncryptionRequest::from_request_parts(
-                sse_customer.as_ref().map(SseCustomerWriteContext::request),
-                managed_encryption,
-            ),
-            object_lock: ObjectLockState::default(),
-        })?;
+        let request_encryption = crate::coordinator::WriteEncryptionRequest::from_request_parts(
+            sse_customer.as_ref().map(SseCustomerWriteContext::request),
+            managed_encryption,
+        );
+        let authorized_write =
+            self.coordinator
+                .authorize_put_object_write(&AuthorizePutObjectRequest {
+                    object: ObjectRequest::new(bucket, &key, requester.clone(), None),
+                    acl: acl.into(),
+                    policy_context: crate::coordinator::PutObjectPolicyContext::new(
+                        None,
+                        None,
+                        acl.policy_condition_value(),
+                    )
+                    .with_managed_encryption(managed_encryption)
+                    .with_sse_customer_algorithm(
+                        sse_customer.as_ref().map(|ctx| ctx.request().algorithm()),
+                    )
+                    .with_request_object_tags_xml(tags_xml.as_deref()),
+                    object_lock: ObjectLockState::default(),
+                    tags: tags_xml.as_deref(),
+                    encryption: request_encryption,
+                })?;
+        let session_id = self
+            .coordinator
+            .begin_stream_put_from_authorized_write(&authorized_write)?;
 
         let success_status = field("success_action_status")
             .and_then(|s| s.parse::<u16>().ok())
@@ -3041,6 +3049,7 @@ impl HttpFrontend {
             tags_xml,
             managed_encryption,
             sse_customer,
+            authorized_write,
         })
     }
 
@@ -3115,19 +3124,6 @@ impl HttpFrontend {
             }
         }
 
-        let acl = parse_put_object_acl(ctx.acl_header.as_deref());
-        let policy_context = crate::coordinator::PutObjectPolicyContext::new(
-            None,
-            None,
-            acl.policy_condition_value(),
-        )
-        .with_managed_encryption(ctx.managed_encryption)
-        .with_sse_customer_algorithm(
-            ctx.sse_customer
-                .as_ref()
-                .map(|ctx| ctx.request().algorithm()),
-        )
-        .with_request_object_tags_xml(ctx.tags_xml.as_deref());
         let write_encryption = self.coordinator.load_stream_put_write_encryption(
             &ctx.binding.bucket,
             &ctx.binding.key,
@@ -3136,27 +3132,18 @@ impl HttpFrontend {
                 .as_ref()
                 .map(SseCustomerWriteContext::request),
         )?;
-        let result = self
-            .coordinator
-            .finalize_stream_put(&FinalizeStreamPutRequest {
-                object: ObjectRequest::new(
-                    &ctx.binding.bucket,
-                    &ctx.binding.key,
-                    ctx.requester.clone(),
-                    None,
-                ),
+        let result = self.coordinator.finalize_stream_put_from_authorized_write(
+            &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
                 session_id: &ctx.binding.session_id,
                 crc64,
                 total_size,
                 metadata_blob: &ctx.metadata_blob,
                 system_metadata: &ctx.system_metadata,
                 write_encryption: write_encryption.as_ref(),
-                tags: ctx.tags_xml.as_deref(),
                 cond: &crate::conditional::WriteCondition::default(),
-                acl: acl.into(),
-                policy_context,
-                requested_object_lock: ObjectLockState::default(),
-            })?;
+            },
+            &ctx.authorized_write,
+        )?;
 
         let mut resp = S3Response::post_object(
             &result,
@@ -3374,11 +3361,48 @@ impl HttpFrontend {
             }
         }
 
+        let requester = Self::requester_from_auth(&auth);
+        let acl =
+            put_object_write_acl_from_components(req.header("x-amz-acl"), acl_grants.as_ref());
+        let request_encryption = crate::coordinator::WriteEncryptionRequest::from_request_parts(
+            sse_customer.as_ref().map(SseCustomerWriteContext::request),
+            managed_encryption,
+        );
+        let authorized_write =
+            self.coordinator
+                .authorize_put_object_write(&AuthorizePutObjectRequest {
+                    object: ObjectRequest::new(
+                        bucket,
+                        key,
+                        requester.clone(),
+                        expected_bucket_owner(req),
+                    ),
+                    acl: acl.clone(),
+                    policy_context: put_object_policy_context_from_request_fields(
+                        inline_tags_xml.as_deref(),
+                        None,
+                        None,
+                        parse_put_object_acl(req.header("x-amz-acl")).policy_condition_value(),
+                        managed_encryption,
+                        sse_customer.as_ref().map(|ctx| ctx.request().algorithm()),
+                        PutObjectGrantHeaders {
+                            grant_read: req.header("x-amz-grant-read"),
+                            grant_write: req.header("x-amz-grant-write"),
+                            grant_read_acp: req.header("x-amz-grant-read-acp"),
+                            grant_write_acp: req.header("x-amz-grant-write-acp"),
+                            grant_full_control: req.header("x-amz-grant-full-control"),
+                        },
+                    ),
+                    object_lock,
+                    tags: inline_tags_xml.as_deref(),
+                    encryption: request_encryption,
+                })?;
+
         Ok(StreamingPutContext {
             trace: current_trace_context(),
             bucket: bucket.to_string(),
             key: key.to_string(),
-            requester: Self::requester_from_auth(&auth),
+            requester,
             expected_bucket_owner: expected_bucket_owner(req).map(str::to_string),
             acl_header: req.header("x-amz-acl").map(str::to_string),
             grant_read_header: req.header("x-amz-grant-read").map(str::to_string),
@@ -3398,6 +3422,7 @@ impl HttpFrontend {
             },
             managed_encryption,
             sse_customer,
+            authorized_write,
             streaming_signing: auth.streaming,
         })
     }
@@ -3416,26 +3441,8 @@ impl HttpFrontend {
             ctx.bucket,
             ctx.key
         );
-        self.coordinator.begin_stream_put(&BeginStreamPutRequest {
-            object: ObjectRequest::new(
-                &ctx.bucket,
-                &ctx.key,
-                ctx.requester.clone(),
-                ctx.expected_bucket_owner.as_deref(),
-            ),
-            acl: put_object_write_acl_from_components(
-                ctx.acl_header.as_deref(),
-                ctx.acl_grants.as_ref(),
-            ),
-            policy: ctx.policy_context(),
-            encryption: crate::coordinator::WriteEncryptionRequest::from_request_parts(
-                ctx.sse_customer
-                    .as_ref()
-                    .map(SseCustomerWriteContext::request),
-                ctx.managed_encryption,
-            ),
-            object_lock: ctx.object_lock,
-        })
+        self.coordinator
+            .begin_stream_put_from_authorized_write(&ctx.authorized_write)
     }
 
     /// Append a segment to a streaming session.
@@ -3493,33 +3500,15 @@ impl HttpFrontend {
         );
         let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
         let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
-        let result = self
-            .coordinator
-            .put_object(&crate::coordinator::PutObjectRequest {
-                object: ObjectRequest::new(
-                    &ctx.bucket,
-                    &ctx.key,
-                    ctx.requester.clone(),
-                    ctx.expected_bucket_owner.as_deref(),
-                ),
+        let result = self.coordinator.put_object_from_authorized_write(
+            &crate::coordinator::AuthorizedPutObjectCommitRequest {
                 data,
                 metadata: &metadata_blob,
                 system_metadata: &system_metadata,
-                tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
-                acl: put_object_write_acl_from_components(
-                    ctx.acl_header.as_deref(),
-                    ctx.acl_grants.as_ref(),
-                ),
-                policy_context: ctx.policy_context(),
-                object_lock: ctx.object_lock,
-                encryption: crate::coordinator::WriteEncryptionRequest::from_request_parts(
-                    ctx.sse_customer
-                        .as_ref()
-                        .map(SseCustomerWriteContext::request),
-                    ctx.managed_encryption,
-                ),
-            })?;
+            },
+            &ctx.authorized_write,
+        )?;
 
         let mut resp = S3Response::put_object(&result);
         apply_sse_customer_write_response_headers(
@@ -3566,30 +3555,18 @@ impl HttpFrontend {
                 .map(SseCustomerWriteContext::request),
         )?;
 
-        let result = self
-            .coordinator
-            .finalize_stream_put(&FinalizeStreamPutRequest {
-                object: ObjectRequest::new(
-                    &ctx.bucket,
-                    &ctx.key,
-                    ctx.requester.clone(),
-                    ctx.expected_bucket_owner.as_deref(),
-                ),
+        let result = self.coordinator.finalize_stream_put_from_authorized_write(
+            &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
                 session_id,
                 crc64,
                 total_size,
                 metadata_blob: &metadata_blob,
                 system_metadata: &system_metadata,
                 write_encryption: write_encryption.as_ref(),
-                tags: ctx.inline_tags_xml.as_deref(),
                 cond: &ctx.cond,
-                acl: put_object_write_acl_from_components(
-                    ctx.acl_header.as_deref(),
-                    ctx.acl_grants.as_ref(),
-                ),
-                policy_context: ctx.policy_context(),
-                requested_object_lock: ctx.object_lock,
-            })?;
+            },
+            &ctx.authorized_write,
+        )?;
 
         let mut resp = S3Response::put_object(&result);
         apply_sse_customer_write_response_headers(
@@ -3910,30 +3887,9 @@ pub struct StreamingPutContext {
     pub checksum: StreamingPutChecksumContract,
     pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
     pub sse_customer: Option<SseCustomerWriteContext>,
+    pub authorized_write: AuthorizedPutObjectWrite,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     pub streaming_signing: Option<auth::StreamingSigningContext>,
-}
-
-impl StreamingPutContext {
-    fn policy_context(&self) -> crate::coordinator::PutObjectPolicyContext<'_> {
-        put_object_policy_context_from_request_fields(
-            self.inline_tags_xml.as_deref(),
-            None,
-            None,
-            parse_put_object_acl(self.acl_header.as_deref()).policy_condition_value(),
-            self.managed_encryption,
-            self.sse_customer
-                .as_ref()
-                .map(|ctx| ctx.request().algorithm()),
-            PutObjectGrantHeaders {
-                grant_read: self.grant_read_header.as_deref(),
-                grant_write: self.grant_write_header.as_deref(),
-                grant_read_acp: self.grant_read_acp_header.as_deref(),
-                grant_write_acp: self.grant_write_acp_header.as_deref(),
-                grant_full_control: self.grant_full_control_header.as_deref(),
-            },
-        )
-    }
 }
 
 /// Context for an in-progress streaming `PostObject`.
@@ -3953,6 +3909,7 @@ pub struct StreamingPostContext {
     pub tags_xml: Option<String>,
     pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
     pub sse_customer: Option<SseCustomerWriteContext>,
+    pub authorized_write: AuthorizedPutObjectWrite,
 }
 
 /// Context for an in-progress streaming `UploadPart`.
@@ -5186,11 +5143,18 @@ fn parse_put_object_acl(value: Option<&str>) -> crate::coordinator::PutObjectAcl
 mod tests {
     use super::*;
     use crate::coordinator::{Coordinator, INTERNAL_SEGMENT_SIZE};
+    use auth::canonical::{
+        canonical_headers, canonical_query_string, canonical_request, sha256_hex, string_to_sign,
+    };
+    use auth::SecretKey;
     use ec::EcConfig;
+    use ring::hmac;
     use server_core::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider};
     use std::sync::Arc;
     use storage::SharedStorageNode;
 
+    const TEST_SIGV4_ACCESS_KEY: &str = "AKID";
+    const TEST_SIGV4_SECRET: &str = "secret";
     const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
 
     fn setup_frontend(dir: &std::path::Path) -> HttpFrontend {
@@ -5241,6 +5205,102 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
+    }
+
+    fn create_sigv4_test_bucket(coord: &Coordinator, name: &str, object_lock_enabled: bool) {
+        coord
+            .create_bucket(&crate::coordinator::CreateBucketRequest {
+                name,
+                requester: crate::coordinator::test_helpers::requester(TEST_SIGV4_ACCESS_KEY),
+                namespace: BucketNamespace::Global,
+                acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
+                ownership: crate::coordinator::BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled,
+            })
+            .unwrap();
+    }
+
+    fn hex_lower(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    fn current_sigv4_timestamp() -> (String, String) {
+        let now_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("current time should be after epoch")
+            .as_millis() as u64;
+        let timestamp = xml::format_timestamp(now_millis);
+        let date = format!(
+            "{}{}{}",
+            &timestamp[0..4],
+            &timestamp[5..7],
+            &timestamp[8..10]
+        );
+        let amz_date = format!(
+            "{}{}{}T{}{}{}Z",
+            &timestamp[0..4],
+            &timestamp[5..7],
+            &timestamp[8..10],
+            &timestamp[11..13],
+            &timestamp[14..16],
+            &timestamp[17..19]
+        );
+        (date, amz_date)
+    }
+
+    fn signed_v4_put_req(body: &[u8], extra_headers: Vec<(String, String)>) -> S3Request {
+        let (date, amz_date) = current_sigv4_timestamp();
+        let body_hash = sha256_hex(body);
+        let mut headers = vec![
+            (
+                "host".to_string(),
+                "examplebucket.s3.amazonaws.com".to_string(),
+            ),
+            ("x-amz-content-sha256".to_string(), body_hash.clone()),
+            ("x-amz-date".to_string(), amz_date.clone()),
+        ];
+        headers.extend(extra_headers);
+
+        let mut signed_headers: Vec<&str> = headers.iter().map(|(name, _)| name.as_str()).collect();
+        signed_headers.sort_unstable();
+        let signed_headers_str = signed_headers.join(";");
+        let canonical_headers_input: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let canonical_headers = canonical_headers(&canonical_headers_input);
+        let canonical_query = canonical_query_string("");
+        let canonical_req = canonical_request(
+            "PUT",
+            "/",
+            &canonical_query,
+            &canonical_headers,
+            &signed_headers_str,
+            &body_hash,
+        );
+        let scope = format!("{date}/us-east-1/s3/aws4_request");
+        let sts = string_to_sign(&amz_date, &scope, &sha256_hex(canonical_req.as_bytes()));
+        let signing_key = auth::sigv4::derive_signing_key(
+            &SecretKey::new(TEST_SIGV4_SECRET.to_string()),
+            &date,
+            "us-east-1",
+            "s3",
+        );
+        let signature = hex_lower(
+            hmac::sign(
+                &hmac::Key::new(hmac::HMAC_SHA256, signing_key.as_ref()),
+                sts.as_bytes(),
+            )
+            .as_ref(),
+        );
+        headers.push((
+            "authorization".to_string(),
+            format!(
+                "AWS4-HMAC-SHA256 Credential={}/{}, SignedHeaders={}, Signature={}",
+                TEST_SIGV4_ACCESS_KEY, scope, signed_headers_str, signature
+            ),
+        ));
+        new_req(http::Method::PUT, "/", "", headers, body.to_vec())
     }
 
     #[test]
@@ -7931,10 +7991,28 @@ mod tests {
     }
 
     #[test]
-    fn prepare_streaming_put_with_object_lock_accepts_sdk_checksum_header() {
+    fn prepare_streaming_put_denies_anonymous_write_to_private_bucket() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = new_req(http::Method::PUT, "", "", vec![], b"hello world".to_vec());
+        match fe.prepare_streaming_put(&req, "mybucket", "mykey", false) {
+            Err(ServerError::AccessDenied) => {}
+            Err(err) => panic!("expected AccessDenied, got {err:?}"),
+            Ok(_) => panic!("expected AccessDenied, got Ok"),
+        }
+    }
+
+    #[test]
+    fn prepare_streaming_put_with_object_lock_accepts_sdk_checksum_header() {
+        let tmp = test_util::tempdir();
+        let mut fe = setup_frontend(tmp.path());
+        fe.credentials.add(
+            TEST_SIGV4_ACCESS_KEY.to_string(),
+            SecretKey::new(TEST_SIGV4_SECRET.to_string()),
+        );
+        create_sigv4_test_bucket(&fe.coordinator, "mybucket", true);
 
         let body = b"hello world".to_vec();
         let mut headers = vec![
@@ -7948,7 +8026,7 @@ mod tests {
             ),
         ];
         headers.extend(checksum_header_pairs(&body));
-        let req = new_req(http::Method::PUT, "", "", headers, body);
+        let req = signed_v4_put_req(&body, headers);
         let ctx = fe
             .prepare_streaming_put(&req, "mybucket", "mykey", false)
             .unwrap();

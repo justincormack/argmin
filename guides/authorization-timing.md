@@ -69,7 +69,39 @@ Allowed commit-time checks include:
 Do not re-run the same request's bucket/object authorization decision at
 finalize time just because the implementation is internally multi-phase.
 
-### 5. Stored-state authorization still belongs in `server-core`
+### 5. Multi-phase writes should carry an authorized token
+
+If a single external write request spans multiple internal phases, request
+entry should produce an opaque authorized token or capability that represents
+the approved write intent for that request.
+
+That token should carry the auth-sensitive request state that the
+authorization decision depended on, such as:
+
+- bucket and key
+- requester identity
+- expected bucket owner
+- ACL intent
+- requested object lock state
+- tags
+- resolved encryption policy
+
+Later internal phases should consume that token rather than accepting a second
+independent description of the same auth-sensitive write request.
+
+In practice this means:
+
+- begin/finalize helpers should take the authorized token as input
+- later phases may accept commit-time data such as checksums, ETags, segment
+  references, or conditional-write inputs
+- later phases should not accept caller-controlled bucket/key/requester/ACL/
+  tag/object-lock inputs that could diverge from what was authorized at
+  request entry
+
+This keeps the "authorize once per external request" rule enforceable in API
+shape, not only by convention.
+
+### 6. Stored-state authorization still belongs in `server-core`
 
 This guide does not change the layering rule that authorization decisions that
 depend on stored bucket/object state belong in `server-core`.
@@ -79,7 +111,7 @@ decision, take the necessary core-side lock or reservation at request entry,
 make the decision there, and then carry that authorized intent through the
 rest of the request.
 
-### 6. Streaming bodies must be gated before body ingestion
+### 7. Streaming bodies must be gated before body ingestion
 
 Streaming endpoints must perform their request authorization before reading a
 meaningful amount of attacker-controlled object body data.
@@ -89,7 +121,7 @@ but repository code must not intentionally defer write authorization until
 after large body buffers, segment promotion, or similar body-driven internal
 transitions.
 
-### 7. Multi-request workflows authorize per request
+### 8. Multi-request workflows authorize per request
 
 Multipart upload is intentionally different from a single streamed `PutObject`.
 
@@ -117,7 +149,10 @@ This policy keeps behavior predictable for clients:
 It also keeps internal implementation details from leaking into externally
 visible semantics. A streamed write may need several internal phases for
 storage reasons, but that should not change when the client is considered
-authorized for the request.
+authorized for the request. For multi-phase single-request writes, the
+authorized-token pattern makes that invariant explicit in the type and helper
+design instead of relying on every caller to manually thread the same
+auth-sensitive inputs through each phase.
 
 ## PR Checklist
 
@@ -130,6 +165,10 @@ If a change touches an object or bucket read/write path, check:
    ingestion?
 5. Are commit-time rejections limited to conflicts, validation, and stored
    state that must be checked at commit?
-6. If the path is multipart or another multi-request workflow, are the
+6. For a multi-phase single-request write, does a bound authorized token carry
+   the auth-sensitive request state across phases?
+7. Do later internal phases avoid taking a second caller-controlled copy of
+   bucket/key/requester/ACL/tag/object-lock state?
+8. If the path is multipart or another multi-request workflow, are the
    authorization boundaries aligned with the external API rather than internal
    helpers?

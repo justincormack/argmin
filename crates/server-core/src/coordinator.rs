@@ -248,6 +248,114 @@ pub struct BeginStreamPartResult {
     pub sse_customer: Option<SseCustomerWriteContext>,
 }
 
+#[derive(Debug)]
+pub struct AuthorizedPutObjectWrite {
+    bucket: String,
+    key: String,
+    requester: Requester,
+    expected_bucket_owner: Option<String>,
+    acl: AuthorizedPutObjectWriteAcl,
+    requested_object_lock: ObjectLockState,
+    tags: Option<String>,
+    write_encryption: ActiveWriteEncryption,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthorizedPutObjectAcl {
+    None,
+    Private,
+    PublicRead,
+    PublicReadWrite,
+    AuthenticatedRead,
+    AwsExecRead,
+    BucketOwnerRead,
+    BucketOwnerFullControl,
+}
+
+impl AuthorizedPutObjectAcl {
+    const fn as_borrowed(self) -> PutObjectAcl<'static> {
+        match self {
+            Self::None => PutObjectAcl::None,
+            Self::Private => PutObjectAcl::Private,
+            Self::PublicRead => PutObjectAcl::PublicRead,
+            Self::PublicReadWrite => PutObjectAcl::PublicReadWrite,
+            Self::AuthenticatedRead => PutObjectAcl::AuthenticatedRead,
+            Self::AwsExecRead => PutObjectAcl::AwsExecRead,
+            Self::BucketOwnerRead => PutObjectAcl::BucketOwnerRead,
+            Self::BucketOwnerFullControl => PutObjectAcl::BucketOwnerFullControl,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AuthorizedPutObjectWriteAcl {
+    None,
+    Canned(AuthorizedPutObjectAcl),
+    Grants(AclGrants),
+}
+
+impl AuthorizedPutObjectWriteAcl {
+    fn from_parsed(acl: &PutObjectWriteAcl<'_>) -> Self {
+        match acl {
+            PutObjectWriteAcl::None => Self::None,
+            PutObjectWriteAcl::Canned(acl) => Self::Canned(match acl {
+                PutObjectAcl::None => AuthorizedPutObjectAcl::None,
+                PutObjectAcl::Private => AuthorizedPutObjectAcl::Private,
+                PutObjectAcl::PublicRead => AuthorizedPutObjectAcl::PublicRead,
+                PutObjectAcl::PublicReadWrite => AuthorizedPutObjectAcl::PublicReadWrite,
+                PutObjectAcl::AuthenticatedRead => AuthorizedPutObjectAcl::AuthenticatedRead,
+                PutObjectAcl::AwsExecRead => AuthorizedPutObjectAcl::AwsExecRead,
+                PutObjectAcl::BucketOwnerRead => AuthorizedPutObjectAcl::BucketOwnerRead,
+                PutObjectAcl::BucketOwnerFullControl => {
+                    AuthorizedPutObjectAcl::BucketOwnerFullControl
+                }
+                PutObjectAcl::Invalid(value) => {
+                    unreachable!("validated PutObject ACL must not remain invalid: {value}")
+                }
+            }),
+            PutObjectWriteAcl::Grants(acl_grants) => Self::Grants(acl_grants.clone()),
+        }
+    }
+
+    fn as_borrowed(&self) -> PutObjectWriteAcl<'_> {
+        match self {
+            Self::None => PutObjectWriteAcl::None,
+            Self::Canned(acl) => PutObjectWriteAcl::Canned(acl.as_borrowed()),
+            Self::Grants(acl_grants) => PutObjectWriteAcl::Grants(acl_grants.clone()),
+        }
+    }
+}
+
+impl AuthorizedPutObjectWrite {
+    fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    fn requester(&self) -> &Requester {
+        &self.requester
+    }
+
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.expected_bucket_owner.as_deref()
+    }
+
+    fn acl(&self) -> PutObjectWriteAcl<'_> {
+        self.acl.as_borrowed()
+    }
+
+    fn requested_object_lock(&self) -> ObjectLockState {
+        self.requested_object_lock
+    }
+
+    fn tags(&self) -> Option<&str> {
+        self.tags.as_deref()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ActiveWriteEncryption {
     None,
@@ -1553,6 +1661,16 @@ pub struct PutObjectRequest<'a> {
     pub encryption: WriteEncryptionRequest<'a>,
 }
 
+#[derive(Debug)]
+pub struct AuthorizePutObjectRequest<'a> {
+    pub object: ObjectRequest<'a>,
+    pub acl: PutObjectWriteAcl<'a>,
+    pub policy_context: PutObjectPolicyContext<'a>,
+    pub object_lock: ObjectLockState,
+    pub tags: Option<&'a str>,
+    pub encryption: WriteEncryptionRequest<'a>,
+}
+
 struct PreparedPutCommit {
     version_id: VersionId,
     generation_id: GenerationId,
@@ -1571,6 +1689,23 @@ struct PutCommitRequest<'a> {
     write_encryption: &'a ActiveWriteEncryption,
     tags: Option<&'a str>,
     cond: &'a WriteCondition,
+}
+
+pub struct AuthorizedPutObjectCommitRequest<'a> {
+    pub data: &'a [u8],
+    pub metadata: &'a MetadataBlob,
+    pub system_metadata: &'a SystemMetadata,
+    pub cond: &'a WriteCondition,
+}
+
+pub struct AuthorizedFinalizeStreamPutRequest<'a> {
+    pub session_id: &'a str,
+    pub crc64: u64,
+    pub total_size: u64,
+    pub metadata_blob: &'a MetadataBlob,
+    pub system_metadata: &'a SystemMetadata,
+    pub write_encryption: ActiveWriteEncryptionRef<'a>,
+    pub cond: &'a WriteCondition,
 }
 
 /// Authenticated requester context needed by core-side authorization.
@@ -6206,29 +6341,75 @@ impl Coordinator {
         )
     }
 
-    fn authorize_put_object_requester(
+    pub fn authorize_put_object_write(
         &self,
-        requester: &Requester,
-        bucket: &str,
-        key: &str,
-        policy_context: PutObjectPolicyContext<'_>,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<BucketSummary, ServerError> {
-        let info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
-        let existing_object = self.put_target_existing_live_object(bucket, key)?;
-        let bucket_policy = self.cached_bucket_policy(&info)?;
-        if Self::requester_can_put_object_with_bucket_policy(
-            requester,
-            &info,
-            key,
-            policy_context,
-            bucket_policy.as_deref(),
-            existing_object.as_ref(),
-        )? {
-            Ok(info)
-        } else {
-            Err(ServerError::AccessDenied)
-        }
+        req: &AuthorizePutObjectRequest<'_>,
+    ) -> Result<AuthorizedPutObjectWrite, ServerError> {
+        let bucket = req.object.bucket_name();
+        let key = req.object.key;
+        self.with_bucket_write_reservation(bucket, |bucket_info| {
+            Self::ensure_expected_bucket_owner(&bucket_info, req.object.expected_bucket_owner())?;
+            let existing_object = self.put_target_existing_live_object(bucket, key)?;
+            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+            if !Self::requester_can_put_object_with_bucket_policy(
+                req.object.requester(),
+                &bucket_info,
+                key,
+                req.policy_context,
+                bucket_policy.as_deref(),
+                existing_object.as_ref(),
+            )? {
+                return Err(ServerError::AccessDenied);
+            }
+            let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
+            Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
+            Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
+            Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
+            Ok(AuthorizedPutObjectWrite {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                requester: req.object.requester().clone(),
+                expected_bucket_owner: req.object.expected_bucket_owner().map(str::to_string),
+                acl: AuthorizedPutObjectWriteAcl::from_parsed(&req.acl),
+                requested_object_lock: req.object_lock,
+                tags: req.tags.map(str::to_string),
+                write_encryption,
+            })
+        })
+    }
+
+    fn create_stream_put_session_for_authorized_write(
+        &self,
+        authorized: &AuthorizedPutObjectWrite,
+    ) -> Result<String, ServerError> {
+        let bucket = authorized.bucket();
+        let key = authorized.key();
+        let stored_encryption = authorized.write_encryption.object_encryption();
+
+        let rng = ring::rand::SystemRandom::new();
+        let mut id_bytes = [0u8; 16];
+        ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
+            ServerError::InternalError {
+                reason: "failed to generate session ID".to_string(),
+            }
+        })?;
+        let session_id = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+            use std::fmt::Write;
+            write!(s, "{b:02x}").unwrap();
+            s
+        });
+
+        let meta_pg_id = self.object_pg_id(bucket, key);
+        let pg = self.storage_node.get_pg(meta_pg_id)?;
+        pg.create_stream_upload(&CreateStreamUploadReq {
+            session_id: SessionId::from(session_id.as_str()),
+            bucket: BucketName::from(bucket),
+            key: ObjectKey::from(key),
+            target: StreamUploadTarget::PutObject,
+            encryption: stored_encryption,
+        })?;
+
+        Ok(session_id)
     }
 
     fn lock_object_for_authorized_read<'a>(
@@ -9028,101 +9209,88 @@ impl Coordinator {
 
     /// Put an object, using a direct single-segment commit when possible.
     pub fn put_object(&self, req: &PutObjectRequest<'_>) -> Result<PutObjectResult, ServerError> {
-        let policy_context = req.effective_policy_context();
+        let authorized = self.authorize_put_object_write(&AuthorizePutObjectRequest {
+            object: ObjectRequest::new(
+                req.object.bucket_name(),
+                req.object.key(),
+                req.object.requester().clone(),
+                req.expected_bucket_owner(),
+            ),
+            acl: req.acl.clone(),
+            policy_context: req.effective_policy_context(),
+            object_lock: req.object_lock,
+            tags: req.tags,
+            encryption: req.encryption,
+        })?;
+        self.put_object_from_authorized_write(
+            &AuthorizedPutObjectCommitRequest {
+                data: req.data,
+                metadata: req.metadata,
+                system_metadata: req.system_metadata,
+                cond: req.cond,
+            },
+            &authorized,
+        )
+    }
+
+    pub fn put_object_from_authorized_write(
+        &self,
+        req: &AuthorizedPutObjectCommitRequest<'_>,
+        authorized: &AuthorizedPutObjectWrite,
+    ) -> Result<PutObjectResult, ServerError> {
         let object_crc64 = checksum::crc64::checksum(req.data);
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_object",
             "bucket={:?} key={:?} bytes={}",
-            req.object.bucket_name(),
-            req.object.key,
+            authorized.bucket(),
+            authorized.key(),
             req.data.len()
         );
 
         if req.data.len() > INTERNAL_SEGMENT_SIZE {
-            self.authorize_put_object_requester(
-                req.object.requester(),
-                req.object.bucket_name(),
-                req.object.key,
-                policy_context,
-                req.expected_bucket_owner(),
-            )?;
-            let session_id = self.begin_stream_put(&BeginStreamPutRequest {
-                object: ObjectRequest::new(
-                    req.object.bucket_name(),
-                    req.object.key(),
-                    req.object.requester().clone(),
-                    req.expected_bucket_owner(),
-                ),
-                acl: req.acl.clone(),
-                policy: policy_context,
-                encryption: req.encryption,
-                object_lock: req.object_lock,
-            })?;
-            let write_encryption = self.load_stream_put_write_encryption(
-                req.object.bucket_name(),
-                req.object.key,
-                &session_id,
-                req.encryption.sse_customer_request(),
-            )?;
+            let session_id = self.create_stream_put_session_for_authorized_write(authorized)?;
+            let write_encryption = &authorized.write_encryption;
             let result = (|| {
                 for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
                     let chunk_storage = write_encryption.encrypt_segment(idx as u32, chunk)?;
                     self.append_stream_segment(
-                        req.object.bucket_name(),
-                        req.object.key,
+                        authorized.bucket(),
+                        authorized.key(),
                         &session_id,
                         idx as u32,
                         &chunk_storage,
                     )?;
                 }
-                self.finalize_stream_put(&FinalizeStreamPutRequest {
-                    object: ObjectRequest::new(
-                        req.object.bucket_name(),
-                        req.object.key(),
-                        req.object.requester().clone(),
-                        req.expected_bucket_owner(),
-                    ),
-                    session_id: &session_id,
-                    crc64: object_crc64,
-                    total_size: req.data.len() as u64,
-                    metadata_blob: req.metadata,
-                    system_metadata: req.system_metadata,
-                    write_encryption: write_encryption.as_ref(),
-                    tags: req.tags,
-                    cond: req.cond,
-                    acl: req.acl.clone(),
-                    policy_context,
-                    requested_object_lock: req.object_lock,
-                })
+                self.finalize_stream_put_from_authorized_write(
+                    &AuthorizedFinalizeStreamPutRequest {
+                        session_id: &session_id,
+                        crc64: object_crc64,
+                        total_size: req.data.len() as u64,
+                        metadata_blob: req.metadata,
+                        system_metadata: req.system_metadata,
+                        write_encryption: write_encryption.as_ref(),
+                        cond: req.cond,
+                    },
+                    authorized,
+                )
             })();
             if result.is_err() {
-                let _ =
-                    self.abort_stream_put(req.object.bucket_name(), req.object.key, &session_id);
+                let _ = self.abort_stream_put(authorized.bucket(), authorized.key(), &session_id);
             }
             return result;
         }
 
-        self.with_bucket_write_reservation(req.object.bucket_name(), |bucket_info| {
-            Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
-            let existing_object =
-                self.put_target_existing_live_object(req.object.bucket_name(), req.object.key)?;
-            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-            if !Self::requester_can_put_object_with_bucket_policy(
-                req.object.requester(),
-                &bucket_info,
-                req.object.key,
-                policy_context,
-                bucket_policy.as_deref(),
-                existing_object.as_ref(),
-            )? {
-                return Err(ServerError::AccessDenied);
-            }
-            let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
+        self.with_bucket_write_reservation(authorized.bucket(), |bucket_info| {
+            Self::ensure_expected_bucket_owner(&bucket_info, authorized.expected_bucket_owner())?;
+            let write_encryption = &authorized.write_encryption;
             Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
-            Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
-            let resolved_object_lock =
-                Self::resolve_new_object_lock_state(&bucket_info, req.object_lock)?;
+            let acl = authorized.acl();
+            Self::ensure_put_object_write_acl_supported(&bucket_info, &acl)?;
+            let resolved_object_lock = Self::resolve_new_object_lock_state(
+                &bucket_info,
+                authorized.requested_object_lock(),
+            )?;
 
             let transient_segment_id = {
                 let rng = ring::rand::SystemRandom::new();
@@ -9152,7 +9320,7 @@ impl Coordinator {
             let written_shards =
                 self.write_segment_shards(shard_pg_id, &segment_okh, segment_vid, &storage_bytes)?;
 
-            let meta_pg_id = self.object_pg_id(req.object.bucket_name(), req.object.key);
+            let meta_pg_id = self.object_pg_id(authorized.bucket(), authorized.key());
             let (meta_pg, shard_pg_opt) =
                 match self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id) {
                     Ok(guards) => guards,
@@ -9171,7 +9339,7 @@ impl Coordinator {
                 .collect();
             let system_metadata = Self::object_system_metadata_with_default_checksum(
                 req.system_metadata,
-                &write_encryption,
+                write_encryption,
                 object_crc64,
             );
 
@@ -9179,12 +9347,12 @@ impl Coordinator {
                 &meta_pg,
                 &bucket_info,
                 &PutCommitRequest {
-                    bucket: req.object.bucket_name(),
-                    key: req.object.key,
+                    bucket: authorized.bucket(),
+                    key: authorized.key(),
                     metadata_blob: req.metadata,
                     system_metadata: &system_metadata,
-                    write_encryption: &write_encryption,
-                    tags: req.tags,
+                    write_encryption,
+                    tags: authorized.tags(),
                     cond: req.cond,
                 },
             ) {
@@ -9195,12 +9363,12 @@ impl Coordinator {
                 }
             };
             let owner =
-                Self::effective_put_object_owner(&bucket_info, req.object.requester(), &req.acl);
-            let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
+                Self::effective_put_object_owner(&bucket_info, authorized.requester(), &acl);
+            let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &acl);
 
             let segment_record = ObjectSegmentRecord {
-                bucket: BucketName::from(req.object.bucket_name()),
-                key: ObjectKey::from(req.object.key),
+                bucket: BucketName::from(authorized.bucket()),
+                key: ObjectKey::from(authorized.key()),
                 version_id: prepared.version_id,
                 segment_index,
                 size: req.data.len() as u64,
@@ -9212,8 +9380,8 @@ impl Coordinator {
                 ec_m: self.ec_config.parity_shards,
             };
             let live_req = PutLiveObjectReq {
-                bucket: BucketName::from(req.object.bucket_name()),
-                key: ObjectKey::from(req.object.key),
+                bucket: BucketName::from(authorized.bucket()),
+                key: ObjectKey::from(authorized.key()),
                 version_id: prepared.version_id,
                 owner,
                 acl_grants: acl_grants.clone(),
@@ -9243,19 +9411,19 @@ impl Coordinator {
             }
             Self::finalize_put_commit_metadata_locked(
                 &meta_pg,
-                req.object.bucket_name(),
-                req.object.key,
+                authorized.bucket(),
+                authorized.key(),
                 prepared.version_id,
                 prepared.stale_payload.as_ref(),
             )?;
             let stored = meta_pg
-                .get_object_meta(req.object.bucket_name(), req.object.key)
+                .get_object_meta(authorized.bucket(), authorized.key())
                 .map_err(ServerError::Metadata)?;
             let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
                 reason: format!(
                     "stored object {} / {} is not live immediately after PutObject",
-                    req.object.bucket_name(),
-                    req.object.key
+                    authorized.bucket(),
+                    authorized.key()
                 ),
             })?;
             let lifecycle_tags = live_record.tags.clone();
@@ -9266,13 +9434,13 @@ impl Coordinator {
             drop(meta_pg);
             let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
                 &bucket_info,
-                req.object.key,
+                authorized.key(),
                 lifecycle_tags.as_deref(),
                 lifecycle_size,
                 lifecycle_last_modified,
             )?;
             if let Some(ref payload) = prepared.stale_payload {
-                self.delete_stale_object_payload(req.object.bucket_name(), req.object.key, payload);
+                self.delete_stale_object_payload(authorized.bucket(), authorized.key(), payload);
             }
 
             Ok(PutObjectResult {
@@ -9300,58 +9468,27 @@ impl Coordinator {
             req.object.bucket_name(),
             req.object.key
         );
-        let bucket = req.object.bucket_name();
-        let key = req.object.key;
-        let policy_context = req.effective_policy_context();
-        self.with_bucket_write_reservation(bucket, |bucket_info| {
-            Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
-            let existing_object = self.put_target_existing_live_object(bucket, key)?;
-            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-            if !Self::requester_can_put_object_with_bucket_policy(
-                req.object.requester(),
-                &bucket_info,
-                key,
-                policy_context,
-                bucket_policy.as_deref(),
-                existing_object.as_ref(),
-            )? {
-                return Err(ServerError::AccessDenied);
-            }
-            let stored_encryption = self
-                .resolve_write_encryption(&bucket_info, req.encryption)?
-                .object_encryption();
-            Self::ensure_sse_c_allowed(
-                &bucket_info,
-                stored_encryption.uses_sse_customer_headers(),
-            )?;
-            Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
-            Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
+        let authorized = self.authorize_put_object_write(&AuthorizePutObjectRequest {
+            object: ObjectRequest::new(
+                req.object.bucket_name(),
+                req.object.key(),
+                req.object.requester().clone(),
+                req.expected_bucket_owner(),
+            ),
+            acl: req.acl.clone(),
+            policy_context: req.effective_policy_context(),
+            object_lock: req.object_lock,
+            tags: None,
+            encryption: req.encryption,
+        })?;
+        self.create_stream_put_session_for_authorized_write(&authorized)
+    }
 
-            let rng = ring::rand::SystemRandom::new();
-            let mut id_bytes = [0u8; 16];
-            ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
-                ServerError::InternalError {
-                    reason: "failed to generate session ID".to_string(),
-                }
-            })?;
-            let session_id = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
-                use std::fmt::Write;
-                write!(s, "{b:02x}").unwrap();
-                s
-            });
-
-            let meta_pg_id = self.object_pg_id(bucket, key);
-            let pg = self.storage_node.get_pg(meta_pg_id)?;
-            pg.create_stream_upload(&CreateStreamUploadReq {
-                session_id: SessionId::from(session_id.as_str()),
-                bucket: BucketName::from(bucket),
-                key: ObjectKey::from(key),
-                target: StreamUploadTarget::PutObject,
-                encryption: stored_encryption,
-            })?;
-
-            Ok(session_id)
-        })
+    pub fn begin_stream_put_from_authorized_write(
+        &self,
+        authorized: &AuthorizedPutObjectWrite,
+    ) -> Result<String, ServerError> {
+        self.create_stream_put_session_for_authorized_write(authorized)
     }
 
     /// Begin a streaming UploadPart session.
@@ -9804,7 +9941,33 @@ impl Coordinator {
     ///
     /// The caller passes the running CRC64 checksum, total size, and metadata
     /// blob computed during the append phase. No segment data is re-read.
-    pub fn finalize_stream_put(
+    pub fn finalize_stream_put_from_authorized_write(
+        &self,
+        req: &AuthorizedFinalizeStreamPutRequest<'_>,
+        authorized: &AuthorizedPutObjectWrite,
+    ) -> Result<PutObjectResult, ServerError> {
+        self.finalize_stream_put(&FinalizeStreamPutRequest {
+            object: ObjectRequest::new(
+                authorized.bucket(),
+                authorized.key(),
+                authorized.requester().clone(),
+                authorized.expected_bucket_owner(),
+            ),
+            session_id: req.session_id,
+            crc64: req.crc64,
+            total_size: req.total_size,
+            metadata_blob: req.metadata_blob,
+            system_metadata: req.system_metadata,
+            write_encryption: req.write_encryption,
+            tags: authorized.tags(),
+            cond: req.cond,
+            acl: authorized.acl(),
+            policy_context: PutObjectPolicyContext::default(),
+            requested_object_lock: authorized.requested_object_lock(),
+        })
+    }
+
+    fn finalize_stream_put(
         &self,
         req: &FinalizeStreamPutRequest,
     ) -> Result<PutObjectResult, ServerError> {
@@ -9826,22 +9989,6 @@ impl Coordinator {
         let tags = req.tags;
         let cond = req.cond;
         self.with_bucket_write_reservation(bucket, |bucket_info| {
-            let existing_object = self.put_target_existing_live_object(bucket, key)?;
-            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-            if !Self::requester_can_put_object_with_bucket_policy(
-                req.object.requester(),
-                &bucket_info,
-                key,
-                req.policy_context
-                    .with_default_canned_acl(req.acl.policy_condition_value())
-                    .with_request_object_tags_xml(
-                        req.policy_context.request_object_tags_xml.or(req.tags),
-                    ),
-                bucket_policy.as_deref(),
-                existing_object.as_ref(),
-            )? {
-                return Err(ServerError::AccessDenied);
-            }
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
             let resolved_object_lock =
                 Self::resolve_new_object_lock_state(&bucket_info, req.requested_object_lock)?;
@@ -10382,15 +10529,19 @@ impl Coordinator {
         let dst_policy_context = req
             .destination_encryption
             .with_policy_context(copy_policy_context);
-        let dst_bucket_info = self.authorize_put_object_requester(
-            requester,
-            dst_bucket,
-            dst_key,
-            dst_policy_context,
-            req.expected_bucket_owner(),
-        )?;
-
-        Self::ensure_put_object_write_acl_supported(&dst_bucket_info, &acl)?;
+        let dst_authorized = self.authorize_put_object_write(&AuthorizePutObjectRequest {
+            object: ObjectRequest::new(
+                dst_bucket,
+                dst_key,
+                requester.clone(),
+                req.expected_bucket_owner(),
+            ),
+            acl: acl.clone(),
+            policy_context: dst_policy_context,
+            object_lock: req.object_lock,
+            tags: request_object_tags_xml,
+            encryption: req.destination_encryption,
+        })?;
 
         // Phase 1: Snapshot source metadata and prepare a read handle.
         let (src_metadata, src_system_metadata, src_tags, mut source_body) = {
@@ -10581,27 +10732,8 @@ impl Coordinator {
             } => Some(StreamingChecksumAccumulator::new(*algo)),
             _ => None,
         };
-        let session_policy = req
-            .destination_encryption
-            .with_policy_context(copy_policy_context);
-        let session_id = self.begin_stream_put(&BeginStreamPutRequest {
-            object: ObjectRequest::new(
-                dst_bucket,
-                dst_key,
-                requester.clone(),
-                req.expected_bucket_owner(),
-            ),
-            acl: acl.clone(),
-            policy: session_policy,
-            encryption: req.destination_encryption,
-            object_lock: req.object_lock,
-        })?;
-        let dst_write_encryption = self.load_stream_put_write_encryption(
-            dst_bucket,
-            dst_key,
-            &session_id,
-            req.destination_encryption.sse_customer_request(),
-        )?;
+        let session_id = self.create_stream_put_session_for_authorized_write(&dst_authorized)?;
+        let dst_write_encryption = &dst_authorized.write_encryption;
         let not_found = |e: ServerError| match e {
             ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
                 bucket: src_bucket.to_string(),
@@ -10693,6 +10825,8 @@ impl Coordinator {
             let lifecycle_last_modified = dst_live.last_modified;
             let result_last_modified = dst_stored.last_modified();
             drop(dst_meta_pg);
+            let dst_bucket_info =
+                self.active_bucket_summary(dst_bucket, req.expected_bucket_owner())?;
             let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
                 &dst_bucket_info,
                 dst_key,
@@ -24205,13 +24339,19 @@ mod tests {
             .unwrap();
         assert_eq!(source.body.read_all().unwrap(), b"public-foo");
         coord
-            .authorize_put_object_requester(
-                &test_helpers::requester("other-user"),
-                "dst",
-                "copied",
-                PutObjectPolicyContext::new(Some("src/public/foo"), None, None),
-                None,
-            )
+            .authorize_put_object_write(&AuthorizePutObjectRequest {
+                object: object_request_with_expected_owner(
+                    "dst",
+                    "copied",
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                acl: PutObjectAcl::None.into(),
+                policy_context: PutObjectPolicyContext::new(Some("src/public/foo"), None, None),
+                object_lock: ObjectLockState::default(),
+                tags: None,
+                encryption: WriteEncryptionRequest::none(),
+            })
             .unwrap();
 
         let copied = coord
@@ -24331,13 +24471,23 @@ mod tests {
             .unwrap();
         assert_eq!(source.body.read_all().unwrap(), b"public-foo");
         coord
-            .authorize_put_object_requester(
-                &test_helpers::requester("other-user"),
-                "dst",
-                "copied",
-                PutObjectPolicyContext::new(Some("src/public/foo"), Some("COPY"), None),
-                None,
-            )
+            .authorize_put_object_write(&AuthorizePutObjectRequest {
+                object: object_request_with_expected_owner(
+                    "dst",
+                    "copied",
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                acl: PutObjectAcl::None.into(),
+                policy_context: PutObjectPolicyContext::new(
+                    Some("src/public/foo"),
+                    Some("COPY"),
+                    None,
+                ),
+                object_lock: ObjectLockState::default(),
+                tags: None,
+                encryption: WriteEncryptionRequest::none(),
+            })
             .unwrap();
 
         coord
@@ -37957,6 +38107,123 @@ mod tests {
     }
 
     #[test]
+    fn put_object_from_authorized_write_commits_authorized_acl_and_tags() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let tags =
+            "<Tagging><TagSet><Tag><Key>scope</Key><Value>open</Value></Tag></TagSet></Tagging>";
+        let authorized = coord
+            .authorize_put_object_write(&AuthorizePutObjectRequest {
+                object: object_request_with_expected_owner("bucket", "obj", test_requester(), None),
+                acl: PutObjectAcl::PublicRead.into(),
+                policy_context: PutObjectPolicyContext::default()
+                    .with_request_object_tags_xml(Some(tags)),
+                object_lock: ObjectLockState::default(),
+                tags: Some(tags),
+                encryption: WriteEncryptionRequest::none(),
+            })
+            .unwrap();
+
+        coord
+            .put_object_from_authorized_write(
+                &AuthorizedPutObjectCommitRequest {
+                    data: b"hello",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    cond: NO_WRITE,
+                },
+                &authorized,
+            )
+            .unwrap();
+
+        let object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj",
+                    None,
+                    Requester::anonymous(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(read_all_body(object.body).unwrap(), b"hello");
+
+        let stored_tags =
+            get_object_tags_test(&coord, "bucket", "obj", None, test_requester(), None).unwrap();
+        assert_eq!(stored_tags.as_deref(), Some(tags));
+    }
+
+    #[test]
+    fn finalize_stream_put_from_authorized_write_commits_authorized_acl_and_tags() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let tags =
+            "<Tagging><TagSet><Tag><Key>scope</Key><Value>stream</Value></Tag></TagSet></Tagging>";
+        let authorized = coord
+            .authorize_put_object_write(&AuthorizePutObjectRequest {
+                object: object_request_with_expected_owner("bucket", "obj", test_requester(), None),
+                acl: PutObjectAcl::PublicRead.into(),
+                policy_context: PutObjectPolicyContext::default()
+                    .with_request_object_tags_xml(Some(tags)),
+                object_lock: ObjectLockState::default(),
+                tags: Some(tags),
+                encryption: WriteEncryptionRequest::none(),
+            })
+            .unwrap();
+        let session_id = coord
+            .begin_stream_put_from_authorized_write(&authorized)
+            .unwrap();
+        coord
+            .append_plaintext_stream_segment_for_test("bucket", "obj", &session_id, 0, b"hello")
+            .unwrap();
+
+        coord
+            .finalize_stream_put_from_authorized_write(
+                &AuthorizedFinalizeStreamPutRequest {
+                    session_id: &session_id,
+                    crc64: checksum::crc64::checksum(b"hello"),
+                    total_size: 5,
+                    metadata_blob: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    write_encryption: ActiveWriteEncryptionRef::None,
+                    cond: NO_WRITE,
+                },
+                &authorized,
+            )
+            .unwrap();
+
+        let object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "obj",
+                    None,
+                    Requester::anonymous(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(read_all_body(object.body).unwrap(), b"hello");
+
+        let stored_tags =
+            get_object_tags_test(&coord, "bucket", "obj", None, test_requester(), None).unwrap();
+        assert_eq!(stored_tags.as_deref(), Some(tags));
+    }
+
+    #[test]
     fn finalize_stream_put_rejects_mismatched_sse_c_write_context() {
         let dir = test_util::tempdir();
         let coord = setup_coordinator_with_sse_c(dir.path());
@@ -38053,6 +38320,67 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    }
+
+    #[test]
+    fn finalize_stream_put_does_not_reauthorize_after_stream_start() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_canned_acl_test(
+            &coord,
+            "bucket",
+            BucketAcl::PublicReadWrite,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        let writer = test_helpers::requester("writer-a");
+        let session_id = coord
+            .begin_stream_put(&BeginStreamPutRequest {
+                object: object_request_with_expected_owner("bucket", "obj", writer.clone(), None),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy: PutObjectPolicyContext::default(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+            })
+            .unwrap();
+        coord
+            .append_plaintext_stream_segment_for_test("bucket", "obj", &session_id, 0, b"hello")
+            .unwrap();
+
+        put_bucket_canned_acl_test(
+            &coord,
+            "bucket",
+            BucketAcl::Private,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        let result = coord
+            .finalize_stream_put(&FinalizeStreamPutRequest {
+                object: object_request_with_expected_owner("bucket", "obj", writer, None),
+                session_id: &session_id,
+                crc64: checksum::crc64::checksum(b"hello"),
+                total_size: 5,
+                metadata_blob: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                write_encryption: ActiveWriteEncryptionRef::None,
+                tags: None,
+                cond: &WriteCondition::default(),
+                acl: NO_PUT_OBJECT_ACL.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                requested_object_lock: ObjectLockState::default(),
+            })
+            .unwrap();
+        assert_eq!(
+            result.etag,
+            format_etag(checksum::crc64::checksum(b"hello"))
+        );
     }
 
     #[test]

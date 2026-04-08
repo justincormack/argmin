@@ -1406,6 +1406,7 @@ async fn handle_streaming_put(
     trace: observability::TraceContext,
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
+    let mut body = body;
 
     let state2 = Arc::clone(&state);
     let bucket_clone = bucket.clone();
@@ -1433,8 +1434,14 @@ async fn handle_streaming_put(
     .await
     {
         Ok(Ok(ctx)) => ctx,
-        Ok(Err(err)) => return error_response(&err),
-        Err(_) => return internal_error_response(),
+        Ok(Err(err)) => {
+            drain_request_body(&mut body, idle_timeout).await;
+            return error_response(&err);
+        }
+        Err(_) => {
+            drain_request_body(&mut body, idle_timeout).await;
+            return internal_error_response();
+        }
     };
     // Build chunked decoder if needed.
     let mut decoder = make_chunked_decoder(&chunked, ctx.streaming_signing.as_ref());
@@ -1452,8 +1459,6 @@ async fn handle_streaming_put(
     let mut total_size: u64 = 0;
     let mut body_started_emitted = false;
     let mut body_timing = StreamingBodyTiming::default();
-    let mut body = body;
-
     loop {
         let frame_wait_start = Instant::now();
         let next_frame = tokio::time::timeout(idle_timeout, body.frame()).await;
@@ -2037,6 +2042,10 @@ async fn abort_streaming_post_object(
     .await;
 }
 
+async fn drain_request_body(body: &mut Incoming, idle_timeout: Duration) {
+    while let Ok(Some(Ok(_))) = tokio::time::timeout(idle_timeout, body.frame()).await {}
+}
+
 /// Handle a streaming `UploadPart`: read body frame-by-frame, feed chunks to
 /// coordinator append API, finalize atomically.
 #[allow(clippy::too_many_arguments)]
@@ -2052,6 +2061,7 @@ async fn handle_streaming_part(
     trace: observability::TraceContext,
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
+    let mut body = body;
 
     let state2 = Arc::clone(&state);
     let bucket_clone = bucket.clone();
@@ -2080,8 +2090,14 @@ async fn handle_streaming_part(
     .await
     {
         Ok(Ok(ctx)) => ctx,
-        Ok(Err(err)) => return error_response(&err),
-        Err(_) => return internal_error_response(),
+        Ok(Err(err)) => {
+            drain_request_body(&mut body, idle_timeout).await;
+            return error_response(&err);
+        }
+        Err(_) => {
+            drain_request_body(&mut body, idle_timeout).await;
+            return internal_error_response();
+        }
     };
     if trailing_hasher.is_none() {
         if let Some(upload_algorithm) = ctx.checksum.upload_checksum_algorithm {
@@ -2103,8 +2119,6 @@ async fn handle_streaming_part(
     let mut total_size: u64 = 0;
     let mut body_started_emitted = false;
     let mut body_timing = StreamingBodyTiming::default();
-    let mut body = body;
-
     loop {
         let frame_wait_start = Instant::now();
         let next_frame = tokio::time::timeout(idle_timeout, body.frame()).await;
