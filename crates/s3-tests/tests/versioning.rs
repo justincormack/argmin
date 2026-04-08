@@ -7,6 +7,7 @@ use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version,
     delete_objects_with_md5, err_status, unique_bucket, CTX,
 };
+use tokio::time::{sleep, Duration};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -230,6 +231,51 @@ async fn clear_versioned_bucket_concurrent(client: aws_sdk_s3::Client, bucket: S
     for task in tasks {
         task.await.unwrap();
     }
+}
+
+async fn wait_for_version_listing_counts(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    expected_versions: usize,
+    expected_delete_markers: usize,
+    description: &str,
+) {
+    let mut last_seen = None;
+
+    for _ in 0..40 {
+        let resp = client
+            .list_object_versions()
+            .bucket(bucket)
+            .send()
+            .await
+            .unwrap();
+        let counts = (resp.versions().len(), resp.delete_markers().len());
+
+        if counts == (expected_versions, expected_delete_markers) {
+            sleep(Duration::from_millis(200)).await;
+
+            let confirm = client
+                .list_object_versions()
+                .bucket(bucket)
+                .send()
+                .await
+                .unwrap();
+            let confirmed = (confirm.versions().len(), confirm.delete_markers().len());
+            if confirmed == counts {
+                return;
+            }
+            last_seen = Some(confirmed);
+        } else {
+            last_seen = Some(counts);
+        }
+
+        sleep(Duration::from_millis(250)).await;
+    }
+
+    let (versions, delete_markers) = last_seen.unwrap_or_default();
+    panic!(
+        "{description} did not converge for {bucket}: expected {expected_versions} versions and {expected_delete_markers} delete markers, last saw {versions} versions and {delete_markers} delete markers"
+    );
 }
 
 // ── Basic versioning CRUD ───────────────────────────────────────────
@@ -1468,26 +1514,25 @@ fn test_versioned_concurrent_object_create_concurrent_remove() {
             )
             .await;
 
-            let resp = client
-                .list_object_versions()
-                .bucket(&bucket)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(resp.versions().len(), num_versions);
+            wait_for_version_listing_counts(
+                client,
+                &bucket,
+                num_versions,
+                0,
+                "version listing after concurrent creates",
+            )
+            .await;
 
             clear_versioned_bucket_concurrent(client.clone(), bucket.clone()).await;
 
-            let resp = client
-                .list_object_versions()
-                .bucket(&bucket)
-                .send()
-                .await
-                .unwrap();
-            assert!(
-                resp.versions().is_empty(),
-                "expected no versions after concurrent removal"
-            );
+            wait_for_version_listing_counts(
+                client,
+                &bucket,
+                0,
+                0,
+                "version listing after concurrent removal",
+            )
+            .await;
         }
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
@@ -1522,16 +1567,14 @@ fn test_versioned_concurrent_object_create_and_remove() {
 
         clear_versioned_bucket_concurrent(client.clone(), bucket.clone()).await;
 
-        let resp = client
-            .list_object_versions()
-            .bucket(&bucket)
-            .send()
-            .await
-            .unwrap();
-        assert!(
-            resp.versions().is_empty(),
-            "expected no versions after final concurrent cleanup"
-        );
+        wait_for_version_listing_counts(
+            client,
+            &bucket,
+            0,
+            0,
+            "version listing after final concurrent cleanup",
+        )
+        .await;
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
@@ -1595,13 +1638,14 @@ fn test_versioning_concurrent_multi_object_delete() {
         .unwrap();
         assert_eq!(resp.deleted().len(), num_objects * num_versions);
 
-        let resp = client
-            .list_object_versions()
-            .bucket(&bucket)
-            .send()
-            .await
-            .unwrap();
-        assert!(resp.versions().is_empty());
+        wait_for_version_listing_counts(
+            client,
+            &bucket,
+            0,
+            0,
+            "version listing after multi-object delete",
+        )
+        .await;
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
     });
