@@ -1,7 +1,7 @@
 use aws_sdk_s3::types::EncodingType;
 use s3_tests::{
     assert_s3_err_code, create_objects, create_objects_with_keys, delete_all_and_bucket,
-    err_status, unique_bucket, CTX,
+    err_status, send_signed_request, unique_bucket, CTX,
 };
 use std::time::Duration;
 
@@ -1779,6 +1779,106 @@ fn test_bucket_listv2_encoding_basic() {
             .await
             .unwrap();
         assert_eq!(get_keys(resp.contents()).len(), 4);
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_list_encoding_url_uses_plus_for_spaces() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let (bucket, keys) = create_objects_with_keys(client, &["foo 3"]).await;
+
+        let url = format!("{}/{bucket}?encoding-type=url", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("<Key>foo+3</Key>"),
+            "unexpected body: {}",
+            response.body
+        );
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_list_without_encoding_type_keeps_spaces_literal() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let (bucket, keys) = create_objects_with_keys(client, &["foo 3"]).await;
+
+        let url = format!("{}/{bucket}", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            !response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("<Key>foo 3</Key>"),
+            "unexpected body: {}",
+            response.body
+        );
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_listv2_encoding_url_uses_plus_for_spaces() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let (bucket, keys) = create_objects_with_keys(client, &["foo 3"]).await;
+
+        let url = format!("{}/{bucket}?list-type=2&encoding-type=url", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("<Key>foo+3</Key>"),
+            "unexpected body: {}",
+            response.body
+        );
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_listv2_without_encoding_type_keeps_spaces_literal() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let (bucket, keys) = create_objects_with_keys(client, &["foo 3"]).await;
+
+        let url = format!("{}/{bucket}?list-type=2", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            !response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("<Key>foo 3</Key>"),
+            "unexpected body: {}",
+            response.body
+        );
 
         delete_all_and_bucket(client, &bucket, &keys).await;
     });

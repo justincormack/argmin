@@ -5,7 +5,6 @@ use crate::coordinator::{
     ObjectPartsInfo,
 };
 use crate::error::ServerError;
-use auth::canonical::uri_encode_path;
 use checksum::{ChecksumAlgorithm, ChecksumType};
 use quick_xml::{escape::unescape, events::Event, Reader};
 #[cfg(test)]
@@ -2124,28 +2123,30 @@ pub fn list_object_versions_xml(
     xml
 }
 
+fn encode_url_listing_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
 fn encode_value(value: &str, encoding_type: Option<&str>) -> String {
     match encoding_type {
-        Some("url") => uri_encode_path(value),
+        Some("url") => encode_url_listing_value(value),
         _ => value.to_string(),
     }
 }
 
 fn encode_list_versions_value(value: &str, encoding_type: Option<&str>) -> String {
     match encoding_type {
-        Some("url") => {
-            let mut out = String::with_capacity(value.len());
-            for byte in value.bytes() {
-                match byte {
-                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                        out.push(byte as char)
-                    }
-                    b' ' => out.push('+'),
-                    _ => out.push_str(&format!("%{byte:02X}")),
-                }
-            }
-            out
-        }
+        Some("url") => encode_url_listing_value(value),
         _ => value.to_string(),
     }
 }
@@ -4122,6 +4123,39 @@ mod tests {
         assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
         assert!(xml.contains("<NextContinuationToken>photos/cat.jpg</NextContinuationToken>"));
         assert!(xml.contains("<CommonPrefixes><Prefix>photos/2024/</Prefix></CommonPrefixes>"));
+    }
+
+    #[test]
+    fn list_objects_xml_with_url_encoding() {
+        let result = ListObjectsResult {
+            objects: vec![ListEntry {
+                key: "dir/hello world&plus+".to_string(),
+                size: 7,
+                etag: "\"abc123\"".to_string(),
+                last_modified: 1685000000000,
+            }],
+            common_prefixes: vec!["dir/prefix here+".to_string()],
+            is_truncated: false,
+            next_continuation_token: None,
+            owner_principal: "owner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
+        };
+        let xml = list_objects_v2_xml(
+            "bucket",
+            None,
+            Some("/"),
+            Some("url"),
+            None,
+            None,
+            false,
+            1000,
+            &result,
+        );
+        assert!(xml.contains("<EncodingType>url</EncodingType>"));
+        assert!(xml.contains("<Key>dir/hello+world%26plus%2B</Key>"));
+        assert!(
+            xml.contains("<CommonPrefixes><Prefix>dir/prefix+here%2B</Prefix></CommonPrefixes>")
+        );
     }
 
     #[test]
