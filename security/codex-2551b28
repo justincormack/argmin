@@ -1,0 +1,305 @@
+Delimiter listing now fetches unbounded rows, enabling DoS
+Link: https://chatgpt.com/codex/security/findings/0da50c0cc2f88191b8ea1f11d9a19c80?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 2551b28
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 23:29:46
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced a denial-of-service vector by removing per-PG query caps for delimiter listings, causing unbounded DB reads and allocations.
+The commit changes ListObjectsV2 to use u32::MAX as the per‑PG limit whenever a delimiter is supplied. The coordinator then requests that many rows from each placement group and collects them all into a Vec before applying delimiter logic and max-keys truncation. In the storage layer, list_objects uses req.max_keys to set the SQL LIMIT and eagerly pushes every row into a vector. With the new per‑PG limit, a single authenticated request with a delimiter (even with default max-keys) can force the server to enumerate the entire bucket across PGs, consuming excessive CPU/memory and risking OOM or prolonged stalls. This is a network-reachable availability issue for any user with valid credentials (or for public buckets if listing is exposed).
+
+# Resolution
+Fixed in commit `daa1b76` (`Fix bounded delimiter object listing`).
+
+The shipped fix removes the unbounded delimiter fetch path in `ListObjectsV2`.
+Delimiter listings now page per placement group in bounded batches and use
+lexicographic jumps over common-prefix subtrees instead of requesting
+effectively unbounded result sets. The storage layer was extended with
+inclusive `start_at` support so the coordinator can resume from computed upper
+bounds without scanning entire prefixes.
+
+# Validation
+## Rubric
+- [x] Coordinator sets per_pg_limit to u32::MAX when delimiter is provided and uses it for per-PG list requests (coordinator.rs:438-459).
+- [x] Coordinator collects all PG responses into all_objects before applying delimiter/max_keys, so memory scales with full result set (coordinator.rs:449-470).
+- [x] PgStore list_objects uses req.max_keys to set SQL LIMIT and pushes all rows into a Vec before truncation (pg_store.rs:392-534).
+- [x] No upstream cap applies when delimiter is used; API-level max_keys only applies after full fetch/dedup (coordinator.rs:469-520).
+- [ ] Dynamic reproduction executed in-container (blocked by missing crates.io dependencies/offline build failure).
+## Report
+Crash/valgrind/debugger attempts were blocked by build constraints. `cargo test -p server list_objects_delimiter_unbounded_fetch -- --nocapture` failed because Cargo could not download `tiny_http` (403 from crates.io) and offline mode reports the package missing. `valgrind --version` and `gdb --version` are not available; lldb is present but there is no built test binary to debug due to the dependency fetch failure. 
+
+Code review confirms the DoS vector: `Coordinator::list_objects_v2` sets `per_pg_limit` to `u32::MAX` whenever `delimiter.is_some()` and passes that to each PG list request, then collects all PG responses into `all_objects` before sorting/dedup and only later applying delimiter/max_keys truncation (coordinator.rs:438-470). The storage layer derives the SQL LIMIT directly from `req.max_keys` (`limit = req.max_keys as i64 + 1`) and eagerly pushes all rows into a `Vec` before truncating to `req.max_keys` (pg_store.rs:392-534). With `u32::MAX`, this becomes an effectively unbounded LIMIT (~4.29e9), so a delimiter listing can force full-bucket enumeration and large memory allocations despite small `max_keys`, validating the availability risk described.
+
+# Evidence
+/workspace/argmin/crates/server/src/coordinator.rs (L438 to 459)
+  Note: Per‑PG limit is set to u32::MAX when a delimiter is supplied, and all results are collected, removing the previous cap.
+```
+        // Bound per-PG queries. Without delimiter, max_keys+1 per PG is
+        // sufficient: the global top max_keys entries can come from at most one
+        // PG each, so max_keys+1 captures them all plus detects truncation.
+        // With a delimiter, many raw keys can collapse into a single common
+        // prefix, so we cannot predict how many raw keys we need — fetch all.
+        let per_pg_limit = if delimiter.is_some() {
+            u32::MAX
+        } else {
+            max_keys.saturating_add(1)
+        };
+
+        // Fan out to all PGs and collect results
+        let mut all_objects: Vec<ObjectRecord> = Vec::new();
+        for &pg_id in self.storage_node.pg_ids() {
+            let pg = self.storage_node.get_pg(pg_id)?;
+            let resp = pg.list_objects(&ListObjectsReq {
+                bucket: bucket.to_string(),
+                prefix: prefix.map(|s| s.to_string()),
+                start_after: continuation_token.map(|s| s.to_string()),
+                max_keys: per_pg_limit,
+            })?;
+            all_objects.extend(resp.objects);
+```
+
+/workspace/argmin/crates/storage/src/pg_store.rs (L392 to 529)
+  Note: Storage list_objects derives SQL LIMIT from req.max_keys and eagerly pushes all returned rows into a Vec, so a u32::MAX limit results in unbounded memory/CPU usage.
+```
+    fn list_objects(&self, req: &ListObjectsReq) -> Result<ListObjectsResp, MetadataError> {
+        // Fetch one extra row to determine truncation.
+        let limit = req.max_keys as i64 + 1;
+
+        let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) =
+            match (&req.prefix, &req.start_after) {
+                (Some(prefix), Some(start_after)) => {
+                    // Prefix match: key >= start_after AND key LIKE 'prefix%'
+                    // Use key > start_after for ListObjectsV2 semantics.
+                    let end = prefix_end(prefix);
+                    match end {
+                        Some(end) => (
+                            "SELECT bucket, key, version_id, size, etag, etag_kind, \
+                             last_modified, storage_class, ec_k, ec_m, status \
+                             FROM objects \
+                             WHERE bucket = ?1 AND key > ?2 AND key >= ?3 AND key < ?4 \
+                             AND status = 0 \
+                             ORDER BY key ASC LIMIT ?5"
+                                .to_string(),
+                            vec![
+                                Box::new(req.bucket.clone()),
+                                Box::new(start_after.clone()),
+                                Box::new(prefix.clone()),
+                                Box::new(end),
+                                Box::new(limit),
+                            ],
+                        ),
+                        None => (
+                            "SELECT bucket, key, version_id, size, etag, etag_kind, \
+                             last_modified, storage_class, ec_k, ec_m, status \
+                             FROM objects \
+                             WHERE bucket = ?1 AND key > ?2 AND key >= ?3 \
+                             AND status = 0 \
+                             ORDER BY key ASC LIMIT ?4"
+                                .to_string(),
+                            vec![
+                                Box::new(req.bucket.clone()),
+                                Box::new(start_after.clone()),
+                                Box::new(prefix.clone()),
+                                Box::new(limit),
+                            ],
+                        ),
+                    }
+                }
+                (Some(prefix), None) => {
+                    let end = prefix_end(prefix);
+                    match end {
+                        Some(end) => (
+                            "SELECT bucket, key, version_id, size, etag, etag_kind, \
+                             last_modified, storage_class, ec_k, ec_m, status \
+                             FROM objects \
+                             WHERE bucket = ?1 AND key >= ?2 AND key < ?3 \
+                             AND status = 0 \
+                             ORDER BY key ASC LIMIT ?4"
+                                .to_string(),
+                            vec![
+                                Box::new(req.bucket.clone()),
+                                Box::new(prefix.clone()),
+                                Box::new(end),
+                                Box::new(limit),
+                            ],
+                        ),
+                        None => (
+                            "SELECT bucket, key, version_id, size, etag, etag_kind, \
+                             last_modified, storage_class, ec_k, ec_m, status \
+                             FROM objects \
+                             WHERE bucket = ?1 AND key >= ?2 \
+                             AND status = 0 \
+                             ORDER BY key ASC LIMIT ?3"
+                                .to_string(),
+                            vec![
+                                Box::new(req.bucket.clone()),
+                                Box::new(prefix.clone()),
+                                Box::new(limit),
+                            ],
+                        ),
+                    }
+                }
+                (None, Some(start_after)) => (
+                    "SELECT bucket, key, version_id, size, etag, etag_kind, \
+                     last_modified, storage_class, ec_k, ec_m, status \
+                     FROM objects \
+                     WHERE bucket = ?1 AND key > ?2 \
+                     AND status = 0 \
+                     ORDER BY key ASC LIMIT ?3"
+                        .to_string(),
+                    vec![
+                        Box::new(req.bucket.clone()),
+                        Box::new(start_after.clone()),
+                        Box::new(limit),
+                    ],
+                ),
+                (None, None) => (
+                    "SELECT bucket, key, version_id, size, etag, etag_kind, \
+                     last_modified, storage_class, ec_k, ec_m, status \
+                     FROM objects \
+                     WHERE bucket = ?1 \
+                     AND status = 0 \
+                     ORDER BY key ASC LIMIT ?2"
+                        .to_string(),
+                    vec![Box::new(req.bucket.clone()), Box::new(limit)],
+                ),
+            };
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| MetadataError::Db {
+            context: "prepare list objects",
+            source: e,
+        })?;
+
+        let rows = stmt
+            .query_map(params_refs.as_slice(), |row| {
+                Ok(ObjectRecord {
+                    bucket: row.get(0)?,
+                    key: row.get(1)?,
+                    version_id: row.get(2)?,
+                    size: row.get::<_, i64>(3)? as u64,
+                    etag: row.get(4)?,
+                    etag_kind: row.get::<_, u8>(5)?,
+                    last_modified: row.get::<_, i64>(6)? as u64,
+                    storage_class: row.get::<_, u8>(7)?,
+                    ec_k: row.get::<_, u8>(8)?,
+                    ec_m: row.get::<_, u8>(9)?,
+                    status: row.get::<_, u8>(10)?,
+                })
+            })
+            .map_err(|e| MetadataError::Db {
+                context: "list objects query",
+                source: e,
+            })?;
+
+        let mut objects: Vec<ObjectRecord> = Vec::new();
+        for row in rows {
+            objects.push(row.map_err(|e| MetadataError::Db {
+                context: "list objects row",
+                source: e,
+            })?);
+        }
+```
+
+Proposed patch:
+diff --git a/crates/server-core/src/coordinator.rs b/crates/server-core/src/coordinator.rs
+index a07508e1c96a63e619527d3e4380b977a7c8d432..23481879871233ee80b4e3f90a7fd1d6c2b1164a 100644
+--- a/crates/server-core/src/coordinator.rs
++++ b/crates/server-core/src/coordinator.rs
+@@ -5927,53 +5927,54 @@ impl Coordinator {
+             req.max_keys
+         );
+         let bucket = req.bucket;
+         let prefix = req.prefix;
+         let delimiter = req.delimiter;
+         let continuation_token = req.continuation_token;
+         let max_keys = req.max_keys;
+         let bucket_info = self.authorize_bucket_read_requester(req.requester, bucket)?;
+ 
+         // MaxKeys=0 is valid per S3 spec: return empty result
+         if max_keys == 0 {
+             return Ok(ListObjectsResult {
+                 objects: Vec::new(),
+                 common_prefixes: Vec::new(),
+                 is_truncated: false,
+                 next_continuation_token: None,
+                 owner_principal: bucket_info.owner_principal,
+                 owner_canonical_id: bucket_info.owner_canonical_id,
+             });
+         }
+ 
+         // Bound per-PG queries. Without delimiter, max_keys+1 per PG is
+         // sufficient: the global top max_keys entries can come from at most one
+         // PG each, so max_keys+1 captures them all plus detects truncation.
+         // With a delimiter, many raw keys can collapse into a single common
+-        // prefix, so we cannot predict how many raw keys we need — fetch all.
++        // prefix, so we cannot predict how many raw keys we need. Still cap
++        // per-PG fetches to avoid unbounded DB reads and allocations.
+         let per_pg_limit = if delimiter.is_some() {
+-            u32::MAX
++            MAX_LIST_RECORDS as u32
+         } else {
+             max_keys.saturating_add(1)
+         };
+ 
+         // Fan out to all PGs and collect results, with a hard memory cap.
+         let mut all_objects: Vec<StoredObject> = Vec::new();
+         let mut hit_record_cap = false;
+         self.pg_topology.for_each_pg(|pg_id| {
+             if hit_record_cap {
+                 return Ok::<(), ServerError>(());
+             }
+             let pg = self.storage_node.get_pg(pg_id)?;
+             let resp = pg.list_objects(&ListObjectsReq {
+                 bucket: BucketName::from(bucket),
+                 prefix: prefix.map(ObjectKey::from),
+                 start_after: continuation_token.map(ObjectKey::from),
+                 max_keys: per_pg_limit,
+             })?;
+             all_objects.extend(resp.objects);
+             if all_objects.len() >= MAX_LIST_RECORDS {
+                 all_objects.truncate(MAX_LIST_RECORDS);
+                 hit_record_cap = true;
+             }
+             Ok::<(), ServerError>(())
+         })?;
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Impact is limited to availability and requires authenticated access, but a single delimiter-based list request can cause unbounded DB reads and memory allocation (coordinator.rs:438-460; pg_store.rs:392-534). Given in-scope authenticated clients and network exposure, medium severity is appropriate.
+## Likelihood
+high - Triggerable by any authenticated client with a delimiter parameter; requires access credentials and a sufficiently large bucket to exhaust resources. | Remote network vector
+## Impact
+medium - Unbounded listing can trigger large SQL scans and memory allocations across PGs, risking OOM or prolonged service stalls (availability impact).
+## Assumptions
+- The service is deployed with ARGMIN_LISTEN_ADDR reachable by the attacker (not strictly localhost-only).
+- The attacker has valid S3 credentials for the Argmin server.
+- Target buckets can contain enough objects for unbounded listing to stress memory/CPU.
+- Valid S3 access key/secret
+- ListObjectsV2 request with a delimiter parameter
+- Bucket with large object count
+## Path
+client -> http -> coordinator -> pg_store -> impact
+## Path evidence
+- `crates/server/src/http/mod.rs:69-84` - ListObjectsV2 reads attacker-controlled delimiter/max-keys and calls coordinator.list_objects_v2.
+- `crates/server/src/http/mod.rs:119-135` - All requests require SigV4 authentication, establishing the credential precondition.
+- `crates/server/src/coordinator.rs:438-460` - per_pg_limit is set to u32::MAX when delimiter is provided, and all PG results are collected.
+- `crates/storage/src/pg_store.rs:392-534` - SQL LIMIT derives from req.max_keys and rows are eagerly pushed into a Vec before truncation.
+- `crates/server/src/config.rs:19-34` - Server listens on configurable address (default 127.0.0.1:9000) and uses env-provided credentials.
+## Narrative
+ListObjectsV2 takes attacker-controlled query params (delimiter/max-keys) after authentication, and passes them into list_objects_v2 (server/src/http/mod.rs:69-84). When delimiter is present, Coordinator sets per_pg_limit to u32::MAX and aggregates all PG results into memory (server/src/coordinator.rs:438-460). The storage layer uses req.max_keys to build SQL LIMIT and pushes every row into a Vec before truncation (storage/src/pg_store.rs:392-534), so u32::MAX produces effectively unbounded DB reads and allocations. An authenticated request with delimiter can therefore exhaust CPU/memory and stall or crash the service. No runtime PoC was executed due to build constraints; analysis is static.
+## Controls
+- SigV4 authentication required for all S3 operations
+- Configurable listen address (default 127.0.0.1:9000)
+- No explicit rate limiting on list operations
+## Blindspots
+- No runtime PoC due to build/dependency download constraints.
+- Deployment exposure (public vs localhost-only) depends on ARGMIN_LISTEN_ADDR configuration.
