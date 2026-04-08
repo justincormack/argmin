@@ -1,0 +1,207 @@
+Duplicate Content-Length header in GetObjectPart responses
+Link: https://chatgpt.com/codex/security/findings/89f0b0af8cb081919e47a4ce12575688?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=low
+Criticality: low (attack path: ignore)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: e190b29
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 22:32:15
+Assignee: Unassigned
+Signals: Validated, Patch generated, Attack-path
+
+# Summary
+Bug introduced: duplicate Content-Length headers due to manual header addition combined with streaming_body()'s own Content-Length insertion.
+The GetObjectPart response builder explicitly adds a Content-Length header and then calls streaming_body, which also appends Content-Length. This results in two Content-Length headers with identical values on every part response. While the values match, multiple Content-Length headers violate HTTP/1.1 rules and can cause some clients or intermediaries to reject or mishandle the response.
+
+Update: cleaned up in commit `4a71bcf` (`Remove duplicate GetObjectPart content length`).
+This was not a real wire-level issue in the current server because final HTTP serialization
+used `HeaderMap::insert`, so only one `Content-Length` header was emitted on the response.
+The redundant builder-level header was still removed for clarity and future safety, and
+regression tests were added for both `GetObjectPart` and `s3_response_to_hyper`.
+
+# Validation
+## Rubric
+- [x] Identify `get_object_part` adding an explicit Content-Length header (response.rs:378-384).
+- [x] Verify `streaming_body` appends another Content-Length header (response.rs:95-98).
+- [x] Confirm `get_object_part` uses `streaming_body`, causing duplicates (response.rs:437).
+- [x] Confirm response serialization iterates headers without deduplication (http/mod.rs:2218-2221).
+- [ ] Dynamic reproduction (build/test/PoC run) succeeds in this environment (blocked by missing libisal, valgrind, gdb).
+## Report
+Rubric-driven review and dynamic attempts: (1) Crash attempt via `cargo test -p server-http get_object_part_multipart -- --nocapture` failed to build because `ec-sys` requires libisal (missing libisal.pc; build.rs panic). (2) Valgrind not available (`valgrind: command not found`). (3) Debugger not available (`gdb: command not found`). With dynamic methods unavailable, code inspection confirms duplication: `S3Response::get_object_part` explicitly adds `Content-Length` (crates/server-http/src/http/response.rs:378-384), then calls `streaming_body`, which unconditionally pushes another `Content-Length` (response.rs:95-98), so headers include two identical entries. The response is serialized by iterating all headers without deduplication (s3_response_to_hyper in crates/server-http/src/http/mod.rs:2218-2221), meaning both Content-Length headers are emitted. This matches the reported HTTP compliance issue.
+
+# Evidence
+/workspace/argmin/crates/server-http/src/http/response.rs (L378 to 384)
+  Note: GetObjectPart explicitly sets a Content-Length header before streaming the body.
+```
+    pub fn get_object_part(result: GetObjectPartResult) -> Self {
+        let mut resp = Self::new(206)
+            .header("ETag", &result.etag)
+            .header("Last-Modified", &format_http_date(result.last_modified))
+            .header("Accept-Ranges", "bytes")
+            .header("Content-Length", &result.part_size.to_string())
+            .header("x-amz-mp-parts-count", &result.parts_count.to_string());
+```
+
+/workspace/argmin/crates/server-http/src/http/response.rs (L95 to 98)
+  Note: streaming_body appends another Content-Length header, leading to duplication.
+```
+    fn streaming_body(mut self, body: ReadHandle, content_length: u64) -> Self {
+        self.headers
+            .push(("Content-Length".to_string(), content_length.to_string()));
+        self.body = Vec::new();
+```
+
+Proposed patch:
+diff --git a/crates/server-http/src/http/mod.rs b/crates/server-http/src/http/mod.rs
+index df11ab1c828f07fe36d13cbd9a685d9f95f11c3c..1d339c067bf8af32fb8439b2ab8e6f5b22fd5cce 100644
+--- a/crates/server-http/src/http/mod.rs
++++ b/crates/server-http/src/http/mod.rs
+@@ -4309,50 +4309,58 @@ mod tests {
+         };
+         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+         assert_eq!(resp.status_code, 206);
+ 
+         // Verify Content-Range
+         let content_range = resp
+             .headers
+             .iter()
+             .find(|(k, _)| k == "Content-Range")
+             .map(|(_, v)| v.as_str())
+             .unwrap();
+         let total = 5 * 1024 * 1024 + 5 * 1024 * 1024 + 100;
+         let start = 5 * 1024 * 1024;
+         let end = 2 * 5 * 1024 * 1024 - 1;
+         assert_eq!(content_range, format!("bytes {start}-{end}/{total}"));
+ 
+         // Verify x-amz-mp-parts-count
+         let parts_count = resp
+             .headers
+             .iter()
+             .find(|(k, _)| k == "x-amz-mp-parts-count")
+             .map(|(_, v)| v.as_str())
+             .unwrap();
+         assert_eq!(parts_count, "3");
+ 
++        // Verify Content-Length appears exactly once.
++        let content_length_count = resp
++            .headers
++            .iter()
++            .filter(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
++            .count();
++        assert_eq!(content_length_count, 1);
++
+         // Verify data
+         assert_eq!(resp.into_test_body_bytes().unwrap(), part2);
+     }
+ 
+     #[test]
+     fn get_object_part_invalid_zero() {
+         let tmp = test_util::tempdir();
+         let fe = setup_frontend(tmp.path());
+         fe.coordinator
+             .create_bucket_for_owner("testuser", "mybucket", false)
+             .unwrap();
+ 
+         // PUT a simple object
+         let req = new_req(http::Method::GET, "", "", vec![], b"hello".to_vec());
+         let op = S3Operation::PutObject {
+             bucket: "mybucket".to_string(),
+             key: "k".to_string(),
+         };
+         fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+ 
+         // partNumber=0 → InvalidArgument
+         let req = make_req("partNumber=0");
+         let op = S3Operation::GetObject {
+             bucket: "mybucket".to_string(),
+             key: "k".to_string(),
+
+
+diff --git a/crates/server-http/src/http/response.rs b/crates/server-http/src/http/response.rs
+index 5a1f153c32b65d7406e6fe4c990c6daf8cb33caa..cd62b83b16369cb7062ed75dae8ed2d59db13ace 100644
+--- a/crates/server-http/src/http/response.rs
++++ b/crates/server-http/src/http/response.rs
+@@ -366,51 +366,50 @@ impl S3Response {
+         if let Some(cl) = result.metadata.get("content-language") {
+             resp = resp.header("Content-Language", cl);
+         }
+         if let Some(ex) = result.metadata.get("expires") {
+             resp = resp.header("Expires", ex);
+         }
+ 
+         for entry in result.metadata.iter() {
+             if entry.key.starts_with("x-amz-meta-") {
+                 resp = resp.meta_header(&entry.key, &entry.value);
+             }
+         }
+ 
+         resp.streaming_body(result.body, result.range_end - result.range_start + 1)
+     }
+ 
+     /// Build a response for a part-level `GetObject` (206 Partial Content).
+     /// Per-part checksum and checksum-type are always emitted (Ceph/AWS
+     /// return them without requiring ChecksumMode=ENABLED on part GETs).
+     #[must_use]
+     pub fn get_object_part(result: GetObjectPartResult) -> Self {
+         let mut resp = Self::new(206)
+             .header("ETag", &result.etag)
+             .header("Last-Modified", &format_http_date(result.last_modified))
+             .header("Accept-Ranges", "bytes")
+-            .header("Content-Length", &result.part_size.to_string())
+             .header("x-amz-mp-parts-count", &result.parts_count.to_string());
+         // Only emit Content-Range for non-empty parts; a zero-byte part has
+         // no valid byte range to express.
+         if result.part_size != 0 {
+             let content_range = format!(
+                 "bytes {}-{}/{}",
+                 result.part_start, result.part_end, result.size
+             );
+             resp = resp.header("Content-Range", &content_range);
+         }
+         if result.version_id.is_versioned() {
+             let vid = format_version_id(result.version_id);
+             resp = resp.header("x-amz-version-id", &vid);
+         }
+ 
+         if let Some(ct) = result.metadata.get("content-type") {
+             resp = resp.header("Content-Type", ct);
+         } else {
+             resp = resp.header("Content-Type", "application/octet-stream");
+         }
+         if let Some(ce) = result.metadata.get("content-encoding") {
+             resp = resp.header("Content-Encoding", ce);
+         }
+         if let Some(cc) = result.metadata.get("cache-control") {
+             resp = resp.header("Cache-Control", cc);
+
+# Attack-path analysis
+Final: ignore | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Although the duplicate Content-Length is a real bug in an in-scope HTTP response path, it is a protocol-compliance/interoperability issue without a credible security impact (no auth bypass, data exposure, or privilege escalation). Therefore the security criticality is reduced to ignore despite the original low severity label.
+## Likelihood
+high - Requires a GetObjectPart request and a client/proxy that rejects duplicate Content-Length; common clients may tolerate it. | Remote network vector
+## Impact
+ignore - Duplicate Content-Length headers can cause response rejection by strict clients/proxies, affecting availability/interoperability only; no confidentiality or integrity impact.
+## Assumptions
+- argmin-s3 is deployed as the HTTP/S3 service described in the threat model.
+- GetObjectPart is reachable by authenticated users or public buckets, and no reverse proxy normalizes duplicate headers.
+- Runtime configuration can bind beyond localhost, but defaults remain 127.0.0.1:9000.
+- Multipart object exists and GetObjectPart is requested
+- Requester has valid SigV4 credentials or the bucket/object is public
+## Path
+n1 -> n2 -> n3 -> n4 -> n5
+## Path evidence
+- `crates/server-http/src/http/response.rs:378-384` - get_object_part explicitly sets Content-Length for part responses.
+- `crates/server-http/src/http/response.rs:95-98` - streaming_body unconditionally appends another Content-Length header.
+- `crates/server-http/src/http/mod.rs:2218-2221` - s3_response_to_hyper serializes all headers without deduplication.
+- `crates/argmin-s3/src/config.rs:20-43` - Configuration shows default listen address (127.0.0.1:9000) and environment-driven credentials.
+## Narrative
+In server-http, get_object_part explicitly sets Content-Length and then calls streaming_body, which unconditionally adds another Content-Length header. The response serializer iterates all headers without deduplication, so clients receive duplicate Content-Length values. This is an HTTP/1.1 compliance issue that can cause interoperability or availability problems with strict clients or proxies, but it does not enable data exposure, auth bypass, or privilege escalation.
+## Controls
+- SigV4 authentication and bucket/object authorization
+- Request limits and timeouts (per threat model)
+## Blindspots
+- No runtime validation of client/proxy behavior due to build/test environment limits.
+- No deployment manifests to confirm real-world exposure beyond localhost defaults.
