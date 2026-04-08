@@ -2478,7 +2478,8 @@ impl HttpFrontend {
                     req.query_param_lossy("version-id-marker"),
                     "version-id-marker",
                 )?;
-                let max_keys = parse_max_keys(req.query_param_lossy("max-keys"))?;
+                let requested_max_keys =
+                    parse_requested_max_keys(req.query_param_lossy("max-keys"))?;
                 let requester = Self::requester_from_auth(auth);
 
                 let result = self.coordinator.list_object_versions(
@@ -2487,14 +2488,14 @@ impl HttpFrontend {
                         prefix: prefix.as_deref(),
                         key_marker: key_marker.as_deref(),
                         version_id_marker,
-                        max_keys,
+                        max_keys: requested_max_keys,
                     },
                 )?;
                 Ok(S3Response::list_object_versions(
                     &bucket,
                     prefix.as_deref(),
                     key_marker.as_deref(),
-                    max_keys,
+                    requested_max_keys,
                     &result,
                 ))
             }
@@ -4032,6 +4033,10 @@ pub fn s3_response_to_hyper(
 
 fn parse_max_keys<S: AsRef<str>>(raw: Option<S>) -> Result<u32, ServerError> {
     Ok(parse_u32_or_default(raw, 1000, "invalid max-keys")?.min(S3_MAX_LIST_KEYS))
+}
+
+fn parse_requested_max_keys<S: AsRef<str>>(raw: Option<S>) -> Result<u32, ServerError> {
+    parse_u32_or_default(raw, 1000, "invalid max-keys")
 }
 
 /// Apply response-* query parameter overrides to a GET response.
@@ -8344,7 +8349,7 @@ mod tests {
     }
 
     #[test]
-    fn list_object_versions_clamps_oversized_max_keys() {
+    fn list_object_versions_echoes_oversized_max_keys() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
@@ -8358,7 +8363,7 @@ mod tests {
 
         let body = String::from_utf8(response_body(resp)).unwrap();
         assert!(
-            body.contains("<MaxKeys>1000</MaxKeys>"),
+            body.contains("<MaxKeys>5000</MaxKeys>"),
             "unexpected body: {body}"
         );
     }

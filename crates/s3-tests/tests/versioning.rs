@@ -5,7 +5,7 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version,
-    delete_objects_with_md5, err_status, unique_bucket, CTX,
+    delete_objects_with_md5, err_status, send_signed_request, unique_bucket, CTX,
 };
 use tokio::time::{sleep, Duration};
 
@@ -1125,6 +1125,110 @@ fn test_versioning_list_object_versions_pagination_and_markers() {
             .await
             .unwrap();
         cleanup_versioned(&bucket, key, &key_versions).await;
+    });
+}
+
+#[test]
+fn test_versioning_list_object_versions_oversized_max_keys_echoed_by_aws() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("oversized-max-keys.txt")
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .max_keys(5000)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(resp.max_keys(), Some(5000));
+        assert_eq!(resp.is_truncated(), Some(false));
+        assert_eq!(resp.versions().len(), 1);
+        assert!(resp.delete_markers().is_empty());
+        assert_eq!(resp.next_key_marker(), None);
+        assert_eq!(resp.next_version_id_marker(), None);
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_versioning_list_object_versions_raw_xml_echoes_oversized_max_keys_on_aws() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("oversized-max-keys-raw.txt")
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await
+            .unwrap();
+
+        let url = format!("{}/{bucket}?versions=&max-keys=5000", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<MaxKeys>5000</MaxKeys>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("<IsTruncated>false</IsTruncated>"),
+            "unexpected body: {}",
+            response.body
+        );
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_versioning_list_object_versions_oversized_max_keys_returns_at_most_1000_entries() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "oversized-max-keys-many-versions.txt";
+
+        for _ in 0..1001 {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b""))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let resp = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .max_keys(5000)
+            .send()
+            .await
+            .unwrap();
+
+        let entry_count = resp.versions().len() + resp.delete_markers().len();
+        assert_eq!(entry_count, 1000);
+        assert_eq!(resp.is_truncated(), Some(true));
+        assert!(resp.next_key_marker().is_some());
+        assert!(resp.next_version_id_marker().is_some());
+
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 
