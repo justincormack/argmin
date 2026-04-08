@@ -1,0 +1,481 @@
+Streaming UploadPart reuploads leave orphaned shard data
+Link: https://chatgpt.com/codex/security/findings/f9aa5008a75081919ca466e7cfced4da?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 470aa8a
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 23:08:39
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+The commit introduces a reachable cleanup gap for streaming UploadPart reuploads: old chunk manifests are deleted before shard cleanup and the cleanup lookup uses old generation version_id instead of the new staging sentinel, so stale shards are never removed.
+With streaming UploadPart enabled, chunk manifests are committed with a u64::MAX staging version_id and commit_stream_part deletes prior chunk rows by upload_id before the coordinator attempts cleanup. The cleanup logic then queries get_multipart_part_chunks using the old generation version_id, which no longer matches the sentinel and no longer exists in metadata because the rows were already deleted. As a result, re-uploading the same part leaves the previous chunk shards on disk. An authenticated client can repeatedly reupload a single part to accumulate orphaned shard data and exhaust storage, bypassing the expected per-part/object size limits.
+
+# Reviewer note
+This report is old in terminology, but the bug shape still appears to be
+present in the current tree.
+
+Terminology changes since the original report:
+- `chunk` manifests are now `segment` manifests
+- `multipart_part_chunks` is now `multipart_part_segments`
+- `get_multipart_part_chunks` is now `get_multipart_part_segments`
+- the affected coordinator path is now `finalize_stream_part` in
+  `crates/server-core/src/coordinator.rs`
+
+Current-tree mapping of the same issue:
+- `finalize_stream_part` still commits new streamed-part segments first and
+  only then attempts best-effort cleanup of the prior streamed-part shards
+  ([crates/server-core/src/coordinator.rs](/home/justin/src/github.com/justincormack/argmin/crates/server-core/src/coordinator.rs#L10161)).
+- `commit_stream_part` still deletes prior `multipart_part_segments` rows for
+  the upload+part before inserting the new rows
+  ([crates/storage/src/pg_store.rs](/home/justin/src/github.com/justincormack/argmin/crates/storage/src/pg_store.rs#L6366)).
+- The subsequent cleanup lookup still fetches by the old generation's
+  `version_id`, via `get_multipart_part_segments`, which filters strictly on
+  `version_id`
+  ([crates/server-core/src/coordinator.rs](/home/justin/src/github.com/justincormack/argmin/crates/server-core/src/coordinator.rs#L10193),
+  [crates/storage/src/pg_store.rs](/home/justin/src/github.com/justincormack/argmin/crates/storage/src/pg_store.rs#L6534)).
+
+So the report should be read as referring to streamed-part segment manifests in
+the current implementation rather than the older chunk-based names.
+
+# Resolution
+Fixed in commit `a939d4c` (`Fix streamed upload part shard cleanup`).
+
+The shipped fix updates the storage contract so `commit_stream_part` returns the
+prior `multipart_part_segments` rows it displaced inside the same transaction,
+before deleting those metadata rows. The coordinator's `finalize_stream_part`
+path now uses that returned segment set for best-effort shard cleanup after the
+commit instead of trying to rediscover the old rows with a post-commit
+`get_multipart_part_segments(... old version_id ...)` lookup that could never
+succeed after the delete.
+
+Regression coverage added with the fix:
+- storage-level coverage now asserts reuploads return the displaced streamed-part
+  segment manifests
+- coordinator-level coverage now verifies that reuploading a streamed part
+  deletes the prior segment shard files from disk
+
+# Validation
+## Rubric
+- [x] Verify streamed part chunks are staged with sentinel version_id u64::MAX (coordinator.rs:1408-1415; pg_store.rs:25-28)
+- [x] Verify commit_stream_part deletes prior multipart_part_chunks for the same upload+part before cleanup (pg_store.rs:2189-2206)
+- [x] Verify cleanup after finalize_stream_part queries old chunks using old_gen as version_id and relies on get_multipart_part_chunks filtering by version_id (coordinator.rs:1455-1482; pg_store.rs:2356-2369)
+- [x] Confirm shard cleanup depends on the retrieved chunk list (coordinator.rs:2360-2372)
+- [x] Attempt dynamic reproduction (cargo test) and note missing libisal/valgrind/gdb blockers
+## Report
+Attempted dynamic reproduction first: `cargo test -p server stream_part_happy_path -- --nocapture` failed to build because `ec-sys` requires libisal (`libisal not found; install intel-isa-l or set PKG_CONFIG_PATH`). Valgrind and gdb are not installed (`valgrind: command not found`, `gdb: command not found`), so crash/valgrind/debugger validation was blocked. Code review confirms the logic gap: streamed part chunks are committed with version_id = u64::MAX (staging sentinel) in finalize_stream_part (crates/server/src/coordinator.rs:1408-1415) and the sentinel is defined as PART_CHUNK_STAGING_VERSION_ID = u64::MAX (crates/storage/src/pg_store.rs:25-28). `commit_stream_part` deletes prior multipart_part_chunks rows for the same upload_id+part_number before returning (crates/storage/src/pg_store.rs:2189-2206). After commit, cleanup uses `old_gen` as `old_vid` and queries `get_multipart_part_chunks(bucket, key, old_vid, part_number)` (crates/server/src/coordinator.rs:1455-1482), but that query filters strictly by version_id (crates/storage/src/pg_store.rs:2356-2369). Since the old rows were deleted and used the u64::MAX sentinel, the lookup returns empty and `delete_chunk_shards_generic` is not invoked (crates/server/src/coordinator.rs:2360-2372), leaving old shard data orphaned. This matches the reported reupload storage leak.
+
+# Evidence
+/workspace/argmin/crates/server/src/coordinator.rs (L1408 to 1483)
+  Note: Streaming part chunks are staged with version_id = u64::MAX, then after commit the cleanup uses old_gen as version_id to fetch old chunks. Because commit_stream_part deletes prior chunk rows first, this lookup returns nothing, leaving old chunk shards orphaned on reupload.
+```
+        let committed_chunks: Vec<MultipartPartChunkRecord> = staging_chunks
+            .iter()
+            .map(|c| MultipartPartChunkRecord {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                upload_id: upload_id.to_string(),
+                version_id: u64::MAX, // staging sentinel — reparented at CompleteMultipartUpload time
+                part_number,
+                chunk_index: c.chunk_index,
+                size: c.size,
+                chunk_okh: c.chunk_okh,
+                chunk_vid: c.chunk_vid,
+                shard_pg_id: c.shard_pg_id,
+                ec_k: c.ec_k,
+                ec_m: c.ec_m,
+            })
+            .collect();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let part_record = MultipartPartRecord {
+            upload_id: upload_id.to_string(),
+            part_number,
+            generation,
+            size: total_size,
+            etag: crc64_to_etag_bytes(crc64),
+            etag_kind: 0,
+            part_okh: [0u8; 16], // no single-shard placement for streamed parts
+            part_vid: generation as u64,
+            ec_k: self.ec_config.data_shards,
+            ec_m: self.ec_config.parity_shards,
+            last_modified: now,
+            checksum: checksum_bytes.clone(),
+        };
+
+        // Atomic commit: upsert part, insert chunks, delete staging.
+        meta_guard
+            .commit_stream_part(session_id, &part_record, &committed_chunks)
+            .map_err(ServerError::Metadata)?;
+
+        // Best-effort cleanup of prior generation's shards.
+        // The prior generation used the non-streaming path, so clean its
+        // single shard set. If it was also a streamed part, clean its chunks.
+        drop(meta_guard);
+        if generation > 0 {
+            let old_gen = generation - 1;
+            // Clean old non-streaming shards.
+            let old_okh = part_key_hash(upload_id, part_number, old_gen);
+            let old_vid = old_gen as u64;
+            let old_shard_pg_id = derive_pg_shards(
+                &format!("mpu/{upload_id}"),
+                &format!("{part_number}/{old_gen}"),
+                old_vid,
+                self.pg_count,
+            );
+            if let Ok(old_pg) = self.storage_node.get_pg(old_shard_pg_id) {
+                let k = self.ec_config.data_shards as usize;
+                let m = self.ec_config.parity_shards as usize;
+                for i in 0..(k + m) {
+                    let old_key = ShardKey::new(&old_okh, old_vid, i as u8);
+                    let _ = old_pg.delete_shard(&old_key);
+                }
+            }
+            // Clean old streamed-part chunks (if prior generation was streamed).
+            // commit_stream_part already handles deleting prior multipart_part_chunks
+            // in its transaction, but the shard data on disk needs cleanup.
+            if let Ok(pg) = self.storage_node.get_pg(meta_pg_id) {
+                if let Ok(old_chunks) =
+                    pg.get_multipart_part_chunks(bucket, key, old_vid, part_number)
+                {
+                    drop(pg);
+                    let _ = self.delete_chunk_shards_generic(&old_chunks);
+                }
+```
+
+/workspace/argmin/crates/storage/src/pg_store.rs (L2189 to 2206)
+  Note: Prior chunk manifests for the same upload+part are deleted during commit_stream_part, so the coordinator cannot retrieve old chunks after commit for shard cleanup.
+```
+            // 3. Delete prior part chunks for this upload+part (re-upload support).
+            //    Scoped by upload_id to avoid clobbering concurrent uploads for the same key.
+            self.conn
+                .execute(
+                    "DELETE FROM multipart_part_chunks \
+                     WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 \
+                     AND part_number = ?4",
+                    params![
+                        sess_bucket,
+                        sess_key,
+                        part.upload_id,
+                        part.part_number
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "commit stream part (delete prior chunks)",
+                    source: e,
+                })?;
+```
+
+Proposed patch:
+diff --git a/crates/server-core/src/coordinator.rs b/crates/server-core/src/coordinator.rs
+index a07508e1c96a63e619527d3e4380b977a7c8d432..f6b5c90281568a4079ecc617302fe2fe0a5e8aa3 100644
+--- a/crates/server-core/src/coordinator.rs
++++ b/crates/server-core/src/coordinator.rs
+@@ -4052,50 +4052,67 @@ impl Coordinator {
+                             claim.algorithm().as_str(),
+                             algo.as_str()
+                         ),
+                     });
+                 }
+                 if claim.expected_bytes() != bytes {
+                     return Err(ServerError::BadDigest);
+                 }
+             }
+             Some(cksum)
+         } else if effective_algo.is_some() || claimed_checksum.is_some() {
+             return Err(ServerError::InvalidRequest {
+                 reason: "missing computed checksum for streaming upload part".to_string(),
+             });
+         } else {
+             None
+         };
+ 
+         // Determine generation for this part.
+         let generation = match meta_guard.get_multipart_part(upload_id, part_number) {
+             Ok(existing) => existing.generation + 1,
+             Err(storage::MetadataError::PartNotFound { .. }) => 0,
+             Err(e) => return Err(ServerError::Metadata(e)),
+         };
+ 
++        // Capture prior streamed-part segments before commit. `commit_stream_part`
++        // removes prior segment manifests for this upload+part as part of its
++        // transaction, so any shard cleanup data must be collected first.
++        let old_stream_segments = if generation > 0 {
++            meta_guard
++                .get_all_multipart_part_segments_for_upload(upload_id)
++                .map(|segments| {
++                    segments
++                        .into_iter()
++                        .filter(|segment| segment.part_number == part_number)
++                        .collect::<Vec<_>>()
++                })
++                .map_err(ServerError::Metadata)?
++        } else {
++            Vec::new()
++        };
++
+         // Build committed object segments from staging rows.
+         let staging_segments = meta_guard
+             .list_stream_segments(session_id)
+             .map_err(ServerError::Metadata)?;
+         let segments_total: u64 = staging_segments.iter().map(|segment| segment.size).sum();
+         if segments_total != total_size {
+             return Err(ServerError::InvalidRequest {
+                 reason: format!(
+                     "total_size mismatch: caller passed {total_size} but staged segments sum to {segments_total}"
+                 ),
+             });
+         }
+ 
+         let committed_segments: Vec<MultipartPartSegmentRecord> = staging_segments
+             .iter()
+             .map(|segment| MultipartPartSegmentRecord {
+                 bucket: BucketName::from(bucket),
+                 key: ObjectKey::from(key),
+                 upload_id: UploadId::from(upload_id),
+                 version_id: u64::MAX, // staging sentinel — reparented at CompleteMultipartUpload time
+                 part_number,
+                 segment_index: segment.segment_index,
+                 size: segment.size,
+                 segment_crc64: segment.segment_crc64,
+                 segment_okh: segment.segment_okh,
+@@ -4134,63 +4151,52 @@ impl Coordinator {
+ 
+         // Best-effort cleanup of prior generation's shards.
+         // The prior generation used the non-streaming path, so clean its
+         // single shard set. If it was also a streamed part, clean its segments.
+         drop(meta_guard);
+         if generation > 0 {
+             let old_gen = generation - 1;
+             // Clean old non-streaming shards.
+             let old_okh = part_key_hash(upload_id, part_number, old_gen);
+             let old_vid =
+                 GenerationId::new(u64::from(old_gen) + 1).expect("old generation must be nonzero");
+             let old_shard_pg_id = self.shard_pg_id_raw(
+                 &format!("mpu/{upload_id}"),
+                 &format!("{part_number}/{old_gen}"),
+                 old_vid.get(),
+             );
+             if let Ok(old_pg) = self.storage_node.get_pg(old_shard_pg_id) {
+                 let k = self.ec_config.data_shards as usize;
+                 let m = self.ec_config.parity_shards as usize;
+                 for i in 0..(k + m) {
+                     let old_key = ShardKey::new(&old_okh, old_vid.get(), i as u8);
+                     let _ = old_pg.delete_shard(&old_key);
+                 }
+             }
+             // Clean old streamed-part segments (if prior generation was streamed).
+-            // `commit_stream_part` already handles deleting prior
+-            // `multipart_part_segments` rows in its transaction, but the shard
+-            // data on disk still needs cleanup.
+-            if let Ok(pg) = self.storage_node.get_pg(meta_pg_id) {
+-                if let Ok(old_segments) = pg.get_multipart_part_segments(
+-                    bucket,
+-                    key,
+-                    VersionId::from_u64(old_vid.get()),
+-                    part_number,
+-                ) {
+-                    drop(pg);
+-                    let _ = self.delete_segment_shards_generic(&old_segments);
+-                }
++            if !old_stream_segments.is_empty() {
++                let _ = self.delete_segment_shards_generic(&old_stream_segments);
+             }
+         }
+ 
+         Ok(UploadPartResult {
+             etag: format_etag(crc64),
+             checksum,
+         })
+     }
+ 
+     /// Abort a streaming upload session.
+     ///
+     /// Marks the session as Aborted and deletes staging rows. Best-effort
+     /// cleans up shard data written during append.
+     pub fn abort_stream_put(
+         &self,
+         bucket: &str,
+         key: &str,
+         session_id: &str,
+     ) -> Result<(), ServerError> {
+         let meta_pg_id = self.object_pg_id(bucket, key);
+         let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
+ 
+         // Validate session exists and matches bucket/key.
+         let session = meta_guard.get_stream_upload(session_id)?;
+         if session.bucket != bucket || session.key != key {
+@@ -18416,50 +18422,125 @@ mod tests {
+             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+             let segments = meta_pg
+                 .get_all_multipart_part_segments_for_upload(&mpu.upload_id)
+                 .unwrap();
+             assert!(
+                 segments.is_empty(),
+                 "object segments rows should be deleted after abort"
+             );
+         }
+ 
+         // Verify shard data is gone.
+         for segment in &segments_before {
+             let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
+             let total = segment.ec_k as usize + segment.ec_m as usize;
+             for i in 0..total {
+                 let shard_key =
+                     ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
+                 assert!(
+                     shard_pg.read_shard(&shard_key).is_err(),
+                     "shard {i} should be deleted after abort"
+                 );
+             }
+         }
+     }
+ 
++    #[test]
++    fn stream_part_reupload_cleans_old_segment_shards() {
++        // Regression: re-uploading the same streaming part should remove shard
++        // data from the prior generation instead of orphaning it on disk.
++        let dir = test_util::tempdir();
++        let coord = setup_coordinator(dir.path());
++        coord.create_bucket("bucket").unwrap();
++
++        let metadata = MetadataBlob::new();
++        let mpu = coord
++            .create_multipart_upload(&CreateMultipartUploadRequest {
++                bucket: "bucket",
++                key: "key",
++                metadata: &metadata,
++                checksum: None,
++
++                requester: TEST_REQUESTER,
++            })
++            .unwrap();
++
++        let upload_streamed_part = |part_data: &[u8]| {
++            let session = begin_stream_part_test(&coord, "bucket", "key", &mpu.upload_id, 1)
++                .unwrap()
++                .session_id;
++            coord
++                .append_stream_segment("bucket", "key", &session, 0, part_data)
++                .unwrap();
++            let crc = checksum::crc64::checksum(part_data);
++            coord
++                .finalize_stream_part(FinalizeStreamPartRequest {
++                    bucket: "bucket",
++                    key: "key",
++                    session_id: &session,
++                    upload_id: &mpu.upload_id,
++                    part_number: 1,
++                    crc64: crc,
++                    total_size: part_data.len() as u64,
++                    claimed_checksum: None,
++                    computed_checksum: None,
++                })
++                .unwrap();
++        };
++
++        upload_streamed_part(b"first-streamed-part-generation");
++        let first_generation_segments = {
++            let meta_pg = coord
++                .storage_node
++                .get_pg(coord.object_pg_id("bucket", "key"))
++                .unwrap();
++            meta_pg
++                .get_all_multipart_part_segments_for_upload(&mpu.upload_id)
++                .unwrap()
++        };
++        assert!(
++            !first_generation_segments.is_empty(),
++            "expected first generation to have segment manifests"
++        );
++
++        upload_streamed_part(b"second-streamed-part-generation");
++
++        // Old shard data should be gone after re-upload.
++        for segment in &first_generation_segments {
++            let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
++            let total = segment.ec_k as usize + segment.ec_m as usize;
++            for i in 0..total {
++                let shard_key =
++                    ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
++                assert!(
++                    shard_pg.read_shard(&shard_key).is_err(),
++                    "old shard {i} should be deleted after streamed part re-upload"
++                );
++            }
++        }
++    }
++
+     // ── Phase 5: Cleanup hardening tests ────────────────────────────
+ 
+     #[test]
+     fn scavenge_stale_sessions_cleans_old() {
+         let dir = test_util::tempdir();
+         let coord = setup_coordinator(dir.path());
+         coord.create_bucket("bucket").unwrap();
+ 
+         // Begin a session (creates with current timestamp).
+         let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+         coord
+             .append_stream_segment("bucket", "key", &session_id, 0, b"data")
+             .unwrap();
+ 
+         // Scavenge with a very large max_age so all sessions created "now" are stale.
+         // We pass max_age = u64::MAX which makes cutoff = now.saturating_sub(MAX) = 0,
+         // meaning all sessions with created_at > 0 would NOT be stale. Instead, use
+         // a generous window: any session older than 1ms is stale.
+         std::thread::sleep(std::time::Duration::from_millis(5));
+         let count = coord.scavenge_stale_sessions(1);
+         assert_eq!(count, 1);
+ 
+         // Session should be gone — appending should fail.
+         let err = coord
+             .append_stream_segment("bucket", "key", &session_id, 1, b"more")
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The bug is reachable from the normal authenticated UploadPart path and demonstrably leaves shard data orphaned, enabling storage exhaustion. It does not provide auth bypass, data exfiltration, or integrity compromise beyond availability, so medium severity aligns with impact and required preconditions.
+## Likelihood
+high - Requires valid credentials and bucket write access, but exploitation is straightforward (repeat reupload) with no apparent quota or cleanup guard. | Remote network vector
+## Impact
+medium - Orphaned shard files can accumulate with repeated UploadPart reuploads, consuming disk and causing service availability degradation or outage.
+## Assumptions
+- The service is deployed with network reachability beyond localhost (e.g., ARGMIN_LISTEN_ADDR bound to 0.0.0.0 or behind a proxy).
+- An attacker can obtain valid S3 credentials and bucket write permission.
+- There is no external garbage collection or quota enforcement that removes orphaned shards.
+- Valid access key/secret
+- Bucket write authorization
+- Multipart UploadPart allowed (streaming path)
+## Path
+n1(Authenticated client)
+  -> n2(UploadPart handler)
+  -> n3(Coordinator finalize_stream_part)
+     -> n4(PgStore deletes prior chunk rows)
+     -> n5(Shard files persist on disk)
+## Path evidence
+- `crates/server/src/http/router.rs:350-352` - UploadPart is routed from PUT with partNumber query parameter (network entrypoint).
+- `crates/server/src/http/mod.rs:1055-1065` - UploadPart requires authorize_bucket_write and calls coordinator.upload_part.
+- `crates/server/src/coordinator.rs:1408-1415` - Streaming committed chunks use version_id = u64::MAX staging sentinel.
+- `crates/storage/src/pg_store.rs:2189-2206` - commit_stream_part deletes prior multipart_part_chunks rows for the same upload+part before cleanup.
+- `crates/server/src/coordinator.rs:1455-1482` - Cleanup queries old chunks using old generation as version_id and then attempts shard deletion.
+- `crates/storage/src/pg_store.rs:2356-2369` - get_multipart_part_chunks filters by version_id, so old chunks are not found after deletion.
+- `crates/server/src/config.rs:20-43` - Listen address default is 127.0.0.1:9000 and credentials are provided via environment variables.
+## Narrative
+UploadPart is a network-exposed operation that requires bucket write authorization. In the streaming finalize path, committed part chunk records are stored with a u64::MAX staging version_id, then commit_stream_part deletes prior multipart_part_chunks rows for the same upload+part. Cleanup afterwards queries get_multipart_part_chunks using the previous generation as version_id, which filters by version_id and returns nothing after deletion. As a result, delete_chunk_shards_generic is never invoked for the prior streamed part, leaving shard files on disk. An authenticated client can repeatedly reupload the same part to accumulate orphaned shard data and exhaust storage, causing availability impact.
+## Controls
+- SigV4 authentication (authenticate_request)
+- Bucket write authorization (authorize_bucket_write)
+- Connection limit via ARGMIN_MAX_CONNECTIONS
+## Blindspots
+- No runtime PoC due to build environment limitations (libisal missing).
+- No repository evidence of external garbage collection or quotas that might mitigate storage exhaustion.
+- Deployment exposure (public vs internal) depends on runtime configuration.
