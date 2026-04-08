@@ -12,6 +12,33 @@ use tokio::time::{sleep, Duration};
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+const CONTROL_KEY_CASES: &[(&str, &str)] = &[
+    ("bad\u{0001}key", "bad%01key"),
+    ("bad\u{001F}key", "bad%1Fkey"),
+    ("bad\u{007F}key", "bad%7Fkey"),
+    ("bad\u{0080}key", "bad%C2%80key"),
+];
+
+const XML_SPECIAL_KEY: &str = "xml<>&\"key";
+const XML_SPECIAL_KEY_ENCODED: &str = "xml%3C%3E%26%22key";
+
+fn expected_raw_list_key(decoded_key: &str) -> String {
+    let mut escaped = String::with_capacity(decoded_key.len());
+    for ch in decoded_key.chars() {
+        match ch {
+            '\u{0001}'..='\u{0008}' | '\u{000B}' | '\u{000C}' | '\u{000E}'..='\u{001F}' => {
+                escaped.push_str(&format!("&#x{:x};", ch as u32));
+            }
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            _ => escaped.push(ch),
+        }
+    }
+    format!("<Key>{escaped}</Key>")
+}
+
 fn assert_canonical_owner_id(id: &str) {
     assert_eq!(
         id.len(),
@@ -41,6 +68,65 @@ async fn setup_versioned_bucket() -> String {
         .await
         .unwrap();
     bucket
+}
+
+fn put_raw_object(bucket: &str, encoded_key: &str) {
+    let url = format!("{}/{bucket}/{encoded_key}", CTX.endpoint());
+    let response = send_signed_request("PUT", &url, b"v1", std::iter::empty::<(&str, &str)>());
+    assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+}
+
+async fn cleanup_versioned_bucket_with_encoding(client: &aws_sdk_s3::Client, bucket: &str) {
+    loop {
+        let resp = client
+            .list_object_versions()
+            .bucket(bucket)
+            .encoding_type(EncodingType::Url)
+            .send()
+            .await
+            .expect("list object versions");
+
+        let mut deleted_any = false;
+        for v in resp.versions() {
+            let encoded_key = v.key().unwrap_or_default();
+            let version_id = v.version_id().unwrap_or_default();
+            let encoded_version_id: String =
+                url::form_urlencoded::byte_serialize(version_id.as_bytes()).collect();
+            let url = format!(
+                "{}/{bucket}/{encoded_key}?versionId={encoded_version_id}",
+                CTX.endpoint()
+            );
+            let response =
+                send_signed_request("DELETE", &url, b"", std::iter::empty::<(&str, &str)>());
+            assert_eq!(response.status, 204, "unexpected body: {}", response.body);
+            deleted_any = true;
+        }
+        for m in resp.delete_markers() {
+            let encoded_key = m.key().unwrap_or_default();
+            let version_id = m.version_id().unwrap_or_default();
+            let encoded_version_id: String =
+                url::form_urlencoded::byte_serialize(version_id.as_bytes()).collect();
+            let url = format!(
+                "{}/{bucket}/{encoded_key}?versionId={encoded_version_id}",
+                CTX.endpoint()
+            );
+            let response =
+                send_signed_request("DELETE", &url, b"", std::iter::empty::<(&str, &str)>());
+            assert_eq!(response.status, 204, "unexpected body: {}", response.body);
+            deleted_any = true;
+        }
+
+        if !deleted_any {
+            break;
+        }
+    }
+
+    client
+        .delete_bucket()
+        .bucket(bucket)
+        .send()
+        .await
+        .expect("delete bucket");
 }
 
 async fn setup_versioned_acl_bucket() -> String {
@@ -1275,6 +1361,139 @@ fn test_versioning_list_object_versions_encoding_type_url() {
         );
 
         cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_versioning_list_object_versions_without_encoding_type_keeps_control_characters_literal() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+
+        for &(_, encoded_key) in CONTROL_KEY_CASES {
+            put_raw_object(&bucket, encoded_key);
+        }
+
+        let url = format!("{}/{bucket}?versions=", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            !response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        for &(decoded_key, _) in CONTROL_KEY_CASES {
+            let needle = expected_raw_list_key(decoded_key);
+            assert!(
+                response.body.contains(&needle),
+                "unexpected body: {}",
+                response.body
+            );
+        }
+
+        cleanup_versioned_bucket_with_encoding(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_versioning_list_object_versions_encoding_type_url_encodes_control_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+
+        for &(_, encoded_key) in CONTROL_KEY_CASES {
+            put_raw_object(&bucket, encoded_key);
+        }
+
+        let resp = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .encoding_type(EncodingType::Url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.encoding_type(), Some(&EncodingType::Url));
+        let mut keys: Vec<String> = resp
+            .versions()
+            .iter()
+            .filter_map(|version| version.key().map(str::to_string))
+            .collect();
+        let mut expected: Vec<String> = CONTROL_KEY_CASES
+            .iter()
+            .map(|(_, encoded_key)| (*encoded_key).to_string())
+            .collect();
+        keys.sort();
+        expected.sort();
+        assert_eq!(keys, expected);
+
+        let url = format!("{}/{bucket}?versions=&encoding-type=url", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        for &(_, encoded_key) in CONTROL_KEY_CASES {
+            assert!(
+                response.body.contains(&format!("<Key>{encoded_key}</Key>")),
+                "unexpected body: {}",
+                response.body
+            );
+        }
+
+        cleanup_versioned_bucket_with_encoding(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_versioning_list_object_versions_without_encoding_type_escapes_xml_special_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+
+        put_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
+
+        let url = format!("{}/{bucket}?versions=", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response
+                .body
+                .contains(&expected_raw_list_key(XML_SPECIAL_KEY)),
+            "unexpected body: {}",
+            response.body
+        );
+
+        cleanup_versioned_bucket_with_encoding(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_versioning_list_object_versions_encoding_type_url_encodes_xml_special_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+
+        put_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
+
+        let url = format!("{}/{bucket}?versions=&encoding-type=url", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response
+                .body
+                .contains(&format!("<Key>{XML_SPECIAL_KEY_ENCODED}</Key>")),
+            "unexpected body: {}",
+            response.body
+        );
+
+        cleanup_versioned_bucket_with_encoding(client, &bucket).await;
     });
 }
 

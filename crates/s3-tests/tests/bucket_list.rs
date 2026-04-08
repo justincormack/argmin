@@ -26,6 +26,17 @@ const SET_A: &[&str] = &["asdf", "boo/bar", "boo/baz/xyzzy", "cquux", "thud", "z
 /// Set B — 7 keys for prefix/general tests.
 const SET_B: &[&str] = &["bar", "baz", "cab", "dog", "foo/bar", "foo/baz", "quux"];
 
+const CONTROL_KEY_CASES: &[(&str, &str)] = &[
+    ("bad\u{0001}key", "bad%01key"),
+    ("bad\u{001F}key", "bad%1Fkey"),
+    ("bad\u{007F}key", "bad%7Fkey"),
+    ("bad\u{0080}key", "bad%C2%80key"),
+];
+
+const XML_SPECIAL_KEY: &str = "xml<>&\"key";
+const XML_SPECIAL_KEY_ENCODED: &str = "xml%3C%3E%26%22key";
+const ECHO_FIELD_VALUE: &str = "echo\u{0001}<>&\"+";
+
 // ── Local helpers ───────────────────────────────────────────────────
 
 fn get_keys(objects: &[aws_sdk_s3::types::Object]) -> Vec<String> {
@@ -40,6 +51,57 @@ fn get_prefixes(prefixes: &[aws_sdk_s3::types::CommonPrefix]) -> Vec<String> {
         .iter()
         .filter_map(|p| p.prefix().map(str::to_string))
         .collect()
+}
+
+fn expected_raw_list_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\u{0001}'..='\u{0008}' | '\u{000B}' | '\u{000C}' | '\u{000E}'..='\u{001F}' => {
+                escaped.push_str(&format!("&#x{:x};", ch as u32));
+            }
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn expected_raw_list_key(decoded_key: &str) -> String {
+    format!("<Key>{}</Key>", expected_raw_list_value(decoded_key))
+}
+
+fn expected_url_list_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn query_encode_value(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn put_raw_object(bucket: &str, encoded_key: &str) {
+    let url = format!("{}/{bucket}/{encoded_key}", CTX.endpoint());
+    let response = send_signed_request("PUT", &url, b"data", std::iter::empty::<(&str, &str)>());
+    assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+}
+
+fn delete_raw_object(bucket: &str, encoded_key: &str) {
+    let url = format!("{}/{bucket}/{encoded_key}", CTX.endpoint());
+    let response = send_signed_request("DELETE", &url, b"", std::iter::empty::<(&str, &str)>());
+    assert_eq!(response.status, 204, "unexpected body: {}", response.body);
 }
 
 async fn head_object_eventually_after_versioning_enable(
@@ -1880,6 +1942,586 @@ fn test_bucket_listv2_without_encoding_type_keeps_spaces_literal() {
             response.body
         );
 
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_list_without_encoding_type_keeps_control_characters_literal() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        for &(_, encoded_key) in CONTROL_KEY_CASES {
+            put_raw_object(&bucket, encoded_key);
+        }
+
+        let url = format!("{}/{bucket}", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            !response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        for &(decoded_key, _) in CONTROL_KEY_CASES {
+            let needle = expected_raw_list_key(decoded_key);
+            assert!(
+                response.body.contains(&needle),
+                "missing raw key {:?} (bytes {:?}) in body bytes {:?}",
+                decoded_key,
+                needle.as_bytes(),
+                response.body.as_bytes()
+            );
+        }
+
+        for &(_, encoded_key) in CONTROL_KEY_CASES {
+            delete_raw_object(&bucket, encoded_key);
+        }
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_list_encoding_type_url_encodes_control_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        for &(_, encoded_key) in CONTROL_KEY_CASES {
+            put_raw_object(&bucket, encoded_key);
+        }
+
+        let resp = client
+            .list_objects()
+            .bucket(&bucket)
+            .encoding_type(EncodingType::Url)
+            .send()
+            .await
+            .unwrap();
+        let mut keys = get_keys(resp.contents());
+        let mut expected: Vec<String> = CONTROL_KEY_CASES
+            .iter()
+            .map(|(_, encoded_key)| (*encoded_key).to_string())
+            .collect();
+        keys.sort();
+        expected.sort();
+        assert_eq!(keys, expected);
+
+        let url = format!("{}/{bucket}?encoding-type=url", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        for &(_, encoded_key) in CONTROL_KEY_CASES {
+            assert!(
+                response.body.contains(&format!("<Key>{encoded_key}</Key>")),
+                "unexpected body: {}",
+                response.body
+            );
+        }
+
+        for &(_, encoded_key) in CONTROL_KEY_CASES {
+            delete_raw_object(&bucket, encoded_key);
+        }
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_listv2_without_encoding_type_keeps_control_characters_literal() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        for &(_, encoded_key) in CONTROL_KEY_CASES {
+            put_raw_object(&bucket, encoded_key);
+        }
+
+        let url = format!("{}/{bucket}?list-type=2", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            !response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        for &(decoded_key, _) in CONTROL_KEY_CASES {
+            let needle = expected_raw_list_key(decoded_key);
+            assert!(
+                response.body.contains(&needle),
+                "missing raw key {:?} (bytes {:?}) in body bytes {:?}",
+                decoded_key,
+                needle.as_bytes(),
+                response.body.as_bytes()
+            );
+        }
+
+        for &(_, encoded_key) in CONTROL_KEY_CASES {
+            delete_raw_object(&bucket, encoded_key);
+        }
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_list_without_encoding_type_escapes_xml_special_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        put_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
+
+        let url = format!("{}/{bucket}", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response
+                .body
+                .contains(&expected_raw_list_key(XML_SPECIAL_KEY)),
+            "unexpected body: {}",
+            response.body
+        );
+
+        delete_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_list_encoding_type_url_encodes_xml_special_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        put_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
+
+        let url = format!("{}/{bucket}?encoding-type=url", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response
+                .body
+                .contains(&format!("<Key>{XML_SPECIAL_KEY_ENCODED}</Key>")),
+            "unexpected body: {}",
+            response.body
+        );
+
+        delete_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_listv2_without_encoding_type_escapes_xml_special_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        put_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
+
+        let url = format!("{}/{bucket}?list-type=2", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response
+                .body
+                .contains(&expected_raw_list_key(XML_SPECIAL_KEY)),
+            "unexpected body: {}",
+            response.body
+        );
+
+        delete_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_listv2_encoding_type_url_encodes_xml_special_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        put_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
+
+        let url = format!("{}/{bucket}?list-type=2&encoding-type=url", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response
+                .body
+                .contains(&format!("<Key>{XML_SPECIAL_KEY_ENCODED}</Key>")),
+            "unexpected body: {}",
+            response.body
+        );
+
+        delete_raw_object(&bucket, XML_SPECIAL_KEY_ENCODED);
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_listv2_encoding_type_url_encodes_control_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        for &(_, encoded_key) in CONTROL_KEY_CASES {
+            put_raw_object(&bucket, encoded_key);
+        }
+
+        let resp = client
+            .list_objects_v2()
+            .bucket(&bucket)
+            .encoding_type(EncodingType::Url)
+            .send()
+            .await
+            .unwrap();
+        let mut keys = get_keys(resp.contents());
+        let mut expected: Vec<String> = CONTROL_KEY_CASES
+            .iter()
+            .map(|(_, encoded_key)| (*encoded_key).to_string())
+            .collect();
+        keys.sort();
+        expected.sort();
+        assert_eq!(keys, expected);
+
+        let url = format!("{}/{bucket}?list-type=2&encoding-type=url", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        for &(_, encoded_key) in CONTROL_KEY_CASES {
+            assert!(
+                response.body.contains(&format!("<Key>{encoded_key}</Key>")),
+                "unexpected body: {}",
+                response.body
+            );
+        }
+
+        for &(_, encoded_key) in CONTROL_KEY_CASES {
+            delete_raw_object(&bucket, encoded_key);
+        }
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_listv2_echoed_fields_without_encoding_type_escape_special_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let url = format!(
+            "{}/{bucket}?list-type=2&prefix={}&delimiter={}&start-after={}",
+            CTX.endpoint(),
+            query_encode_value(ECHO_FIELD_VALUE),
+            query_encode_value(ECHO_FIELD_VALUE),
+            query_encode_value(ECHO_FIELD_VALUE)
+        );
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains(&format!(
+                "<Prefix>{}</Prefix>",
+                expected_raw_list_value(ECHO_FIELD_VALUE)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<Delimiter>{}</Delimiter>",
+                expected_raw_list_value(ECHO_FIELD_VALUE)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<StartAfter>{}</StartAfter>",
+                expected_raw_list_value(ECHO_FIELD_VALUE)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_listv2_echoed_fields_with_encoding_type_url_encode_special_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let url = format!(
+            "{}/{bucket}?list-type=2&encoding-type=url&prefix={}&delimiter={}&start-after={}",
+            CTX.endpoint(),
+            query_encode_value(ECHO_FIELD_VALUE),
+            query_encode_value(ECHO_FIELD_VALUE),
+            query_encode_value(ECHO_FIELD_VALUE)
+        );
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<Prefix>{}</Prefix>",
+                expected_url_list_value(ECHO_FIELD_VALUE)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<Delimiter>{}</Delimiter>",
+                expected_url_list_value(ECHO_FIELD_VALUE)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<StartAfter>{}</StartAfter>",
+                expected_url_list_value(ECHO_FIELD_VALUE)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_listv1_echoed_fields_without_encoding_type_escape_special_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let url = format!(
+            "{}/{bucket}?prefix={}&marker={}&delimiter={}",
+            CTX.endpoint(),
+            query_encode_value(ECHO_FIELD_VALUE),
+            query_encode_value(ECHO_FIELD_VALUE),
+            query_encode_value(ECHO_FIELD_VALUE)
+        );
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains(&format!(
+                "<Prefix>{}</Prefix>",
+                expected_raw_list_value(ECHO_FIELD_VALUE)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<Marker>{}</Marker>",
+                expected_raw_list_value(ECHO_FIELD_VALUE)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<Delimiter>{}</Delimiter>",
+                expected_raw_list_value(ECHO_FIELD_VALUE)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_listv1_echoed_fields_with_encoding_type_url_encode_special_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let url = format!(
+            "{}/{bucket}?encoding-type=url&prefix={}&marker={}&delimiter={}",
+            CTX.endpoint(),
+            query_encode_value(ECHO_FIELD_VALUE),
+            query_encode_value(ECHO_FIELD_VALUE),
+            query_encode_value(ECHO_FIELD_VALUE)
+        );
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<Prefix>{}</Prefix>",
+                expected_url_list_value(ECHO_FIELD_VALUE)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<Marker>{}</Marker>",
+                expected_url_list_value(ECHO_FIELD_VALUE)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<Delimiter>{}</Delimiter>",
+                expected_url_list_value(ECHO_FIELD_VALUE)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_listv1_next_marker_without_encoding_type_escapes_special_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let next_marker = "aaa\u{0001}<>&\"+";
+        let encoded_next_marker = query_encode_value(next_marker);
+        put_raw_object(&bucket, &format!("{encoded_next_marker}%2Bobj"));
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("zzz+obj")
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let url = format!("{}/{bucket}?delimiter=%2B&max-keys=1", CTX.endpoint());
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<IsTruncated>true</IsTruncated>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<NextMarker>{}</NextMarker>",
+                expected_raw_list_value(next_marker)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+
+        delete_raw_object(&bucket, &format!("{encoded_next_marker}%2Bobj"));
+        let keys = vec!["zzz+obj".to_string()];
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
+#[test]
+fn test_bucket_listv1_next_marker_with_encoding_type_url_encodes_special_characters() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let next_marker = "aaa\u{0001}<>&\"+";
+        let encoded_next_marker = query_encode_value(next_marker);
+        put_raw_object(&bucket, &format!("{encoded_next_marker}%2Bobj"));
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("zzz+obj")
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let url = format!(
+            "{}/{bucket}?encoding-type=url&delimiter=%2B&max-keys=1",
+            CTX.endpoint()
+        );
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("<IsTruncated>true</IsTruncated>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<NextMarker>{}</NextMarker>",
+                expected_url_list_value(next_marker)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+
+        delete_raw_object(&bucket, &format!("{encoded_next_marker}%2Bobj"));
+        let keys = vec!["zzz+obj".to_string()];
         delete_all_and_bucket(client, &bucket, &keys).await;
     });
 }

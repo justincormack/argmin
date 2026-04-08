@@ -543,7 +543,7 @@ pub fn list_objects_v2_xml(
 
     if let Some(p) = prefix {
         xml.push_str("<Prefix>");
-        xml.push_str(&xml_escape(p));
+        xml.push_str(&xml_escape_list_value(&encode_value(p, encoding_type)));
         xml.push_str("</Prefix>");
     } else {
         xml.push_str("<Prefix/>");
@@ -551,7 +551,7 @@ pub fn list_objects_v2_xml(
 
     if let Some(d) = delimiter {
         xml.push_str("<Delimiter>");
-        xml.push_str(&xml_escape(d));
+        xml.push_str(&xml_escape_list_value(&encode_value(d, encoding_type)));
         xml.push_str("</Delimiter>");
     }
 
@@ -569,7 +569,7 @@ pub fn list_objects_v2_xml(
 
     if let Some(s) = start_after {
         xml.push_str("<StartAfter>");
-        xml.push_str(&xml_escape(s));
+        xml.push_str(&xml_escape_list_value(&encode_value(s, encoding_type)));
         xml.push_str("</StartAfter>");
     }
 
@@ -597,7 +597,10 @@ pub fn list_objects_v2_xml(
     for obj in &result.objects {
         xml.push_str("<Contents>");
         xml.push_str("<Key>");
-        xml.push_str(&xml_escape(&encode_value(&obj.key, encoding_type)));
+        xml.push_str(&xml_escape_list_value(&encode_value(
+            &obj.key,
+            encoding_type,
+        )));
         xml.push_str("</Key>");
         xml.push_str("<LastModified>");
         xml.push_str(&format_timestamp(obj.last_modified));
@@ -621,7 +624,7 @@ pub fn list_objects_v2_xml(
 
     for prefix in &result.common_prefixes {
         xml.push_str("<CommonPrefixes><Prefix>");
-        xml.push_str(&xml_escape(&encode_value(prefix, encoding_type)));
+        xml.push_str(&xml_escape_list_value(&encode_value(prefix, encoding_type)));
         xml.push_str("</Prefix></CommonPrefixes>");
     }
 
@@ -651,7 +654,7 @@ pub fn list_objects_v1_xml(
 
     if let Some(p) = prefix {
         xml.push_str("<Prefix>");
-        xml.push_str(&xml_escape(p));
+        xml.push_str(&xml_escape_list_value(&encode_value(p, encoding_type)));
         xml.push_str("</Prefix>");
     } else {
         xml.push_str("<Prefix/>");
@@ -659,7 +662,7 @@ pub fn list_objects_v1_xml(
 
     if let Some(m) = marker {
         xml.push_str("<Marker>");
-        xml.push_str(&xml_escape(m));
+        xml.push_str(&xml_escape_list_value(&encode_value(m, encoding_type)));
         xml.push_str("</Marker>");
     } else {
         xml.push_str("<Marker/>");
@@ -667,7 +670,7 @@ pub fn list_objects_v1_xml(
 
     if let Some(d) = delimiter {
         xml.push_str("<Delimiter>");
-        xml.push_str(&xml_escape(d));
+        xml.push_str(&xml_escape_list_value(&encode_value(d, encoding_type)));
         xml.push_str("</Delimiter>");
     }
 
@@ -688,7 +691,7 @@ pub fn list_objects_v1_xml(
     if result.is_truncated {
         if let Some(ref token) = result.next_continuation_token {
             xml.push_str("<NextMarker>");
-            xml.push_str(&xml_escape(token));
+            xml.push_str(&xml_escape_list_value(&encode_value(token, encoding_type)));
             xml.push_str("</NextMarker>");
         }
     }
@@ -699,7 +702,10 @@ pub fn list_objects_v1_xml(
     for obj in &result.objects {
         xml.push_str("<Contents>");
         xml.push_str("<Key>");
-        xml.push_str(&xml_escape(&encode_value(&obj.key, encoding_type)));
+        xml.push_str(&xml_escape_list_value(&encode_value(
+            &obj.key,
+            encoding_type,
+        )));
         xml.push_str("</Key>");
         xml.push_str("<LastModified>");
         xml.push_str(&format_timestamp(obj.last_modified));
@@ -721,7 +727,7 @@ pub fn list_objects_v1_xml(
 
     for prefix in &result.common_prefixes {
         xml.push_str("<CommonPrefixes><Prefix>");
-        xml.push_str(&xml_escape(&encode_value(prefix, encoding_type)));
+        xml.push_str(&xml_escape_list_value(&encode_value(prefix, encoding_type)));
         xml.push_str("</Prefix></CommonPrefixes>");
     }
 
@@ -2013,13 +2019,19 @@ pub fn list_object_versions_xml(
 
     xml.push_str("<Prefix>");
     if let Some(p) = prefix {
-        xml.push_str(&xml_escape(&encode_list_versions_value(p, encoding_type)));
+        xml.push_str(&xml_escape_list_value(&encode_list_versions_value(
+            p,
+            encoding_type,
+        )));
     }
     xml.push_str("</Prefix>");
 
     xml.push_str("<KeyMarker>");
     if let Some(km) = key_marker {
-        xml.push_str(&xml_escape(&encode_list_versions_value(km, encoding_type)));
+        xml.push_str(&xml_escape_list_value(&encode_list_versions_value(
+            km,
+            encoding_type,
+        )));
     }
     xml.push_str("</KeyMarker>");
 
@@ -2033,7 +2045,10 @@ pub fn list_object_versions_xml(
 
     if let Some(ref nkm) = result.next_key_marker {
         xml.push_str("<NextKeyMarker>");
-        xml.push_str(&xml_escape(&encode_list_versions_value(nkm, encoding_type)));
+        xml.push_str(&xml_escape_list_value(&encode_list_versions_value(
+            nkm,
+            encoding_type,
+        )));
         xml.push_str("</NextKeyMarker>");
     }
 
@@ -2060,7 +2075,7 @@ pub fn list_object_versions_xml(
         if entry.is_delete_marker {
             xml.push_str("<DeleteMarker>");
             xml.push_str("<Key>");
-            xml.push_str(&xml_escape(&encode_list_versions_value(
+            xml.push_str(&xml_escape_list_value(&encode_list_versions_value(
                 &entry.key,
                 encoding_type,
             )));
@@ -2081,7 +2096,7 @@ pub fn list_object_versions_xml(
         } else {
             xml.push_str("<Version>");
             xml.push_str("<Key>");
-            xml.push_str(&xml_escape(&encode_list_versions_value(
+            xml.push_str(&xml_escape_list_value(&encode_list_versions_value(
                 &entry.key,
                 encoding_type,
             )));
@@ -2149,6 +2164,23 @@ fn encode_list_versions_value(value: &str, encoding_type: Option<&str>) -> Strin
         Some("url") => encode_url_listing_value(value),
         _ => value.to_string(),
     }
+}
+
+fn xml_escape_list_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\u{0001}'..='\u{0008}' | '\u{000B}' | '\u{000C}' | '\u{000E}'..='\u{001F}' => {
+                out.push_str(&format!("&#x{:x};", c as u32));
+            }
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 /// Escape special XML characters.
@@ -4422,14 +4454,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_delete_objects_control_character_key_rejected() {
+    fn parse_delete_objects_control_character_key_allowed() {
         let xml = b"<Delete><Object><Key>bad\x7fkey</Key></Object></Delete>";
-        match parse_delete_objects_xml(xml) {
-            Err(ServerError::InvalidRequest { reason }) => {
-                assert_eq!(reason, "Couldn't parse the specified URI.");
-            }
-            other => panic!("expected InvalidRequest, got {other:?}"),
-        }
+        let (entries, quiet) = parse_delete_objects_xml(xml).unwrap();
+        assert!(!quiet);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "bad\x7fkey");
     }
 
     // ── delete_objects_result_xml ────────────────────────────────────

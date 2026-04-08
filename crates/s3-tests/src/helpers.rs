@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use auth::canonical::canonical_query_string;
 use aws_sdk_s3::client::customize::CustomizableOperation;
 use aws_sdk_s3::operation::delete_objects::builders::DeleteObjectsFluentBuilder;
 use aws_sdk_s3::operation::delete_objects::{DeleteObjectsError, DeleteObjectsOutput};
@@ -649,25 +650,7 @@ fn days_to_date(days: i64) -> (i64, u32, u32) {
 }
 
 fn normalize_query(raw: &str) -> String {
-    if raw.is_empty() {
-        return String::new();
-    }
-    let mut pairs: Vec<(String, String)> = raw
-        .split('&')
-        .filter(|segment| !segment.is_empty())
-        .map(|segment| {
-            let mut parts = segment.splitn(2, '=');
-            let key = parts.next().unwrap_or("").to_string();
-            let value = parts.next().unwrap_or("").to_string();
-            (key, value)
-        })
-        .collect();
-    pairs.sort();
-    pairs
-        .iter()
-        .map(|(key, value)| format!("{key}={value}"))
-        .collect::<Vec<_>>()
-        .join("&")
+    canonical_query_string(raw)
 }
 
 /// Build a PutBucketLifecycleConfiguration request that sets the required
