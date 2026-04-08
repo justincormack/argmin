@@ -39,19 +39,20 @@ impl ComparisonEnv {
         std::env::var_os("S3_TEST_ENDPOINT")?;
 
         let _ = &*CTX;
-        let local_server = TestServer::start().await;
+        let external_region = CTX.region().to_string();
+        let local_server = TestServer::start_https_in_region(&external_region).await;
         let local_client = build_client_with_ca(
             local_server.endpoint(),
             s3_tests::server::TEST_ACCESS_KEY,
             s3_tests::server::TEST_SECRET_KEY,
-            s3_tests::server::TEST_REGION,
+            &external_region,
             local_server.tls_ca_pem(),
         )
         .await;
 
         Some(Self {
             external_client: CTX.client().clone(),
-            external_region: CTX.region().to_string(),
+            external_region,
             local_client,
             local_server,
         })
@@ -69,7 +70,7 @@ impl ComparisonEnv {
         create_bucket_in_region(
             &self.local_client,
             &local_bucket,
-            s3_tests::server::TEST_REGION,
+            &self.external_region,
         )
         .await;
         (external_bucket, local_bucket)
@@ -125,7 +126,7 @@ impl ComparisonEnv {
             SignedRequestCredentials {
                 access_key: s3_tests::server::TEST_ACCESS_KEY,
                 secret_key: s3_tests::server::TEST_SECRET_KEY,
-                region: s3_tests::server::TEST_REGION,
+                region: &self.external_region,
                 tls_ca_pem: self.local_server.tls_ca_pem(),
             },
         )
@@ -838,9 +839,6 @@ fn test_head_bucket_response_shape_matches_aws_when_regions_match() {
         let Some(env) = ComparisonEnv::setup().await else {
             return;
         };
-        if env.external_region != s3_tests::server::TEST_REGION {
-            return;
-        }
 
         let (external_bucket, local_bucket) = env.create_bucket_pair().await;
 
@@ -1937,9 +1935,6 @@ fn test_list_objects_v1_without_delimiter_omits_next_marker_like_aws() {
         let Some(env) = ComparisonEnv::setup().await else {
             return;
         };
-        if env.external_region != s3_tests::server::TEST_REGION {
-            return;
-        }
         let (external_bucket, local_bucket) = env.create_bucket_pair().await;
 
         for (bucket, client) in [
@@ -1998,6 +1993,77 @@ fn test_list_objects_v1_without_delimiter_omits_next_marker_like_aws() {
             xml_tag_text(&local_list.body, "NextMarker").is_none(),
             "local unexpectedly included NextMarker: {}",
             local_list.body
+        );
+
+        delete_all_and_bucket(
+            &env.external_client,
+            &external_bucket,
+            &["aaa".to_string(), "zzz".to_string()],
+        )
+        .await;
+        delete_all_and_bucket(
+            &env.local_client,
+            &local_bucket,
+            &["aaa".to_string(), "zzz".to_string()],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_list_objects_v2_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+
+        for (bucket, client) in [
+            (&external_bucket, &env.external_client),
+            (&local_bucket, &env.local_client),
+        ] {
+            client
+                .put_object()
+                .bucket(bucket)
+                .key("aaa")
+                .body(ByteStream::from_static(b"a"))
+                .send()
+                .await
+                .expect("put first list-objects-v2 fixture");
+            client
+                .put_object()
+                .bucket(bucket)
+                .key("zzz")
+                .body(ByteStream::from_static(b"z"))
+                .send()
+                .await
+                .expect("put second list-objects-v2 fixture");
+        }
+
+        let aws_list = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("list-type=2&max-keys=1"),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_list = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("list-type=2&max-keys=1"),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "ListObjectsV2",
+            &aws_list,
+            &local_list,
+            &["content-length"],
+            &[],
+            &["Name", "NextContinuationToken", "LastModified", "ETag"],
         );
 
         delete_all_and_bucket(

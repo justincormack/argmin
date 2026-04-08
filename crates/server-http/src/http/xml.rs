@@ -571,6 +571,16 @@ pub fn list_objects_v2_xml(
         xml.push_str("</StartAfter>");
     }
 
+    if let Some(ref token) = result.next_continuation_token {
+        xml.push_str("<NextContinuationToken>");
+        xml.push_str(&xml_escape(token));
+        xml.push_str("</NextContinuationToken>");
+    }
+
+    xml.push_str("<KeyCount>");
+    xml.push_str(&(result.objects.len() + result.common_prefixes.len()).to_string());
+    xml.push_str("</KeyCount>");
+
     xml.push_str("<MaxKeys>");
     xml.push_str(&max_keys.to_string());
     xml.push_str("</MaxKeys>");
@@ -578,16 +588,6 @@ pub fn list_objects_v2_xml(
     xml.push_str("<IsTruncated>");
     xml.push_str(if result.is_truncated { "true" } else { "false" });
     xml.push_str("</IsTruncated>");
-
-    xml.push_str("<KeyCount>");
-    xml.push_str(&(result.objects.len() + result.common_prefixes.len()).to_string());
-    xml.push_str("</KeyCount>");
-
-    if let Some(ref token) = result.next_continuation_token {
-        xml.push_str("<NextContinuationToken>");
-        xml.push_str(&xml_escape(token));
-        xml.push_str("</NextContinuationToken>");
-    }
 
     let owner_id = result.owner_canonical_id.as_str();
 
@@ -4150,8 +4150,17 @@ mod tests {
         );
         assert!(xml.contains("<Prefix>photos/</Prefix>"));
         assert!(xml.contains("<Delimiter>/</Delimiter>"));
-        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
         assert!(xml.contains("<NextContinuationToken>photos/cat.jpg</NextContinuationToken>"));
+        assert!(xml.contains("<KeyCount>2</KeyCount>"));
+        assert!(xml.contains("<MaxKeys>1</MaxKeys>"));
+        assert!(xml.contains("<IsTruncated>true</IsTruncated>"));
+        let next_token_pos = xml.find("<NextContinuationToken>").unwrap();
+        let key_count_pos = xml.find("<KeyCount>").unwrap();
+        let max_keys_pos = xml.find("<MaxKeys>").unwrap();
+        let truncated_pos = xml.find("<IsTruncated>").unwrap();
+        assert!(next_token_pos < key_count_pos);
+        assert!(key_count_pos < max_keys_pos);
+        assert!(max_keys_pos < truncated_pos);
         assert!(xml.contains("<CommonPrefixes><Prefix>photos/2024/</Prefix></CommonPrefixes>"));
     }
 

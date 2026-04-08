@@ -78,14 +78,22 @@ impl TestServer {
     }
 
     pub async fn start_http() -> Self {
-        Self::start_with_transport(TestServerTransport::Http).await
+        Self::start_http_in_region(TEST_REGION).await
     }
 
     pub async fn start_https() -> Self {
-        Self::start_with_transport(TestServerTransport::Https).await
+        Self::start_https_in_region(TEST_REGION).await
     }
 
-    async fn start_with_transport(transport: TestServerTransport) -> Self {
+    pub async fn start_http_in_region(region: &str) -> Self {
+        Self::start_with_transport(TestServerTransport::Http, region).await
+    }
+
+    pub async fn start_https_in_region(region: &str) -> Self {
+        Self::start_with_transport(TestServerTransport::Https, region).await
+    }
+
+    async fn start_with_transport(transport: TestServerTransport, region: &str) -> Self {
         configure_local_tracing();
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -129,7 +137,7 @@ impl TestServer {
             server_core::coordinator::Coordinator::new_with_managed_key_provider(
                 Arc::clone(&storage_node),
                 ec_config,
-                TEST_REGION.to_string(),
+                region.to_string(),
                 Some(sse_c_validator),
                 sse_s3_provider,
             )
@@ -154,7 +162,7 @@ impl TestServer {
                     server_core::coordinator::Coordinator::new_with_managed_key_provider(
                         Arc::clone(&storage_node),
                         ec_config,
-                        TEST_REGION.to_string(),
+                        region.to_string(),
                         Some(sse_c_validator),
                         sse_s3_provider,
                     )
