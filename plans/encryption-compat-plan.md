@@ -2,11 +2,13 @@
 
 ## Scope
 
-This is a stub plan for the remaining S3 encryption compatibility surface.
+This is a stub plan for the remaining S3 encryption compatibility surface after
+the `SSE-C` and `SSE-S3` phases.
 
-The current server does not implement per-object S3 encryption semantics. The
-remaining `s3-tests` coverage in this area should be tracked here rather than in
-the old integration-framework bootstrap plan.
+The current server does implement per-object S3 encryption semantics for
+`SSE-C` and `SSE-S3`. The remaining compatibility and `s3-tests` coverage in
+this area should be tracked here rather than in the old
+integration-framework bootstrap plan.
 
 This plan covers the three main S3 encryption families:
 - SSE-S3
@@ -35,23 +37,27 @@ Implemented:
 - SSE-C bucket-level gating subset
 - direct TLS support and HTTPS enforcement for SSE-C
 - transport/auth support needed to carry encryption headers through the HTTP layer
+- SSE-S3 object encryption/decryption
+- SSE-S3 request/response handling
+- SSE-S3 bucket default encryption support
+- SSE-S3 bucket policy condition support
+- SSE-S3 write-path coverage for normal writes, multipart, copy, and POST
 
 Not implemented:
-- SSE-S3 object encryption/decryption
 - SSE-KMS object encryption/decryption
-- default bucket encryption
-- encryption policy/enforcement behavior
+- SSE-KMS-backed default bucket encryption
+- remaining encryption policy/enforcement behavior beyond the current SSE-C and
+  SSE-S3 surface
 
 Partially implemented:
-- encryption-aware object attribute responses for SSE-C; broader SSE-S3/SSE-KMS
-  behavior remains open
+- encryption-aware object attribute responses for the implemented SSE-C and
+  SSE-S3 surface; broader SSE-KMS behavior remains open
 
 Known test surface still blocked on this work:
 - `encryption_kms.rs`
-- `encryption_s3.rs`
 - `encryption_kms_default.rs`
 - `policy_encryption.rs`
-- remaining non-SSE-C encryption cases in `object_attributes.rs`
+- remaining SSE-KMS-related cases in `object_attributes.rs`
 
 ## Compatibility Areas
 
@@ -59,12 +65,13 @@ Known test surface still blocked on this work:
 
 Server-managed keys for per-object encryption.
 
-Chosen direction:
+Status: implemented.
 
-- implement `SSE-S3` first
-- use a temporary but explicit service-managed wrapping-key provider
-- keep that key role separate from the `SSE-C` validator key
-- preserve the per-object random `DEK` envelope model already used by `SSE-C`
+`SSE-S3` is complete enough to be tracked as finished by
+[plans/completed/sse-s3-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/completed/sse-s3-plan.md).
+
+That work established the current service-managed encryption model used for the
+implemented non-`KMS` managed-encryption surface.
 
 See `plans/completed/sse-s3-plan.md` for the detailed implementation plan.
 
@@ -94,10 +101,9 @@ writes, copy, multipart, and reporting APIs.
 
 ## Recommended Implementation Order
 
-1. SSE-S3 core object encryption model
-2. default bucket encryption on top of SSE-S3
-3. SSE-KMS abstraction and compatibility
-4. encryption policy/enforcement tests
+1. SSE-KMS abstraction and compatibility
+2. SSE-KMS-backed default bucket encryption
+3. remaining encryption policy/enforcement tests
 
 ## Initial Design Defaults
 
@@ -107,7 +113,7 @@ writes, copy, multipart, and reporting APIs.
 
 ## Test Plan
 
-Targeted integration tests once work starts:
+Targeted integration tests for remaining work and regression coverage:
 - `cargo test -p s3-tests --test encryption_s3`
 - `cargo test -p s3-tests --test encryption_sse_c`
 - `cargo test -p s3-tests --test encryption_kms`
