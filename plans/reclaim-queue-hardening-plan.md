@@ -122,6 +122,15 @@ explicit capacity policy.
 - overload behavior if the queue cannot drain within a reasonable bound
 - metrics and tracing for queue depth, wait time, and dropped or delayed work
 
+### Narrow Next Scope
+
+If phase 2 is taken up soon, keep the initial scope narrow:
+
+1. add reclaim-queue observability first
+2. add a bounded object reclaim queue with explicit producer backpressure
+3. add focused saturation and wakeup tests, including coverage that waiting
+   does not happen while unrelated metadata locks are held
+
 ### Design Constraints
 
 - do not lose reclaim work silently
