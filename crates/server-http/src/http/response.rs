@@ -589,8 +589,11 @@ impl S3Response {
     /// Build a response for `HeadBucket`.
     #[must_use]
     pub fn head_bucket(info: &BucketSummary, region: &str) -> Self {
-        let _ = info;
-        Self::new(200).header("x-amz-bucket-region", region)
+        Self::new(200)
+            .header("Content-Type", "application/xml")
+            .header("x-amz-access-point-alias", "false")
+            .header("x-amz-bucket-arn", &format!("arn:aws:s3:::{}", info.name))
+            .header("x-amz-bucket-region", region)
     }
 
     /// Build a response for `GetBucketLocation`.
@@ -2196,7 +2199,19 @@ mod tests {
         };
         let resp = S3Response::head_bucket(&info, "us-west-2");
         assert_eq!(resp.status_code, 200);
+        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
+        assert_eq!(
+            find_header(&resp, "x-amz-access-point-alias"),
+            Some("false")
+        );
+        assert_eq!(
+            find_header(&resp, "x-amz-bucket-arn"),
+            Some("arn:aws:s3:::b")
+        );
         assert_eq!(find_header(&resp, "x-amz-bucket-region"), Some("us-west-2"));
+        assert_eq!(find_header(&resp, "Content-Length"), None);
+        assert!(resp.body.is_empty());
+        assert!(resp.stream.is_none());
     }
 
     #[test]

@@ -60,19 +60,14 @@ impl ComparisonEnv {
 
     async fn create_bucket_pair(&self) -> (String, String) {
         let external_bucket = unique_bucket();
-        let local_bucket = unique_bucket();
+        let local_bucket = external_bucket.clone();
         create_bucket_in_region(
             &self.external_client,
             &external_bucket,
             &self.external_region,
         )
         .await;
-        create_bucket_in_region(
-            &self.local_client,
-            &local_bucket,
-            &self.external_region,
-        )
-        .await;
+        create_bucket_in_region(&self.local_client, &local_bucket, &self.external_region).await;
         (external_bucket, local_bucket)
     }
 
@@ -858,7 +853,13 @@ fn test_head_bucket_response_shape_matches_aws_when_regions_match() {
             b"",
             std::iter::empty::<(&str, &str)>(),
         );
-        assert_response_shape_matches("HeadBucket", &aws_head, &local_head, &[], &[]);
+        assert_response_shape_matches(
+            "HeadBucket",
+            &aws_head,
+            &local_head,
+            &["transfer-encoding"],
+            &[],
+        );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
         delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;

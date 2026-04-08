@@ -94,6 +94,18 @@ Related note:
 
 - [plans/requester-pays-note.md](/home/justin/src/github.com/justincormack/argmin/plans/requester-pays-note.md)
 
+### 7. `HeadBucket` omits `Transfer-Encoding: chunked`
+
+AWS includes `Transfer-Encoding: chunked` on successful `HeadBucket`
+responses. Argmin does not currently emit that header.
+
+This is not an intentional S3 behavior difference in our application logic.
+The remaining mismatch appears to come from Hyper's `HEAD` response handling,
+which suppresses chunked transfer encoding and sends a zero-length response
+instead.
+
+The `s3-diff-tests` `HeadBucket` response-shape check ignores only this header.
+
 ## How to treat new differences
 
 If AWS-backed tests expose a difference that is not listed here:
