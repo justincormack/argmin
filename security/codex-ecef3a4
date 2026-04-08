@@ -1,0 +1,378 @@
+Unbounded reclaim queue allows memory exhaustion via reads
+Link: https://chatgpt.com/codex/security/findings/ac2907595f688191b9bafd379e4a679c?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: medium)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: ecef3a4
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 22:21:52
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced a DoS risk by adding an unbounded reclaim queue and enqueuing on every payload lease drop without limits or rate control.
+This commit moves payload reclamation to a background queue. The new queue stores (bucket, key, generation) tuples in a VecDeque/HashSet without any size limits or backpressure. Every payload lease drop enqueues an entry, even when there is no reclaim record, meaning high-volume reads across many objects can continuously grow the queue faster than the single worker can drain it. An authenticated (or anonymous on public buckets) client can issue many GETs/updates to create unique generations and force the queue to grow until memory exhaustion, causing a denial of service.
+
+# Validation
+## Rubric
+- [x] Identify lease acquisition and drop path that enqueues reclaim on read completion (coordinator.rs).
+- [x] Confirm reclaim queue implementation is in-memory VecDeque/HashSet with no bounds (node.rs).
+- [x] Verify enqueue path accepts unique roots without rate limiting beyond exact-match dedup (node.rs).
+- [x] Check reclaim worker drain model and early-return when no reclaim record exists (coordinator.rs).
+## Report
+Dynamic attempts: `cargo build -p storage --bin reclaim_queue_dos` failed because ec-sys requires libisal (`libisal not found`; see /workspace/validation_artifacts/build_attempt.log). Valgrind and gdb are not installed (`valgrind --version`/`gdb --version` failed), and lldb could not run because the PoC binary was not built (`/workspace/argmin/target/debug/reclaim_queue_dos` missing). Code review confirms the DoS risk: PayloadLease::drop enqueues reclaim work when the last lease is released (crates/server-core/src/coordinator.rs:198-218). ReadHandle constructors acquire leases on reads (e.g., from_chunk_manifest acquires a lease at coordinator.rs:330-369), so each read completion can enqueue. SharedStorageNode stores reclaim_queue as in-memory VecDeque/HashSet without bounds (crates/storage/src/node.rs:84-98, 133-137), and enqueue_object_payload_reclaim unconditionally queues new roots (node.rs:236-248). The reclaim worker is a single thread draining the queue (coordinator.rs:2212-2219), and try_reclaim_object_payload returns Ok when no reclaim record exists (coordinator.rs:1496-1532), so high-volume unique reads can grow the queue faster than it drains, causing memory exhaustion.
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator.rs (L198 to 218)
+  Note: Every payload lease drop now enqueues reclaim work, which can happen on every read of an object, feeding the unbounded queue.
+```
+struct PayloadLease {
+    runtime: ReadRuntime,
+    bucket: String,
+    key: String,
+    generation_id: GenerationId,
+}
+
+impl Drop for PayloadLease {
+    fn drop(&mut self) {
+        if self.storage_node().release_object_payload_lease(
+            &self.bucket,
+            &self.key,
+            self.generation_id,
+        ) == 0
+        {
+            self.runtime.enqueue_object_payload_reclaim(
+                &self.bucket,
+                &self.key,
+                self.generation_id,
+            );
+        }
+```
+
+/workspace/argmin/crates/storage/src/node.rs (L236 to 250)
+  Note: enqueue_object_payload_reclaim pushes every new root into the queue with no bound or throttling, enabling memory growth under load.
+```
+    /// Queue a payload generation for background reclaim.
+    pub fn enqueue_object_payload_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) {
+        let root = (bucket.to_string(), key.to_string(), generation_id);
+        let (state_lock, cv) = &self.reclaim_queue;
+        let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.queued.insert(root.clone()) {
+            state.queue.push_back(root);
+            cv.notify_one();
+        }
+    }
+```
+
+/workspace/argmin/crates/storage/src/node.rs (L84 to 139)
+  Note: Reclaim queue is implemented as in-memory VecDeque/HashSet without any size limits or backpressure.
+```
+pub struct SharedStorageNode {
+    stores: HashMap<u32, Mutex<PgStore>>,
+    pg_id_list: Vec<u32>,
+    data_dir: PathBuf,
+    bucket_locks: Vec<Mutex<()>>,
+    object_payload_leases: Mutex<HashMap<(String, String, GenerationId), usize>>,
+    reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
+}
+
+type ReclaimRoot = (String, String, GenerationId);
+
+struct ReclaimQueueState {
+    queue: VecDeque<ReclaimRoot>,
+    queued: HashSet<ReclaimRoot>,
+}
+
+const BUCKET_LOCK_STRIPES: usize = 256;
+
+impl SharedStorageNode {
+    /// Open a shared storage node, creating PG directories as needed.
+    pub fn open(data_dir: &Path, pg_ids: &[u32]) -> Result<Self, StoreError> {
+        std::fs::create_dir_all(data_dir).map_err(|e| StoreError::Io {
+            context: "create data dir",
+            source: e,
+        })?;
+
+        let mut stores = HashMap::with_capacity(pg_ids.len());
+        let mut pg_id_list = Vec::with_capacity(pg_ids.len());
+
+        for &pg_id in pg_ids {
+            let pg_dir = data_dir.join(format!("pg-{pg_id:04}"));
+            let store = PgStore::open(&pg_dir, pg_id)?;
+            stores.insert(pg_id, Mutex::new(store));
+            pg_id_list.push(pg_id);
+        }
+
+        pg_id_list.sort_unstable();
+
+        let mut bucket_locks = Vec::with_capacity(BUCKET_LOCK_STRIPES);
+        for _ in 0..BUCKET_LOCK_STRIPES {
+            bucket_locks.push(Mutex::new(()));
+        }
+
+        Ok(Self {
+            stores,
+            pg_id_list,
+            data_dir: data_dir.to_path_buf(),
+            bucket_locks,
+            object_payload_leases: Mutex::new(HashMap::new()),
+            reclaim_queue: (
+                Mutex::new(ReclaimQueueState {
+                    queue: VecDeque::new(),
+                    queued: HashSet::new(),
+                }),
+                Condvar::new(),
+            ),
+```
+
+Proposed patch:
+diff --git a/crates/storage/src/node.rs b/crates/storage/src/node.rs
+index a5ba27d9ef0599edba10a74e5d083b317e822fca..f48ee9917288ab0496e1b275054bac49ba0a9b11 100644
+--- a/crates/storage/src/node.rs
++++ b/crates/storage/src/node.rs
+@@ -122,50 +122,51 @@ impl StorageNode for LocalStorageNode {
+ pub struct SharedStorageNode {
+     stores: HashMap<u32, Mutex<PgStore>>,
+     pg_paths: HashMap<u32, PgDataPaths>,
+     pg_id_list: Vec<u32>,
+     data_dir: PathBuf,
+     bucket_locks: Vec<Mutex<()>>,
+     object_payload_leases: Mutex<HashMap<(String, String, GenerationId), usize>>,
+     reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
+ }
+ 
+ type ReclaimRoot = (String, String, GenerationId);
+ 
+ pub enum ReclaimWorkItem {
+     ObjectPayload(ReclaimRoot),
+     BucketDelete(String),
+ }
+ 
+ struct ReclaimQueueState {
+     object_queue: VecDeque<ReclaimRoot>,
+     queued_objects: HashSet<ReclaimRoot>,
+     bucket_delete_queue: VecDeque<String>,
+     queued_bucket_deletes: HashSet<String>,
+ }
+ 
+ const BUCKET_LOCK_STRIPES: usize = 256;
++const MAX_OBJECT_RECLAIM_QUEUE_DEPTH: usize = 16_384;
+ 
+ impl SharedStorageNode {
+     /// Open a shared storage node, creating PG directories as needed.
+     pub fn open(data_dir: &Path, pg_ids: &[u32]) -> Result<Self, StoreError> {
+         std::fs::create_dir_all(data_dir).map_err(|e| StoreError::Io {
+             context: "create data dir",
+             source: e,
+         })?;
+ 
+         let mut stores = HashMap::with_capacity(pg_ids.len());
+         let mut pg_paths = HashMap::with_capacity(pg_ids.len());
+         let mut pg_id_list = Vec::with_capacity(pg_ids.len());
+ 
+         for &pg_id in pg_ids {
+             let pg_dir = data_dir.join(format!("pg-{pg_id:04}"));
+             let store = PgStore::open(&pg_dir, pg_id)?;
+             let shards_dir = pg_dir.join("shards");
+             let tmp_dir = pg_dir.join("tmp");
+             stores.insert(pg_id, Mutex::new(store));
+             pg_paths.insert(
+                 pg_id,
+                 PgDataPaths {
+                     shards_dir,
+                     tmp_dir,
+                 },
+@@ -429,82 +430,88 @@ impl SharedStorageNode {
+     }
+ 
+     /// Return the number of active object-payload leases for a bucket.
+     pub fn bucket_object_payload_lease_count(&self, bucket: &str) -> usize {
+         let leases = self
+             .object_payload_leases
+             .lock()
+             .unwrap_or_else(|e| e.into_inner());
+         leases
+             .iter()
+             .filter(|((lease_bucket, _, _), _)| lease_bucket == bucket)
+             .map(|(_, count)| *count)
+             .sum()
+     }
+ 
+     /// Queue a payload generation for background reclaim.
+     pub fn enqueue_object_payload_reclaim(
+         &self,
+         bucket: &str,
+         key: &str,
+         generation_id: GenerationId,
+     ) {
+         let root = (bucket.to_string(), key.to_string(), generation_id);
+         let (state_lock, cv) = &self.reclaim_queue;
+         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
++        while state.object_queue.len() >= MAX_OBJECT_RECLAIM_QUEUE_DEPTH
++            && !state.queued_objects.contains(&root)
++        {
++            state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
++        }
+         if state.queued_objects.insert(root.clone()) {
+             state.object_queue.push_back(root);
+             cv.notify_one();
+         }
+     }
+ 
+     /// Queue a bucket for deferred final deletion once reclaim is drained.
+     pub fn enqueue_bucket_delete_finalize(&self, bucket: &str) {
+         let (state_lock, cv) = &self.reclaim_queue;
+         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+         let bucket = bucket.to_string();
+         if state.queued_bucket_deletes.insert(bucket.clone()) {
+             state.bucket_delete_queue.push_back(bucket);
+             cv.notify_one();
+         }
+     }
+ 
+     /// Block until reclaim work is available, or stop has been requested.
+     pub fn wait_for_reclaim_work(&self, stop: &AtomicBool) -> Option<ReclaimWorkItem> {
+         let (state_lock, cv) = &self.reclaim_queue;
+         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
+         while state.object_queue.is_empty()
+             && state.bucket_delete_queue.is_empty()
+             && !stop.load(Ordering::SeqCst)
+         {
+             state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
+         }
+         if stop.load(Ordering::SeqCst) {
+             return None;
+         }
+         if let Some(root) = state.object_queue.pop_front() {
+             state.queued_objects.remove(&root);
++            cv.notify_all();
+             return Some(ReclaimWorkItem::ObjectPayload(root));
+         }
+         let bucket = state.bucket_delete_queue.pop_front()?;
+         state.queued_bucket_deletes.remove(&bucket);
+         Some(ReclaimWorkItem::BucketDelete(bucket))
+     }
+ 
+     /// Wake reclaim workers so they can observe shutdown or new work.
+     pub fn wake_reclaim_workers(&self) {
+         self.reclaim_queue.1.notify_all();
+     }
+ 
+     /// Lock two PGs for operations that span a metadata PG and a shard PG.
+     ///
+     /// When both IDs are the same, returns `(guard, None)` — the caller uses
+     /// the single guard for both roles. When different, locks in ascending
+     /// ID order to prevent deadlocks and returns `(lower_guard, Some(higher_guard))`.
+     ///
+     /// The first returned guard corresponds to `pg_a`, the second to `pg_b`.
+     pub fn lock_two_pgs(
+         &self,
+         pg_a: u32,
+         pg_b: u32,
+     ) -> Result<(MutexGuard<'_, PgStore>, Option<MutexGuard<'_, PgStore>>), StoreError> {
+         observability::trace_scope!(
+@@ -711,26 +718,63 @@ mod tests {
+         let (tx, rx) = channel();
+         std::thread::scope(|s| {
+             let guard = node.lock_bucket("bucket-a");
+             s.spawn(|| {
+                 let _g2 = node.lock_bucket("bucket-a");
+                 tx.send(()).unwrap();
+             });
+ 
+             // Second lock on same bucket should block while first guard is held.
+             assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
+             drop(guard);
+             rx.recv_timeout(Duration::from_secs(1)).unwrap();
+         });
+     }
+ 
+     #[test]
+     fn shared_node_bucket_lock_different_buckets_do_not_deadlock() {
+         let tmp = test_util::tempdir();
+         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
+         let a_guard = node.lock_bucket("bucket-a");
+         // Different bucket may map to the same stripe, but this must never deadlock.
+         // We only assert that taking locks in sequence is safe.
+         drop(a_guard);
+         let _b_guard = node.lock_bucket("bucket-b");
+     }
++
++    #[test]
++    fn object_reclaim_queue_applies_backpressure() {
++        use std::sync::mpsc::channel;
++        use std::time::Duration;
++
++        let tmp = test_util::tempdir();
++        let node = Arc::new(SharedStorageNode::open(tmp.path(), &[0]).unwrap());
++        let stop = Arc::new(AtomicBool::new(false));
++
++        for generation in 0..MAX_OBJECT_RECLAIM_QUEUE_DEPTH {
++            node.enqueue_object_payload_reclaim("bucket", "key", generation as GenerationId);
++        }
++
++        let (tx, rx) = channel();
++        std::thread::scope(|scope| {
++            let producer_node = Arc::clone(&node);
++            scope.spawn(move || {
++                producer_node.enqueue_object_payload_reclaim(
++                    "bucket",
++                    "key",
++                    MAX_OBJECT_RECLAIM_QUEUE_DEPTH as GenerationId,
++                );
++                tx.send(()).unwrap();
++            });
++
++            // A producer for a new root should block once the queue reaches its cap.
++            assert!(rx.recv_timeout(Duration::from_millis(50)).is_err());
++
++            // Draining one item frees capacity and allows the blocked producer to proceed.
++            match node.wait_for_reclaim_work(&stop) {
++                Some(ReclaimWorkItem::ObjectPayload(_)) => {}
++                other => panic!("expected object payload reclaim work, got {other:?}"),
++            }
++            rx.recv_timeout(Duration::from_secs(1)).unwrap();
++        });
++    }
+ }
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The bug is real and reachable via the HTTP read path, but the impact is availability-only and requires sustained volume across unique objects/generations. Auth/bucket ACLs and deployment exposure affect who can trigger it. This aligns with a medium DoS rather than high/critical impact.
+## Likelihood
+high - Requires many unique read targets or the ability to create new generations; feasible for authenticated users or public buckets, but not fully unauthenticated in all deployments. | Remote network vector
+## Impact
+medium - Unbounded memory growth can crash or stall the single-node service, reducing availability for all clients; no confidentiality or integrity impact is shown.
+## Assumptions
+- The argmin-s3 HTTP listener is reachable by an attacker (public internet or internal network), not only localhost.
+- The attacker can perform many object reads across unique (bucket, key, generation) tuples via valid credentials or public-read buckets.
+- No external rate limiting or reverse-proxy backpressure is in place that would cap request volume.
+- Ability to issue S3 GET/READ requests against many unique object generations (auth credentials or public bucket)
+- Sufficient object diversity or write ability to create unique generations
+## Path
+Client -> GET/READ -> ReadHandle(lease) -> PayloadLease::drop -> enqueue reclaim -> unbounded queue -> OOM/DoS
+## Path evidence
+- `crates/argmin-s3/src/main.rs:75-99` - argmin-s3 binds a TCP listener and serves the HTTP frontend, establishing the network-exposed runtime entrypoint.
+- `crates/argmin-s3/src/config.rs:20-63` - Listen address is configurable via ARGMIN_LISTEN_ADDR with default 127.0.0.1:9000, indicating possible network exposure.
+- `crates/server-core/src/coordinator.rs:198-218` - PayloadLease::drop enqueues object payload reclaim when the lease count reaches zero.
+- `crates/server-core/src/coordinator.rs:330-369` - ReadHandle creation acquires object payload leases on reads.
+- `crates/storage/src/node.rs:84-139` - SharedStorageNode stores reclaim_queue as an in-memory VecDeque/HashSet without a size limit.
+- `crates/storage/src/node.rs:236-248` - enqueue_object_payload_reclaim unconditionally pushes unique roots into the queue with no bounding.
+- `crates/server-core/src/coordinator.rs:2212-2219` - A single reclaim worker thread drains the queue, limiting drain rate.
+## Narrative
+Payload leases for object reads enqueue reclaim work on drop, and the reclaim queue is an in-memory VecDeque/HashSet with no size limit. Read paths acquire leases on every object read, so many unique reads (or writes to create new generations) will enqueue unique roots faster than the single reclaim worker can drain them. This makes memory exhaustion plausible from an in-scope HTTP read surface when the service is reachable and the attacker has read access (including public buckets).
+## Controls
+- SigV4 authentication and bucket ACLs
+- Configurable max_connections
+## Blindspots
+- No runtime PoC execution in this environment; conclusions are based on static analysis only.
+- No deployment manifests available to confirm actual network exposure (public vs internal).
+- Actual object/versioning configuration could affect how easily unique generations are created.
