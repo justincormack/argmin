@@ -106,7 +106,25 @@ instead.
 
 The `s3-diff-tests` `HeadBucket` response-shape check ignores only this header.
 
-### 8. `AccessDenied` does not yet match AWS principal-specific error text
+### 8. SigV2 is not implemented
+
+Argmin does not implement AWS Signature Version 2 authentication.
+
+That is intentionally not part of the current auth surface, but it is still a
+real compatibility gap because AWS continues to accept SigV2 in at least some
+older regions even though newer regions require SigV4.
+
+In practice:
+
+- Argmin requires SigV4 everywhere
+- AWS still accepts SigV2 in some regions such as `us-east-1` and `us-west-2`
+- AWS rejects SigV2 in newer regions such as `eu-central-1`
+
+Related note:
+
+- [plans/sigv2-compat-note.md](/home/justin/src/github.com/justincormack/argmin/plans/sigv2-compat-note.md)
+
+### 9. `AccessDenied` does not yet match AWS principal-specific error text
 
 Argmin now matches the generic XML error shape for several `AccessDenied`
 cases, but it does not yet reproduce AWS's more specific denial messages that
