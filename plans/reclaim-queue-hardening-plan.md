@@ -20,6 +20,28 @@ This means normal reads can feed the in-memory reclaim queue even when there is
 nothing pending reclaim. The queue is also structurally unbounded today, so
 high-cardinality traffic can grow it without limit.
 
+## Status
+
+Phase 1 is completed in commit `1c6e141`.
+
+Implemented:
+
+- added an exact metadata predicate for whether a generation is still pending
+  reclaim
+- changed `PayloadLease::drop` to re-enqueue only when durable reclaim state
+  still exists for that generation
+- added focused regressions for:
+  - no enqueue on final read lease drop when no reclaim record exists
+  - correct retry after an earlier reclaim attempt was skipped because a lease
+    was still active
+
+This closes the read-amplified behavior described in
+`security/codex-ecef3a4`.
+
+Phase 2 remains open. The in-memory reclaim queue is still structurally
+unbounded for legitimate reclaim-producing workloads such as delete-heavy or
+overwrite-heavy traffic.
+
 ## Goals
 
 - remove the read-amplified queue growth described in
@@ -37,6 +59,8 @@ high-cardinality traffic can grow it without limit.
 ## Phase 1: Gate Read-Side Re-Enqueue on Pending Reclaim
 
 This is the immediate fix for `security/codex-ecef3a4`.
+
+Status: completed in commit `1c6e141`.
 
 ### Design
 
@@ -84,6 +108,8 @@ Add at least:
 
 This is follow-on hardening, not required to resolve
 `security/codex-ecef3a4`.
+
+Status: not started.
 
 Even after phase 1, delete-heavy or overwrite-heavy workloads can still produce
 many legitimate reclaim entries. The in-memory queue should eventually have an

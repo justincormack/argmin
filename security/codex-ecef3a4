@@ -1,7 +1,7 @@
 Unbounded reclaim queue allows memory exhaustion via reads
 Link: https://chatgpt.com/codex/security/findings/ac2907595f688191b9bafd379e4a679c?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: medium)
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin
@@ -258,6 +258,39 @@ index a5ba27d9ef0599edba10a74e5d083b317e822fca..f48ee9917288ab0496e1b275054bac49
          let bucket = state.bucket_delete_queue.pop_front()?;
          state.queued_bucket_deletes.remove(&bucket);
          Some(ReclaimWorkItem::BucketDelete(bucket))
+
+# Resolution
+
+Fixed in commit `1c6e141` (`Gate reclaim retries on pending metadata`).
+
+Phase 1 of the reclaim-queue hardening plan is now shipped:
+
+- added a storage metadata helper to answer whether a specific
+  `(bucket, key, generation_id)` still has any durable reclaim record
+- changed `PayloadLease::drop` so the final lease release only re-enqueues
+  reclaim work when that generation is actually pending reclaim
+- preserved the intended retry path for reclaim records that were queued
+  earlier but could not be reclaimed yet because a read lease was still active
+
+This resolves the read-amplified denial of service described in this finding:
+ordinary reads of non-pending generations no longer manufacture reclaim queue
+entries on final lease drop.
+
+Added regression coverage:
+
+- storage: exact reclaim-existence predicate across simple, segmented, and
+  multipart reclaim tables
+- coordinator: no reclaim work is enqueued when a read-only lease drops with
+  no reclaim record
+- coordinator: a pending reclaim is re-enqueued correctly after an earlier
+  lease-gated reclaim attempt
+
+Follow-up status:
+
+- the broader queue backpressure / bounded-memory work remains tracked as phase
+  2 in `plans/reclaim-queue-hardening-plan.md`
+- this report is resolved because the specific read-driven enqueue bug has been
+  fixed
      }
  
      /// Wake reclaim workers so they can observe shutdown or new work.
