@@ -209,14 +209,6 @@ pub(crate) fn validate_object_key(key: &str) -> Result<(), ServerError> {
             reason: "object key must not contain null bytes".to_string(),
         });
     }
-    if key.chars().any(|c| {
-        let code = c as u32;
-        (code <= 0x1F) || (0x7F..=0x9F).contains(&code)
-    }) {
-        return Err(ServerError::InvalidRequest {
-            reason: "Couldn't parse the specified URI.".to_string(),
-        });
-    }
     Ok(())
 }
 
@@ -779,11 +771,17 @@ mod tests {
     }
 
     #[test]
-    fn object_key_rejects_control_chars() {
-        let err = route("GET", "/bucket/\u{008A}-", "").unwrap_err();
+    fn object_key_allows_control_chars_except_nul() {
+        assert!(route("GET", "/bucket/\u{008A}-", "").is_ok());
+        assert!(route("GET", "/bucket/\u{0001}-", "").is_ok());
+    }
+
+    #[test]
+    fn object_key_rejects_nul() {
+        let err = route("GET", "/bucket/\0", "").unwrap_err();
         match err {
             ServerError::InvalidRequest { reason } => {
-                assert_eq!(reason, "Couldn't parse the specified URI.");
+                assert_eq!(reason, "object key must not contain null bytes");
             }
             _ => panic!("expected InvalidRequest, got {err:?}"),
         }

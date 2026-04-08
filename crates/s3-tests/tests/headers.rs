@@ -13,6 +13,47 @@ fn agent() -> ureq::Agent {
     s3_tests::test_agent()
 }
 
+fn raw_signed_request(method: &str, path: &str, body: &[u8]) -> (u16, String) {
+    let s = Signer::new(method, path)
+        .body_hash(&sha256_hex(body))
+        .sign();
+    let url = format!("{}{}", CTX.endpoint(), path);
+    let mut response = match method {
+        "GET" => agent()
+            .get(&url)
+            .header("Authorization", &s.authorization)
+            .header("x-amz-date", &s.amz_date)
+            .header("x-amz-content-sha256", &s.amz_content_sha256)
+            .call()
+            .expect("transport error"),
+        "HEAD" => agent()
+            .head(&url)
+            .header("Authorization", &s.authorization)
+            .header("x-amz-date", &s.amz_date)
+            .header("x-amz-content-sha256", &s.amz_content_sha256)
+            .call()
+            .expect("transport error"),
+        "DELETE" => agent()
+            .delete(&url)
+            .header("Authorization", &s.authorization)
+            .header("x-amz-date", &s.amz_date)
+            .header("x-amz-content-sha256", &s.amz_content_sha256)
+            .call()
+            .expect("transport error"),
+        "PUT" => agent()
+            .put(&url)
+            .header("Authorization", &s.authorization)
+            .header("x-amz-date", &s.amz_date)
+            .header("x-amz-content-sha256", &s.amz_content_sha256)
+            .send(body)
+            .expect("transport error"),
+        other => panic!("unsupported method: {other}"),
+    };
+    let status = response.status().as_u16();
+    let body = response.body_mut().read_to_string().unwrap_or_default();
+    (status, body)
+}
+
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
@@ -1721,6 +1762,39 @@ fn test_put_invalid_percent_encoding_in_key() {
             "expected 400 for invalid percent-encoding, got {status}"
         );
         assert_error_code(&body, "InvalidURI");
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_put_percent_encoded_nul_in_key_rejected() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let path = format!("/{bucket}/bad%00key");
+        let (status, body) = raw_signed_request("PUT", &path, b"");
+        assert_eq!(status, 400, "unexpected body: {body}");
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_put_percent_encoded_control_characters_in_key_accepted() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let cases = ["bad%01key", "bad%1Fkey", "bad%7Fkey", "bad%C2%80key"];
+
+        for encoded_key in cases {
+            let path = format!("/{bucket}/{encoded_key}");
+            let (put_status, put_body) = raw_signed_request("PUT", &path, b"");
+            assert_eq!(put_status, 200, "unexpected PUT body: {put_body}");
+
+            let (head_status, head_body) = raw_signed_request("HEAD", &path, b"");
+            assert_eq!(head_status, 200, "unexpected HEAD body: {head_body}");
+
+            let (delete_status, delete_body) = raw_signed_request("DELETE", &path, b"");
+            assert_eq!(delete_status, 204, "unexpected DELETE body: {delete_body}");
+        }
+
         cleanup(&bucket, &[]).await;
     });
 }
