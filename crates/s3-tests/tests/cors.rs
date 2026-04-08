@@ -57,15 +57,19 @@ async fn preflight_status_eventually(
     expected_status: u16,
     description: &str,
 ) -> PreflightSnapshot {
-    const MAX_ATTEMPTS: usize = 20;
+    const MAX_ATTEMPTS: usize = 40;
 
     for attempt in 0..MAX_ATTEMPTS {
         let snapshot = preflight_snapshot(url, origin, request_method, request_headers);
         if snapshot.status == expected_status {
-            return snapshot;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            let confirmed = preflight_snapshot(url, origin, request_method, request_headers);
+            if confirmed.status == expected_status {
+                return confirmed;
+            }
         }
         if attempt + 1 < MAX_ATTEMPTS {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
             continue;
         }
         panic!(
@@ -96,6 +100,13 @@ async fn setup_cors_bucket(rules: Vec<CorsRule>) -> String {
         .await
         .unwrap();
 
+    client
+        .get_bucket_cors()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+
     bucket
 }
 
@@ -112,6 +123,13 @@ async fn setup_public_cors_bucket(rules: Vec<CorsRule>) -> String {
         .put_bucket_cors()
         .bucket(&bucket)
         .cors_configuration(config)
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .get_bucket_cors()
+        .bucket(&bucket)
         .send()
         .await
         .unwrap();
