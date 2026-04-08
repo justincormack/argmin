@@ -60,6 +60,7 @@ use storage::ManagedEncryptionAlgorithm;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 
 const TRACE_TARGET: &str = "server_http";
+const S3_MAX_LIST_KEYS: u32 = 1_000;
 
 fn current_trace_context() -> observability::TraceContext {
     observability::current_context().unwrap_or_else(observability::TraceContext::new_request)
@@ -4030,7 +4031,7 @@ pub fn s3_response_to_hyper(
 }
 
 fn parse_max_keys<S: AsRef<str>>(raw: Option<S>) -> Result<u32, ServerError> {
-    parse_u32_or_default(raw, 1000, "invalid max-keys")
+    Ok(parse_u32_or_default(raw, 1000, "invalid max-keys")?.min(S3_MAX_LIST_KEYS))
 }
 
 /// Apply response-* query parameter overrides to a GET response.
@@ -8340,6 +8341,26 @@ mod tests {
             Err(e) => panic!("expected InvalidArgument, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
+    }
+
+    #[test]
+    fn list_object_versions_clamps_oversized_max_keys() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = make_req("versions&max-keys=5000");
+        let op = S3Operation::ListObjectVersions {
+            bucket: "mybucket".to_string(),
+        };
+        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
+        assert_eq!(resp.status_code, 200);
+
+        let body = String::from_utf8(response_body(resp)).unwrap();
+        assert!(
+            body.contains("<MaxKeys>1000</MaxKeys>"),
+            "unexpected body: {body}"
+        );
     }
 
     #[test]

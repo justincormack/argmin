@@ -1,0 +1,436 @@
+ListObjectVersions lacks record cap, enabling memory DoS
+Link: https://chatgpt.com/codex/security/findings/14ea495962ec8191aa3601e241b84725?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
+Criticality: medium (attack path: medium)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 195d31f
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 23:20:30
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced: ListObjectVersions now collects per-PG results without a hard cap, and the max-keys input is unbounded, allowing attacker-controlled memory growth and database work.
+The commit wires ListObjectVersions to query each placement group and then aggregates all results into a single in-memory vector. Unlike ListObjectsV2, this path does not enforce the global MAX_LIST_RECORDS cap. The HTTP layer also parses max-keys directly into a u32 without an upper bound. An authenticated client can pass an extremely large max-keys value (e.g., near u32::MAX), causing each PG to return a large number of records that are then accumulated and sorted. With sufficiently large buckets, this can exhaust memory and crash the server, resulting in a denial of service.
+
+# Reviewer note
+Reviewed against commit `195d31f` and the current tree behavior. This is a valid medium-severity availability issue.
+
+- At commit `195d31f`, `ListObjectVersions` parses `max-keys` directly into `u32` with no upper bound in [crates/server/src/http/mod.rs](/home/justin/src/github.com/justincormack/argmin/crates/server/src/http/mod.rs), then forwards it unchanged into the coordinator.
+- The same commit's coordinator path in [crates/server/src/coordinator.rs](/home/justin/src/github.com/justincormack/argmin/crates/server/src/coordinator.rs) fans out to every PG, requests `max_keys.saturating_add(1)` from each, and extends a single `Vec` with no `MAX_LIST_RECORDS` guard, unlike the neighboring `ListObjectsV2` implementation.
+- The storage path in [crates/storage/src/pg_store.rs](/home/justin/src/github.com/justincormack/argmin/crates/storage/src/pg_store.rs) translates that into `LIMIT max_keys + 1`, so a large authenticated request amplifies both database work and in-process memory growth.
+- The current tree still has the same bug shape under renamed crates: `parse_max_keys` only validates syntax, `Coordinator::list_object_versions` still aggregates without a global cap, and the targeted tests only cover malformed `max-keys`, not large-but-valid values.
+
+Focused validation run locally:
+
+- `cargo test -p server-http list_object_versions_invalid_max_keys -- --nocapture`
+- `cargo test -p server-core list_object_versions_with_sparse_pg_topology -- --nocapture`
+
+Both passed, but neither exercises the large `max-keys` path.
+
+One caveat on the generated patch: adding a hard cap is necessary, but truncating the unsorted cross-PG accumulator before global ordering is proven can change pagination order and markers. Any fix should preserve AWS-compatible ordering while bounding memory.
+
+# Validation
+## Rubric
+- [x] Attempt to build/run server to trigger OOM via large max-keys (crash path)
+- [x] Attempt valgrind/asan or debugger if crash not possible (blocked by build failure)
+- [x] Verify HTTP ListObjectVersions parses max-keys without upper bound (http/mod.rs:258-267)
+- [x] Verify coordinator aggregates per-PG versions without global cap (coordinator.rs:1226-1238)
+- [x] Confirm listing path with MAX_LIST_RECORDS cap to show missing protection (coordinator.rs:1090-1104; constant 22-24)
+## Report
+Build attempts to enable crash/valgrind/debugger validation failed due to network-restricted dependency fetches: `cargo build` could not download tiny_http from crates.io (403), and `cargo build --offline` reported no matching package, leaving no binary to run. After this failure, I validated via code review. The HTTP handler for ListObjectVersions parses `max-keys` directly into a u32 with no upper bound and forwards it unchanged to the coordinator (crates/server/src/http/mod.rs:258-275). The coordinator’s list_object_versions fan-outs across all placement groups, requests `max_keys.saturating_add(1)` per PG, and extends a single `all_versions` Vec with no global cap (crates/server/src/coordinator.rs:1226-1238). In contrast, ListObjectsV2 enforces a hard `MAX_LIST_RECORDS` cap and truncates the global vector (crates/server/src/coordinator.rs:1090-1104; constant at 22-24). The storage layer uses SQL LIMIT `max_keys+1` per PG (crates/storage/src/pg_store.rs:593-598), so very large max-keys forces large DB work and large per-PG result sets. This confirms the reported unbounded memory growth path for authenticated clients sending large max-keys on ListObjectVersions, enabling DoS via memory exhaustion.
+
+# Evidence
+/workspace/argmin/crates/server/src/coordinator.rs (L1226 to 1238)
+  Note: ListObjectVersions aggregates per-PG results into all_versions without a global cap, enabling large in-memory growth when max-keys is large.
+```
+        // Fan out to all PGs and collect version records
+        let mut all_versions: Vec<ObjectRecord> = Vec::new();
+        for &pg_id in self.storage_node.pg_ids() {
+            let pg = self.storage_node.get_pg(pg_id)?;
+            let resp = pg.list_object_versions(&ListObjectVersionsReq {
+                bucket: bucket.to_string(),
+                prefix: prefix.map(|s| s.to_string()),
+                key_marker: key_marker.map(|s| s.to_string()),
+                version_id_marker,
+                max_keys: max_keys.saturating_add(1),
+            })?;
+            all_versions.extend(resp.versions);
+        }
+```
+
+/workspace/argmin/crates/server/src/http/mod.rs (L258 to 267)
+  Note: max-keys is parsed from user input without any upper bound, allowing very large values to flow into ListObjectVersions.
+```
+            S3Operation::ListObjectVersions { bucket } => {
+                let prefix = req.query_param("prefix");
+                let key_marker = req.query_param("key-marker");
+                let version_id_marker = req
+                    .query_param("version-id-marker")
+                    .and_then(|s| s.parse::<u64>().ok());
+                let max_keys: u32 = req
+                    .query_param("max-keys")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1000);
+```
+
+Proposed patch:
+diff --git a/crates/server-core/src/coordinator.rs b/crates/server-core/src/coordinator.rs
+index a07508e1c96a63e619527d3e4380b977a7c8d432..4f4e245ae0bfc020879f92fe70506aa65c5f4029 100644
+--- a/crates/server-core/src/coordinator.rs
++++ b/crates/server-core/src/coordinator.rs
+@@ -6092,102 +6092,110 @@ impl Coordinator {
+             "Coordinator::list_object_versions",
+             "bucket={} max_keys={}",
+             req.bucket,
+             req.max_keys
+         );
+         let bucket = req.bucket;
+         let prefix = req.prefix;
+         let key_marker = req.key_marker;
+         let version_id_marker = req.version_id_marker;
+         let max_keys = req.max_keys;
+         let bucket_info = self.authorize_bucket_read_requester(req.requester, bucket)?;
+ 
+         if max_keys == 0 {
+             return Ok(ListObjectVersionsResult {
+                 versions: Vec::new(),
+                 is_truncated: false,
+                 next_key_marker: None,
+                 next_version_id_marker: None,
+                 owner_principal: bucket_info.owner_principal,
+                 owner_canonical_id: bucket_info.owner_canonical_id,
+             });
+         }
+ 
+         // Fan out to all PGs and collect version records
+         let mut all_versions: Vec<StoredObject> = Vec::new();
++        let mut hit_record_cap = false;
+         self.pg_topology.for_each_pg(|pg_id| {
++            if hit_record_cap {
++                return Ok::<(), ServerError>(());
++            }
+             let pg = self.storage_node.get_pg(pg_id)?;
+             let resp = pg.list_object_versions(&ListObjectVersionsReq {
+                 bucket: BucketName::from(bucket),
+                 prefix: prefix.map(ObjectKey::from),
+                 key_marker: key_marker.map(ObjectKey::from),
+                 version_id_marker,
+                 max_keys: max_keys.saturating_add(1),
+             })?;
+             all_versions.extend(resp.versions);
++            if all_versions.len() >= MAX_LIST_RECORDS {
++                all_versions.truncate(MAX_LIST_RECORDS);
++                hit_record_cap = true;
++            }
+             Ok::<(), ServerError>(())
+         })?;
+ 
+         // Sort by (key ASC, version_id DESC)
+         all_versions.sort_by(|a, b| {
+             a.key()
+                 .cmp(b.key())
+                 .then(b.version_id().to_u64().cmp(&a.version_id().to_u64()))
+         });
+ 
+         // Build result entries, tracking is_latest per key
+         let max = max_keys as usize;
+         let mut versions: Vec<VersionEntry> = Vec::new();
+         let mut last_key: Option<&str> = None;
+ 
+         for obj in &all_versions {
+             if versions.len() >= max {
+                 break;
+             }
+             let obj_key = obj.key();
+             let is_latest = last_key.is_none_or(|k| k != obj_key.as_str());
+             if is_latest {
+                 last_key = Some(obj_key);
+             }
+ 
+             let (size, etag) = match obj.as_live() {
+                 Some(record) => (record.size, record.etag.format()),
+                 None => (0, String::new()),
+             };
+ 
+             versions.push(VersionEntry {
+                 key: obj_key.to_string(),
+                 version_id: obj.version_id(),
+                 is_latest,
+                 size,
+                 etag,
+                 last_modified: obj.last_modified(),
+                 is_delete_marker: obj.is_delete_marker(),
+             });
+         }
+ 
+-        let is_truncated = all_versions.len() > max;
++        let is_truncated = hit_record_cap || all_versions.len() > max;
+         let (next_key_marker, next_version_id_marker) = if is_truncated {
+             if let Some(last) = versions.last() {
+                 (Some(last.key.clone()), Some(last.version_id))
+             } else {
+                 (None, None)
+             }
+         } else {
+             (None, None)
+         };
+ 
+         Ok(ListObjectVersionsResult {
+             versions,
+             is_truncated,
+             next_key_marker,
+             next_version_id_marker,
+             owner_principal: bucket_info.owner_principal,
+             owner_canonical_id: bucket_info.owner_canonical_id,
+         })
+     }
+ 
+     /// Batch-delete objects.
+     pub fn delete_objects(
+         &self,
+         req: &DeleteObjectsRequest,
+     ) -> Result<DeleteObjectsResult, ServerError> {
+
+
+diff --git a/crates/server-http/src/http/mod.rs b/crates/server-http/src/http/mod.rs
+index df11ab1c828f07fe36d13cbd9a685d9f95f11c3c..a50b81725e6c0fb3be4527a4e192da9280d56b48 100644
+--- a/crates/server-http/src/http/mod.rs
++++ b/crates/server-http/src/http/mod.rs
+@@ -1640,54 +1640,51 @@ impl HttpFrontend {
+                 Ok(S3Response::list_parts(
+                     &bucket,
+                     &key,
+                     &upload_id,
+                     part_number_marker,
+                     max_parts,
+                     &result,
+                 ))
+             }
+             // OptionsRequest is handled before auth in handle_s3_request
+             S3Operation::OptionsRequest { .. } => {
+                 unreachable!("OPTIONS handled before dispatch")
+             }
+             S3Operation::ListObjectVersions { bucket } => {
+                 let prefix = req.query_param_lossy("prefix");
+                 let key_marker = req.query_param_lossy("key-marker");
+                 let version_id_marker = match req.query_param_lossy("version-id-marker") {
+                     None => None,
+                     Some(v) if v == "null" => Some(VersionId::Null),
+                     Some(v) => Some(VersionId::from_u64(v.parse::<u64>().map_err(|_| {
+                         ServerError::InvalidArgument {
+                             reason: format!("invalid version-id-marker: {v}"),
+                         }
+                     })?)),
+                 };
+-                let max_keys: u32 = req
+-                    .query_param_lossy("max-keys")
+-                    .and_then(|s| s.parse().ok())
+-                    .unwrap_or(1000);
++                let max_keys: u32 = parse_max_keys(req.query_param_lossy("max-keys"))?;
+                 let requester =
+                     crate::coordinator::Requester::from_principal(auth.principal.as_deref());
+ 
+                 let result = self.coordinator.list_object_versions(
+                     &crate::coordinator::ListObjectVersionsRequest {
+                         bucket: &bucket,
+                         prefix: prefix.as_deref(),
+                         key_marker: key_marker.as_deref(),
+                         version_id_marker,
+                         max_keys,
+                         requester,
+                     },
+                 )?;
+                 Ok(S3Response::list_object_versions(
+                     &bucket,
+                     prefix.as_deref(),
+                     key_marker.as_deref(),
+                     max_keys,
+                     &result,
+                 ))
+             }
+         }
+     }
+ 
+     fn authenticate(&self, req: &S3Request) -> Result<AuthContext, ServerError> {
+@@ -2748,56 +2745,59 @@ pub fn s3_response_to_hyper(
+         resp.status_code,
+         body_len,
+         resp.stream.is_some(),
+     );
+     let mut builder = http::Response::builder().status(resp.status_code);
+     for (name, value) in &resp.headers {
+         builder = builder.header(name.as_str(), value.as_str());
+     }
+     let body = match resp.stream {
+         Some(stream) => S3HyperBody::streaming(
+             stream,
+             permit.expect("streaming response requires request permit"),
+             stream_read_chunk_size,
+             trace,
+         ),
+         None => S3HyperBody::buffered(resp.body, permit, trace),
+     };
+     builder
+         .body(body)
+         .expect("response builder should not fail")
+ }
+ 
+ fn parse_max_keys<S: AsRef<str>>(raw: Option<S>) -> Result<u32, ServerError> {
+     match raw {
+         None => Ok(1000),
+-        Some(s) => s
+-            .as_ref()
+-            .parse::<u32>()
+-            .map_err(|_| ServerError::InvalidArgument {
+-                reason: "invalid max-keys".to_string(),
+-            }),
++        Some(s) => {
++            let parsed = s
++                .as_ref()
++                .parse::<u32>()
++                .map_err(|_| ServerError::InvalidArgument {
++                    reason: "invalid max-keys".to_string(),
++                })?;
++            Ok(parsed.min(1000))
++        }
+     }
+ }
+ 
+ /// Apply response-* query parameter overrides to a GET response.
+ /// Checksum algorithm names and the corresponding header names.
+ const CHECKSUM_HEADERS: &[(&str, &str)] = &[
+     ("SHA256", "x-amz-checksum-sha256"),
+     ("CRC64NVME", "x-amz-checksum-crc64nvme"),
+     ("CRC32", "x-amz-checksum-crc32"),
+     ("CRC32C", "x-amz-checksum-crc32c"),
+     ("SHA1", "x-amz-checksum-sha1"),
+ ];
+ 
+ /// Map a checksum header name (e.g. `x-amz-checksum-crc32`) to its
+ /// `ChecksumAlgorithm`. Returns `None` for unrecognized headers.
+ fn checksum_algo_from_header(header: &str) -> Option<ChecksumAlgorithm> {
+     let lower = header.to_ascii_lowercase();
+     for &(algo_name, h) in CHECKSUM_HEADERS {
+         if h == lower {
+             return ChecksumAlgorithm::parse(algo_name);
+         }
+     }
+     None
+ }
+ 
+@@ -4695,50 +4695,78 @@ mod tests {
+         let req2 = new_req(
+             http::Method::GET,
+             "",
+             "",
+             vec![("if-none-match".to_string(), "*".to_string())],
+             b"world".to_vec(),
+         );
+         let op2 = S3Operation::PutObject {
+             bucket: "mybucket".to_string(),
+             key: "k".to_string(),
+         };
+         match fe.dispatch_routed(&req2, &test_auth(), op2) {
+             Err(ServerError::PreconditionFailed) => {}
+             Err(e) => panic!("expected PreconditionFailed, got {e:?}"),
+             Ok(_) => panic!("expected PreconditionFailed, got Ok"),
+         }
+ 
+         // No leaked streaming sessions.
+         assert_eq!(
+             fe.coordinator.scavenge_stale_sessions(0),
+             0,
+             "streaming session leaked after PutObject precondition failure"
+         );
+     }
+ 
++    #[test]
++    fn list_object_versions_max_keys_is_clamped() {
++        let tmp = test_util::tempdir();
++        let fe = setup_frontend(tmp.path());
++        fe.coordinator
++            .create_bucket_for_owner("testuser", "mybucket", false)
++            .unwrap();
++
++        let req = new_req(
++            http::Method::GET,
++            "/mybucket",
++            "versions&max-keys=5000",
++            vec![],
++            vec![],
++        );
++        let op = S3Operation::ListObjectVersions {
++            bucket: "mybucket".to_string(),
++        };
++        let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
++        let body = String::from_utf8(resp.body).unwrap();
++        assert!(body.contains("<MaxKeys>1000</MaxKeys>"), "body was: {body}");
++    }
++    #[test]
++    fn parse_max_keys_clamps_to_s3_limit() {
++        assert_eq!(parse_max_keys(Some("500")).unwrap(), 500);
++        assert_eq!(parse_max_keys(Some("1000")).unwrap(), 1000);
++        assert_eq!(parse_max_keys(Some("5000")).unwrap(), 1000);
++    }
+     #[test]
+     fn upload_part_abort_cleans_up_session_on_bad_checksum() {
+         // UploadPart with a wrong checksum header so finalize_stream_part
+         // fails with BadDigest.  The handler's abort path must clean up.
+         let tmp = test_util::tempdir();
+         let fe = setup_frontend(tmp.path());
+         fe.coordinator
+             .create_bucket_for_owner("testuser", "mybucket", false)
+             .unwrap();
+ 
+         // Create a multipart upload.
+         let create_req = new_req(
+             http::Method::POST,
+             "/mybucket/mykey",
+             "uploads",
+             vec![],
+             vec![],
+         );
+         let create_op = S3Operation::CreateMultipartUpload {
+             bucket: "mybucket".to_string(),
+             key: "mykey".to_string(),
+         };
+         let resp = fe
+             .dispatch_routed(&create_req, &test_auth(), create_op)
+             .unwrap();
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+The issue is a real, reachable availability flaw in the main HTTP S3 path. It requires valid credentials and a sufficiently large bucket to create significant memory pressure, and it does not impact confidentiality or integrity. This aligns with medium severity; there is no evidence for higher impact or unauthenticated reachability.
+## Likelihood
+high - An authenticated client can supply very large max-keys; triggering OOM depends on bucket size and deployment exposure, making exploitation plausible but not guaranteed. | Remote network vector
+## Impact
+medium - Unbounded aggregation and sorting of version records can exhaust memory and crash the single-node server, causing availability loss without affecting data integrity or confidentiality.
+## Assumptions
+- The service is deployed with a non-local listen address (e.g., 0.0.0.0) or behind a proxy to accept remote client traffic.
+- An attacker can obtain valid S3 credentials for the service.
+- Target buckets can contain a large number of objects/versions such that large listings allocate significant memory.
+- valid SigV4 credentials
+- existing bucket with many object versions
+## Path
+n1 -> n2 -> n3 -> n4 -> n5
+## Path evidence
+- `crates/server/src/http/mod.rs:258-275` - ListObjectVersions reads max-keys from the query string into u32 without an upper bound and passes it to the coordinator.
+- `crates/server/src/coordinator.rs:1215-1238` - Coordinator list_object_versions fans out across PGs and aggregates all version records into a single vector with no global cap.
+- `crates/server/src/coordinator.rs:22-24` - Defines MAX_LIST_RECORDS cap used elsewhere, showing a missing cap for ListObjectVersions.
+- `crates/server/src/coordinator.rs:1090-1104` - ListObjectsV2 enforces MAX_LIST_RECORDS cap when aggregating, contrasting with ListObjectVersions.
+- `crates/server/src/http/mod.rs:70-73` - All requests go through authenticate(), indicating this is reachable by authenticated clients.
+- `crates/server/src/config.rs:18-39` - Configuration shows listen address default (127.0.0.1:9000) and required access key/secret environment variables.
+- `crates/server/src/main.rs:83-99` - HTTP server binds to configurable listen address, establishing network exposure when deployed.
+## Narrative
+ListObjectVersions parses the user-controlled max-keys query parameter into u32 without an upper bound and forwards it to the coordinator. The coordinator fans out to all placement groups, requesting max_keys+1 from each and appending all results into a single vector without a global cap before sorting. This allows an authenticated client to drive unbounded memory growth and potentially crash the process, impacting availability. The ListObjectsV2 path explicitly applies a MAX_LIST_RECORDS cap, highlighting the missing control for versions.
+## Controls
+- SigV4 authentication required for all requests (HttpFrontend::dispatch)
+- ListObjectsV2 uses MAX_LIST_RECORDS cap (not applied to ListObjectVersions)
+## Blindspots
+- No runtime PoC executed due to build dependency restrictions; assessment is static.
+- Actual deployment exposure (public vs local-only) is unknown.
+- Operational rate limits or external proxies may mitigate request volume.

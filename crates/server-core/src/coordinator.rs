@@ -164,6 +164,7 @@ impl EncodedChecksumClaim {
 /// Hard cap on total records fetched across all PGs for a single list query.
 /// Prevents unbounded memory when delimiter causes u32::MAX per-PG limits.
 const MAX_LIST_RECORDS: usize = 100_000;
+const S3_MAX_LIST_KEYS: u32 = 1_000;
 
 /// Result of a PutObject operation.
 #[derive(Debug)]
@@ -12913,18 +12914,18 @@ impl Coordinator {
         &self,
         req: &ListObjectVersionsRequest,
     ) -> Result<ListObjectVersionsResult, ServerError> {
+        let max_keys = req.max_keys.min(S3_MAX_LIST_KEYS);
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::list_object_versions",
             "bucket={} max_keys={}",
             req.bucket.name,
-            req.max_keys
+            max_keys
         );
         let bucket = req.bucket.name;
         let prefix = req.prefix;
         let key_marker = req.key_marker;
         let version_id_marker = req.version_id_marker;
-        let max_keys = req.max_keys;
         let bucket_info = self.authorize_bucket_read_requester(
             &req.bucket.requester,
             bucket,
@@ -12942,8 +12943,25 @@ impl Coordinator {
             });
         }
 
-        // Fan out to all PGs and collect version records
-        let mut all_versions: Vec<StoredObject> = Vec::new();
+        struct VersionCursor {
+            versions: Vec<StoredObject>,
+            next_index: usize,
+        }
+
+        impl VersionCursor {
+            fn current(&self) -> Option<&StoredObject> {
+                self.versions.get(self.next_index)
+            }
+
+            fn pop_current(&mut self) -> StoredObject {
+                let version = self.versions[self.next_index].clone();
+                self.next_index += 1;
+                version
+            }
+        }
+
+        let fetch_limit = max_keys.saturating_add(1);
+        let mut cursors = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_object_versions(&ListObjectVersionsReq {
@@ -12951,26 +12969,43 @@ impl Coordinator {
                 prefix: prefix.map(ObjectKey::from),
                 key_marker: key_marker.map(ObjectKey::from),
                 version_id_marker,
-                max_keys: max_keys.saturating_add(1),
+                max_keys: fetch_limit,
             })?;
-            all_versions.extend(resp.versions);
+            cursors.push(VersionCursor {
+                versions: resp.versions,
+                next_index: 0,
+            });
             Ok::<(), ServerError>(())
         })?;
 
-        // Sort by key only and preserve each PG's per-key version order.
-        // All versions for a given key live in the same object PG, and the
-        // storage layer already returns those versions newest-write-first.
-        all_versions.sort_by(|a, b| a.key().cmp(b.key()));
+        // Merge the per-PG sorted streams without materializing every record in
+        // the bucket. All versions for a given key live in the same object PG,
+        // and each PG already returns entries in key ASC / newest-first order.
+        let max = max_keys as usize;
+        let mut merged_versions = Vec::with_capacity(max.saturating_add(1));
+        while merged_versions.len() <= max {
+            let Some((cursor_index, _)) = cursors
+                .iter()
+                .enumerate()
+                .filter_map(|(cursor_index, cursor)| {
+                    cursor.current().map(|version| (cursor_index, version))
+                })
+                .min_by(|(left_index, left), (right_index, right)| {
+                    left.key()
+                        .cmp(right.key())
+                        .then_with(|| left_index.cmp(right_index))
+                })
+            else {
+                break;
+            };
+            merged_versions.push(cursors[cursor_index].pop_current());
+        }
 
         // Build result entries, tracking is_latest per key
-        let max = max_keys as usize;
         let mut versions: Vec<VersionEntry> = Vec::new();
         let mut last_key: Option<&str> = None;
 
-        for obj in &all_versions {
-            if versions.len() >= max {
-                break;
-            }
+        for obj in merged_versions.iter().take(max) {
             let obj_key = obj.key();
             let is_latest = last_key.is_none_or(|k| k != obj_key.as_str());
             if is_latest {
@@ -13007,7 +13042,7 @@ impl Coordinator {
             });
         }
 
-        let is_truncated = all_versions.len() > max;
+        let is_truncated = merged_versions.len() > max;
         let (next_key_marker, next_version_id_marker) = if is_truncated {
             if let Some(last) = versions.last() {
                 (Some(last.key.clone()), Some(last.version_id))
@@ -19249,6 +19284,234 @@ mod tests {
             })
             .unwrap();
         assert!(resp.versions.is_empty());
+    }
+
+    #[test]
+    fn list_object_versions_clamps_oversized_max_keys() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let metadata = MetadataBlob::new();
+        let system_metadata = SystemMetadata::EMPTY;
+
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        for index in 0..1005 {
+            let key = format!("key-{index:04}");
+            test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: object_request_with_expected_owner(
+                        "bucket",
+                        &key,
+                        test_requester(),
+                        None,
+                    ),
+                    data: b"value",
+                    metadata: &metadata,
+                    system_metadata: &system_metadata,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .unwrap();
+        }
+
+        let resp = coord
+            .list_object_versions(&ListObjectVersionsRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 5000,
+            })
+            .unwrap();
+
+        assert_eq!(resp.versions.len(), 1000);
+        assert!(resp.is_truncated);
+        assert_eq!(resp.next_key_marker.as_deref(), Some("key-0999"));
+        assert_eq!(resp.next_version_id_marker, Some(VersionId::from_u64(1)));
+    }
+
+    #[test]
+    fn list_object_versions_paginates_across_pgs() {
+        fn key_for_prefix_on_distinct_pg(
+            coord: &Coordinator,
+            bucket: &str,
+            prefix: &str,
+            excluded_pg_ids: &[u32],
+        ) -> String {
+            for index in 0..10_000 {
+                let key = format!("{prefix}-{index:04}");
+                let pg_id = coord.object_pg_id(bucket, &key);
+                if !excluded_pg_ids.contains(&pg_id) {
+                    return key;
+                }
+            }
+            panic!("failed to find key for prefix {prefix}");
+        }
+
+        let tmp = test_util::tempdir();
+        let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &[0, 2, 5]).unwrap());
+        let coord = setup_coordinator_with_shared_storage(storage_node);
+        let metadata = MetadataBlob::new();
+        let system_metadata = SystemMetadata::EMPTY;
+
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_requester(),
+            None,
+        )
+        .unwrap();
+
+        let key_a = key_for_prefix_on_distinct_pg(&coord, "bucket", "a", &[]);
+        let pg_a = coord.object_pg_id("bucket", &key_a);
+        let key_b = key_for_prefix_on_distinct_pg(&coord, "bucket", "b", &[pg_a]);
+        let pg_b = coord.object_pg_id("bucket", &key_b);
+        let key_c = key_for_prefix_on_distinct_pg(&coord, "bucket", "c", &[pg_a, pg_b]);
+
+        let older_a = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    &key_a,
+                    test_requester(),
+                    None,
+                ),
+                data: b"older-a",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        let newer_a = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    &key_a,
+                    test_requester(),
+                    None,
+                ),
+                data: b"newer-a",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    &key_b,
+                    test_requester(),
+                    None,
+                ),
+                data: b"value-b",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    &key_c,
+                    test_requester(),
+                    None,
+                ),
+                data: b"value-c",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let first_page = coord
+            .list_object_versions(&ListObjectVersionsRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 2,
+            })
+            .unwrap();
+        assert_eq!(first_page.versions.len(), 2);
+        assert_eq!(first_page.versions[0].key, key_a);
+        assert_eq!(first_page.versions[0].version_id, newer_a.version_id);
+        assert_eq!(first_page.versions[1].key, key_a);
+        assert_eq!(first_page.versions[1].version_id, older_a.version_id);
+        assert!(first_page.versions[0].is_latest);
+        assert!(!first_page.versions[1].is_latest);
+        assert!(first_page.is_truncated);
+        assert_eq!(first_page.next_key_marker.as_deref(), Some(key_a.as_str()));
+        assert_eq!(first_page.next_version_id_marker, Some(older_a.version_id));
+
+        let second_page = coord
+            .list_object_versions(&ListObjectVersionsRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                key_marker: first_page.next_key_marker.as_deref(),
+                version_id_marker: first_page.next_version_id_marker,
+                max_keys: 2,
+            })
+            .unwrap();
+        assert_eq!(second_page.versions.len(), 2);
+        assert_eq!(second_page.versions[0].key, key_b);
+        assert_eq!(second_page.versions[0].version_id, VersionId::from_u64(1));
+        assert!(second_page.versions[0].is_latest);
+        assert_eq!(second_page.versions[1].key, key_c);
+        assert_eq!(second_page.versions[1].version_id, VersionId::from_u64(1));
+        assert!(second_page.versions[1].is_latest);
+        assert!(!second_page.is_truncated);
+        assert_eq!(second_page.next_key_marker, None);
+        assert_eq!(second_page.next_version_id_marker, None);
     }
 
     #[test]
