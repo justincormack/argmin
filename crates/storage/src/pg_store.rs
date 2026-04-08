@@ -3985,6 +3985,36 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    fn payload_reclaim_exists(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<bool, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT
+                    EXISTS(
+                        SELECT 1 FROM simple_payload_reclaims
+                        WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3
+                    )
+                    OR EXISTS(
+                        SELECT 1 FROM object_segments_reclaims
+                        WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3
+                    )
+                    OR EXISTS(
+                        SELECT 1 FROM multipart_reclaims
+                        WHERE bucket = ?1 AND key = ?2 AND generation_id = ?3
+                    )",
+                params![bucket, key, generation_id.get() as i64],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "payload reclaim exists",
+                source: e,
+            })
+    }
+
     fn get_bucket_payload_reclaim_root(
         &self,
         bucket: &str,

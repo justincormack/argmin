@@ -339,6 +339,14 @@ pub trait PgMetadataStore {
         generation_id: GenerationId,
     ) -> Result<(), MetadataError>;
 
+    /// Return whether any durable reclaim record exists for this exact generation.
+    fn payload_reclaim_exists(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<bool, MetadataError>;
+
     /// Return one reclaim root in the bucket, if any exist.
     ///
     /// Used by synchronous bucket deletion to drain deferred reclaim work.

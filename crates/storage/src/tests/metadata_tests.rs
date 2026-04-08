@@ -5655,6 +5655,83 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
 }
 
 #[test]
+fn payload_reclaim_exists_checks_all_reclaim_tables() {
+    let (_dir, store) = make_pg_store();
+
+    let simple_generation = GenerationId::new(3).unwrap();
+    let segments_generation = GenerationId::new(7).unwrap();
+    let multipart_generation = GenerationId::new(11).unwrap();
+
+    assert!(!store
+        .payload_reclaim_exists("b", "k", simple_generation)
+        .unwrap());
+
+    store
+        .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            generation_id: simple_generation,
+            ec: EcShape { k: 4, m: 2 },
+            created_at: 1,
+        })
+        .unwrap();
+    assert!(store
+        .payload_reclaim_exists("b", "k", simple_generation)
+        .unwrap());
+    store
+        .delete_simple_payload_reclaim("b", "k", simple_generation)
+        .unwrap();
+
+    store
+        .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            generation_id: segments_generation,
+            created_at: 1,
+            segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                segment_index: 0,
+                segment_okh: [0x12; 16],
+                segment_vid: GenerationId::new(21).unwrap(),
+                shard_pg_id: 0,
+                ec: EcShape { k: 4, m: 2 },
+            }],
+        })
+        .unwrap();
+    assert!(store
+        .payload_reclaim_exists("b", "k", segments_generation)
+        .unwrap());
+    store
+        .delete_object_segments_reclaim("b", "k", segments_generation)
+        .unwrap();
+
+    store
+        .put_multipart_reclaim(&MultipartReclaimRecord {
+            bucket: "b".into(),
+            key: "k".into(),
+            generation_id: multipart_generation,
+            created_at: 1,
+            parts: vec![MultipartReclaimPartRecord::ShardSet {
+                part_number: 1,
+                part_okh: [0x34; 16],
+                part_vid: GenerationId::new(22).unwrap(),
+                shard_pg_id: 0,
+                ec: EcShape { k: 4, m: 2 },
+            }],
+        })
+        .unwrap();
+    assert!(store
+        .payload_reclaim_exists("b", "k", multipart_generation)
+        .unwrap());
+    store
+        .delete_multipart_reclaim("b", "k", multipart_generation)
+        .unwrap();
+
+    assert!(!store
+        .payload_reclaim_exists("b", "k", multipart_generation)
+        .unwrap());
+}
+
+#[test]
 fn commit_stream_part_rejects_mismatched_segment_part_number() {
     let (_dir, store) = make_pg_store();
 
