@@ -1123,6 +1123,8 @@ impl S3Response {
     /// Build an error response.
     #[must_use]
     pub fn error(err: &ServerError, resource: &str) -> Self {
+        const INTERNAL_ERROR_MESSAGE: &str = "We encountered an internal error. Please try again.";
+
         // Special cases that need extra XML elements
         match err {
             ServerError::XAmzContentSHA256Mismatch {
@@ -1268,13 +1270,18 @@ impl S3Response {
             ServerError::InvalidArgument { reason } => reason.as_str(),
             ServerError::InvalidBucketName { reason } => reason.as_str(),
             ServerError::InvalidBucketNamespace { reason, .. } => reason.as_str(),
-            ServerError::MetadataBlobError { reason } => reason.as_str(),
             ServerError::NotImplemented { feature } => feature.as_str(),
             ServerError::HeaderNotImplemented { header } => header.as_str(),
             ServerError::QueryParameterNotImplemented { query_parameter } => {
                 query_parameter.as_str()
             }
             ServerError::VersionNotFound { .. } => "The specified version does not exist.",
+            ServerError::InternalError { .. }
+            | ServerError::IntegrityError { .. }
+            | ServerError::Store(_)
+            | ServerError::Metadata(_)
+            | ServerError::Ec(_)
+            | ServerError::MetadataBlobError { .. } => INTERNAL_ERROR_MESSAGE,
             _ => {
                 fallback = err.to_string();
                 fallback.as_str()
@@ -2545,6 +2552,34 @@ mod tests {
         assert_eq!(resp.status_code, 500);
         let body = String::from_utf8(resp.body).unwrap();
         assert!(body.contains("InternalError"));
+        assert!(body.contains("We encountered an internal error. Please try again."));
+        assert!(!body.contains("shard not found"));
+    }
+
+    #[test]
+    fn error_response_internal_reason_is_sanitized() {
+        let err = ServerError::InternalError {
+            reason: "sqlite path /tmp/secret.db".to_string(),
+        };
+        let resp = S3Response::error(&err, "/x");
+        assert_eq!(resp.status_code, 500);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("InternalError"));
+        assert!(body.contains("We encountered an internal error. Please try again."));
+        assert!(!body.contains("/tmp/secret.db"));
+    }
+
+    #[test]
+    fn error_response_metadata_blob_reason_is_sanitized() {
+        let err = ServerError::MetadataBlobError {
+            reason: "invalid metadata bytes: 0xFF".to_string(),
+        };
+        let resp = S3Response::error(&err, "/x");
+        assert_eq!(resp.status_code, 500);
+        let body = String::from_utf8(resp.body).unwrap();
+        assert!(body.contains("InternalError"));
+        assert!(body.contains("We encountered an internal error. Please try again."));
+        assert!(!body.contains("0xFF"));
     }
 
     #[test]
