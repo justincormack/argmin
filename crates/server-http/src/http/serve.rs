@@ -495,14 +495,14 @@ async fn handle(
         .headers()
         .get(http::header::RANGE)
         .and_then(|value| value.to_str().ok())
-        .map(|value| format!(" range={value}"))
+        .map(|value| format!(" raw_range={}", observability::escaped(value)))
         .unwrap_or_default();
     let _ = observability::event_in_context(
         &trace,
         TRACE_TARGET,
         "request_start",
         Some(format_args!(
-            "method={} path={} has_query={} query_params={} sigv4_query={}{}",
+            "method={} path={:?} has_query={} query_params={} sigv4_query={}{}",
             method,
             path,
             query_summary.has_query(),

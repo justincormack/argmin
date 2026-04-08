@@ -189,7 +189,7 @@ string_newtype!(
 );
 
 /// Serialized user metadata blob.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct SerializedMetadataBlob(Vec<u8>);
 
 impl SerializedMetadataBlob {
@@ -227,8 +227,16 @@ impl From<SerializedMetadataBlob> for Vec<u8> {
     }
 }
 
+impl std::fmt::Debug for SerializedMetadataBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SerializedMetadataBlob")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
 /// Serialized system metadata blob.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct SerializedSystemMetadataBlob(Vec<u8>);
 
 impl SerializedSystemMetadataBlob {
@@ -266,8 +274,16 @@ impl From<SerializedSystemMetadataBlob> for Vec<u8> {
     }
 }
 
+impl std::fmt::Debug for SerializedSystemMetadataBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SerializedSystemMetadataBlob")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
 /// Serialized tag-set XML.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct SerializedTagSet(String);
 
 impl SerializedTagSet {
@@ -310,6 +326,14 @@ impl From<&str> for SerializedTagSet {
 impl From<SerializedTagSet> for String {
     fn from(value: SerializedTagSet) -> Self {
         value.0
+    }
+}
+
+impl std::fmt::Debug for SerializedTagSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SerializedTagSet")
+            .field("xml_len", &self.0.len())
+            .finish()
     }
 }
 
@@ -378,7 +402,7 @@ pub const SSE_S3_SEGMENT_NONCE_PREFIX_LEN: usize = OBJECT_ENCRYPTION_SEGMENT_NON
 pub const SSE_S3_CHECKSUM_NONCE_LEN: usize = OBJECT_ENCRYPTION_CHECKSUM_NONCE_LEN;
 
 /// Stored per-object `SSE-C` state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SseCustomerObjectState {
     pub validator_key_id: u32,
     pub validator_salt: [u8; SSE_C_VALIDATOR_SALT_LEN],
@@ -389,6 +413,22 @@ pub struct SseCustomerObjectState {
     pub segment_nonce_prefix: [u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
     pub checksum_nonce: [u8; SSE_C_CHECKSUM_NONCE_LEN],
     pub encrypted_checksum_metadata: Vec<u8>,
+}
+
+impl std::fmt::Debug for SseCustomerObjectState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SseCustomerObjectState")
+            .field("validator_key_id", &self.validator_key_id)
+            .field(
+                "encrypted_checksum_metadata_len",
+                &self.encrypted_checksum_metadata.len(),
+            )
+            .field(
+                "secret_material",
+                &observability::redacted("sse_customer_state"),
+            )
+            .finish()
+    }
 }
 
 impl SseCustomerObjectState {
@@ -499,7 +539,7 @@ impl SseCustomerObjectState {
 }
 
 /// Stored per-object `SSE-S3` state.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SseS3ObjectState {
     pub wrapping_key_id: u32,
     pub wrap_nonce: [u8; SSE_S3_WRAP_NONCE_LEN],
@@ -507,6 +547,19 @@ pub struct SseS3ObjectState {
     pub segment_nonce_prefix: [u8; SSE_S3_SEGMENT_NONCE_PREFIX_LEN],
     pub checksum_nonce: [u8; SSE_S3_CHECKSUM_NONCE_LEN],
     pub encrypted_checksum_metadata: Vec<u8>,
+}
+
+impl std::fmt::Debug for SseS3ObjectState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SseS3ObjectState")
+            .field("wrapping_key_id", &self.wrapping_key_id)
+            .field(
+                "encrypted_checksum_metadata_len",
+                &self.encrypted_checksum_metadata.len(),
+            )
+            .field("secret_material", &observability::redacted("sse_s3_state"))
+            .finish()
+    }
 }
 
 impl SseS3ObjectState {
@@ -599,12 +652,22 @@ impl SseS3ObjectState {
 }
 
 /// Persisted object encryption state.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub enum ObjectEncryption {
     #[default]
     None,
     SseCustomer(SseCustomerObjectState),
     SseS3(SseS3ObjectState),
+}
+
+impl std::fmt::Debug for ObjectEncryption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            Self::SseCustomer(state) => f.debug_tuple("SseCustomer").field(state).finish(),
+            Self::SseS3(state) => f.debug_tuple("SseS3").field(state).finish(),
+        }
+    }
 }
 
 impl ObjectEncryption {
@@ -1158,10 +1221,19 @@ impl StoredObject {
 }
 
 /// Durable owner identity stored on object and multipart metadata rows.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OwnerIdentity {
     pub principal: String,
     pub canonical_id: CanonicalUserId,
+}
+
+impl std::fmt::Debug for OwnerIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnerIdentity")
+            .field("principal", &observability::escaped(&self.principal))
+            .field("canonical_id", &self.canonical_id)
+            .finish()
+    }
 }
 
 impl OwnerIdentity {
@@ -1345,7 +1417,7 @@ impl BucketState {
 }
 
 /// Bucket metadata.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BucketInfo {
     pub name: BucketName,
     pub owner_principal: String,
@@ -1383,6 +1455,60 @@ pub struct BucketInfo {
     pub encryption: EffectiveBucketEncryptionConfig,
 }
 
+impl std::fmt::Debug for BucketInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BucketInfo")
+            .field("name", &self.name)
+            .field(
+                "owner_principal",
+                &observability::escaped(&self.owner_principal),
+            )
+            .field("owner_canonical_id", &self.owner_canonical_id)
+            .field("created_at", &self.created_at)
+            .field("region", &self.region)
+            .field("state", &self.state)
+            .field("versioning", &self.versioning)
+            .field("object_lock", &self.object_lock)
+            .field("acl_grants", &self.acl_grants)
+            .field("public_read", &self.public_read)
+            .field("public_write", &self.public_write)
+            .field(
+                "write_reservations_blocked",
+                &self.write_reservations_blocked,
+            )
+            .field("active_write_reservations", &self.active_write_reservations)
+            .field(
+                "cors_config_len",
+                &self.cors_config.as_ref().map(String::len),
+            )
+            .field("tags", &self.tags)
+            .field(
+                "public_access_block_len",
+                &self.public_access_block.as_ref().map(String::len),
+            )
+            .field(
+                "ownership_controls_len",
+                &self.ownership_controls.as_ref().map(String::len),
+            )
+            .field(
+                "bucket_policy_len",
+                &self.bucket_policy.as_ref().map(String::len),
+            )
+            .field("bucket_policy_public", &self.bucket_policy_public)
+            .field("bucket_policy_generation", &self.bucket_policy_generation)
+            .field(
+                "bucket_lifecycle_len",
+                &self.bucket_lifecycle.as_ref().map(String::len),
+            )
+            .field(
+                "bucket_lifecycle_generation",
+                &self.bucket_lifecycle_generation,
+            )
+            .field("encryption", &self.encryption)
+            .finish()
+    }
+}
+
 /// Complete bucket metadata required when creating a bucket row.
 #[derive(Debug, Clone, Copy)]
 pub struct CreateBucketConfig<'a> {
@@ -1397,7 +1523,7 @@ pub struct CreateBucketConfig<'a> {
 }
 
 /// Authoritative in-memory subset of bucket metadata used on hot object paths.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BucketFastPathInfo {
     pub name: BucketName,
     pub owner_principal: String,
@@ -1417,6 +1543,43 @@ pub struct BucketFastPathInfo {
     pub bucket_lifecycle_present: bool,
     pub bucket_lifecycle_generation: u64,
     pub encryption: EffectiveBucketEncryptionConfig,
+}
+
+impl std::fmt::Debug for BucketFastPathInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BucketFastPathInfo")
+            .field("name", &self.name)
+            .field(
+                "owner_principal",
+                &observability::escaped(&self.owner_principal),
+            )
+            .field("owner_canonical_id", &self.owner_canonical_id)
+            .field("created_at", &self.created_at)
+            .field("state", &self.state)
+            .field("versioning", &self.versioning)
+            .field("object_lock", &self.object_lock)
+            .field("acl_grants", &self.acl_grants)
+            .field("public_read", &self.public_read)
+            .field("public_write", &self.public_write)
+            .field(
+                "public_access_block_len",
+                &self.public_access_block.as_ref().map(String::len),
+            )
+            .field(
+                "ownership_controls_len",
+                &self.ownership_controls.as_ref().map(String::len),
+            )
+            .field("bucket_policy_present", &self.bucket_policy_present)
+            .field("bucket_policy_public", &self.bucket_policy_public)
+            .field("bucket_policy_generation", &self.bucket_policy_generation)
+            .field("bucket_lifecycle_present", &self.bucket_lifecycle_present)
+            .field(
+                "bucket_lifecycle_generation",
+                &self.bucket_lifecycle_generation,
+            )
+            .field("encryption", &self.encryption)
+            .finish()
+    }
 }
 
 /// Stored bucket encryption configuration subset currently implemented by Argmin.
@@ -2129,6 +2292,82 @@ mod tests {
             OBJECT_ENCRYPTION_SEGMENT_TAG_LEN
         );
         assert!(!decoded.uses_sse_customer_headers());
+    }
+
+    #[test]
+    fn debug_redacts_blob_and_encryption_contents() {
+        let metadata = SerializedMetadataBlob::from(b"top-secret-metadata".to_vec());
+        let system_metadata = SerializedSystemMetadataBlob::from(b"checksum-secret".to_vec());
+        let tags = SerializedTagSet::from("<Tagging>secret-tag</Tagging>");
+        let metadata_debug = format!("{metadata:?}");
+        let system_debug = format!("{system_metadata:?}");
+        let tags_debug = format!("{tags:?}");
+        assert!(metadata_debug.contains("len"));
+        assert!(system_debug.contains("len"));
+        assert!(tags_debug.contains("xml_len"));
+        assert!(!metadata_debug.contains("top-secret-metadata"));
+        assert!(!system_debug.contains("checksum-secret"));
+        assert!(!tags_debug.contains("secret-tag"));
+
+        let encryption = ObjectEncryption::SseCustomer(SseCustomerObjectState {
+            validator_key_id: 42,
+            validator_salt: [1u8; SSE_C_VALIDATOR_SALT_LEN],
+            validator_hmac: [2u8; SSE_C_VALIDATOR_HMAC_LEN],
+            wrap_salt: [3u8; SSE_C_WRAP_SALT_LEN],
+            wrap_nonce: [4u8; SSE_C_WRAP_NONCE_LEN],
+            wrapped_dek: [5u8; SSE_C_WRAPPED_DEK_LEN],
+            segment_nonce_prefix: [6u8; SSE_C_SEGMENT_NONCE_PREFIX_LEN],
+            checksum_nonce: [7u8; SSE_C_CHECKSUM_NONCE_LEN],
+            encrypted_checksum_metadata: vec![8, 9, 10],
+        });
+        let debug = format!("{encryption:?}");
+        assert!(debug.contains("<redacted:sse_customer_state>"));
+        assert!(!debug.contains("wrapped_dek"));
+        assert!(!debug.contains("validator_hmac"));
+    }
+
+    #[test]
+    fn bucket_info_debug_summarizes_raw_configs() {
+        let info = BucketInfo {
+            name: BucketName::from("buck\r\net"),
+            owner_principal: "own\ner".to_string(),
+            owner_canonical_id: CanonicalUserId::from_principal("owner"),
+            created_at: 1,
+            region: 0,
+            state: BucketState::Active,
+            versioning: BucketVersioningState::Disabled,
+            object_lock: BucketObjectLockConfig::default(),
+            acl_grants: AclGrants::default(),
+            public_read: false,
+            public_write: false,
+            write_reservations_blocked: false,
+            active_write_reservations: 0,
+            cors_config: Some("<CORS>secret</CORS>".to_string()),
+            tags: Some(SerializedTagSet::from("<Tagging>secret-tag</Tagging>")),
+            public_access_block: Some("<PublicAccessBlock>secret</PublicAccessBlock>".to_string()),
+            ownership_controls: Some("<OwnershipControls>secret</OwnershipControls>".to_string()),
+            bucket_policy: Some("{\"Statement\":\"secret-policy\"}".to_string()),
+            bucket_policy_public: false,
+            bucket_policy_generation: 7,
+            bucket_lifecycle: Some(
+                "<LifecycleConfiguration>secret</LifecycleConfiguration>".to_string(),
+            ),
+            bucket_lifecycle_generation: 8,
+            encryption: EffectiveBucketEncryptionConfig::default(),
+        };
+        let debug = format!("{info:?}");
+        assert!(debug.contains(r#""own\ner""#));
+        assert!(debug.contains("cors_config_len"));
+        assert!(debug.contains("bucket_policy_len"));
+        assert!(debug.contains("bucket_lifecycle_len"));
+        assert!(!debug.contains("secret-policy"));
+        assert!(!debug.contains("<CORS>secret</CORS>"));
+        assert!(!debug.contains("secret-tag"));
+
+        let fast_debug = format!("{:?}", BucketFastPathInfo::from(&info));
+        assert!(fast_debug.contains(r#""own\ner""#));
+        assert!(!fast_debug.contains("secret-policy"));
+        assert!(!fast_debug.contains("<OwnershipControls>secret</OwnershipControls>"));
     }
 
     #[test]

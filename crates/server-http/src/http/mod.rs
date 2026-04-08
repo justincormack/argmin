@@ -306,7 +306,7 @@ impl ResponseBodyTrace {
             TRACE_TARGET,
             "response_first_chunk",
             Some(format_args!(
-                "status={} method={} path={} has_query={} query_params={} sigv4_query={} streaming={} body_len={} first_chunk_len={} lifetime_us={}",
+                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} first_chunk_len={} lifetime_us={}",
                 self.status_code,
                 self.meta.method,
                 self.meta.path,
@@ -338,7 +338,7 @@ impl ResponseBodyTrace {
             TRACE_TARGET,
             "response_body_complete",
             Some(format_args!(
-                "status={} method={} path={} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={}",
+                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={}",
                 self.status_code,
                 self.meta.method,
                 self.meta.path,
@@ -363,7 +363,7 @@ impl ResponseBodyTrace {
             TRACE_TARGET,
             "response_body_error",
             Some(format_args!(
-                "status={} method={} path={} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} error={}",
+                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} error_code={}",
                 self.status_code,
                 self.meta.method,
                 self.meta.path,
@@ -374,7 +374,7 @@ impl ResponseBodyTrace {
                 self.body_len,
                 self.bytes_sent,
                 self.meta.started_at.elapsed().as_micros(),
-                err
+                err.s3_error_code()
             )),
         );
     }
@@ -389,7 +389,7 @@ impl ResponseBodyTrace {
             TRACE_TARGET,
             "response_body_dropped",
             Some(format_args!(
-                "status={} method={} path={} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={}",
+                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={}",
                 self.status_code,
                 self.meta.method,
                 self.meta.path,
@@ -556,7 +556,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::handle_s3_request",
-            "method={} path={} has_query={} query_params={} sigv4_query={}",
+            "method={} path={:?} has_query={} query_params={} sigv4_query={}",
             s3req.method,
             s3req.path(),
             query.has_query(),
@@ -568,7 +568,7 @@ impl HttpFrontend {
             observability::trace_scope!(
                 TRACE_TARGET,
                 "HttpFrontend::route_request",
-                "method={} path={} has_query={} query_params={} sigv4_query={}",
+                "method={} path={:?} has_query={} query_params={} sigv4_query={}",
                 s3req.method.as_str(),
                 s3req.path(),
                 query.has_query(),
@@ -591,7 +591,7 @@ impl HttpFrontend {
             observability::trace_scope!(
                 TRACE_TARGET,
                 "HttpFrontend::authenticate",
-                "method={} path={}",
+                "method={} path={:?}",
                 s3req.method.as_str(),
                 s3req.path()
             );
@@ -620,7 +620,7 @@ impl HttpFrontend {
             observability::trace_scope!(
                 TRACE_TARGET,
                 "HttpFrontend::map_dispatch_result",
-                "method={} path={}",
+                "method={} path={:?}",
                 s3req.method.as_str(),
                 s3req.path()
             );
@@ -648,7 +648,7 @@ impl HttpFrontend {
                 observability::trace_scope!(
                     TRACE_TARGET,
                     "HttpFrontend::apply_actual_cors",
-                    "method={} path={} bucket={:?}",
+                    "method={} path={:?} bucket={:?}",
                     s3req.method.as_str(),
                     s3req.path(),
                     bucket
@@ -861,7 +861,7 @@ impl HttpFrontend {
         observability::trace_scope!(
             TRACE_TARGET,
             "HttpFrontend::dispatch_routed",
-            "method={} path={} op={:?} principal={:?}",
+            "method={} path={:?} op={:?} principal={:?}",
             req.method.as_str(),
             req.path(),
             operation,
@@ -1268,7 +1268,7 @@ impl HttpFrontend {
                                 TRACE_TARGET,
                                 "get_object_range_request",
                                 Some(format_args!(
-                                    "bucket={:?} key={:?} version_id={:?} raw_range={} parsed_range={}",
+                                    "bucket={:?} key={:?} version_id={:?} raw_range={:?} parsed_range={}",
                                     bucket, key, vid, range_header, byte_range
                                 )),
                             );
@@ -1306,7 +1306,7 @@ impl HttpFrontend {
                                 TRACE_TARGET,
                                 "get_object_range_ignored",
                                 Some(format_args!(
-                                    "bucket={:?} key={:?} version_id={:?} raw_range={} reason=invalid_header",
+                                    "bucket={:?} key={:?} version_id={:?} raw_range={:?} reason=invalid_header",
                                     bucket,
                                     key,
                                     vid,
