@@ -5504,6 +5504,41 @@ mod tests {
     }
 
     #[test]
+    fn s3_response_to_hyper_deduplicates_content_length() {
+        let resp = S3Response {
+            status_code: 200,
+            headers: vec![
+                ("Content-Length".to_string(), "5".to_string()),
+                ("Content-Length".to_string(), "5".to_string()),
+            ],
+            body: b"hello".to_vec(),
+            stream: None,
+        };
+
+        let hyper_resp = s3_response_to_hyper(
+            resp,
+            None,
+            8192,
+            ResponseTraceMeta::new(observability::TraceContext::new_request(), "GET", "/", ""),
+        );
+        assert_eq!(
+            hyper_resp
+                .headers()
+                .get_all(http::header::CONTENT_LENGTH)
+                .iter()
+                .count(),
+            1
+        );
+        assert_eq!(
+            hyper_resp
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            Some("5")
+        );
+    }
+
+    #[test]
     fn parse_bucket_namespace_defaults_to_global() {
         let req = new_req(http::Method::PUT, "/bucket", "", vec![], vec![]);
         assert_eq!(
@@ -8791,6 +8826,13 @@ mod tests {
             .map(|(_, v)| v.as_str())
             .unwrap();
         assert_eq!(parts_count, "3");
+
+        let content_length_count = resp
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("Content-Length"))
+            .count();
+        assert_eq!(content_length_count, 1);
 
         // Verify data
         assert_eq!(resp.into_test_body_bytes().unwrap(), part2);

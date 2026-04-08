@@ -512,7 +512,6 @@ impl S3Response {
             .header("ETag", &result.etag)
             .header("Last-Modified", &format_http_date(result.last_modified))
             .header("Accept-Ranges", "bytes")
-            .header("Content-Length", &result.part_size.to_string())
             .header("x-amz-mp-parts-count", &result.parts_count.to_string());
         // Only emit Content-Range for non-empty parts; a zero-byte part has
         // no valid byte range to express.
