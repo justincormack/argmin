@@ -1,0 +1,334 @@
+Unauthorized callers can enumerate bucket names via error codes
+Link: https://chatgpt.com/codex/security/findings/7d9f3405d7dc8191acc374f3bfdd6d08?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=low
+Criticality: low (attack path: low)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 9e22ede
+Author: justin@specialbusservice.com
+Created: 17/03/2026, 23:30:47
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Introduced an information disclosure issue: unauthorized users can infer bucket existence because the new auth path performs head_bucket() before access control and propagates BucketNotFound vs AccessDenied errors.
+The new authorization helpers in the HTTP frontend call head_bucket() before checking whether the caller can read or write the bucket. If the bucket does not exist, the coordinator returns BucketNotFound, which is mapped to a 404/NoSuchBucket response. If the bucket exists but the caller is not authorized, the code returns AccessDenied (403). This distinction allows remote, unauthenticated users to probe bucket names and learn which private buckets exist. To avoid enumeration, authorization should be checked without leaking existence (e.g., return AccessDenied for unauthorized callers before disclosing BucketNotFound).
+
+Update: this is not a valid issue for our AWS-compatibility target.
+AWS itself distinguishes these cases on anonymous bucket-surface requests:
+an existing private bucket returns `403 AccessDenied`, while a nonexistent
+bucket returns `404 NoSuchBucket`. We intentionally match that behavior.
+
+Existing external coverage:
+- `crates/s3-tests/tests/bucket_anon.rs`
+  - `test_anon_head_bucket_private_fail`
+  - `test_anon_head_nonexistent_bucket_returns_404`
+  - `test_anon_list_objects_v1_private_bucket_fail`
+  - `test_anon_list_objects_v1_nonexistent_bucket_returns_404`
+  - `test_anon_list_objects_v2_private_bucket_fail`
+  - `test_anon_list_objects_v2_nonexistent_bucket_returns_404`
+  - `test_anon_bucket_surfaces_distinguish_private_and_nonexistent_like_aws`
+
+So the reported distinction is real, but it is AWS behavior we deliberately
+test and preserve, not a security bug to “fix”.
+
+# Validation
+## Rubric
+- [x] Attempted debug build/dynamic repro; blocked by crates.io 403 and missing cached deps.
+- [x] Confirmed anonymous access path on MissingAuth (crates/server/src/http/mod.rs:307-334).
+- [x] Confirmed authorize_bucket_read/write call head_bucket before permission checks (crates/server/src/http/mod.rs:373-396).
+- [x] Confirmed head_bucket maps missing bucket to ServerError::BucketNotFound (crates/server/src/coordinator.rs:236-239).
+- [x] Confirmed BucketNotFound => 404 and Auth => 403 (crates/server/src/error.rs:57-92), enabling existence probing.
+## Report
+Dynamic attempts: `cargo build -p server` failed due to crates.io access (403), and `cargo build --offline` failed because `tiny_http` was not cached. valgrind and gdb are not installed, so crash/valgrind/debugger validation could not proceed. Code review shows anonymous access is allowed when auth headers are missing (AuthContext::Anonymous on MissingAuth in crates/server/src/http/mod.rs:307-334). Authorization helpers call `self.coordinator.head_bucket(bucket)?` before checking permissions (crates/server/src/http/mod.rs:373-396), and dispatch uses these helpers for bucket operations (e.g., HeadBucket/ListObjects in crates/server/src/http/mod.rs:93-105). The coordinator maps missing buckets to `ServerError::BucketNotFound` (crates/server/src/coordinator.rs:236-239), and ServerError maps BucketNotFound to NoSuchBucket/HTTP 404 while auth errors map to AccessDenied/HTTP 403 (crates/server/src/error.rs:57-92). Thus an unauthenticated caller can distinguish existing private buckets (403) from non-existent ones (404), confirming the enumeration issue.
+
+# Evidence
+/workspace/argmin/crates/server/src/error.rs (L57 to 93)
+  Note: BucketNotFound is mapped to NoSuchBucket/404 while Auth errors map to AccessDenied/403, enabling bucket existence enumeration when combined with the above logic.
+```
+impl ServerError {
+    /// Map to S3 error code string.
+    pub fn s3_error_code(&self) -> &'static str {
+        match self {
+            Self::BucketNotFound { .. } => "NoSuchBucket",
+            Self::BucketAlreadyExists => "BucketAlreadyOwnedByYou",
+            Self::BucketNotEmpty => "BucketNotEmpty",
+            Self::ObjectNotFound { .. } => "NoSuchKey",
+            Self::Auth(auth::AuthError::MissingAuth) => "AccessDenied",
+            Self::Auth(auth::AuthError::UnknownAccessKey) => "InvalidAccessKeyId",
+            Self::Auth(auth::AuthError::SignatureMismatch) => "SignatureDoesNotMatch",
+            Self::Auth(auth::AuthError::RequestExpired) => "RequestTimeTooSkewed",
+            Self::Auth(_) => "AccessDenied",
+            Self::PreconditionFailed => "PreconditionFailed",
+            Self::NotModified { .. } => "NotModified",
+            Self::InvalidRequest { .. } => "InvalidRequest",
+            Self::InvalidArgument { .. } => "InvalidArgument",
+            Self::InvalidBucketName { .. } => "InvalidBucketName",
+            Self::MetadataBlobError { .. } => "InternalError",
+            Self::ObjectTooLarge { .. } => "EntityTooLarge",
+            Self::MethodNotAllowed => "MethodNotAllowed",
+            Self::InvalidRange { .. } => "InvalidRange",
+            Self::Store(_) => "InternalError",
+            Self::Metadata(_) => "InternalError",
+            Self::Ec(_) => "InternalError",
+        }
+    }
+
+    /// Map to HTTP status code.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            Self::BucketNotFound { .. } => 404,
+            Self::BucketAlreadyExists => 409,
+            Self::BucketNotEmpty => 409,
+            Self::ObjectNotFound { .. } => 404,
+            Self::Auth(_) => 403,
+            Self::InvalidRequest { .. }
+```
+
+/workspace/argmin/crates/server/src/http/mod.rs (L373 to 397)
+  Note: authorize_bucket_read/write fetch bucket info via head_bucket() before checking permissions, causing BucketNotFound errors to leak to unauthorized callers.
+```
+    fn authorize_bucket_read(&self, auth: &AuthContext, bucket: &str) -> Result<(), ServerError> {
+        let info = self.coordinator.head_bucket(bucket)?;
+        let visibility = if info.public_read {
+            ResourceVisibility::PublicRead
+        } else {
+            ResourceVisibility::Private
+        };
+        if can_read_bucket(auth, &info.owner_principal, visibility) {
+            Ok(())
+        } else {
+            Err(ServerError::Auth(auth::AuthError::AccessDenied))
+        }
+    }
+
+    fn authorize_bucket_write(
+        &self,
+        auth: &AuthContext,
+        bucket: &str,
+    ) -> Result<(), ServerError> {
+        let info = self.coordinator.head_bucket(bucket)?;
+        if can_write_bucket(auth, &info.owner_principal) {
+            Ok(())
+        } else {
+            Err(ServerError::Auth(auth::AuthError::AccessDenied))
+        }
+```
+
+Proposed patch:
+diff --git a/crates/server-core/src/coordinator.rs b/crates/server-core/src/coordinator.rs
+index a07508e1c96a63e619527d3e4380b977a7c8d432..3c0b9378f6342e5ed293c485cace1ffdad539b7f 100644
+--- a/crates/server-core/src/coordinator.rs
++++ b/crates/server-core/src/coordinator.rs
+@@ -2362,92 +2362,106 @@ impl Coordinator {
+     }
+ 
+     fn requester_principal_required(requester: Requester<'_>) -> Result<&str, ServerError> {
+         requester.principal_opt().ok_or(ServerError::AccessDenied)
+     }
+ 
+     fn ownership_controls_xml(ownership: BucketObjectOwnership) -> String {
+         format!(
+             "<OwnershipControls><Rule><ObjectOwnership>{}</ObjectOwnership></Rule></OwnershipControls>",
+             ownership.as_str()
+         )
+     }
+ 
+     fn now_millis() -> u64 {
+         std::time::SystemTime::now()
+             .duration_since(std::time::UNIX_EPOCH)
+             .unwrap_or_default()
+             .as_millis() as u64
+     }
+ 
+     fn authorize_bucket_read_requester(
+         &self,
+         requester: Requester<'_>,
+         bucket: &str,
+     ) -> Result<BucketSummary, ServerError> {
+-        let info = self.head_bucket(bucket)?;
++        let info = self.head_bucket_for_authorization(requester, bucket)?;
+         if Self::requester_can_read_bucket(
+             requester,
+             &info.owner_principal,
+             Self::effective_public_read(&info),
+         ) {
+             Ok(info)
+         } else {
+             Err(ServerError::AccessDenied)
+         }
+     }
+ 
+     fn authorize_bucket_admin_requester(
+         &self,
+         requester: Requester<'_>,
+         bucket: &str,
+     ) -> Result<BucketSummary, ServerError> {
+-        let info = self.head_bucket(bucket)?;
++        let info = self.head_bucket_for_authorization(requester, bucket)?;
+         if Self::requester_can_bucket_admin(requester, &info.owner_principal) {
+             Ok(info)
+         } else {
+             Err(ServerError::AccessDenied)
+         }
+     }
+ 
+     fn authorize_object_write_requester(
+         &self,
+         requester: Requester<'_>,
+         bucket: &str,
+     ) -> Result<BucketSummary, ServerError> {
+-        let info = self.head_bucket(bucket)?;
++        let info = self.head_bucket_for_authorization(requester, bucket)?;
+         if Self::requester_can_object_write(
+             requester,
+             &info.owner_principal,
+             Self::effective_public_write(&info),
+         ) {
+             Ok(info)
+         } else {
+             Err(ServerError::AccessDenied)
+         }
+     }
+ 
++    fn head_bucket_for_authorization(
++        &self,
++        requester: Requester<'_>,
++        bucket: &str,
++    ) -> Result<BucketSummary, ServerError> {
++        match self.head_bucket(bucket) {
++            Ok(info) => Ok(info),
++            Err(ServerError::BucketNotFound { .. }) if requester.principal_opt().is_none() => {
++                Err(ServerError::AccessDenied)
++            }
++            Err(err) => Err(err),
++        }
++    }
++
+     fn bucket_summary(info: BucketInfo) -> BucketSummary {
+         BucketSummary {
+             name: info.name.into_string(),
+             owner_principal: info.owner_principal,
+             owner_canonical_id: info.owner_canonical_id,
+             created_at: info.created_at,
+             public_read: info.public_read,
+             public_write: info.public_write,
+             versioning: info.versioning,
+             public_access_block: info.public_access_block,
+             ownership_controls: info.ownership_controls,
+         }
+     }
+ 
+     /// Create a new coordinator.
+     pub fn new(
+         storage_node: Arc<SharedStorageNode>,
+         ec_config: EcConfig,
+         region: String,
+     ) -> Result<Self, ServerError> {
+         let ec_codec = Arc::new(ErasureCodec::new(ec_config)?);
+         let pg_topology = PgTopology::new(storage_node.pg_ids()).map_err(|reason| {
+             ServerError::InternalError {
+                 reason: reason.to_string(),
+             }
+@@ -10568,50 +10582,64 @@ mod tests {
+             .head_bucket_for_requester(&HeadBucketRequest {
+                 bucket: "bucket",
+                 requester: Requester::principal("other-user"),
+             })
+             .unwrap_err();
+         assert!(matches!(err, ServerError::AccessDenied));
+     }
+ 
+     #[test]
+     fn head_bucket_allows_public_read_for_anonymous() {
+         let tmp = test_util::tempdir();
+         let coord = setup_coordinator(tmp.path());
+         coord
+             .create_bucket_for_owner("owner-a", "bucket", true)
+             .unwrap();
+ 
+         let info = coord
+             .head_bucket_for_requester(&HeadBucketRequest {
+                 bucket: "bucket",
+                 requester: Requester::anonymous(),
+             })
+             .unwrap();
+         assert_eq!(info.name, "bucket");
+     }
+ 
++    #[test]
++    fn head_bucket_masks_missing_bucket_for_anonymous() {
++        let tmp = test_util::tempdir();
++        let coord = setup_coordinator(tmp.path());
++
++        let err = coord
++            .head_bucket_for_requester(&HeadBucketRequest {
++                bucket: "missing",
++                requester: Requester::anonymous(),
++            })
++            .unwrap_err();
++        assert!(matches!(err, ServerError::AccessDenied));
++    }
++
+     #[test]
+     fn list_objects_rejects_non_owner_requester() {
+         let tmp = test_util::tempdir();
+         let coord = setup_coordinator(tmp.path());
+         coord
+             .create_bucket_for_owner("owner-a", "bucket", false)
+             .unwrap();
+         test_helpers::put_object(
+             &coord,
+             &PutObjectRequest {
+                 bucket: "bucket",
+                 key: "key",
+                 data: b"data",
+                 metadata: &MetadataBlob::new(),
+                 tags: None,
+                 cond: NO_WRITE,
+                 requester: Requester::principal("owner-a"),
+                 acl: NO_PUT_OBJECT_ACL,
+             },
+         )
+         .unwrap();
+ 
+         let err = coord
+             .list_objects_v2(&ListObjectsV2Request {
+                 bucket: "bucket",
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Although the issue is remotely reachable when the service is exposed, the impact is limited to bucket existence enumeration (metadata only) with no data access or privilege escalation. Default binding is localhost and exposure depends on deployment. These factors reduce impact and overall risk compared to the original medium rating.
+## Likelihood
+high - If the HTTP endpoint is exposed, probing unauthenticated requests is trivial; however default binding is localhost unless configured otherwise. | Remote network vector
+## Impact
+low - Only bucket existence is disclosed; no object data or credentials are exposed, and no write/modify capability is gained.
+## Assumptions
+- The S3 HTTP server is reachable by an attacker (e.g., ARGMIN_LISTEN_ADDR bound to a non-loopback interface).
+- Bucket names are not already public and their existence is considered sensitive metadata.
+- No external gateway normalizes error responses before they reach clients.
+- Network access to the S3 HTTP endpoint
+- Ability to send unauthenticated requests
+- Ability to guess or enumerate bucket names
+## Path
+n1(unauth HTTP) -> n2(Anonymous) -> n3(head_bucket before authz) -> n4(404 vs 403) -> n5(bucket enumeration)
+## Path evidence
+- `crates/server/src/http/mod.rs:307-334` - MissingAuth is converted to AuthContext::Anonymous, allowing unauthenticated requests to continue.
+- `crates/server/src/http/mod.rs:373-397` - authorize_bucket_read/write call coordinator.head_bucket before checking permissions.
+- `crates/server/src/http/mod.rs:93-105` - Bucket operations (HeadBucket/ListObjects) invoke authorize_bucket_read/write.
+- `crates/server/src/coordinator.rs:236-239` - head_bucket maps missing buckets to ServerError::BucketNotFound.
+- `crates/server/src/error.rs:61-92` - BucketNotFound maps to 404/NoSuchBucket while Auth errors map to 403/AccessDenied.
+- `crates/server/src/config.rs:18-39` - Default listen address is 127.0.0.1:9000 but can be configured via ARGMIN_LISTEN_ADDR.
+- `crates/server/src/main.rs:83-99` - tiny_http server binds to the configured listen address, establishing the HTTP attack surface.
+## Narrative
+The HTTP frontend treats missing auth headers as anonymous access and proceeds to authorization helpers. Those helpers call head_bucket before checking permissions, so a non-existent bucket yields BucketNotFound (mapped to 404/NoSuchBucket), while an unauthorized access yields AccessDenied (403). This allows unauthenticated clients to probe bucket names and learn existence, which is a limited information disclosure but reachable from the S3 HTTP endpoint.
+## Controls
+- SigV4 authentication via authenticate_request
+- Bucket ACL checks via can_read_bucket/can_write_bucket
+- Error mapping to S3 codes and HTTP status
+## Blindspots
+- No deployment manifests to confirm real-world exposure (public vs internal).
+- No runtime validation possible in this environment to observe actual responses.
+- External reverse proxies could normalize errors, which is not visible in repo.
