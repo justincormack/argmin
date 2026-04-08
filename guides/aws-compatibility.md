@@ -106,6 +106,24 @@ instead.
 
 The `s3-diff-tests` `HeadBucket` response-shape check ignores only this header.
 
+### 8. `AccessDenied` does not yet match AWS principal-specific error text
+
+Argmin now matches the generic XML error shape for several `AccessDenied`
+cases, but it does not yet reproduce AWS's more specific denial messages that
+name the requester principal and the denied action/resource.
+
+In practice this means anonymous/private-object `AccessDenied` responses are
+covered, but authenticated denials that AWS renders with caller-specific IAM
+or account details may still differ in `<Message>`.
+
+This should be revisited as part of durable account and credential work,
+because exact matching depends on carrying richer persistent account identity
+through to error rendering.
+
+Related plan:
+
+- [plans/persistent-account-and-credential-management.md](/home/justin/src/github.com/justincormack/argmin/plans/persistent-account-and-credential-management.md)
+
 ## How to treat new differences
 
 If AWS-backed tests expose a difference that is not listed here:

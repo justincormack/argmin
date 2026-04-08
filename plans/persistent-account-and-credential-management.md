@@ -84,3 +84,9 @@ strategy should be filled in once we decide the intended operational model.
 Concrete account modelling should also be defined here when implementation
 starts, including the durable representation of accounts, their identity
 fields, and how those records relate to credential records.
+
+When this work is implemented, re-check AWS conformance for principal-specific
+`AccessDenied` responses. Current compatibility work only matches the generic
+anonymous/private-object denial shape; AWS also emits caller-specific denial
+messages that include the requester principal plus the denied action/resource,
+and those are expected to depend on richer persistent account identity.
