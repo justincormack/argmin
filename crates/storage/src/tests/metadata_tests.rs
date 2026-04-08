@@ -161,6 +161,7 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
             bucket: "list-bucket".into(),
             prefix: None,
             start_after: None,
+            start_at: None,
             max_keys: 100,
         })
         .unwrap();
@@ -201,6 +202,7 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
             bucket: "prefix-bucket".into(),
             prefix: Some("photos/".into()),
             start_after: None,
+            start_at: None,
             max_keys: 100,
         })
         .unwrap();
@@ -238,6 +240,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
             bucket: "page-bucket".into(),
             prefix: None,
             start_after: None,
+            start_at: None,
             max_keys: 3,
         })
         .unwrap();
@@ -254,6 +257,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
             bucket: "page-bucket".into(),
             prefix: None,
             start_after: resp1.next_start_after,
+            start_at: None,
             max_keys: 3,
         })
         .unwrap();
@@ -274,6 +278,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
                 bucket: "page-bucket".into(),
                 prefix: None,
                 start_after: start_after.clone(),
+                start_at: None,
                 max_keys: 3,
             })
             .unwrap();
@@ -297,6 +302,7 @@ fn metadata_list_empty_bucket(store: &dyn PgMetadataStore) {
             bucket: "empty-bucket".into(),
             prefix: None,
             start_after: None,
+            start_at: None,
             max_keys: 100,
         })
         .unwrap();
@@ -3310,6 +3316,7 @@ mod prop_tests {
                     bucket: bucket.into(),
                     prefix: prefix.clone(),
                     start_after: start_after.clone(),
+                    start_at: None,
                     max_keys,
                 })
                 .unwrap();
@@ -3420,6 +3427,7 @@ mod prop_tests {
             bucket: PROP_TEST_BUCKET.into(),
             prefix: None,
             start_after: None,
+            start_at: None,
             max_keys: UNPAGINATED_MAX_KEYS,
         }) {
             Ok(resp) => {
@@ -3469,6 +3477,7 @@ mod prop_tests {
             bucket: PROP_TEST_BUCKET.into(),
             prefix: None,
             start_after,
+            start_at: None,
             max_keys,
         }) {
             Ok(resp) => Ok((
@@ -6254,6 +6263,7 @@ fn suspended_null_live_version_stays_current_when_last_modified_ties() {
             bucket: "b".into(),
             prefix: None,
             start_after: None,
+            start_at: None,
             max_keys: 10,
         })
         .unwrap();
@@ -6339,6 +6349,7 @@ fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
             bucket: "b".into(),
             prefix: None,
             start_after: None,
+            start_at: None,
             max_keys: 10,
         })
         .unwrap();

@@ -147,6 +147,31 @@ string_newtype!(
     ObjectKey
 );
 
+/// Return the smallest valid UTF-8 string that sorts after every key beginning
+/// with `prefix`, or `None` if no such bound exists.
+#[must_use]
+pub fn key_prefix_upper_bound(prefix: &str) -> Option<String> {
+    if prefix.is_empty() {
+        return None;
+    }
+
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        let mut next = last as u32 + 1;
+        while next <= char::MAX as u32 {
+            if let Some(next_char) = char::from_u32(next) {
+                let mut upper = String::new();
+                upper.extend(chars.iter().copied());
+                upper.push(next_char);
+                return Some(upper);
+            }
+            next += 1;
+        }
+    }
+
+    None
+}
+
 string_newtype!(
     /// Multipart upload identifier.
     UploadId
@@ -1613,6 +1638,7 @@ pub struct ListObjectsReq {
     pub bucket: BucketName,
     pub prefix: Option<ObjectKey>,
     pub start_after: Option<ObjectKey>,
+    pub start_at: Option<ObjectKey>,
     pub max_keys: u32,
 }
 

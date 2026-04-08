@@ -3056,6 +3056,10 @@ impl PgMetadataStore for PgStore {
             where_clauses.push(format!("o.key > ?{param_idx}"));
             params_vec.push(Box::new(start_after.clone()));
             param_idx += 1;
+        } else if let Some(ref start_at) = req.start_at {
+            where_clauses.push(format!("o.key >= ?{param_idx}"));
+            params_vec.push(Box::new(start_at.clone()));
+            param_idx += 1;
         }
 
         if let Some(ref prefix) = req.prefix {
@@ -3063,7 +3067,7 @@ impl PgMetadataStore for PgStore {
             params_vec.push(Box::new(prefix.clone()));
             param_idx += 1;
 
-            if let Some(end) = prefix_end(prefix) {
+            if let Some(end) = key_prefix_upper_bound(prefix) {
                 where_clauses.push(format!("o.key < ?{param_idx}"));
                 params_vec.push(Box::new(end));
                 param_idx += 1;
@@ -3183,7 +3187,7 @@ impl PgMetadataStore for PgStore {
             params_vec.push(Box::new(prefix.clone()));
             param_idx += 1;
 
-            if let Some(end) = prefix_end(prefix) {
+            if let Some(end) = key_prefix_upper_bound(prefix) {
                 where_clauses.push(format!("key < ?{param_idx}"));
                 params_vec.push(Box::new(end));
                 param_idx += 1;
@@ -4466,7 +4470,7 @@ impl PgMetadataStore for PgStore {
             params_vec.push(Box::new(prefix.clone()));
             param_idx += 1;
 
-            if let Some(end) = prefix_end(prefix) {
+            if let Some(end) = key_prefix_upper_bound(prefix) {
                 where_clauses.push(format!("key < ?{param_idx}"));
                 params_vec.push(Box::new(end));
                 param_idx += 1;
@@ -6681,19 +6685,6 @@ impl PgMetadataStore for PgStore {
 ///
 /// For prefix "foo", returns Some("fop") — the next string after all strings
 /// starting with "foo". Returns None if the prefix is all 0xFF bytes (no upper bound).
-fn prefix_end(prefix: &str) -> Option<String> {
-    let bytes = prefix.as_bytes();
-    let mut end = bytes.to_vec();
-    // Increment the last byte; if it overflows, pop and try the next.
-    while let Some(last) = end.pop() {
-        if last < 0xFF {
-            end.push(last + 1);
-            return String::from_utf8(end).ok();
-        }
-    }
-    None
-}
-
 /// fsync a directory to ensure renames are durable.
 fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     let f = fs::File::open(dir)?;
@@ -6713,35 +6704,31 @@ mod tests {
     // ── prefix_end ────────────────────────────────────────────────────
 
     #[test]
-    fn prefix_end_basic() {
-        assert_eq!(prefix_end("foo"), Some("fop".to_string()));
+    fn key_prefix_upper_bound_basic() {
+        assert_eq!(key_prefix_upper_bound("foo"), Some("fop".to_string()));
     }
 
     #[test]
-    fn prefix_end_empty() {
-        assert_eq!(prefix_end(""), None);
+    fn key_prefix_upper_bound_empty() {
+        assert_eq!(key_prefix_upper_bound(""), None);
     }
 
     #[test]
-    fn prefix_end_del_char() {
-        // 0x7F (DEL) is valid in a Rust &str; incrementing gives 0x80 which
-        // is not valid UTF-8, so from_utf8 fails and prefix_end returns None.
-        let s = "\x7f";
-        assert_eq!(prefix_end(s), None);
+    fn key_prefix_upper_bound_del_char() {
+        assert_eq!(key_prefix_upper_bound("\x7f"), Some("\u{80}".to_string()));
     }
 
     #[test]
-    fn prefix_end_trailing_del() {
-        // "abc" + DEL(0x7F) → increment 0x7F to 0x80 → not valid UTF-8 → None
-        // So prefix_end returns None for this input (can't produce valid UTF-8 upper bound)
-        let s = "abc\x7f";
-        assert_eq!(prefix_end(s), None);
+    fn key_prefix_upper_bound_trailing_del() {
+        assert_eq!(
+            key_prefix_upper_bound("abc\x7f"),
+            Some("abc\u{80}".to_string())
+        );
     }
 
     #[test]
-    fn prefix_end_tilde() {
-        // '~' is 0x7E, incrementing gives 0x7F which is valid UTF-8
-        assert_eq!(prefix_end("~"), Some("\x7f".to_string()));
+    fn key_prefix_upper_bound_tilde() {
+        assert_eq!(key_prefix_upper_bound("~"), Some("\x7f".to_string()));
     }
 
     // ── pg_id accessor ────────────────────────────────────────────────
@@ -6790,6 +6777,7 @@ mod tests {
                 bucket: "bucket".into(),
                 prefix: Some("photos/".into()),
                 start_after: Some("photos/a.jpg".into()),
+                start_at: None,
                 max_keys: 10,
             })
             .unwrap();
@@ -6974,6 +6962,7 @@ mod tests {
                 bucket: "b".into(),
                 prefix: None,
                 start_after: None,
+                start_at: None,
                 max_keys: 2,
             })
             .unwrap();
@@ -6988,11 +6977,55 @@ mod tests {
                 bucket: "b".into(),
                 prefix: None,
                 start_after: resp.next_start_after,
+                start_at: None,
                 max_keys: 2,
             })
             .unwrap();
         assert_eq!(resp2.objects.len(), 2);
         assert!(resp2.is_truncated);
         assert_eq!(resp2.objects[0].key(), "key-02");
+    }
+
+    #[test]
+    fn list_objects_start_at_is_inclusive() {
+        let tmp = test_util::tempdir();
+        let store = PgStore::open(tmp.path(), 0).unwrap();
+
+        for key in ["alpha", "beta", "gamma"] {
+            store
+                .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
+                    bucket: "b".into(),
+                    key: key.into(),
+                    version_id: VersionId::Null,
+                    owner: test_owner(),
+                    acl_grants: AclGrants::default(),
+                    public_read: false,
+                    generation_id: GenerationId::MIN,
+                    size: 0,
+                    etag: ObjectEtag::SinglePart([0; 8]),
+                    ec: EcShape { k: 4, m: 2 },
+                    layout: ObjectLayout::Standard,
+                    tags: None,
+                    metadata_blob: None,
+                    system_metadata_blob: None,
+                    object_lock: ObjectLockState::default(),
+                    encryption: ObjectEncryption::None,
+                }))
+                .unwrap();
+        }
+
+        let resp = store
+            .list_objects(&ListObjectsReq {
+                bucket: "b".into(),
+                prefix: None,
+                start_after: None,
+                start_at: Some("beta".into()),
+                max_keys: 10,
+            })
+            .unwrap();
+
+        assert_eq!(resp.objects.len(), 2);
+        assert_eq!(resp.objects[0].key(), "beta");
+        assert_eq!(resp.objects[1].key(), "gamma");
     }
 }

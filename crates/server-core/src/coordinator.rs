@@ -20,19 +20,20 @@ use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
 use storage::{
-    BucketEncryptionConfig, BucketFastPathInfo, BucketInfo, BucketLifecycleConfiguration,
-    BucketName, BucketObjectLockConfig, BucketState, CommitMultipartReq, CommitStreamPutReq,
-    CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, EffectiveBucketEncryptionConfig,
-    GenerationId, LifecycleDate, LifecycleExpiration, LifecycleRule, LifecycleRuleStatus,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq, LiveObjectRecord,
-    ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectLockState,
-    ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PutDeleteMarkerReq, PutLiveObjectReq,
-    PutObjectReq, ReclaimWorkItem, SerializedMetadataBlob, SerializedSystemMetadataBlob,
-    SerializedTagSet, SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    key_prefix_upper_bound, BucketEncryptionConfig, BucketFastPathInfo, BucketInfo,
+    BucketLifecycleConfiguration, BucketName, BucketObjectLockConfig, BucketState,
+    CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq, CreateStreamUploadReq,
+    EcShape, EffectiveBucketEncryptionConfig, GenerationId, LifecycleDate, LifecycleExpiration,
+    LifecycleRule, LifecycleRuleStatus, ListMultipartUploadsReq, ListObjectVersionsReq,
+    ListObjectsReq, ListPartsReq, LiveObjectRecord, ManagedEncryptionAlgorithm,
+    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
+    ObjectEncryption, ObjectKey, ObjectLayout, ObjectLockState, ObjectPartRecord,
+    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
+    OwnerIdentity, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq, ReclaimWorkItem,
+    SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey,
+    SharedStorageNode, StoredObject, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
 
 use crate::conditional::{
@@ -2961,6 +2962,7 @@ impl ReadRuntime {
                 bucket: bucket_info.name.clone(),
                 prefix: None,
                 start_after: None,
+                start_at: None,
                 max_keys: u32::MAX,
             })?;
             drop(pg);
@@ -12740,6 +12742,25 @@ impl Coordinator {
         &self,
         req: &ListObjectsV2Request,
     ) -> Result<ListObjectsResult, ServerError> {
+        #[derive(Clone)]
+        enum ListObjectsPageStart {
+            After(ObjectKey),
+            At(ObjectKey),
+        }
+
+        struct ObjectCursor {
+            pg_id: u32,
+            objects: Vec<StoredObject>,
+            next_index: usize,
+            next_page_start: Option<ListObjectsPageStart>,
+        }
+
+        impl ObjectCursor {
+            fn current(&self) -> Option<&StoredObject> {
+                self.objects.get(self.next_index)
+            }
+        }
+
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::list_objects_v2",
@@ -12751,7 +12772,7 @@ impl Coordinator {
         let prefix = req.prefix;
         let delimiter = req.delimiter;
         let continuation_token = req.continuation_token;
-        let max_keys = req.max_keys;
+        let max_keys = req.max_keys.min(S3_MAX_LIST_KEYS);
         let bucket_info = self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_list_bucket_with_bucket_policy(
@@ -12774,143 +12795,242 @@ impl Coordinator {
             });
         }
 
-        // Bound per-PG queries. Without delimiter, max_keys+1 per PG is
-        // sufficient: the global top max_keys entries can come from at most one
-        // PG each, so max_keys+1 captures them all plus detects truncation.
-        // With a delimiter, many raw keys can collapse into a single common
-        // prefix, so we cannot predict how many raw keys we need — fetch all.
-        let per_pg_limit = if delimiter.is_some() {
-            u32::MAX
-        } else {
-            max_keys.saturating_add(1)
-        };
+        let fetch_limit = max_keys.saturating_add(1);
 
-        // Fan out to all PGs and collect results, with a hard memory cap.
-        let mut all_objects: Vec<StoredObject> = Vec::new();
-        let mut hit_record_cap = false;
-        self.pg_topology.for_each_pg(|pg_id| {
-            if hit_record_cap {
-                return Ok::<(), ServerError>(());
+        if delimiter.is_none() {
+            // Without delimiter, max_keys+1 per PG is sufficient: the global
+            // top max_keys entries can come from at most one PG each, so this
+            // captures every possible page entry plus one extra for truncation.
+            let mut all_objects: Vec<StoredObject> = Vec::new();
+            let mut hit_record_cap = false;
+            self.pg_topology.for_each_pg(|pg_id| {
+                if hit_record_cap {
+                    return Ok::<(), ServerError>(());
+                }
+                let pg = self.storage_node.get_pg(pg_id)?;
+                let resp = pg.list_objects(&ListObjectsReq {
+                    bucket: BucketName::from(bucket),
+                    prefix: prefix.map(ObjectKey::from),
+                    start_after: continuation_token.map(ObjectKey::from),
+                    start_at: None,
+                    max_keys: fetch_limit,
+                })?;
+                all_objects.extend(resp.objects);
+                if all_objects.len() >= MAX_LIST_RECORDS {
+                    all_objects.truncate(MAX_LIST_RECORDS);
+                    hit_record_cap = true;
+                }
+                Ok::<(), ServerError>(())
+            })?;
+
+            all_objects.sort_by(|a, b| a.key().cmp(b.key()));
+            all_objects.dedup_by(|a, b| a.key() == b.key());
+
+            let max = max_keys as usize;
+            let mut objects: Vec<ListEntry> = Vec::new();
+            let mut last_entry: Option<String> = None;
+            for obj in &all_objects {
+                if objects.len() >= max {
+                    break;
+                }
+                let obj_key = obj.key();
+                let record = obj
+                    .as_live()
+                    .expect("list_objects returns only live objects");
+                let system_metadata = self.deserialize_visible_system_metadata(
+                    record.system_metadata_blob.as_ref(),
+                    &record.encryption,
+                    None,
+                )?;
+                objects.push(ListEntry {
+                    key: obj_key.to_string(),
+                    size: record.size,
+                    etag: record.etag.format(),
+                    last_modified: record.last_modified,
+                    checksum_algorithm: system_metadata.checksum_algorithm(),
+                    checksum_type: system_metadata.checksum_type(),
+                });
+                last_entry = Some(obj_key.to_string());
             }
-            let pg = self.storage_node.get_pg(pg_id)?;
+
+            let is_truncated = hit_record_cap || all_objects.len() > max;
+            let next_token = if is_truncated { last_entry } else { None };
+
+            return Ok(ListObjectsResult {
+                objects,
+                common_prefixes: Vec::new(),
+                is_truncated,
+                next_continuation_token: next_token,
+                owner_principal: bucket_info.owner_principal,
+                owner_canonical_id: bucket_info.owner_canonical_id,
+            });
+        }
+
+        let prefix_str = prefix.unwrap_or("");
+        let delimiter = delimiter.expect("checked above");
+        let initial_start = continuation_token.map(|token| {
+            if let Some(after_prefix) = token.strip_prefix(prefix_str) {
+                if after_prefix.ends_with(delimiter) {
+                    if let Some(upper_bound) = key_prefix_upper_bound(token) {
+                        return ListObjectsPageStart::At(ObjectKey::from(upper_bound));
+                    }
+                }
+            }
+            ListObjectsPageStart::After(ObjectKey::from(token))
+        });
+
+        let fetch_objects_page = |cursor: &mut ObjectCursor,
+                                  start: Option<ListObjectsPageStart>|
+         -> Result<(), ServerError> {
+            let (start_after, start_at) = match start {
+                Some(ListObjectsPageStart::After(key)) => (Some(key), None),
+                Some(ListObjectsPageStart::At(key)) => (None, Some(key)),
+                None => (None, None),
+            };
+            let pg = self.storage_node.get_pg(cursor.pg_id)?;
             let resp = pg.list_objects(&ListObjectsReq {
                 bucket: BucketName::from(bucket),
                 prefix: prefix.map(ObjectKey::from),
-                start_after: continuation_token.map(ObjectKey::from),
-                max_keys: per_pg_limit,
+                start_after,
+                start_at,
+                max_keys: fetch_limit,
             })?;
-            all_objects.extend(resp.objects);
-            if all_objects.len() >= MAX_LIST_RECORDS {
-                all_objects.truncate(MAX_LIST_RECORDS);
-                hit_record_cap = true;
+            cursor.objects = resp.objects;
+            cursor.next_index = 0;
+            cursor.next_page_start = resp.next_start_after.map(ListObjectsPageStart::After);
+            Ok(())
+        };
+
+        let refill_cursor = |cursor: &mut ObjectCursor| -> Result<(), ServerError> {
+            while cursor.current().is_none() {
+                let Some(next_start) = cursor.next_page_start.clone() else {
+                    break;
+                };
+                fetch_objects_page(cursor, Some(next_start))?;
             }
+            Ok(())
+        };
+
+        let jump_cursor_to =
+            |cursor: &mut ObjectCursor, start: ListObjectsPageStart| -> Result<(), ServerError> {
+                cursor.objects.clear();
+                cursor.next_index = 0;
+                cursor.next_page_start = Some(start);
+                refill_cursor(cursor)
+            };
+
+        let skip_cursor_prefix =
+            |cursor: &mut ObjectCursor, common_prefix: &str| -> Result<(), ServerError> {
+                while cursor
+                    .current()
+                    .is_some_and(|obj| obj.key().as_str().starts_with(common_prefix))
+                {
+                    cursor.next_index += 1;
+                    refill_cursor(cursor)?;
+                }
+                Ok(())
+            };
+
+        let mut cursors = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let mut cursor = ObjectCursor {
+                pg_id,
+                objects: Vec::new(),
+                next_index: 0,
+                next_page_start: None,
+            };
+            fetch_objects_page(&mut cursor, initial_start.clone())?;
+            cursors.push(cursor);
             Ok::<(), ServerError>(())
         })?;
 
-        // Sort by key
-        all_objects.sort_by(|a, b| a.key().cmp(b.key()));
-
-        // Dedup by key (same key from different PGs shouldn't happen with
-        // correct PG derivation, but be safe)
-        all_objects.dedup_by(|a, b| a.key() == b.key());
-
-        // Apply delimiter logic and build result entries, stopping at max_keys
         let max = max_keys as usize;
         let mut objects: Vec<ListEntry> = Vec::new();
         let mut common_prefixes: Vec<String> = Vec::new();
-        let mut entry_count = 0usize;
         let mut last_entry: Option<String> = None;
         let mut is_truncated = false;
-        let token = continuation_token;
+        let mut active_common_prefix: Option<(String, Option<ObjectKey>)> = None;
 
-        if let Some(delim) = delimiter {
-            let prefix_str = prefix.unwrap_or("");
-            let mut seen_prefixes = std::collections::HashSet::new();
+        loop {
+            let Some((cursor_index, current_key)) = cursors
+                .iter()
+                .enumerate()
+                .filter_map(|(cursor_index, cursor)| {
+                    cursor
+                        .current()
+                        .map(|object| (cursor_index, object.key().to_string()))
+                })
+                .min_by(|(left_index, left_key), (right_index, right_key)| {
+                    left_key
+                        .cmp(right_key)
+                        .then_with(|| left_index.cmp(right_index))
+                })
+            else {
+                break;
+            };
 
-            let mut i = 0;
-            while i < all_objects.len() {
-                if entry_count >= max {
-                    is_truncated = true;
-                    break;
-                }
-                let obj = &all_objects[i];
-                let obj_key = obj.key();
-                let after_prefix = &obj_key[prefix_str.len()..];
-                if let Some(pos) = after_prefix.find(delim) {
-                    let cp = format!("{}{}", prefix_str, &after_prefix[..pos + delim.len()]);
-                    // Skip all remaining keys under this common prefix so the
-                    // continuation token advances past the entire group.
-                    let is_new = seen_prefixes.insert(cp.clone());
-                    while i < all_objects.len() && all_objects[i].key().starts_with(&cp) {
-                        i += 1;
-                    }
-                    if is_new && token.is_none_or(|t| cp.as_str() > t) {
-                        common_prefixes.push(cp.clone());
-                        entry_count += 1;
-                        last_entry = Some(cp);
-                    }
-                } else {
-                    if token.is_none_or(|t| obj_key.as_str() > t) {
-                        let record = obj
-                            .as_live()
-                            .expect("list_objects returns only live objects");
-                        let system_metadata = self.deserialize_visible_system_metadata(
-                            record.system_metadata_blob.as_ref(),
-                            &record.encryption,
-                            None,
+            if let Some((ref common_prefix, ref upper_bound)) = active_common_prefix {
+                if current_key.starts_with(common_prefix) {
+                    if let Some(upper_bound) = upper_bound.clone() {
+                        jump_cursor_to(
+                            &mut cursors[cursor_index],
+                            ListObjectsPageStart::At(upper_bound),
                         )?;
-                        objects.push(ListEntry {
-                            key: obj_key.to_string(),
-                            size: record.size,
-                            etag: record.etag.format(),
-                            last_modified: record.last_modified,
-                            checksum_algorithm: system_metadata.checksum_algorithm(),
-                            checksum_type: system_metadata.checksum_type(),
-                        });
-                        entry_count += 1;
-                        last_entry = Some(obj_key.to_string());
+                    } else {
+                        skip_cursor_prefix(&mut cursors[cursor_index], common_prefix)?;
                     }
-                    i += 1;
+                    continue;
                 }
+                active_common_prefix = None;
             }
-        } else {
-            for obj in &all_objects {
-                if entry_count >= max {
+
+            let current = cursors[cursor_index]
+                .current()
+                .expect("selected cursor should have a current object")
+                .clone();
+            let obj_key = current.key().to_string();
+            let after_prefix = obj_key
+                .strip_prefix(prefix_str)
+                .expect("list_objects query must respect the requested prefix");
+
+            if let Some(pos) = after_prefix.find(delimiter) {
+                let common_prefix =
+                    format!("{}{}", prefix_str, &after_prefix[..pos + delimiter.len()]);
+                let upper_bound = key_prefix_upper_bound(&common_prefix).map(ObjectKey::from);
+                active_common_prefix = Some((common_prefix.clone(), upper_bound));
+                if objects.len() + common_prefixes.len() >= max {
                     is_truncated = true;
                     break;
                 }
-                let obj_key = obj.key();
-                if token.is_none_or(|t| obj_key.as_str() > t) {
-                    let record = obj
-                        .as_live()
-                        .expect("list_objects returns only live objects");
-                    let system_metadata = self.deserialize_visible_system_metadata(
-                        record.system_metadata_blob.as_ref(),
-                        &record.encryption,
-                        None,
-                    )?;
-                    objects.push(ListEntry {
-                        key: obj_key.to_string(),
-                        size: record.size,
-                        etag: record.etag.format(),
-                        last_modified: record.last_modified,
-                        checksum_algorithm: system_metadata.checksum_algorithm(),
-                        checksum_type: system_metadata.checksum_type(),
-                    });
-                    entry_count += 1;
-                    last_entry = Some(obj_key.to_string());
-                }
+                common_prefixes.push(common_prefix.clone());
+                last_entry = Some(common_prefix);
+                continue;
             }
 
-            // Check if there were more objects than max_keys (only if no token).
-            if token.is_none() && all_objects.len() > max {
+            if objects.len() + common_prefixes.len() >= max {
                 is_truncated = true;
+                break;
             }
-        }
 
-        // If we hit the record cap, there may be more results we didn't fetch.
-        if hit_record_cap {
-            is_truncated = true;
+            let record = current
+                .as_live()
+                .expect("list_objects returns only live objects");
+            let system_metadata = self.deserialize_visible_system_metadata(
+                record.system_metadata_blob.as_ref(),
+                &record.encryption,
+                None,
+            )?;
+            objects.push(ListEntry {
+                key: obj_key.clone(),
+                size: record.size,
+                etag: record.etag.format(),
+                last_modified: record.last_modified,
+                checksum_algorithm: system_metadata.checksum_algorithm(),
+                checksum_type: system_metadata.checksum_type(),
+            });
+            last_entry = Some(obj_key);
+            cursors[cursor_index].next_index += 1;
+            refill_cursor(&mut cursors[cursor_index])?;
         }
 
         let next_token = if is_truncated { last_entry } else { None };
@@ -21789,6 +21909,180 @@ mod tests {
             !result2.objects.is_empty() || !result2.common_prefixes.is_empty(),
             "continuation page should have entries"
         );
+    }
+
+    #[test]
+    fn list_objects_delimiter_continuation_skips_large_common_prefix() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        for i in 0..1500 {
+            let key = format!("dir/file-{i:04}.txt");
+            test_helpers::put_object(
+                &coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: object_request_with_expected_owner(
+                        "bucket",
+                        &key,
+                        test_requester(),
+                        None,
+                    ),
+                    data: b"data",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+
+                    acl: NO_PUT_OBJECT_ACL.into(),
+                },
+            )
+            .unwrap();
+        }
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "z.txt",
+                    test_requester(),
+                    None,
+                ),
+                data: b"z",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let page1 = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                delimiter: Some("/"),
+                continuation_token: None,
+                max_keys: 1,
+            })
+            .unwrap();
+        assert!(page1.objects.is_empty());
+        assert_eq!(page1.common_prefixes, vec!["dir/".to_string()]);
+        assert!(page1.is_truncated);
+
+        let token = page1
+            .next_continuation_token
+            .as_deref()
+            .expect("first page should return a continuation token")
+            .to_string();
+        let page2 = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                delimiter: Some("/"),
+                continuation_token: Some(&token),
+                max_keys: 1,
+            })
+            .unwrap();
+        assert_eq!(page2.common_prefixes, Vec::<String>::new());
+        assert_eq!(page2.objects.len(), 1);
+        assert_eq!(page2.objects[0].key, "z.txt");
+        assert!(!page2.is_truncated);
+    }
+
+    #[test]
+    fn list_objects_delimiter_with_no_upper_bound_common_prefix_is_final_page() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let delimiter = "\u{10ffff}";
+
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "a", test_requester(), None),
+                data: b"a",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    &format!("{delimiter}child"),
+                    test_requester(),
+                    None,
+                ),
+                data: b"b",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let page1 = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                delimiter: Some(delimiter),
+                continuation_token: None,
+                max_keys: 1,
+            })
+            .unwrap();
+        assert_eq!(page1.objects.len(), 1);
+        assert_eq!(page1.objects[0].key, "a");
+        assert!(page1.common_prefixes.is_empty());
+        assert!(page1.is_truncated);
+
+        let token = page1
+            .next_continuation_token
+            .as_deref()
+            .expect("first page should return a continuation token")
+            .to_string();
+        let page2 = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                delimiter: Some(delimiter),
+                continuation_token: Some(&token),
+                max_keys: 1,
+            })
+            .unwrap();
+        assert!(page2.objects.is_empty());
+        assert_eq!(page2.common_prefixes, vec![delimiter.to_string()]);
+        assert!(!page2.is_truncated);
+        assert!(page2.next_continuation_token.is_none());
     }
 
     #[test]
