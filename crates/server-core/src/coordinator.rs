@@ -10159,7 +10159,7 @@ impl Coordinator {
         };
 
         // Atomic commit: upsert part, insert segments, delete staging.
-        meta_guard
+        let displaced_segments = meta_guard
             .commit_stream_part(session_id, &part_record, &committed_segments)
             .map_err(ServerError::Metadata)?;
 
@@ -10187,19 +10187,8 @@ impl Coordinator {
                 }
             }
             // Clean old streamed-part segments (if prior generation was streamed).
-            // `commit_stream_part` already handles deleting prior
-            // `multipart_part_segments` rows in its transaction, but the shard
-            // data on disk still needs cleanup.
-            if let Ok(pg) = self.storage_node.get_pg(meta_pg_id) {
-                if let Ok(old_segments) = pg.get_multipart_part_segments(
-                    bucket,
-                    key,
-                    VersionId::from_u64(old_vid.get()),
-                    part_number,
-                ) {
-                    drop(pg);
-                    let _ = self.delete_segment_shards_generic(&old_segments);
-                }
+            if !displaced_segments.is_empty() {
+                let _ = self.delete_segment_shards_generic(&displaced_segments);
             }
         }
 
@@ -40262,6 +40251,137 @@ mod tests {
             })
             .unwrap();
         assert_eq!(object.body.read_all().unwrap(), data_a);
+    }
+
+    #[test]
+    fn streamed_upload_part_reupload_deletes_prior_segment_shards() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let mpu = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let session_a = begin_stream_part_test(&coord, "bucket", "key", &mpu.upload_id, 1)
+            .unwrap()
+            .session_id;
+        let data_a = b"streamed-reupload-a";
+        coord
+            .append_plaintext_stream_segment_for_test("bucket", "key", &session_a, 0, data_a)
+            .unwrap();
+        let result_a = coord
+            .finalize_stream_part(FinalizeStreamPartRequest {
+                upload: multipart_object_request("bucket", "key", &mpu.upload_id, test_requester()),
+                session_id: &session_a,
+                part_number: 1,
+                crc64: checksum::crc64::checksum(data_a),
+                total_size: data_a.len() as u64,
+                claimed_checksum: None,
+                computed_checksum: None,
+            })
+            .unwrap();
+
+        let meta_pg_id = coord.object_pg_id("bucket", "key");
+        let segments_before = {
+            let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            let segments = meta_pg
+                .get_all_multipart_part_segments_for_upload(&mpu.upload_id)
+                .unwrap();
+            assert_eq!(
+                segments.len(),
+                1,
+                "expected exactly one stored segment before reupload"
+            );
+            segments
+        };
+        for segment in &segments_before {
+            let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
+            let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
+            for i in 0..total_shards {
+                let shard_key =
+                    ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
+                assert!(
+                    shard_pg.read_shard(&shard_key).is_ok(),
+                    "old shard {i} should exist before reupload"
+                );
+            }
+        }
+
+        let session_b = begin_stream_part_test(&coord, "bucket", "key", &mpu.upload_id, 1)
+            .unwrap()
+            .session_id;
+        let data_b = b"streamed-reupload-b";
+        coord
+            .append_plaintext_stream_segment_for_test("bucket", "key", &session_b, 0, data_b)
+            .unwrap();
+        let result_b = coord
+            .finalize_stream_part(FinalizeStreamPartRequest {
+                upload: multipart_object_request("bucket", "key", &mpu.upload_id, test_requester()),
+                session_id: &session_b,
+                part_number: 1,
+                crc64: checksum::crc64::checksum(data_b),
+                total_size: data_b.len() as u64,
+                claimed_checksum: None,
+                computed_checksum: None,
+            })
+            .unwrap();
+        assert_ne!(result_a.etag, result_b.etag);
+
+        let segments_after = {
+            let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
+            let segments = meta_pg
+                .get_all_multipart_part_segments_for_upload(&mpu.upload_id)
+                .unwrap();
+            assert_eq!(
+                segments.len(),
+                1,
+                "reupload should leave exactly one current segment"
+            );
+            segments
+        };
+        assert_ne!(
+            segments_before[0].segment_okh,
+            segments_after[0].segment_okh
+        );
+
+        for segment in &segments_before {
+            let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
+            let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
+            for i in 0..total_shards {
+                let shard_key =
+                    ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
+                assert!(
+                    shard_pg.read_shard(&shard_key).is_err(),
+                    "old shard {i} should be deleted after reupload"
+                );
+            }
+        }
+        for segment in &segments_after {
+            let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
+            let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
+            for i in 0..total_shards {
+                let shard_key =
+                    ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
+                assert!(
+                    shard_pg.read_shard(&shard_key).is_ok(),
+                    "new shard {i} should remain after reupload"
+                );
+            }
+        }
     }
 
     #[test]

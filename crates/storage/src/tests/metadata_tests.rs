@@ -5034,9 +5034,13 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         })
         .collect();
 
-    store
+    let displaced_segments = store
         .commit_stream_part("sp-1", &make_part(3000), &segments_v1)
         .unwrap();
+    assert!(
+        displaced_segments.is_empty(),
+        "first upload should not return displaced segments"
+    );
 
     let segments = store
         .get_multipart_part_segments("b", "k", VersionId::from_u64(u64::MAX), 1)
@@ -5073,9 +5077,17 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         ec_m: 2,
     }];
 
-    store
+    let displaced_segments = store
         .commit_stream_part("sp-2", &make_part(5000), &segments_v2)
         .unwrap();
+    assert_eq!(displaced_segments.len(), 3);
+    assert!(displaced_segments
+        .iter()
+        .all(|segment| segment.segment_okh == [0x11; 16]));
+    assert!(displaced_segments
+        .iter()
+        .map(|segment| segment.segment_index)
+        .eq(0..3));
 
     // Verify: only 1 segment (stale rows deleted)
     let segments = store

@@ -618,7 +618,7 @@ fn streaming_upload_part_lifecycle() {
         ec_m: 2,
     }];
 
-    store
+    let displaced_segments = store
         .commit_stream_part(
             "ss-part",
             &MultipartPartRecord {
@@ -638,6 +638,10 @@ fn streaming_upload_part_lifecycle() {
             &part_segments,
         )
         .unwrap();
+    assert!(
+        displaced_segments.is_empty(),
+        "first stream-part commit should not displace any prior segments"
+    );
 
     // Session gone.
     let err = store.get_stream_upload("ss-part").unwrap_err();

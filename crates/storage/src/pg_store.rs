@@ -6237,7 +6237,7 @@ impl PgMetadataStore for PgStore {
         session_id: &str,
         part: &MultipartPartRecord,
         segments: &[MultipartPartSegmentRecord],
-    ) -> Result<(), MetadataError> {
+    ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE")
             .map_err(|e| MetadataError::Db {
@@ -6245,7 +6245,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
 
-        let result: Result<(), MetadataError> = (|| {
+        let result: Result<Vec<MultipartPartSegmentRecord>, MetadataError> = (|| {
             // 1. Verify session exists, is InProgress, is UploadPart kind, and matches
             //    the target bucket/key/upload_id/part_number. Then transition to Completing.
             let sess_row =
@@ -6363,7 +6363,65 @@ impl PgMetadataStore for PgStore {
                     source: e,
                 })?;
 
-            // 3. Delete prior part segments for this upload+part (re-upload support).
+            // 3. Capture prior part segments for this upload+part before deleting
+            //    their metadata rows so the caller can reclaim their shards.
+            let displaced_segments = {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT bucket, key, upload_id, version_id, part_number, segment_index, size, segment_crc64, segment_okh, \
+                         segment_vid, shard_pg_id, ec_k, ec_m FROM multipart_part_segments \
+                         WHERE bucket = ?1 AND key = ?2 AND upload_id = ?3 AND part_number = ?4 \
+                         ORDER BY segment_index ASC",
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "commit stream part (prepare displaced segments)",
+                        source: e,
+                    })?;
+
+                let rows = stmt
+                    .query_map(
+                        params![sess_bucket, sess_key, part.upload_id, part.part_number],
+                        |row| {
+                            let okh_blob: Vec<u8> = row.get(8)?;
+                            let okh = PgStore::parse_okh_blob(&okh_blob, 8)?;
+                            Ok(MultipartPartSegmentRecord {
+                                bucket: row.get(0)?,
+                                key: row.get(1)?,
+                                upload_id: row.get(2)?,
+                                version_id: row.get::<_, i64>(3)? as u64,
+                                part_number: row.get(4)?,
+                                segment_index: row.get(5)?,
+                                size: row.get::<_, i64>(6)? as u64,
+                                segment_crc64: row.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+                                segment_okh: okh,
+                                segment_vid: Self::parse_generation_id(
+                                    row.get::<_, i64>(9)?,
+                                    9,
+                                    "segment_vid",
+                                )?,
+                                shard_pg_id: row.get(10)?,
+                                ec_k: row.get(11)?,
+                                ec_m: row.get(12)?,
+                            })
+                        },
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "commit stream part (query displaced segments)",
+                        source: e,
+                    })?;
+
+                let mut displaced = Vec::new();
+                for row in rows {
+                    displaced.push(row.map_err(|e| MetadataError::Db {
+                        context: "commit stream part (read displaced segment row)",
+                        source: e,
+                    })?);
+                }
+                displaced
+            };
+
+            // 4. Delete prior part segments for this upload+part (re-upload support).
             //    Scoped by upload_id to avoid clobbering concurrent uploads for the same key.
             self.conn
                 .execute(
@@ -6377,7 +6435,7 @@ impl PgMetadataStore for PgStore {
                     source: e,
                 })?;
 
-            // 4. Insert committed multipart part segment rows.
+            // 5. Insert committed multipart part segment rows.
             {
                 let mut stmt = self
                     .conn
@@ -6435,11 +6493,11 @@ impl PgMetadataStore for PgStore {
                     source: e,
                 })?;
 
-            Ok(())
+            Ok(displaced_segments)
         })();
 
         match result {
-            Ok(()) => {
+            Ok(displaced_segments) => {
                 if let Err(e) = self.conn.execute_batch("COMMIT") {
                     let _ = self.conn.execute_batch("ROLLBACK");
                     return Err(MetadataError::Db {
@@ -6447,7 +6505,7 @@ impl PgMetadataStore for PgStore {
                         source: e,
                     });
                 }
-                Ok(())
+                Ok(displaced_segments)
             }
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK");

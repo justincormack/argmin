@@ -556,14 +556,16 @@ pub trait PgMetadataStore {
     /// In a single transaction:
     /// 1. Transition session to Completing
     /// 2. Upsert multipart part metadata
-    /// 3. Insert committed multipart part segment rows
-    /// 4. Delete the stream_uploads + stream_upload_segments staging rows
+    /// 3. Return any prior committed multipart part segment rows displaced by
+    ///    this re-upload so callers can clean up their shard data
+    /// 4. Insert committed multipart part segment rows
+    /// 5. Delete the stream_uploads + stream_upload_segments staging rows
     fn commit_stream_part(
         &self,
         session_id: &str,
         part: &MultipartPartRecord,
         segments: &[MultipartPartSegmentRecord],
-    ) -> Result<(), MetadataError>;
+    ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError>;
 
     /// Read committed segments for a StandardInternal object.
     fn get_object_segments(
