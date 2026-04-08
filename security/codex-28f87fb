@@ -1,7 +1,7 @@
 Control characters now allowed in keys enable log injection
 Link: https://chatgpt.com/codex/security/findings/7befaa9607ec819195495c6b6fc64edf?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
 Criticality: low
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin
@@ -59,3 +59,28 @@ pub(crate) fn validate_object_key(key: &str) -> Result<(), ServerError> {
             ctx.key,
             streaming_put_session_label(session_id.as_deref()),
 ```
+
+# Resolution
+Fixed by the observability-formatting hardening work shipped in:
+
+- `7085c81` `Harden trace formatting for request metadata`
+- `8d37645` `Harden observability debug formatting`
+- `aeb1180` `Complete observability formatting hardening`
+
+The resolution keeps AWS-compatible key semantics unchanged and instead makes
+observability output safe.
+
+Implemented changes:
+
+- `crates/observability/src/lib.rs` now provides shared escaped and redacted
+  formatting helpers for tracing and debug output
+- attacker-controlled identifier types in `crates/storage/src/types.rs`,
+  including `ObjectKey`, now implement observability-safe `Debug`
+- high-risk trace sites in `crates/server-core/src/coordinator.rs`,
+  `crates/server-http/src/http/mod.rs`, `crates/server-http/src/http/serve.rs`,
+  `crates/storage/src/node.rs`, and `crates/storage/src/pg_store.rs` now use
+  escaped `{:?}` formatting or explicit observability helpers instead of raw
+  `{}` formatting
+- remaining high-risk HTTP traces also avoid raw path and `Range` formatting
+
+Ongoing guidance for future code lives in `guides/observability-formatting.md`.

@@ -1,7 +1,7 @@
 Tracing logs presigned URL queries and credentials
 Link: https://chatgpt.com/codex/security/findings/f1f14bcef8bc8191baadb0b09b414ed8?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
 Criticality: low (attack path: low)
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin
@@ -308,3 +308,30 @@ ARGMIN_TRACE enables request tracing that prints request method/path/query and S
 ## Blindspots
 - No deployment manifests or logging pipeline configuration available to assess who can access stderr/log aggregation.
 - Static-only analysis; unable to run PoC due to build dependency (libisal) missing.
+
+# Resolution
+Fixed by the observability-formatting hardening work shipped in:
+
+- `7085c81` `Harden trace formatting for request metadata`
+- `8d37645` `Harden observability debug formatting`
+- `aeb1180` `Complete observability formatting hardening`
+
+Implemented changes:
+
+- request-start tracing in `crates/server-http/src/http/serve.rs` no longer
+  logs raw query strings; it now logs safe summaries such as `has_query`,
+  parameter count, and escaped `Range` metadata
+- authentication tracing in `crates/auth/src/request.rs` no longer emits raw
+  query text and instead uses summarized query information
+- POST SigV4 tracing in `crates/auth/src/post.rs` no longer logs the raw
+  credential value and instead emits a redacted or summarized field
+- `crates/server-http/src/http/mod.rs` now logs stable S3 error codes for
+  response-body errors rather than formatting the full error text
+- secret-bearing `Debug` surfaces in `crates/auth/src/credential.rs`,
+  `crates/auth/src/error.rs`, `crates/auth/src/request.rs`,
+  `crates/auth/src/sigv4.rs`, `crates/server-core/src/sse.rs`, and
+  `crates/storage/src/types.rs` now redact tokens, signatures, keys, and other
+  persisted encryption material instead of exposing raw values
+
+The reusable policy for future observability code now lives in
+`guides/observability-formatting.md`.

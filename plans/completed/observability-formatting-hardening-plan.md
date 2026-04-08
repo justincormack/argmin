@@ -16,6 +16,19 @@ framework that writes formatted fields verbatim to sinks. This is the right time
 to establish formatting and redaction rules before more logging surfaces are
 added.
 
+## Outcome
+
+This plan is complete.
+
+The implemented work shipped across:
+
+- `7085c81` `Harden trace formatting for request metadata`
+- `8d37645` `Harden observability debug formatting`
+- `aeb1180` `Complete observability formatting hardening`
+
+Ongoing expectations for new code and future audits are captured in
+`guides/observability-formatting.md`.
+
 ## Problem
 
 There are two distinct risks:
@@ -145,11 +158,8 @@ surfaces soon.
 
 ### Remaining
 
-- update
-  `security/codex-28f87fb` and `security/codex-90f9972` with the shipped fix
-  details and residual scope
-- optionally do a later broad audit of less common diagnostic surfaces outside
-  the current high-risk observability scope if logging expands materially
+- later broad audits may still be useful if observability surface area expands,
+  but the scoped work from this plan is complete
 
 ### Phase 1: Shared observability-safe formatting primitives
 
