@@ -34,6 +34,8 @@ Implemented changes:
 - multi-phase `PutObject` now carries an explicit authorized token so later
   phases consume bound auth-sensitive request state rather than accepting a
   second caller-controlled copy
+- `CopyObject` destination writes now finalize from the authorized write token
+  instead of rebuilding auth-sensitive state at commit time
 - regressions cover early denial and token-bound direct/streamed commit state
 
 The plan remains open because adjacent write paths should still be reviewed
@@ -108,10 +110,22 @@ Follow-up checks:
 ### 2. Audit adjacent single-request write paths
 
 Audit these paths against the same guide and convert them to the same pattern
-where appropriate:
+where appropriate.
+
+Completed:
 
 - copy destination writes
-- any other future multi-phase single-request write path
+
+Reviewed and left as-is:
+
+- `UploadPartCopy`
+
+Future multi-phase single-request write paths should adopt the same token
+pattern when they are introduced.
+
+`UploadPartCopy` was reviewed as part of this audit and remains consistent with
+the multipart model: it authorizes once per external request and does not need
+the single-request authorized-write token used by `PutObject` and `CopyObject`.
 
 `PostObject` now follows the safe streamed finalize helper and should stay
 aligned with `PutObject`.

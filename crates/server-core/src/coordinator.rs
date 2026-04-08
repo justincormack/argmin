@@ -1708,6 +1708,11 @@ pub struct AuthorizedFinalizeStreamPutRequest<'a> {
     pub cond: &'a WriteCondition,
 }
 
+enum AuthorizedWriteTags<'a> {
+    Bound,
+    TrustedDerived(Option<&'a str>),
+}
+
 /// Authenticated requester context needed by core-side authorization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requester {
@@ -9946,6 +9951,23 @@ impl Coordinator {
         req: &AuthorizedFinalizeStreamPutRequest<'_>,
         authorized: &AuthorizedPutObjectWrite,
     ) -> Result<PutObjectResult, ServerError> {
+        self.finalize_stream_put_with_authorized_write_tags(
+            req,
+            authorized,
+            AuthorizedWriteTags::Bound,
+        )
+    }
+
+    fn finalize_stream_put_with_authorized_write_tags(
+        &self,
+        req: &AuthorizedFinalizeStreamPutRequest<'_>,
+        authorized: &AuthorizedPutObjectWrite,
+        tags: AuthorizedWriteTags<'_>,
+    ) -> Result<PutObjectResult, ServerError> {
+        let tags = match tags {
+            AuthorizedWriteTags::Bound => authorized.tags(),
+            AuthorizedWriteTags::TrustedDerived(tags) => tags,
+        };
         self.finalize_stream_put(&FinalizeStreamPutRequest {
             object: ObjectRequest::new(
                 authorized.bucket(),
@@ -9959,7 +9981,7 @@ impl Coordinator {
             metadata_blob: req.metadata_blob,
             system_metadata: req.system_metadata,
             write_encryption: req.write_encryption,
-            tags: authorized.tags(),
+            tags,
             cond: req.cond,
             acl: authorized.acl(),
             policy_context: PutObjectPolicyContext::default(),
@@ -10721,7 +10743,7 @@ impl Coordinator {
                 ..
             } => (*new_system_metadata).clone(),
         };
-        let tags = match &req.tagging {
+        let committed_tags = match &req.tagging {
             TaggingDirective::Copy => src_tags,
             TaggingDirective::Replace(tags) => tags.map(SerializedTagSet::from),
         };
@@ -10784,27 +10806,19 @@ impl Coordinator {
                 system_metadata.set_checksum(algo, None, b64);
             }
 
-            let put_result = self.finalize_stream_put(&FinalizeStreamPutRequest {
-                object: ObjectRequest::new(
-                    dst_bucket,
-                    dst_key,
-                    requester.clone(),
-                    req.expected_bucket_owner(),
-                ),
-                session_id: &session_id,
-                crc64: crc64.finalize(),
-                total_size,
-                metadata_blob: &metadata_blob,
-                system_metadata: &system_metadata,
-                write_encryption: dst_write_encryption.as_ref(),
-                tags: tags.as_deref(),
-                cond: dst_cond,
-                acl: acl.clone(),
-                policy_context: req
-                    .destination_encryption
-                    .with_policy_context(copy_policy_context),
-                requested_object_lock: req.object_lock,
-            })?;
+            let put_result = self.finalize_stream_put_with_authorized_write_tags(
+                &AuthorizedFinalizeStreamPutRequest {
+                    session_id: &session_id,
+                    crc64: crc64.finalize(),
+                    total_size,
+                    metadata_blob: &metadata_blob,
+                    system_metadata: &system_metadata,
+                    write_encryption: dst_write_encryption.as_ref(),
+                    cond: dst_cond,
+                },
+                &dst_authorized,
+                AuthorizedWriteTags::TrustedDerived(committed_tags.as_deref()),
+            )?;
 
             let dst_meta_pg = self
                 .storage_node
@@ -28681,6 +28695,76 @@ mod tests {
             })
             .unwrap();
         assert_eq!(obj.tags.as_deref(), Some(tags_xml));
+    }
+
+    #[test]
+    fn copy_object_commits_authorized_acl_and_trusted_copied_tags() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        let tags =
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(tags),
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        coord
+            .copy_object(&CopyObjectRequest {
+                source: CopySource {
+                    bucket: "bucket",
+                    key: "src",
+                    version_id: None,
+                    condition: NO_READ,
+                    expected_bucket_owner: None,
+                },
+                destination: object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    test_requester(),
+                    None,
+                ),
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
+                acl: PutObjectAcl::PublicRead.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                source_sse_customer: None,
+                destination_encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+            })
+            .unwrap();
+
+        let object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    None,
+                    Requester::anonymous(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(read_all_body(object.body).unwrap(), b"data");
+        assert_eq!(object.tags.as_deref(), Some(tags));
     }
 
     #[test]
