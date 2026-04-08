@@ -1,0 +1,125 @@
+Delayed PutObject authorization enables extra body read
+Link: https://chatgpt.com/codex/cloud/security/findings/b95b2e22b80c819181ce244149e079ba?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: low (attack path: low)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 7ceb1e1
+Author: justin@specialbusservice.com
+Created: 22/03/2026, 20:39:28
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced a delayed authorization check for streaming PutObject, allowing extra body ingestion before access denial.
+The new fast path removes the early begin_stream_put call from prepare_streaming_put and stores only the principal/ACL headers. Authorization and bucket write reservation now happen later in start_streaming_put_session, which is invoked only after the request body fills the internal segment buffer. As a result, a client with valid credentials but without write permission can cause the server to read and buffer up to INTERNAL_SEGMENT_SIZE (8 MiB) of data before the access check fails, increasing bandwidth/CPU usage and enabling low-effort availability degradation.
+
+# Validation
+## Rubric
+- [x] Identify where streaming PutObject authorization is enforced (begin_stream_put) and confirm it checks write permission.
+- [x] Confirm prepare_streaming_put no longer calls begin_stream_put and only stores principal/ACL.
+- [x] Trace streaming ingest to show buffering up to INTERNAL_SEGMENT_SIZE before session creation.
+- [x] Verify INTERNAL_SEGMENT_SIZE value (8 MiB) to quantify pre-auth ingestion.
+- [ ] Reproduce dynamically with debug build/PoC (blocked by missing libisal and unavailable valgrind/gdb).
+## Report
+Crash attempt: `cargo build -p argmin-s3` failed because `ec-sys` requires the system `libisal` (missing `libisal.pc`), so no binary was produced for a crash PoC. `valgrind` and `gdb` are not installed in the container, blocking those methods. Code validation: `prepare_streaming_put` constructs `StreamingPutContext` without calling `begin_stream_put`, while `start_streaming_put_session` later invokes `coordinator.begin_stream_put` with requester/ACL info (crates/server-http/src/http/mod.rs:2375-2412). The streaming handler reads body frames and calls `ingest_streaming_put_payload` after `prepare_streaming_put` returns (crates/server-http/src/http/serve.rs:1136-1223). Inside `ingest_streaming_put_payload`, the buffer is filled until it reaches `INTERNAL_SEGMENT_SIZE`; only then does it call `append_streaming_put_buffer`, which calls `ensure_streaming_put_session` and thus `start_streaming_put_session` (crates/server-http/src/http/serve.rs:1520-1709). `begin_stream_put` is where write authorization is enforced, returning `AccessDenied` if the requester lacks write permission (crates/server-core/src/coordinator.rs:3682-3689). `INTERNAL_SEGMENT_SIZE` is 8 MiB (crates/server-core/src/coordinator.rs:45). Therefore an authenticated but unauthorized client can force the server to read/buffer up to 8 MiB before the access check fails, matching the suspected availability impact.
+
+# Evidence
+/workspace/argmin/crates/server-http/src/http/mod.rs (L2375 to 2412)
+  Note: prepare_streaming_put now only records principal/ACL headers and defers begin_stream_put (authorization) to start_streaming_put_session.
+```
+        Ok(StreamingPutContext {
+            trace: current_trace_context(),
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            requester_principal: auth.principal,
+            acl_header: req.header("x-amz-acl").map(str::to_string),
+            metadata_blob,
+            cond,
+            inline_tags_xml,
+            checksum: StreamingPutChecksumContract {
+                response_headers: ChecksumResponseHeaders(checksum_response),
+            },
+            streaming_signing: auth.streaming,
+        })
+    }
+
+    /// Start a stream-backed `PutObject` session after the body has exceeded
+    /// one internal segment.
+    pub fn start_streaming_put_session(
+        &self,
+        ctx: &StreamingPutContext,
+    ) -> Result<String, ServerError> {
+        let _trace = observability::AttachedTrace::new(ctx.trace.clone());
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "HttpFrontend::start_streaming_put_session",
+            "bucket={} key={}",
+            ctx.bucket,
+            ctx.key
+        );
+        self.coordinator.begin_stream_put(&BeginStreamPutRequest {
+            bucket: &ctx.bucket,
+            key: &ctx.key,
+            requester: crate::coordinator::Requester::from_principal(
+                ctx.requester_principal.as_deref(),
+            ),
+            acl: parse_put_object_acl(ctx.acl_header.as_deref()),
+        })
+```
+
+/workspace/argmin/crates/server-http/src/http/serve.rs (L1695 to 1709)
+  Note: The streaming handler only calls append_streaming_put_buffer (which triggers session creation) after buffering a full segment, meaning body data is read before authorization.
+```
+    let mut remaining = payload;
+    while !remaining.is_empty() {
+        if ingest.buf.len() == crate::coordinator::INTERNAL_SEGMENT_SIZE {
+            let mut flush_data = PooledSegmentBuffer::new(state);
+            std::mem::swap(ingest.buf, &mut flush_data);
+            append_streaming_put_buffer(
+                state,
+                ctx,
+                ingest.session_id,
+                ingest.segment_index,
+                flush_data,
+                *ingest.total_size,
+                ingest.timing,
+            )
+            .await?;
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Downgraded from medium because the effect is limited to pre-auth buffering of a single 8 MiB segment per request, with max_inflight_requests and max_connections limiting aggregate impact, and exploitation requires valid credentials without write permission.
+## Likelihood
+high - An authenticated client can easily send a streaming PUT; requires valid credentials and a bucket where they lack write permission. | Remote network vector
+## Impact
+low - Impact is limited to availability; at most one internal segment (8 MiB) is buffered before AccessDenied, and concurrency limits cap aggregate effect.
+## Assumptions
+- The service is deployed with ARGMIN_LISTEN_ADDR bound to a network-reachable interface (e.g., 0.0.0.0:9000) or behind ingress.
+- Multiple credentials/principals exist such that an authenticated principal can lack write permission to a target bucket.
+- Authenticated clients can issue streaming PutObject requests using SigV4.
+- Valid access key/secret
+- Target bucket exists
+- Requester lacks write permission for the bucket/object
+## Path
+Client -> ingest_streaming_put_payload -> buffer to 8MiB -> ensure_streaming_put_session -> begin_stream_put (AccessDenied after buffering)
+## Path evidence
+- `crates/server-http/src/http/mod.rs:2375-2412` - StreamingPutContext is created without authz, and begin_stream_put is invoked only in start_streaming_put_session.
+- `crates/server-http/src/http/serve.rs:1505-1569` - ensure_streaming_put_session triggers start_streaming_put_session to create the session.
+- `crates/server-http/src/http/serve.rs:1695-1716` - Buffering proceeds until INTERNAL_SEGMENT_SIZE, then append_streaming_put_buffer is called.
+- `crates/server-core/src/coordinator.rs:3682-3689` - begin_stream_put enforces write authorization and returns AccessDenied.
+- `crates/server-core/src/coordinator.rs:41-45` - INTERNAL_SEGMENT_SIZE is defined as 8 MiB.
+- `crates/argmin-s3/src/config.rs:22-46` - Default listen address is 127.0.0.1:9000; exposure depends on deployment configuration.
+## Narrative
+prepare_streaming_put builds StreamingPutContext without calling begin_stream_put, while start_streaming_put_session performs begin_stream_put (authz) later (crates/server-http/src/http/mod.rs). In ingest_streaming_put_payload, the server buffers request body data until the internal segment buffer reaches INTERNAL_SEGMENT_SIZE, only then calling append_streaming_put_buffer -> ensure_streaming_put_session -> start_streaming_put_session (crates/server-http/src/http/serve.rs). Authorization is enforced in coordinator.begin_stream_put, which returns AccessDenied for unauthorized requesters (crates/server-core/src/coordinator.rs). INTERNAL_SEGMENT_SIZE is 8 MiB. Thus, an authenticated but unauthorized client can force the server to read/buffer up to 8 MiB per request before the access check fails, impacting availability.
+## Controls
+- SigV4 authentication for requesters
+- Authorization check in coordinator.begin_stream_put
+- Max connections and max in-flight request limits
+- MAX_OBJECT_SIZE enforced during streaming ingest
+## Blindspots
+- No deployment manifests to confirm actual network exposure or ingress configuration.
+- No runtime PoC executed due to build environment limitations.
