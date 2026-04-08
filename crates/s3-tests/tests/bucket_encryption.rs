@@ -4,7 +4,8 @@ use aws_sdk_s3::types::{
     ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
 use s3_tests::{
-    assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
+    assert_s3_err_code, create_bucket_with_sse_c_enabled, err_status, sse_c_header_values,
+    test_sse_c_key, unique_bucket, CTX,
 };
 
 fn endpoint_is_https() -> bool {
@@ -70,6 +71,11 @@ fn blocked_encryption_types(rule: &ServerSideEncryptionRule) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn default_sse_c_blocked(rule: &ServerSideEncryptionRule) -> bool {
+    let blocked = blocked_encryption_types(rule);
+    blocked == vec!["SSE-C".to_string()]
+}
+
 async fn cleanup(bucket: &str, key: Option<&str>) {
     let client = CTX.client();
     if let Some(key) = key {
@@ -79,7 +85,7 @@ async fn cleanup(bucket: &str, key: Option<&str>) {
 }
 
 #[test]
-fn test_get_bucket_encryption_default_sse_s3() {
+fn test_get_bucket_encryption_default_reports_current_sse_c_state() {
     s3_tests::run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
@@ -99,12 +105,56 @@ fn test_get_bucket_encryption_default_sse_s3() {
 
         let blocked = blocked_encryption_types(rule);
         assert!(
-            blocked.is_empty() || blocked == vec!["NONE".to_string()],
-            "expected no blocked types or NONE, got {:?}",
+            blocked.is_empty()
+                || blocked == vec!["NONE".to_string()]
+                || blocked == vec!["SSE-C".to_string()],
+            "expected default blocked types to be NONE/empty or SSE-C, got {:?}",
             blocked
         );
 
         cleanup(&bucket, None).await;
+    });
+}
+
+#[test]
+fn test_bucket_encryption_default_sse_c_put_behavior_matches_reported_state() {
+    require_https_endpoint();
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let key = "default-blocked-put";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let resp = client
+            .get_bucket_encryption()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let rule = &resp.server_side_encryption_configuration().unwrap().rules()[0];
+        let sse_c_blocked = default_sse_c_blocked(rule);
+
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+        let result = with_sse_c_headers!(
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"blocked")),
+            key_b64,
+            key_md5_b64
+        )
+        .send()
+        .await;
+        if sse_c_blocked {
+            assert_eq!(err_status(&result), 403);
+            assert_s3_err_code(&result, "AccessDenied");
+            cleanup(&bucket, None).await;
+        } else {
+            result.unwrap();
+            cleanup(&bucket, Some(key)).await;
+        }
     });
 }
 
@@ -236,7 +286,9 @@ fn test_bucket_encryption_does_not_block_existing_sse_c_reads() {
         let client = CTX.client();
         let bucket = unique_bucket();
         let key = "existing-sse-c-object";
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        create_bucket_with_sse_c_enabled(client, &bucket)
+            .await
+            .unwrap();
 
         let customer_key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);

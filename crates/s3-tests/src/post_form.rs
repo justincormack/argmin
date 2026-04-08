@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ring::hmac;
 
-use crate::{build_test_agent, sse_c_header_values};
+use crate::{build_test_agent, sse_c_header_values, RawResponse};
 
 fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> hmac::Tag {
     let k_secret = format!("AWS4{}", secret);
@@ -145,7 +145,7 @@ fn build_multipart(
     (content_type, body)
 }
 
-fn sigv4_post_fields_for_credentials(
+pub fn sigv4_post_fields_for_credentials(
     access_key: &str,
     secret: &str,
     region: &str,
@@ -235,6 +235,49 @@ pub fn post_object_to_test_endpoint_with_headers(
     let status = resp.status().as_u16();
     let body = resp.body_mut().read_to_string().unwrap_or_default();
     (status, body)
+}
+
+pub fn post_object_raw_to_test_endpoint_with_headers(
+    endpoint: &str,
+    tls_ca_pem: Option<&[u8]>,
+    bucket: &str,
+    fields: &[(String, String)],
+    file_data: &[u8],
+    file_name: &str,
+    headers: &[(String, String)],
+) -> RawResponse {
+    let url = format!("{}/{}", endpoint, bucket);
+    let field_refs: Vec<(&str, &str)> = fields
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect();
+    let (content_type, body) = build_multipart(&field_refs, file_data, file_name);
+    let agent = build_test_agent(endpoint, tls_ca_pem, std::time::Duration::from_secs(30));
+    let req = agent.post(&url).header("Content-Type", &content_type);
+    let req = headers.iter().fold(req, |req, (name, value)| {
+        req.header(name.as_str(), value.as_str())
+    });
+    let mut resp = req.send(&body[..]).expect("HTTP transport error");
+    let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .expect("response header is valid utf-8")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    RawResponse {
+        status,
+        headers,
+        body,
+    }
 }
 
 pub fn post_object_to_test_endpoint(

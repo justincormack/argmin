@@ -3,13 +3,21 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::primitives::{ByteStream, DateTime};
 use aws_sdk_s3::types::{
-    BucketLocationConstraint, BucketVersioningStatus, CreateBucketConfiguration,
-    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, VersioningConfiguration,
+    BucketLifecycleConfiguration, BucketLocationConstraint, BucketVersioningStatus,
+    CorsConfiguration, CorsRule, CreateBucketConfiguration, DefaultRetention, ExpirationStatus,
+    LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectLockConfiguration,
+    ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode,
+    ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership,
+    OwnershipControls, OwnershipControlsRule, PublicAccessBlockConfiguration, ServerSideEncryption,
+    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+    Tag, Tagging, VersioningConfiguration,
 };
 use aws_sdk_s3::Client;
 use s3_tests::{
-    build_client_with_ca, build_test_agent, cleanup_versioned_bucket, delete_all_and_bucket,
-    send_signed_request_with_credentials, unique_bucket, RawResponse, SignedRequestCredentials,
+    build_client_with_ca, build_test_agent, cleanup_versioned_bucket, content_md5_header,
+    delete_all_and_bucket, post_object_raw_to_test_endpoint_with_headers,
+    put_bucket_lifecycle_with_md5, send_signed_request_with_credentials,
+    sigv4_post_fields_for_credentials, unique_bucket, RawResponse, SignedRequestCredentials,
     TestServer, CTX,
 };
 use s3_types::is_legacy_create_bucket_region;
@@ -232,6 +240,45 @@ async fn create_object_lock_bucket_pair(env: &ComparisonEnv) -> (String, String)
     (external_bucket, local_bucket)
 }
 
+async fn create_matching_object_lock_bucket_pair(env: &ComparisonEnv) -> (String, String) {
+    let external_bucket = unique_bucket();
+    let local_bucket = external_bucket.clone();
+    create_object_lock_bucket_in_region(
+        &env.external_client,
+        &external_bucket,
+        &env.external_region,
+    )
+    .await;
+    create_object_lock_bucket_in_region(&env.local_client, &local_bucket, &env.external_region)
+        .await;
+    (external_bucket, local_bucket)
+}
+
+async fn put_object_pair(
+    env: &ComparisonEnv,
+    external_bucket: &str,
+    local_bucket: &str,
+    key: &str,
+    body: &'static [u8],
+) {
+    env.external_client
+        .put_object()
+        .bucket(external_bucket)
+        .key(key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await
+        .expect("put external fixture object");
+    env.local_client
+        .put_object()
+        .bucket(local_bucket)
+        .key(key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await
+        .expect("put local fixture object");
+}
+
 fn future_datetime(seconds_from_now: u64) -> DateTime {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -445,6 +492,14 @@ fn response_header_value<'a>(response: &'a RawResponse, name: &str) -> Option<&'
         .iter()
         .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
         .map(|(_, value)| value.as_str())
+}
+
+fn normalize_location_header(value: &str) -> String {
+    let (scheme, rest) = value
+        .split_once("://")
+        .expect("location header should contain a scheme");
+    let path_start = rest.find('/').unwrap_or(rest.len());
+    format!("{scheme}://<authority>{}", &rest[path_start..])
 }
 
 fn xml_text_unescape(text: &str) -> String {
@@ -1226,7 +1281,928 @@ fn test_versioned_object_response_shape_matches_aws() {
 }
 
 #[test]
-fn test_copy_object_response_headers_match_aws() {
+fn test_get_bucket_location_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("location="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("location="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches("GetBucketLocation", &aws_get, &local_get, &[], &[], &[]);
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_versioning_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        enable_bucket_versioning(&env.external_client, &external_bucket).await;
+        enable_bucket_versioning(&env.local_client, &local_bucket).await;
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("versioning="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("versioning="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "GetBucketVersioning",
+            &aws_get,
+            &local_get,
+            &[],
+            &[],
+            &[],
+        );
+
+        cleanup_versioned_bucket(&env.external_client, &external_bucket).await;
+        cleanup_versioned_bucket(&env.local_client, &local_bucket).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_encryption_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let encryption = ServerSideEncryptionConfiguration::builder()
+            .rules(
+                ServerSideEncryptionRule::builder()
+                    .apply_server_side_encryption_by_default(
+                        ServerSideEncryptionByDefault::builder()
+                            .sse_algorithm(ServerSideEncryption::Aes256)
+                            .build()
+                            .unwrap(),
+                    )
+                    .build(),
+            )
+            .build()
+            .unwrap();
+
+        env.external_client
+            .put_bucket_encryption()
+            .bucket(&external_bucket)
+            .server_side_encryption_configuration(encryption.clone())
+            .send()
+            .await
+            .expect("put external bucket encryption");
+        env.local_client
+            .put_bucket_encryption()
+            .bucket(&local_bucket)
+            .server_side_encryption_configuration(encryption)
+            .send()
+            .await
+            .expect("put local bucket encryption");
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("encryption="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("encryption="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "GetBucketEncryption",
+            &aws_get,
+            &local_get,
+            &[],
+            &[],
+            &[],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_cors_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let cors = CorsConfiguration::builder()
+            .cors_rules(
+                CorsRule::builder()
+                    .allowed_origins("https://example.com")
+                    .allowed_methods("GET")
+                    .allowed_methods("PUT")
+                    .allowed_headers("*")
+                    .expose_headers("x-amz-request-id")
+                    .max_age_seconds(3600)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        env.external_client
+            .put_bucket_cors()
+            .bucket(&external_bucket)
+            .cors_configuration(cors.clone())
+            .send()
+            .await
+            .expect("put external bucket cors");
+        env.local_client
+            .put_bucket_cors()
+            .bucket(&local_bucket)
+            .cors_configuration(cors)
+            .send()
+            .await
+            .expect("put local bucket cors");
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("cors="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("cors="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches("GetBucketCors", &aws_get, &local_get, &[], &[], &[]);
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_tagging_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let tagging = Tagging::builder()
+            .tag_set(Tag::builder().key("env").value("prod").build().unwrap())
+            .tag_set(Tag::builder().key("team").value("storage").build().unwrap())
+            .build()
+            .unwrap();
+
+        env.external_client
+            .put_bucket_tagging()
+            .bucket(&external_bucket)
+            .tagging(tagging.clone())
+            .send()
+            .await
+            .expect("put external bucket tagging");
+        env.local_client
+            .put_bucket_tagging()
+            .bucket(&local_bucket)
+            .tagging(tagging)
+            .send()
+            .await
+            .expect("put local bucket tagging");
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("tagging="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("tagging="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches("GetBucketTagging", &aws_get, &local_get, &[], &[], &[]);
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_lifecycle_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let lifecycle = BucketLifecycleConfiguration::builder()
+            .rules(
+                LifecycleRule::builder()
+                    .id("expire-current")
+                    .filter(LifecycleRuleFilter::builder().prefix("logs/").build())
+                    .status(ExpirationStatus::Enabled)
+                    .expiration(LifecycleExpiration::builder().days(30).build())
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        put_bucket_lifecycle_with_md5(&env.external_client, &external_bucket, lifecycle.clone())
+            .send()
+            .await
+            .expect("put external bucket lifecycle");
+        put_bucket_lifecycle_with_md5(&env.local_client, &local_bucket, lifecycle)
+            .send()
+            .await
+            .expect("put local bucket lifecycle");
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("lifecycle="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("lifecycle="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "GetBucketLifecycleConfiguration",
+            &aws_get,
+            &local_get,
+            &[],
+            &[],
+            &[],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_public_access_block_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let config = PublicAccessBlockConfiguration::builder()
+            .block_public_acls(true)
+            .ignore_public_acls(true)
+            .block_public_policy(true)
+            .restrict_public_buckets(false)
+            .build();
+
+        env.external_client
+            .put_public_access_block()
+            .bucket(&external_bucket)
+            .public_access_block_configuration(config.clone())
+            .send()
+            .await
+            .expect("put external public access block");
+        env.local_client
+            .put_public_access_block()
+            .bucket(&local_bucket)
+            .public_access_block_configuration(config)
+            .send()
+            .await
+            .expect("put local public access block");
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("publicAccessBlock="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("publicAccessBlock="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "GetPublicAccessBlock",
+            &aws_get,
+            &local_get,
+            &[],
+            &[],
+            &[],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_ownership_controls_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let ownership_controls = OwnershipControls::builder()
+            .rules(
+                OwnershipControlsRule::builder()
+                    .object_ownership(ObjectOwnership::BucketOwnerPreferred)
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+
+        env.external_client
+            .put_bucket_ownership_controls()
+            .bucket(&external_bucket)
+            .ownership_controls(ownership_controls.clone())
+            .send()
+            .await
+            .expect("put external ownership controls");
+        env.local_client
+            .put_bucket_ownership_controls()
+            .bucket(&local_bucket)
+            .ownership_controls(ownership_controls)
+            .send()
+            .await
+            .expect("put local ownership controls");
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("ownershipControls="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("ownershipControls="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "GetBucketOwnershipControls",
+            &aws_get,
+            &local_get,
+            &[],
+            &[],
+            &[],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_policy_status_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("policyStatus="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("policyStatus="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "GetBucketPolicyStatus",
+            &aws_get,
+            &local_get,
+            &[],
+            &[],
+            &["RequestId", "HostId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_acl_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("acl="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("acl="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "GetBucketAcl",
+            &aws_get,
+            &local_get,
+            &[],
+            &[],
+            &["ID", "DisplayName"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_object_lock_configuration_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = create_matching_object_lock_bucket_pair(&env).await;
+        let config = ObjectLockConfiguration::builder()
+            .object_lock_enabled(ObjectLockEnabled::Enabled)
+            .rule(
+                ObjectLockRule::builder()
+                    .default_retention(
+                        DefaultRetention::builder()
+                            .mode(ObjectLockRetentionMode::Governance)
+                            .days(7)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build();
+
+        env.external_client
+            .put_object_lock_configuration()
+            .bucket(&external_bucket)
+            .object_lock_configuration(config.clone())
+            .send()
+            .await
+            .expect("put external object lock configuration");
+        env.local_client
+            .put_object_lock_configuration()
+            .bucket(&local_bucket)
+            .object_lock_configuration(config)
+            .send()
+            .await
+            .expect("put local object lock configuration");
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("object-lock="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("object-lock="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "GetBucketObjectLockConfiguration",
+            &aws_get,
+            &local_get,
+            &[],
+            &[],
+            &[],
+        );
+
+        cleanup_object_lock_bucket(&env.external_client, &external_bucket).await;
+        cleanup_object_lock_bucket(&env.local_client, &local_bucket).await;
+    });
+}
+
+#[test]
+fn test_get_object_retention_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = create_matching_object_lock_bucket_pair(&env).await;
+        let key = "shape-retention.txt";
+        let retain_until = future_datetime(24 * 60 * 60);
+
+        let external_put = env
+            .external_client
+            .put_object()
+            .bucket(&external_bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"retention"))
+            .send()
+            .await
+            .expect("put external retention fixture");
+        let local_put = env
+            .local_client
+            .put_object()
+            .bucket(&local_bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"retention"))
+            .send()
+            .await
+            .expect("put local retention fixture");
+        let external_version = external_put.version_id().expect("external version id");
+        let local_version = local_put.version_id().expect("local version id");
+        let retention = ObjectLockRetention::builder()
+            .mode(ObjectLockRetentionMode::Governance)
+            .retain_until_date(retain_until)
+            .build();
+
+        env.external_client
+            .put_object_retention()
+            .bucket(&external_bucket)
+            .key(key)
+            .version_id(external_version)
+            .retention(retention.clone())
+            .send()
+            .await
+            .expect("put external object retention");
+        env.local_client
+            .put_object_retention()
+            .bucket(&local_bucket)
+            .key(key)
+            .version_id(local_version)
+            .retention(retention)
+            .send()
+            .await
+            .expect("put local object retention");
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            key,
+            Some(&format!("retention=&versionId={external_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            key,
+            Some(&format!("retention=&versionId={local_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "GetObjectRetention",
+            &aws_get,
+            &local_get,
+            &[],
+            &["x-amz-version-id"],
+            &[],
+        );
+
+        cleanup_object_lock_bucket(&env.external_client, &external_bucket).await;
+        cleanup_object_lock_bucket(&env.local_client, &local_bucket).await;
+    });
+}
+
+#[test]
+fn test_get_object_legal_hold_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = create_matching_object_lock_bucket_pair(&env).await;
+        let key = "shape-legal-hold.txt";
+
+        let external_put = env
+            .external_client
+            .put_object()
+            .bucket(&external_bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"legal-hold"))
+            .send()
+            .await
+            .expect("put external legal hold fixture");
+        let local_put = env
+            .local_client
+            .put_object()
+            .bucket(&local_bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"legal-hold"))
+            .send()
+            .await
+            .expect("put local legal hold fixture");
+        let external_version = external_put.version_id().expect("external version id");
+        let local_version = local_put.version_id().expect("local version id");
+
+        env.external_client
+            .put_object_legal_hold()
+            .bucket(&external_bucket)
+            .key(key)
+            .version_id(external_version)
+            .legal_hold(object_lock_legal_hold(ObjectLockLegalHoldStatus::On))
+            .send()
+            .await
+            .expect("put external legal hold");
+        env.local_client
+            .put_object_legal_hold()
+            .bucket(&local_bucket)
+            .key(key)
+            .version_id(local_version)
+            .legal_hold(object_lock_legal_hold(ObjectLockLegalHoldStatus::On))
+            .send()
+            .await
+            .expect("put local legal hold");
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            key,
+            Some(&format!("legal-hold=&versionId={external_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            key,
+            Some(&format!("legal-hold=&versionId={local_version}")),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "GetObjectLegalHold",
+            &aws_get,
+            &local_get,
+            &[],
+            &["x-amz-version-id"],
+            &[],
+        );
+
+        cleanup_object_lock_bucket(&env.external_client, &external_bucket).await;
+        cleanup_object_lock_bucket(&env.local_client, &local_bucket).await;
+    });
+}
+
+#[test]
+fn test_get_object_tagging_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-object-tagging.txt";
+        let tagging = Tagging::builder()
+            .tag_set(Tag::builder().key("env").value("prod").build().unwrap())
+            .tag_set(Tag::builder().key("tier").value("hot").build().unwrap())
+            .build()
+            .unwrap();
+
+        put_object_pair(
+            &env,
+            &external_bucket,
+            &local_bucket,
+            key,
+            b"object-tagging",
+        )
+        .await;
+        env.external_client
+            .put_object_tagging()
+            .bucket(&external_bucket)
+            .key(key)
+            .tagging(tagging.clone())
+            .send()
+            .await
+            .expect("put external object tagging");
+        env.local_client
+            .put_object_tagging()
+            .bucket(&local_bucket)
+            .key(key)
+            .tagging(tagging)
+            .send()
+            .await
+            .expect("put local object tagging");
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            key,
+            Some("tagging="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            key,
+            Some("tagging="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches("GetObjectTagging", &aws_get, &local_get, &[], &[], &[]);
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_get_object_acl_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-object-acl.txt";
+
+        put_object_pair(&env, &external_bucket, &local_bucket, key, b"object-acl").await;
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            key,
+            Some("acl="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            key,
+            Some("acl="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "GetObjectAcl",
+            &aws_get,
+            &local_get,
+            &[],
+            &[],
+            &["ID", "DisplayName"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_post_object_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-post-object.txt";
+        let file_data = b"post-body";
+        let aws_fields = sigv4_post_fields_for_credentials(
+            CTX.access_key(),
+            CTX.secret_key(),
+            &env.external_region,
+            &external_bucket,
+            key,
+            &[],
+        );
+        let local_fields = sigv4_post_fields_for_credentials(
+            s3_tests::server::TEST_ACCESS_KEY,
+            s3_tests::server::TEST_SECRET_KEY,
+            &env.external_region,
+            &local_bucket,
+            key,
+            &[],
+        );
+
+        let aws_post = post_object_raw_to_test_endpoint_with_headers(
+            CTX.endpoint(),
+            None,
+            &external_bucket,
+            &aws_fields,
+            file_data,
+            "test.txt",
+            &[],
+        );
+        let local_post = post_object_raw_to_test_endpoint_with_headers(
+            env.local_server.endpoint(),
+            env.local_server.tls_ca_pem(),
+            &local_bucket,
+            &local_fields,
+            file_data,
+            "test.txt",
+            &[],
+        );
+
+        assert_xml_response_shape_matches(
+            "PostObject",
+            &aws_post,
+            &local_post,
+            &["etag", "location"],
+            &[],
+            &["ETag"],
+        );
+        assert_eq!(
+            normalize_location_header(
+                response_header_value(&local_post, "location").expect("local post location"),
+            ),
+            normalize_location_header(
+                response_header_value(&aws_post, "location").expect("aws post location"),
+            ),
+            "PostObject: normalized Location mismatch\naws headers: {:?}\nlocal headers: {:?}",
+            aws_post.headers,
+            local_post.headers,
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_response_shape_matches_aws() {
     s3_tests::run(async {
         let Some(env) = ComparisonEnv::setup().await else {
             return;
@@ -1276,12 +2252,13 @@ fn test_copy_object_response_headers_match_aws() {
             b"",
             [("x-amz-copy-source", format!("{local_bucket}/{src_key}"))],
         );
-        assert_response_headers_match(
+        assert_xml_response_shape_matches(
             "CopyObject",
             &aws_copy,
             &local_copy,
             &["content-length"],
             &[],
+            &["ETag", "LastModified"],
         );
 
         delete_all_and_bucket(
@@ -1882,6 +2859,66 @@ fn test_object_lock_read_response_shape_matches_aws() {
 
         cleanup_object_lock_bucket(&env.external_client, &external_bucket).await;
         cleanup_object_lock_bucket(&env.local_client, &local_bucket).await;
+    });
+}
+
+#[test]
+fn test_delete_objects_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let keys = ["shape-delete-objects-a.txt", "shape-delete-objects-b.txt"];
+        let delete_body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <Delete>\
+             <Object><Key>{}</Key></Object>\
+             <Object><Key>{}</Key></Object>\
+             </Delete>",
+            keys[0], keys[1]
+        );
+        let md5_header = content_md5_header(delete_body.as_bytes());
+
+        for key in keys {
+            put_object_pair(
+                &env,
+                &external_bucket,
+                &local_bucket,
+                key,
+                b"delete-objects",
+            )
+            .await;
+        }
+
+        let aws_delete = env.send_external(
+            "POST",
+            &external_bucket,
+            "",
+            Some("delete="),
+            delete_body.as_bytes(),
+            [md5_header.clone()],
+        );
+        let local_delete = env.send_local(
+            "POST",
+            &local_bucket,
+            "",
+            Some("delete="),
+            delete_body.as_bytes(),
+            [md5_header],
+        );
+
+        assert_xml_response_shape_matches(
+            "DeleteObjects",
+            &aws_delete,
+            &local_delete,
+            &[],
+            &[],
+            &[],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
     });
 }
 

@@ -151,6 +151,22 @@ impl S3Response {
         self
     }
 
+    fn fixed_body(mut self, body: Vec<u8>) -> Self {
+        self.body = body;
+        self.stream = None;
+        self.headers
+            .push(("Content-Length".to_string(), self.body.len().to_string()));
+        self
+    }
+
+    fn fixed_xml_body_no_content_type(self, xml: String) -> Self {
+        self.fixed_body(xml.into_bytes())
+    }
+
+    fn chunked_xml_body_no_content_type(self, xml: String) -> Self {
+        self.chunked_body(xml.into_bytes())
+    }
+
     fn chunked_body(mut self, body: Vec<u8>) -> Self {
         self.body = Vec::new();
         self.stream = Some(ReadHandle::from_buffered_bytes(body));
@@ -248,7 +264,7 @@ impl S3Response {
             self = self.header("x-amz-object-lock-mode", retention.mode.as_str());
             self = self.header(
                 "x-amz-object-lock-retain-until-date",
-                &xml::format_object_lock_timestamp(retention.retain_until_unix_seconds),
+                &format_object_lock_header_timestamp(retention.retain_until_unix_seconds),
             );
         }
         if let Some(legal_hold) = object_lock.legal_hold.as_legal_hold_status() {
@@ -324,6 +340,7 @@ impl S3Response {
         key: &str,
         success_status: u16,
         success_redirect: Option<&str>,
+        location: Option<&str>,
     ) -> Self {
         let mut resp = if let Some(location) = success_redirect.and_then(|redirect_url| {
             success_action_redirect_location(redirect_url, bucket, key, &result.etag)
@@ -341,6 +358,15 @@ impl S3Response {
                 Self::new(status)
             }
         };
+        if success_redirect.is_none() {
+            if let Some(location) = location {
+                resp = resp.header("Location", location);
+            }
+            resp = resp.apply_checksum_mode_headers(&result.system_metadata);
+            if let Some(checksum_type) = result.system_metadata.checksum_type() {
+                resp = resp.header("x-amz-checksum-type", checksum_type.as_str());
+            }
+        }
         resp = resp.header("ETag", &result.etag);
         if result.version_id.is_versioned() {
             let vid = format_version_id(result.version_id);
@@ -603,7 +629,7 @@ impl S3Response {
     #[must_use]
     pub fn get_bucket_location(region: &str) -> Self {
         let body = xml::get_bucket_location_xml(bucket_location_constraint(region));
-        Self::new(200).xml_body(body)
+        Self::new(200).chunked_xml_body(body)
     }
 
     /// Build a response for `PutBucketVersioning`.
@@ -616,7 +642,7 @@ impl S3Response {
     #[must_use]
     pub fn get_bucket_versioning(state: BucketVersioningState) -> Self {
         let body = xml::get_bucket_versioning_xml(state);
-        Self::new(200).xml_body(body)
+        Self::new(200).chunked_xml_body_no_content_type(body)
     }
 
     /// Build a response for `PutObjectLockConfiguration`.
@@ -629,7 +655,7 @@ impl S3Response {
     #[must_use]
     pub fn get_bucket_object_lock_configuration(config: BucketObjectLockConfig) -> Self {
         let body = xml::get_bucket_object_lock_configuration_xml(config);
-        Self::new(200).xml_body(body)
+        Self::new(200).chunked_xml_body_no_content_type(body)
     }
 
     /// Build a response for `PutObjectRetention`.
@@ -642,7 +668,7 @@ impl S3Response {
     #[must_use]
     pub fn get_object_retention(retention: Option<ObjectRetention>) -> Self {
         let body = xml::get_object_retention_xml(retention);
-        Self::new(200).xml_body(body)
+        Self::new(200).chunked_xml_body_no_content_type(body)
     }
 
     /// Build a response for `PutObjectLegalHold`.
@@ -655,7 +681,7 @@ impl S3Response {
     #[must_use]
     pub fn get_object_legal_hold(status: Option<LegalHoldStatus>) -> Self {
         let body = xml::get_object_legal_hold_xml(status);
-        Self::new(200).xml_body(body)
+        Self::new(200).chunked_xml_body_no_content_type(body)
     }
 
     /// Build a response for `PutBucketEncryption`.
@@ -674,7 +700,7 @@ impl S3Response {
     #[must_use]
     pub fn get_bucket_encryption(config: EffectiveBucketEncryptionConfig) -> Self {
         let body = xml::get_bucket_encryption_xml(config);
-        Self::new(200).xml_body(body)
+        Self::new(200).chunked_xml_body_no_content_type(body)
     }
 
     /// Build a response for `ListBuckets`.
@@ -750,7 +776,7 @@ impl S3Response {
     #[must_use]
     pub fn delete_objects(result: &DeleteObjectsResult, quiet: bool) -> Self {
         let body = xml::delete_objects_result_xml(&result.deleted, &result.errors, quiet);
-        Self::new(200).xml_body(body)
+        Self::new(200).chunked_xml_body(body)
     }
 
     /// Build a response for `ListObjectVersions`.
@@ -803,7 +829,7 @@ impl S3Response {
     /// Build a response for `GetBucketCors` (200 OK, XML body).
     #[must_use]
     pub fn get_bucket_cors(config_xml: &str) -> Self {
-        Self::new(200).xml_body(config_xml.to_string())
+        Self::new(200).chunked_xml_body_no_content_type(config_xml.to_string())
     }
 
     /// Build a response for `DeleteBucketCors` (204 No Content).
@@ -821,7 +847,7 @@ impl S3Response {
     /// Build a response for `GetBucketTagging` (200 OK, XML body).
     #[must_use]
     pub fn get_bucket_tagging(xml: &str) -> Self {
-        Self::new(200).xml_body(xml.to_string())
+        Self::new(200).chunked_xml_body_no_content_type(xml.to_string())
     }
 
     /// Build a response for `DeleteBucketTagging` (204 No Content).
@@ -839,7 +865,12 @@ impl S3Response {
     /// Build a response for `GetBucketLifecycleConfiguration` (200 OK, XML body).
     #[must_use]
     pub fn get_bucket_lifecycle(xml: &str) -> Self {
-        Self::new(200).xml_body(xml.to_string())
+        Self::new(200)
+            .header(
+                "x-amz-transition-default-minimum-object-size",
+                "all_storage_classes_128K",
+            )
+            .fixed_xml_body_no_content_type(xml.to_string())
     }
 
     /// Build a response for `DeleteBucketLifecycle` (204 No Content).
@@ -857,7 +888,7 @@ impl S3Response {
     /// Build a response for `GetObjectTagging` (200 OK, XML body).
     #[must_use]
     pub fn get_object_tagging(xml: &str) -> Self {
-        Self::new(200).xml_body(xml.to_string())
+        Self::new(200).chunked_xml_body_no_content_type(xml.to_string())
     }
 
     /// Build a response for `DeleteObjectTagging` (204 No Content).
@@ -875,7 +906,7 @@ impl S3Response {
     /// Build a response for `GetBucketPublicAccessBlock` (200 OK, XML body).
     #[must_use]
     pub fn get_bucket_public_access_block(config_xml: &str) -> Self {
-        Self::new(200).xml_body(config_xml.to_string())
+        Self::new(200).chunked_xml_body_no_content_type(config_xml.to_string())
     }
 
     /// Build a response for `DeleteBucketPublicAccessBlock` (204 No Content).
@@ -893,7 +924,7 @@ impl S3Response {
     /// Build a response for `GetBucketOwnershipControls` (200 OK, XML body).
     #[must_use]
     pub fn get_bucket_ownership_controls(config_xml: &str) -> Self {
-        Self::new(200).xml_body(config_xml.to_string())
+        Self::new(200).fixed_xml_body_no_content_type(config_xml.to_string())
     }
 
     /// Build a response for `DeleteBucketOwnershipControls` (204 No Content).
@@ -960,7 +991,7 @@ impl S3Response {
         owner_display_name: &str,
         grants: &[xml::RenderedAclGrant],
     ) -> Self {
-        Self::new(200).xml_body(xml::acl_xml(
+        Self::new(200).chunked_xml_body(xml::acl_xml(
             owner_display_name,
             &result.owner_canonical_id,
             grants,
@@ -984,7 +1015,7 @@ impl S3Response {
         owner_display_name: &str,
         grants: &[xml::RenderedAclGrant],
     ) -> Self {
-        let mut resp = Self::new(200).xml_body(xml::acl_xml(
+        let mut resp = Self::new(200).chunked_xml_body(xml::acl_xml(
             owner_display_name,
             &result.owner_canonical_id,
             grants,
@@ -1161,6 +1192,14 @@ impl S3Response {
             ServerError::ObjectNotFound { key, .. } | ServerError::DeleteMarkerHit { key, .. } => {
                 let body =
                     xml::no_such_key_error_xml(key, Self::TEST_REQUEST_ID, Self::TEST_HOST_ID);
+                return Self::new(404).chunked_xml_body(body);
+            }
+            ServerError::NoSuchBucketPolicy { bucket } => {
+                let body = xml::no_such_bucket_policy_error_xml(
+                    bucket,
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
                 return Self::new(404).chunked_xml_body(body);
             }
             ServerError::AccessDenied
@@ -1366,6 +1405,27 @@ impl S3Response {
             resp
         }
     }
+}
+
+fn format_object_lock_header_timestamp(unix_seconds: u64) -> String {
+    let days_since_epoch = unix_seconds / 86400;
+    let time_of_day = unix_seconds % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    let z = days_since_epoch as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = i64::from(yoe) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
 }
 
 /// Format a unix millisecond timestamp as HTTP date (RFC 7231).
@@ -1637,6 +1697,7 @@ mod tests {
             "folder/my file.txt",
             201,
             Some("https://example.com/success"),
+            None,
         );
         assert_eq!(resp.status_code, 303);
         assert_eq!(
@@ -1658,10 +1719,21 @@ mod tests {
             managed_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
             lifecycle_expiration: None,
         };
-        let resp = S3Response::post_object(&result, "my-bucket", "my-key", 204, None);
+        let resp = S3Response::post_object(
+            &result,
+            "my-bucket",
+            "my-key",
+            204,
+            None,
+            Some("https://s3.us-east-1.amazonaws.com/my-bucket/my-key"),
+        );
         assert_eq!(
             find_header(&resp, "x-amz-server-side-encryption"),
             Some("AES256")
+        );
+        assert_eq!(
+            find_header(&resp, "Location"),
+            Some("https://s3.us-east-1.amazonaws.com/my-bucket/my-key")
         );
     }
 
@@ -1680,6 +1752,7 @@ mod tests {
             "my-key",
             204,
             Some("https://example.com/success?foo=bar"),
+            None,
         );
         assert_eq!(resp.status_code, 303);
         assert_eq!(
@@ -1705,6 +1778,7 @@ mod tests {
             "my-key",
             200,
             Some("https://example.com/\n"),
+            Some("https://s3.us-east-1.amazonaws.com/my-bucket/my-key"),
         );
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Location"), None);
@@ -2198,8 +2272,8 @@ mod tests {
             }),
         });
         assert_eq!(resp.status_code, 200);
-        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
-        let body = String::from_utf8(resp.body).unwrap();
+        assert_eq!(find_header(&resp, "Content-Type"), None);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"));
         assert!(body.contains("<Days>1</Days>"));
     }
@@ -2211,8 +2285,8 @@ mod tests {
             retain_until_unix_seconds: 1_775_001_600,
         }));
         assert_eq!(resp.status_code, 200);
-        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
-        let body = String::from_utf8(resp.body).unwrap();
+        assert_eq!(find_header(&resp, "Content-Type"), None);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<Retention"));
         assert!(body.contains("<Mode>GOVERNANCE</Mode>"));
     }
@@ -2221,8 +2295,8 @@ mod tests {
     fn get_object_legal_hold_response() {
         let resp = S3Response::get_object_legal_hold(Some(LegalHoldStatus::On));
         assert_eq!(resp.status_code, 200);
-        assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
-        let body = String::from_utf8(resp.body).unwrap();
+        assert_eq!(find_header(&resp, "Content-Type"), None);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<LegalHold"));
         assert!(body.contains("<Status>ON</Status>"));
     }
@@ -2317,7 +2391,7 @@ mod tests {
         let resp = S3Response::get_bucket_location("us-east-1");
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<LocationConstraint"));
         assert!(body.contains("/>"));
         assert!(!body.contains(">us-east-1<"));
@@ -2328,7 +2402,7 @@ mod tests {
         let resp = S3Response::get_bucket_location("eu-west-1");
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains(">EU</LocationConstraint>"));
     }
 
@@ -2377,7 +2451,11 @@ mod tests {
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration/>",
         );
         assert_eq!(get.status_code, 200);
-        assert_eq!(find_header(&get, "Content-Type"), Some("application/xml"));
+        assert_eq!(find_header(&get, "Content-Type"), None);
+        assert_eq!(
+            find_header(&get, "x-amz-transition-default-minimum-object-size"),
+            Some("all_storage_classes_128K")
+        );
 
         let delete = S3Response::delete_bucket_lifecycle();
         assert_eq!(delete.status_code, 204);
@@ -2615,9 +2693,9 @@ mod tests {
         ];
         let resp = S3Response::get_bucket_acl(&result, "owner", &grants);
         assert_eq!(resp.status_code, 200);
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains(owner_canonical_id.as_str()));
-        assert!(body.contains("<DisplayName>owner</DisplayName>"));
+        assert!(!body.contains("<DisplayName>"));
     }
 
     // ── error ─────────────────────────────────────────────────────────
@@ -2718,7 +2796,7 @@ mod tests {
         let resp = S3Response::delete_objects(&result, false);
         assert_eq!(resp.status_code, 200);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("DeleteResult"));
         assert!(body.contains("key1"));
     }
@@ -2820,7 +2898,7 @@ mod tests {
         let resp = S3Response::precondition_failed();
         assert_eq!(resp.status_code, 412);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("PreconditionFailed"));
     }
 }

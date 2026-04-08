@@ -417,7 +417,7 @@ impl S3HyperBody {
 
     fn streaming(
         body: crate::coordinator::ReadHandle,
-        permit: OwnedSemaphorePermit,
+        permit: Option<OwnedSemaphorePermit>,
         read_chunk_size: usize,
         trace: ResponseBodyTrace,
     ) -> Self {
@@ -451,7 +451,7 @@ impl S3HyperBody {
         Self {
             state: S3HyperBodyState::Streaming(rx),
             trace: Some(trace),
-            _permit: Some(permit),
+            _permit: permit,
         }
     }
 }
@@ -1924,7 +1924,9 @@ impl HttpFrontend {
                             expected_bucket_owner,
                         ))?
                 {
-                    Ok(S3Response::get_object_tagging(&tags_xml))
+                    let mut tags = xml::parse_tagging_xml(tags_xml.as_bytes(), 10)?;
+                    tags.reverse();
+                    Ok(S3Response::get_object_tagging(&xml::get_tagging_xml(&tags)))
                 } else {
                     // S3 returns empty TagSet (not 404) for objects with no tags
                     let empty = xml::get_tagging_xml(&[]);
@@ -2991,6 +2993,18 @@ impl HttpFrontend {
             .or_else(|| field("redirect"))
             .filter(|s| !s.is_empty())
             .map(std::string::ToString::to_string);
+        let response_location = req.header("host").map(|host| {
+            let scheme = if req.transport_security.is_secure() {
+                "https"
+            } else {
+                "http"
+            };
+            format!(
+                "{scheme}://{host}/{}/{}",
+                percent_encode_location_path_segment(bucket),
+                percent_encode_location_key(&key)
+            )
+        });
 
         Ok(StreamingPostContext {
             trace: current_trace_context(),
@@ -3005,6 +3019,7 @@ impl HttpFrontend {
             system_metadata,
             success_status,
             success_redirect,
+            response_location,
             form_fields: form_fields.to_vec(),
             policy_b64: field("policy").map(std::string::ToString::to_string),
             checksum_sha256_b64: field("x-amz-checksum-sha256")
@@ -3135,6 +3150,7 @@ impl HttpFrontend {
             &ctx.binding.key,
             ctx.success_status,
             ctx.success_redirect.as_deref(),
+            ctx.response_location.as_deref(),
         );
         apply_sse_customer_write_response_headers(
             &mut resp,
@@ -3916,6 +3932,7 @@ pub struct StreamingPostContext {
     pub system_metadata: SystemMetadata,
     pub success_status: u16,
     pub success_redirect: Option<String>,
+    pub response_location: Option<String>,
     pub form_fields: Vec<(String, String)>,
     pub policy_b64: Option<String>,
     pub checksum_sha256_b64: Option<String>,
@@ -3936,6 +3953,42 @@ pub struct StreamingPartContext {
     pub sse_customer: Option<SseCustomerWriteContext>,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     pub streaming_signing: Option<auth::StreamingSigningContext>,
+}
+
+fn percent_encode_location_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+fn percent_encode_location_key(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
 }
 
 /// Convert an `S3Response` into a hyper-compatible HTTP response.
@@ -4019,12 +4072,7 @@ pub fn s3_response_to_hyper(
         resp.stream.is_some(),
     );
     let body = match resp.stream {
-        Some(stream) => S3HyperBody::streaming(
-            stream,
-            permit.expect("streaming response requires request permit"),
-            stream_read_chunk_size,
-            trace,
-        ),
+        Some(stream) => S3HyperBody::streaming(stream, permit, stream_read_chunk_size, trace),
         None => S3HyperBody::buffered(resp.body, permit, trace),
     };
     let mut response = http::Response::new(body);
@@ -5351,7 +5399,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resp.status_code, 200);
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<LocationConstraint"));
         assert!(!body.contains(">us-east-1<"));
     }
@@ -6081,7 +6129,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains(canonical_id.as_str()));
     }
 
@@ -6284,11 +6332,11 @@ mod tests {
             )
             .unwrap();
         assert_eq!(get_resp.status_code, 200);
+        assert_eq!(find_header(&get_resp, "Content-Type"), None);
         assert_eq!(
-            find_header(&get_resp, "Content-Type"),
-            Some("application/xml")
+            String::from_utf8(get_resp.into_test_body_bytes().unwrap()).unwrap(),
+            expected
         );
-        assert_eq!(String::from_utf8(get_resp.body).unwrap(), expected);
 
         let delete_req = new_req(http::Method::DELETE, "/", "lifecycle", vec![], vec![]);
         let delete_resp = fe
@@ -6882,7 +6930,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains(canonical_id.as_str()));
     }
 
@@ -6928,7 +6976,7 @@ mod tests {
                 },
             )
             .unwrap();
-        let body = String::from_utf8(resp.body).unwrap();
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains(s3_types::AclGrantee::authenticated_users_uri()));
     }
 
@@ -7053,7 +7101,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(get_resp.status_code, 200);
-        let body = String::from_utf8(get_resp.body).unwrap();
+        let body = String::from_utf8(get_resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"));
         assert!(body.contains("<Days>1</Days>"));
     }

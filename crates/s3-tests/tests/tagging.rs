@@ -9,6 +9,7 @@ use s3_tests::{
     CTX,
 };
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::sync::{LazyLock, Mutex};
 
 static BUCKET_POLICY_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -28,6 +29,18 @@ fn tag(key: &str, value: &str) -> Tag {
 
 fn tagging(tags: Vec<Tag>) -> Tagging {
     Tagging::builder().set_tag_set(Some(tags)).build().unwrap()
+}
+
+fn assert_tag_sets_match_unordered(actual: &[Tag], expected: &[Tag]) {
+    let actual: BTreeSet<_> = actual
+        .iter()
+        .map(|tag| (tag.key().to_string(), tag.value().to_string()))
+        .collect();
+    let expected: BTreeSet<_> = expected
+        .iter()
+        .map(|tag| (tag.key().to_string(), tag.value().to_string()))
+        .collect();
+    assert_eq!(actual, expected);
 }
 
 fn object_resource(bucket: &str, key: &str) -> String {
@@ -1700,7 +1713,7 @@ fn test_get_tags_acl_public() {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.tag_set(), input_tags.tag_set());
+        assert_tag_sets_match_unordered(response.tag_set(), input_tags.tag_set());
 
         cleanup(&bucket, &[key]).await;
     });
@@ -1762,7 +1775,7 @@ fn test_put_tags_acl_public() {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.tag_set(), input_tags.tag_set());
+        assert_tag_sets_match_unordered(response.tag_set(), input_tags.tag_set());
 
         cleanup(&bucket, &[key]).await;
     });
@@ -2199,7 +2212,7 @@ fn test_bucket_policy_put_obj_tagging_request_object_tag() {
             .send()
             .await
             .unwrap();
-        assert_eq!(stored.tag_set(), public_tags.tag_set());
+        assert_tag_sets_match_unordered(stored.tag_set(), public_tags.tag_set());
 
         cleanup(&bucket, &[key]).await;
     });
@@ -2290,7 +2303,7 @@ fn test_bucket_policy_put_obj_version_tagging_request_object_tag() {
             .send()
             .await
             .unwrap();
-        assert_eq!(stored.tag_set(), public_tags.tag_set());
+        assert_tag_sets_match_unordered(stored.tag_set(), public_tags.tag_set());
 
         cleanup_versioned_bucket(CTX.client(), &bucket).await;
     });

@@ -12,7 +12,8 @@ pub use helpers::{
     unique_bucket, RawResponse, SignedRequestCredentials,
 };
 pub use post_form::{
-    post_object_to_test_endpoint, post_object_to_test_endpoint_with_headers,
+    post_object_raw_to_test_endpoint_with_headers, post_object_to_test_endpoint,
+    post_object_to_test_endpoint_with_headers, sigv4_post_fields_for_credentials,
     sigv4_post_sse_c_fields_for_credentials,
 };
 pub use server::TestServer;
@@ -189,6 +190,11 @@ impl TestContext {
     /// The HTTP endpoint URL (e.g. "http://127.0.0.1:12345").
     pub fn endpoint(&self) -> &str {
         &self.endpoint
+    }
+
+    /// The local test server CA, if running against the embedded HTTPS server.
+    pub fn tls_ca_pem(&self) -> Option<&'static [u8]> {
+        self._server.as_ref().and_then(TestServer::tls_ca_pem)
     }
 
     /// The access key ID.
@@ -397,11 +403,7 @@ pub fn test_agent() -> ureq::Agent {
 }
 
 pub fn test_agent_with_timeout(timeout: std::time::Duration) -> ureq::Agent {
-    build_test_agent(
-        CTX.endpoint(),
-        CTX._server.as_ref().and_then(TestServer::tls_ca_pem),
-        timeout,
-    )
+    build_test_agent(CTX.endpoint(), CTX.tls_ca_pem(), timeout)
 }
 
 pub fn build_test_agent(

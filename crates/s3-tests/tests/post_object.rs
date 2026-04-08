@@ -3,8 +3,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aws_sdk_s3::types::ServerSideEncryption;
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, err_status, sigv4_post_sse_c_fields_for_credentials, sse_c_header_values,
-    test_sse_c_key, unique_bucket, CTX,
+    assert_s3_err_code, err_status, post_object_raw_to_test_endpoint_with_headers,
+    sigv4_post_sse_c_fields_for_credentials, sse_c_header_values, test_sse_c_key, unique_bucket,
+    RawResponse, CTX,
 };
 
 /// Create a bucket, returning its name.
@@ -312,6 +313,31 @@ fn post_object_to_endpoint(
     (status, body_str)
 }
 
+fn post_object_raw(
+    bucket: &str,
+    fields: &[(String, String)],
+    file_data: &[u8],
+    file_name: &str,
+) -> RawResponse {
+    post_object_raw_to_test_endpoint_with_headers(
+        CTX.endpoint(),
+        CTX.tls_ca_pem(),
+        bucket,
+        fields,
+        file_data,
+        file_name,
+        &[],
+    )
+}
+
+fn response_header_value<'a>(response: &'a RawResponse, name: &str) -> Option<&'a str> {
+    response
+        .headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
 fn assert_error_code(body: &str, code: &str) {
     let expected = format!("<Code>{code}</Code>");
     assert!(
@@ -349,6 +375,47 @@ fn test_post_object_authenticated_request() {
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(&data[..], file_data);
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_post_object_default_success_headers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "post-default-success";
+        let fields = sigv4_fields(&bucket, key, &[]);
+        let expected_location = format!("{}/{bucket}/{key}", CTX.endpoint());
+
+        let resp = post_object_raw(&bucket, &fields, b"data", "test.txt");
+        assert_eq!(resp.status, 204, "expected 204, got {:?}", resp);
+        assert_eq!(resp.body, "");
+        assert_eq!(
+            response_header_value(&resp, "Location"),
+            Some(expected_location.as_str())
+        );
+        assert_eq!(
+            response_header_value(&resp, "x-amz-server-side-encryption"),
+            Some("AES256")
+        );
+        assert_eq!(
+            response_header_value(&resp, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert!(
+            response_header_value(&resp, "x-amz-checksum-crc64nvme").is_some(),
+            "expected checksum header in {:?}",
+            resp.headers
+        );
 
         client
             .delete_object()
@@ -1073,13 +1140,28 @@ fn test_post_object_set_success_code_200() {
             ])],
         );
         fields.push(("success_action_status".to_string(), "200".to_string()));
-        let field_refs: Vec<(&str, &str)> = fields
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
+        let expected_location = format!("{}/{bucket}/{key}", CTX.endpoint());
 
-        let (status, _) = post_object(&bucket, &field_refs, b"data", "test.txt");
-        assert_eq!(status, 200);
+        let resp = post_object_raw(&bucket, &fields, b"data", "test.txt");
+        assert_eq!(resp.status, 200, "expected 200, got {:?}", resp);
+        assert_eq!(resp.body, "");
+        assert_eq!(
+            response_header_value(&resp, "Location"),
+            Some(expected_location.as_str())
+        );
+        assert_eq!(
+            response_header_value(&resp, "x-amz-server-side-encryption"),
+            Some("AES256")
+        );
+        assert_eq!(
+            response_header_value(&resp, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert!(
+            response_header_value(&resp, "x-amz-checksum-crc64nvme").is_some(),
+            "expected checksum header in {:?}",
+            resp.headers
+        );
 
         client
             .delete_object()
@@ -1109,21 +1191,43 @@ fn test_post_object_set_success_code_201() {
             ])],
         );
         fields.push(("success_action_status".to_string(), "201".to_string()));
-        let field_refs: Vec<(&str, &str)> = fields
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
+        let expected_location = format!("{}/{bucket}/{key}", CTX.endpoint());
 
-        let (status, body) = post_object(&bucket, &field_refs, b"data", "test.txt");
-        assert_eq!(status, 201);
+        let resp = post_object_raw(&bucket, &fields, b"data", "test.txt");
+        assert_eq!(resp.status, 201, "expected 201, got {:?}", resp);
+        assert_eq!(
+            response_header_value(&resp, "Location"),
+            Some(expected_location.as_str())
+        );
+        assert_eq!(
+            response_header_value(&resp, "x-amz-server-side-encryption"),
+            Some("AES256")
+        );
+        assert_eq!(
+            response_header_value(&resp, "x-amz-checksum-type"),
+            Some("FULL_OBJECT")
+        );
+        assert!(
+            response_header_value(&resp, "x-amz-checksum-crc64nvme").is_some(),
+            "expected checksum header in {:?}",
+            resp.headers
+        );
         // 201 response should contain XML with Location, Bucket, Key, ETag
         assert!(
-            body.contains("<Bucket>"),
+            resp.body.contains("<Bucket>"),
             "expected Bucket in XML: {}",
-            body
+            resp.body
         );
-        assert!(body.contains("<Key>"), "expected Key in XML: {}", body);
-        assert!(body.contains("<ETag>"), "expected ETag in XML: {}", body);
+        assert!(
+            resp.body.contains("<Key>"),
+            "expected Key in XML: {}",
+            resp.body
+        );
+        assert!(
+            resp.body.contains("<ETag>"),
+            "expected ETag in XML: {}",
+            resp.body
+        );
 
         client
             .delete_object()

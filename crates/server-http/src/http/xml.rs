@@ -116,6 +116,28 @@ pub fn no_such_key_error_xml(key: &str, request_id: &str, host_id: &str) -> Stri
     )
 }
 
+/// Format an S3 `NoSuchBucketPolicy` error response.
+#[must_use]
+pub fn no_such_bucket_policy_error_xml(
+    bucket_name: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>NoSuchBucketPolicy</Code>\
+         <Message>The bucket policy does not exist</Message>\
+         <BucketName>{}</BucketName>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(bucket_name),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
 /// Format an S3 `KeyTooLongError` response.
 #[must_use]
 pub fn key_too_long_error_xml(size: usize, max_size_allowed: usize, request_id: &str) -> String {
@@ -320,7 +342,7 @@ fn append_canonical_owner_xml(xml: &mut String, element: &str, owner: &RenderedC
 /// Format a `GetBucketAcl`/`GetObjectAcl` XML response.
 #[must_use]
 pub fn acl_xml(
-    owner_display_name: &str,
+    _owner_display_name: &str,
     owner_canonical_id: &CanonicalUserId,
     grants: &[RenderedAclGrant],
 ) -> String {
@@ -330,9 +352,7 @@ pub fn acl_xml(
          <Owner><ID>",
     );
     xml.push_str(&xml_escape(owner_canonical_id.as_str()));
-    xml.push_str("</ID><DisplayName>");
-    xml.push_str(&xml_escape(owner_display_name));
-    xml.push_str("</DisplayName></Owner><AccessControlList>");
+    xml.push_str("</ID></Owner><AccessControlList>");
     for grant in grants {
         append_rendered_acl_grant(&mut xml, grant);
     }
@@ -388,11 +408,6 @@ fn append_rendered_acl_grant(xml: &mut String, grant: &RenderedAclGrant) {
             xml.push_str("CanonicalUser\"><ID>");
             xml.push_str(&xml_escape(id.as_str()));
             xml.push_str("</ID>");
-            if let Some(display_name) = &grant.display_name {
-                xml.push_str("<DisplayName>");
-                xml.push_str(&xml_escape(display_name));
-                xml.push_str("</DisplayName>");
-            }
         }
         AclGrantee::AllUsers | AclGrantee::AuthenticatedUsers => {
             xml.push_str("Group\"><URI>");
@@ -980,12 +995,15 @@ pub fn delete_objects_result_xml(
 
     if !quiet {
         for d in deleted {
-            let vid = super::response::format_version_id(d.version_id);
             xml.push_str("<Deleted><Key>");
             xml.push_str(&xml_escape(&d.key));
-            xml.push_str("</Key><VersionId>");
-            xml.push_str(&xml_escape(&vid));
-            xml.push_str("</VersionId>");
+            xml.push_str("</Key>");
+            let vid = super::response::format_version_id(d.version_id);
+            if d.version_id.is_versioned() {
+                xml.push_str("<VersionId>");
+                xml.push_str(&xml_escape(&vid));
+                xml.push_str("</VersionId>");
+            }
             if d.delete_marker {
                 xml.push_str("<DeleteMarker>true</DeleteMarker>");
                 xml.push_str("<DeleteMarkerVersionId>");
@@ -1939,7 +1957,8 @@ pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig
         .collect();
 
     let sse_c_blocked = match encryption_types.as_slice() {
-        [] | ["NONE"] => false,
+        [] => default_encryption.is_some(),
+        ["NONE"] => false,
         ["SSE-C"] => true,
         [other] => {
             return Err(ServerError::InvalidArgument {
@@ -1967,6 +1986,7 @@ pub fn get_bucket_encryption_xml(config: EffectiveBucketEncryptionConfig) -> Str
          <ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Rule>",
     );
+    xml.push_str("<BucketKeyEnabled>false</BucketKeyEnabled>");
     xml.push_str("<ApplyServerSideEncryptionByDefault><SSEAlgorithm>");
     xml.push_str(config.default_encryption.as_str());
     xml.push_str("</SSEAlgorithm></ApplyServerSideEncryptionByDefault>");
@@ -2481,7 +2501,7 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
 pub fn get_cors_config_xml(config: &crate::cors::CorsConfiguration) -> String {
     let mut xml = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-         <CORSConfiguration>",
+         <CORSConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
     );
 
     for rule in &config.rules {
@@ -2499,10 +2519,10 @@ pub fn get_cors_config_xml(config: &crate::cors::CorsConfiguration) -> String {
             xml.push_str("</AllowedMethod>");
         }
 
-        for header in &rule.allowed_headers {
-            xml.push_str("<AllowedHeader>");
-            xml.push_str(&xml_escape(header));
-            xml.push_str("</AllowedHeader>");
+        if let Some(max_age) = rule.max_age_seconds {
+            xml.push_str("<MaxAgeSeconds>");
+            xml.push_str(&max_age.to_string());
+            xml.push_str("</MaxAgeSeconds>");
         }
 
         for header in &rule.expose_headers {
@@ -2511,10 +2531,10 @@ pub fn get_cors_config_xml(config: &crate::cors::CorsConfiguration) -> String {
             xml.push_str("</ExposeHeader>");
         }
 
-        if let Some(max_age) = rule.max_age_seconds {
-            xml.push_str("<MaxAgeSeconds>");
-            xml.push_str(&max_age.to_string());
-            xml.push_str("</MaxAgeSeconds>");
+        for header in &rule.allowed_headers {
+            xml.push_str("<AllowedHeader>");
+            xml.push_str(&xml_escape(header));
+            xml.push_str("</AllowedHeader>");
         }
 
         xml.push_str("</CORSRule>");
@@ -2561,11 +2581,6 @@ pub fn copy_object_result_xml(
     system_metadata: &SystemMetadata,
 ) -> String {
     let mut checksum_xml = String::new();
-    if let Some(checksum_type) = system_metadata.checksum_type() {
-        checksum_xml.push_str("<ChecksumType>");
-        checksum_xml.push_str(checksum_type.as_str());
-        checksum_xml.push_str("</ChecksumType>");
-    }
     for (header, value) in system_metadata.checksum_header_pairs() {
         let Some(tag) = checksum_header_to_xml_tag(header) else {
             continue;
@@ -2578,15 +2593,20 @@ pub fn copy_object_result_xml(
         checksum_xml.push_str(tag);
         checksum_xml.push('>');
     }
+    if let Some(checksum_type) = system_metadata.checksum_type() {
+        checksum_xml.push_str("<ChecksumType>");
+        checksum_xml.push_str(checksum_type.as_str());
+        checksum_xml.push_str("</ChecksumType>");
+    }
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-         <ETag>{}</ETag>\
          <LastModified>{}</LastModified>\
+         <ETag>{}</ETag>\
          {}\
          </CopyObjectResult>",
-        xml_escape(etag),
         format_timestamp(last_modified),
+        xml_escape(etag),
         checksum_xml,
     )
 }
@@ -2644,7 +2664,7 @@ pub(crate) fn format_object_lock_timestamp(unix_seconds: u64) -> String {
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
     let (year, month, day) = days_to_date(days_since_epoch as i64);
-    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+    format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}.000Z")
 }
 
 fn parse_object_lock_timestamp_secs_with<F>(raw: &str, invalid: F) -> Result<u64, ServerError>
@@ -4096,7 +4116,7 @@ mod tests {
         let owner_canonical_id = CanonicalUserId::from_principal("owner");
         let xml = bucket_acl_xml("owner", &owner_canonical_id, BucketAcl::PublicRead);
         assert!(xml.contains(&format!("<Owner><ID>{}</ID>", owner_canonical_id.as_str())));
-        assert!(xml.contains("<DisplayName>owner</DisplayName>"));
+        assert!(!xml.contains("<DisplayName>"));
         assert!(xml.contains("CanonicalUser"));
     }
 
@@ -4559,6 +4579,7 @@ mod tests {
         }];
         let xml = delete_objects_result_xml(&deleted, &errors, false);
         assert!(xml.contains("<Deleted><Key>key1</Key>"));
+        assert!(!xml.contains("<VersionId>null</VersionId>"));
         assert!(xml.contains("<Error><Key>key2</Key>"));
         assert!(xml.contains("<Code>AccessDenied</Code>"));
         assert!(xml.contains("DeleteResult"));
@@ -4760,10 +4781,9 @@ mod tests {
         assert!(
             xml.contains("<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">")
         );
-        assert!(xml.contains("<ETag>&quot;abcdef1234567890&quot;</ETag>"));
-        assert!(xml.contains("<LastModified>2024-01-15T12:30:45.000Z</LastModified>"));
-        assert!(xml.contains("<ChecksumType>FULL_OBJECT</ChecksumType>"));
-        assert!(xml.contains("<ChecksumCRC64NVME>AAAAAA==</ChecksumCRC64NVME>"));
+        assert!(xml.contains(
+            "<LastModified>2024-01-15T12:30:45.000Z</LastModified><ETag>&quot;abcdef1234567890&quot;</ETag><ChecksumCRC64NVME>AAAAAA==</ChecksumCRC64NVME><ChecksumType>FULL_OBJECT</ChecksumType>"
+        ));
         assert!(xml.contains("</CopyObjectResult>"));
     }
 
@@ -5011,7 +5031,7 @@ mod tests {
         }));
         assert!(xml.contains("<Retention"));
         assert!(xml.contains("<Mode>GOVERNANCE</Mode>"));
-        assert!(xml.contains("<RetainUntilDate>2026-04-01T00:00:00Z</RetainUntilDate>"));
+        assert!(xml.contains("<RetainUntilDate>2026-04-01T00:00:00.000Z</RetainUntilDate>"));
     }
 
     #[test]
@@ -5123,6 +5143,7 @@ mod tests {
         let xml = get_bucket_encryption_xml(blocked.effective());
         let parsed = parse_bucket_encryption_xml(xml.as_bytes()).unwrap();
         assert_eq!(parsed, blocked);
+        assert!(xml.contains("<BucketKeyEnabled>false</BucketKeyEnabled>"));
 
         let unblocked_xml = get_bucket_encryption_xml(
             BucketEncryptionConfig {
@@ -5133,6 +5154,7 @@ mod tests {
         );
         assert!(!unblocked_xml.contains("<EncryptionType>"));
         assert!(unblocked_xml.contains("<SSEAlgorithm>AES256</SSEAlgorithm>"));
+        assert!(unblocked_xml.contains("<BucketKeyEnabled>false</BucketKeyEnabled>"));
     }
 
     // ── CORS XML ─────────────────────────────────────────────────────
@@ -5237,13 +5259,18 @@ mod tests {
             }],
         };
         let xml = get_cors_config_xml(&config);
-        assert!(xml.contains("<CORSConfiguration>"));
+        assert!(
+            xml.contains("<CORSConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">")
+        );
         assert!(xml.contains("<AllowedOrigin>http://example.com</AllowedOrigin>"));
         assert!(xml.contains("<AllowedMethod>GET</AllowedMethod>"));
         assert!(xml.contains("<AllowedMethod>PUT</AllowedMethod>"));
         assert!(xml.contains("<AllowedHeader>*</AllowedHeader>"));
         assert!(xml.contains("<ExposeHeader>x-amz-request-id</ExposeHeader>"));
         assert!(xml.contains("<MaxAgeSeconds>3600</MaxAgeSeconds>"));
+        assert!(xml.contains(
+            "<MaxAgeSeconds>3600</MaxAgeSeconds><ExposeHeader>x-amz-request-id</ExposeHeader><AllowedHeader>*</AllowedHeader>"
+        ));
 
         // Parse it back
         let parsed = parse_cors_config_xml(xml.as_bytes()).unwrap();

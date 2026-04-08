@@ -3045,6 +3045,66 @@ mod tests {
         (addr, ServerGuard(handle))
     }
 
+    fn response_body_complete(buf: &[u8], header_end: usize, headers: &str) -> bool {
+        let body_start = header_end + 4;
+        if let Some(content_length) = headers.lines().find_map(|line| {
+            let lower = line.to_lowercase();
+            lower
+                .strip_prefix("content-length: ")
+                .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+        }) {
+            return buf.len() >= body_start + content_length;
+        }
+
+        let is_chunked = headers.lines().any(|line| {
+            let lower = line.to_lowercase();
+            lower
+                .strip_prefix("transfer-encoding: ")
+                .is_some_and(|value| value.split(',').any(|part| part.trim() == "chunked"))
+        });
+        if !is_chunked {
+            return body_start == buf.len();
+        }
+
+        let mut offset = body_start;
+        while offset < buf.len() {
+            let Some(line_end_rel) = buf[offset..].windows(2).position(|w| w == b"\r\n") else {
+                return false;
+            };
+            let line_end = offset + line_end_rel;
+            let size_line = match std::str::from_utf8(&buf[offset..line_end]) {
+                Ok(line) => line,
+                Err(_) => return false,
+            };
+            let size_hex = size_line.split(';').next().unwrap_or("").trim();
+            let Ok(chunk_size) = usize::from_str_radix(size_hex, 16) else {
+                return false;
+            };
+            offset = line_end + 2;
+            let Some(chunk_end) = offset.checked_add(chunk_size) else {
+                return false;
+            };
+            let Some(chunk_crlf_end) = chunk_end.checked_add(2) else {
+                return false;
+            };
+            if buf.len() < chunk_crlf_end {
+                return false;
+            }
+            if &buf[chunk_end..chunk_crlf_end] != b"\r\n" {
+                return false;
+            }
+            offset = chunk_crlf_end;
+            if chunk_size == 0 {
+                if buf.len() < offset + 2 {
+                    return false;
+                }
+                return &buf[offset..offset + 2] == b"\r\n";
+            }
+        }
+
+        false
+    }
+
     fn read_http_response(stream: &mut StdTcpStream, timeout: Duration) -> String {
         let mut buf = Vec::with_capacity(8192);
         let mut tmp = [0u8; 4096];
@@ -3064,17 +3124,7 @@ mod tests {
             let text = String::from_utf8_lossy(&buf);
             if let Some(header_end) = text.find("\r\n\r\n") {
                 let headers = &text[..header_end];
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        let lower = line.to_lowercase();
-                        lower
-                            .strip_prefix("content-length: ")
-                            .map(|v| v.trim().parse::<usize>().unwrap_or(0))
-                    })
-                    .unwrap_or(0);
-                let body_start = header_end + 4;
-                if buf.len() >= body_start + content_length {
+                if response_body_complete(&buf, header_end, headers) {
                     break;
                 }
             }

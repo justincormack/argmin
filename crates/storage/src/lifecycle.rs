@@ -193,7 +193,7 @@ pub fn parse_lifecycle_configuration_xml(
 #[must_use]
 pub fn render_lifecycle_configuration_xml(config: &BucketLifecycleConfiguration) -> String {
     let mut xml = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
     );
 
@@ -1198,7 +1198,7 @@ mod tests {
         assert!(!rule.filter.explicit_filter);
         assert_eq!(
             render_lifecycle_configuration_xml(&config),
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ID>rule1</ID><Prefix>logs/</Prefix><Status>Enabled</Status><Expiration><Days>7</Days></Expiration></Rule></LifecycleConfiguration>"
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule><ID>rule1</ID><Prefix>logs/</Prefix><Status>Enabled</Status><Expiration><Days>7</Days></Expiration></Rule></LifecycleConfiguration>"
         );
     }
 
