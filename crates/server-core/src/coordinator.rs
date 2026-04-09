@@ -2083,6 +2083,18 @@ pub struct BeginStreamPartRequest<'a> {
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
+/// Parsed request for appending plaintext to a streaming UploadPart session.
+#[derive(Debug)]
+pub struct AppendStreamPartRequest<'a> {
+    pub bucket: &'a str,
+    pub key: &'a str,
+    pub session_id: &'a str,
+    pub part_number: u32,
+    pub segment_index: u32,
+    pub data: &'a [u8],
+    pub sse_customer: Option<&'a SseCustomerRequest>,
+}
+
 impl<'a> BucketRequest<'a> {
     pub fn new(
         name: &'a str,
@@ -9409,6 +9421,27 @@ impl Coordinator {
         self.append_stream_segment(bucket, key, session_id, segment_index, &storage_data)
     }
 
+    pub fn append_stream_part_data(
+        &self,
+        req: &AppendStreamPartRequest<'_>,
+    ) -> Result<(), ServerError> {
+        let write_encryption = self.load_stream_part_write_encryption(
+            req.bucket,
+            req.key,
+            req.session_id,
+            req.part_number,
+            req.sse_customer,
+        )?;
+        let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
+        self.append_stream_segment(
+            req.bucket,
+            req.key,
+            req.session_id,
+            req.segment_index,
+            &storage_data,
+        )
+    }
+
     /// Begin a streaming UploadPart session.
     ///
     /// Creates a `StreamUploadKind::UploadPart` session tied to the given
@@ -10383,6 +10416,15 @@ impl Coordinator {
     }
 
     pub fn abort_stream_put_session(
+        &self,
+        bucket: &str,
+        key: &str,
+        session_id: &str,
+    ) -> Result<(), ServerError> {
+        self.abort_stream_put(bucket, key, session_id)
+    }
+
+    pub fn abort_stream_part_session(
         &self,
         bucket: &str,
         key: &str,

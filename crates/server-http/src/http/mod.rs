@@ -2973,16 +2973,13 @@ impl HttpFrontend {
         };
         let sse_customer_request =
             parse_sse_customer_form_fields(req.transport_security, form_fields)?;
-        let sse_customer = self
-            .coordinator
-            .prepare_sse_customer_write_context(sse_customer_request.as_ref())?;
         let managed_encryption =
-            parse_managed_encryption_form_fields(form_fields, sse_customer.is_some())?;
+            parse_managed_encryption_form_fields(form_fields, sse_customer_request.is_some())?;
 
         let requester = Self::requester_from_auth(effective_auth);
         let acl = parse_put_object_acl(field("acl"));
         let request_encryption = crate::coordinator::WriteEncryptionRequest::from_request_parts(
-            sse_customer.as_ref().map(SseCustomerWriteContext::request),
+            sse_customer_request.as_ref(),
             managed_encryption,
         );
         let prepared_put = self
@@ -2997,7 +2994,7 @@ impl HttpFrontend {
                 )
                 .with_managed_encryption(managed_encryption)
                 .with_sse_customer_algorithm(
-                    sse_customer.as_ref().map(|ctx| ctx.request().algorithm()),
+                    sse_customer_request.as_ref().map(|req| req.algorithm()),
                 )
                 .with_request_object_tags_xml(tags_xml.as_deref()),
                 object_lock: ObjectLockState::default(),
@@ -3045,7 +3042,7 @@ impl HttpFrontend {
                 .map(std::string::ToString::to_string),
             tags_xml,
             managed_encryption,
-            sse_customer,
+            sse_customer: sse_customer_request,
             authorized_write: prepared_put.authorized_write,
         })
     }
@@ -3132,9 +3129,7 @@ impl HttpFrontend {
                 cond: &crate::conditional::WriteCondition::default(),
             },
             &ctx.authorized_write,
-            ctx.sse_customer
-                .as_ref()
-                .map(SseCustomerWriteContext::request),
+            ctx.sse_customer.as_ref(),
         )?;
 
         let mut resp = S3Response::post_object(
@@ -3145,12 +3140,7 @@ impl HttpFrontend {
             ctx.success_redirect.as_deref(),
             ctx.response_location.as_deref(),
         );
-        apply_sse_customer_write_response_headers(
-            &mut resp,
-            ctx.sse_customer
-                .as_ref()
-                .map(SseCustomerWriteContext::request),
-        );
+        apply_sse_customer_write_response_headers(&mut resp, ctx.sse_customer.as_ref());
         Ok(resp)
     }
 
@@ -3177,9 +3167,7 @@ impl HttpFrontend {
             &ctx.binding.session_id,
             segment_index,
             data,
-            ctx.sse_customer
-                .as_ref()
-                .map(SseCustomerWriteContext::request),
+            ctx.sse_customer.as_ref(),
         )
     }
 
@@ -3287,10 +3275,8 @@ impl HttpFrontend {
         }
         let content_md5 = ContentMd5Claim::from_request(req)?;
         let sse_customer_request = parse_sse_customer_request(req)?;
-        let sse_customer = self
-            .coordinator
-            .prepare_sse_customer_write_context(sse_customer_request.as_ref())?;
-        let managed_encryption = parse_managed_encryption_request(req, sse_customer.is_some())?;
+        let managed_encryption =
+            parse_managed_encryption_request(req, sse_customer_request.is_some())?;
 
         // Parse inline tags before starting the session.
         let inline_tags_xml = if let Some(tagging_header) = req.header("x-amz-tagging") {
@@ -3351,7 +3337,7 @@ impl HttpFrontend {
         let acl =
             put_object_write_acl_from_components(req.header("x-amz-acl"), acl_grants.as_ref());
         let request_encryption = crate::coordinator::WriteEncryptionRequest::from_request_parts(
-            sse_customer.as_ref().map(SseCustomerWriteContext::request),
+            sse_customer_request.as_ref(),
             managed_encryption,
         );
         let authorized_write =
@@ -3370,7 +3356,9 @@ impl HttpFrontend {
                         None,
                         parse_put_object_acl(req.header("x-amz-acl")).policy_condition_value(),
                         managed_encryption,
-                        sse_customer.as_ref().map(|ctx| ctx.request().algorithm()),
+                        sse_customer_request
+                            .as_ref()
+                            .map(SseCustomerRequest::algorithm),
                         PutObjectGrantHeaders {
                             grant_read: req.header("x-amz-grant-read"),
                             grant_write: req.header("x-amz-grant-write"),
@@ -3407,7 +3395,7 @@ impl HttpFrontend {
                 response_headers: ChecksumResponseHeaders(checksum_response),
             },
             managed_encryption,
-            sse_customer,
+            sse_customer: sse_customer_request,
             authorized_write,
             streaming_signing: auth.streaming,
         })
@@ -3455,9 +3443,7 @@ impl HttpFrontend {
             session_id,
             segment_index,
             data,
-            ctx.sse_customer
-                .as_ref()
-                .map(SseCustomerWriteContext::request),
+            ctx.sse_customer.as_ref(),
         )
     }
 
@@ -3491,12 +3477,7 @@ impl HttpFrontend {
         )?;
 
         let mut resp = S3Response::put_object(&result);
-        apply_sse_customer_write_response_headers(
-            &mut resp,
-            ctx.sse_customer
-                .as_ref()
-                .map(SseCustomerWriteContext::request),
-        );
+        apply_sse_customer_write_response_headers(&mut resp, ctx.sse_customer.as_ref());
         Self::apply_streaming_put_checksum_headers(ctx, &mut resp, trailer_checksums);
         Ok(resp)
     }
@@ -3537,18 +3518,11 @@ impl HttpFrontend {
                 cond: &ctx.cond,
             },
             &ctx.authorized_write,
-            ctx.sse_customer
-                .as_ref()
-                .map(SseCustomerWriteContext::request),
+            ctx.sse_customer.as_ref(),
         )?;
 
         let mut resp = S3Response::put_object(&result);
-        apply_sse_customer_write_response_headers(
-            &mut resp,
-            ctx.sse_customer
-                .as_ref()
-                .map(SseCustomerWriteContext::request),
-        );
+        apply_sse_customer_write_response_headers(&mut resp, ctx.sse_customer.as_ref());
         Self::apply_streaming_put_checksum_headers(ctx, &mut resp, trailer_checksums);
         Ok(resp)
     }
@@ -3667,23 +3641,19 @@ impl HttpFrontend {
             segment_index,
             data.len()
         );
-        let write_encryption = self.coordinator.load_stream_part_write_encryption(
-            &ctx.binding.object.bucket,
-            &ctx.binding.object.key,
-            &ctx.binding.object.session_id,
-            ctx.binding.part_number,
-            ctx.sse_customer
-                .as_ref()
-                .map(SseCustomerWriteContext::request),
-        )?;
-        let data = write_encryption.encrypt_segment(segment_index, data)?;
-        self.coordinator.append_stream_segment(
-            &ctx.binding.object.bucket,
-            &ctx.binding.object.key,
-            &ctx.binding.object.session_id,
-            segment_index,
-            &data,
-        )
+        self.coordinator
+            .append_stream_part_data(&crate::coordinator::AppendStreamPartRequest {
+                bucket: &ctx.binding.object.bucket,
+                key: &ctx.binding.object.key,
+                session_id: &ctx.binding.object.session_id,
+                part_number: ctx.binding.part_number,
+                segment_index,
+                data,
+                sse_customer: ctx
+                    .sse_customer
+                    .as_ref()
+                    .map(SseCustomerWriteContext::request),
+            })
     }
 
     /// Finalize a streaming `UploadPart` session and return an `S3Response`.
@@ -3798,7 +3768,7 @@ impl HttpFrontend {
             ctx.binding.upload_id,
             ctx.binding.part_number
         );
-        let _ = self.coordinator.abort_stream_put(
+        let _ = self.coordinator.abort_stream_part_session(
             &ctx.binding.object.bucket,
             &ctx.binding.object.key,
             &ctx.binding.object.session_id,
@@ -3860,7 +3830,7 @@ pub struct StreamingPutContext {
     pub object_lock: ObjectLockState,
     pub checksum: StreamingPutChecksumContract,
     pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
-    pub sse_customer: Option<SseCustomerWriteContext>,
+    pub sse_customer: Option<SseCustomerRequest>,
     pub authorized_write: AuthorizedPutObjectWrite,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
     pub streaming_signing: Option<auth::StreamingSigningContext>,
@@ -3882,7 +3852,7 @@ pub struct StreamingPostContext {
     pub checksum_sha256_b64: Option<String>,
     pub tags_xml: Option<String>,
     pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
-    pub sse_customer: Option<SseCustomerWriteContext>,
+    pub sse_customer: Option<SseCustomerRequest>,
     pub authorized_write: AuthorizedPutObjectWrite,
 }
 
@@ -8815,27 +8785,20 @@ mod tests {
         let result = (|| {
             use base64::Engine;
 
-            let write_encryption = fe.coordinator.load_stream_part_write_encryption(
-                bucket,
-                key,
-                &session.session_id,
-                part_number,
-                None,
-            )?;
-            let mut staged = Vec::new();
-
             for (segment_index, chunk) in data
                 .chunks(crate::coordinator::INTERNAL_SEGMENT_SIZE)
                 .enumerate()
             {
-                let chunk = write_encryption.encrypt_segment(segment_index as u32, chunk)?;
-                staged.extend_from_slice(&chunk);
-                fe.coordinator.append_stream_segment(
-                    bucket,
-                    key,
-                    &session.session_id,
-                    segment_index as u32,
-                    &chunk,
+                fe.coordinator.append_stream_part_data(
+                    &crate::coordinator::AppendStreamPartRequest {
+                        bucket,
+                        key,
+                        session_id: &session.session_id,
+                        part_number,
+                        segment_index: segment_index as u32,
+                        data: chunk,
+                        sse_customer: None,
+                    },
                 )?;
             }
             let computed_checksum =
@@ -8850,7 +8813,7 @@ mod tests {
                     upload: MultipartObjectRequest::new(bucket, key, upload_id, requester, None),
                     session_id: &session.session_id,
                     part_number,
-                    crc64: checksum::crc64::checksum(&staged),
+                    crc64: checksum::crc64::checksum(data),
                     total_size: data.len() as u64,
                     claimed_checksum: claimed_checksum.as_ref(),
                     computed_checksum,
@@ -8859,7 +8822,7 @@ mod tests {
         if result.is_err() {
             let _ = fe
                 .coordinator
-                .abort_stream_put(bucket, key, &session.session_id);
+                .abort_stream_part_session(bucket, key, &session.session_id);
         }
         result.unwrap()
     }

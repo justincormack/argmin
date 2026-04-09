@@ -49,22 +49,16 @@ pub fn upload_part(
     })?;
     let session_id = &session.session_id;
     let result = (|| {
-        let write_encryption = coord.load_stream_part_write_encryption(
-            req.upload.bucket_name(),
-            req.upload.key(),
-            session_id,
-            req.part_number,
-            req.sse_customer,
-        )?;
         for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
-            let data = write_encryption.encrypt_segment(idx as u32, chunk)?;
-            coord.append_stream_segment(
-                req.upload.bucket_name(),
-                req.upload.key(),
+            coord.append_stream_part_data(&AppendStreamPartRequest {
+                bucket: req.upload.bucket_name(),
+                key: req.upload.key(),
                 session_id,
-                idx as u32,
-                &data,
-            )?;
+                part_number: req.part_number,
+                segment_index: idx as u32,
+                data: chunk,
+                sse_customer: req.sse_customer,
+            })?;
         }
         let crc = checksum::crc64::checksum(req.data);
         let computed_checksum = {
@@ -91,7 +85,8 @@ pub fn upload_part(
         })
     })();
     if result.is_err() {
-        let _ = coord.abort_stream_put(req.upload.bucket_name(), req.upload.key(), session_id);
+        let _ =
+            coord.abort_stream_part_session(req.upload.bucket_name(), req.upload.key(), session_id);
     }
     result
 }
