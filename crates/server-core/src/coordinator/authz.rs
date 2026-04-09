@@ -962,8 +962,8 @@ impl Coordinator {
         bucket: &str,
         expected_bucket_owner: Option<&str>,
         action: auth::PolicyAction,
-    ) -> Result<BucketSummary, ServerError> {
-        let info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
+    ) -> Result<ValidatedBucket, ServerError> {
+        let info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
         let bucket_policy = self.cached_bucket_policy(&info)?;
         if Self::requester_can_bucket_action_with_bucket_policy(
             requester,
@@ -982,7 +982,7 @@ impl Coordinator {
         &self,
         req: &R,
         action: auth::PolicyAction,
-    ) -> Result<BucketSummary, ServerError>
+    ) -> Result<ValidatedBucket, ServerError>
     where
         R: BucketScopedAuthorizationRequest + ?Sized,
     {
@@ -1113,6 +1113,14 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
         Ok(())
+    }
+
+    pub(super) fn validate_expected_bucket_owner(
+        bucket: BucketSummary,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<ValidatedBucket, ServerError> {
+        Self::ensure_expected_bucket_owner(&bucket, expected_bucket_owner)?;
+        Ok(ValidatedBucket(bucket))
     }
 
     pub(super) fn requester_principal_required(requester: &Requester) -> Result<&str, ServerError> {
@@ -1394,8 +1402,10 @@ impl Coordinator {
         policy_action: auth::PolicyAction,
         request_object_tags_xml: Option<&str>,
     ) -> Result<LockedReadObject<'a>, ServerError> {
-        let bucket_info = self
-            .active_bucket_summary(object.object.bucket_name(), object.expected_bucket_owner())?;
+        let bucket_info = self.checked_active_bucket_summary(
+            object.object.bucket_name(),
+            object.expected_bucket_owner(),
+        )?;
         let can_discover_missing = Self::requester_can_bucket_admin(
             object.object.requester(),
             &bucket_info.owner_principal,
@@ -1437,8 +1447,8 @@ impl Coordinator {
         version_id: Option<VersionId>,
         authorization: ObjectAclAuthorization,
         expected_bucket_owner: Option<&str>,
-    ) -> Result<(BucketSummary, LockedReadObject<'a>), ServerError> {
-        let bucket_info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
+    ) -> Result<(ValidatedBucket, LockedReadObject<'a>), ServerError> {
+        let bucket_info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
         let can_discover_missing =
             Self::requester_can_discover_missing_object_acl(requester, &bucket_info);
         let bucket_policy = match authorization {
@@ -1488,8 +1498,8 @@ impl Coordinator {
         requester: &Requester,
         bucket: &str,
         expected_bucket_owner: Option<&str>,
-    ) -> Result<BucketSummary, ServerError> {
-        let info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
+    ) -> Result<ValidatedBucket, ServerError> {
+        let info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
         if Self::requester_can_read_bucket(
             requester,
             &info,
@@ -1503,7 +1513,10 @@ impl Coordinator {
         }
     }
 
-    pub(super) fn authorize_bucket_read_for<R>(&self, req: &R) -> Result<BucketSummary, ServerError>
+    pub(super) fn authorize_bucket_read_for<R>(
+        &self,
+        req: &R,
+    ) -> Result<ValidatedBucket, ServerError>
     where
         R: BucketScopedAuthorizationRequest + ?Sized,
     {
@@ -1519,8 +1532,8 @@ impl Coordinator {
         requester: &Requester,
         bucket: &str,
         expected_bucket_owner: Option<&str>,
-    ) -> Result<BucketSummary, ServerError> {
-        let info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
+    ) -> Result<ValidatedBucket, ServerError> {
+        let info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
         if Self::requester_can_bucket_admin(requester, &info.owner_principal) {
             Ok(info)
         } else {
@@ -1531,7 +1544,7 @@ impl Coordinator {
     pub(super) fn authorize_bucket_admin_for<R>(
         &self,
         req: &R,
-    ) -> Result<BucketSummary, ServerError>
+    ) -> Result<ValidatedBucket, ServerError>
     where
         R: BucketScopedAuthorizationRequest + ?Sized,
     {
@@ -1624,7 +1637,7 @@ impl Coordinator {
         version_id: Option<VersionId>,
         expected_bucket_owner: Option<&str>,
     ) -> Result<LockedReadObject<'a>, ServerError> {
-        let bucket_info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
+        let bucket_info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
         let can_read_bucket = Self::requester_can_discover_missing_object(requester, &bucket_info);
         let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
             Ok(locked) => locked,
@@ -1652,7 +1665,7 @@ impl Coordinator {
         policy_action: auth::PolicyAction,
         expected_bucket_owner: Option<&str>,
     ) -> Result<LockedReadObject<'a>, ServerError> {
-        let bucket_info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
+        let bucket_info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
         let can_read_bucket = Self::requester_can_discover_missing_object(requester, &bucket_info);
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {

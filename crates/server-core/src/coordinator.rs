@@ -140,6 +140,23 @@ pub struct BucketSummary {
     pub encryption: EffectiveBucketEncryptionConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ValidatedBucket(BucketSummary);
+
+impl ValidatedBucket {
+    fn into_inner(self) -> BucketSummary {
+        self.0
+    }
+}
+
+impl std::ops::Deref for ValidatedBucket {
+    type Target = BucketSummary;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 /// Result of a GetBucketAcl operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GetBucketAclResult {
@@ -1477,7 +1494,7 @@ pub struct CopySource<'a> {
     pub key: &'a str,
     pub version_id: Option<VersionId>,
     pub condition: &'a ReadCondition,
-    pub expected_bucket_owner: Option<&'a str>,
+    expected_bucket_owner: Option<&'a str>,
 }
 
 /// Parsed CopyObject request from the HTTP layer.
@@ -1504,6 +1521,28 @@ pub struct UploadPartCopyRequest<'a> {
     pub copy_source_range: Option<(u64, u64)>,
     pub source_sse_customer: Option<&'a SseCustomerRequest>,
     pub sse_customer: Option<&'a SseCustomerRequest>,
+}
+
+impl<'a> CopySource<'a> {
+    pub fn new(
+        bucket: &'a str,
+        key: &'a str,
+        version_id: Option<VersionId>,
+        condition: &'a ReadCondition,
+        expected_bucket_owner: Option<&'a str>,
+    ) -> Self {
+        Self {
+            bucket,
+            key,
+            version_id,
+            condition,
+            expected_bucket_owner,
+        }
+    }
+
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.expected_bucket_owner
+    }
 }
 
 /// Explicit caller-selected encryption for write APIs before bucket-default
@@ -1847,7 +1886,7 @@ pub struct ListBucketsRequest {
 pub struct BucketRequest<'a> {
     pub name: &'a str,
     pub requester: Requester,
-    pub expected_bucket_owner: Option<&'a str>,
+    expected_bucket_owner: Option<&'a str>,
 }
 
 /// Request for an object-scoped operation.
@@ -2140,7 +2179,7 @@ impl<'a> BucketRequest<'a> {
         &self.requester
     }
 
-    pub fn expected_bucket_owner(&self) -> Option<&str> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
         self.expected_bucket_owner
     }
 }
@@ -2196,7 +2235,7 @@ impl<'a> ObjectRequest<'a> {
         self.bucket.requester()
     }
 
-    pub fn expected_bucket_owner(&self) -> Option<&str> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
         self.bucket.expected_bucket_owner()
     }
 }
@@ -2261,7 +2300,7 @@ impl<'a> ObjectVersionRequest<'a> {
         self.object.requester()
     }
 
-    pub fn expected_bucket_owner(&self) -> Option<&str> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
         self.object.expected_bucket_owner()
     }
 }
@@ -2326,7 +2365,7 @@ impl<'a> MultipartObjectRequest<'a> {
         self.object.requester()
     }
 
-    pub fn expected_bucket_owner(&self) -> Option<&str> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
         self.object.expected_bucket_owner()
     }
 }
@@ -2346,12 +2385,6 @@ impl ExpectedBucketOwnerRequest for MultipartObjectRequest<'_> {
 impl BucketScopedAuthorizationRequest for MultipartObjectRequest<'_> {
     fn requester(&self) -> &Requester {
         MultipartObjectRequest::requester(self)
-    }
-}
-
-impl<'a> CopySource<'a> {
-    fn expected_bucket_owner(&self) -> Option<&str> {
-        self.expected_bucket_owner
     }
 }
 
@@ -4905,7 +4938,10 @@ impl Coordinator {
         self.authorize_put_object_write(req)
     }
 
-    fn acquire_bucket_write_reservation(&self, bucket: &str) -> Result<BucketSummary, ServerError> {
+    fn unchecked_bucket_write_reservation(
+        &self,
+        bucket: &str,
+    ) -> Result<BucketSummary, ServerError> {
         loop {
             let bucket_pg = self.get_bucket_pg(bucket)?;
             match bucket_pg.acquire_bucket_write_reservation(bucket) {
@@ -4939,12 +4975,12 @@ impl Coordinator {
             })
     }
 
-    fn with_bucket_write_reservation<T>(
+    fn with_unchecked_bucket_write_reservation<T>(
         &self,
         bucket: &str,
         action: impl FnOnce(BucketSummary) -> Result<T, ServerError>,
     ) -> Result<T, ServerError> {
-        let bucket_info = self.acquire_bucket_write_reservation(bucket)?;
+        let bucket_info = self.unchecked_bucket_write_reservation(bucket)?;
         let result = action(bucket_info);
         let release_result = self.release_bucket_write_reservation(bucket);
         match (result, release_result) {
@@ -4958,14 +4994,15 @@ impl Coordinator {
     fn with_bucket_write_reservation_for<R, T>(
         &self,
         req: &R,
-        action: impl FnOnce(BucketSummary) -> Result<T, ServerError>,
+        action: impl FnOnce(ValidatedBucket) -> Result<T, ServerError>,
     ) -> Result<T, ServerError>
     where
         R: BucketScopedRequest + ?Sized,
     {
         let expected_bucket_owner = req.expected_bucket_owner();
-        self.with_bucket_write_reservation(req.bucket_name(), |bucket_info| {
-            Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
+        self.with_unchecked_bucket_write_reservation(req.bucket_name(), |bucket_info| {
+            let bucket_info =
+                Self::validate_expected_bucket_owner(bucket_info, expected_bucket_owner)?;
             action(bucket_info)
         })
     }
@@ -5099,16 +5136,10 @@ impl Coordinator {
         }
     }
 
-    fn active_bucket_summary(
-        &self,
-        name: &str,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<BucketSummary, ServerError> {
+    fn unchecked_active_bucket_summary(&self, name: &str) -> Result<BucketSummary, ServerError> {
         if let Some(info) = self.storage_node.get_bucket_fast_path(name) {
             if info.state == BucketState::Active {
-                let bucket = Self::bucket_summary_fast(info);
-                Self::ensure_expected_bucket_owner(&bucket, expected_bucket_owner)?;
-                return Ok(bucket);
+                return Ok(Self::bucket_summary_fast(info));
             }
             return Err(ServerError::BucketNotFound {
                 name: name.to_string(),
@@ -5123,16 +5154,25 @@ impl Coordinator {
             other => ServerError::Metadata(other),
         })?;
         self.storage_node.upsert_bucket_fast_path((&info).into());
-        let bucket = Self::bucket_summary(info);
-        Self::ensure_expected_bucket_owner(&bucket, expected_bucket_owner)?;
-        Ok(bucket)
+        Ok(Self::bucket_summary(info))
     }
 
-    fn active_bucket_summary_for<R>(&self, req: &R) -> Result<BucketSummary, ServerError>
+    fn checked_active_bucket_summary(
+        &self,
+        name: &str,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<ValidatedBucket, ServerError> {
+        Self::validate_expected_bucket_owner(
+            self.unchecked_active_bucket_summary(name)?,
+            expected_bucket_owner,
+        )
+    }
+
+    fn active_bucket_summary_for<R>(&self, req: &R) -> Result<ValidatedBucket, ServerError>
     where
         R: BucketScopedRequest + ?Sized,
     {
-        self.active_bucket_summary(req.bucket_name(), req.expected_bucket_owner())
+        self.checked_active_bucket_summary(req.bucket_name(), req.expected_bucket_owner())
     }
 
     /// Create a new coordinator.
@@ -5368,7 +5408,7 @@ impl Coordinator {
                 {
                     return Err(ServerError::BucketAlreadyOwnedByYou);
                 }
-                let existing = self.active_bucket_summary(req.name, None)?;
+                let existing = self.unchecked_active_bucket_summary(req.name)?;
                 let resolved =
                     self.resolve_create_bucket_recreate_acl_update(&existing, &owner, &req.acl)?;
                 self.apply_bucket_acl_update(req.name, &resolved)
@@ -5624,6 +5664,7 @@ impl Coordinator {
             req.name
         );
         self.authorize_bucket_read_for(req)
+            .map(ValidatedBucket::into_inner)
     }
 
     pub fn bucket_exists(&self, name: &str) -> Result<bool, ServerError> {
@@ -5633,7 +5674,7 @@ impl Coordinator {
             "bucket={:?}",
             name
         );
-        match self.active_bucket_summary(name, None) {
+        match self.unchecked_active_bucket_summary(name) {
             Ok(_) => Ok(true),
             Err(ServerError::BucketNotFound { .. }) => Ok(false),
             Err(err) => Err(err),
@@ -6411,7 +6452,7 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let bucket = self.active_bucket_summary(req.name, req.expected_bucket_owner())?;
+        let bucket = self.checked_active_bucket_summary(req.name, req.expected_bucket_owner())?;
         if !Self::requester_can_read_bucket_acl(&req.requester, &bucket) {
             return Err(ServerError::AccessDenied);
         }
@@ -6426,6 +6467,7 @@ impl Coordinator {
                 )]),
             });
         }
+        let bucket = bucket.into_inner();
         Ok(GetBucketAclResult {
             owner_principal: bucket.owner_principal,
             owner_canonical_id: bucket.owner_canonical_id,
@@ -6459,8 +6501,8 @@ impl Coordinator {
         &self,
         req: &PutBucketAclRequest<'_>,
     ) -> Result<ResolvedBucketAclUpdate, ServerError> {
-        let bucket_info =
-            self.active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
+        let bucket_info = self
+            .checked_active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
         if !Self::requester_can_write_bucket_acl(&req.bucket.requester, &bucket_info) {
             return Err(ServerError::AccessDenied);
         }
@@ -6741,13 +6783,13 @@ impl Coordinator {
         expected_bucket_owner: Option<&str>,
     ) -> Result<
         (
-            BucketSummary,
+            ValidatedBucket,
             Option<Arc<auth::BucketPolicy>>,
             LockedReadObject<'a>,
         ),
         ServerError,
     > {
-        let bucket_info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
+        let bucket_info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
         let can_discover_missing =
             Self::requester_can_bucket_admin(requester, &bucket_info.owner_principal);
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
@@ -7957,7 +7999,8 @@ impl Coordinator {
             });
         }
 
-        let bucket_info = self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+        let bucket_info =
+            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
 
         // Lock metadata PG and validate upload exists.
@@ -9315,7 +9358,7 @@ impl Coordinator {
             let result_last_modified = dst_stored.last_modified();
             drop(dst_meta_pg);
             let dst_bucket_info =
-                self.active_bucket_summary(dst_bucket, req.expected_bucket_owner())?;
+                self.checked_active_bucket_summary(dst_bucket, req.expected_bucket_owner())?;
             let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
                 &dst_bucket_info,
                 dst_key,
@@ -10051,7 +10094,7 @@ impl Coordinator {
             drop(pgs);
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 let lifecycle_bucket =
-                    self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                    self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
                 self.current_object_lifecycle_expiration(
                     &lifecycle_bucket,
                     key,
@@ -10118,7 +10161,7 @@ impl Coordinator {
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 let lifecycle_bucket =
-                    self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                    self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
                 self.current_object_lifecycle_expiration(
                     &lifecycle_bucket,
                     key,
@@ -10265,7 +10308,7 @@ impl Coordinator {
             drop(pgs);
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 let lifecycle_bucket =
-                    self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                    self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
                 self.current_object_lifecycle_expiration(
                     &lifecycle_bucket,
                     key,
@@ -10334,7 +10377,7 @@ impl Coordinator {
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 let lifecycle_bucket =
-                    self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                    self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
                 self.current_object_lifecycle_expiration(
                     &lifecycle_bucket,
                     key,
@@ -10437,7 +10480,7 @@ impl Coordinator {
             drop(pgs);
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 let lifecycle_bucket =
-                    self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                    self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
                 self.current_object_lifecycle_expiration(
                     &lifecycle_bucket,
                     key,
@@ -10507,7 +10550,7 @@ impl Coordinator {
             drop(pgs);
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 let lifecycle_bucket =
-                    self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                    self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
                 self.current_object_lifecycle_expiration(
                     &lifecycle_bucket,
                     key,
@@ -10601,7 +10644,7 @@ impl Coordinator {
         drop(pgs);
         let lifecycle_expiration = if emit_lifecycle_expiration {
             let lifecycle_bucket =
-                self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
             self.current_object_lifecycle_expiration(
                 &lifecycle_bucket,
                 key,
@@ -10948,7 +10991,7 @@ impl Coordinator {
         };
         let lifecycle_expiration = if emit_lifecycle_expiration {
             let lifecycle_bucket =
-                self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
             self.current_object_lifecycle_expiration(
                 &lifecycle_bucket,
                 key,
@@ -10997,7 +11040,8 @@ impl Coordinator {
         let request_version_id = req.object.version_id;
         let cond = req.cond;
         let requester = req.object.requester();
-        let bucket_info = self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+        let bucket_info =
+            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
 
         match (bucket_info.versioning, request_version_id) {
@@ -11406,7 +11450,8 @@ impl Coordinator {
         let delimiter = req.delimiter;
         let continuation_token = req.continuation_token;
         let max_keys = req.max_keys.min(S3_MAX_LIST_KEYS);
-        let bucket_info = self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+        let bucket_info =
+            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_list_bucket_with_bucket_policy(
             &req.bucket.requester,
@@ -11415,6 +11460,8 @@ impl Coordinator {
         ) {
             return Err(ServerError::AccessDenied);
         }
+        let owner_principal = bucket_info.owner_principal.clone();
+        let owner_canonical_id = bucket_info.owner_canonical_id.clone();
 
         // MaxKeys=0 is valid per S3 spec: return empty result
         if max_keys == 0 {
@@ -11423,8 +11470,8 @@ impl Coordinator {
                 common_prefixes: Vec::new(),
                 is_truncated: false,
                 next_continuation_token: None,
-                owner_principal: bucket_info.owner_principal,
-                owner_canonical_id: bucket_info.owner_canonical_id,
+                owner_principal,
+                owner_canonical_id,
             });
         }
 
@@ -11494,8 +11541,8 @@ impl Coordinator {
                 common_prefixes: Vec::new(),
                 is_truncated,
                 next_continuation_token: next_token,
-                owner_principal: bucket_info.owner_principal,
-                owner_canonical_id: bucket_info.owner_canonical_id,
+                owner_principal,
+                owner_canonical_id,
             });
         }
 
@@ -11673,8 +11720,8 @@ impl Coordinator {
             common_prefixes,
             is_truncated,
             next_continuation_token: next_token,
-            owner_principal: bucket_info.owner_principal,
-            owner_canonical_id: bucket_info.owner_canonical_id,
+            owner_principal,
+            owner_canonical_id,
         })
     }
 
@@ -11696,6 +11743,8 @@ impl Coordinator {
         let key_marker = req.key_marker;
         let version_id_marker = req.version_id_marker;
         let bucket_info = self.authorize_bucket_read_for(&req.bucket)?;
+        let owner_principal = bucket_info.owner_principal.clone();
+        let owner_canonical_id = bucket_info.owner_canonical_id.clone();
 
         if max_keys == 0 {
             return Ok(ListObjectVersionsResult {
@@ -11703,8 +11752,8 @@ impl Coordinator {
                 is_truncated: false,
                 next_key_marker: None,
                 next_version_id_marker: None,
-                owner_principal: bucket_info.owner_principal,
-                owner_canonical_id: bucket_info.owner_canonical_id,
+                owner_principal,
+                owner_canonical_id,
             });
         }
 
@@ -11823,8 +11872,8 @@ impl Coordinator {
             is_truncated,
             next_key_marker,
             next_version_id_marker,
-            owner_principal: bucket_info.owner_principal,
-            owner_canonical_id: bucket_info.owner_canonical_id,
+            owner_principal,
+            owner_canonical_id,
         })
     }
 
@@ -11844,7 +11893,7 @@ impl Coordinator {
         let bucket = req.bucket.name;
         let entries = req.entries;
         let requester = &req.bucket.requester;
-        self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+        self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
 
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
@@ -12023,7 +12072,7 @@ impl Coordinator {
         let source_sse_customer = req.source_sse_customer;
 
         let dst_bucket_info =
-            self.active_bucket_summary(dst_bucket, req.expected_bucket_owner())?;
+            self.checked_active_bucket_summary(dst_bucket, req.expected_bucket_owner())?;
         let dst_bucket_policy = self.cached_bucket_policy(&dst_bucket_info)?;
         let dst_meta_pg = self
             .storage_node
@@ -12768,7 +12817,8 @@ impl Coordinator {
         let bucket = req.object.bucket_name();
         let key = req.object.key;
         let upload_id = req.upload_id;
-        let bucket_info = self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+        let bucket_info =
+            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
         // 1. Lock meta PG and validate upload.
         let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
         match meta_pg.get_multipart_upload(upload_id) {
@@ -12838,7 +12888,8 @@ impl Coordinator {
         let upload_id = req.upload.upload_id;
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
-        let bucket_info = self.active_bucket_summary(bucket, req.expected_bucket_owner())?;
+        let bucket_info =
+            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
         // 1. Lock meta PG and validate upload.
         let meta_pg_id = self.object_pg_id(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
@@ -14091,7 +14142,7 @@ mod tests {
     fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
         for _ in 0..200 {
             if matches!(
-                coord.active_bucket_summary(name, None),
+                coord.unchecked_active_bucket_summary(name),
                 Err(ServerError::BucketNotFound { .. })
             ) {
                 let bucket_pg = coord.get_bucket_pg(name).unwrap();
@@ -14515,7 +14566,9 @@ mod tests {
             .unwrap();
 
         // Head
-        let info = coord.active_bucket_summary("test-bucket", None).unwrap();
+        let info = coord
+            .unchecked_active_bucket_summary("test-bucket")
+            .unwrap();
         assert_eq!(info.name, "test-bucket");
 
         // List
@@ -14528,7 +14581,9 @@ mod tests {
 
         // Delete
         delete_bucket_test(&coord, "test-bucket").unwrap();
-        assert!(coord.active_bucket_summary("test-bucket", None).is_err());
+        assert!(coord
+            .unchecked_active_bucket_summary("test-bucket")
+            .is_err());
     }
 
     #[test]
@@ -18328,7 +18383,7 @@ mod tests {
             })
             .unwrap();
 
-        let bucket = coord.active_bucket_summary("bucket", None).unwrap();
+        let bucket = coord.unchecked_active_bucket_summary("bucket").unwrap();
         assert_eq!(bucket.owner_principal, "owner-a");
         assert_eq!(bucket.owner_canonical_id, owner_canonical_id);
     }
@@ -24078,7 +24133,7 @@ mod tests {
                 test_helpers::requester("owner-a"), None)
             .unwrap();
 
-        let bucket = coord.active_bucket_summary("bucket", None).unwrap();
+        let bucket = coord.unchecked_active_bucket_summary("bucket").unwrap();
         let policy = coord.cached_bucket_policy(&bucket).unwrap();
         let decision = Coordinator::bucket_policy_decision_for_put_object_action(
             &test_helpers::requester("other-user"),
@@ -24108,7 +24163,7 @@ mod tests {
                 test_helpers::requester("owner-a"), None)
             .unwrap();
 
-        let bucket = coord.active_bucket_summary("bucket", None).unwrap();
+        let bucket = coord.unchecked_active_bucket_summary("bucket").unwrap();
         let policy = coord.cached_bucket_policy(&bucket).unwrap();
         let decision = Coordinator::bucket_policy_decision_for_put_object_action(
             &test_helpers::requester("other-user"),
@@ -30162,7 +30217,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let bucket = coord.active_bucket_summary("bucket", None).unwrap();
+        let bucket = coord.unchecked_active_bucket_summary("bucket").unwrap();
         let before = Coordinator::current_unix_seconds().unwrap();
         let resolved = Coordinator::resolve_new_object_lock_state(
             &bucket,
@@ -30210,7 +30265,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let bucket = coord.active_bucket_summary("bucket", None).unwrap();
+        let bucket = coord.unchecked_active_bucket_summary("bucket").unwrap();
         let explicit = ObjectLockState {
             retention: Some(ObjectRetention {
                 mode: ObjectLockMode::Compliance,
@@ -30230,7 +30285,7 @@ mod tests {
         coord
             .create_bucket_for_owner("owner-a", "bucket", false)
             .unwrap();
-        let bucket = coord.active_bucket_summary("bucket", None).unwrap();
+        let bucket = coord.unchecked_active_bucket_summary("bucket").unwrap();
         let err = Coordinator::validate_requested_object_lock_state(
             &bucket,
             ObjectLockState {
@@ -30262,7 +30317,7 @@ mod tests {
             })
             .unwrap();
 
-        let bucket = coord.active_bucket_summary("bucket", None).unwrap();
+        let bucket = coord.unchecked_active_bucket_summary("bucket").unwrap();
         let now = Coordinator::current_unix_seconds().unwrap();
         let err = Coordinator::validate_requested_object_lock_state(
             &bucket,
@@ -33476,7 +33531,7 @@ mod tests {
 
         delete_bucket_test(&coord, "bucket").unwrap();
         assert!(matches!(
-            coord.active_bucket_summary("bucket", None),
+            coord.unchecked_active_bucket_summary("bucket"),
             Err(ServerError::BucketNotFound { .. })
         ));
 
@@ -33566,7 +33621,7 @@ mod tests {
 
         delete_bucket_test(&deleter, "bucket").unwrap();
         assert!(matches!(
-            deleter.active_bucket_summary("bucket", None),
+            deleter.unchecked_active_bucket_summary("bucket"),
             Err(ServerError::BucketNotFound { .. })
         ));
         assert!(matches!(

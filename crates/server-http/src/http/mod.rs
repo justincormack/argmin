@@ -903,33 +903,33 @@ impl HttpFrontend {
             S3Operation::DeleteBucket { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
-                    .delete_bucket(&crate::coordinator::BucketRequest {
-                        name: &bucket,
+                    .delete_bucket(&crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    })?;
+                    ))?;
                 Ok(S3Response::delete_bucket())
             }
             S3Operation::HeadBucket { bucket } => {
                 let requester = Self::requester_from_auth(auth);
-                let info = self
-                    .coordinator
-                    .head_bucket(&crate::coordinator::BucketRequest {
-                        name: &bucket,
-                        requester,
-                        expected_bucket_owner,
-                    })?;
+                let info =
+                    self.coordinator
+                        .head_bucket(&crate::coordinator::BucketRequest::new(
+                            &bucket,
+                            requester,
+                            expected_bucket_owner,
+                        ))?;
                 Ok(S3Response::head_bucket(&info, self.coordinator.region()))
             }
             S3Operation::GetBucketLocation { bucket } => {
                 let requester = Self::requester_from_auth(auth);
-                let _info = self
-                    .coordinator
-                    .head_bucket(&crate::coordinator::BucketRequest {
-                        name: &bucket,
-                        requester,
-                        expected_bucket_owner,
-                    })?;
+                let _info =
+                    self.coordinator
+                        .head_bucket(&crate::coordinator::BucketRequest::new(
+                            &bucket,
+                            requester,
+                            expected_bucket_owner,
+                        ))?;
                 Ok(S3Response::get_bucket_location(self.coordinator.region()))
             }
             S3Operation::ListObjectsV1 { bucket } => {
@@ -1110,13 +1110,13 @@ impl HttpFrontend {
                         destination_managed_encryption,
                     );
                     let result = self.coordinator.copy_object(&CopyObjectRequest {
-                        source: CopySource {
-                            bucket: &src_bucket,
-                            key: &src_key,
-                            version_id: src_version_id,
-                            condition: &src_cond,
-                            expected_bucket_owner: expected_source_bucket_owner(req),
-                        },
+                        source: CopySource::new(
+                            &src_bucket,
+                            &src_key,
+                            src_version_id,
+                            &src_cond,
+                            expected_source_bucket_owner(req),
+                        ),
                         destination: ObjectRequest::new(
                             &bucket,
                             &key,
@@ -1602,11 +1602,11 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_versioning(
                     &crate::coordinator::PutBucketVersioningRequest {
-                        bucket: crate::coordinator::BucketRequest {
-                            name: &bucket,
+                        bucket: crate::coordinator::BucketRequest::new(
+                            &bucket,
                             requester,
                             expected_bucket_owner,
-                        },
+                        ),
                         state: versioning_state,
                     },
                 )?;
@@ -1614,13 +1614,13 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketVersioning { bucket } => {
                 let requester = Self::requester_from_auth(auth);
-                let state =
-                    self.coordinator
-                        .get_bucket_versioning(&crate::coordinator::BucketRequest {
-                            name: &bucket,
-                            requester,
-                            expected_bucket_owner,
-                        })?;
+                let state = self.coordinator.get_bucket_versioning(
+                    &crate::coordinator::BucketRequest::new(
+                        &bucket,
+                        requester,
+                        expected_bucket_owner,
+                    ),
+                )?;
                 Ok(S3Response::get_bucket_versioning(state))
             }
             S3Operation::PutBucketObjectLockConfiguration { bucket } => {
@@ -1632,11 +1632,11 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_object_lock_configuration(
                     &crate::coordinator::PutBucketObjectLockConfigurationRequest {
-                        bucket: crate::coordinator::BucketRequest {
-                            name: &bucket,
+                        bucket: crate::coordinator::BucketRequest::new(
+                            &bucket,
                             requester,
                             expected_bucket_owner,
-                        },
+                        ),
                         config,
                     },
                 )?;
@@ -1645,11 +1645,11 @@ impl HttpFrontend {
             S3Operation::GetBucketObjectLockConfiguration { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 let config = self.coordinator.get_bucket_object_lock_configuration(
-                    &crate::coordinator::BucketRequest {
-                        name: &bucket,
+                    &crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    },
+                    ),
                 )?;
                 Ok(S3Response::get_bucket_object_lock_configuration(config))
             }
@@ -1659,11 +1659,11 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_encryption(
                     &crate::coordinator::PutBucketEncryptionRequest {
-                        bucket: crate::coordinator::BucketRequest {
-                            name: &bucket,
+                        bucket: crate::coordinator::BucketRequest::new(
+                            &bucket,
                             requester,
                             expected_bucket_owner,
-                        },
+                        ),
                         config,
                     },
                 )?;
@@ -1671,23 +1671,24 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketEncryption { bucket } => {
                 let requester = Self::requester_from_auth(auth);
-                let config =
-                    self.coordinator
-                        .get_bucket_encryption(&crate::coordinator::BucketRequest {
-                            name: &bucket,
-                            requester,
-                            expected_bucket_owner,
-                        })?;
+                let config = self.coordinator.get_bucket_encryption(
+                    &crate::coordinator::BucketRequest::new(
+                        &bucket,
+                        requester,
+                        expected_bucket_owner,
+                    ),
+                )?;
                 Ok(S3Response::get_bucket_encryption(config))
             }
             S3Operation::DeleteBucketEncryption { bucket } => {
                 let requester = Self::requester_from_auth(auth);
-                self.coordinator
-                    .delete_bucket_encryption(&crate::coordinator::BucketRequest {
-                        name: &bucket,
+                self.coordinator.delete_bucket_encryption(
+                    &crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    })?;
+                    ),
+                )?;
                 Ok(S3Response::delete_bucket_encryption())
             }
             S3Operation::PostObject { .. } => {
@@ -1707,11 +1708,11 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .put_bucket_cors(&crate::coordinator::PutBucketConfigRequest {
-                        bucket: crate::coordinator::BucketRequest {
-                            name: &bucket,
+                        bucket: crate::coordinator::BucketRequest::new(
+                            &bucket,
                             requester,
                             expected_bucket_owner,
-                        },
+                        ),
                         config: &config_xml,
                     })?;
                 Ok(S3Response::put_bucket_cors())
@@ -1720,11 +1721,11 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 match self
                     .coordinator
-                    .get_bucket_cors(&crate::coordinator::BucketRequest {
-                        name: &bucket,
+                    .get_bucket_cors(&crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    })? {
+                    ))? {
                     Some(config_xml) => Ok(S3Response::get_bucket_cors(&config_xml)),
                     None => Err(ServerError::NoSuchCorsConfiguration {
                         bucket: bucket.clone(),
@@ -1734,11 +1735,11 @@ impl HttpFrontend {
             S3Operation::DeleteBucketCors { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
-                    .delete_bucket_cors(&crate::coordinator::BucketRequest {
-                        name: &bucket,
+                    .delete_bucket_cors(&crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    })?;
+                    ))?;
                 Ok(S3Response::delete_bucket_cors())
             }
             S3Operation::PutBucketTagging { bucket } => {
@@ -1751,11 +1752,11 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .put_bucket_tags(&crate::coordinator::PutBucketConfigRequest {
-                        bucket: crate::coordinator::BucketRequest {
-                            name: &bucket,
+                        bucket: crate::coordinator::BucketRequest::new(
+                            &bucket,
                             requester,
                             expected_bucket_owner,
-                        },
+                        ),
                         config: &tags_xml,
                     })?;
                 Ok(S3Response::put_bucket_tagging())
@@ -1764,11 +1765,11 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 match self
                     .coordinator
-                    .get_bucket_tags(&crate::coordinator::BucketRequest {
-                        name: &bucket,
+                    .get_bucket_tags(&crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    })? {
+                    ))? {
                     Some(tags_xml) => Ok(S3Response::get_bucket_tagging(&tags_xml)),
                     None => Err(ServerError::NoSuchTagSet {
                         resource: bucket.clone(),
@@ -1778,11 +1779,11 @@ impl HttpFrontend {
             S3Operation::DeleteBucketTagging { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
-                    .delete_bucket_tags(&crate::coordinator::BucketRequest {
-                        name: &bucket,
+                    .delete_bucket_tags(&crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    })?;
+                    ))?;
                 Ok(S3Response::delete_bucket_tagging())
             }
             S3Operation::PutBucketLifecycle { bucket } => {
@@ -1794,11 +1795,11 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_lifecycle(
                     &crate::coordinator::PutBucketConfigRequest {
-                        bucket: crate::coordinator::BucketRequest {
-                            name: &bucket,
+                        bucket: crate::coordinator::BucketRequest::new(
+                            &bucket,
                             requester,
                             expected_bucket_owner,
-                        },
+                        ),
                         config: &config_xml,
                     },
                 )?;
@@ -1806,13 +1807,13 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketLifecycle { bucket } => {
                 let requester = Self::requester_from_auth(auth);
-                match self
-                    .coordinator
-                    .get_bucket_lifecycle(&crate::coordinator::BucketRequest {
-                        name: &bucket,
+                match self.coordinator.get_bucket_lifecycle(
+                    &crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    })? {
+                    ),
+                )? {
                     Some(config_xml) => Ok(S3Response::get_bucket_lifecycle(&config_xml)),
                     None => Err(ServerError::NoSuchLifecycleConfiguration {
                         bucket: bucket.clone(),
@@ -1821,12 +1822,13 @@ impl HttpFrontend {
             }
             S3Operation::DeleteBucketLifecycle { bucket } => {
                 let requester = Self::requester_from_auth(auth);
-                self.coordinator
-                    .delete_bucket_lifecycle(&crate::coordinator::BucketRequest {
-                        name: &bucket,
+                self.coordinator.delete_bucket_lifecycle(
+                    &crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    })?;
+                    ),
+                )?;
                 Ok(S3Response::delete_bucket_lifecycle())
             }
             S3Operation::PutObjectRetention { bucket, key } => {
@@ -2031,11 +2033,11 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_public_access_block(
                     &crate::coordinator::PutBucketConfigRequest {
-                        bucket: crate::coordinator::BucketRequest {
-                            name: &bucket,
+                        bucket: crate::coordinator::BucketRequest::new(
+                            &bucket,
                             requester,
                             expected_bucket_owner,
-                        },
+                        ),
                         config: &config_xml,
                     },
                 )?;
@@ -2044,11 +2046,11 @@ impl HttpFrontend {
             S3Operation::GetBucketPublicAccessBlock { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 match self.coordinator.get_bucket_public_access_block(
-                    &crate::coordinator::BucketRequest {
-                        name: &bucket,
+                    &crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    },
+                    ),
                 )? {
                     Some(config_xml) => Ok(S3Response::get_bucket_public_access_block(&config_xml)),
                     None => Err(ServerError::NoSuchPublicAccessBlockConfiguration {
@@ -2059,11 +2061,11 @@ impl HttpFrontend {
             S3Operation::DeleteBucketPublicAccessBlock { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.delete_bucket_public_access_block(
-                    &crate::coordinator::BucketRequest {
-                        name: &bucket,
+                    &crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    },
+                    ),
                 )?;
                 Ok(S3Response::delete_bucket_public_access_block())
             }
@@ -2074,11 +2076,11 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_ownership_controls(
                     &crate::coordinator::PutBucketConfigRequest {
-                        bucket: crate::coordinator::BucketRequest {
-                            name: &bucket,
+                        bucket: crate::coordinator::BucketRequest::new(
+                            &bucket,
                             requester,
                             expected_bucket_owner,
-                        },
+                        ),
                         config: &config_xml,
                     },
                 )?;
@@ -2087,11 +2089,11 @@ impl HttpFrontend {
             S3Operation::GetBucketOwnershipControls { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 match self.coordinator.get_bucket_ownership_controls(
-                    &crate::coordinator::BucketRequest {
-                        name: &bucket,
+                    &crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    },
+                    ),
                 )? {
                     Some(config_xml) => Ok(S3Response::get_bucket_ownership_controls(&config_xml)),
                     None => Err(ServerError::OwnershipControlsNotFound {
@@ -2102,11 +2104,11 @@ impl HttpFrontend {
             S3Operation::DeleteBucketOwnershipControls { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.delete_bucket_ownership_controls(
-                    &crate::coordinator::BucketRequest {
-                        name: &bucket,
+                    &crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    },
+                    ),
                 )?;
                 Ok(S3Response::delete_bucket_ownership_controls())
             }
@@ -2119,11 +2121,11 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_policy(
                     &crate::coordinator::PutBucketConfigRequest {
-                        bucket: crate::coordinator::BucketRequest {
-                            name: &bucket,
+                        bucket: crate::coordinator::BucketRequest::new(
+                            &bucket,
                             requester,
                             expected_bucket_owner,
-                        },
+                        ),
                         config: policy,
                     },
                 )?;
@@ -2131,13 +2133,13 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketPolicy { bucket } => {
                 let requester = Self::requester_from_auth(auth);
-                match self
-                    .coordinator
-                    .get_bucket_policy(&crate::coordinator::BucketRequest {
-                        name: &bucket,
+                match self.coordinator.get_bucket_policy(
+                    &crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    })? {
+                    ),
+                )? {
                     Some(policy) => Ok(S3Response::get_bucket_policy(&policy)),
                     None => Err(ServerError::NoSuchBucketPolicy {
                         bucket: bucket.clone(),
@@ -2147,33 +2149,33 @@ impl HttpFrontend {
             S3Operation::GetBucketPolicyStatus { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 let is_public = self.coordinator.get_bucket_policy_status(
-                    &crate::coordinator::BucketRequest {
-                        name: &bucket,
+                    &crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    },
+                    ),
                 )?;
                 Ok(S3Response::get_bucket_policy_status(is_public))
             }
             S3Operation::DeleteBucketPolicy { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
-                    .delete_bucket_policy(&crate::coordinator::BucketRequest {
-                        name: &bucket,
+                    .delete_bucket_policy(&crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    })?;
+                    ))?;
                 Ok(S3Response::delete_bucket_policy())
             }
             S3Operation::GetBucketAcl { bucket } => {
                 let requester = Self::requester_from_auth(auth);
                 let result =
                     self.coordinator
-                        .get_bucket_acl(&crate::coordinator::BucketRequest {
-                            name: &bucket,
+                        .get_bucket_acl(&crate::coordinator::BucketRequest::new(
+                            &bucket,
                             requester,
                             expected_bucket_owner,
-                        })?;
+                        ))?;
                 let (owner_display_name, grants) = self.render_acl_grants(
                     &result.owner_principal,
                     &result.owner_canonical_id,
@@ -2211,11 +2213,11 @@ impl HttpFrontend {
                     crate::coordinator::PutBucketAclInput::Grants(parse_acl_grants(req)?)
                 };
                 let acl_req = crate::coordinator::PutBucketAclRequest {
-                    bucket: crate::coordinator::BucketRequest {
-                        name: &bucket,
+                    bucket: crate::coordinator::BucketRequest::new(
+                        &bucket,
                         requester,
                         expected_bucket_owner,
-                    },
+                    ),
                     acl,
                 };
                 self.coordinator.validate_put_bucket_acl_request(&acl_req)?;
@@ -2340,13 +2342,13 @@ impl HttpFrontend {
                         None
                     };
                 let result = self.coordinator.upload_part_copy(&UploadPartCopyRequest {
-                    source: CopySource {
-                        bucket: &src_bucket,
-                        key: &src_key,
-                        version_id: src_version_id,
-                        condition: &src_cond,
-                        expected_bucket_owner: expected_source_bucket_owner(req),
-                    },
+                    source: CopySource::new(
+                        &src_bucket,
+                        &src_key,
+                        src_version_id,
+                        &src_cond,
+                        expected_source_bucket_owner(req),
+                    ),
                     upload: MultipartObjectRequest::new(
                         &bucket,
                         &key,
@@ -5375,11 +5377,11 @@ mod tests {
 
         let bucket = fe
             .coordinator
-            .head_bucket(&crate::coordinator::BucketRequest {
-                name: "mybucket",
-                requester: crate::coordinator::Requester::authenticated(account.clone()),
-                expected_bucket_owner: None,
-            })
+            .head_bucket(&crate::coordinator::BucketRequest::new(
+                "mybucket",
+                crate::coordinator::Requester::authenticated(account.clone()),
+                None,
+            ))
             .unwrap();
         assert_eq!(bucket.owner_canonical_id, owner_canonical_id);
 
