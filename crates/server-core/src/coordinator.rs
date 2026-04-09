@@ -5713,10 +5713,11 @@ impl Coordinator {
             req.bucket.name,
             req.config.sse_c_blocked
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.bucket.requester,
             req.bucket.name,
             req.bucket.expected_bucket_owner(),
+            auth::PolicyAction::PutEncryptionConfiguration,
         )?;
         let effective_config = req.config.effective();
         let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
@@ -5745,10 +5746,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let info = self.authorize_bucket_admin_requester(
+        let info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.requester,
             req.name,
             req.expected_bucket_owner(),
+            auth::PolicyAction::GetEncryptionConfiguration,
         )?;
         Ok(info.encryption)
     }
@@ -5760,10 +5762,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.requester,
             req.name,
             req.expected_bucket_owner(),
+            auth::PolicyAction::PutEncryptionConfiguration,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
         bucket_pg
@@ -5789,10 +5792,11 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.bucket.requester,
             req.bucket.name,
             req.bucket.expected_bucket_owner(),
+            auth::PolicyAction::PutBucketCors,
         )?;
         let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
         bucket_pg
@@ -5812,10 +5816,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_read_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.requester,
             req.name,
             req.expected_bucket_owner(),
+            auth::PolicyAction::GetBucketCors,
         )?;
         self.load_bucket_cors_config(req.name)
     }
@@ -5827,10 +5832,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.requester,
             req.name,
             req.expected_bucket_owner(),
+            auth::PolicyAction::PutBucketCors,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
         bucket_pg.delete_bucket_cors(req.name).map_err(|e| match e {
@@ -5849,10 +5855,11 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.bucket.requester,
             req.bucket.name,
             req.bucket.expected_bucket_owner(),
+            auth::PolicyAction::PutBucketTagging,
         )?;
         let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
         bucket_pg
@@ -5872,10 +5879,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_read_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.requester,
             req.name,
             req.expected_bucket_owner(),
+            auth::PolicyAction::GetBucketTagging,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
         bucket_pg.get_bucket_tags(req.name).map_err(|e| match e {
@@ -5893,10 +5901,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.requester,
             req.name,
             req.expected_bucket_owner(),
+            auth::PolicyAction::PutBucketTagging,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
         bucket_pg.delete_bucket_tags(req.name).map_err(|e| match e {
@@ -6056,10 +6065,11 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.bucket.requester,
             req.bucket.name,
             req.bucket.expected_bucket_owner(),
+            auth::PolicyAction::PutLifecycleConfiguration,
         )?;
         let parsed_config = Arc::new(
             storage::parse_lifecycle_configuration_xml(req.config.as_bytes()).map_err(|error| {
@@ -6115,10 +6125,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.requester,
             req.name,
             req.expected_bucket_owner(),
+            auth::PolicyAction::GetLifecycleConfiguration,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
         bucket_pg
@@ -6138,10 +6149,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.requester,
             req.name,
             req.expected_bucket_owner(),
+            auth::PolicyAction::PutLifecycleConfiguration,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
         bucket_pg
@@ -6267,10 +6279,11 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let bucket_info = self.authorize_bucket_admin_requester(
+        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.bucket.requester,
             req.bucket.name,
             req.bucket.expected_bucket_owner(),
+            auth::PolicyAction::PutBucketOwnershipControls,
         )?;
         if Self::is_bucket_owner_enforced(Some(req.config))
             && !Self::acl_grants_owner_full_control_only(
@@ -6307,10 +6320,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.requester,
             req.name,
             req.expected_bucket_owner(),
+            auth::PolicyAction::GetBucketOwnershipControls,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
         bucket_pg
@@ -6333,10 +6347,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.requester,
             req.name,
             req.expected_bucket_owner(),
+            auth::PolicyAction::PutBucketOwnershipControls,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
         bucket_pg
@@ -13590,6 +13605,101 @@ mod tests {
         ))
     }
 
+    fn delete_bucket_encryption_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        coord.delete_bucket_encryption(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
+    }
+
+    fn put_bucket_cors_test(
+        coord: &Coordinator,
+        name: &str,
+        config: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        coord.put_bucket_cors(&put_bucket_config_request_with_expected_owner(
+            name,
+            config,
+            requester,
+            expected_bucket_owner,
+        ))
+    }
+
+    fn get_bucket_cors_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<Option<String>, ServerError> {
+        coord.get_bucket_cors(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
+    }
+
+    fn delete_bucket_cors_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        coord.delete_bucket_cors(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
+    }
+
+    fn put_bucket_tags_test(
+        coord: &Coordinator,
+        name: &str,
+        config: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        coord.put_bucket_tags(&put_bucket_config_request_with_expected_owner(
+            name,
+            config,
+            requester,
+            expected_bucket_owner,
+        ))
+    }
+
+    fn get_bucket_tags_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<Option<String>, ServerError> {
+        coord.get_bucket_tags(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
+    }
+
+    fn delete_bucket_tags_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        coord.delete_bucket_tags(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
+    }
+
     fn put_bucket_policy_test(
         coord: &Coordinator,
         name: &str,
@@ -13735,6 +13845,19 @@ mod tests {
         expected_bucket_owner: Option<&str>,
     ) -> Result<Option<String>, ServerError> {
         coord.get_bucket_ownership_controls(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
+    }
+
+    fn delete_bucket_ownership_controls_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        coord.delete_bucket_ownership_controls(&bucket_request_with_expected_owner(
             name,
             requester,
             expected_bucket_owner,
@@ -17281,6 +17404,650 @@ mod tests {
             .unwrap();
 
         let err = get_bucket_public_access_block_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_bucket_cors_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let cors = "<CORSConfiguration><CORSRule><AllowedOrigin>https://example.com</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_cors_test(
+            &coord,
+            "bucket",
+            cors,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetBucketCORS","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let config = get_bucket_cors_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config, Some(cors.to_string()));
+    }
+
+    #[test]
+    fn put_and_delete_bucket_cors_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let cors = "<CORSConfiguration><CORSRule><AllowedOrigin>https://example.com</AllowedOrigin><AllowedMethod>PUT</AllowedMethod></CORSRule></CORSConfiguration>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:PutBucketCORS","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        put_bucket_cors_test(
+            &coord,
+            "bucket",
+            cors,
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_bucket_cors_test(
+                &coord,
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None
+            )
+            .unwrap(),
+            Some(cors.to_string())
+        );
+
+        delete_bucket_cors_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_bucket_cors_test(
+                &coord,
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn get_bucket_cors_bucket_policy_deny_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let cors = "<CORSConfiguration><CORSRule><AllowedOrigin>https://example.com</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_cors_test(
+            &coord,
+            "bucket",
+            cors,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketCORS","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let err = get_bucket_cors_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_bucket_tags_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let tags =
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>test</Value></Tag></TagSet></Tagging>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_tags_test(
+            &coord,
+            "bucket",
+            tags,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetBucketTagging","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let config = get_bucket_tags_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config, Some(tags.to_string()));
+    }
+
+    #[test]
+    fn put_and_delete_bucket_tags_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let tags =
+            "<Tagging><TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:PutBucketTagging","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        put_bucket_tags_test(
+            &coord,
+            "bucket",
+            tags,
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_bucket_tags_test(
+                &coord,
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None
+            )
+            .unwrap(),
+            Some(tags.to_string())
+        );
+
+        delete_bucket_tags_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_bucket_tags_test(
+                &coord,
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn get_bucket_tags_bucket_policy_deny_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let tags =
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>test</Value></Tag></TagSet></Tagging>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_tags_test(
+            &coord,
+            "bucket",
+            tags,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketTagging","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let err = get_bucket_tags_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_bucket_lifecycle_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let lifecycle = "<LifecycleConfiguration>\
+            <Rule>\
+                <ID>expire</ID>\
+                <Filter><Prefix>logs/</Prefix></Filter>\
+                <Status>Enabled</Status>\
+                <Expiration><Days>3</Days></Expiration>\
+            </Rule>\
+        </LifecycleConfiguration>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            lifecycle,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetLifecycleConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let config = get_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config, Some(lifecycle.to_string()));
+    }
+
+    #[test]
+    fn put_and_delete_bucket_lifecycle_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let lifecycle = "<LifecycleConfiguration>\
+            <Rule>\
+                <ID>expire</ID>\
+                <Filter><Prefix>archive/</Prefix></Filter>\
+                <Status>Enabled</Status>\
+                <Expiration><Days>7</Days></Expiration>\
+            </Rule>\
+        </LifecycleConfiguration>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:PutLifecycleConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            lifecycle,
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_bucket_lifecycle_test(
+                &coord,
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None
+            )
+            .unwrap(),
+            Some(lifecycle.to_string())
+        );
+
+        delete_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_bucket_lifecycle_test(
+                &coord,
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn get_bucket_lifecycle_bucket_policy_deny_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let lifecycle = "<LifecycleConfiguration>\
+            <Rule>\
+                <ID>expire</ID>\
+                <Filter><Prefix>logs/</Prefix></Filter>\
+                <Status>Enabled</Status>\
+                <Expiration><Days>3</Days></Expiration>\
+            </Rule>\
+        </LifecycleConfiguration>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            lifecycle,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetLifecycleConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let err = get_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_bucket_ownership_controls_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let controls = "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            controls,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetBucketOwnershipControls","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let config = get_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config, Some(controls.to_string()));
+    }
+
+    #[test]
+    fn put_and_delete_bucket_ownership_controls_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let controls = "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:PutBucketOwnershipControls","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        put_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            controls,
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_bucket_ownership_controls_test(
+                &coord,
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None
+            )
+            .unwrap(),
+            Some(controls.to_string())
+        );
+
+        delete_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_bucket_ownership_controls_test(
+                &coord,
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn get_bucket_ownership_controls_bucket_policy_deny_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let controls = "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            controls,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketOwnershipControls","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let err = get_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_bucket_encryption_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_encryption_test(
+            &coord,
+            "bucket",
+            BucketEncryptionConfig {
+                default_encryption: None,
+                sse_c_blocked: true,
+            },
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetEncryptionConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let config = get_bucket_encryption_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert!(config.sse_c_blocked);
+    }
+
+    #[test]
+    fn put_and_delete_bucket_encryption_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:PutEncryptionConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        put_bucket_encryption_test(
+            &coord,
+            "bucket",
+            BucketEncryptionConfig {
+                default_encryption: None,
+                sse_c_blocked: true,
+            },
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert!(
+            get_bucket_encryption_test(
+                &coord,
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None
+            )
+            .unwrap()
+            .sse_c_blocked
+        );
+
+        delete_bucket_encryption_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_bucket_encryption_test(
+                &coord,
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None
+            )
+            .unwrap(),
+            EffectiveBucketEncryptionConfig::default()
+        );
+    }
+
+    #[test]
+    fn get_bucket_encryption_bucket_policy_deny_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetEncryptionConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let err = get_bucket_encryption_test(
             &coord,
             "bucket",
             test_helpers::requester("111122223333"),

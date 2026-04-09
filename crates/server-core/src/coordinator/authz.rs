@@ -841,12 +841,23 @@ impl Coordinator {
         bucket: &BucketSummary,
         policy: Option<&auth::BucketPolicy>,
     ) -> bool {
-        match Self::bucket_policy_decision_for_bucket(
+        Self::requester_can_bucket_action_with_bucket_policy(
             requester,
             bucket,
             auth::PolicyAction::GetBucketPublicAccessBlock,
             policy,
-        ) {
+            Self::requester_can_bucket_admin(requester, &bucket.owner_principal),
+        )
+    }
+
+    pub(super) fn requester_can_bucket_action_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+        default_allowed: bool,
+    ) -> bool {
+        match Self::bucket_policy_decision_for_bucket(requester, bucket, action, policy) {
             auth::PolicyEvaluation::ExplicitDeny => false,
             auth::PolicyEvaluation::ExplicitAllow
                 if Self::bucket_policy_allow_survives_restrict_public_buckets(
@@ -856,7 +867,7 @@ impl Coordinator {
                 true
             }
             auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
-                Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+                default_allowed
             }
         }
     }
@@ -866,24 +877,13 @@ impl Coordinator {
         bucket: &BucketSummary,
         policy: Option<&auth::BucketPolicy>,
     ) -> bool {
-        match Self::bucket_policy_decision_for_bucket(
+        Self::requester_can_bucket_action_with_bucket_policy(
             requester,
             bucket,
             auth::PolicyAction::GetBucketPolicyStatus,
             policy,
-        ) {
-            auth::PolicyEvaluation::ExplicitDeny => false,
-            auth::PolicyEvaluation::ExplicitAllow
-                if Self::bucket_policy_allow_survives_restrict_public_buckets(
-                    requester, bucket,
-                ) =>
-            {
-                true
-            }
-            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
-                Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
-            }
-        }
+            Self::requester_can_bucket_admin(requester, &bucket.owner_principal),
+        )
     }
 
     pub(super) fn requester_can_get_bucket_object_lock_configuration_with_bucket_policy(
@@ -891,24 +891,13 @@ impl Coordinator {
         bucket: &BucketSummary,
         policy: Option<&auth::BucketPolicy>,
     ) -> bool {
-        match Self::bucket_policy_decision_for_bucket(
+        Self::requester_can_bucket_action_with_bucket_policy(
             requester,
             bucket,
             auth::PolicyAction::GetBucketObjectLockConfiguration,
             policy,
-        ) {
-            auth::PolicyEvaluation::ExplicitDeny => false,
-            auth::PolicyEvaluation::ExplicitAllow
-                if Self::bucket_policy_allow_survives_restrict_public_buckets(
-                    requester, bucket,
-                ) =>
-            {
-                true
-            }
-            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
-                Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
-            }
-        }
+            Self::requester_can_bucket_admin(requester, &bucket.owner_principal),
+        )
     }
 
     pub(super) fn requester_can_list_bucket_with_bucket_policy(
@@ -916,29 +905,40 @@ impl Coordinator {
         bucket: &BucketSummary,
         policy: Option<&auth::BucketPolicy>,
     ) -> bool {
-        match Self::bucket_policy_decision_for_bucket(
+        Self::requester_can_bucket_action_with_bucket_policy(
             requester,
             bucket,
             auth::PolicyAction::ListBucket,
             policy,
+            Self::requester_can_read_bucket(
+                requester,
+                bucket,
+                &bucket.owner_principal,
+                &bucket.acl_grants,
+                Self::effective_public_read(bucket),
+            ),
+        )
+    }
+
+    pub(super) fn authorize_bucket_admin_or_bucket_policy_action(
+        &self,
+        requester: &Requester,
+        bucket: &str,
+        expected_bucket_owner: Option<&str>,
+        action: auth::PolicyAction,
+    ) -> Result<BucketSummary, ServerError> {
+        let info = self.active_bucket_summary(bucket, expected_bucket_owner)?;
+        let bucket_policy = self.cached_bucket_policy(&info)?;
+        if Self::requester_can_bucket_action_with_bucket_policy(
+            requester,
+            &info,
+            action,
+            bucket_policy.as_deref(),
+            Self::requester_can_bucket_admin(requester, &info.owner_principal),
         ) {
-            auth::PolicyEvaluation::ExplicitDeny => false,
-            auth::PolicyEvaluation::ExplicitAllow
-                if Self::bucket_policy_allow_survives_restrict_public_buckets(
-                    requester, bucket,
-                ) =>
-            {
-                true
-            }
-            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
-                Self::requester_can_read_bucket(
-                    requester,
-                    bucket,
-                    &bucket.owner_principal,
-                    &bucket.acl_grants,
-                    Self::effective_public_read(bucket),
-                )
-            }
+            Ok(info)
+        } else {
+            Err(ServerError::AccessDenied)
         }
     }
 

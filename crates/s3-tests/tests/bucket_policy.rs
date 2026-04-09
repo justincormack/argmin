@@ -1,12 +1,15 @@
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    CompletedMultipartUpload, CompletedPart, Grant, ObjectOwnership, Permission,
-    ServerSideEncryption,
+    BlockedEncryptionTypes, BucketLifecycleConfiguration, CompletedMultipartUpload, CompletedPart,
+    CorsConfiguration, CorsRule, EncryptionType, ExpirationStatus, Grant, LifecycleExpiration,
+    LifecycleRule, LifecycleRuleFilter, ObjectOwnership, OwnershipControls, OwnershipControlsRule,
+    Permission, ServerSideEncryption, ServerSideEncryptionByDefault,
+    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging,
 };
 use s3_tests::{
     assert_s3_err_code, create_public_bucket, disable_bucket_public_access_block, err_status,
-    sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
+    put_bucket_lifecycle_with_md5, sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
 };
 use serde_json::json;
 use std::future::Future;
@@ -207,16 +210,61 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
-    const MAX_ATTEMPTS: usize = 20;
+    eventually_ok_with_retry(
+        description,
+        20,
+        std::time::Duration::from_millis(200),
+        &mut op,
+    )
+    .await
+}
 
-    for attempt in 0..MAX_ATTEMPTS {
+async fn eventually_ok_with_retry<T, E, F, Fut>(
+    description: &str,
+    max_attempts: usize,
+    delay: std::time::Duration,
+    mut op: F,
+) -> T
+where
+    E: std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    for attempt in 0..max_attempts {
         match op().await {
             Ok(output) => return output,
-            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Err(_) if attempt + 1 < max_attempts => {
+                tokio::time::sleep(delay).await;
             }
             Err(err) => panic!("{description} failed unexpectedly: {err:?}"),
         }
+    }
+
+    unreachable!()
+}
+
+async fn eventually_result_matches<T, E, F, Fut, P>(
+    description: &str,
+    max_attempts: usize,
+    delay: std::time::Duration,
+    mut op: F,
+    mut predicate: P,
+) where
+    E: std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+    P: FnMut(&Result<T, E>) -> bool,
+{
+    for attempt in 0..max_attempts {
+        let result = op().await;
+        if predicate(&result) {
+            return;
+        }
+        if attempt + 1 < max_attempts {
+            tokio::time::sleep(delay).await;
+            continue;
+        }
+        panic!("{description} did not converge");
     }
 
     unreachable!()
@@ -275,6 +323,85 @@ async fn alt_get_bucket_policy_status_access_denied_eventually(bucket: &str) {
     }
 
     unreachable!()
+}
+
+fn simple_cors_configuration(origin: &str, method: &str) -> CorsConfiguration {
+    CorsConfiguration::builder()
+        .cors_rules(
+            CorsRule::builder()
+                .allowed_origins(origin)
+                .allowed_methods(method)
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap()
+}
+
+fn simple_bucket_tagging(key: &str, value: &str) -> Tagging {
+    Tagging::builder()
+        .tag_set(Tag::builder().key(key).value(value).build().unwrap())
+        .build()
+        .unwrap()
+}
+
+fn simple_lifecycle_configuration(prefix: &str, days: i32) -> BucketLifecycleConfiguration {
+    BucketLifecycleConfiguration::builder()
+        .rules(
+            LifecycleRule::builder()
+                .id("expire-current")
+                .filter(LifecycleRuleFilter::builder().prefix(prefix).build())
+                .status(ExpirationStatus::Enabled)
+                .expiration(LifecycleExpiration::builder().days(days).build())
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap()
+}
+
+fn simple_bucket_ownership_controls(ownership: ObjectOwnership) -> OwnershipControls {
+    OwnershipControls::builder()
+        .rules(
+            OwnershipControlsRule::builder()
+                .object_ownership(ownership)
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap()
+}
+
+fn simple_bucket_encryption(blocked: EncryptionType) -> ServerSideEncryptionConfiguration {
+    let default = ServerSideEncryptionByDefault::builder()
+        .sse_algorithm(ServerSideEncryption::Aes256)
+        .build()
+        .unwrap();
+    ServerSideEncryptionConfiguration::builder()
+        .rules(
+            ServerSideEncryptionRule::builder()
+                .apply_server_side_encryption_by_default(default)
+                .blocked_encryption_types(
+                    BlockedEncryptionTypes::builder()
+                        .encryption_type(blocked)
+                        .build(),
+                )
+                .build(),
+        )
+        .build()
+        .unwrap()
+}
+
+fn blocked_encryption_types(rule: &ServerSideEncryptionRule) -> Vec<String> {
+    rule.blocked_encryption_types()
+        .map(|blocked| {
+            blocked
+                .encryption_type()
+                .iter()
+                .map(|value| value.as_str().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 async fn create_bucket_allowing_public_policy(client: &aws_sdk_s3::Client) -> String {
@@ -922,6 +1049,612 @@ fn test_bucket_policy_list_objects_v1() {
         assert_eq!(response.contents()[0].key(), Some("obj"));
 
         cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_cors_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        let config = simple_cors_configuration("https://example.com", "GET");
+        client
+            .put_bucket_cors()
+            .bucket(&bucket)
+            .cors_configuration(config)
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:GetBucketCORS",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let response = eventually_ok("GetBucketCORS", || {
+            alt_client.get_bucket_cors().bucket(&bucket).send()
+        })
+        .await;
+        assert_eq!(response.cors_rules().len(), 1);
+        assert_eq!(
+            response.cors_rules()[0].allowed_origins(),
+            ["https://example.com"]
+        );
+        assert!(response.cors_rules()[0]
+            .allowed_methods()
+            .contains(&"GET".to_string()));
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_cors_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutBucketCORS",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let put_config = simple_cors_configuration("https://put.example.com", "PUT");
+        eventually_ok("PutBucketCORS", || {
+            alt_client
+                .put_bucket_cors()
+                .bucket(&bucket)
+                .cors_configuration(put_config.clone())
+                .send()
+        })
+        .await;
+
+        let read_back = client
+            .get_bucket_cors()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_back.cors_rules().len(), 1);
+        assert_eq!(
+            read_back.cors_rules()[0].allowed_origins(),
+            ["https://put.example.com"]
+        );
+
+        eventually_ok("DeleteBucketCORS", || {
+            alt_client.delete_bucket_cors().bucket(&bucket).send()
+        })
+        .await;
+
+        eventually_result_matches(
+            "GetBucketCORS absent",
+            60,
+            std::time::Duration::from_millis(500),
+            || client.get_bucket_cors().bucket(&bucket).send(),
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(404)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("NoSuchCORSConfiguration")
+                })
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_tagging_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("env", "test"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:GetBucketTagging",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let response = eventually_ok("GetBucketTagging", || {
+            alt_client.get_bucket_tagging().bucket(&bucket).send()
+        })
+        .await;
+        assert_eq!(response.tag_set().len(), 1);
+        assert_eq!(response.tag_set()[0].key(), "env");
+        assert_eq!(response.tag_set()[0].value(), "test");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_tagging_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutBucketTagging",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok("PutBucketTagging", || {
+            alt_client
+                .put_bucket_tagging()
+                .bucket(&bucket)
+                .tagging(simple_bucket_tagging("team", "storage"))
+                .send()
+        })
+        .await;
+
+        let read_back = client
+            .get_bucket_tagging()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_back.tag_set().len(), 1);
+        assert_eq!(read_back.tag_set()[0].key(), "team");
+        assert_eq!(read_back.tag_set()[0].value(), "storage");
+
+        eventually_ok("DeleteBucketTagging", || {
+            alt_client.delete_bucket_tagging().bucket(&bucket).send()
+        })
+        .await;
+
+        eventually_result_matches(
+            "GetBucketTagging absent",
+            60,
+            std::time::Duration::from_millis(500),
+            || client.get_bucket_tagging().bucket(&bucket).send(),
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(404)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("NoSuchTagSet")
+                })
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_lifecycle_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        put_bucket_lifecycle_with_md5(client, &bucket, simple_lifecycle_configuration("logs/", 30))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:GetLifecycleConfiguration",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let response = eventually_ok_with_retry(
+            "GetBucketLifecycleConfiguration",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .get_bucket_lifecycle_configuration()
+                    .bucket(&bucket)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(response.rules().len(), 1);
+        assert_eq!(response.rules()[0].id(), Some("expire-current"));
+        assert_eq!(
+            response.rules()[0].filter().and_then(|f| f.prefix()),
+            Some("logs/")
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_lifecycle_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutLifecycleConfiguration",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutBucketLifecycleConfiguration",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                put_bucket_lifecycle_with_md5(
+                    alt_client,
+                    &bucket,
+                    simple_lifecycle_configuration("archive/", 14),
+                )
+                .send()
+            },
+        )
+        .await;
+
+        let read_back = client
+            .get_bucket_lifecycle_configuration()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_back.rules().len(), 1);
+        assert_eq!(
+            read_back.rules()[0].filter().and_then(|f| f.prefix()),
+            Some("archive/")
+        );
+
+        eventually_ok("DeleteBucketLifecycle", || {
+            alt_client.delete_bucket_lifecycle().bucket(&bucket).send()
+        })
+        .await;
+
+        eventually_result_matches(
+            "GetBucketLifecycleConfiguration absent",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                client
+                    .get_bucket_lifecycle_configuration()
+                    .bucket(&bucket)
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(404)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("NoSuchLifecycleConfiguration")
+                })
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_ownership_controls_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_ownership_controls()
+            .bucket(&bucket)
+            .ownership_controls(simple_bucket_ownership_controls(
+                ObjectOwnership::BucketOwnerPreferred,
+            ))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:GetBucketOwnershipControls",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let response = eventually_ok_with_retry(
+            "GetBucketOwnershipControls",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .get_bucket_ownership_controls()
+                    .bucket(&bucket)
+                    .send()
+            },
+        )
+        .await;
+        let rules = response.ownership_controls().unwrap().rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].object_ownership,
+            ObjectOwnership::BucketOwnerPreferred
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_ownership_controls_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutBucketOwnershipControls",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutBucketOwnershipControls",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_bucket_ownership_controls()
+                    .bucket(&bucket)
+                    .ownership_controls(simple_bucket_ownership_controls(
+                        ObjectOwnership::BucketOwnerPreferred,
+                    ))
+                    .send()
+            },
+        )
+        .await;
+
+        let read_back = client
+            .get_bucket_ownership_controls()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let rules = read_back.ownership_controls().unwrap().rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].object_ownership,
+            ObjectOwnership::BucketOwnerPreferred
+        );
+
+        eventually_ok("DeleteBucketOwnershipControls", || {
+            alt_client
+                .delete_bucket_ownership_controls()
+                .bucket(&bucket)
+                .send()
+        })
+        .await;
+
+        eventually_result_matches(
+            "GetBucketOwnershipControls absent",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                client
+                    .get_bucket_ownership_controls()
+                    .bucket(&bucket)
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(404)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("OwnershipControlsNotFoundError")
+                })
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_encryption_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_encryption()
+            .bucket(&bucket)
+            .server_side_encryption_configuration(simple_bucket_encryption(EncryptionType::SseC))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:GetEncryptionConfiguration",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let response = eventually_ok_with_retry(
+            "GetBucketEncryption",
+            60,
+            std::time::Duration::from_millis(500),
+            || alt_client.get_bucket_encryption().bucket(&bucket).send(),
+        )
+        .await;
+        let rules = response
+            .server_side_encryption_configuration()
+            .unwrap()
+            .rules();
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            blocked_encryption_types(&rules[0]),
+            vec!["SSE-C".to_string()]
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_encryption_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutEncryptionConfiguration",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutBucketEncryption",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_bucket_encryption()
+                    .bucket(&bucket)
+                    .server_side_encryption_configuration(simple_bucket_encryption(
+                        EncryptionType::SseC,
+                    ))
+                    .send()
+            },
+        )
+        .await;
+
+        let read_back = client
+            .get_bucket_encryption()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let rules = read_back
+            .server_side_encryption_configuration()
+            .unwrap()
+            .rules();
+        assert_eq!(
+            blocked_encryption_types(&rules[0]),
+            vec!["SSE-C".to_string()]
+        );
+
+        eventually_ok("DeleteBucketEncryption", || {
+            alt_client.delete_bucket_encryption().bucket(&bucket).send()
+        })
+        .await;
+
+        let after_delete = client
+            .get_bucket_encryption()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let rules = after_delete
+            .server_side_encryption_configuration()
+            .unwrap()
+            .rules();
+        let blocked = blocked_encryption_types(&rules[0]);
+        assert!(blocked.is_empty() || blocked == vec!["NONE".to_string()]);
+
+        cleanup(&bucket, &[]).await;
     });
 }
 
