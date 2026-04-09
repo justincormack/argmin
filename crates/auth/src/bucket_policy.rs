@@ -107,6 +107,8 @@ pub enum PolicyAction {
     GetObjectRetention,
     GetObjectLegalHold,
     PutObject,
+    PutObjectAcl,
+    PutObjectVersionAcl,
     PutObjectTagging,
     PutObjectVersionTagging,
     PutObjectRetention,
@@ -147,6 +149,8 @@ impl PolicyAction {
             Self::GetObjectRetention => "s3:GetObjectRetention",
             Self::GetObjectLegalHold => "s3:GetObjectLegalHold",
             Self::PutObject => "s3:PutObject",
+            Self::PutObjectAcl => "s3:PutObjectAcl",
+            Self::PutObjectVersionAcl => "s3:PutObjectVersionAcl",
             Self::PutObjectTagging => "s3:PutObjectTagging",
             Self::PutObjectVersionTagging => "s3:PutObjectVersionTagging",
             Self::PutObjectRetention => "s3:PutObjectRetention",
@@ -586,7 +590,7 @@ pub enum PolicyEffect {
     Deny,
 }
 
-const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 18] = [
+const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 20] = [
     PolicyAction::GetObject,
     PolicyAction::GetObjectVersion,
     PolicyAction::GetObjectAcl,
@@ -596,6 +600,8 @@ const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 18] = [
     PolicyAction::GetObjectRetention,
     PolicyAction::GetObjectLegalHold,
     PolicyAction::PutObject,
+    PolicyAction::PutObjectAcl,
+    PolicyAction::PutObjectVersionAcl,
     PolicyAction::PutObjectTagging,
     PolicyAction::PutObjectVersionTagging,
     PolicyAction::PutObjectRetention,
@@ -905,7 +911,7 @@ const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 16] = [
     PolicyAction::PutBucketObjectLockConfiguration,
 ];
 
-const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 18] = [
+const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 20] = [
     PolicyAction::GetObject,
     PolicyAction::GetObjectVersion,
     PolicyAction::GetObjectAcl,
@@ -915,6 +921,8 @@ const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 18] = [
     PolicyAction::GetObjectRetention,
     PolicyAction::GetObjectLegalHold,
     PolicyAction::PutObject,
+    PolicyAction::PutObjectAcl,
+    PolicyAction::PutObjectVersionAcl,
     PolicyAction::PutObjectTagging,
     PolicyAction::PutObjectVersionTagging,
     PolicyAction::PutObjectRetention,
@@ -2045,6 +2053,42 @@ mod tests {
         let tags = [PolicyTag::new("security", "public")];
         let request = request(
             PolicyAction::GetObjectAcl,
+            "bucket",
+            "key",
+            Some("caller"),
+            &tags,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn put_object_acl_existing_tag_condition_matches() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObjectAcl","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let tags = [PolicyTag::new("security", "public")];
+        let request = request(
+            PolicyAction::PutObjectAcl,
+            "bucket",
+            "key",
+            Some("caller"),
+            &tags,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn put_object_version_acl_existing_tag_condition_matches() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObjectVersionAcl","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let tags = [PolicyTag::new("security", "public")];
+        let request = request(
+            PolicyAction::PutObjectVersionAcl,
             "bucket",
             "key",
             Some("caller"),

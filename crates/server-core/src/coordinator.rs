@@ -2748,7 +2748,7 @@ struct DeletedLiveObjectReclaim {
 
 enum ObjectAclAuthorization {
     ReadWithPolicy(auth::PolicyAction),
-    Write,
+    WriteWithPolicy(auth::PolicyAction),
 }
 
 impl Drop for ReclaimSweeper {
@@ -7114,7 +7114,9 @@ impl Coordinator {
             req.object.bucket_name(),
             req.object.key(),
             req.object.version_id,
-            ObjectAclAuthorization::Write,
+            ObjectAclAuthorization::WriteWithPolicy(Self::put_object_acl_policy_action(
+                req.object.version_id,
+            )),
             req.object.expected_bucket_owner(),
         )?;
         if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
@@ -24625,6 +24627,142 @@ mod tests {
             .unwrap_err();
             assert!(matches!(err, ServerError::AccessDenied));
         }
+    }
+
+    #[test]
+    fn put_object_acl_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObjectAcl","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        put_object_canned_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            PutObjectAcl::PublicRead,
+            test_helpers::requester("other-user"),
+            None,
+        )
+        .unwrap();
+
+        let acl = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::AllUsers,
+            AclPermission::Read,
+        ));
+    }
+
+    #[test]
+    fn put_object_version_acl_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObjectVersionAcl","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        put_object_canned_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            PutObjectAcl::PublicRead,
+            test_helpers::requester("other-user"),
+            None,
+        )
+        .unwrap();
+
+        let acl = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::AllUsers,
+            AclPermission::Read,
+        ));
     }
 
     #[test]

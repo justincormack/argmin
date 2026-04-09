@@ -69,6 +69,7 @@
                 "s3:DeleteObjectTagging",
                 "s3:DeleteObjectVersionTagging",
                 "s3:GetObjectAcl",
+                "s3:GetObjectVersionAcl",
                 "s3:PutObjectAcl",
                 "s3:PutObjectVersionAcl",
                 "s3:GetObjectRetention",

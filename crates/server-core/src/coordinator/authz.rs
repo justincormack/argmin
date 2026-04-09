@@ -366,6 +366,16 @@ impl Coordinator {
         }
     }
 
+    pub(super) fn put_object_acl_policy_action(
+        version_id: Option<VersionId>,
+    ) -> auth::PolicyAction {
+        if version_id.is_some() {
+            auth::PolicyAction::PutObjectVersionAcl
+        } else {
+            auth::PolicyAction::PutObjectAcl
+        }
+    }
+
     pub(super) fn get_object_tagging_policy_action(
         version_id: Option<VersionId>,
     ) -> auth::PolicyAction {
@@ -778,6 +788,32 @@ impl Coordinator {
                 }
                 auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
                     Self::requester_can_read_object_acl(requester, bucket, object)
+                }
+            },
+        )
+    }
+
+    pub(super) fn requester_can_write_object_acl_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        Ok(
+            match Self::bucket_policy_decision_for_object(
+                requester, bucket, object, action, None, policy,
+            )? {
+                auth::PolicyEvaluation::ExplicitDeny => false,
+                auth::PolicyEvaluation::ExplicitAllow
+                    if Self::bucket_policy_allow_survives_restrict_public_buckets(
+                        requester, bucket,
+                    ) =>
+                {
+                    true
+                }
+                auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
+                    Self::requester_can_write_object_acl(requester, bucket, object)
                 }
             },
         )
@@ -1390,8 +1426,10 @@ impl Coordinator {
         let can_discover_missing =
             Self::requester_can_discover_missing_object_acl(requester, &bucket_info);
         let bucket_policy = match authorization {
-            ObjectAclAuthorization::ReadWithPolicy(_) => self.cached_bucket_policy(&bucket_info)?,
-            ObjectAclAuthorization::Write => None,
+            ObjectAclAuthorization::ReadWithPolicy(_)
+            | ObjectAclAuthorization::WriteWithPolicy(_) => {
+                self.cached_bucket_policy(&bucket_info)?
+            }
         };
         let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
             Ok(locked) => locked,
@@ -1403,8 +1441,14 @@ impl Coordinator {
             Err(other) => return Err(other),
         };
         let allowed = match authorization {
-            ObjectAclAuthorization::Write => {
-                Self::requester_can_write_object_acl(requester, &bucket_info, &locked.record)
+            ObjectAclAuthorization::WriteWithPolicy(policy_action) => {
+                Self::requester_can_write_object_acl_with_bucket_policy(
+                    requester,
+                    &bucket_info,
+                    &locked.record,
+                    policy_action,
+                    bucket_policy.as_deref(),
+                )?
             }
             ObjectAclAuthorization::ReadWithPolicy(policy_action) => {
                 Self::requester_can_read_object_acl_with_bucket_policy(

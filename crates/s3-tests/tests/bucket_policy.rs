@@ -1,13 +1,14 @@
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BlockedEncryptionTypes, BucketLifecycleConfiguration, CompletedMultipartUpload, CompletedPart,
-    CorsConfiguration, CorsRule, DefaultRetention, EncryptionType, ExpirationStatus, Grant,
-    LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectLockConfiguration,
-    ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership, OwnershipControls,
+    BlockedEncryptionTypes, BucketLifecycleConfiguration, BucketVersioningStatus,
+    CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule, DefaultRetention,
+    EncryptionType, ExpirationStatus, Grant, LifecycleExpiration, LifecycleRule,
+    LifecycleRuleFilter, ObjectCannedAcl, ObjectLockConfiguration, ObjectLockEnabled,
+    ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership, OwnershipControls,
     OwnershipControlsRule, Permission, PublicAccessBlockConfiguration, ServerSideEncryption,
     ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
-    Tag, Tagging,
+    Tag, Tagging, VersioningConfiguration,
 };
 use s3_tests::{
     assert_s3_err_code, create_public_bucket, disable_bucket_public_access_block, err_status,
@@ -514,6 +515,14 @@ async fn canonical_owner_id(client: &aws_sdk_s3::Client, bucket: &str) -> String
         .id()
         .expect("expected owner ID in GetBucketAcl")
         .to_string()
+}
+
+async fn client_canonical_id(client: &aws_sdk_s3::Client) -> String {
+    let bucket = unique_bucket();
+    s3_tests::create_bucket(client, &bucket).await.unwrap();
+    let owner_id = canonical_owner_id(client, &bucket).await;
+    cleanup_with_client(client, &bucket, &[]).await;
+    owner_id
 }
 
 fn has_grant(grants: &[Grant], permission: Permission, canonical_user_id: Option<&str>) -> bool {
@@ -2282,6 +2291,319 @@ fn test_bucket_policy_copy_object_grant_full_control() {
         );
 
         cleanup(&bucket, &["src", "allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_acl_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("owned-by-bucket")
+            .body(ByteStream::from_static(b"owned-by-bucket"))
+            .send()
+            .await
+            .unwrap();
+
+        let alt_id = client_canonical_id(alt_client).await;
+        let grant_read_header = format!("id=\"{alt_id}\"");
+
+        let denied = alt_client
+            .put_object_acl()
+            .bucket(&bucket)
+            .key("owned-by-bucket")
+            .customize()
+            .mutate_request({
+                let grant_read_header = grant_read_header.clone();
+                move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-read", grant_read_header.clone());
+                }
+            })
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutObjectAcl",
+                bucket_wildcard_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutObjectAcl with bucket policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                let grant_read_header = grant_read_header.clone();
+                alt_client
+                    .put_object_acl()
+                    .bucket(&bucket)
+                    .key("owned-by-bucket")
+                    .customize()
+                    .mutate_request(move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-read", grant_read_header.clone());
+                    })
+                    .send()
+            },
+        )
+        .await;
+
+        let owner_view = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("owned-by-bucket")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_grant(owner_view.grants(), Permission::Read, Some(&alt_id)),
+            "expected READ grant for alternate account, got {:?}",
+            owner_view.grants()
+        );
+
+        let alt_get = eventually_ok_with_retry(
+            "GetObject after PutObjectAcl",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key("owned-by-bucket")
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            alt_get.body.collect().await.unwrap().into_bytes().as_ref(),
+            b"owned-by-bucket"
+        );
+
+        cleanup(&bucket, &["owned-by-bucket"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_canned_acl_uses_put_object_permission() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        set_object_writer_ownership(&bucket).await;
+
+        let denied = alt_client
+            .put_object()
+            .bucket(&bucket)
+            .key("public-read")
+            .acl(ObjectCannedAcl::PublicRead)
+            .body(ByteStream::from_static(b"public-read"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutObject",
+                bucket_wildcard_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutObject with canned ACL under PutObject policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("public-read")
+                    .acl(ObjectCannedAcl::PublicRead)
+                    .body(ByteStream::from_static(b"public-read"))
+                    .send()
+            },
+        )
+        .await;
+
+        let url = format!("{}/{}/public-read", CTX.endpoint(), bucket);
+        let mut last = None;
+        for _ in 0..60 {
+            let (status, body) = anonymous_get_status_and_body(&url);
+            if status == 200 && body == "public-read" {
+                cleanup(&bucket, &["public-read"]).await;
+                return;
+            }
+            last = Some((status, body));
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+
+        cleanup(&bucket, &["public-read"]).await;
+        panic!("anonymous GET did not observe public-read ACL: {last:?}");
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_version_acl_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let put = client
+            .put_object()
+            .bucket(&bucket)
+            .key("versioned")
+            .body(ByteStream::from_static(b"versioned-body"))
+            .send()
+            .await
+            .unwrap();
+        let version_id = put
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+
+        let alt_id = client_canonical_id(alt_client).await;
+        let grant_read_header = format!("id=\"{alt_id}\"");
+
+        let denied = alt_client
+            .put_object_acl()
+            .bucket(&bucket)
+            .key("versioned")
+            .version_id(&version_id)
+            .customize()
+            .mutate_request({
+                let grant_read_header = grant_read_header.clone();
+                move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-read", grant_read_header.clone());
+                }
+            })
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:PutObjectVersionAcl",
+                "Resource": bucket_wildcard_resource(&bucket),
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutObjectAcl on version with bucket policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                let grant_read_header = grant_read_header.clone();
+                alt_client
+                    .put_object_acl()
+                    .bucket(&bucket)
+                    .key("versioned")
+                    .version_id(&version_id)
+                    .customize()
+                    .mutate_request(move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-read", grant_read_header.clone());
+                    })
+                    .send()
+            },
+        )
+        .await;
+
+        let owner_view = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("versioned")
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_grant(owner_view.grants(), Permission::Read, Some(&alt_id)),
+            "expected READ grant for alternate account on version, got {:?}",
+            owner_view.grants()
+        );
+
+        let alt_get = eventually_ok_with_retry(
+            "GetObject version after PutObjectVersionAcl",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .get_object()
+                    .bucket(&bucket)
+                    .key("versioned")
+                    .version_id(&version_id)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            alt_get.body.collect().await.unwrap().into_bytes().as_ref(),
+            b"versioned-body"
+        );
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("versioned")
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
     });
 }
 
