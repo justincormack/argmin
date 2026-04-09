@@ -978,6 +978,22 @@ impl Coordinator {
         }
     }
 
+    pub(super) fn authorize_bucket_admin_or_bucket_policy_action_for<R>(
+        &self,
+        req: &R,
+        action: auth::PolicyAction,
+    ) -> Result<BucketSummary, ServerError>
+    where
+        R: BucketScopedAuthorizationRequest + ?Sized,
+    {
+        self.authorize_bucket_admin_or_bucket_policy_action(
+            req.requester(),
+            req.bucket_name(),
+            req.expected_bucket_owner(),
+            action,
+        )
+    }
+
     pub(super) fn parse_policy_existing_object_tags(
         object: &StoredObject,
     ) -> Result<Vec<(String, String)>, ServerError> {
@@ -1487,6 +1503,17 @@ impl Coordinator {
         }
     }
 
+    pub(super) fn authorize_bucket_read_for<R>(&self, req: &R) -> Result<BucketSummary, ServerError>
+    where
+        R: BucketScopedAuthorizationRequest + ?Sized,
+    {
+        self.authorize_bucket_read_requester(
+            req.requester(),
+            req.bucket_name(),
+            req.expected_bucket_owner(),
+        )
+    }
+
     pub(super) fn authorize_bucket_admin_requester(
         &self,
         requester: &Requester,
@@ -1499,6 +1526,20 @@ impl Coordinator {
         } else {
             Err(ServerError::AccessDenied)
         }
+    }
+
+    pub(super) fn authorize_bucket_admin_for<R>(
+        &self,
+        req: &R,
+    ) -> Result<BucketSummary, ServerError>
+    where
+        R: BucketScopedAuthorizationRequest + ?Sized,
+    {
+        self.authorize_bucket_admin_requester(
+            req.requester(),
+            req.bucket_name(),
+            req.expected_bucket_owner(),
+        )
     }
 
     pub(super) fn requester_can_bypass_governance_retention(
@@ -1545,8 +1586,7 @@ impl Coordinator {
     ) -> Result<AuthorizedPutObjectWrite, ServerError> {
         let bucket = req.object.bucket_name();
         let key = req.object.key;
-        self.with_bucket_write_reservation(bucket, |bucket_info| {
-            Self::ensure_expected_bucket_owner(&bucket_info, req.object.expected_bucket_owner())?;
+        self.with_bucket_write_reservation_for(&req.object, |bucket_info| {
             let existing_object = self.put_target_existing_live_object(bucket, key)?;
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             if !Self::requester_can_put_object_with_bucket_policy(

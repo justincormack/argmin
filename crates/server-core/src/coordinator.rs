@@ -279,6 +279,18 @@ impl AuthorizedPutObjectWrite {
     }
 }
 
+impl BucketScopedRequest for AuthorizedPutObjectWrite {
+    fn bucket_name(&self) -> &str {
+        AuthorizedPutObjectWrite::bucket(self)
+    }
+}
+
+impl ExpectedBucketOwnerRequest for AuthorizedPutObjectWrite {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        AuthorizedPutObjectWrite::expected_bucket_owner(self)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum ActiveWriteEncryption {
     None,
@@ -2095,6 +2107,18 @@ pub struct AppendStreamPartRequest<'a> {
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
 
+trait ExpectedBucketOwnerRequest {
+    fn expected_bucket_owner(&self) -> Option<&str>;
+}
+
+trait BucketScopedRequest: ExpectedBucketOwnerRequest {
+    fn bucket_name(&self) -> &str;
+}
+
+trait BucketScopedAuthorizationRequest: BucketScopedRequest {
+    fn requester(&self) -> &Requester;
+}
+
 impl<'a> BucketRequest<'a> {
     pub fn new(
         name: &'a str,
@@ -2118,6 +2142,24 @@ impl<'a> BucketRequest<'a> {
 
     pub fn expected_bucket_owner(&self) -> Option<&str> {
         self.expected_bucket_owner
+    }
+}
+
+impl BucketScopedRequest for BucketRequest<'_> {
+    fn bucket_name(&self) -> &str {
+        BucketRequest::name(self)
+    }
+}
+
+impl ExpectedBucketOwnerRequest for BucketRequest<'_> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        BucketRequest::expected_bucket_owner(self)
+    }
+}
+
+impl BucketScopedAuthorizationRequest for BucketRequest<'_> {
+    fn requester(&self) -> &Requester {
+        BucketRequest::requester(self)
     }
 }
 
@@ -2156,6 +2198,24 @@ impl<'a> ObjectRequest<'a> {
 
     pub fn expected_bucket_owner(&self) -> Option<&str> {
         self.bucket.expected_bucket_owner()
+    }
+}
+
+impl BucketScopedRequest for ObjectRequest<'_> {
+    fn bucket_name(&self) -> &str {
+        ObjectRequest::bucket_name(self)
+    }
+}
+
+impl ExpectedBucketOwnerRequest for ObjectRequest<'_> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        ObjectRequest::expected_bucket_owner(self)
+    }
+}
+
+impl BucketScopedAuthorizationRequest for ObjectRequest<'_> {
+    fn requester(&self) -> &Requester {
+        ObjectRequest::requester(self)
     }
 }
 
@@ -2206,6 +2266,24 @@ impl<'a> ObjectVersionRequest<'a> {
     }
 }
 
+impl BucketScopedRequest for ObjectVersionRequest<'_> {
+    fn bucket_name(&self) -> &str {
+        ObjectVersionRequest::bucket_name(self)
+    }
+}
+
+impl ExpectedBucketOwnerRequest for ObjectVersionRequest<'_> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        ObjectVersionRequest::expected_bucket_owner(self)
+    }
+}
+
+impl BucketScopedAuthorizationRequest for ObjectVersionRequest<'_> {
+    fn requester(&self) -> &Requester {
+        ObjectVersionRequest::requester(self)
+    }
+}
+
 impl<'a> MultipartObjectRequest<'a> {
     pub fn new(
         bucket: &'a str,
@@ -2250,6 +2328,24 @@ impl<'a> MultipartObjectRequest<'a> {
 
     pub fn expected_bucket_owner(&self) -> Option<&str> {
         self.object.expected_bucket_owner()
+    }
+}
+
+impl BucketScopedRequest for MultipartObjectRequest<'_> {
+    fn bucket_name(&self) -> &str {
+        MultipartObjectRequest::bucket_name(self)
+    }
+}
+
+impl ExpectedBucketOwnerRequest for MultipartObjectRequest<'_> {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        MultipartObjectRequest::expected_bucket_owner(self)
+    }
+}
+
+impl BucketScopedAuthorizationRequest for MultipartObjectRequest<'_> {
+    fn requester(&self) -> &Requester {
+        MultipartObjectRequest::requester(self)
     }
 }
 
@@ -2307,21 +2403,9 @@ impl<'a> ListObjectsV2Request<'a> {
     }
 }
 
-impl<'a> ListObjectVersionsRequest<'a> {
-    fn expected_bucket_owner(&self) -> Option<&str> {
-        self.bucket.expected_bucket_owner()
-    }
-}
-
 impl<'a> ListPartsRequest<'a> {
     fn expected_bucket_owner(&self) -> Option<&str> {
         self.upload.expected_bucket_owner()
-    }
-}
-
-impl<'a> ListMultipartUploadsRequest<'a> {
-    fn expected_bucket_owner(&self) -> Option<&str> {
-        self.bucket.expected_bucket_owner()
     }
 }
 
@@ -2331,21 +2415,9 @@ impl<'a> DeleteObjectsRequest<'a> {
     }
 }
 
-impl<'a> CreateMultipartUploadRequest<'a> {
-    fn expected_bucket_owner(&self) -> Option<&str> {
-        self.object.expected_bucket_owner()
-    }
-}
-
 impl<'a> GetObjectAttributesRequest<'a> {
     fn expected_bucket_owner(&self) -> Option<&str> {
         self.object.expected_bucket_owner()
-    }
-}
-
-impl<'a> CompleteMultipartUploadRequest<'a> {
-    fn expected_bucket_owner(&self) -> Option<&str> {
-        self.upload.expected_bucket_owner()
     }
 }
 
@@ -4883,6 +4955,21 @@ impl Coordinator {
         }
     }
 
+    fn with_bucket_write_reservation_for<R, T>(
+        &self,
+        req: &R,
+        action: impl FnOnce(BucketSummary) -> Result<T, ServerError>,
+    ) -> Result<T, ServerError>
+    where
+        R: BucketScopedRequest + ?Sized,
+    {
+        let expected_bucket_owner = req.expected_bucket_owner();
+        self.with_bucket_write_reservation(req.bucket_name(), |bucket_info| {
+            Self::ensure_expected_bucket_owner(&bucket_info, expected_bucket_owner)?;
+            action(bucket_info)
+        })
+    }
+
     fn next_completed_multipart_upload_order_for_bucket(
         &self,
         bucket: &str,
@@ -5039,6 +5126,13 @@ impl Coordinator {
         let bucket = Self::bucket_summary(info);
         Self::ensure_expected_bucket_owner(&bucket, expected_bucket_owner)?;
         Ok(bucket)
+    }
+
+    fn active_bucket_summary_for<R>(&self, req: &R) -> Result<BucketSummary, ServerError>
+    where
+        R: BucketScopedRequest + ?Sized,
+    {
+        self.active_bucket_summary(req.bucket_name(), req.expected_bucket_owner())
     }
 
     /// Create a new coordinator.
@@ -5459,11 +5553,7 @@ impl Coordinator {
             req.name
         );
         let name = req.name;
-        let _bucket_info = self.authorize_bucket_admin_requester(
-            &req.requester,
-            name,
-            req.expected_bucket_owner(),
-        )?;
+        let _bucket_info = self.authorize_bucket_admin_for(req)?;
         self.begin_bucket_write_drain(name)?;
 
         let mut marked_deleting = false;
@@ -5533,7 +5623,7 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        self.authorize_bucket_read_requester(&req.requester, req.name, req.expected_bucket_owner())
+        self.authorize_bucket_read_for(req)
     }
 
     pub fn bucket_exists(&self, name: &str) -> Result<bool, ServerError> {
@@ -5578,11 +5668,7 @@ impl Coordinator {
             req.bucket.name,
             req.state
         );
-        let bucket_info = self.authorize_bucket_admin_requester(
-            &req.bucket.requester,
-            req.bucket.name,
-            req.bucket.expected_bucket_owner(),
-        )?;
+        let bucket_info = self.authorize_bucket_admin_for(&req.bucket)?;
         if bucket_info.object_lock.enabled && req.state != BucketVersioningState::Enabled {
             return Err(ServerError::InvalidBucketState);
         }
@@ -5617,11 +5703,7 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let info = self.authorize_bucket_read_requester(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
-        )?;
+        let info = self.authorize_bucket_read_for(req)?;
         Ok(info.versioning)
     }
 
@@ -5637,10 +5719,8 @@ impl Coordinator {
             req.config.object_lock_enabled.unwrap_or(false),
             req.config.default_retention.is_some()
         );
-        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.bucket.requester,
-            req.bucket.name,
-            req.bucket.expected_bucket_owner(),
+        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
             auth::PolicyAction::PutBucketObjectLockConfiguration,
         )?;
         if bucket_info.versioning != BucketVersioningState::Enabled {
@@ -5685,8 +5765,7 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let info = self.active_bucket_summary(req.name, None)?;
-        Self::ensure_expected_bucket_owner(&info, req.expected_bucket_owner())?;
+        let info = self.active_bucket_summary_for(req)?;
         let bucket_policy = self.cached_bucket_policy(&info)?;
         if !Self::requester_can_get_bucket_object_lock_configuration_with_bucket_policy(
             &req.requester,
@@ -5714,10 +5793,8 @@ impl Coordinator {
             req.bucket.name,
             req.config.sse_c_blocked
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.bucket.requester,
-            req.bucket.name,
-            req.bucket.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
             auth::PolicyAction::PutEncryptionConfiguration,
         )?;
         let effective_config = req.config.effective();
@@ -5747,10 +5824,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
+        let info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
             auth::PolicyAction::GetEncryptionConfiguration,
         )?;
         Ok(info.encryption)
@@ -5763,10 +5838,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
             auth::PolicyAction::PutEncryptionConfiguration,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
@@ -5793,10 +5866,8 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.bucket.requester,
-            req.bucket.name,
-            req.bucket.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
             auth::PolicyAction::PutBucketCors,
         )?;
         let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
@@ -5817,10 +5888,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
             auth::PolicyAction::GetBucketCors,
         )?;
         self.load_bucket_cors_config(req.name)
@@ -5833,10 +5902,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
             auth::PolicyAction::PutBucketCors,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
@@ -5856,10 +5923,8 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.bucket.requester,
-            req.bucket.name,
-            req.bucket.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
             auth::PolicyAction::PutBucketTagging,
         )?;
         let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
@@ -5880,10 +5945,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
             auth::PolicyAction::GetBucketTagging,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
@@ -5902,10 +5965,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
             auth::PolicyAction::PutBucketTagging,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
@@ -5925,11 +5986,7 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let bucket_info = self.authorize_bucket_admin_requester(
-            &req.bucket.requester,
-            req.bucket.name,
-            req.bucket.expected_bucket_owner(),
-        )?;
+        let bucket_info = self.authorize_bucket_admin_for(&req.bucket)?;
         let parsed_policy =
             auth::parse_bucket_policy(req.config).map_err(|e| ServerError::MalformedPolicy {
                 reason: e.reason().to_string(),
@@ -5981,11 +6038,7 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
-        )?;
+        let _bucket_info = self.authorize_bucket_admin_for(req)?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
         bucket_pg.get_bucket_policy(req.name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
@@ -6002,8 +6055,7 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let bucket_info = self.active_bucket_summary(req.name, None)?;
-        Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
+        let bucket_info = self.active_bucket_summary_for(req)?;
         if !bucket_info.bucket_policy_present {
             if !Self::requester_can_bucket_admin(&req.requester, &bucket_info.owner_principal) {
                 return Err(ServerError::AccessDenied);
@@ -6030,11 +6082,7 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
-        )?;
+        let _bucket_info = self.authorize_bucket_admin_for(req)?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
         bucket_pg
             .delete_bucket_policy(req.name)
@@ -6066,10 +6114,8 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.bucket.requester,
-            req.bucket.name,
-            req.bucket.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
             auth::PolicyAction::PutLifecycleConfiguration,
         )?;
         let parsed_config = Arc::new(
@@ -6126,10 +6172,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
             auth::PolicyAction::GetLifecycleConfiguration,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
@@ -6150,10 +6194,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
             auth::PolicyAction::PutLifecycleConfiguration,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
@@ -6187,10 +6229,8 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.bucket.requester,
-            req.bucket.name,
-            req.bucket.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
             auth::PolicyAction::PutBucketPublicAccessBlock,
         )?;
         let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
@@ -6220,8 +6260,7 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let bucket_info = self.active_bucket_summary(req.name, None)?;
-        Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
+        let bucket_info = self.active_bucket_summary_for(req)?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_get_bucket_public_access_block_with_bucket_policy(
             &req.requester,
@@ -6251,10 +6290,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
             auth::PolicyAction::PutBucketPublicAccessBlock,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
@@ -6282,10 +6319,8 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.bucket.requester,
-            req.bucket.name,
-            req.bucket.expected_bucket_owner(),
+        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
             auth::PolicyAction::PutBucketOwnershipControls,
         )?;
         if Self::is_bucket_owner_enforced(Some(req.config))
@@ -6323,10 +6358,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
             auth::PolicyAction::GetBucketOwnershipControls,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
@@ -6350,10 +6383,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
-            &req.requester,
-            req.name,
-            req.expected_bucket_owner(),
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
             auth::PolicyAction::PutBucketOwnershipControls,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
@@ -7668,8 +7699,7 @@ impl Coordinator {
             return result;
         }
 
-        self.with_bucket_write_reservation(authorized.bucket(), |bucket_info| {
-            Self::ensure_expected_bucket_owner(&bucket_info, authorized.expected_bucket_owner())?;
+        self.with_bucket_write_reservation_for(authorized, |bucket_info| {
             let write_encryption = &authorized.write_encryption;
             Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
             let acl = authorized.acl();
@@ -8437,7 +8467,7 @@ impl Coordinator {
         let metadata_blob = req.metadata_blob;
         let tags = req.tags;
         let cond = req.cond;
-        self.with_bucket_write_reservation(bucket, |bucket_info| {
+        self.with_bucket_write_reservation_for(&req.object, |bucket_info| {
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
             let resolved_object_lock =
                 Self::resolve_new_object_lock_state(&bucket_info, req.requested_object_lock)?;
@@ -11665,11 +11695,7 @@ impl Coordinator {
         let prefix = req.prefix;
         let key_marker = req.key_marker;
         let version_id_marker = req.version_id_marker;
-        let bucket_info = self.authorize_bucket_read_requester(
-            &req.bucket.requester,
-            bucket,
-            req.expected_bucket_owner(),
-        )?;
+        let bucket_info = self.authorize_bucket_read_for(&req.bucket)?;
 
         if max_keys == 0 {
             return Ok(ListObjectVersionsResult {
@@ -11878,8 +11904,7 @@ impl Coordinator {
         let bucket = req.object.bucket_name();
         let key = req.object.key;
         let policy_context = req.effective_policy_context();
-        self.with_bucket_write_reservation(bucket, |bucket_info| {
-            Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
+        self.with_bucket_write_reservation_for(&req.object, |bucket_info| {
             if req.object.requester().is_anonymous() {
                 return Err(ServerError::AccessDenied);
             }
@@ -12277,8 +12302,7 @@ impl Coordinator {
         let upload_id = req.upload.upload_id;
         let parts = req.parts;
         let claimed_checksum = req.claimed_checksum;
-        self.with_bucket_write_reservation(bucket, |bucket_info| {
-            Self::ensure_expected_bucket_owner(&bucket_info, req.expected_bucket_owner())?;
+        self.with_bucket_write_reservation_for(&req.upload, |bucket_info| {
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             let _completion_guard = self.storage_node.lock_multipart_completion_bucket(bucket);
             let completion_order = self.next_completed_multipart_upload_order_for_bucket(bucket)?;
@@ -12906,11 +12930,7 @@ impl Coordinator {
         let key_marker = req.key_marker;
         let upload_id_marker = req.upload_id_marker;
         let max_uploads = req.max_uploads;
-        let _bucket_info = self.authorize_bucket_read_requester(
-            &req.bucket.requester,
-            bucket,
-            req.expected_bucket_owner(),
-        )?;
+        let _bucket_info = self.authorize_bucket_read_for(&req.bucket)?;
 
         if max_uploads == 0 {
             return Ok(ListMultipartUploadsResult {
