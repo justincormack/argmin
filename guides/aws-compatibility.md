@@ -104,7 +104,31 @@ Related note:
 
 - [plans/requester-pays-note.md](/home/justin/src/github.com/justincormack/argmin/plans/requester-pays-note.md)
 
-### 7. `HeadBucket` omits `Transfer-Encoding: chunked`
+### 7. MFA Delete on bucket versioning is not implemented
+
+Argmin supports the basic bucket versioning state (`Enabled` / `Suspended`),
+but it does not implement AWS's MFA Delete surface.
+
+That means the current gap includes both APIs involved in the AWS behavior:
+
+- `GetBucketVersioning` does not expose the `MfaDelete` response element
+- `PutBucketVersioning` does not implement `MfaDelete` request handling or the
+  required `x-amz-mfa` header flow for changing MFA Delete state
+
+AWS documents this as part of the bucket versioning configuration rather than a
+separate API surface:
+
+- `GetBucketVersioning` returns `MfaDelete` when the bucket has been configured
+  with MFA Delete
+- `PutBucketVersioning` requires `x-amz-mfa` plus both `Status` and
+  `MfaDelete` when enabling MFA Delete
+
+Sources:
+
+- https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketVersioning.html
+- https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketVersioning.html
+
+### 8. `HeadBucket` omits `Transfer-Encoding: chunked`
 
 AWS includes `Transfer-Encoding: chunked` on successful `HeadBucket`
 responses. Argmin does not currently emit that header.
@@ -116,7 +140,7 @@ instead.
 
 The `s3-diff-tests` `HeadBucket` response-shape check ignores only this header.
 
-### 8. SigV2 is not implemented
+### 9. SigV2 is not implemented
 
 Argmin does not implement AWS Signature Version 2 authentication.
 
@@ -134,7 +158,7 @@ Related note:
 
 - [plans/sigv2-compat-note.md](/home/justin/src/github.com/justincormack/argmin/plans/sigv2-compat-note.md)
 
-### 9. Object ownership and object ACL behavior are incomplete
+### 10. Object ownership and object ACL behavior are incomplete
 
 Argmin does not yet implement full AWS object ownership semantics or the full
 object ACL API surface.
@@ -148,7 +172,7 @@ Related plan:
 
 - [plans/aws-auth-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/aws-auth-compat-plan.md)
 
-### 10. Account-level Block Public Access is not implemented
+### 11. Account-level Block Public Access is not implemented
 
 Argmin supports the bucket-level public access block surface needed by the
 current feature set, but it does not implement AWS account-level Block Public
@@ -161,7 +185,7 @@ Related plan:
 
 - [plans/aws-auth-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/aws-auth-compat-plan.md)
 
-### 11. Bucket policy CRUD does not yet match AWS root-principal behavior
+### 12. Bucket policy CRUD does not yet match AWS root-principal behavior
 
 For `GetBucketPolicy`, `PutBucketPolicy`, and `DeleteBucketPolicy`, AWS allows
 the bucket owner's account `root` principal to perform the operation even if
@@ -175,7 +199,7 @@ Related plan:
 
 - [plans/bucket-policy-root-principal-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/bucket-policy-root-principal-compat-plan.md)
 
-### 12. `AccessDenied` does not yet match AWS principal-specific error text
+### 13. `AccessDenied` does not yet match AWS principal-specific error text
 
 Argmin now matches the generic XML error shape for several `AccessDenied`
 cases, but it does not yet reproduce AWS's more specific denial messages that
