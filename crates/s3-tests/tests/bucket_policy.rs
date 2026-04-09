@@ -9,6 +9,7 @@ use s3_tests::{
     sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
 };
 use serde_json::json;
+use std::future::Future;
 
 fn agent() -> ureq::Agent {
     s3_tests::test_agent()
@@ -195,6 +196,82 @@ async fn upload_part_copy_eventually(
             }
             Err(err) => panic!("UploadPartCopy failed unexpectedly: {err:?}"),
         }
+    }
+
+    unreachable!()
+}
+
+async fn eventually_ok<T, E, F, Fut>(description: &str, mut op: F) -> T
+where
+    E: std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match op().await {
+            Ok(output) => return output,
+            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!("{description} failed unexpectedly: {err:?}"),
+        }
+    }
+
+    unreachable!()
+}
+
+async fn get_object_eventually(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> aws_sdk_s3::operation::get_object::GetObjectOutput {
+    eventually_ok("GetObject", || {
+        client.get_object().bucket(bucket).key(key).send()
+    })
+    .await
+}
+
+async fn get_bucket_policy_status_eventually(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+) -> aws_sdk_s3::operation::get_bucket_policy_status::GetBucketPolicyStatusOutput {
+    eventually_ok("GetBucketPolicyStatus", || {
+        client.get_bucket_policy_status().bucket(bucket).send()
+    })
+    .await
+}
+
+async fn alt_get_bucket_policy_status_access_denied_eventually(bucket: &str) {
+    // This waits for a policy transition from allow to explicit deny on the
+    // same action. On AWS the old allow decision can remain visible for longer
+    // than the simpler allow-propagation cases in this file.
+    const MAX_ATTEMPTS: usize = 60;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .alt_client()
+            .get_bucket_policy_status()
+            .bucket(bucket)
+            .send()
+            .await;
+        match &result {
+            Ok(_) => {}
+            Err(err)
+                if err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                    && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                        == Some("AccessDenied") =>
+            {
+                return;
+            }
+            Err(_) => {}
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+        panic!("GetBucketPolicyStatus did not converge to AccessDenied for bucket {bucket}: {result:?}");
     }
 
     unreachable!()
@@ -701,8 +778,11 @@ fn test_get_bucket_policy_status_cross_account_allow() {
             .send()
             .await
             .unwrap();
-
-        assert!(!bucket_policy_status_is_public(alt_client, &bucket).await);
+        let result = get_bucket_policy_status_eventually(alt_client, &bucket).await;
+        assert!(!result
+            .policy_status()
+            .and_then(|status| status.is_public())
+            .expect("expected PolicyStatus.IsPublic"));
 
         cleanup(&bucket, &[]).await;
     });
@@ -716,6 +796,31 @@ fn test_get_bucket_policy_status_cross_account_deny_overrides_allow() {
         let alt_client = CTX.alt_client();
 
         let bucket = create_bucket_allowing_sse_c(client).await;
+        let allow_policy = bucket_policy_document(
+            principal.clone(),
+            "Allow",
+            "s3:GetBucketPolicyStatus",
+            bucket_resource(&bucket),
+        );
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(allow_policy)
+            .send()
+            .await
+            .unwrap();
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let allow_result = get_bucket_policy_status_eventually(alt_client, &bucket).await;
+        assert!(!allow_result
+            .policy_status()
+            .and_then(|status| status.is_public())
+            .expect("expected PolicyStatus.IsPublic"));
+
         let policy = json!({
             "Version": "2012-10-17",
             "Statement": [
@@ -748,19 +853,7 @@ fn test_get_bucket_policy_status_cross_account_deny_overrides_allow() {
             .await
             .unwrap();
 
-        let result = alt_client
-            .get_bucket_policy_status()
-            .bucket(&bucket)
-            .send()
-            .await;
-        assert_eq!(err_status(&result), 403);
-        assert_eq!(
-            result
-                .unwrap_err()
-                .as_service_error()
-                .and_then(ProvideErrorMetadata::code),
-            Some("AccessDenied")
-        );
+        alt_get_bucket_policy_status_access_denied_eventually(&bucket).await;
 
         cleanup(&bucket, &[]).await;
     });
@@ -1014,31 +1107,31 @@ fn test_bucket_policy_put_obj_grant_full_control() {
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key("allowed")
-            .body(ByteStream::from_static(b"allowed"))
-            .customize()
-            .mutate_request({
-                let full_control_header = full_control_header.clone();
-                move |req| {
+        eventually_ok("PutObject with grant-full-control", || {
+            let full_control_header = full_control_header.clone();
+            alt_client
+                .put_object()
+                .bucket(&bucket)
+                .key("allowed")
+                .body(ByteStream::from_static(b"allowed"))
+                .customize()
+                .mutate_request(move |req| {
                     req.headers_mut()
                         .insert("x-amz-grant-full-control", full_control_header.clone());
-                }
-            })
-            .send()
-            .await
-            .unwrap();
+                })
+                .send()
+        })
+        .await;
 
-        alt_client
-            .put_object()
-            .bucket(&control_bucket)
-            .key("control")
-            .body(ByteStream::from_static(b"control"))
-            .send()
-            .await
-            .unwrap();
+        eventually_ok("PutObject control write", || {
+            alt_client
+                .put_object()
+                .bucket(&control_bucket)
+                .key("control")
+                .body(ByteStream::from_static(b"control"))
+                .send()
+        })
+        .await;
 
         let allowed_acl = alt_client
             .get_object_acl()
@@ -1169,22 +1262,21 @@ fn test_bucket_policy_copy_object_grant_full_control() {
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        alt_client
-            .copy_object()
-            .bucket(&bucket)
-            .key("allowed")
-            .copy_source(format!("{bucket}/src"))
-            .customize()
-            .mutate_request({
-                let full_control_header = full_control_header.clone();
-                move |req| {
+        eventually_ok("CopyObject with grant-full-control", || {
+            let full_control_header = full_control_header.clone();
+            alt_client
+                .copy_object()
+                .bucket(&bucket)
+                .key("allowed")
+                .copy_source(format!("{bucket}/src"))
+                .customize()
+                .mutate_request(move |req| {
                     req.headers_mut()
                         .insert("x-amz-grant-full-control", full_control_header.clone());
-                }
-            })
-            .send()
-            .await
-            .unwrap();
+                })
+                .send()
+        })
+        .await;
 
         let allowed_acl = alt_client
             .get_object_acl()
@@ -1880,15 +1972,16 @@ fn test_bucket_policy_put_obj_request_object_tag() {
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key("allowed")
-            .tagging("security=public")
-            .body(ByteStream::from_static(b"allowed"))
-            .send()
-            .await
-            .unwrap();
+        eventually_ok("PutObject with request-object-tag condition", || {
+            alt_client
+                .put_object()
+                .bucket(&bucket)
+                .key("allowed")
+                .tagging("security=public")
+                .body(ByteStream::from_static(b"allowed"))
+                .send()
+        })
+        .await;
 
         cleanup(&bucket, &["allowed", "denied"]).await;
     });
@@ -1940,13 +2033,14 @@ fn test_bucket_policy_multipart_upload_requires_object_resource() {
             .await
             .unwrap();
 
-        let upload = alt_client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await
-            .unwrap();
+        let upload = eventually_ok("CreateMultipartUpload with object resource policy", || {
+            alt_client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+        })
+        .await;
         alt_client
             .abort_multipart_upload()
             .bucket(&bucket)
@@ -2072,14 +2166,18 @@ fn test_bucket_policy_multipart_upload_request_object_tag() {
         assert_eq!(err_status(&denied), 403);
         assert_s3_err_code(&denied, "AccessDenied");
 
-        let upload = alt_client
-            .create_multipart_upload()
-            .bucket(&bucket)
-            .key("allowed")
-            .tagging("security=public")
-            .send()
-            .await
-            .unwrap();
+        let upload = eventually_ok(
+            "CreateMultipartUpload with request-object-tag condition",
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key("allowed")
+                    .tagging("security=public")
+                    .send()
+            },
+        )
+        .await;
         let upload_id = upload.upload_id().unwrap().to_string();
         alt_client
             .abort_multipart_upload()
@@ -2146,6 +2244,9 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
             .send()
             .await
             .unwrap();
+        let source_probe = get_object_eventually(alt_client, &src_bucket, "public/foo").await;
+        let source_probe_body = source_probe.body.collect().await.unwrap().into_bytes();
+        assert_eq!(source_probe_body.as_ref(), b"public/foo");
 
         let upload = alt_client
             .create_multipart_upload()
@@ -2257,7 +2358,6 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
 fn test_bucket_policy_another_bucket() {
     s3_tests::run(async {
         let client = CTX.client();
-        let alt_client = CTX.alt_client();
         let principal = alt_policy_principal();
 
         let bucket1 = unique_bucket();
@@ -2307,21 +2407,11 @@ fn test_bucket_policy_another_bucket() {
             .await
             .unwrap();
 
-        let resp1 = alt_client
-            .list_objects()
-            .bucket(&bucket1)
-            .send()
-            .await
-            .unwrap();
+        let resp1 = alt_list_objects_v1_eventually(&bucket1).await;
         assert_eq!(resp1.contents().len(), 1);
         assert_eq!(resp1.contents()[0].key(), Some("obj1"));
 
-        let resp2 = alt_client
-            .list_objects()
-            .bucket(&bucket2)
-            .send()
-            .await
-            .unwrap();
+        let resp2 = alt_list_objects_v1_eventually(&bucket2).await;
         assert_eq!(resp2.contents().len(), 1);
         assert_eq!(resp2.contents()[0].key(), Some("obj2"));
 
@@ -2366,14 +2456,15 @@ fn test_bucket_policy_condition_operator_if_exists() {
             .await
             .unwrap();
 
-        alt_client
-            .put_object()
-            .bucket(&bucket)
-            .key("foo")
-            .body(ByteStream::from_static(b"bar"))
-            .send()
-            .await
-            .unwrap();
+        eventually_ok("PutObject with StringLikeIfExists condition", || {
+            alt_client
+                .put_object()
+                .bucket(&bucket)
+                .key("foo")
+                .body(ByteStream::from_static(b"bar"))
+                .send()
+        })
+        .await;
 
         let resp = client
             .get_object()
