@@ -36,6 +36,7 @@ use storage::{
     StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
 
+pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
 use crate::conditional::{
     check_copy_source_conditions, check_delete_conditions, check_read_conditions,
     check_write_conditions, DeleteCondition, ReadCondition, WriteCondition,
@@ -77,90 +78,6 @@ pub const MAX_OBJECT_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 pub const INTERNAL_SEGMENT_SIZE: usize = 8 * 1024 * 1024;
 
 const LIFECYCLE_SWEEP_INTERVAL_MILLIS: u64 = 1000;
-
-/// A checksum claim parsed from HTTP headers or trailers.
-///
-/// Base64 decoding and length validation happen at construction time,
-/// so the coordinator receives already-decoded, validated bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChecksumClaim {
-    expected: RawChecksum,
-}
-
-impl ChecksumClaim {
-    /// Parse a base64-encoded checksum value, validating format and length.
-    pub fn from_base64(algorithm: ChecksumAlgorithm, b64: &str) -> Result<Self, ServerError> {
-        use base64::Engine;
-
-        let mut bytes = [0u8; 32];
-        let decoded_len = base64::engine::general_purpose::STANDARD
-            .decode_slice(b64, &mut bytes)
-            .map_err(|_| ServerError::InvalidRequest {
-                reason: "invalid base64 in checksum value".to_string(),
-            })?;
-        let expected_len = algorithm.expected_byte_length();
-        if decoded_len != expected_len {
-            return Err(ServerError::InvalidRequest {
-                reason: format!(
-                    "checksum length {} does not match {} (expected {})",
-                    decoded_len,
-                    algorithm.as_str(),
-                    expected_len,
-                ),
-            });
-        }
-        Ok(Self {
-            expected: RawChecksum::new(algorithm, &bytes[..decoded_len])
-                .expect("decoded checksum bytes were length-validated against the algorithm"),
-        })
-    }
-
-    /// The checksum algorithm.
-    pub fn algorithm(&self) -> ChecksumAlgorithm {
-        self.expected.algorithm()
-    }
-
-    /// The decoded checksum bytes.
-    pub fn expected_bytes(&self) -> &[u8] {
-        self.expected.bytes()
-    }
-
-    /// The expected checksum value as canonical base64.
-    pub fn to_base64(&self) -> String {
-        use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(self.expected.bytes())
-    }
-}
-
-/// A typed encoded checksum claim whose serialized form is preserved as-is.
-///
-/// Used for multipart-complete object-level checksum claims, where some valid
-/// values are composite forms such as `base64-N`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EncodedChecksumClaim {
-    algorithm: ChecksumAlgorithm,
-    encoded_value: String,
-}
-
-impl EncodedChecksumClaim {
-    #[must_use]
-    pub fn new(algorithm: ChecksumAlgorithm, encoded_value: String) -> Self {
-        Self {
-            algorithm,
-            encoded_value,
-        }
-    }
-
-    #[must_use]
-    pub fn algorithm(&self) -> ChecksumAlgorithm {
-        self.algorithm
-    }
-
-    #[must_use]
-    pub fn encoded_value(&self) -> &str {
-        &self.encoded_value
-    }
-}
 
 /// Hard cap on total records fetched across all PGs for a single list query.
 /// Prevents unbounded memory when delimiter causes u32::MAX per-PG limits.
@@ -13718,9 +13635,9 @@ impl Coordinator {
             // UploadPartCopy has no checksum header/body claim from the client.
             // When the multipart upload is checksum-configured, treat the
             // server-computed checksum as the authoritative part claim.
-            let claimed_checksum = computed_checksum.as_ref().map(|checksum| ChecksumClaim {
-                expected: checksum.clone(),
-            });
+            let claimed_checksum = computed_checksum
+                .as_ref()
+                .map(|checksum| ChecksumClaim::from_raw(checksum.clone()));
 
             self.finalize_stream_part(FinalizeStreamPartRequest {
                 upload: MultipartObjectRequest::new(

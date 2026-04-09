@@ -12,6 +12,7 @@
     clippy::unreadable_literal
 )]
 
+pub mod checksum_claim;
 pub mod conditional;
 pub mod coordinator;
 pub mod error;
@@ -21,3 +22,5 @@ pub mod pg;
 pub mod range;
 pub mod sse;
 pub mod system_metadata;
+
+pub use checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
