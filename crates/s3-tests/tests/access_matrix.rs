@@ -12,6 +12,7 @@ use s3_tests::{
     assert_s3_err_code, delete_all_and_bucket, disable_bucket_public_access_block, err_status,
     unique_bucket, CTX,
 };
+use std::time::Duration;
 
 const ACL_KEY: &str = "foo";
 const DEFAULT_KEY: &str = "bar";
@@ -166,6 +167,40 @@ async fn assert_alt_get_object_body(bucket: &str, key: &str, expected_body: &[u8
     assert_eq!(body.as_ref(), expected_body);
 }
 
+async fn assert_alt_get_object_body_eventually(bucket: &str, key: &str, expected_body: &[u8]) {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match CTX
+            .alt_client()
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let body = response.body.collect().await.unwrap().into_bytes();
+                if body.as_ref() == expected_body {
+                    return;
+                }
+                if attempt + 1 < MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    continue;
+                }
+                panic!(
+                    "alt GetObject body did not converge for {bucket}/{key}: expected {:?}, got {:?}",
+                    expected_body, body.as_ref()
+                );
+            }
+            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!("alt GetObject failed for {bucket}/{key}: {err:?}"),
+        }
+    }
+}
+
 async fn assert_alt_get_object_denied(bucket: &str, key: &str) {
     let result = CTX
         .alt_client()
@@ -175,6 +210,29 @@ async fn assert_alt_get_object_denied(bucket: &str, key: &str) {
         .send()
         .await;
     assert_access_denied(&result);
+}
+
+async fn assert_alt_get_object_denied_eventually(bucket: &str, key: &str) {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .alt_client()
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        if result.is_err() && err_status(&result) == 403 {
+            assert_s3_err_code(&result, "AccessDenied");
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!("alt GetObject did not converge to AccessDenied for {bucket}/{key}: {result:?}");
+    }
 }
 
 async fn assert_alt_put_object_denied(bucket: &str, key: &str, body: &'static [u8]) {
@@ -267,8 +325,16 @@ async fn run_access_matrix(
 ) {
     let fixture = setup_access_matrix(bucket_acl, object_acl).await;
 
+    // The first data-plane assertion after the control-plane setup uses an
+    // eventual helper: cross-account authorization can lag behind
+    // PutBucketAcl / PutPublicAccessBlock / PutBucketOwnershipControls.
+    // Once the first operation converges, subsequent assertions in the same
+    // test can use the immediate variants because the authorization decision
+    // has already propagated.
     if object_acl.allows_read() {
-        assert_alt_get_object_body(&fixture.bucket, ACL_KEY, b"foocontent").await;
+        assert_alt_get_object_body_eventually(&fixture.bucket, ACL_KEY, b"foocontent").await;
+    } else if bucket_acl == BucketAclCase::Private {
+        assert_alt_get_object_denied_eventually(&fixture.bucket, ACL_KEY).await;
     } else {
         assert_alt_get_object_denied(&fixture.bucket, ACL_KEY).await;
     }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::ObjectCannedAcl;
 use s3_tests::{unique_bucket, CTX};
@@ -5,6 +7,79 @@ use s3_tests::{unique_bucket, CTX};
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
 fn agent() -> ureq::Agent {
     s3_tests::test_agent()
+}
+
+/// Retry an anonymous HTTP request until it returns the expected status.
+///
+/// Anonymous data-plane authorization can lag behind control-plane writes such
+/// as PutBucketAcl and PutPublicAccessBlock on AWS.  This helper retries the
+/// request so that tests do not flake due to eventual consistency.
+async fn anon_get_status_eventually(url: &str, expected_status: u16, description: &str) -> String {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut resp = agent().get(url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let body = resp.body_mut().read_to_string().unwrap_or_default();
+        if status == expected_status {
+            return body;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "{description} did not converge to HTTP {expected_status} for {url}, last status {status}, body: {body}"
+        );
+    }
+    unreachable!()
+}
+
+async fn anon_head_status_eventually(url: &str, expected_status: u16, description: &str) {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut resp = agent().head(url).call().expect("transport error");
+        let status = resp.status().as_u16();
+        let _ = resp.body_mut().read_to_string();
+        if status == expected_status {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "{description} did not converge to HTTP {expected_status} for {url}, last status {status}"
+        );
+    }
+    unreachable!()
+}
+
+async fn anon_put_status_eventually(
+    url: &str,
+    body: &'static [u8],
+    expected_status: u16,
+    description: &str,
+) {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut resp = agent().put(url).send(body).expect("transport error");
+        let status = resp.status().as_u16();
+        let _ = resp.body_mut().read_to_string();
+        if status == expected_status {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "{description} did not converge to HTTP {expected_status} for {url}, last status {status}"
+        );
+    }
+    unreachable!()
 }
 
 /// Create a public-read bucket, returning its name.
@@ -53,10 +128,8 @@ fn test_anon_get_object_public_bucket() {
             .unwrap();
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
-        let mut resp = agent().get(&url).call().expect("transport error");
-        assert_eq!(resp.status().as_u16(), 200);
-        let data = resp.body_mut().read_to_vec().unwrap();
-        assert_eq!(&data[..], b"public data");
+        let body = anon_get_status_eventually(&url, 200, "anon GET on public bucket").await;
+        assert_eq!(body.as_bytes(), b"public data");
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -115,8 +188,7 @@ fn test_anon_head_object_public_bucket() {
             .unwrap();
 
         let url = format!("{}/{}/obj", CTX.endpoint(), bucket);
-        let resp = agent().head(&url).call().expect("transport error");
-        assert_eq!(resp.status().as_u16(), 200);
+        anon_head_status_eventually(&url, 200, "anon HEAD on public bucket").await;
 
         cleanup(&bucket, &["obj"]).await;
     });
@@ -130,8 +202,7 @@ fn test_anon_head_bucket_public() {
         let bucket = setup_public_bucket().await;
 
         let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let resp = agent().head(&url).call().expect("transport error");
-        assert_eq!(resp.status().as_u16(), 200);
+        anon_head_status_eventually(&url, 200, "anon HEAD on public bucket").await;
 
         cleanup(&bucket, &[]).await;
     });
@@ -304,9 +375,7 @@ fn test_anon_list_objects_v1_public_bucket() {
             .unwrap();
 
         let url = format!("{}/{}", CTX.endpoint(), bucket);
-        let mut resp = agent().get(&url).call().expect("transport error");
-        assert_eq!(resp.status().as_u16(), 200);
-        let body = resp.body_mut().read_to_string().unwrap();
+        let body = anon_get_status_eventually(&url, 200, "anon list v1 on public bucket").await;
         assert!(
             body.contains("<Key>obj1</Key>"),
             "expected obj1 in listing: {}",
@@ -381,9 +450,7 @@ fn test_anon_list_objects_v2_public_bucket() {
             .unwrap();
 
         let url = format!("{}/{}?list-type=2", CTX.endpoint(), bucket);
-        let mut resp = agent().get(&url).call().expect("transport error");
-        assert_eq!(resp.status().as_u16(), 200);
-        let body = resp.body_mut().read_to_string().unwrap();
+        let body = anon_get_status_eventually(&url, 200, "anon list v2 on public bucket").await;
         assert!(
             body.contains("<Key>obj1</Key>"),
             "expected obj1 in v2 listing: {}",
@@ -487,17 +554,13 @@ fn test_object_anon_put_write_access() {
         let bucket = setup_public_write_bucket().await;
 
         let url = format!("{}/{}/anon-upload", CTX.endpoint(), bucket);
-        let mut resp = agent()
-            .put(&url)
-            .send(b"public write" as &[u8])
-            .expect("transport error");
-        let status = resp.status().as_u16();
-        let body = resp.body_mut().read_to_string().unwrap_or_default();
-        assert_eq!(
-            status, 200,
-            "expected 200 for anon PUT on public-read-write bucket, got {} body={}",
-            status, body
-        );
+        anon_put_status_eventually(
+            &url,
+            b"public write",
+            200,
+            "anon PUT on public-read-write bucket",
+        )
+        .await;
 
         CTX.client()
             .delete_object()

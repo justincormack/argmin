@@ -123,11 +123,12 @@ The main categories currently covered are:
     `PutBucketOwnershipControls`, and `PutPublicAccessBlock`.
   - An owner-side read-back such as `GetBucketPolicy` is not sufficient proof
     that the corresponding data-plane authorization decision has converged.
-  - Existing helpers in `bucket_policy.rs`, `ownership.rs`, and
-    `public_access_block.rs` wait for the exact operation under test
-    (`GetObject`, `ListObjects`, `GetBucketPolicyStatus`, `CopyObject`,
-    `UploadPartCopy`, `CreateMultipartUpload`, and similar) rather than
-    assuming immediate consistency after the control-plane write.
+  - Existing helpers in `bucket_policy.rs`, `ownership.rs`,
+    `public_access_block.rs`, `access_matrix.rs`, and `bucket_anon.rs` wait
+    for the exact operation under test (`GetObject`, `ListObjects`,
+    `GetBucketPolicyStatus`, `CopyObject`, `UploadPartCopy`,
+    `CreateMultipartUpload`, and similar) rather than assuming immediate
+    consistency after the control-plane write.
 
 - CORS and response-policy convergence
   - Preflight behavior can take time to reflect CORS configuration updates, so
