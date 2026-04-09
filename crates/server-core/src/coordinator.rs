@@ -5637,10 +5637,11 @@ impl Coordinator {
             req.config.object_lock_enabled.unwrap_or(false),
             req.config.default_retention.is_some()
         );
-        let bucket_info = self.authorize_bucket_admin_requester(
+        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.bucket.requester,
             req.bucket.name,
             req.bucket.expected_bucket_owner(),
+            auth::PolicyAction::PutBucketObjectLockConfiguration,
         )?;
         if bucket_info.versioning != BucketVersioningState::Enabled {
             return Err(ServerError::InvalidBucketState);
@@ -6186,10 +6187,11 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.bucket.requester,
             req.bucket.name,
             req.bucket.expected_bucket_owner(),
+            auth::PolicyAction::PutBucketPublicAccessBlock,
         )?;
         let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
         bucket_pg
@@ -6249,10 +6251,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_requester(
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action(
             &req.requester,
             req.name,
             req.expected_bucket_owner(),
+            auth::PolicyAction::PutBucketPublicAccessBlock,
         )?;
         let bucket_pg = self.get_bucket_pg(req.name)?;
         bucket_pg
@@ -13823,6 +13826,19 @@ mod tests {
         ))
     }
 
+    fn delete_bucket_public_access_block_test(
+        coord: &Coordinator,
+        name: &str,
+        requester: Requester,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<(), ServerError> {
+        coord.delete_bucket_public_access_block(&bucket_request_with_expected_owner(
+            name,
+            requester,
+            expected_bucket_owner,
+        ))
+    }
+
     fn put_bucket_ownership_controls_test(
         coord: &Coordinator,
         name: &str,
@@ -17411,6 +17427,96 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn get_bucket_public_access_block_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let config = "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_public_access_block_test(
+            &coord,
+            "bucket",
+            config,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetBucketPublicAccessBlock","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let read_back = get_bucket_public_access_block_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_back, Some(config.to_string()));
+    }
+
+    #[test]
+    fn put_and_delete_bucket_public_access_block_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let config = "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:PutBucketPublicAccessBlock","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        put_bucket_public_access_block_test(
+            &coord,
+            "bucket",
+            config,
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_bucket_public_access_block_test(
+                &coord,
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None
+            )
+            .unwrap(),
+            Some(config.to_string())
+        );
+
+        delete_bucket_public_access_block_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_bucket_public_access_block_test(
+                &coord,
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -29378,6 +29484,104 @@ mod tests {
         )
         .unwrap();
         assert!(config.enabled);
+    }
+
+    #[test]
+    fn put_bucket_object_lock_configuration_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+        let update = BucketObjectLockConfigurationUpdate {
+            object_lock_enabled: Some(true),
+            default_retention: Some(ObjectLockDefaultRetention {
+                mode: s3_types::ObjectLockMode::Governance,
+                period: s3_types::RetentionPeriod::days(1).unwrap(),
+            }),
+        };
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutBucketObjectLockConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        put_bucket_object_lock_configuration_test(
+            &coord,
+            "bucket",
+            update,
+            test_helpers::requester("other-user"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            get_bucket_object_lock_configuration_test(
+                &coord,
+                "bucket",
+                test_helpers::requester("owner-a"),
+                None
+            )
+            .unwrap(),
+            BucketObjectLockConfig {
+                enabled: true,
+                default_retention: update.default_retention,
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_object_lock_configuration_bucket_policy_deny_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+        let update = BucketObjectLockConfigurationUpdate {
+            object_lock_enabled: Some(true),
+            default_retention: Some(ObjectLockDefaultRetention {
+                mode: s3_types::ObjectLockMode::Governance,
+                period: s3_types::RetentionPeriod::days(1).unwrap(),
+            }),
+        };
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutBucketObjectLockConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        let err = put_bucket_object_lock_configuration_test(
+            &coord,
+            "bucket",
+            update,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
     }
 
     #[test]

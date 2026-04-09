@@ -34,6 +34,8 @@ Completed:
   - `GetLifecycleConfiguration` / `PutLifecycleConfiguration`
   - `GetBucketOwnershipControls` / `PutBucketOwnershipControls`
   - `GetEncryptionConfiguration` / `PutEncryptionConfiguration`
+  - `GetBucketPublicAccessBlock` / `PutBucketPublicAccessBlock`
+  - `GetBucketObjectLockConfiguration` / `PutBucketObjectLockConfiguration`
 - Added `authorize_bucket_admin_or_bucket_policy_action(...)` in
   `crates/server-core/src/coordinator/authz.rs`.
 - Switched these coordinator APIs to the shared helper:
@@ -42,6 +44,8 @@ Completed:
   - bucket lifecycle
   - bucket ownership controls
   - bucket encryption
+  - bucket public access block write/delete
+  - bucket object lock configuration write
 - Added coordinator unit coverage for allow/deny cases on those API families.
 - Added AWS-backed `s3-tests` coverage for:
   - CORS cross-account allow
@@ -49,6 +53,8 @@ Completed:
   - lifecycle cross-account allow
   - ownership controls cross-account allow
   - bucket encryption cross-account allow
+  - bucket public access block cross-account allow
+  - bucket object lock configuration cross-account allow
 - Hardened the AWS-backed tests for propagation and stale-success after delete.
 
 Validated against AWS:
@@ -59,12 +65,23 @@ Validated against AWS:
 - ownership controls
 - bucket encryption
 
+Implemented locally and ready for AWS revalidation:
+
+- bucket public access block
+- bucket object lock configuration
+
 Still open:
 
-- verify the remaining bucket-admin-only APIs against AWS docs and behavior
-- decide whether any additional bucket config APIs should move to the helper
-- keep versioning unchanged unless AWS behavior is confirmed to allow
-  bucket-policy delegation
+- rerun the new public access block and object lock `s3-tests` against AWS when
+  network/DNS access is available
+
+Versioning note:
+
+- `GetBucketVersioning` remains owner-only.
+- AWS API docs explicitly say `GetBucketVersioning` requires the bucket owner.
+- `PutBucketVersioning` is also being kept owner-only.
+- That matches the current AWS compatibility judgment unless contrary behavior is
+  found on real AWS later.
 
 ## Scope
 
@@ -75,13 +92,13 @@ Confirmed or likely affected APIs include:
 - `GetLifecycleConfiguration` / `PutLifecycleConfiguration` / `DeleteBucketLifecycle`
 - `GetBucketOwnershipControls` / `PutBucketOwnershipControls` / `DeleteBucketOwnershipControls`
 - `GetEncryptionConfiguration` / `PutEncryptionConfiguration`
+- `GetBucketPublicAccessBlock` / `PutBucketPublicAccessBlock` / `DeletePublicAccessBlock`
+- `GetBucketObjectLockConfiguration` / `PutBucketObjectLockConfiguration`
 
 Still to verify before changing:
 
 - `GetBucketVersioning` / `PutBucketVersioning`
-- any remaining bucket-admin-only configuration APIs such as
-  `PutBucketPublicAccessBlock` / `DeleteBucketPublicAccessBlock`
-  and `PutBucketObjectLockConfiguration`
+- any remaining bucket-admin-only configuration APIs beyond versioning
 
 Each API should be verified against AWS documentation before changing it, so we
 only widen authorization where AWS actually allows the operation via bucket

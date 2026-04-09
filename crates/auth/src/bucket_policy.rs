@@ -96,6 +96,8 @@ pub enum PolicyAction {
     PutBucketTagging,
     PutEncryptionConfiguration,
     PutLifecycleConfiguration,
+    PutBucketPublicAccessBlock,
+    PutBucketObjectLockConfiguration,
     GetObject,
     GetObjectVersion,
     GetObjectAcl,
@@ -134,6 +136,8 @@ impl PolicyAction {
             Self::PutBucketTagging => "s3:PutBucketTagging",
             Self::PutEncryptionConfiguration => "s3:PutEncryptionConfiguration",
             Self::PutLifecycleConfiguration => "s3:PutLifecycleConfiguration",
+            Self::PutBucketPublicAccessBlock => "s3:PutBucketPublicAccessBlock",
+            Self::PutBucketObjectLockConfiguration => "s3:PutBucketObjectLockConfiguration",
             Self::GetObject => "s3:GetObject",
             Self::GetObjectVersion => "s3:GetObjectVersion",
             Self::GetObjectAcl => "s3:GetObjectAcl",
@@ -882,7 +886,7 @@ fn validate_resource_applicability(
     Ok(())
 }
 
-const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 14] = [
+const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 16] = [
     PolicyAction::GetBucketCors,
     PolicyAction::GetBucketOwnershipControls,
     PolicyAction::GetBucketTagging,
@@ -897,6 +901,8 @@ const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 14] = [
     PolicyAction::PutBucketTagging,
     PolicyAction::PutEncryptionConfiguration,
     PolicyAction::PutLifecycleConfiguration,
+    PolicyAction::PutBucketPublicAccessBlock,
+    PolicyAction::PutBucketObjectLockConfiguration,
 ];
 
 const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 18] = [
@@ -2282,6 +2288,36 @@ mod tests {
     }
 
     #[test]
+    fn put_bucket_public_access_block_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutBucketPublicAccessBlock","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(
+            PolicyAction::PutBucketPublicAccessBlock,
+            "bucket",
+            Some("caller"),
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn put_bucket_object_lock_configuration_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutBucketObjectLockConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(
+            PolicyAction::PutBucketObjectLockConfiguration,
+            "bucket",
+            Some("caller"),
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
     fn list_bucket_matches_bucket_resource() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
@@ -2461,6 +2497,36 @@ mod tests {
     fn put_lifecycle_configuration_object_only_resource_is_rejected() {
         let err = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutLifecycleConfiguration","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_public_access_block_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutBucketPublicAccessBlock","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_object_lock_configuration_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutBucketObjectLockConfiguration","Resource":"arn:aws:s3:::bucket/*"}]}"#,
         )
         .unwrap_err();
 

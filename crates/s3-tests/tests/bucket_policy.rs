@@ -2,10 +2,12 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BlockedEncryptionTypes, BucketLifecycleConfiguration, CompletedMultipartUpload, CompletedPart,
-    CorsConfiguration, CorsRule, EncryptionType, ExpirationStatus, Grant, LifecycleExpiration,
-    LifecycleRule, LifecycleRuleFilter, ObjectOwnership, OwnershipControls, OwnershipControlsRule,
-    Permission, ServerSideEncryption, ServerSideEncryptionByDefault,
-    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging,
+    CorsConfiguration, CorsRule, DefaultRetention, EncryptionType, ExpirationStatus, Grant,
+    LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectLockConfiguration,
+    ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership, OwnershipControls,
+    OwnershipControlsRule, Permission, PublicAccessBlockConfiguration, ServerSideEncryption,
+    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+    Tag, Tagging,
 };
 use s3_tests::{
     assert_s3_err_code, create_public_bucket, disable_bucket_public_access_block, err_status,
@@ -404,6 +406,31 @@ fn blocked_encryption_types(rule: &ServerSideEncryptionRule) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn simple_public_access_block() -> PublicAccessBlockConfiguration {
+    PublicAccessBlockConfiguration::builder()
+        .block_public_acls(true)
+        .ignore_public_acls(true)
+        .block_public_policy(true)
+        .restrict_public_buckets(false)
+        .build()
+}
+
+fn simple_object_lock_configuration() -> ObjectLockConfiguration {
+    ObjectLockConfiguration::builder()
+        .object_lock_enabled(ObjectLockEnabled::Enabled)
+        .rule(
+            ObjectLockRule::builder()
+                .default_retention(
+                    DefaultRetention::builder()
+                        .mode(ObjectLockRetentionMode::Governance)
+                        .days(1)
+                        .build(),
+                )
+                .build(),
+        )
+        .build()
+}
+
 async fn create_bucket_allowing_public_policy(client: &aws_sdk_s3::Client) -> String {
     let bucket = unique_bucket();
     s3_tests::create_bucket(client, &bucket).await.unwrap();
@@ -414,6 +441,16 @@ async fn create_bucket_allowing_public_policy(client: &aws_sdk_s3::Client) -> St
 async fn create_bucket_allowing_sse_c(client: &aws_sdk_s3::Client) -> String {
     let bucket = unique_bucket();
     s3_tests::create_bucket_with_sse_c_enabled(client, &bucket)
+        .await
+        .unwrap();
+    bucket
+}
+
+async fn create_object_lock_bucket(client: &aws_sdk_s3::Client) -> String {
+    let bucket = unique_bucket();
+    s3_tests::create_bucket_request(client, &bucket)
+        .object_lock_enabled_for_bucket(true)
+        .send()
         .await
         .unwrap();
     bucket
@@ -1391,6 +1428,222 @@ fn test_bucket_policy_put_bucket_lifecycle_cross_account_allow() {
             },
         )
         .await;
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_public_access_block_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_public_access_block()
+            .bucket(&bucket)
+            .public_access_block_configuration(simple_public_access_block())
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:GetBucketPublicAccessBlock",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let response = eventually_ok_with_retry(
+            "GetPublicAccessBlock",
+            60,
+            std::time::Duration::from_millis(500),
+            || alt_client.get_public_access_block().bucket(&bucket).send(),
+        )
+        .await;
+        let config = response.public_access_block_configuration().unwrap();
+        assert_eq!(config.block_public_acls(), Some(true));
+        assert_eq!(config.ignore_public_acls(), Some(true));
+        assert_eq!(config.block_public_policy(), Some(true));
+        assert_eq!(config.restrict_public_buckets(), Some(false));
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_public_access_block_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutBucketPublicAccessBlock",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutPublicAccessBlock",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_public_access_block()
+                    .bucket(&bucket)
+                    .public_access_block_configuration(simple_public_access_block())
+                    .send()
+            },
+        )
+        .await;
+
+        let read_back = client
+            .get_public_access_block()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let config = read_back.public_access_block_configuration().unwrap();
+        assert_eq!(config.block_public_acls(), Some(true));
+        assert_eq!(config.ignore_public_acls(), Some(true));
+        assert_eq!(config.block_public_policy(), Some(true));
+        assert_eq!(config.restrict_public_buckets(), Some(false));
+
+        eventually_ok("DeletePublicAccessBlock", || {
+            alt_client
+                .delete_public_access_block()
+                .bucket(&bucket)
+                .send()
+        })
+        .await;
+
+        eventually_result_matches(
+            "GetPublicAccessBlock absent",
+            60,
+            std::time::Duration::from_millis(500),
+            || client.get_public_access_block().bucket(&bucket).send(),
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(404)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("NoSuchPublicAccessBlockConfiguration")
+                })
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_object_lock_configuration_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_object_lock_bucket(client).await;
+        let config = simple_object_lock_configuration();
+        client
+            .put_object_lock_configuration()
+            .bucket(&bucket)
+            .object_lock_configuration(config.clone())
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:GetBucketObjectLockConfiguration",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let response = eventually_ok_with_retry(
+            "GetObjectLockConfiguration",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .get_object_lock_configuration()
+                    .bucket(&bucket)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(response.object_lock_configuration(), Some(&config));
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_object_lock_configuration_cross_account_allow() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_object_lock_bucket(client).await;
+        let config = simple_object_lock_configuration();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutBucketObjectLockConfiguration",
+                bucket_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutObjectLockConfiguration",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object_lock_configuration()
+                    .bucket(&bucket)
+                    .object_lock_configuration(config.clone())
+                    .send()
+            },
+        )
+        .await;
+
+        let read_back = client
+            .get_object_lock_configuration()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_back.object_lock_configuration(), Some(&config));
 
         cleanup(&bucket, &[]).await;
     });
