@@ -510,6 +510,142 @@ fn test_get_bucket_policy_status_nonpublic_bucket_policy() {
 }
 
 #[test]
+fn test_get_bucket_policy_status_public_ipv4_full_range_bucket_policy() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:ListBucket",
+                "Resource": bucket_resource(&bucket),
+                "Condition": {
+                    "IpAddress": {
+                        "aws:SourceIp": "0.0.0.0/0"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert!(bucket_policy_status_is_public(client, &bucket).await);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_policy_status_public_ipv4_cidr_broader_than_slash_8_bucket_policy() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:ListBucket",
+                "Resource": bucket_resource(&bucket),
+                "Condition": {
+                    "IpAddress": {
+                        "aws:SourceIp": "11.0.0.0/7"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert!(bucket_policy_status_is_public(client, &bucket).await);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_policy_status_nonpublic_ipv4_slash_8_bucket_policy() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:ListBucket",
+                "Resource": bucket_resource(&bucket),
+                "Condition": {
+                    "IpAddress": {
+                        "aws:SourceIp": "11.0.0.0/8"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert!(!bucket_policy_status_is_public(client, &bucket).await);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_policy_status_public_ipv6_ula_bucket_policy() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": "s3:ListBucket",
+                "Resource": bucket_resource(&bucket),
+                "Condition": {
+                    "IpAddress": {
+                        "aws:SourceIp": "fd00::/8"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        assert!(bucket_policy_status_is_public(client, &bucket).await);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_get_bucket_policy_status_nonpublic_fixed_principal_policy() {
     s3_tests::run(async {
         let client = CTX.client();

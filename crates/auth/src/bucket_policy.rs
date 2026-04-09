@@ -1,5 +1,6 @@
 use s3_types::{aws_account_id_from_principal, CanonicalUserId};
 use serde_json::Value;
+use std::net::{IpAddr, Ipv4Addr};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketPolicy {
@@ -1294,10 +1295,62 @@ fn is_fixed_source_ip(value: &str) -> bool {
     if !is_fixed_value(value) {
         return false;
     }
-    if let Some((_, prefix)) = value.split_once('/') {
-        return prefix.parse::<u8>().is_ok();
+
+    let Some((addr, prefix)) = parse_ip_addr_or_cidr(value) else {
+        return false;
+    };
+
+    match addr {
+        IpAddr::V4(addr) => ipv4_source_ip_is_non_public(addr, prefix),
+        IpAddr::V6(_) => prefix >= 32,
     }
-    value.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn parse_ip_addr_or_cidr(value: &str) -> Option<(IpAddr, u8)> {
+    if let Some((addr, prefix)) = value.split_once('/') {
+        let addr = addr.parse::<IpAddr>().ok()?;
+        let prefix = prefix.parse::<u8>().ok()?;
+        let max_prefix = match addr {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        (prefix <= max_prefix).then_some((addr, prefix))
+    } else {
+        let addr = value.parse::<IpAddr>().ok()?;
+        let prefix = match addr {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        Some((addr, prefix))
+    }
+}
+
+fn ipv4_source_ip_is_non_public(addr: Ipv4Addr, prefix: u8) -> bool {
+    prefix >= 8 || ipv4_cidr_is_subset_of_rfc1918(addr, prefix)
+}
+
+fn ipv4_cidr_is_subset_of_rfc1918(addr: Ipv4Addr, prefix: u8) -> bool {
+    ipv4_cidr_is_subset_of(addr, prefix, Ipv4Addr::new(10, 0, 0, 0), 8)
+        || ipv4_cidr_is_subset_of(addr, prefix, Ipv4Addr::new(172, 16, 0, 0), 12)
+        || ipv4_cidr_is_subset_of(addr, prefix, Ipv4Addr::new(192, 168, 0, 0), 16)
+}
+
+fn ipv4_cidr_is_subset_of(
+    addr: Ipv4Addr,
+    prefix: u8,
+    range_addr: Ipv4Addr,
+    range_prefix: u8,
+) -> bool {
+    prefix >= range_prefix
+        && ipv4_prefix_bits(addr, range_prefix) == ipv4_prefix_bits(range_addr, range_prefix)
+}
+
+fn ipv4_prefix_bits(addr: Ipv4Addr, prefix: u8) -> u32 {
+    if prefix == 0 {
+        0
+    } else {
+        u32::from(addr) & (u32::MAX << (32 - u32::from(prefix)))
+    }
 }
 
 #[cfg(test)]
@@ -1356,6 +1409,51 @@ mod tests {
         )
         .unwrap();
         assert!(!policy.is_public());
+    }
+
+    #[test]
+    fn broad_ipv4_source_ip_cidr_is_public() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"IpAddress":{"aws:SourceIp":"0.0.0.0/0"}}}]}"#,
+        )
+        .unwrap();
+        assert!(policy.is_public());
+    }
+
+    #[test]
+    fn broad_ipv6_source_ip_cidr_is_public() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"IpAddress":{"aws:SourceIp":"::/0"}}}]}"#,
+        )
+        .unwrap();
+        assert!(policy.is_public());
+    }
+
+    #[test]
+    fn broad_ipv6_ula_source_ip_cidr_is_public() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"IpAddress":{"aws:SourceIp":"fd00::/8"}}}]}"#,
+        )
+        .unwrap();
+        assert!(policy.is_public());
+    }
+
+    #[test]
+    fn narrow_private_ipv4_source_ip_cidr_is_not_public() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}]}"#,
+        )
+        .unwrap();
+        assert!(!policy.is_public());
+    }
+
+    #[test]
+    fn ipv4_source_ip_cidr_broader_than_slash_8_is_public() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"IpAddress":{"aws:SourceIp":"11.0.0.0/7"}}}]}"#,
+        )
+        .unwrap();
+        assert!(policy.is_public());
     }
 
     #[test]

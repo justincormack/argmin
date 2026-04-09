@@ -18298,6 +18298,40 @@ mod tests {
     }
 
     #[test]
+    fn put_bucket_policy_rejects_broad_source_ip_policy_when_block_public_policy_enabled() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+        put_bucket_public_access_block_test(&coord,
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                test_helpers::requester("owner-a"), None)
+            .unwrap();
+
+        let err = put_bucket_policy_test(&coord,
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"IpAddress":{"aws:SourceIp":"0.0.0.0/0"}}}]}"#,
+                test_helpers::requester("owner-a"), None)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+        assert_eq!(
+            get_bucket_policy_test(&coord, "bucket", test_helpers::requester("owner-a"), None)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
     fn put_bucket_policy_rejects_string_not_equals_vpc_for_enforced_object_action() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -18737,6 +18771,29 @@ mod tests {
         put_bucket_policy_test(&coord,
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
+                test_helpers::requester("111122223333"), None)
+            .unwrap();
+
+        let is_public = get_bucket_policy_status_test(
+            &coord,
+            "bucket",
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+        assert!(is_public);
+    }
+
+    #[test]
+    fn get_bucket_policy_status_reports_broad_source_ip_policy_as_public() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(&coord,
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"IpAddress":{"aws:SourceIp":"0.0.0.0/0"}}}]}"#,
                 test_helpers::requester("111122223333"), None)
             .unwrap();
 
