@@ -64,16 +64,8 @@ Validated against AWS:
 - lifecycle
 - ownership controls
 - bucket encryption
-
-Implemented locally and ready for AWS revalidation:
-
 - bucket public access block
 - bucket object lock configuration
-
-Still open:
-
-- rerun the new public access block and object lock `s3-tests` against AWS when
-  network/DNS access is available
 
 Versioning note:
 
@@ -124,13 +116,12 @@ policy.
 6. Add AWS-backed `s3-tests` for representative bucket config APIs.
 7. Update compatibility docs only if any gaps remain after the code changes.
 
-Current remaining steps:
+Current state:
 
-1. Verify the remaining bucket-admin-only APIs against AWS docs and real AWS.
-2. Extend `PolicyAction` and the shared helper only where AWS actually delegates
-   access via bucket policy.
-3. Add the matching local and AWS-backed tests for any newly widened APIs.
-4. Run broader verification before commit.
+1. This plan's implemented scope is complete.
+2. Versioning remains intentionally owner-only.
+3. Any future changes should come from a new follow-up plan if AWS evidence
+   shows additional bucket-admin-only APIs should be widened.
 
 ## Recommended Order
 
