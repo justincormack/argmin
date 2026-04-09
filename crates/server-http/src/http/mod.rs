@@ -2985,28 +2985,25 @@ impl HttpFrontend {
             sse_customer.as_ref().map(SseCustomerWriteContext::request),
             managed_encryption,
         );
-        let authorized_write =
-            self.coordinator
-                .authorize_put_object_write(&AuthorizePutObjectRequest {
-                    object: ObjectRequest::new(bucket, &key, requester.clone(), None),
-                    acl: acl.into(),
-                    policy_context: crate::coordinator::PutObjectPolicyContext::new(
-                        None,
-                        None,
-                        acl.policy_condition_value(),
-                    )
-                    .with_managed_encryption(managed_encryption)
-                    .with_sse_customer_algorithm(
-                        sse_customer.as_ref().map(|ctx| ctx.request().algorithm()),
-                    )
-                    .with_request_object_tags_xml(tags_xml.as_deref()),
-                    object_lock: ObjectLockState::default(),
-                    tags: tags_xml.as_deref(),
-                    encryption: request_encryption,
-                })?;
-        let session_id = self
+        let prepared_put = self
             .coordinator
-            .begin_stream_put_from_authorized_write(&authorized_write)?;
+            .begin_stream_put(&AuthorizePutObjectRequest {
+                object: ObjectRequest::new(bucket, &key, requester.clone(), None),
+                acl: acl.into(),
+                policy_context: crate::coordinator::PutObjectPolicyContext::new(
+                    None,
+                    None,
+                    acl.policy_condition_value(),
+                )
+                .with_managed_encryption(managed_encryption)
+                .with_sse_customer_algorithm(
+                    sse_customer.as_ref().map(|ctx| ctx.request().algorithm()),
+                )
+                .with_request_object_tags_xml(tags_xml.as_deref()),
+                object_lock: ObjectLockState::default(),
+                tags: tags_xml.as_deref(),
+                encryption: request_encryption,
+            })?;
 
         let success_status = field("success_action_status")
             .and_then(|s| s.parse::<u16>().ok())
@@ -3031,7 +3028,7 @@ impl HttpFrontend {
         Ok(StreamingPostContext {
             trace: current_trace_context(),
             binding: StreamObjectBinding {
-                session_id,
+                session_id: prepared_put.session_id,
                 bucket: bucket.to_string(),
                 key,
             },
@@ -3049,7 +3046,7 @@ impl HttpFrontend {
             tags_xml,
             managed_encryption,
             sse_customer,
-            authorized_write,
+            authorized_write: prepared_put.authorized_write,
         })
     }
 
@@ -3370,7 +3367,7 @@ impl HttpFrontend {
         );
         let authorized_write =
             self.coordinator
-                .authorize_put_object_write(&AuthorizePutObjectRequest {
+                .prepare_put_object_write(&AuthorizePutObjectRequest {
                     object: ObjectRequest::new(
                         bucket,
                         key,
@@ -3442,7 +3439,7 @@ impl HttpFrontend {
             ctx.key
         );
         self.coordinator
-            .begin_stream_put_from_authorized_write(&ctx.authorized_write)
+            .begin_stream_put_session(&ctx.authorized_write)
     }
 
     /// Append a segment to a streaming session.

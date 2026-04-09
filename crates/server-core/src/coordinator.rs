@@ -166,6 +166,12 @@ pub struct BeginStreamPartResult {
 }
 
 #[derive(Debug)]
+pub struct PreparedStreamPut {
+    pub authorized_write: AuthorizedPutObjectWrite,
+    pub session_id: String,
+}
+
+#[derive(Debug)]
 pub struct AuthorizedPutObjectWrite {
     bucket: String,
     key: String,
@@ -6240,7 +6246,14 @@ impl Coordinator {
         )
     }
 
-    pub fn authorize_put_object_write(
+    pub fn prepare_put_object_write(
+        &self,
+        req: &AuthorizePutObjectRequest<'_>,
+    ) -> Result<AuthorizedPutObjectWrite, ServerError> {
+        self.authorize_put_object_write(req)
+    }
+
+    fn authorize_put_object_write(
         &self,
         req: &AuthorizePutObjectRequest<'_>,
     ) -> Result<AuthorizedPutObjectWrite, ServerError> {
@@ -9354,7 +9367,19 @@ impl Coordinator {
 
     // ── Streaming upload session API ──────────────────────────────────
 
-    pub fn begin_stream_put_from_authorized_write(
+    pub fn begin_stream_put(
+        &self,
+        req: &AuthorizePutObjectRequest<'_>,
+    ) -> Result<PreparedStreamPut, ServerError> {
+        let authorized_write = self.authorize_put_object_write(req)?;
+        let session_id = self.create_stream_put_session_for_authorized_write(&authorized_write)?;
+        Ok(PreparedStreamPut {
+            authorized_write,
+            session_id,
+        })
+    }
+
+    pub fn begin_stream_put_session(
         &self,
         authorized: &AuthorizedPutObjectWrite,
     ) -> Result<String, ServerError> {
@@ -15454,7 +15479,7 @@ mod tests {
             tags: None,
             encryption,
         })?;
-        coord.begin_stream_put_from_authorized_write(&authorized)
+        coord.begin_stream_put_session(&authorized)
     }
 
     fn begin_stream_part_test(
@@ -38201,9 +38226,7 @@ mod tests {
                 encryption: WriteEncryptionRequest::none(),
             })
             .unwrap();
-        let session_id = coord
-            .begin_stream_put_from_authorized_write(&authorized)
-            .unwrap();
+        let session_id = coord.begin_stream_put_session(&authorized).unwrap();
         coord
             .append_plaintext_stream_segment_for_test("bucket", "obj", &session_id, 0, b"hello")
             .unwrap();
