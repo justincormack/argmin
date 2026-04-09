@@ -944,6 +944,18 @@ impl PgStore {
         })
     }
 
+    fn bucket_subresource_invalid_aux(
+        kind: BucketSubresourceKind,
+        aux: BucketSubresourceAux,
+    ) -> MetadataError {
+        MetadataError::Db {
+            context: "put bucket subresource",
+            source: rusqlite::Error::InvalidParameterName(format!(
+                "{kind:?} does not support aux {aux:?}"
+            )),
+        }
+    }
+
     /// Map a row with columns (bucket, key, version_id, generation_id, size,
     /// etag, etag_kind, last_modified, storage_class, ec_k, ec_m, status,
     /// tags, data_layout, parts_count, metadata_blob, system_metadata_blob,
@@ -2491,6 +2503,103 @@ impl PgMetadataStore for PgStore {
             });
         }
         Ok(())
+    }
+
+    fn put_bucket_subresource(
+        &self,
+        name: &str,
+        req: PutBucketSubresource<'_>,
+    ) -> Result<(), MetadataError> {
+        if !req.kind.supports_aux(req.aux) {
+            return Err(Self::bucket_subresource_invalid_aux(req.kind, req.aux));
+        }
+        match req.kind {
+            BucketSubresourceKind::Cors => self.put_bucket_cors(name, req.body),
+            BucketSubresourceKind::Tagging => self.put_bucket_tags(name, req.body),
+            BucketSubresourceKind::PublicAccessBlock => {
+                self.put_bucket_public_access_block(name, req.body)
+            }
+            BucketSubresourceKind::OwnershipControls => {
+                self.put_bucket_ownership_controls(name, req.body)
+            }
+            BucketSubresourceKind::Policy => {
+                let is_public = req
+                    .aux
+                    .policy_is_public()
+                    .ok_or_else(|| Self::bucket_subresource_invalid_aux(req.kind, req.aux))?;
+                self.put_bucket_policy(name, req.body, is_public)
+            }
+            BucketSubresourceKind::Lifecycle => self.put_bucket_lifecycle(name, req.body),
+        }
+    }
+
+    fn get_bucket_subresource(
+        &self,
+        name: &str,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<StoredBucketSubresource>, MetadataError> {
+        let info = self.head_bucket_raw(name)?;
+        Ok(match kind {
+            BucketSubresourceKind::Cors => info.cors_config.map(|body| StoredBucketSubresource {
+                body,
+                generation: None,
+                aux: BucketSubresourceAux::None,
+            }),
+            BucketSubresourceKind::Tagging => info.tags.map(|body| StoredBucketSubresource {
+                body: body.into_inner(),
+                generation: None,
+                aux: BucketSubresourceAux::None,
+            }),
+            BucketSubresourceKind::PublicAccessBlock => {
+                info.public_access_block
+                    .map(|body| StoredBucketSubresource {
+                        body,
+                        generation: None,
+                        aux: BucketSubresourceAux::None,
+                    })
+            }
+            BucketSubresourceKind::OwnershipControls => {
+                info.ownership_controls.map(|body| StoredBucketSubresource {
+                    body,
+                    generation: None,
+                    aux: BucketSubresourceAux::None,
+                })
+            }
+            BucketSubresourceKind::Policy => {
+                let generation = info.bucket_policy_generation;
+                let aux = BucketSubresourceAux::policy(info.bucket_policy_public);
+                info.bucket_policy.map(|body| StoredBucketSubresource {
+                    body,
+                    generation: Some(generation),
+                    aux,
+                })
+            }
+            BucketSubresourceKind::Lifecycle => {
+                let generation = info.bucket_lifecycle_generation;
+                info.bucket_lifecycle.map(|body| StoredBucketSubresource {
+                    body,
+                    generation: Some(generation),
+                    aux: BucketSubresourceAux::None,
+                })
+            }
+        })
+    }
+
+    fn delete_bucket_subresource(
+        &self,
+        name: &str,
+        kind: BucketSubresourceKind,
+    ) -> Result<(), MetadataError> {
+        match kind {
+            BucketSubresourceKind::Cors => self.delete_bucket_cors(name),
+            BucketSubresourceKind::Tagging => self.delete_bucket_tags(name),
+            BucketSubresourceKind::PublicAccessBlock => {
+                self.delete_bucket_public_access_block(name)
+            }
+            BucketSubresourceKind::OwnershipControls => self.delete_bucket_ownership_controls(name),
+            BucketSubresourceKind::Policy => self.delete_bucket_policy(name),
+            BucketSubresourceKind::Lifecycle => self.delete_bucket_lifecycle(name),
+        }
     }
 
     fn put_bucket_encryption(

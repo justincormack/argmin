@@ -176,6 +176,30 @@ pub trait PgMetadataStore {
     /// Delete a bucket's ownership controls. Idempotent.
     fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError>;
 
+    /// Store an opaque bucket subresource with typed auxiliary summary data.
+    ///
+    /// This is the generic storage boundary for bucket-scoped configuration
+    /// payloads whose primary stored form is an opaque string.
+    fn put_bucket_subresource(
+        &self,
+        name: &str,
+        req: PutBucketSubresource<'_>,
+    ) -> Result<(), MetadataError>;
+
+    /// Retrieve an opaque bucket subresource and its typed summary data.
+    fn get_bucket_subresource(
+        &self,
+        name: &str,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<StoredBucketSubresource>, MetadataError>;
+
+    /// Delete an opaque bucket subresource. Idempotent.
+    fn delete_bucket_subresource(
+        &self,
+        name: &str,
+        kind: BucketSubresourceKind,
+    ) -> Result<(), MetadataError>;
+
     /// Store the currently supported bucket encryption configuration subset.
     fn put_bucket_encryption(
         &self,

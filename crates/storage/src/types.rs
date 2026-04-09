@@ -1416,6 +1416,88 @@ impl BucketState {
     }
 }
 
+/// Typed bucket subresources whose payloads are stored opaquely.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketSubresourceKind {
+    Cors = 0,
+    Tagging = 1,
+    PublicAccessBlock = 2,
+    OwnershipControls = 3,
+    Policy = 4,
+    Lifecycle = 5,
+}
+
+impl BucketSubresourceKind {
+    #[must_use]
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Cors),
+            1 => Some(Self::Tagging),
+            2 => Some(Self::PublicAccessBlock),
+            3 => Some(Self::OwnershipControls),
+            4 => Some(Self::Policy),
+            5 => Some(Self::Lifecycle),
+            _ => None,
+        }
+    }
+}
+
+/// Typed auxiliary summary data associated with a stored bucket subresource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BucketSubresourceAux {
+    #[default]
+    None,
+    Policy {
+        is_public: bool,
+    },
+}
+
+impl BucketSubresourceAux {
+    #[must_use]
+    pub const fn policy(is_public: bool) -> Self {
+        Self::Policy { is_public }
+    }
+
+    #[must_use]
+    pub const fn policy_is_public(self) -> Option<bool> {
+        match self {
+            Self::None => None,
+            Self::Policy { is_public } => Some(is_public),
+        }
+    }
+}
+
+impl BucketSubresourceKind {
+    #[must_use]
+    pub const fn supports_aux(self, aux: BucketSubresourceAux) -> bool {
+        matches!(
+            (self, aux),
+            (_, BucketSubresourceAux::None)
+                | (
+                    BucketSubresourceKind::Policy,
+                    BucketSubresourceAux::Policy { .. }
+                )
+        )
+    }
+}
+
+/// Generic storage-layer request for bucket subresource writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PutBucketSubresource<'a> {
+    pub kind: BucketSubresourceKind,
+    pub body: &'a str,
+    pub aux: BucketSubresourceAux,
+}
+
+/// Generic stored representation of an opaque bucket subresource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredBucketSubresource {
+    pub body: String,
+    pub generation: Option<u64>,
+    pub aux: BucketSubresourceAux,
+}
+
 /// Bucket metadata.
 #[derive(Clone)]
 pub struct BucketInfo {
