@@ -3121,25 +3121,20 @@ impl HttpFrontend {
             }
         }
 
-        let write_encryption = self.coordinator.load_stream_put_write_encryption(
-            &ctx.binding.bucket,
-            &ctx.binding.key,
-            &ctx.binding.session_id,
-            ctx.sse_customer
-                .as_ref()
-                .map(SseCustomerWriteContext::request),
-        )?;
-        let result = self.coordinator.finalize_stream_put_from_authorized_write(
+        let result = self.coordinator.finalize_authorized_stream_put(
             &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
                 session_id: &ctx.binding.session_id,
                 crc64,
                 total_size,
                 metadata_blob: &ctx.metadata_blob,
                 system_metadata: &ctx.system_metadata,
-                write_encryption: write_encryption.as_ref(),
+                write_encryption: crate::coordinator::ActiveWriteEncryptionRef::None,
                 cond: &crate::conditional::WriteCondition::default(),
             },
             &ctx.authorized_write,
+            ctx.sse_customer
+                .as_ref()
+                .map(SseCustomerWriteContext::request),
         )?;
 
         let mut resp = S3Response::post_object(
@@ -3176,21 +3171,15 @@ impl HttpFrontend {
             segment_index,
             data.len()
         );
-        let write_encryption = self.coordinator.load_stream_put_write_encryption(
-            &ctx.binding.bucket,
-            &ctx.binding.key,
-            &ctx.binding.session_id,
-            ctx.sse_customer
-                .as_ref()
-                .map(SseCustomerWriteContext::request),
-        )?;
-        let data = write_encryption.encrypt_segment(segment_index, data)?;
-        self.coordinator.append_stream_segment(
+        self.coordinator.append_stream_put_data(
             &ctx.binding.bucket,
             &ctx.binding.key,
             &ctx.binding.session_id,
             segment_index,
-            &data,
+            data,
+            ctx.sse_customer
+                .as_ref()
+                .map(SseCustomerWriteContext::request),
         )
     }
 
@@ -3204,7 +3193,7 @@ impl HttpFrontend {
             ctx.binding.bucket,
             ctx.binding.key
         );
-        let _ = self.coordinator.abort_stream_put(
+        let _ = self.coordinator.abort_stream_put_session(
             &ctx.binding.bucket,
             &ctx.binding.key,
             &ctx.binding.session_id,
@@ -3460,21 +3449,15 @@ impl HttpFrontend {
             segment_index,
             data.len()
         );
-        let write_encryption = self.coordinator.load_stream_put_write_encryption(
-            &ctx.bucket,
-            &ctx.key,
-            session_id,
-            ctx.sse_customer
-                .as_ref()
-                .map(SseCustomerWriteContext::request),
-        )?;
-        let segment_data = write_encryption.encrypt_segment(segment_index, data)?;
-        self.coordinator.append_stream_segment(
+        self.coordinator.append_stream_put_data(
             &ctx.bucket,
             &ctx.key,
             session_id,
             segment_index,
-            &segment_data,
+            data,
+            ctx.sse_customer
+                .as_ref()
+                .map(SseCustomerWriteContext::request),
         )
     }
 
@@ -3497,7 +3480,7 @@ impl HttpFrontend {
         );
         let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
         let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
-        let result = self.coordinator.put_object_from_authorized_write(
+        let result = self.coordinator.commit_put_object_write(
             &crate::coordinator::AuthorizedPutObjectCommitRequest {
                 data,
                 metadata: &metadata_blob,
@@ -3543,26 +3526,20 @@ impl HttpFrontend {
         );
         let metadata_blob = Self::merged_streaming_put_metadata_blob(ctx, trailer_checksums);
         let system_metadata = Self::merged_streaming_put_system_metadata(ctx, trailer_checksums);
-        let write_encryption = self.coordinator.load_stream_put_write_encryption(
-            &ctx.bucket,
-            &ctx.key,
-            session_id,
-            ctx.sse_customer
-                .as_ref()
-                .map(SseCustomerWriteContext::request),
-        )?;
-
-        let result = self.coordinator.finalize_stream_put_from_authorized_write(
+        let result = self.coordinator.finalize_authorized_stream_put(
             &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
                 session_id,
                 crc64,
                 total_size,
                 metadata_blob: &metadata_blob,
                 system_metadata: &system_metadata,
-                write_encryption: write_encryption.as_ref(),
+                write_encryption: crate::coordinator::ActiveWriteEncryptionRef::None,
                 cond: &ctx.cond,
             },
             &ctx.authorized_write,
+            ctx.sse_customer
+                .as_ref()
+                .map(SseCustomerWriteContext::request),
         )?;
 
         let mut resp = S3Response::put_object(&result);
@@ -3588,7 +3565,7 @@ impl HttpFrontend {
         );
         let _ = self
             .coordinator
-            .abort_stream_put(&ctx.bucket, &ctx.key, session_id);
+            .abort_stream_put_session(&ctx.bucket, &ctx.key, session_id);
     }
 
     /// Prepare a streaming `UploadPart` session.

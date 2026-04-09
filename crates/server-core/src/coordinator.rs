@@ -9145,6 +9145,14 @@ impl Coordinator {
         )
     }
 
+    pub fn commit_put_object_write(
+        &self,
+        req: &AuthorizedPutObjectCommitRequest<'_>,
+        authorized: &AuthorizedPutObjectWrite,
+    ) -> Result<PutObjectResult, ServerError> {
+        self.put_object_from_authorized_write(req, authorized)
+    }
+
     pub fn put_object_from_authorized_write(
         &self,
         req: &AuthorizedPutObjectCommitRequest<'_>,
@@ -9384,6 +9392,21 @@ impl Coordinator {
         authorized: &AuthorizedPutObjectWrite,
     ) -> Result<String, ServerError> {
         self.create_stream_put_session_for_authorized_write(authorized)
+    }
+
+    pub fn append_stream_put_data(
+        &self,
+        bucket: &str,
+        key: &str,
+        session_id: &str,
+        segment_index: u32,
+        data: &[u8],
+        sse_customer: Option<&SseCustomerRequest>,
+    ) -> Result<(), ServerError> {
+        let write_encryption =
+            self.load_stream_put_write_encryption(bucket, key, session_id, sse_customer)?;
+        let storage_data = write_encryption.encrypt_segment(segment_index, data)?;
+        self.append_stream_segment(bucket, key, session_id, segment_index, &storage_data)
     }
 
     /// Begin a streaming UploadPart session.
@@ -9845,6 +9868,32 @@ impl Coordinator {
             req,
             authorized,
             AuthorizedWriteTags::Bound,
+        )
+    }
+
+    pub fn finalize_authorized_stream_put(
+        &self,
+        req: &AuthorizedFinalizeStreamPutRequest<'_>,
+        authorized: &AuthorizedPutObjectWrite,
+        sse_customer: Option<&SseCustomerRequest>,
+    ) -> Result<PutObjectResult, ServerError> {
+        let write_encryption = self.load_stream_put_write_encryption(
+            authorized.bucket(),
+            authorized.key(),
+            req.session_id,
+            sse_customer,
+        )?;
+        self.finalize_stream_put_from_authorized_write(
+            &AuthorizedFinalizeStreamPutRequest {
+                session_id: req.session_id,
+                crc64: req.crc64,
+                total_size: req.total_size,
+                metadata_blob: req.metadata_blob,
+                system_metadata: req.system_metadata,
+                write_encryption: write_encryption.as_ref(),
+                cond: req.cond,
+            },
+            authorized,
         )
     }
 
@@ -10331,6 +10380,15 @@ impl Coordinator {
         }
 
         Ok(())
+    }
+
+    pub fn abort_stream_put_session(
+        &self,
+        bucket: &str,
+        key: &str,
+        session_id: &str,
+    ) -> Result<(), ServerError> {
+        self.abort_stream_put(bucket, key, session_id)
     }
 
     /// Scavenge abandoned streaming upload sessions across all PGs.
