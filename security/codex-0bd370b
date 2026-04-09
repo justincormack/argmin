@@ -1,0 +1,142 @@
+BlockPublicPolicy bypass via full-range SourceIp CIDR
+Link: https://chatgpt.com/codex/cloud/security/findings/ec7a426dfdbc8191949c85a369af2d80?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 0bd370b
+Author: justin@specialbusservice.com
+Created: 29/03/2026, 12:05:16
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+A new public-policy classifier accepts SourceIp conditions without checking for full-range CIDRs, allowing a public policy to slip past BlockPublicPolicy enforcement.
+The commit introduces a typed bucket policy parser and a public-policy classifier used to enforce BlockPublicPolicy. In the classifier, any aws:SourceIp condition with the IpAddress operator and a syntactically valid CIDR is treated as restricting public access. This logic does not detect full-range CIDRs such as 0.0.0.0/0 or ::/0, which match all IPs and therefore do not constrain access. As a result, a policy with Principal "*" and an IpAddress condition for 0.0.0.0/0 is classified as non-public, so put_bucket_policy succeeds even when BlockPublicPolicy is true. This bypasses the guardrail and can allow unintended public access once policies are evaluated.
+
+# Validation
+## Rubric
+- [x] Identify how public policies are classified and used for enforcement (bucket_policy.rs:21-85; coordinator.rs:4685-4694).
+- [x] Confirm aws:SourceIp + IpAddress conditions are treated as non-public when is_fixed_source_ip returns true (bucket_policy.rs:421-444).
+- [x] Verify is_fixed_source_ip accepts any CIDR prefix, including full-range /0 (bucket_policy.rs:453-460).
+- [x] Reproduce misclassification with a runtime test using Principal "*" and SourceIp 0.0.0.0/0 (public_policy_sourceip_test.log).
+## Report
+Rubric-driven validation performed. Crash/valgrind/debugger attempts: ran a targeted debug build via `cargo test -p auth --test public_policy_sourceip -- --nocapture` (no memory crash; assertion failure indicates logic bug). `valgrind --version` and `gdb --version` both returned `command not found`, so valgrind/debugger traces were not possible in this environment.
+
+Dynamic evidence: Added integration test `crates/auth/tests/public_policy_sourceip.rs` that expects a policy with Principal "*" and Condition IpAddress aws:SourceIp "0.0.0.0/0" to be public. Running the test fails with panic `expected public: SourceIp 0.0.0.0/0 does not constrain access` (see /workspace/validation_artifacts/public_policy_sourceip_test.log). This shows `policy.is_public()` returns false for a full-range CIDR.
+
+Code evidence: BucketPolicy::is_public calls PolicyStatement::allows_public_access (bucket_policy.rs:21-85). Public access is considered constrained if `conditions_constrain_public_principal` returns true (bucket_policy.rs:75-85, 417-418). For aws:SourceIp, `is_non_public_condition_clause` treats any IpAddress with `is_fixed_source_ip` as non-public (bucket_policy.rs:421-444). `is_fixed_source_ip` only checks that the prefix parses as u8, so a full-range CIDR like 0.0.0.0/0 is accepted as “fixed” (bucket_policy.rs:453-460), causing misclassification. In server-core, BlockPublicPolicy enforcement relies on `parsed_policy.is_public()` (coordinator.rs:4685-4694), so this misclassification allows a public policy to bypass the guardrail.
+
+Conclusion: The classifier incorrectly treats full-range SourceIp CIDRs as restricting, so a policy with Principal "*" and aws:SourceIp 0.0.0.0/0 is marked non-public and bypasses BlockPublicPolicy.
+
+# Evidence
+/workspace/argmin/crates/auth/src/bucket_policy.rs (L421 to 460)
+  Note: The classifier treats any aws:SourceIp IpAddress condition as restricting when is_fixed_source_ip returns true; is_fixed_source_ip accepts any CIDR prefix without checking for full-range /0 or validating the IP portion, so policies with 0.0.0.0/0 are misclassified as non-public.
+```
+fn is_non_public_condition_clause(clause: &PolicyConditionClause) -> bool {
+    match clause.key.as_str() {
+        "aws:PrincipalOrgID"
+        | "aws:SourceVpc"
+        | "aws:SourceVpce"
+        | "aws:SourceOwner"
+        | "aws:SourceAccount"
+        | "aws:userid"
+        | "s3:DataAccessPointAccount" => {
+            matches!(
+                clause.operator.as_str(),
+                "StringEquals" | "StringEqualsIgnoreCase" | "StringLike"
+            ) && clause.values.iter().all(|value| is_fixed_value(value))
+        }
+        "aws:SourceArn" | "s3:DataAccessPointArn" => {
+            matches!(
+                clause.operator.as_str(),
+                "ArnEquals" | "ArnLike" | "StringEquals" | "StringEqualsIgnoreCase" | "StringLike"
+            ) && clause.values.iter().all(|value| is_fixed_value(value))
+        }
+        "aws:SourceIp" => {
+            clause.operator == "IpAddress"
+                && clause.values.iter().all(|value| is_fixed_source_ip(value))
+        }
+        _ => false,
+    }
+}
+
+fn is_fixed_value(value: &str) -> bool {
+    !value.contains('*') && !value.contains("${")
+}
+
+fn is_fixed_source_ip(value: &str) -> bool {
+    if !is_fixed_value(value) {
+        return false;
+    }
+    if let Some((_, prefix)) = value.split_once('/') {
+        return prefix.parse::<u8>().is_ok();
+    }
+    value.parse::<std::net::IpAddr>().is_ok()
+```
+
+/workspace/argmin/crates/server-core/src/coordinator.rs (L4685 to 4694)
+  Note: PutBucketPolicy relies on parsed_policy.is_public() to block public policies when BlockPublicPolicy is enabled, so misclassification here enables bypass.
+```
+        let bucket_info =
+            self.authorize_bucket_admin_requester(&requester, name, expected_bucket_owner)?;
+        let parsed_policy =
+            auth::parse_bucket_policy(policy).map_err(|e| ServerError::MalformedPolicy {
+                reason: e.reason().to_string(),
+            })?;
+        if Self::blocks_public_policy(bucket_info.public_access_block.as_deref())
+            && parsed_policy.is_public()
+        {
+            return Err(ServerError::AccessDenied);
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+While the logic flaw is real and in-scope, exploitation requires bucket owner privileges (admin-only). The attacker already has full access to the bucket, so the bypass primarily defeats a guardrail meant to prevent accidental public exposure rather than enabling a new privilege escalation. Impact is limited to the owner’s bucket and does not cross tenant boundaries in this single-tenant design, so the probability × impact aligns better with low severity than medium.
+## Likelihood
+low - Requires bucket owner credentials and a specific policy condition (SourceIp /0). This is plausible but not likely for most attackers, and depends on operator usage.
+## Impact
+medium - Allows a bucket owner to set a policy that is effectively public despite BlockPublicPolicy, which can expose bucket objects to anonymous users. However, it does not grant new capabilities to an attacker without owner credentials.
+## Assumptions
+- Deployment may bind ARGMIN_LISTEN_ADDR to a non-local interface; default is 127.0.0.1:9000.
+- PutBucketPolicy is only available to the bucket owner principal (bucket admin).
+- A policy with Principal "*" and aws:SourceIp 0.0.0.0/0 is intended to be treated as public by policy evaluation.
+- Authenticated bucket owner credentials
+- Ability to call PutBucketPolicy
+- BlockPublicPolicy enabled for the bucket
+- Policy condition uses aws:SourceIp with /0 CIDR
+## Path
+n1 -> n2 -> n3 -> n4 -> n5
+## Path evidence
+- `crates/auth/src/bucket_policy.rs:417-460` - SourceIp IpAddress condition is considered non-public if is_fixed_source_ip returns true; is_fixed_source_ip accepts any CIDR prefix without checking for full-range /0.
+- `crates/server-core/src/coordinator.rs:4682-4694` - BlockPublicPolicy enforcement uses parsed_policy.is_public(); misclassification bypasses the guardrail.
+- `crates/server-core/src/coordinator.rs:3487-3503` - authorize_bucket_admin_requester restricts bucket admin operations to the owner principal.
+- `crates/argmin-s3/src/config.rs:20-66` - Server listen address is configured via ARGMIN_LISTEN_ADDR with default 127.0.0.1:9000, informing exposure assumptions.
+## Narrative
+The bucket policy classifier treats any aws:SourceIp IpAddress clause as non-public if the value parses as a fixed CIDR. The helper only checks that the prefix parses as u8, so a full-range CIDR like 0.0.0.0/0 passes and is treated as restricting. The BlockPublicPolicy guardrail depends on parsed_policy.is_public(), so this misclassification can allow a public policy to be accepted even when BlockPublicPolicy is enabled. The path is reachable only to the bucket owner principal and affects public access controls, not cross-tenant authorization.
+## Controls
+- SigV4 authentication
+- Bucket owner authorization for admin operations
+- BlockPublicPolicy guardrail
+## Blindspots
+- No deployment manifests to confirm whether the service is exposed to public networks.
+- Static review only; did not execute policy evaluation or access checks at runtime in this environment.
+- No evidence about multi-tenant deployments or external IAM policy models beyond code.
+
+# Resolution
+Fixed in commit `ca5911f` (`auth: match S3 SourceIp public policy rules`).
+
+The resolution replaced the old `aws:SourceIp` classifier, which accepted any
+syntactically valid CIDR as non-public, with AWS-aligned threshold logic:
+IPv4 CIDRs are only non-public when they are `/8` or narrower or entirely
+within RFC1918 private space, and IPv6 CIDRs are only non-public when they
+are `/32` or narrower. That closes the BlockPublicPolicy bypass for broad
+ranges such as `0.0.0.0/0` and `::/0`, and also fixes the persisted
+`bucket_policy_public` bit used by `GetBucketPolicyStatus` and
+`RestrictPublicBuckets`.
+
+Regression coverage was added in local unit tests and in AWS-backed
+`s3-tests`. The AWS compatibility runs confirmed the intended behavior for
+`0.0.0.0/0`, `11.0.0.0/7`, `11.0.0.0/8`, and `fd00::/8`.
