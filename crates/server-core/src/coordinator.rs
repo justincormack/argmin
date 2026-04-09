@@ -5907,19 +5907,11 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            &req.bucket,
+        self.put_opaque_bucket_subresource(
+            req,
             auth::PolicyAction::PutBucketCors,
-        )?;
-        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
-        bucket_pg
-            .put_bucket_cors(req.bucket.name, req.config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+            storage::BucketSubresourceKind::Cors,
+        )
     }
 
     pub fn get_bucket_cors(&self, req: &BucketRequest<'_>) -> Result<Option<String>, ServerError> {
@@ -5929,11 +5921,27 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        self.get_opaque_bucket_subresource(
             req,
             auth::PolicyAction::GetBucketCors,
-        )?;
-        self.load_bucket_cors_config(req.name)
+            storage::BucketSubresourceKind::Cors,
+        )
+    }
+
+    /// Loads the raw bucket CORS configuration for HTTP CORS evaluation.
+    ///
+    /// This intentionally bypasses normal bucket-config authorization because
+    /// CORS preflight handling and actual-response header decoration need the
+    /// stored CORS rules without turning those paths into authenticated bucket
+    /// config reads.
+    pub fn load_bucket_cors_config(&self, name: &str) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::load_bucket_cors_config",
+            "bucket={:?}",
+            name
+        );
+        self.load_opaque_bucket_subresource(name, storage::BucketSubresourceKind::Cors)
     }
 
     pub fn delete_bucket_cors(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
@@ -5943,17 +5951,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        self.delete_opaque_bucket_subresource(
             req,
             auth::PolicyAction::PutBucketCors,
-        )?;
-        let bucket_pg = self.get_bucket_pg(req.name)?;
-        bucket_pg.delete_bucket_cors(req.name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })
+            storage::BucketSubresourceKind::Cors,
+        )
     }
 
     pub fn put_bucket_tags(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
@@ -5964,19 +5966,11 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            &req.bucket,
+        self.put_opaque_bucket_subresource(
+            req,
             auth::PolicyAction::PutBucketTagging,
-        )?;
-        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
-        bucket_pg
-            .put_bucket_tags(req.bucket.name, req.config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+            storage::BucketSubresourceKind::Tagging,
+        )
     }
 
     pub fn get_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<Option<String>, ServerError> {
@@ -5986,17 +5980,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        self.get_opaque_bucket_subresource(
             req,
             auth::PolicyAction::GetBucketTagging,
-        )?;
-        let bucket_pg = self.get_bucket_pg(req.name)?;
-        bucket_pg.get_bucket_tags(req.name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })
+            storage::BucketSubresourceKind::Tagging,
+        )
     }
 
     pub fn delete_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
@@ -6006,17 +5994,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        self.delete_opaque_bucket_subresource(
             req,
             auth::PolicyAction::PutBucketTagging,
-        )?;
-        let bucket_pg = self.get_bucket_pg(req.name)?;
-        bucket_pg.delete_bucket_tags(req.name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })
+            storage::BucketSubresourceKind::Tagging,
+        )
     }
 
     pub fn put_bucket_policy(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
@@ -6565,26 +6547,75 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Loads the raw bucket CORS configuration for HTTP CORS evaluation.
-    ///
-    /// This intentionally bypasses normal bucket-config authorization because
-    /// CORS preflight handling and actual-response header decoration need the
-    /// stored CORS rules without turning those paths into authenticated bucket
-    /// config reads.
-    pub fn load_bucket_cors_config(&self, name: &str) -> Result<Option<String>, ServerError> {
-        observability::trace_scope!(
-            TRACE_TARGET,
-            "Coordinator::load_bucket_cors_config",
-            "bucket={:?}",
-            name
-        );
+    fn put_opaque_bucket_subresource(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+        action: auth::PolicyAction,
+        kind: storage::BucketSubresourceKind,
+    ) -> Result<(), ServerError> {
+        let _bucket_info =
+            self.authorize_bucket_admin_or_bucket_policy_action_for(&req.bucket, action)?;
+        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
+        bucket_pg
+            .put_bucket_subresource(
+                req.bucket.name,
+                storage::PutBucketSubresource {
+                    kind,
+                    body: req.config,
+                    aux: storage::BucketSubresourceAux::None,
+                },
+            )
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    fn get_opaque_bucket_subresource(
+        &self,
+        req: &BucketRequest<'_>,
+        action: auth::PolicyAction,
+        kind: storage::BucketSubresourceKind,
+    ) -> Result<Option<String>, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(req, action)?;
+        self.load_opaque_bucket_subresource(req.name, kind)
+    }
+
+    fn delete_opaque_bucket_subresource(
+        &self,
+        req: &BucketRequest<'_>,
+        action: auth::PolicyAction,
+        kind: storage::BucketSubresourceKind,
+    ) -> Result<(), ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(req, action)?;
+        let bucket_pg = self.get_bucket_pg(req.name)?;
+        bucket_pg
+            .delete_bucket_subresource(req.name, kind)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    fn load_opaque_bucket_subresource(
+        &self,
+        name: &str,
+        kind: storage::BucketSubresourceKind,
+    ) -> Result<Option<String>, ServerError> {
         let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg.get_bucket_cors(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })
+        bucket_pg
+            .get_bucket_subresource(name, kind)
+            .map(|stored| stored.map(|stored| stored.body))
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
     }
 
     // ── Bucket tagging ────────────────────────────────────────────────
