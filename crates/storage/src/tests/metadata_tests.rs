@@ -883,7 +883,7 @@ fn file_bucket_subresource_roundtrip() {
             .unwrap(),
         Some(StoredBucketSubresource {
             body: "<Cors/>".to_string(),
-            generation: None,
+            generation: Some(1),
             aux: BucketSubresourceAux::None,
         })
     );
@@ -913,7 +913,7 @@ fn file_bucket_subresource_roundtrip() {
             .unwrap(),
         Some(StoredBucketSubresource {
             body: "<Tagging/>".to_string(),
-            generation: None,
+            generation: Some(1),
             aux: BucketSubresourceAux::None,
         })
     );
@@ -934,7 +934,7 @@ fn file_bucket_subresource_roundtrip() {
             .unwrap(),
         Some(StoredBucketSubresource {
             body: "<PublicAccessBlock/>".to_string(),
-            generation: None,
+            generation: Some(1),
             aux: BucketSubresourceAux::None,
         })
     );
@@ -955,7 +955,7 @@ fn file_bucket_subresource_roundtrip() {
             .unwrap(),
         Some(StoredBucketSubresource {
             body: "<OwnershipControls/>".to_string(),
-            generation: None,
+            generation: Some(1),
             aux: BucketSubresourceAux::None,
         })
     );
@@ -1056,6 +1056,117 @@ fn file_bucket_subresource_rejects_aux_kind_mismatch() {
         )
         .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::Db { .. }));
+}
+
+#[test]
+fn file_bucket_subresource_generations_bump_across_overwrite_and_delete() {
+    let (_dir, store) = make_pg_store();
+    store
+        .create_bucket(
+            "bucket",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+    store.put_bucket_cors("bucket", "<Cors/>").unwrap();
+    assert_eq!(
+        store
+            .get_bucket_subresource("bucket", BucketSubresourceKind::Cors)
+            .unwrap()
+            .unwrap()
+            .generation,
+        Some(1)
+    );
+
+    store
+        .put_bucket_subresource(
+            "bucket",
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Cors,
+                body: "<Cors><Rule/></Cors>",
+                aux: BucketSubresourceAux::None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .get_bucket_subresource("bucket", BucketSubresourceKind::Cors)
+            .unwrap()
+            .unwrap(),
+        StoredBucketSubresource {
+            body: "<Cors><Rule/></Cors>".to_string(),
+            generation: Some(2),
+            aux: BucketSubresourceAux::None,
+        }
+    );
+
+    store.delete_bucket_cors("bucket").unwrap();
+    assert_eq!(
+        store
+            .get_bucket_subresource("bucket", BucketSubresourceKind::Cors)
+            .unwrap(),
+        None
+    );
+
+    store
+        .put_bucket_cors("bucket", "<Cors><Rule>again</Rule></Cors>")
+        .unwrap();
+    assert_eq!(
+        store
+            .get_bucket_subresource("bucket", BucketSubresourceKind::Cors)
+            .unwrap()
+            .unwrap(),
+        StoredBucketSubresource {
+            body: "<Cors><Rule>again</Rule></Cors>".to_string(),
+            generation: Some(4),
+            aux: BucketSubresourceAux::None,
+        }
+    );
+}
+
+#[test]
+fn delete_bucket_cascades_bucket_subresources() {
+    let (_dir, store) = make_pg_store();
+    store
+        .create_bucket(
+            "bucket",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+    store
+        .put_bucket_policy("bucket", "{\"Version\":\"2012-10-17\"}", true)
+        .unwrap();
+    assert!(store
+        .get_bucket_subresource("bucket", BucketSubresourceKind::Policy)
+        .unwrap()
+        .is_some());
+
+    store.delete_bucket("bucket").unwrap();
+
+    store
+        .create_bucket(
+            "bucket",
+            "owner",
+            &CanonicalUserId::from_principal("owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .get_bucket_subresource("bucket", BucketSubresourceKind::Policy)
+            .unwrap(),
+        None
+    );
 }
 
 #[test]

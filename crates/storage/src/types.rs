@@ -1473,11 +1473,21 @@ impl BucketSubresourceKind {
     pub const fn supports_aux(self, aux: BucketSubresourceAux) -> bool {
         matches!(
             (self, aux),
-            (_, BucketSubresourceAux::None)
+            (BucketSubresourceKind::Cors, BucketSubresourceAux::None)
+                | (BucketSubresourceKind::Tagging, BucketSubresourceAux::None)
+                | (
+                    BucketSubresourceKind::PublicAccessBlock,
+                    BucketSubresourceAux::None
+                )
+                | (
+                    BucketSubresourceKind::OwnershipControls,
+                    BucketSubresourceAux::None
+                )
                 | (
                     BucketSubresourceKind::Policy,
                     BucketSubresourceAux::Policy { .. }
                 )
+                | (BucketSubresourceKind::Lifecycle, BucketSubresourceAux::None)
         )
     }
 }

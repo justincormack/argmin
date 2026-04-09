@@ -956,6 +956,442 @@ impl PgStore {
         }
     }
 
+    fn bucket_subresource_aux_to_sql(aux: BucketSubresourceAux) -> Option<i64> {
+        match aux {
+            BucketSubresourceAux::None => None,
+            BucketSubresourceAux::Policy { is_public } => Some(i64::from(is_public)),
+        }
+    }
+
+    fn bucket_subresource_aux_from_sql(
+        kind: BucketSubresourceKind,
+        raw: Option<i64>,
+    ) -> Result<BucketSubresourceAux, rusqlite::Error> {
+        match kind {
+            BucketSubresourceKind::Policy => match raw {
+                Some(0) => Ok(BucketSubresourceAux::policy(false)),
+                Some(1) => Ok(BucketSubresourceAux::policy(true)),
+                Some(value) => Err(rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("invalid policy aux_int_1: {value}")),
+                )),
+                None => Err(rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Null,
+                    Box::from("missing policy aux_int_1"),
+                )),
+            },
+            _ => match raw {
+                None => Ok(BucketSubresourceAux::None),
+                Some(value) => Err(rusqlite::Error::FromSqlConversionFailure(
+                    2,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("unexpected aux_int_1 for {kind:?}: {value}")),
+                )),
+            },
+        }
+    }
+
+    fn parse_bucket_subresource_generation(
+        raw: i64,
+        col_idx: usize,
+    ) -> Result<u64, rusqlite::Error> {
+        if raw < 0 {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                col_idx,
+                rusqlite::types::Type::Integer,
+                Box::from(format!(
+                    "invalid negative bucket subresource generation: {raw}"
+                )),
+            ));
+        }
+        Ok(raw as u64)
+    }
+
+    fn put_bucket_subresource_internal(
+        &self,
+        name: &str,
+        kind: BucketSubresourceKind,
+        body: &str,
+        aux: BucketSubresourceAux,
+    ) -> Result<(), MetadataError> {
+        if !kind.supports_aux(aux) {
+            return Err(Self::bucket_subresource_invalid_aux(kind, aux));
+        }
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket subresource (begin txn)",
+                source: e,
+            })?;
+        let result: Result<(), MetadataError> = (|| {
+            let updated = match kind {
+                BucketSubresourceKind::Cors => self
+                    .conn
+                    .execute(
+                        "UPDATE buckets SET cors_config = ?1 WHERE name = ?2",
+                        params![body, name],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "put bucket subresource (update bucket cors mirror)",
+                        source: e,
+                    })?,
+                BucketSubresourceKind::Tagging => self
+                    .conn
+                    .execute(
+                        "UPDATE buckets SET tags = ?1 WHERE name = ?2",
+                        params![body, name],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "put bucket subresource (update bucket tags mirror)",
+                        source: e,
+                    })?,
+                BucketSubresourceKind::PublicAccessBlock => self
+                    .conn
+                    .execute(
+                        "UPDATE buckets SET public_access_block = ?1 WHERE name = ?2",
+                        params![body, name],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "put bucket subresource (update public access block mirror)",
+                        source: e,
+                    })?,
+                BucketSubresourceKind::OwnershipControls => self
+                    .conn
+                    .execute(
+                        "UPDATE buckets SET ownership_controls = ?1 WHERE name = ?2",
+                        params![body, name],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "put bucket subresource (update ownership controls mirror)",
+                        source: e,
+                    })?,
+                BucketSubresourceKind::Policy => self
+                    .conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET bucket_policy = ?1, bucket_policy_public = ?2 \
+                         WHERE name = ?3",
+                        params![body, i32::from(aux.policy_is_public().unwrap()), name],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "put bucket subresource (update bucket policy mirror)",
+                        source: e,
+                    })?,
+                BucketSubresourceKind::Lifecycle => self
+                    .conn
+                    .execute(
+                        "UPDATE buckets SET bucket_lifecycle = ?1 WHERE name = ?2",
+                        params![body, name],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "put bucket subresource (update bucket lifecycle mirror)",
+                        source: e,
+                    })?,
+            };
+            if updated == 0 {
+                return Err(MetadataError::BucketNotFound {
+                    name: BucketName::from(name),
+                });
+            }
+
+            self.conn
+                .execute(
+                    "INSERT INTO bucket_subresources (bucket_name, kind, body, generation, aux_int_1) \
+                     VALUES (?1, ?2, ?3, 1, ?4) \
+                     ON CONFLICT(bucket_name, kind) DO UPDATE SET \
+                         body = excluded.body, \
+                         generation = bucket_subresources.generation + 1, \
+                         aux_int_1 = excluded.aux_int_1",
+                    params![
+                        name,
+                        kind as u8 as i64,
+                        body,
+                        Self::bucket_subresource_aux_to_sql(aux),
+                    ],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "put bucket subresource (upsert subresource row)",
+                    source: e,
+                })?;
+
+            let generation = self
+                .conn
+                .query_row(
+                    "SELECT generation FROM bucket_subresources \
+                     WHERE bucket_name = ?1 AND kind = ?2",
+                    params![name, kind as u8 as i64],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "put bucket subresource (load generation)",
+                    source: e,
+                })
+                .and_then(|raw| {
+                    Self::parse_bucket_subresource_generation(raw, 0).map_err(|source| {
+                        MetadataError::Db {
+                            context: "put bucket subresource (parse generation)",
+                            source,
+                        }
+                    })
+                })?;
+
+            match kind {
+                BucketSubresourceKind::Policy => {
+                    self.conn
+                        .execute(
+                            "UPDATE buckets SET bucket_policy_generation = ?1 WHERE name = ?2",
+                            params![generation as i64, name],
+                        )
+                        .map_err(|e| MetadataError::Db {
+                            context: "put bucket subresource (update policy generation mirror)",
+                            source: e,
+                        })?;
+                }
+                BucketSubresourceKind::Lifecycle => {
+                    self.conn
+                        .execute(
+                            "UPDATE buckets SET bucket_lifecycle_generation = ?1 WHERE name = ?2",
+                            params![generation as i64, name],
+                        )
+                        .map_err(|e| MetadataError::Db {
+                            context: "put bucket subresource (update lifecycle generation mirror)",
+                            source: e,
+                        })?;
+                }
+                _ => {}
+            }
+
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| MetadataError::Db {
+                        context: "put bucket subresource (commit txn)",
+                        source: e,
+                    })?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    fn delete_bucket_subresource_internal(
+        &self,
+        name: &str,
+        kind: BucketSubresourceKind,
+    ) -> Result<(), MetadataError> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket subresource (begin txn)",
+                source: e,
+            })?;
+        let result: Result<(), MetadataError> = (|| {
+            let updated = match kind {
+                BucketSubresourceKind::Cors => self
+                    .conn
+                    .execute(
+                        "UPDATE buckets SET cors_config = NULL WHERE name = ?1",
+                        params![name],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "delete bucket subresource (clear bucket cors mirror)",
+                        source: e,
+                    })?,
+                BucketSubresourceKind::Tagging => self
+                    .conn
+                    .execute(
+                        "UPDATE buckets SET tags = NULL WHERE name = ?1",
+                        params![name],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "delete bucket subresource (clear bucket tags mirror)",
+                        source: e,
+                    })?,
+                BucketSubresourceKind::PublicAccessBlock => self
+                    .conn
+                    .execute(
+                        "UPDATE buckets SET public_access_block = NULL WHERE name = ?1",
+                        params![name],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "delete bucket subresource (clear public access block mirror)",
+                        source: e,
+                    })?,
+                BucketSubresourceKind::OwnershipControls => self
+                    .conn
+                    .execute(
+                        "UPDATE buckets SET ownership_controls = NULL WHERE name = ?1",
+                        params![name],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "delete bucket subresource (clear ownership controls mirror)",
+                        source: e,
+                    })?,
+                BucketSubresourceKind::Policy => self
+                    .conn
+                    .execute(
+                        "UPDATE buckets \
+                         SET bucket_policy = NULL, bucket_policy_public = 0 \
+                         WHERE name = ?1",
+                        params![name],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "delete bucket subresource (clear bucket policy mirror)",
+                        source: e,
+                    })?,
+                BucketSubresourceKind::Lifecycle => self
+                    .conn
+                    .execute(
+                        "UPDATE buckets SET bucket_lifecycle = NULL WHERE name = ?1",
+                        params![name],
+                    )
+                    .map_err(|e| MetadataError::Db {
+                        context: "delete bucket subresource (clear bucket lifecycle mirror)",
+                        source: e,
+                    })?,
+            };
+            if updated == 0 {
+                return Err(MetadataError::BucketNotFound {
+                    name: BucketName::from(name),
+                });
+            }
+
+            self.conn
+                .execute(
+                    "INSERT INTO bucket_subresources (bucket_name, kind, body, generation, aux_int_1) \
+                     VALUES (?1, ?2, NULL, 1, NULL) \
+                     ON CONFLICT(bucket_name, kind) DO UPDATE SET \
+                         body = NULL, \
+                         generation = bucket_subresources.generation + 1, \
+                         aux_int_1 = NULL",
+                    params![name, kind as u8 as i64],
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "delete bucket subresource (tombstone subresource row)",
+                    source: e,
+                })?;
+
+            let generation = self
+                .conn
+                .query_row(
+                    "SELECT generation FROM bucket_subresources \
+                     WHERE bucket_name = ?1 AND kind = ?2",
+                    params![name, kind as u8 as i64],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| MetadataError::Db {
+                    context: "delete bucket subresource (load generation)",
+                    source: e,
+                })
+                .and_then(|raw| {
+                    Self::parse_bucket_subresource_generation(raw, 0).map_err(|source| {
+                        MetadataError::Db {
+                            context: "delete bucket subresource (parse generation)",
+                            source,
+                        }
+                    })
+                })?;
+
+            match kind {
+                BucketSubresourceKind::Policy => {
+                    self.conn
+                        .execute(
+                            "UPDATE buckets SET bucket_policy_generation = ?1 WHERE name = ?2",
+                            params![generation as i64, name],
+                        )
+                        .map_err(|e| MetadataError::Db {
+                            context: "delete bucket subresource (update policy generation mirror)",
+                            source: e,
+                        })?;
+                }
+                BucketSubresourceKind::Lifecycle => {
+                    self.conn
+                        .execute(
+                            "UPDATE buckets SET bucket_lifecycle_generation = ?1 WHERE name = ?2",
+                            params![generation as i64, name],
+                        )
+                        .map_err(|e| MetadataError::Db {
+                            context:
+                                "delete bucket subresource (update lifecycle generation mirror)",
+                            source: e,
+                        })?;
+                }
+                _ => {}
+            }
+
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.conn
+                    .execute_batch("COMMIT")
+                    .map_err(|e| MetadataError::Db {
+                        context: "delete bucket subresource (commit txn)",
+                        source: e,
+                    })?;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(err)
+            }
+        }
+    }
+
+    fn get_bucket_subresource_internal(
+        &self,
+        name: &str,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<StoredBucketSubresource>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT s.body, s.generation, s.aux_int_1 \
+                 FROM buckets b \
+                 LEFT JOIN bucket_subresources s \
+                   ON s.bucket_name = b.name AND s.kind = ?2 \
+                 WHERE b.name = ?1",
+                params![name, kind as u8 as i64],
+                |row| {
+                    let body = row.get::<_, Option<String>>(0)?;
+                    let generation = row.get::<_, Option<i64>>(1)?;
+                    let aux = row.get::<_, Option<i64>>(2)?;
+                    match body {
+                        Some(body) => Ok(Some(StoredBucketSubresource {
+                            body,
+                            generation: Some(Self::parse_bucket_subresource_generation(
+                                generation.ok_or_else(|| {
+                                    rusqlite::Error::FromSqlConversionFailure(
+                                        1,
+                                        rusqlite::types::Type::Null,
+                                        Box::from("missing bucket subresource generation"),
+                                    )
+                                })?,
+                                1,
+                            )?),
+                            aux: Self::bucket_subresource_aux_from_sql(kind, aux)?,
+                        })),
+                        None => Ok(None),
+                    }
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket subresource",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            })
+    }
+
     /// Map a row with columns (bucket, key, version_id, generation_id, size,
     /// etag, etag_kind, last_modified, storage_class, ec_k, ec_m, status,
     /// tags, data_layout, parts_count, metadata_blob, system_metadata_blob,
@@ -2125,113 +2561,39 @@ impl PgMetadataStore for PgStore {
     }
 
     fn put_bucket_cors(&self, name: &str, config: &str) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET cors_config = ?1 WHERE name = ?2",
-                params![config, name],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put bucket cors",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
-        }
-        Ok(())
+        self.put_bucket_subresource_internal(
+            name,
+            BucketSubresourceKind::Cors,
+            config,
+            BucketSubresourceAux::None,
+        )
     }
 
     fn get_bucket_cors(&self, name: &str) -> Result<Option<String>, MetadataError> {
-        self.conn
-            .query_row(
-                "SELECT cors_config FROM buckets WHERE name = ?1",
-                params![name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get bucket cors",
-                source: e,
-            })?
-            .ok_or(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            })
+        self.get_bucket_subresource_internal(name, BucketSubresourceKind::Cors)
+            .map(|stored| stored.map(|stored| stored.body))
     }
 
     fn delete_bucket_cors(&self, name: &str) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET cors_config = NULL WHERE name = ?1",
-                params![name],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete bucket cors",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
-        }
-        Ok(())
+        self.delete_bucket_subresource_internal(name, BucketSubresourceKind::Cors)
     }
 
     fn put_bucket_tags(&self, name: &str, tags: &str) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET tags = ?1 WHERE name = ?2",
-                params![tags, name],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put bucket tags",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
-        }
-        Ok(())
+        self.put_bucket_subresource_internal(
+            name,
+            BucketSubresourceKind::Tagging,
+            tags,
+            BucketSubresourceAux::None,
+        )
     }
 
     fn get_bucket_tags(&self, name: &str) -> Result<Option<String>, MetadataError> {
-        self.conn
-            .query_row(
-                "SELECT tags FROM buckets WHERE name = ?1",
-                params![name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get bucket tags",
-                source: e,
-            })?
-            .ok_or(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            })
+        self.get_bucket_subresource_internal(name, BucketSubresourceKind::Tagging)
+            .map(|stored| stored.map(|stored| stored.body))
     }
 
     fn delete_bucket_tags(&self, name: &str) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET tags = NULL WHERE name = ?1",
-                params![name],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete bucket tags",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
-        }
-        Ok(())
+        self.delete_bucket_subresource_internal(name, BucketSubresourceKind::Tagging)
     }
 
     fn put_bucket_public_access_block(
@@ -2239,58 +2601,21 @@ impl PgMetadataStore for PgStore {
         name: &str,
         config: &str,
     ) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET public_access_block = ?1 WHERE name = ?2",
-                params![config, name],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put bucket public access block",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
-        }
-        Ok(())
+        self.put_bucket_subresource_internal(
+            name,
+            BucketSubresourceKind::PublicAccessBlock,
+            config,
+            BucketSubresourceAux::None,
+        )
     }
 
     fn get_bucket_public_access_block(&self, name: &str) -> Result<Option<String>, MetadataError> {
-        self.conn
-            .query_row(
-                "SELECT public_access_block FROM buckets WHERE name = ?1",
-                params![name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get bucket public access block",
-                source: e,
-            })?
-            .ok_or(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            })
+        self.get_bucket_subresource_internal(name, BucketSubresourceKind::PublicAccessBlock)
+            .map(|stored| stored.map(|stored| stored.body))
     }
 
     fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET public_access_block = NULL WHERE name = ?1",
-                params![name],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete bucket public access block",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
-        }
-        Ok(())
+        self.delete_bucket_subresource_internal(name, BucketSubresourceKind::PublicAccessBlock)
     }
 
     fn put_bucket_policy(
@@ -2299,125 +2624,39 @@ impl PgMetadataStore for PgStore {
         policy: &str,
         is_public: bool,
     ) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets \
-                 SET bucket_policy = ?1, bucket_policy_public = ?2, \
-                     bucket_policy_generation = bucket_policy_generation + 1 \
-                 WHERE name = ?3",
-                params![policy, i32::from(is_public), name],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put bucket policy",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
-        }
-        Ok(())
+        self.put_bucket_subresource_internal(
+            name,
+            BucketSubresourceKind::Policy,
+            policy,
+            BucketSubresourceAux::policy(is_public),
+        )
     }
 
     fn get_bucket_policy(&self, name: &str) -> Result<Option<String>, MetadataError> {
-        self.conn
-            .query_row(
-                "SELECT bucket_policy FROM buckets WHERE name = ?1",
-                params![name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get bucket policy",
-                source: e,
-            })?
-            .ok_or(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            })
+        self.get_bucket_subresource_internal(name, BucketSubresourceKind::Policy)
+            .map(|stored| stored.map(|stored| stored.body))
     }
 
     fn delete_bucket_policy(&self, name: &str) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets \
-                 SET bucket_policy = NULL, bucket_policy_public = 0, \
-                     bucket_policy_generation = bucket_policy_generation + 1 \
-                 WHERE name = ?1",
-                params![name],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete bucket policy",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
-        }
-        Ok(())
+        self.delete_bucket_subresource_internal(name, BucketSubresourceKind::Policy)
     }
 
     fn put_bucket_lifecycle(&self, name: &str, config: &str) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets \
-                 SET bucket_lifecycle = ?1, \
-                     bucket_lifecycle_generation = bucket_lifecycle_generation + 1 \
-                 WHERE name = ?2",
-                params![config, name],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put bucket lifecycle",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
-        }
-        Ok(())
+        self.put_bucket_subresource_internal(
+            name,
+            BucketSubresourceKind::Lifecycle,
+            config,
+            BucketSubresourceAux::None,
+        )
     }
 
     fn get_bucket_lifecycle(&self, name: &str) -> Result<Option<String>, MetadataError> {
-        self.conn
-            .query_row(
-                "SELECT bucket_lifecycle FROM buckets WHERE name = ?1",
-                params![name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get bucket lifecycle",
-                source: e,
-            })?
-            .ok_or(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            })
+        self.get_bucket_subresource_internal(name, BucketSubresourceKind::Lifecycle)
+            .map(|stored| stored.map(|stored| stored.body))
     }
 
     fn delete_bucket_lifecycle(&self, name: &str) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets \
-                 SET bucket_lifecycle = NULL, \
-                     bucket_lifecycle_generation = bucket_lifecycle_generation + 1 \
-                 WHERE name = ?1",
-                params![name],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete bucket lifecycle",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
-        }
-        Ok(())
+        self.delete_bucket_subresource_internal(name, BucketSubresourceKind::Lifecycle)
     }
 
     fn put_bucket_acl(
@@ -2451,58 +2690,21 @@ impl PgMetadataStore for PgStore {
     }
 
     fn put_bucket_ownership_controls(&self, name: &str, config: &str) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET ownership_controls = ?1 WHERE name = ?2",
-                params![config, name],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "put bucket ownership controls",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
-        }
-        Ok(())
+        self.put_bucket_subresource_internal(
+            name,
+            BucketSubresourceKind::OwnershipControls,
+            config,
+            BucketSubresourceAux::None,
+        )
     }
 
     fn get_bucket_ownership_controls(&self, name: &str) -> Result<Option<String>, MetadataError> {
-        self.conn
-            .query_row(
-                "SELECT ownership_controls FROM buckets WHERE name = ?1",
-                params![name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|e| MetadataError::Db {
-                context: "get bucket ownership controls",
-                source: e,
-            })?
-            .ok_or(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            })
+        self.get_bucket_subresource_internal(name, BucketSubresourceKind::OwnershipControls)
+            .map(|stored| stored.map(|stored| stored.body))
     }
 
     fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError> {
-        let updated = self
-            .conn
-            .execute(
-                "UPDATE buckets SET ownership_controls = NULL WHERE name = ?1",
-                params![name],
-            )
-            .map_err(|e| MetadataError::Db {
-                context: "delete bucket ownership controls",
-                source: e,
-            })?;
-        if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
-        }
-        Ok(())
+        self.delete_bucket_subresource_internal(name, BucketSubresourceKind::OwnershipControls)
     }
 
     fn put_bucket_subresource(
@@ -2510,27 +2712,7 @@ impl PgMetadataStore for PgStore {
         name: &str,
         req: PutBucketSubresource<'_>,
     ) -> Result<(), MetadataError> {
-        if !req.kind.supports_aux(req.aux) {
-            return Err(Self::bucket_subresource_invalid_aux(req.kind, req.aux));
-        }
-        match req.kind {
-            BucketSubresourceKind::Cors => self.put_bucket_cors(name, req.body),
-            BucketSubresourceKind::Tagging => self.put_bucket_tags(name, req.body),
-            BucketSubresourceKind::PublicAccessBlock => {
-                self.put_bucket_public_access_block(name, req.body)
-            }
-            BucketSubresourceKind::OwnershipControls => {
-                self.put_bucket_ownership_controls(name, req.body)
-            }
-            BucketSubresourceKind::Policy => {
-                let is_public = req
-                    .aux
-                    .policy_is_public()
-                    .ok_or_else(|| Self::bucket_subresource_invalid_aux(req.kind, req.aux))?;
-                self.put_bucket_policy(name, req.body, is_public)
-            }
-            BucketSubresourceKind::Lifecycle => self.put_bucket_lifecycle(name, req.body),
-        }
+        self.put_bucket_subresource_internal(name, req.kind, req.body, req.aux)
     }
 
     fn get_bucket_subresource(
@@ -2538,51 +2720,7 @@ impl PgMetadataStore for PgStore {
         name: &str,
         kind: BucketSubresourceKind,
     ) -> Result<Option<StoredBucketSubresource>, MetadataError> {
-        let info = self.head_bucket_raw(name)?;
-        Ok(match kind {
-            BucketSubresourceKind::Cors => info.cors_config.map(|body| StoredBucketSubresource {
-                body,
-                generation: None,
-                aux: BucketSubresourceAux::None,
-            }),
-            BucketSubresourceKind::Tagging => info.tags.map(|body| StoredBucketSubresource {
-                body: body.into_inner(),
-                generation: None,
-                aux: BucketSubresourceAux::None,
-            }),
-            BucketSubresourceKind::PublicAccessBlock => {
-                info.public_access_block
-                    .map(|body| StoredBucketSubresource {
-                        body,
-                        generation: None,
-                        aux: BucketSubresourceAux::None,
-                    })
-            }
-            BucketSubresourceKind::OwnershipControls => {
-                info.ownership_controls.map(|body| StoredBucketSubresource {
-                    body,
-                    generation: None,
-                    aux: BucketSubresourceAux::None,
-                })
-            }
-            BucketSubresourceKind::Policy => {
-                let generation = info.bucket_policy_generation;
-                let aux = BucketSubresourceAux::policy(info.bucket_policy_public);
-                info.bucket_policy.map(|body| StoredBucketSubresource {
-                    body,
-                    generation: Some(generation),
-                    aux,
-                })
-            }
-            BucketSubresourceKind::Lifecycle => {
-                let generation = info.bucket_lifecycle_generation;
-                info.bucket_lifecycle.map(|body| StoredBucketSubresource {
-                    body,
-                    generation: Some(generation),
-                    aux: BucketSubresourceAux::None,
-                })
-            }
-        })
+        self.get_bucket_subresource_internal(name, kind)
     }
 
     fn delete_bucket_subresource(
@@ -2590,16 +2728,7 @@ impl PgMetadataStore for PgStore {
         name: &str,
         kind: BucketSubresourceKind,
     ) -> Result<(), MetadataError> {
-        match kind {
-            BucketSubresourceKind::Cors => self.delete_bucket_cors(name),
-            BucketSubresourceKind::Tagging => self.delete_bucket_tags(name),
-            BucketSubresourceKind::PublicAccessBlock => {
-                self.delete_bucket_public_access_block(name)
-            }
-            BucketSubresourceKind::OwnershipControls => self.delete_bucket_ownership_controls(name),
-            BucketSubresourceKind::Policy => self.delete_bucket_policy(name),
-            BucketSubresourceKind::Lifecycle => self.delete_bucket_lifecycle(name),
-        }
+        self.delete_bucket_subresource_internal(name, kind)
     }
 
     fn put_bucket_encryption(

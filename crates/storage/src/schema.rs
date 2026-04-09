@@ -398,6 +398,19 @@ CREATE TABLE IF NOT EXISTS buckets (
 const CREATE_BUCKETS_OWNER_LIST_INDEX: &str = "\
 CREATE INDEX IF NOT EXISTS idx_buckets_owner_list ON buckets (owner_principal, name)";
 
+/// Bucket-scoped opaque subresource storage.
+const CREATE_BUCKET_SUBRESOURCES_TABLE: &str = "\
+CREATE TABLE IF NOT EXISTS bucket_subresources (
+    bucket_name     TEXT NOT NULL,
+    kind            INTEGER NOT NULL CHECK (kind IN (0, 1, 2, 3, 4, 5)),
+    body            TEXT,
+    generation      INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0),
+    aux_int_1       INTEGER,
+    PRIMARY KEY (bucket_name, kind),
+    FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE,
+    CHECK (aux_int_1 IS NULL OR aux_int_1 IN (0, 1))
+)";
+
 /// SQLite pragmas for per-PG databases: WAL mode, NORMAL synchronous.
 const PG_PRAGMAS: &str = "\
 PRAGMA journal_mode=WAL;
@@ -434,6 +447,7 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_MULTIPART_PART_CHUNKS_VERSION_INDEX, [])?;
     conn.execute(CREATE_BUCKETS_TABLE, [])?;
     conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
+    conn.execute(CREATE_BUCKET_SUBRESOURCES_TABLE, [])?;
     conn.execute(CREATE_OBJECT_PARTS_OFFSET_INDEX, [])?;
     migrate_checksum_columns(conn)?;
     migrate_segment_crc_columns(conn)?;
