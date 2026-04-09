@@ -109,6 +109,75 @@ stalled-stream watchdog. This keeps slower remote runs from failing with
 `ThroughputBelowMinimum` while preserving the stricter local defaults for the
 embedded server.
 
+### AWS convergence and retries
+
+AWS-backed `s3-tests` already contain a number of retry and eventual-check
+helpers. These are not all the same class of issue, and new tests should match
+the existing patterns instead of adding blind sleeps.
+
+The main categories currently covered are:
+
+- authorization and policy propagation
+  - Cross-account and anonymous data-plane authorization can lag behind
+    control-plane writes such as `PutBucketPolicy`, `PutBucketAcl`,
+    `PutBucketOwnershipControls`, and `PutPublicAccessBlock`.
+  - An owner-side read-back such as `GetBucketPolicy` is not sufficient proof
+    that the corresponding data-plane authorization decision has converged.
+  - Existing helpers in `bucket_policy.rs`, `ownership.rs`, and
+    `public_access_block.rs` wait for the exact operation under test
+    (`GetObject`, `ListObjects`, `GetBucketPolicyStatus`, `CopyObject`,
+    `UploadPartCopy`, `CreateMultipartUpload`, and similar) rather than
+    assuming immediate consistency after the control-plane write.
+
+- CORS and response-policy convergence
+  - Preflight behavior can take time to reflect CORS configuration updates, so
+    `cors.rs` uses eventual status checks instead of asserting on the first
+    response.
+
+- versioning and lifecycle metadata convergence
+  - Some metadata surfaces do not update immediately after the enabling or rule
+    write that causes them.
+  - `bucket_list.rs` waits for `HeadObject` after enabling versioning.
+  - `lifecycle.rs` waits for `x-amz-expiration` to appear on `PutObject`,
+    `HeadObject`, and `GetObject`.
+  - `versioning.rs` confirms expected version/delete-marker counts twice before
+    treating the state as stable.
+
+- object-lock policy and retention timing
+  - In `object_lock.rs`, policy-based bypass permissions can lag behind bucket
+    policy reads, so the tests retry the actual bypass operation until it is
+    accepted.
+  - Those retries build a fresh alternate client for external AWS runs because
+    the propagation issue is on the authorization decision path being observed,
+    not just in local test control flow.
+  - Object-lock cleanup and related tests also wait for legal-hold and
+    retention windows to pass when AWS is correctly enforcing them.
+
+- cleanup races
+  - Bucket deletion frequently races with multipart uploads, object version
+    cleanup, and other bucket state transitions, producing transient
+    `OperationAborted` or `BucketNotEmpty`.
+  - Cleanup helpers in files such as `bucket_acl.rs`, `multipart.rs`, and
+    `expected_bucket_owner.rs` retry those delete paths rather than treating
+    them as hard failures.
+
+- local orchestration timing
+  - A few sleeps are not AWS eventual-consistency workarounds at all. For
+    example, `admission.rs` uses a short delay only to ensure the local test
+    server has accepted a slow request before sending the competing request.
+
+Guideline for new AWS-backed tests:
+
+- If the test depends on a control-plane change becoming visible to a
+  data-plane operation, add an eventual helper for that exact operation.
+- Prefer retrying a success predicate or a specific expected error code over a
+  fixed sleep.
+- Treat owner read-backs (`GetBucketPolicy`, `GetBucketAcl`, etc.) as useful
+  diagnostics, not as proof that the external behavior under test has
+  converged.
+- Use a fixed sleep only when the test is coordinating local timing, not when
+  it is waiting for AWS state to settle.
+
 ### HTTP-only transport checks
 
 HTTP-only transport checks live in `crates/s3-http-tests`. They reuse the same
