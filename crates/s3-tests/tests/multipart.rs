@@ -231,6 +231,26 @@ fn has_grant(grants: &[aws_sdk_s3::types::Grant], permission: Permission, uri: &
     })
 }
 
+#[test]
+fn test_create_multipart_upload_rejects_system_metadata_over_limit() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let result = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("multipart-system-metadata-too-large")
+            .content_disposition("d".repeat(3000))
+            .send()
+            .await;
+
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MetadataTooLarge");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
 // ── Basic lifecycle ─────────────────────────────────────────────────
 
 #[test]

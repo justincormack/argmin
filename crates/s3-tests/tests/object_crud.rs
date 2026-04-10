@@ -1349,6 +1349,55 @@ fn test_object_metadata_too_large() {
     });
 }
 
+#[test]
+fn test_object_system_metadata_too_large() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let oversized = "d".repeat(3000);
+
+        let result = client
+            .put_object()
+            .bucket(&bucket)
+            .key("system-metadata-too-large")
+            .content_disposition(oversized)
+            .body(ByteStream::from_static(b""))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MetadataTooLarge");
+
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_put_object_rejects_request_header_section_over_limit() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let url = format!("{}/{bucket}/header-section-too-large", CTX.endpoint());
+        let response = send_signed_request(
+            "PUT",
+            &url,
+            b"",
+            vec![("x-test-padding".to_string(), "p".repeat(9000))],
+        );
+
+        assert_eq!(response.status, 400, "unexpected body: {}", response.body);
+        assert!(
+            response
+                .body
+                .contains("<Code>RequestHeaderSectionTooLarge</Code>"),
+            "unexpected body: {}",
+            response.body
+        );
+
+        let keys: Vec<String> = Vec::new();
+        delete_all_and_bucket(client, &bucket, &keys).await;
+    });
+}
+
 // ── ETag consistency ─────────────────────────────────────────────────
 
 #[test]

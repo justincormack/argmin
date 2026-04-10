@@ -1403,6 +1403,15 @@ impl S3Response {
                     xml::key_too_long_error_xml(*size, *max_size_allowed, Self::TEST_REQUEST_ID);
                 return Self::new(400).chunked_xml_body(body);
             }
+            ServerError::RequestHeaderSectionTooLarge => {
+                let body = xml::error_xml(
+                    "RequestHeaderSectionTooLarge",
+                    "The request header and query parameters used to make the request exceed the maximum allowed size.",
+                    resource,
+                    Self::TEST_REQUEST_ID,
+                );
+                return Self::new(400).chunked_xml_body(body);
+            }
             _ => {}
         }
 

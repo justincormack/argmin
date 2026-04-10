@@ -82,6 +82,9 @@ pub enum ServerError {
     #[error("metadata too large")]
     MetadataTooLarge,
 
+    #[error("request header section too large")]
+    RequestHeaderSectionTooLarge,
+
     #[error("request too large (max {max_message_length_bytes} bytes)")]
     MaxMessageLengthExceeded { max_message_length_bytes: usize },
 
@@ -275,6 +278,7 @@ impl ServerError {
             Self::MetadataBlobError { .. } => "InternalError",
             Self::ObjectTooLarge { .. } => "EntityTooLarge",
             Self::MetadataTooLarge => "MetadataTooLarge",
+            Self::RequestHeaderSectionTooLarge => "RequestHeaderSectionTooLarge",
             Self::MaxMessageLengthExceeded { .. } => "MaxMessageLengthExceeded",
             Self::MethodNotAllowed | Self::HeadDeleteMarkerMethodNotAllowed { .. } => {
                 "MethodNotAllowed"
@@ -390,7 +394,9 @@ impl ServerError {
             | Self::HeaderNotImplemented { .. }
             | Self::QueryParameterNotImplemented { .. } => 501,
             Self::InternalError { .. } => 500,
-            Self::ObjectTooLarge { .. } | Self::MetadataTooLarge => 400,
+            Self::ObjectTooLarge { .. }
+            | Self::MetadataTooLarge
+            | Self::RequestHeaderSectionTooLarge => 400,
             Self::MethodNotAllowed | Self::HeadDeleteMarkerMethodNotAllowed { .. } => 405,
             Self::InvalidRange { .. } => 416,
             Self::PreconditionFailed => 412,
@@ -640,6 +646,14 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_request_header_section_too_large() {
+        assert_eq!(
+            ServerError::RequestHeaderSectionTooLarge.s3_error_code(),
+            "RequestHeaderSectionTooLarge"
+        );
+    }
+
+    #[test]
     fn s3_error_code_method_not_allowed() {
         assert_eq!(
             ServerError::MethodNotAllowed.s3_error_code(),
@@ -773,6 +787,7 @@ mod tests {
             400
         );
         assert_eq!(ServerError::MetadataTooLarge.http_status(), 400);
+        assert_eq!(ServerError::RequestHeaderSectionTooLarge.http_status(), 400);
         assert_eq!(
             ServerError::MalformedPolicy {
                 reason: "bad".into()

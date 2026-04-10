@@ -122,6 +122,22 @@ fn canned_acl_and_header_grants_conflict() -> ServerError {
     }
 }
 
+const MAX_WRITE_REQUEST_HEADER_SECTION_SIZE: usize = 8 * 1024;
+
+fn validate_write_request_header_section_size(headers: &[(&str, &str)]) -> Result<(), ServerError> {
+    let mut total_header_section_size = 0usize;
+    for (name, value) in headers {
+        total_header_section_size = total_header_section_size
+            .checked_add(name.len())
+            .and_then(|size| size.checked_add(value.len()))
+            .ok_or(ServerError::RequestHeaderSectionTooLarge)?;
+        if total_header_section_size > MAX_WRITE_REQUEST_HEADER_SECTION_SIZE {
+            return Err(ServerError::RequestHeaderSectionTooLarge);
+        }
+    }
+    Ok(())
+}
+
 fn parse_request_metadata<'a, I>(headers: I) -> Result<(MetadataBlob, SystemMetadata), ServerError>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -1042,6 +1058,8 @@ impl HttpFrontend {
                     let acl = parse_put_object_write_acl(req)?;
                     let src_cond = copy_source_condition_from_headers(req);
                     let dst_cond = write_condition_from_headers(req)?;
+                    let request_headers: Vec<(&str, &str)> = req.header_iter().collect();
+                    validate_write_request_header_section_size(&request_headers)?;
                     // Parse metadata and checksum algorithm at the HTTP boundary
                     // so the coordinator never sees raw headers.
                     let replace_metadata;
@@ -1050,7 +1068,7 @@ impl HttpFrontend {
                     let directive = match req.header("x-amz-metadata-directive") {
                         Some(d) if d.eq_ignore_ascii_case("REPLACE") => {
                             let (blob, mut system_metadata) =
-                                parse_request_metadata(req.header_iter())?;
+                                parse_request_metadata(request_headers.iter().copied())?;
                             system_metadata.strip_checksum_values();
                             replace_metadata = blob;
                             replace_system_metadata = system_metadata;
@@ -1166,8 +1184,10 @@ impl HttpFrontend {
                     } else {
                         None
                     };
+                    let request_headers: Vec<(&str, &str)> = req.header_iter().collect();
+                    validate_write_request_header_section_size(&request_headers)?;
                     let (metadata_blob, system_metadata) =
-                        parse_request_metadata(req.header_iter())?;
+                        parse_request_metadata(request_headers.iter().copied())?;
                     let cond = write_condition_from_headers(req)?;
                     let requester = Self::requester_from_auth(auth);
                     let acl = parse_put_object_write_acl(req)?;
@@ -2243,7 +2263,10 @@ impl HttpFrontend {
                 let sse_customer_headers = sse_customer
                     .as_ref()
                     .map(SseCustomerRequest::response_headers);
-                let (metadata, system_metadata) = parse_request_metadata(req.header_iter())?;
+                let request_headers: Vec<(&str, &str)> = req.header_iter().collect();
+                validate_write_request_header_section_size(&request_headers)?;
+                let (metadata, system_metadata) =
+                    parse_request_metadata(request_headers.iter().copied())?;
 
                 // Parse optional checksum algorithm/type headers.
                 let checksum_algorithm = match req.header("x-amz-checksum-algorithm") {
@@ -3332,7 +3355,10 @@ impl HttpFrontend {
             }
         }
 
-        let (metadata_blob, mut system_metadata) = parse_request_metadata(req.header_iter())?;
+        let request_headers: Vec<(&str, &str)> = req.header_iter().collect();
+        validate_write_request_header_section_size(&request_headers)?;
+        let (metadata_blob, mut system_metadata) =
+            parse_request_metadata(request_headers.iter().copied())?;
         if uses_aws_chunked_transport {
             system_metadata.strip_aws_chunked_content_encoding();
         }
@@ -5284,6 +5310,33 @@ mod tests {
             ),
         ));
         new_req(http::Method::PUT, "/", "", headers, body.to_vec())
+    }
+
+    #[test]
+    fn validate_write_request_header_section_size_accepts_headers_at_limit() {
+        let headers = vec![(
+            "x-test-padding",
+            "p".repeat(MAX_WRITE_REQUEST_HEADER_SECTION_SIZE - "x-test-padding".len()),
+        )];
+        let refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        validate_write_request_header_section_size(&refs).unwrap();
+    }
+
+    #[test]
+    fn validate_write_request_header_section_size_rejects_headers_over_limit() {
+        let headers = vec![(
+            "x-test-padding",
+            "p".repeat(MAX_WRITE_REQUEST_HEADER_SECTION_SIZE - "x-test-padding".len() + 1),
+        )];
+        let refs: Vec<(&str, &str)> = headers
+            .iter()
+            .map(|(name, value)| (*name, value.as_str()))
+            .collect();
+        let err = validate_write_request_header_section_size(&refs).unwrap_err();
+        assert!(matches!(err, ServerError::RequestHeaderSectionTooLarge));
     }
 
     #[test]

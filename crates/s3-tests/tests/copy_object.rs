@@ -1161,6 +1161,30 @@ fn test_copy_object_replace_strips_bogus_inline_checksum() {
 }
 
 #[test]
+fn test_copy_object_replace_rejects_system_metadata_over_limit() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "src", b"hello world").await;
+
+        let result = client
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{}/src", bucket))
+            .metadata_directive(aws_sdk_s3::types::MetadataDirective::Replace)
+            .content_disposition("d".repeat(3000))
+            .send()
+            .await;
+
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MetadataTooLarge");
+
+        cleanup(&bucket, &["src"]).await;
+    });
+}
+
+#[test]
 fn test_copy_object_replace_checksum_algorithm_recomputes() {
     // CopyObject REPLACE with x-amz-checksum-algorithm should compute
     // the checksum from the destination data and persist it.
