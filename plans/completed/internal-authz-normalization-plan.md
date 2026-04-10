@@ -2,35 +2,27 @@
 
 ## Status
 
-In progress.
+Completed.
 
-Workstream 1 has started. The first slice is now in the tree:
+This plan landed across the following refactor slices:
 
-1. raw locked object read loading is split from read authorization evaluation
-2. public `authorize_get_*` object-read entrypoints still keep the same shape
-3. `CopyObject` and `UploadPartCopy` source-read authorization now uses the
-   same split internal path
+1. `ace3549`: normalized object read authorization internals
+2. `8938996`: normalized object tagging / ACL / object-lock auth internals
+3. `6672c65`: simplified the shared bucket-policy auth helpers
+4. `7b8d61c`: added the minimal `ObjectPolicyTarget` helper for object-vs-
+   missing-key policy evaluation
 
-The remaining work in workstream 1 is to carry that cleanup further through the
-read-family helpers and decide whether the resulting internal token shapes
-should be tightened before moving on to the ACL/tagging/object-lock families.
+The resulting end state is:
 
-Workstream 2 is also now in progress:
-
-1. object tagging, object ACL, and object-lock authorization now share the
-   same raw loaded-object state pattern instead of each carrying their own
-   mixed load-and-authorize helper
-2. object-lock authorization still preserves the security-sensitive ordering:
-   authorize first, then validate that the bucket has object lock configured
-
-Workstream 3 has started in a limited way:
-
-1. the repeated object bucket-policy allow/deny/fallback shape is now shared by
-   a common internal helper for object read, tagging, ACL, object lock, and
-   delete-style object authorization
-2. the remaining bucket-policy consolidation work is to extend that cleanup to
-   the rest of the internal predicate families without obscuring operation
-   semantics
+1. public S3 handlers still use one `authorize_*` entrypoint per operation
+2. object read, tagging, ACL, and object-lock internals all use a clearer
+   split between loading locked state and evaluating authorization
+3. object-lock authorization preserves the security-sensitive ordering of
+   authorization before bucket object-lock configuration disclosure
+4. shared bucket-policy allow/deny/fallback evaluation is less repetitive
+   without collapsing operation-specific auth contracts into generic public APIs
+5. the minimal object-vs-missing-key policy split is handled explicitly by a
+   small internal `ObjectPolicyTarget` helper rather than ad hoc local matching
 
 Public S3 handlers now consistently use operation-specific `authorize_*`
 entrypoints with typed authorized values. The remaining cleanup is internal to
@@ -205,3 +197,5 @@ This plan is complete when:
 4. no public coordinator handlers depend directly on legacy generic auth helper
    shapes
 5. workspace tests remain clean with no AWS-behavior regressions
+
+All success criteria are now met.
