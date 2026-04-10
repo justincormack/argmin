@@ -362,6 +362,12 @@ struct AuthorizedObjectRead<'a> {
     locked: LockedReadObject<'a>,
 }
 
+struct LoadedObjectReadState<'a> {
+    bucket_info: ValidatedBucket,
+    bucket_policy: Option<Arc<auth::BucketPolicy>>,
+    locked: LockedReadObject<'a>,
+}
+
 struct AuthorizedCopyObject<'a> {
     source: LockedReadObject<'a>,
     destination: AuthorizedPutObjectWrite,
@@ -23796,6 +23802,30 @@ mod tests {
             })
             .unwrap();
         assert!(matches!(authorized.locked.record, StoredObject::Live(_)));
+    }
+
+    #[test]
+    fn authorize_get_object_masks_missing_private_object_as_access_denied() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .authorize_get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "missing",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
     }
 
     #[test]

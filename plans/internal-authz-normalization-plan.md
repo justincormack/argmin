@@ -2,7 +2,18 @@
 
 ## Status
 
-Pending.
+In progress.
+
+Workstream 1 has started. The first slice is now in the tree:
+
+1. raw locked object read loading is split from read authorization evaluation
+2. public `authorize_get_*` object-read entrypoints still keep the same shape
+3. `CopyObject` and `UploadPartCopy` source-read authorization now uses the
+   same split internal path
+
+The remaining work in workstream 1 is to carry that cleanup further through the
+read-family helpers and decide whether the resulting internal token shapes
+should be tightened before moving on to the ACL/tagging/object-lock families.
 
 Public S3 handlers now consistently use operation-specific `authorize_*`
 entrypoints with typed authorized values. The remaining cleanup is internal to
