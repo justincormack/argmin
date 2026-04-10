@@ -1,9 +1,9 @@
-use std::io::Cursor;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use auth::AccountIdentity;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use storage::CanonicalUserId;
 
@@ -336,20 +336,18 @@ fn make_test_tls_acceptor() -> tokio_rustls::TlsAcceptor {
 }
 
 fn load_certs_from_pem(data: &[u8]) -> Result<Vec<CertificateDer<'static>>, String> {
-    let mut reader = Cursor::new(data);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_slice_iter(data)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("failed to read test TLS cert: {e}"))
 }
 
 fn load_private_key_from_pem(data: &[u8]) -> Result<PrivateKeyDer<'static>, String> {
-    let mut reader = Cursor::new(data);
-    let Some(key) = rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("failed to read test TLS key: {e}"))?
-    else {
-        return Err("no private key found in test TLS key PEM".to_string());
-    };
-    Ok(key)
+    PrivateKeyDer::from_pem_slice(data).map_err(|e| match e {
+        rustls::pki_types::pem::Error::NoItemsFound => {
+            "no private key found in test TLS key PEM".to_string()
+        }
+        _ => format!("failed to read test TLS key: {e}"),
+    })
 }
 
 #[cfg(test)]

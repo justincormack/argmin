@@ -33,7 +33,6 @@ aws-smithy-http-client = { version = "1", features = ["rustls-ring"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2"
 
 # Test infrastructure
 tempfile = "3"

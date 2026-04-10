@@ -1,12 +1,11 @@
 mod config;
 
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
 use auth::{AccountIdentity, CredentialRecord, CredentialStore, SecretKey};
 use ec::EcConfig;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use server_core::coordinator::Coordinator;
 use server_core::sse::{
@@ -21,22 +20,19 @@ use config::ServerConfig;
 use server_http::http::HttpFrontend;
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>, String> {
-    let file = File::open(path).map_err(|e| format!("failed to open TLS cert {path}: {e}"))?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader)
+    CertificateDer::pem_file_iter(path)
+        .map_err(|e| format!("failed to open TLS cert {path}: {e}"))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("failed to read TLS cert {path}: {e}"))
 }
 
 fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>, String> {
-    let file = File::open(path).map_err(|e| format!("failed to open TLS key {path}: {e}"))?;
-    let mut reader = BufReader::new(file);
-    let Some(key) = rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| format!("failed to read TLS key {path}: {e}"))?
-    else {
-        return Err(format!("no private key found in {path}"));
-    };
-    Ok(key)
+    PrivateKeyDer::from_pem_file(path).map_err(|e| match e {
+        rustls::pki_types::pem::Error::NoItemsFound => {
+            format!("no private key found in {path}")
+        }
+        _ => format!("failed to read TLS key {path}: {e}"),
+    })
 }
 
 fn build_tls_acceptor(config: &ServerConfig) -> Result<Option<TlsAcceptor>, String> {
