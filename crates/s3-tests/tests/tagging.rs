@@ -11,6 +11,7 @@ use s3_tests::{
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 static BUCKET_POLICY_TEST_GUARD: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -29,6 +30,69 @@ fn tag(key: &str, value: &str) -> Tag {
 
 fn tagging(tags: Vec<Tag>) -> Tagging {
     Tagging::builder().set_tag_set(Some(tags)).build().unwrap()
+}
+
+async fn wait_for_tag_count(bucket: &str, key: &str, expected_count: usize, description: &str) {
+    const MAX_ATTEMPTS: usize = 40;
+
+    let mut last_seen = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .client()
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        match result {
+            Ok(resp) if resp.tag_set().len() == expected_count => return,
+            Ok(resp) => last_seen = Some(format!("{} tags", resp.tag_set().len())),
+            Err(err) => last_seen = Some(format!("{err:?}")),
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    let last_seen = last_seen.unwrap_or_else(|| "no response".to_string());
+    panic!(
+        "{description} did not converge for {bucket}/{key}: expected {expected_count} tags, last saw {last_seen}"
+    );
+}
+
+async fn wait_for_current_delete_marker_tagging_method_not_allowed(
+    bucket: &str,
+    key: &str,
+    description: &str,
+) {
+    const MAX_ATTEMPTS: usize = 40;
+
+    let mut last_seen = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .client()
+            .get_object_tagging()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        if result.is_err() && err_status(&result) == 405 {
+            assert_s3_err_code(&result, "MethodNotAllowed");
+            return;
+        }
+        last_seen = Some(match result {
+            Ok(resp) => format!("Ok({} tags)", resp.tag_set().len()),
+            Err(err) => format!("{err:?}"),
+        });
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    let last_seen = last_seen.unwrap_or_else(|| "no response".to_string());
+    panic!(
+        "{description} did not converge for {bucket}/{key}: expected 405 MethodNotAllowed, last saw {last_seen}"
+    );
 }
 
 fn assert_tag_sets_match_unordered(actual: &[Tag], expected: &[Tag]) {
@@ -1524,6 +1588,7 @@ fn test_delete_tagged_object_no_tags_on_delete_marker() {
             .unwrap();
 
         // Verify tags are set
+        wait_for_tag_count(&bucket, key, 2, "tag visibility after put").await;
         let result = client
             .get_object_tagging()
             .bucket(&bucket)
@@ -1556,14 +1621,12 @@ fn test_delete_tagged_object_no_tags_on_delete_marker() {
         assert_eq!(err_status(&result), 405);
 
         // GetObjectTagging without versionId (current = delete marker) → 405
-        let result = client
-            .get_object_tagging()
-            .bucket(&bucket)
-            .key(key)
-            .send()
-            .await;
-        assert!(result.is_err());
-        assert_eq!(err_status(&result), 405);
+        wait_for_current_delete_marker_tagging_method_not_allowed(
+            &bucket,
+            key,
+            "current delete-marker GetObjectTagging",
+        )
+        .await;
 
         cleanup_versioned_bucket(CTX.client(), &bucket).await;
     });

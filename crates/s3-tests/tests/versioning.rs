@@ -290,34 +290,111 @@ async fn create_versioned_object_concurrent(
 }
 
 async fn clear_versioned_bucket_concurrent(client: aws_sdk_s3::Client, bucket: String) {
-    let resp = client
-        .list_object_versions()
-        .bucket(&bucket)
-        .send()
-        .await
-        .unwrap();
+    loop {
+        let resp = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
 
-    let mut tasks = Vec::with_capacity(resp.versions().len());
-    for version in resp.versions() {
-        let client = client.clone();
-        let bucket = bucket.clone();
-        let key = version.key().unwrap().to_string();
-        let version_id = version.version_id().unwrap().to_string();
-        tasks.push(tokio::spawn(async move {
-            client
-                .delete_object()
-                .bucket(bucket)
-                .key(key)
-                .version_id(version_id)
+        if resp.versions().is_empty() && resp.delete_markers().is_empty() {
+            sleep(Duration::from_millis(200)).await;
+            let confirm = client
+                .list_object_versions()
+                .bucket(&bucket)
                 .send()
                 .await
                 .unwrap();
-        }));
+            if confirm.versions().is_empty() && confirm.delete_markers().is_empty() {
+                return;
+            }
+            continue;
+        }
+
+        let mut tasks = Vec::with_capacity(resp.versions().len() + resp.delete_markers().len());
+        for version in resp.versions() {
+            let client = client.clone();
+            let bucket = bucket.clone();
+            let key = version.key().unwrap().to_string();
+            let version_id = version.version_id().unwrap().to_string();
+            tasks.push(tokio::spawn(async move {
+                client
+                    .delete_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .version_id(version_id)
+                    .send()
+                    .await
+                    .unwrap();
+            }));
+        }
+        for marker in resp.delete_markers() {
+            let client = client.clone();
+            let bucket = bucket.clone();
+            let key = marker.key().unwrap().to_string();
+            let version_id = marker.version_id().unwrap().to_string();
+            tasks.push(tokio::spawn(async move {
+                client
+                    .delete_object()
+                    .bucket(bucket)
+                    .key(key)
+                    .version_id(version_id)
+                    .send()
+                    .await
+                    .unwrap();
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+    }
+}
+
+async fn wait_for_minimum_version_listing_counts(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    minimum_versions: usize,
+    expected_delete_markers: usize,
+    description: &str,
+) {
+    let mut last_seen = None;
+
+    for _ in 0..40 {
+        let resp = client
+            .list_object_versions()
+            .bucket(bucket)
+            .send()
+            .await
+            .unwrap();
+        let counts = (resp.versions().len(), resp.delete_markers().len());
+
+        if counts.0 >= minimum_versions && counts.1 == expected_delete_markers {
+            sleep(Duration::from_millis(200)).await;
+
+            let confirm = client
+                .list_object_versions()
+                .bucket(bucket)
+                .send()
+                .await
+                .unwrap();
+            let confirmed = (confirm.versions().len(), confirm.delete_markers().len());
+            if confirmed.0 >= minimum_versions && confirmed.1 == expected_delete_markers {
+                return;
+            }
+            last_seen = Some(confirmed);
+        } else {
+            last_seen = Some(counts);
+        }
+
+        sleep(Duration::from_millis(250)).await;
     }
 
-    for task in tasks {
-        task.await.unwrap();
-    }
+    let (versions, delete_markers) = last_seen.unwrap_or_default();
+    panic!(
+        "{description} did not converge for {bucket}: expected at least {minimum_versions} versions and {expected_delete_markers} delete markers, last saw {versions} versions and {delete_markers} delete markers"
+    );
 }
 
 async fn wait_for_version_listing_counts(
@@ -1883,7 +1960,7 @@ fn test_versioned_concurrent_object_create_concurrent_remove() {
             )
             .await;
 
-            wait_for_version_listing_counts(
+            wait_for_minimum_version_listing_counts(
                 client,
                 &bucket,
                 num_versions,

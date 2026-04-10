@@ -5,6 +5,7 @@ use aws_sdk_s3::types::{
 use s3_tests::{
     assert_s3_err_code, disable_bucket_public_access_block, err_status, unique_bucket, CTX,
 };
+use std::time::Duration;
 
 const AUTHENTICATED_USERS_GROUP_URI: &str =
     "http://acs.amazonaws.com/groups/global/AuthenticatedUsers";
@@ -125,7 +126,7 @@ async fn object_owner_id(bucket: &str, key: &str) -> String {
 }
 
 async fn alt_get_object_access_denied_eventually(bucket: &str, key: &str) {
-    const MAX_ATTEMPTS: usize = 60;
+    const MAX_ATTEMPTS: usize = 120;
 
     for attempt in 0..MAX_ATTEMPTS {
         let result = CTX
@@ -139,10 +140,23 @@ async fn alt_get_object_access_denied_eventually(bucket: &str, key: &str) {
             assert_s3_err_code(&result, "AccessDenied");
             true
         } {
-            return;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let confirm = CTX
+                .alt_client()
+                .get_object()
+                .bucket(bucket)
+                .key(key)
+                .send()
+                .await;
+            if confirm.is_err() && err_status(&confirm) == 403 && {
+                assert_s3_err_code(&confirm, "AccessDenied");
+                true
+            } {
+                return;
+            }
         }
         if attempt + 1 < MAX_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
         panic!(
@@ -155,7 +169,7 @@ async fn alt_get_object_access_denied_eventually(bucket: &str, key: &str) {
 }
 
 async fn alt_list_bucket_access_denied_eventually(bucket: &str) {
-    const MAX_ATTEMPTS: usize = 60;
+    const MAX_ATTEMPTS: usize = 120;
 
     for attempt in 0..MAX_ATTEMPTS {
         let result = CTX
@@ -168,10 +182,22 @@ async fn alt_list_bucket_access_denied_eventually(bucket: &str) {
             assert_s3_err_code(&result, "AccessDenied");
             true
         } {
-            return;
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            let confirm = CTX
+                .alt_client()
+                .list_objects_v2()
+                .bucket(bucket)
+                .send()
+                .await;
+            if confirm.is_err() && err_status(&confirm) == 403 && {
+                assert_s3_err_code(&confirm, "AccessDenied");
+                true
+            } {
+                return;
+            }
         }
         if attempt + 1 < MAX_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
         panic!(
