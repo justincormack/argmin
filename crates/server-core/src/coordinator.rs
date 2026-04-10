@@ -6256,15 +6256,14 @@ impl Coordinator {
             &req.bucket,
             auth::PolicyAction::PutBucketPublicAccessBlock,
         )?;
-        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
-        bucket_pg
-            .put_bucket_public_access_block(req.bucket.name, req.config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        self.store_bucket_subresource(
+            req.bucket.name,
+            storage::PutBucketSubresource {
+                kind: storage::BucketSubresourceKind::PublicAccessBlock,
+                body: req.config,
+                aux: storage::BucketSubresourceAux::None,
+            },
+        )?;
         let config = req.config.to_string();
         self.storage_node
             .update_bucket_fast_path_if_present(req.bucket.name, |info| {
@@ -6292,15 +6291,10 @@ impl Coordinator {
         ) {
             return Err(ServerError::AccessDenied);
         }
-        let bucket_pg = self.get_bucket_pg(req.name)?;
-        bucket_pg
-            .get_bucket_public_access_block(req.name)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+        self.load_opaque_bucket_subresource(
+            req.name,
+            storage::BucketSubresourceKind::PublicAccessBlock,
+        )
     }
 
     pub fn delete_bucket_public_access_block(
@@ -6317,15 +6311,10 @@ impl Coordinator {
             req,
             auth::PolicyAction::PutBucketPublicAccessBlock,
         )?;
-        let bucket_pg = self.get_bucket_pg(req.name)?;
-        bucket_pg
-            .delete_bucket_public_access_block(req.name)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        self.remove_bucket_subresource(
+            req.name,
+            storage::BucketSubresourceKind::PublicAccessBlock,
+        )?;
         self.storage_node
             .update_bucket_fast_path_if_present(req.name, |info| info.public_access_block = None);
         Ok(())
@@ -6354,15 +6343,14 @@ impl Coordinator {
         {
             return Err(ServerError::InvalidBucketAclWithObjectOwnership);
         }
-        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
-        bucket_pg
-            .put_bucket_ownership_controls(req.bucket.name, req.config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        self.store_bucket_subresource(
+            req.bucket.name,
+            storage::PutBucketSubresource {
+                kind: storage::BucketSubresourceKind::OwnershipControls,
+                body: req.config,
+                aux: storage::BucketSubresourceAux::None,
+            },
+        )?;
         let config = req.config.to_string();
         self.storage_node
             .update_bucket_fast_path_if_present(req.bucket.name, |info| {
@@ -6381,19 +6369,11 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        self.get_opaque_bucket_subresource(
             req,
             auth::PolicyAction::GetBucketOwnershipControls,
-        )?;
-        let bucket_pg = self.get_bucket_pg(req.name)?;
-        bucket_pg
-            .get_bucket_ownership_controls(req.name)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+            storage::BucketSubresourceKind::OwnershipControls,
+        )
     }
 
     pub fn delete_bucket_ownership_controls(
@@ -6410,15 +6390,10 @@ impl Coordinator {
             req,
             auth::PolicyAction::PutBucketOwnershipControls,
         )?;
-        let bucket_pg = self.get_bucket_pg(req.name)?;
-        bucket_pg
-            .delete_bucket_ownership_controls(req.name)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        self.remove_bucket_subresource(
+            req.name,
+            storage::BucketSubresourceKind::OwnershipControls,
+        )?;
         self.storage_node
             .update_bucket_fast_path_if_present(req.name, |info| info.ownership_controls = None);
         Ok(())
@@ -6555,22 +6530,14 @@ impl Coordinator {
     ) -> Result<(), ServerError> {
         let _bucket_info =
             self.authorize_bucket_admin_or_bucket_policy_action_for(&req.bucket, action)?;
-        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
-        bucket_pg
-            .put_bucket_subresource(
-                req.bucket.name,
-                storage::PutBucketSubresource {
-                    kind,
-                    body: req.config,
-                    aux: storage::BucketSubresourceAux::None,
-                },
-            )
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+        self.store_bucket_subresource(
+            req.bucket.name,
+            storage::PutBucketSubresource {
+                kind,
+                body: req.config,
+                aux: storage::BucketSubresourceAux::None,
+            },
+        )
     }
 
     fn get_opaque_bucket_subresource(
@@ -6590,9 +6557,33 @@ impl Coordinator {
         kind: storage::BucketSubresourceKind,
     ) -> Result<(), ServerError> {
         let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(req, action)?;
-        let bucket_pg = self.get_bucket_pg(req.name)?;
+        self.remove_bucket_subresource(req.name, kind)
+    }
+
+    fn store_bucket_subresource(
+        &self,
+        name: &str,
+        req: storage::PutBucketSubresource<'_>,
+    ) -> Result<(), ServerError> {
+        let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
-            .delete_bucket_subresource(req.name, kind)
+            .put_bucket_subresource(name, req)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    fn remove_bucket_subresource(
+        &self,
+        name: &str,
+        kind: storage::BucketSubresourceKind,
+    ) -> Result<(), ServerError> {
+        let bucket_pg = self.get_bucket_pg(name)?;
+        bucket_pg
+            .delete_bucket_subresource(name, kind)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
