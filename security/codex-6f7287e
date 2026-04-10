@@ -1,0 +1,148 @@
+UploadPartCopy skips multipart part-number limit validation
+Link: https://chatgpt.com/codex/cloud/security/findings/e8d73ae9d6188191b7f55391673530f3?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: low (attack path: low)
+Status: fixed in fd74f68
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 6f7287e
+Author: justin@specialbusservice.com
+Created: 10/04/2026, 14:05:20
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Remediation
+Fixed in commit `fd74f68` (`Validate multipart part number bounds consistently`).
+
+The fix restores explicit `InvalidArgument` validation for multipart part
+numbers at the API entry points and also adds a shared bounds check in
+`create_upload_part_stream_session`, so both plain `UploadPart` and
+`UploadPartCopy` enforce the AWS `1..=10000` limit consistently.
+
+Regression coverage was added for:
+- server-core `UploadPartCopy` invalid part number
+- external `s3-tests` plain `UploadPart` invalid part number
+- external `s3-tests` `UploadPartCopy` invalid part number
+
+# Summary
+The commit introduces a regression where UploadPartCopy no longer enforces the multipart part-number upper bound, allowing oversized part numbers to be stored.
+Previously, UploadPartCopy used begin_stream_part, which validates part_number is within 1..=10,000. The refactor bypasses that path and calls create_upload_part_stream_session directly. The new authorize_upload_part_copy path only feeds part_number into the SSE-C scope helper (which just enforces nonzero/u16), so values above 10,000 are now accepted. This lets authenticated users create parts beyond the intended limit, violating S3 semantics and increasing metadata/disk usage (availability impact).
+
+# Validation
+## Rubric
+- [x] Verify begin_stream_part enforces 1..=10,000 part_number range (coordinator.rs:8088-8107)
+- [x] Trace UploadPartCopy to create_upload_part_stream_session without range check (coordinator.rs:11948-11972)
+- [x] Confirm create_upload_part_stream_session stores part_number without validation (coordinator.rs:8135-8164)
+- [x] Check authorize_upload_part_copy performs no range validation beyond SSE-C scope (authz.rs:2793-2858)
+- [x] Validate SseCustomerSegmentScope::multipart_part only enforces >0/u16 (sse.rs:390-401)
+## Report
+Attempted dynamic validation first. A debug build with `cargo test -p server-core --lib --no-run` failed because `ec-sys` requires the system library `libisal` (build.rs error: “libisal not found; install intel-isa-l or set PKG_CONFIG_PATH”). `valgrind` and `gdb` are not installed; `lldb` is present but no binary could be produced due to the missing dependency. Proceeded with code review. `begin_stream_part` enforces the 1..=10,000 part_number range (coordinator.rs:8088-8107). In contrast, `upload_part_copy` streams directly by calling `create_upload_part_stream_session` with the supplied part_number (coordinator.rs:11948-11972), and `create_upload_part_stream_session` stores `part_number` in `StreamUploadTarget::UploadPart` without validation (coordinator.rs:8135-8164). The authorization path for UploadPartCopy does not check the range; it only passes part_number into the SSE-C scope helper (authz.rs:2793-2858). `SseCustomerSegmentScope::multipart_part` only rejects zero or values that don’t fit in u16 (sse.rs:390-401), so 10,001 is accepted. This confirms the regression: UploadPartCopy bypasses the 10,000 upper bound and can store oversized part numbers.
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator.rs (L11948 to 11972)
+  Note: UploadPartCopy now directly creates a stream session with the supplied part_number without performing the range validation.
+```
+        // Phase 2: Stream into the destination multipart part session.
+        let AuthorizedMultipartPartWrite {
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            upload,
+            sse_customer,
+        } = destination;
+        let dst_meta_pg = self.storage_node.get_pg(self.object_pg_id(&bucket, &key))?;
+        let current_upload = dst_meta_pg.get_multipart_upload(upload_id.as_str())?;
+        if current_upload.bucket != bucket || current_upload.key != key {
+            return Err(ServerError::NoSuchUpload { upload_id });
+        }
+        if current_upload.state != UploadState::InProgress {
+            return Err(ServerError::NoSuchUpload { upload_id });
+        }
+        let session_id = self.create_upload_part_stream_session(
+            &dst_meta_pg,
+            &bucket,
+            &key,
+            upload_id.as_str(),
+            part_number,
+            &upload,
+        )?;
+```
+
+/workspace/argmin/crates/server-core/src/coordinator.rs (L8084 to 8108)
+  Note: begin_stream_part enforces the 1..=10,000 part-number range, which UploadPartCopy no longer calls.
+```
+    /// Begin a streaming UploadPart session.
+    ///
+    /// Creates a `StreamUploadKind::UploadPart` session tied to the given
+    /// multipart upload. Validates that the upload exists and is InProgress.
+    pub fn begin_stream_part(
+        &self,
+        req: &BeginStreamPartRequest<'_>,
+    ) -> Result<BeginStreamPartResult, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::begin_stream_part",
+            "bucket={:?} key={:?} upload_id={:?} part_number={}",
+            req.upload.bucket_name(),
+            req.upload.key(),
+            req.upload.upload_id,
+            req.part_number
+        );
+        let part_number = req.part_number;
+
+        // Validate part number range.
+        if part_number == 0 || part_number > 10_000 {
+            return Err(ServerError::InvalidArgument {
+                reason: format!("part number must be between 1 and 10000, got {part_number}"),
+            });
+        }
+```
+
+/workspace/argmin/crates/server-core/src/coordinator/authz.rs (L2849 to 2858)
+  Note: authorize_upload_part_copy uses part_number only for SSE-C scope (nonzero/u16) and does not enforce the 10,000 upper bound.
+```
+            Self::ensure_sse_c_allowed(
+                &dst_bucket_info,
+                dst_upload.encryption.uses_sse_customer_headers(),
+            )?;
+            self.ensure_write_encryption_supported(&dst_upload.encryption)?;
+            let sse_customer = self.prepare_existing_sse_customer_write_context(
+                &dst_upload.encryption,
+                req.sse_customer,
+                SseCustomerSegmentScope::multipart_part(part_number)?,
+                true,
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The bug is real and reachable through the authenticated S3 API, but impact is limited to availability/metadata growth and requires write privileges. No auth bypass or data exposure is shown; default binding is localhost. These factors keep severity low.
+## Likelihood
+high - Requires valid credentials and write permission, but is straightforward to trigger by choosing a large partNumber in UploadPartCopy. | Remote network vector
+## Impact
+low - Allows storage of multipart parts beyond S3's 10,000-part limit, increasing metadata and disk usage; no confidentiality or integrity breach demonstrated.
+## Assumptions
+- argmin-s3 is deployed with its HTTP endpoint reachable to the attacker (directly or via proxy).
+- Attacker has valid access key/secret and permission to perform UploadPartCopy on the target multipart upload.
+- No external quotas or deployment-specific limits enforce the 10,000 part number ceiling.
+- Valid S3 credentials with write permission to the destination multipart upload (UploadPartCopy)
+## Path
+client -> UploadPartCopy handler -> upload_part_copy -> create_upload_part_stream_session -> metadata growth
+## Path evidence
+- `crates/server-core/src/coordinator.rs:8084-8107` - begin_stream_part enforces part_number range 1..=10,000.
+- `crates/server-core/src/coordinator.rs:11948-11972` - UploadPartCopy creates a stream session with part_number without range validation.
+- `crates/server-http/src/http/request.rs:300-309` - parse_part_number only checks >0; no upper bound.
+- `crates/server-core/src/sse.rs:390-401` - SseCustomerSegmentScope::multipart_part only enforces nonzero and u16 fit.
+- `crates/server-http/src/http/mod.rs:2327-2355` - HTTP UploadPartCopy handler passes parsed part_number into coordinator.
+- `crates/argmin-s3/src/config.rs:27-61` - Default listen address is 127.0.0.1:9000; exposure is deployment-configurable.
+## Narrative
+UploadPartCopy takes partNumber from the HTTP query and only validates it as a positive integer. The standard upload path enforces 1..=10,000 in begin_stream_part, but UploadPartCopy bypasses this and directly calls create_upload_part_stream_session with the supplied part_number. The authorization path only uses part_number for SSE-C scope, which rejects zero or values not fitting in u16, so values like 10,001 are accepted. This enables authenticated users to create multipart parts beyond the intended limit, increasing metadata/disk usage (availability impact). Default listen address is 127.0.0.1:9000 but is configurable, so exposure depends on deployment.
+## Controls
+- SigV4 authentication
+- Bucket policy/ACL authorization for multipart writes
+- Max connections/in-flight request limits
+## Blindspots
+- No runtime validation of the PoC due to missing build dependencies.
+- No deployment manifests to confirm public exposure or additional quota/limit controls.
+- Unclear multi-tenant usage; impact may be smaller in single-tenant setups.
