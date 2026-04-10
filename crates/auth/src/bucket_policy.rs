@@ -2,6 +2,8 @@ use s3_types::{aws_account_id_from_principal, CanonicalUserId};
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr};
 
+pub const MAX_BUCKET_POLICY_BYTES: usize = 20 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketPolicy {
     version: Option<PolicyVersion>,
@@ -77,6 +79,25 @@ impl BucketPolicy {
         } else {
             PolicyEvaluation::NoMatch
         }
+    }
+
+    #[must_use]
+    pub fn normalized_json(&self) -> String {
+        let mut out = String::from("{");
+        if let Some(version) = self.version {
+            out.push_str("\"Version\":");
+            push_json_string(&mut out, version.as_str());
+            out.push(',');
+        }
+        out.push_str("\"Statement\":[");
+        for (index, statement) in self.statements.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            statement.push_normalized_json(&mut out);
+        }
+        out.push_str("]}");
+        out
     }
 }
 
@@ -582,12 +603,51 @@ impl PolicyStatement {
             ConditionMatchResult::Matches
         }
     }
+
+    fn push_normalized_json(&self, out: &mut String) {
+        out.push('{');
+        let mut first_field = true;
+
+        if let Some(sid) = self.sid() {
+            push_json_field_name(out, "Sid", &mut first_field);
+            push_json_string(out, sid);
+        }
+
+        push_json_field_name(out, "Effect", &mut first_field);
+        push_json_string(out, self.effect.as_str());
+
+        push_json_field_name(out, "Principal", &mut first_field);
+        self.principal.push_normalized_json(out);
+
+        push_json_field_name(out, "Action", &mut first_field);
+        push_json_string_or_array(out, self.actions());
+
+        push_json_field_name(out, "Resource", &mut first_field);
+        push_json_string_or_array(out, self.resources());
+
+        if !self.conditions.is_empty() {
+            push_json_field_name(out, "Condition", &mut first_field);
+            push_condition_map(out, self.conditions());
+        }
+
+        out.push('}');
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyEffect {
     Allow,
     Deny,
+}
+
+impl PolicyEffect {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "Allow",
+            Self::Deny => "Deny",
+        }
+    }
 }
 
 const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 20] = [
@@ -688,6 +748,29 @@ impl PolicyPrincipal {
                 requester_canonical_user_id.is_some_and(|requester| requester.as_str() == value)
             })
     }
+
+    fn push_normalized_json(&self, out: &mut String) {
+        if self.wildcard {
+            push_json_string(out, "*");
+            return;
+        }
+
+        out.push('{');
+        let mut first_field = true;
+        if !self.aws().is_empty() {
+            push_json_field_name(out, "AWS", &mut first_field);
+            push_json_string_or_array(out, self.aws());
+        }
+        if !self.canonical_user().is_empty() {
+            push_json_field_name(out, "CanonicalUser", &mut first_field);
+            push_json_string_or_array(out, self.canonical_user());
+        }
+        if !self.service().is_empty() {
+            push_json_field_name(out, "Service", &mut first_field);
+            push_json_string_or_array(out, self.service());
+        }
+        out.push('}');
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -695,6 +778,82 @@ pub struct PolicyConditionClause {
     operator: String,
     key: String,
     values: Vec<String>,
+}
+
+impl PolicyVersion {
+    #[must_use]
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::V2008_10_17 => "2008-10-17",
+            Self::V2012_10_17 => "2012-10-17",
+        }
+    }
+}
+
+fn push_json_field_name(out: &mut String, field_name: &str, first_field: &mut bool) {
+    if !*first_field {
+        out.push(',');
+    }
+    *first_field = false;
+    push_json_string(out, field_name);
+    out.push(':');
+}
+
+fn push_json_string(out: &mut String, value: &str) {
+    out.push_str(&serde_json::to_string(value).expect("serializing JSON string"));
+}
+
+fn push_json_string_or_array(out: &mut String, values: &[String]) {
+    match values {
+        [value] => push_json_string(out, value),
+        _ => {
+            out.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                push_json_string(out, value);
+            }
+            out.push(']');
+        }
+    }
+}
+
+fn push_condition_map(out: &mut String, clauses: &[PolicyConditionClause]) {
+    type ConditionOperandGroup<'a> = Vec<(&'a str, &'a [String])>;
+    type ConditionOperatorGroup<'a> = Vec<(&'a str, ConditionOperandGroup<'a>)>;
+
+    let mut grouped: ConditionOperatorGroup<'_> = Vec::new();
+    for clause in clauses {
+        if let Some((_, operands)) = grouped
+            .iter_mut()
+            .find(|(operator, _)| *operator == clause.operator())
+        {
+            operands.push((clause.key(), clause.values()));
+        } else {
+            grouped.push((clause.operator(), vec![(clause.key(), clause.values())]));
+        }
+    }
+
+    out.push('{');
+    for (operator_index, (operator, operands)) in grouped.iter().enumerate() {
+        if operator_index > 0 {
+            out.push(',');
+        }
+        push_json_string(out, operator);
+        out.push(':');
+        out.push('{');
+        for (operand_index, (key, values)) in operands.iter().enumerate() {
+            if operand_index > 0 {
+                out.push(',');
+            }
+            push_json_string(out, key);
+            out.push(':');
+            push_json_string_or_array(out, values);
+        }
+        out.push('}');
+    }
+    out.push('}');
 }
 
 impl PolicyConditionClause {
@@ -1426,6 +1585,34 @@ mod tests {
         assert_eq!(policy.version(), Some(PolicyVersion::V2012_10_17));
         assert!(policy.statements().is_empty());
         assert!(!policy.is_public());
+        assert_eq!(
+            policy.normalized_json(),
+            r#"{"Version":"2012-10-17","Statement":[]}"#
+        );
+    }
+
+    #[test]
+    fn normalized_json_canonicalizes_bucket_policy_shape() {
+        let policy = parse_bucket_policy(
+            "{\n  \"Statement\": {\n    \"Resource\": [\"arn:aws:s3:::bucket\"],\n    \"Action\": [\"s3:ListBucket\"],\n    \"Principal\": {\"AWS\": \"arn:aws:iam::123456789012:root\"},\n    \"Effect\": \"Allow\",\n    \"Sid\": \"One\"\n  },\n  \"Version\": \"2012-10-17\"\n}",
+        )
+        .unwrap();
+        assert_eq!(
+            policy.normalized_json(),
+            r#"{"Version":"2012-10-17","Statement":[{"Sid":"One","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#
+        );
+    }
+
+    #[test]
+    fn normalized_json_groups_conditions_by_operator() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/classification":["public","shared"],"s3:ExistingObjectTag/region":"us-east-1"},"IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            policy.normalized_json(),
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"IpAddress":{"aws:SourceIp":"10.0.0.0/8"},"StringEquals":{"s3:ExistingObjectTag/classification":["public","shared"],"s3:ExistingObjectTag/region":"us-east-1"}}}]}"#
+        );
     }
 
     #[test]

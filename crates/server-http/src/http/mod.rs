@@ -5314,7 +5314,7 @@ mod tests {
 
     #[test]
     fn validate_write_request_header_section_size_accepts_headers_at_limit() {
-        let headers = vec![(
+        let headers = [(
             "x-test-padding",
             "p".repeat(MAX_WRITE_REQUEST_HEADER_SECTION_SIZE - "x-test-padding".len()),
         )];
@@ -5327,7 +5327,7 @@ mod tests {
 
     #[test]
     fn validate_write_request_header_section_size_rejects_headers_over_limit() {
-        let headers = vec![(
+        let headers = [(
             "x-test-padding",
             "p".repeat(MAX_WRITE_REQUEST_HEADER_SECTION_SIZE - "x-test-padding".len() + 1),
         )];
@@ -6249,7 +6249,8 @@ mod tests {
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
 
-        let policy = "{\"Version\":\"2012-10-17\",\"Statement\":[]}";
+        let policy = "{\n  \"Statement\": {\n    \"Resource\": [\"arn:aws:s3:::mybucket\"],\n    \"Action\": [\"s3:ListBucket\"],\n    \"Principal\": {\"AWS\": \"arn:aws:iam::123456789012:root\"},\n    \"Effect\": \"Allow\",\n    \"Sid\": \"One\"\n  },\n  \"Version\": \"2012-10-17\"\n}";
+        let expected_policy = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"One\",\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"arn:aws:iam::123456789012:root\"},\"Action\":\"s3:ListBucket\",\"Resource\":\"arn:aws:s3:::mybucket\"}]}";
         let put_req = new_req(
             http::Method::PUT,
             "/",
@@ -6279,7 +6280,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(get_resp.status_code, 200);
-        assert_eq!(String::from_utf8(get_resp.body).unwrap(), policy);
+        assert_eq!(String::from_utf8(get_resp.body).unwrap(), expected_policy);
         assert!(get_resp
             .headers
             .iter()
@@ -6360,6 +6361,52 @@ mod tests {
         ) {
             Err(ServerError::MalformedPolicy { reason }) => {
                 assert!(reason.contains("invalid JSON"));
+            }
+            Err(e) => panic!("expected MalformedPolicy, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn put_bucket_policy_rejects_normalized_policy_over_20kb() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let mut policy = String::from("{\"Version\":\"2012-10-17\",\"Statement\":[");
+        let mut statement_count = 0usize;
+        while policy.len() <= auth::bucket_policy::MAX_BUCKET_POLICY_BYTES {
+            if statement_count > 0 {
+                policy.push(',');
+            }
+            policy.push_str(&format!(
+                "{{\"Sid\":\"Stmt{statement_count:04}\",\"Effect\":\"Allow\",\"Principal\":{{\"AWS\":\"arn:aws:iam::123456789012:root\"}},\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::mybucket/path-{statement_count:04}*\"}}"
+            ));
+            statement_count += 1;
+        }
+        policy.push_str("]}");
+        let put_req = new_req(
+            http::Method::PUT,
+            "/",
+            "policy",
+            checksum_header_pairs(policy.as_bytes()),
+            policy.into_bytes(),
+        );
+        match fe.dispatch_routed(
+            &put_req,
+            &test_auth(),
+            S3Operation::PutBucketPolicy {
+                bucket: "mybucket".to_string(),
+            },
+        ) {
+            Err(ServerError::MalformedPolicy { reason }) => {
+                assert_eq!(
+                    reason,
+                    format!(
+                        "Normalized policy document exceeds the maximum allowed size of {} bytes",
+                        auth::bucket_policy::MAX_BUCKET_POLICY_BYTES
+                    )
+                );
             }
             Err(e) => panic!("expected MalformedPolicy, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),

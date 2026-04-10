@@ -1421,6 +1421,7 @@ impl S3Response {
             ServerError::InvalidArgument { reason } => reason.as_str(),
             ServerError::InvalidBucketName { reason } => reason.as_str(),
             ServerError::InvalidBucketNamespace { reason, .. } => reason.as_str(),
+            ServerError::MalformedPolicy { reason } => reason.as_str(),
             ServerError::NotImplemented { feature } => feature.as_str(),
             ServerError::HeaderNotImplemented { header } => header.as_str(),
             ServerError::QueryParameterNotImplemented { query_parameter } => {

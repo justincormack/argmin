@@ -1062,6 +1062,141 @@ fn test_put_bucket_policy_not_principal_rejected() {
 }
 
 #[test]
+fn test_put_bucket_policy_allows_raw_over_limit_when_normalized_under_limit() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        let mut statements = Vec::new();
+        let (pretty_policy, normalized_policy) = loop {
+            statements.push(json!({
+                "Sid": format!("Stmt{:04}", statements.len()),
+                "Effect": "Allow",
+                "Principal": fixed_nonpublic_principal(),
+                "Action": ["s3:GetObject"],
+                "Resource": [bucket_wildcard_resource(&bucket)],
+            }));
+
+            let policy_value = json!({
+                "Version": "2012-10-17",
+                "Statement": statements,
+            });
+            let pretty = serde_json::to_string_pretty(&policy_value).unwrap();
+            let normalized = auth::parse_bucket_policy(&pretty)
+                .unwrap()
+                .normalized_json();
+            if pretty.len() > 20 * 1024 && normalized.len() <= 20 * 1024 {
+                break (pretty, normalized);
+            }
+        };
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(pretty_policy)
+            .send()
+            .await
+            .unwrap();
+
+        let fetched = client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap()
+            .policy()
+            .unwrap()
+            .to_string();
+        assert_eq!(fetched, normalized_policy);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_put_bucket_policy_rejects_oversized_normalized_policy() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        let mut statements = Vec::new();
+        let normalized_policy = loop {
+            statements.push(json!({
+                "Sid": format!("Stmt{:04}", statements.len()),
+                "Effect": "Allow",
+                "Principal": fixed_nonpublic_principal(),
+                "Action": "s3:GetObject",
+                "Resource": format!("{}path-{:04}*", bucket_wildcard_resource(&bucket), statements.len()),
+            }));
+
+            let policy = serde_json::to_string(&json!({
+                "Version": "2012-10-17",
+                "Statement": statements,
+            }))
+            .unwrap();
+            let normalized = auth::parse_bucket_policy(&policy)
+                .unwrap()
+                .normalized_json();
+            if normalized.len() > 24 * 1024 {
+                break normalized;
+            }
+        };
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(normalized_policy)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), Some("MalformedPolicy"));
+        assert_eq!(
+            err.message(),
+            Some("Normalized policy document exceeds the maximum allowed size of 20480 bytes")
+        );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_returns_normalized_json() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let resource = bucket_resource(&bucket);
+        let policy = format!(
+            "{{\n  \"Statement\": {{\n    \"Resource\": [\"{resource}\"],\n    \"Action\": [\"s3:ListBucket\"],\n    \"Principal\": {principal},\n    \"Effect\": \"Allow\",\n    \"Sid\": \"One\"\n  }},\n  \"Version\": \"2012-10-17\"\n}}",
+            principal = fixed_nonpublic_principal()
+        );
+        let expected = format!(
+            "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Sid\":\"One\",\"Effect\":\"Allow\",\"Principal\":{principal},\"Action\":\"s3:ListBucket\",\"Resource\":\"{resource}\"}}]}}",
+            principal = fixed_nonpublic_principal()
+        );
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let fetched = client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap()
+            .policy()
+            .unwrap()
+            .to_string();
+        assert_eq!(fetched, expected);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_list_objects_v1() {
     s3_tests::run(async {
         let principal = alt_policy_principal();

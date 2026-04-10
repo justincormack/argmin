@@ -1982,6 +1982,15 @@ impl Coordinator {
             .map_err(|e| ServerError::MalformedPolicy {
                 reason: e.reason().to_string(),
             })?;
+        let normalized_policy = parsed_policy.normalized_json();
+        if normalized_policy.len() > auth::bucket_policy::MAX_BUCKET_POLICY_BYTES {
+            return Err(ServerError::MalformedPolicy {
+                reason: format!(
+                    "Normalized policy document exceeds the maximum allowed size of {} bytes",
+                    auth::bucket_policy::MAX_BUCKET_POLICY_BYTES
+                ),
+            });
+        }
         let policy_is_public = parsed_policy.is_public();
         if Self::blocks_public_policy(bucket_info.public_access_block.as_deref())
             && policy_is_public
@@ -1990,7 +1999,7 @@ impl Coordinator {
         }
         Ok(AuthorizedPutBucketPolicy {
             bucket: req.bucket.name.to_string(),
-            body: req.config.to_string(),
+            body: normalized_policy,
             parsed_policy: Arc::new(parsed_policy),
             policy_is_public,
         })
