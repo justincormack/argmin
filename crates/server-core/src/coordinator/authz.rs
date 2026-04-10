@@ -51,6 +51,11 @@ struct ObjectStateLoadRequest<'a> {
     missing_discovery: MissingObjectDiscovery,
 }
 
+enum ObjectPolicyTarget<'a> {
+    Existing(&'a StoredObject),
+    MissingKey(&'a str),
+}
+
 impl Coordinator {
     pub(super) fn requester_can_bucket_admin(requester: &Requester, owner_principal: &str) -> bool {
         requester.principal_opt() == Some(owner_principal)
@@ -745,6 +750,29 @@ impl Coordinator {
         ))
     }
 
+    fn object_policy_decision(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        target: ObjectPolicyTarget<'_>,
+        action: auth::PolicyAction,
+        policy_context: PutObjectPolicyContext<'_>,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<auth::PolicyEvaluation, ServerError> {
+        match target {
+            ObjectPolicyTarget::Existing(object) => Self::bucket_policy_decision_for_object(
+                requester,
+                bucket,
+                object,
+                action,
+                policy_context,
+                policy,
+            ),
+            ObjectPolicyTarget::MissingKey(key) => Ok(Self::bucket_policy_decision_for_key(
+                requester, bucket, key, action, policy,
+            )),
+        }
+    }
+
     pub(super) fn requester_can_read_object_with_bucket_policy(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -808,17 +836,17 @@ impl Coordinator {
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
-        let decision = match object {
-            Some(object) => Self::bucket_policy_decision_for_object(
-                requester,
-                bucket,
-                object,
-                action,
-                PutObjectPolicyContext::default(),
-                policy,
-            )?,
-            None => Self::bucket_policy_decision_for_key(requester, bucket, key, action, policy),
-        };
+        let decision = Self::object_policy_decision(
+            requester,
+            bucket,
+            match object {
+                Some(object) => ObjectPolicyTarget::Existing(object),
+                None => ObjectPolicyTarget::MissingKey(key),
+            },
+            action,
+            PutObjectPolicyContext::default(),
+            policy,
+        )?;
 
         Ok(Self::bucket_policy_allows_with_fallback(
             requester,
