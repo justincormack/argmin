@@ -2028,11 +2028,214 @@ pub enum PutObjectAclInput<'a> {
     Grants(AclGrants),
 }
 
+impl PutObjectAclInput<'_> {
+    pub const fn policy_condition_value(&self) -> Option<&'static str> {
+        match self {
+            Self::Canned(acl) => acl.policy_condition_value(),
+            Self::Grants(_) => None,
+        }
+    }
+}
+
 /// Request for a PutObjectAcl operation.
 #[derive(Debug)]
 pub struct PutObjectAclRequest<'a> {
     pub object: ObjectVersionRequest<'a>,
     pub acl: PutObjectAclInput<'a>,
+    pub policy_context: PutObjectPolicyContext<'a>,
+}
+
+impl<'a> PutObjectAclRequest<'a> {
+    fn authorization_policy_context(&self) -> Result<PutObjectPolicyContext<'a>, ServerError> {
+        let policy_context = self.policy_context;
+        if policy_context.copy_source.is_some()
+            || policy_context.metadata_directive.is_some()
+            || policy_context.managed_encryption.is_some()
+            || policy_context.sse_customer_algorithm.is_some()
+            || policy_context.request_object_tags_xml.is_some()
+        {
+            return Err(ServerError::InvalidArgument {
+                reason: "PutObjectAcl policy context contains unsupported fields".to_string(),
+            });
+        }
+
+        match &self.acl {
+            PutObjectAclInput::Canned(acl) => {
+                if policy_context.grant_read.is_some()
+                    || policy_context.grant_write.is_some()
+                    || policy_context.grant_read_acp.is_some()
+                    || policy_context.grant_write_acp.is_some()
+                    || policy_context.grant_full_control.is_some()
+                {
+                    return Err(ServerError::InvalidArgument {
+                        reason:
+                            "PutObjectAcl canned ACL policy context cannot include grant headers"
+                                .to_string(),
+                    });
+                }
+                let expected_canned_acl = acl.policy_condition_value();
+                if policy_context.canned_acl.is_some()
+                    && policy_context.canned_acl != expected_canned_acl
+                {
+                    return Err(ServerError::InvalidArgument {
+                        reason: "PutObjectAcl canned ACL policy context mismatch".to_string(),
+                    });
+                }
+                Ok(PutObjectPolicyContext::default().with_default_canned_acl(expected_canned_acl))
+            }
+            PutObjectAclInput::Grants(acl_grants) => {
+                if policy_context.canned_acl.is_some() {
+                    return Err(ServerError::InvalidArgument {
+                        reason: "PutObjectAcl grant policy context cannot include canned ACL"
+                            .to_string(),
+                    });
+                }
+                let header_grants =
+                    parse_put_object_acl_grants_from_policy_context(policy_context)?;
+                if let Some(header_grants) = header_grants {
+                    if &header_grants != acl_grants {
+                        return Err(ServerError::InvalidArgument {
+                            reason: "PutObjectAcl grant policy context mismatch".to_string(),
+                        });
+                    }
+                    Ok(PutObjectPolicyContext::default().with_acl_grant_headers(
+                        policy_context.grant_read,
+                        policy_context.grant_write,
+                        policy_context.grant_read_acp,
+                        policy_context.grant_write_acp,
+                        policy_context.grant_full_control,
+                    ))
+                } else {
+                    Ok(PutObjectPolicyContext::default())
+                }
+            }
+        }
+    }
+}
+
+fn parse_put_object_acl_grant_header_value(
+    value: &str,
+    permission: AclPermission,
+) -> Result<Vec<AclGrant>, ServerError> {
+    let mut grants = Vec::new();
+    let mut remaining = value.trim();
+    if remaining.is_empty() {
+        return Err(ServerError::InvalidArgument {
+            reason: "empty ACL grant header value".to_string(),
+        });
+    }
+
+    while !remaining.is_empty() {
+        let (grantee_kind, rest) =
+            remaining
+                .split_once('=')
+                .ok_or_else(|| ServerError::InvalidArgument {
+                    reason: format!("invalid ACL grant header entry: {remaining}"),
+                })?;
+        let grantee_kind = grantee_kind.trim();
+        let rest = rest.trim_start();
+        let quoted = rest
+            .strip_prefix('"')
+            .ok_or_else(|| ServerError::InvalidArgument {
+                reason: format!("invalid ACL grant header entry: {remaining}"),
+            })?;
+        let quote_end = quoted
+            .find('"')
+            .ok_or_else(|| ServerError::InvalidArgument {
+                reason: format!("invalid ACL grant header entry: {remaining}"),
+            })?;
+        let grantee_value = &quoted[..quote_end];
+        let next = &quoted[quote_end + 1..];
+        if grantee_value.is_empty() {
+            return Err(ServerError::InvalidArgument {
+                reason: format!("invalid ACL grant header entry: {remaining}"),
+            });
+        }
+        let grantee =
+            match grantee_kind {
+                "id" => AclGrantee::CanonicalUser(CanonicalUserId::new(grantee_value).ok_or_else(
+                    || ServerError::InvalidArgument {
+                        reason: "invalid canonical user ID in ACL grant header".to_string(),
+                    },
+                )?),
+                "uri" => AclGrantee::parse_group_uri(grantee_value).ok_or_else(|| {
+                    ServerError::InvalidArgument {
+                        reason: format!("unsupported ACL group URI: {grantee_value}"),
+                    }
+                })?,
+                other => {
+                    return Err(ServerError::InvalidArgument {
+                        reason: format!("unsupported ACL grant header grantee: {other}"),
+                    });
+                }
+            };
+        grants.push(AclGrant::new(grantee, permission));
+
+        remaining = next.trim_start();
+        if remaining.is_empty() {
+            break;
+        }
+        remaining = remaining
+            .strip_prefix(',')
+            .ok_or_else(|| ServerError::InvalidArgument {
+                reason: format!("invalid ACL grant header entry: {remaining}"),
+            })?;
+        remaining = remaining.trim_start();
+        if remaining.is_empty() {
+            return Err(ServerError::InvalidArgument {
+                reason: format!("invalid ACL grant header entry: {value}"),
+            });
+        }
+    }
+
+    Ok(grants)
+}
+
+fn extend_put_object_acl_grants_from_header(
+    grants: &mut Vec<AclGrant>,
+    value: Option<&str>,
+    permission: AclPermission,
+) -> Result<(), ServerError> {
+    if let Some(value) = value {
+        grants.extend(parse_put_object_acl_grant_header_value(value, permission)?);
+    }
+    Ok(())
+}
+
+fn parse_put_object_acl_grants_from_policy_context(
+    policy_context: PutObjectPolicyContext<'_>,
+) -> Result<Option<AclGrants>, ServerError> {
+    let mut grants = Vec::new();
+    extend_put_object_acl_grants_from_header(
+        &mut grants,
+        policy_context.grant_read,
+        AclPermission::Read,
+    )?;
+    extend_put_object_acl_grants_from_header(
+        &mut grants,
+        policy_context.grant_write,
+        AclPermission::Write,
+    )?;
+    extend_put_object_acl_grants_from_header(
+        &mut grants,
+        policy_context.grant_read_acp,
+        AclPermission::ReadAcp,
+    )?;
+    extend_put_object_acl_grants_from_header(
+        &mut grants,
+        policy_context.grant_write_acp,
+        AclPermission::WriteAcp,
+    )?;
+    extend_put_object_acl_grants_from_header(
+        &mut grants,
+        policy_context.grant_full_control,
+        AclPermission::FullControl,
+    )?;
+    if grants.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(AclGrants::new(grants)))
+    }
 }
 
 /// Request for a GetObject or HeadObject operation.
@@ -2885,9 +3088,12 @@ struct DeletedLiveObjectReclaim {
     kind: DeletedLiveObjectKind,
 }
 
-enum ObjectAclAuthorization {
+enum ObjectAclAuthorization<'a> {
     ReadWithPolicy(auth::PolicyAction),
-    WriteWithPolicy(auth::PolicyAction),
+    WriteWithPolicy {
+        action: auth::PolicyAction,
+        policy_context: PutObjectPolicyContext<'a>,
+    },
 }
 
 impl Drop for ReclaimSweeper {
@@ -7077,9 +7283,10 @@ impl Coordinator {
             req.object.bucket_name(),
             req.object.key(),
             req.object.version_id,
-            ObjectAclAuthorization::WriteWithPolicy(Self::put_object_acl_policy_action(
-                req.object.version_id,
-            )),
+            ObjectAclAuthorization::WriteWithPolicy {
+                action: Self::put_object_acl_policy_action(req.object.version_id),
+                policy_context: req.authorization_policy_context()?,
+            },
             req.object.expected_bucket_owner(),
         )?;
         if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
@@ -13988,6 +14195,7 @@ mod tests {
                 expected_bucket_owner,
             ),
             acl: PutObjectAclInput::Grants(acl_grants),
+            policy_context: PutObjectPolicyContext::default(),
         })
     }
 
@@ -14009,6 +14217,8 @@ mod tests {
                 expected_bucket_owner,
             ),
             acl: PutObjectAclInput::Canned(acl),
+            policy_context: PutObjectPolicyContext::default()
+                .with_default_canned_acl(acl.policy_condition_value()),
         })
     }
 
@@ -24845,6 +25055,198 @@ mod tests {
     }
 
     #[test]
+    fn put_object_acl_bucket_policy_deny_on_public_acl() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObjectAcl","Resource":"arn:aws:s3:::bucket/*"},{"Effect":"Deny","Principal":{"AWS":"other-user"},"Action":"s3:PutObjectAcl","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringLike":{"s3:x-amz-acl":"public*"}}}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        put_object_canned_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            PutObjectAcl::Private,
+            test_helpers::requester("other-user"),
+            None,
+        )
+        .unwrap();
+
+        let err = put_object_canned_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            PutObjectAcl::PublicRead,
+            test_helpers::requester("other-user"),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let acl = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        assert!(!grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::AllUsers,
+            AclPermission::Read,
+        ));
+    }
+
+    #[test]
+    fn put_object_acl_rejects_canned_acl_policy_context_mismatch() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObjectAcl","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        let err = coord
+            .put_object_acl(&PutObjectAclRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                acl: PutObjectAclInput::Canned(PutObjectAcl::Private),
+                policy_context: PutObjectPolicyContext::default()
+                    .with_default_canned_acl(PutObjectAcl::PublicRead.policy_condition_value()),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn put_object_acl_rejects_grant_policy_context_mismatch() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObjectAcl","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        let err = coord
+            .put_object_acl(&PutObjectAclRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                acl: PutObjectAclInput::Grants(AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::CanonicalUser(CanonicalUserId::from_principal("grantee-a")),
+                    AclPermission::Read,
+                )])),
+                policy_context: PutObjectPolicyContext::default().with_acl_grant_headers(
+                    Some(r#"id="different-grantee""#),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
+    }
+
+    #[test]
     fn put_object_version_acl_bucket_policy_allow_applies() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -24912,6 +25314,114 @@ mod tests {
         assert!(grants_contain(
             &acl.acl_grants,
             &AclGrantee::AllUsers,
+            AclPermission::Read,
+        ));
+    }
+
+    #[test]
+    fn put_object_version_acl_bucket_policy_grant_read_condition_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        let grantee_canonical_id = CanonicalUserId::from_principal("grantee-canonical");
+        let grant_read_header = format!("id=\"{grantee_canonical_id}\"");
+        let grant_read_header_json = format!(
+            "\"{}\"",
+            grant_read_header.replace('\\', "\\\\").replace('"', "\\\"")
+        );
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            &format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"other-user"}},"Action":"s3:PutObjectVersionAcl","Resource":"arn:aws:s3:::bucket/*","Condition":{{"StringEquals":{{"s3:x-amz-grant-read":{}}}}}}}]}}"#,
+                grant_read_header_json
+            ),
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        let err = put_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            AclGrants::new(vec![AclGrant::new(
+                AclGrantee::CanonicalUser(grantee_canonical_id.clone()),
+                AclPermission::Read,
+            )]),
+            test_helpers::requester("other-user"),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        coord
+            .put_object_acl(&PutObjectAclRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(put.version_id),
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                acl: PutObjectAclInput::Grants(AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::CanonicalUser(grantee_canonical_id.clone()),
+                    AclPermission::Read,
+                )])),
+                policy_context: PutObjectPolicyContext::default().with_acl_grant_headers(
+                    Some(&grant_read_header),
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            })
+            .unwrap();
+
+        let acl = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::CanonicalUser(grantee_canonical_id),
             AclPermission::Read,
         ));
     }

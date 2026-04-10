@@ -1854,6 +1854,17 @@ fn test_bucket_policy_put_bucket_encryption_cross_account_allow() {
 
         let bucket = unique_bucket();
         s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let initial = client
+            .get_bucket_encryption()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        let initial_rules = initial
+            .server_side_encryption_configuration()
+            .unwrap()
+            .rules();
+        let initial_blocked = blocked_encryption_types(&initial_rules[0]);
         client
             .put_bucket_policy()
             .bucket(&bucket)
@@ -1914,7 +1925,10 @@ fn test_bucket_policy_put_bucket_encryption_cross_account_allow() {
             .unwrap()
             .rules();
         let blocked = blocked_encryption_types(&rules[0]);
-        assert!(blocked.is_empty() || blocked == vec!["NONE".to_string()]);
+        assert_eq!(
+            blocked, initial_blocked,
+            "DeleteBucketEncryption should restore the bucket's prior default blocked types"
+        );
 
         cleanup(&bucket, &[]).await;
     });
@@ -2469,6 +2483,97 @@ fn test_bucket_policy_put_object_canned_acl_uses_put_object_permission() {
 }
 
 #[test]
+fn test_bucket_policy_put_object_acl_deny_on_public_acl() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        set_object_writer_ownership(&bucket).await;
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("owned-by-bucket")
+            .body(ByteStream::from_static(b"owned-by-bucket"))
+            .send()
+            .await
+            .unwrap();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal.clone(),
+                    "Action": "s3:PutObjectAcl",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": principal,
+                    "Action": "s3:PutObjectAcl",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                    "Condition": {
+                        "StringLike": {
+                            "s3:x-amz-acl": "public*"
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutObjectAcl private under bucket policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object_acl()
+                    .bucket(&bucket)
+                    .key("owned-by-bucket")
+                    .acl(ObjectCannedAcl::Private)
+                    .send()
+            },
+        )
+        .await;
+
+        let denied = alt_client
+            .put_object_acl()
+            .bucket(&bucket)
+            .key("owned-by-bucket")
+            .acl(ObjectCannedAcl::PublicRead)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let owner_view = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("owned-by-bucket")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            !has_grant(owner_view.grants(), Permission::Read, None),
+            "did not expect READ grant for AllUsers, got {:?}",
+            owner_view.grants()
+        );
+
+        cleanup(&bucket, &["owned-by-bucket"]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_object_version_acl_cross_account_allow() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
@@ -2593,6 +2698,132 @@ fn test_bucket_policy_put_object_version_acl_cross_account_allow() {
         assert_eq!(
             alt_get.body.collect().await.unwrap().into_bytes().as_ref(),
             b"versioned-body"
+        );
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("versioned")
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_version_acl_grant_read_condition_applies() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let put = client
+            .put_object()
+            .bucket(&bucket)
+            .key("versioned")
+            .body(ByteStream::from_static(b"versioned-body"))
+            .send()
+            .await
+            .unwrap();
+        let version_id = put
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+
+        let alt_id = client_canonical_id(alt_client).await;
+        let owner_id = client_canonical_id(client).await;
+        let grant_read_header = format!("id=\"{alt_id}\"");
+        let wrong_grant_read_header = format!("id=\"{owner_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:PutObjectVersionAcl",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-grant-read": grant_read_header.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = alt_client
+            .put_object_acl()
+            .bucket(&bucket)
+            .key("versioned")
+            .version_id(&version_id)
+            .customize()
+            .mutate_request({
+                let wrong_grant_read_header = wrong_grant_read_header.clone();
+                move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-read", wrong_grant_read_header.clone());
+                }
+            })
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        eventually_ok_with_retry(
+            "PutObjectVersionAcl with grant-read condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                let grant_read_header = grant_read_header.clone();
+                alt_client
+                    .put_object_acl()
+                    .bucket(&bucket)
+                    .key("versioned")
+                    .version_id(&version_id)
+                    .customize()
+                    .mutate_request(move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-read", grant_read_header.clone());
+                    })
+                    .send()
+            },
+        )
+        .await;
+
+        let owner_view = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("versioned")
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_grant(owner_view.grants(), Permission::Read, Some(&alt_id)),
+            "expected READ grant for alternate account on version, got {:?}",
+            owner_view.grants()
         );
 
         client

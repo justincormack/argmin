@@ -478,7 +478,7 @@ impl Coordinator {
         bucket: &BucketSummary,
         object: &StoredObject,
         action: auth::PolicyAction,
-        request_object_tags_xml: Option<&str>,
+        policy_context: PutObjectPolicyContext<'_>,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<auth::PolicyEvaluation, ServerError> {
         let Some(policy) = policy else {
@@ -495,7 +495,7 @@ impl Coordinator {
             .map(|(key, value)| auth::PolicyTag::new(key, value))
             .collect();
         let request_object_tags = if policy.requires_request_object_tags_for_action(action) {
-            match request_object_tags_xml {
+            match policy_context.request_object_tags_xml {
                 Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
                 None => Vec::new(),
             }
@@ -515,7 +515,21 @@ impl Coordinator {
         );
         let request = request
             .with_existing_object_tags(&existing_tags)
-            .with_request_object_tags(&request_object_tags);
+            .with_request_object_tags(&request_object_tags)
+            .with_copy_source(policy_context.copy_source)
+            .with_metadata_directive(policy_context.metadata_directive)
+            .with_canned_acl(policy_context.canned_acl)
+            .with_server_side_encryption(
+                policy_context
+                    .managed_encryption
+                    .map(ManagedEncryptionAlgorithm::as_str),
+            )
+            .with_sse_customer_algorithm(policy_context.sse_customer_algorithm)
+            .with_grant_read(policy_context.grant_read)
+            .with_grant_write(policy_context.grant_write)
+            .with_grant_read_acp(policy_context.grant_read_acp)
+            .with_grant_write_acp(policy_context.grant_write_acp)
+            .with_grant_full_control(policy_context.grant_full_control);
         Ok(policy.evaluate(&request))
     }
 
@@ -650,7 +664,12 @@ impl Coordinator {
     ) -> Result<bool, ServerError> {
         Ok(
             match Self::bucket_policy_decision_for_object(
-                requester, bucket, object, action, None, policy,
+                requester,
+                bucket,
+                object,
+                action,
+                PutObjectPolicyContext::default(),
+                policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,
                 auth::PolicyEvaluation::ExplicitAllow
@@ -681,7 +700,8 @@ impl Coordinator {
                 bucket,
                 object,
                 action,
-                request_object_tags_xml,
+                PutObjectPolicyContext::default()
+                    .with_request_object_tags_xml(request_object_tags_xml),
                 policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,
@@ -708,7 +728,12 @@ impl Coordinator {
     ) -> Result<bool, ServerError> {
         Ok(
             match Self::bucket_policy_decision_for_object(
-                requester, bucket, object, action, None, policy,
+                requester,
+                bucket,
+                object,
+                action,
+                PutObjectPolicyContext::default(),
+                policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,
                 auth::PolicyEvaluation::ExplicitAllow
@@ -735,7 +760,12 @@ impl Coordinator {
     ) -> Result<bool, ServerError> {
         let decision = match object {
             Some(object) => Self::bucket_policy_decision_for_object(
-                requester, bucket, object, action, None, policy,
+                requester,
+                bucket,
+                object,
+                action,
+                PutObjectPolicyContext::default(),
+                policy,
             )?,
             None => Self::bucket_policy_decision_for_key(requester, bucket, key, action, policy),
         };
@@ -769,7 +799,12 @@ impl Coordinator {
     ) -> Result<bool, ServerError> {
         Ok(
             match Self::bucket_policy_decision_for_object(
-                requester, bucket, object, action, None, policy,
+                requester,
+                bucket,
+                object,
+                action,
+                PutObjectPolicyContext::default(),
+                policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,
                 auth::PolicyEvaluation::ExplicitAllow
@@ -791,11 +826,17 @@ impl Coordinator {
         bucket: &BucketSummary,
         object: &StoredObject,
         action: auth::PolicyAction,
+        policy_context: PutObjectPolicyContext<'_>,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
         Ok(
             match Self::bucket_policy_decision_for_object(
-                requester, bucket, object, action, None, policy,
+                requester,
+                bucket,
+                object,
+                action,
+                policy_context,
+                policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,
                 auth::PolicyEvaluation::ExplicitAllow
@@ -1438,7 +1479,7 @@ impl Coordinator {
         bucket: &str,
         key: &str,
         version_id: Option<VersionId>,
-        authorization: ObjectAclAuthorization,
+        authorization: ObjectAclAuthorization<'_>,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(ValidatedBucket, LockedReadObject<'a>), ServerError> {
         let bucket_info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
@@ -1446,7 +1487,7 @@ impl Coordinator {
             Self::requester_can_discover_missing_object_acl(requester, &bucket_info);
         let bucket_policy = match authorization {
             ObjectAclAuthorization::ReadWithPolicy(_)
-            | ObjectAclAuthorization::WriteWithPolicy(_) => {
+            | ObjectAclAuthorization::WriteWithPolicy { .. } => {
                 self.cached_bucket_policy(&bucket_info)?
             }
         };
@@ -1460,15 +1501,17 @@ impl Coordinator {
             Err(other) => return Err(other),
         };
         let allowed = match authorization {
-            ObjectAclAuthorization::WriteWithPolicy(policy_action) => {
-                Self::requester_can_write_object_acl_with_bucket_policy(
-                    requester,
-                    &bucket_info,
-                    &locked.record,
-                    policy_action,
-                    bucket_policy.as_deref(),
-                )?
-            }
+            ObjectAclAuthorization::WriteWithPolicy {
+                action: policy_action,
+                policy_context,
+            } => Self::requester_can_write_object_acl_with_bucket_policy(
+                requester,
+                &bucket_info,
+                &locked.record,
+                policy_action,
+                policy_context,
+                bucket_policy.as_deref(),
+            )?,
             ObjectAclAuthorization::ReadWithPolicy(policy_action) => {
                 Self::requester_can_read_object_acl_with_bucket_policy(
                     requester,
@@ -1908,7 +1951,7 @@ impl Coordinator {
                 bucket,
                 object,
                 auth::PolicyAction::BypassGovernanceRetention,
-                None,
+                PutObjectPolicyContext::default(),
                 policy,
             )? {
                 auth::PolicyEvaluation::ExplicitDeny => false,

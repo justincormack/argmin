@@ -2009,6 +2009,8 @@ impl HttpFrontend {
                                 expected_bucket_owner,
                             ),
                             acl: crate::coordinator::PutObjectAclInput::Canned(acl),
+                            policy_context: crate::coordinator::PutObjectPolicyContext::default()
+                                .with_default_canned_acl(acl.policy_condition_value()),
                         })?
                 } else {
                     let acl_grants = parse_acl_grants(req)?;
@@ -2022,6 +2024,14 @@ impl HttpFrontend {
                                 expected_bucket_owner,
                             ),
                             acl: crate::coordinator::PutObjectAclInput::Grants(acl_grants),
+                            policy_context: crate::coordinator::PutObjectPolicyContext::default()
+                                .with_acl_grant_headers(
+                                    req.header("x-amz-grant-read"),
+                                    req.header("x-amz-grant-write"),
+                                    req.header("x-amz-grant-read-acp"),
+                                    req.header("x-amz-grant-write-acp"),
+                                    req.header("x-amz-grant-full-control"),
+                                ),
                         })?
                 };
                 Ok(S3Response::put_object_acl(result_version_id))
@@ -7647,6 +7657,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(resp.status_code, 200);
+    }
+
+    #[test]
+    fn put_object_acl_without_acl_payload_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+        let metadata = crate::metadata_blob::MetadataBlob::default();
+        let system_metadata = server_core::system_metadata::SystemMetadata::default();
+        fe.coordinator
+            .put_object(&crate::coordinator::PutObjectRequest {
+                object: test_object_request("mybucket", "mykey"),
+                data: b"hello",
+                metadata: &metadata,
+                system_metadata: &system_metadata,
+                tags: None,
+                cond: &crate::conditional::WriteCondition::default(),
+                acl: crate::coordinator::PutObjectAcl::None.into(),
+                policy_context: crate::coordinator::PutObjectPolicyContext::default(),
+                object_lock: Default::default(),
+                encryption: crate::coordinator::WriteEncryptionRequest::none(),
+            })
+            .unwrap();
+
+        let req = new_req(http::Method::PUT, "", "", vec![], vec![]);
+        match fe.dispatch_routed(
+            &req,
+            &test_auth(),
+            S3Operation::PutObjectAcl {
+                bucket: "mybucket".to_string(),
+                key: "mykey".to_string(),
+            },
+        ) {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert_eq!(reason, "missing ACL XML body");
+            }
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected InvalidArgument, got Ok"),
+        }
     }
 
     #[test]
