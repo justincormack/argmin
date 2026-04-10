@@ -2212,6 +2212,59 @@ impl Coordinator {
         })
     }
 
+    pub(super) fn authorize_put_bucket_versioning(
+        &self,
+        req: &PutBucketVersioningRequest<'_>,
+    ) -> Result<AuthorizedPutBucketVersioning, ServerError> {
+        let bucket_info = self.authorize_bucket_admin_for(&req.bucket)?;
+        if bucket_info.object_lock.enabled && req.state != BucketVersioningState::Enabled {
+            return Err(ServerError::InvalidBucketState);
+        }
+        Ok(AuthorizedPutBucketVersioning {
+            bucket: req.bucket.name.to_string(),
+            state: req.state,
+        })
+    }
+
+    pub(super) fn authorize_get_bucket_versioning(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketVersioning, ServerError> {
+        let info = self.authorize_bucket_read_for(req)?;
+        Ok(AuthorizedGetBucketVersioning {
+            state: info.versioning,
+        })
+    }
+
+    pub(super) fn authorize_put_bucket_object_lock_configuration(
+        &self,
+        req: &PutBucketObjectLockConfigurationRequest<'_>,
+    ) -> Result<AuthorizedPutBucketObjectLockConfiguration, ServerError> {
+        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutBucketObjectLockConfiguration,
+        )?;
+        if bucket_info.versioning != BucketVersioningState::Enabled {
+            return Err(ServerError::InvalidBucketState);
+        }
+
+        let final_enabled =
+            bucket_info.object_lock.enabled || req.config.object_lock_enabled.is_some();
+        if !final_enabled {
+            return Err(ServerError::InvalidRequest {
+                reason: "Object Lock must be enabled before configuring this bucket".to_string(),
+            });
+        }
+
+        Ok(AuthorizedPutBucketObjectLockConfiguration {
+            bucket: req.bucket.name.to_string(),
+            config: BucketObjectLockConfig {
+                enabled: true,
+                default_retention: req.config.default_retention,
+            },
+        })
+    }
+
     pub(super) fn authorize_get_bucket_encryption(
         &self,
         req: &BucketRequest<'_>,
@@ -2489,5 +2542,94 @@ impl Coordinator {
         } else {
             Err(ServerError::AccessDenied)
         }
+    }
+
+    pub(super) fn authorize_get_object<'a>(
+        &'a self,
+        req: &GetObjectRequest<'_>,
+    ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
+        let locked = self.lock_object_for_authorized_read_with_policy(
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key(),
+            req.object.version_id,
+            Self::get_object_policy_action(req.object.version_id),
+            req.expected_bucket_owner(),
+        )?;
+        Ok(AuthorizedObjectRead { locked })
+    }
+
+    pub(super) fn authorize_get_object_part<'a>(
+        &'a self,
+        req: &GetObjectPartRequest<'_>,
+    ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
+        let locked = self.lock_object_for_authorized_read_with_policy(
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key(),
+            req.object.version_id,
+            Self::get_object_policy_action(req.object.version_id),
+            req.expected_bucket_owner(),
+        )?;
+        Ok(AuthorizedObjectRead { locked })
+    }
+
+    pub(super) fn authorize_head_object_part<'a>(
+        &'a self,
+        req: &GetObjectPartRequest<'_>,
+    ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
+        let locked = self.lock_object_for_authorized_read_with_policy(
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key(),
+            req.object.version_id,
+            Self::get_object_policy_action(req.object.version_id),
+            req.expected_bucket_owner(),
+        )?;
+        Ok(AuthorizedObjectRead { locked })
+    }
+
+    pub(super) fn authorize_head_object<'a>(
+        &'a self,
+        req: &GetObjectRequest<'_>,
+    ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
+        let locked = self.lock_object_for_authorized_read_with_policy(
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key(),
+            req.object.version_id,
+            Self::get_object_policy_action(req.object.version_id),
+            req.expected_bucket_owner(),
+        )?;
+        Ok(AuthorizedObjectRead { locked })
+    }
+
+    pub(super) fn authorize_get_object_attributes<'a>(
+        &'a self,
+        req: &GetObjectAttributesRequest<'_>,
+    ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
+        let locked = self.lock_object_for_authorized_read_with_policy(
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key(),
+            req.object.version_id,
+            Self::get_object_policy_action(req.object.version_id),
+            req.expected_bucket_owner(),
+        )?;
+        Ok(AuthorizedObjectRead { locked })
+    }
+
+    pub(super) fn authorize_get_object_range<'a>(
+        &'a self,
+        req: &GetObjectRangeRequest<'_>,
+    ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
+        let locked = self.lock_object_for_authorized_read(
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key(),
+            req.object.version_id,
+            req.expected_bucket_owner(),
+        )?;
+        Ok(AuthorizedObjectRead { locked })
     }
 }

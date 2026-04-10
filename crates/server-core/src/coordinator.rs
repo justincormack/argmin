@@ -242,6 +242,23 @@ struct AuthorizedPutBucketEncryption {
 }
 
 #[derive(Debug)]
+struct AuthorizedPutBucketVersioning {
+    bucket: String,
+    state: BucketVersioningState,
+}
+
+#[derive(Debug)]
+struct AuthorizedGetBucketVersioning {
+    state: BucketVersioningState,
+}
+
+#[derive(Debug)]
+struct AuthorizedPutBucketObjectLockConfiguration {
+    bucket: String,
+    config: BucketObjectLockConfig,
+}
+
+#[derive(Debug)]
 struct AuthorizedGetBucketEncryption {
     config: EffectiveBucketEncryptionConfig,
 }
@@ -319,6 +336,10 @@ struct AuthorizedGetObjectAcl {
     result: GetObjectAclResult,
 }
 
+struct AuthorizedObjectRead<'a> {
+    locked: LockedReadObject<'a>,
+}
+
 impl std::fmt::Debug for AuthorizedObjectTagsAccess<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedObjectTagsAccess")
@@ -359,6 +380,13 @@ impl std::fmt::Debug for AuthorizedPutObjectAclUpdate<'_> {
             .field("version_id", &self.version_id)
             .field("acl_grants", &self.acl_grants)
             .field("public_read", &self.public_read)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for AuthorizedObjectRead<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizedObjectRead")
             .finish_non_exhaustive()
     }
 }
@@ -6033,13 +6061,10 @@ impl Coordinator {
             req.bucket.name,
             req.state
         );
-        let bucket_info = self.authorize_bucket_admin_for(&req.bucket)?;
-        if bucket_info.object_lock.enabled && req.state != BucketVersioningState::Enabled {
-            return Err(ServerError::InvalidBucketState);
-        }
-        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
+        let authorized = self.authorize_put_bucket_versioning(req)?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
         bucket_pg
-            .put_bucket_versioning(req.bucket.name, req.state)
+            .put_bucket_versioning(&authorized.bucket, authorized.state)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -6052,8 +6077,8 @@ impl Coordinator {
                 other => ServerError::Metadata(other),
             })?;
         self.storage_node
-            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
-                info.versioning = req.state
+            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
+                info.versioning = authorized.state
             });
         Ok(())
     }
@@ -6068,8 +6093,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let info = self.authorize_bucket_read_for(req)?;
-        Ok(info.versioning)
+        let authorized = self.authorize_get_bucket_versioning(req)?;
+        Ok(authorized.state)
     }
 
     pub fn put_bucket_object_lock_configuration(
@@ -6084,29 +6109,10 @@ impl Coordinator {
             req.config.object_lock_enabled.unwrap_or(false),
             req.config.default_retention.is_some()
         );
-        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            &req.bucket,
-            auth::PolicyAction::PutBucketObjectLockConfiguration,
-        )?;
-        if bucket_info.versioning != BucketVersioningState::Enabled {
-            return Err(ServerError::InvalidBucketState);
-        }
-
-        let final_enabled =
-            bucket_info.object_lock.enabled || req.config.object_lock_enabled.is_some();
-        if !final_enabled {
-            return Err(ServerError::InvalidRequest {
-                reason: "Object Lock must be enabled before configuring this bucket".to_string(),
-            });
-        }
-
-        let final_config = BucketObjectLockConfig {
-            enabled: true,
-            default_retention: req.config.default_retention,
-        };
-        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
+        let authorized = self.authorize_put_bucket_object_lock_configuration(req)?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
         bucket_pg
-            .put_bucket_object_lock(req.bucket.name, final_config)
+            .put_bucket_object_lock(&authorized.bucket, authorized.config)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -6114,8 +6120,8 @@ impl Coordinator {
                 other => ServerError::Metadata(other),
             })?;
         self.storage_node
-            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
-                info.object_lock = final_config
+            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
+                info.object_lock = authorized.config
             });
         Ok(())
     }
@@ -9971,18 +9977,13 @@ impl Coordinator {
         let key = req.object.key();
         let version_id = req.object.version_id;
         let cond = req.cond;
-        let requester = req.object.requester();
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.lock_object_for_authorized_read_with_policy(
-            requester,
-            bucket,
-            key,
-            version_id,
-            Self::get_object_policy_action(version_id),
-            req.expected_bucket_owner(),
-        )?;
+        let AuthorizedObjectRead {
+            locked:
+                LockedReadObject {
+                    record: stored,
+                    pgs,
+                },
+        } = self.authorize_get_object(req)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -10156,18 +10157,13 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
-        let requester = req.object.requester();
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.lock_object_for_authorized_read_with_policy(
-            requester,
-            bucket,
-            key,
-            version_id,
-            Self::get_object_policy_action(version_id),
-            req.expected_bucket_owner(),
-        )?;
+        let AuthorizedObjectRead {
+            locked:
+                LockedReadObject {
+                    record: stored,
+                    pgs,
+                },
+        } = self.authorize_get_object_part(req)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -10380,18 +10376,13 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
-        let requester = req.object.requester();
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.lock_object_for_authorized_read_with_policy(
-            requester,
-            bucket,
-            key,
-            version_id,
-            Self::get_object_policy_action(version_id),
-            req.expected_bucket_owner(),
-        )?;
+        let AuthorizedObjectRead {
+            locked:
+                LockedReadObject {
+                    record: stored,
+                    pgs,
+                },
+        } = self.authorize_head_object_part(req)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -10549,18 +10540,13 @@ impl Coordinator {
         let key = req.object.key();
         let version_id = req.object.version_id;
         let cond = req.cond;
-        let requester = req.object.requester();
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.lock_object_for_authorized_read_with_policy(
-            requester,
-            bucket,
-            key,
-            version_id,
-            Self::get_object_policy_action(version_id),
-            req.expected_bucket_owner(),
-        )?;
+        let AuthorizedObjectRead {
+            locked:
+                LockedReadObject {
+                    record: stored,
+                    pgs,
+                },
+        } = self.authorize_head_object(req)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -10639,23 +10625,17 @@ impl Coordinator {
         );
         let bucket = req.object.bucket_name();
         let key = req.object.key();
-        let version_id = req.object.version_id;
         let cond = req.cond;
         let want_parts = req.want_parts;
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
-        let requester = req.object.requester();
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.lock_object_for_authorized_read_with_policy(
-            requester,
-            bucket,
-            key,
-            version_id,
-            Self::get_object_policy_action(version_id),
-            req.expected_bucket_owner(),
-        )?;
+        let AuthorizedObjectRead {
+            locked:
+                LockedReadObject {
+                    record: stored,
+                    pgs,
+                },
+        } = self.authorize_get_object_attributes(req)?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -10784,17 +10764,13 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let range = req.range;
         let cond = req.cond;
-        let requester = req.object.requester();
-        let LockedReadObject {
-            record: stored,
-            pgs,
-        } = self.lock_object_for_authorized_read(
-            requester,
-            bucket,
-            key,
-            version_id,
-            req.expected_bucket_owner(),
-        )?;
+        let AuthorizedObjectRead {
+            locked:
+                LockedReadObject {
+                    record: stored,
+                    pgs,
+                },
+        } = self.authorize_get_object_range(req)?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -23942,6 +23918,58 @@ mod tests {
     }
 
     #[test]
+    fn authorize_get_object_bucket_policy_existing_tag_controls_access() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(&coord,
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+                test_helpers::requester("owner-a"), None)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "publictag",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"public",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(
+                    "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+                ),
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let authorized = coord
+            .authorize_get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "publictag",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert!(matches!(authorized.locked.record, StoredObject::Live(_)));
+    }
+
+    #[test]
     fn put_object_tagging_bucket_policy_uses_current_existing_tags() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -26525,6 +26553,53 @@ mod tests {
 
         let err = coord
             .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn authorize_get_object_range_rejects_private_read_for_non_owner() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"secret",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let err = coord
+            .authorize_get_object_range(&GetObjectRangeRequest {
+                range: ByteRange::Range { start: 0, end: 0 },
                 sse_customer: None,
                 object: object_version_request_with_expected_owner(
                     "bucket",
@@ -30240,6 +30315,57 @@ mod tests {
     }
 
     #[test]
+    fn authorize_put_bucket_versioning_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .authorize_put_bucket_versioning(&PutBucketVersioningRequest {
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                state: BucketVersioningState::Enabled,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn authorize_put_bucket_versioning_rejects_suspend_on_object_lock_bucket() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
+            .unwrap();
+
+        let err = coord
+            .authorize_put_bucket_versioning(&PutBucketVersioningRequest {
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                state: BucketVersioningState::Suspended,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidBucketState));
+    }
+
+    #[test]
     fn put_bucket_object_lock_requires_enabled_versioning() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -30467,6 +30593,59 @@ mod tests {
                 None
             )
             .unwrap(),
+            BucketObjectLockConfig {
+                enabled: true,
+                default_retention: update.default_retention,
+            }
+        );
+    }
+
+    #[test]
+    fn authorize_put_bucket_object_lock_configuration_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::from_principal("owner-a");
+        let update = BucketObjectLockConfigurationUpdate {
+            object_lock_enabled: Some(true),
+            default_retention: Some(ObjectLockDefaultRetention {
+                mode: s3_types::ObjectLockMode::Governance,
+                period: s3_types::RetentionPeriod::days(1).unwrap(),
+            }),
+        };
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(owner),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutBucketObjectLockConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+
+        let authorized = coord
+            .authorize_put_bucket_object_lock_configuration(
+                &PutBucketObjectLockConfigurationRequest {
+                    bucket: bucket_request_with_expected_owner(
+                        "bucket",
+                        test_helpers::requester("other-user"),
+                        None,
+                    ),
+                    config: update,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            authorized.config,
             BucketObjectLockConfig {
                 enabled: true,
                 default_retention: update.default_retention,
