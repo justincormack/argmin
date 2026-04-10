@@ -21,6 +21,15 @@ fn require_https_endpoint() {
     );
 }
 
+async fn setup_sse_c_bucket() -> String {
+    let client = CTX.client();
+    let bucket = unique_bucket();
+    s3_tests::create_bucket_with_sse_c_enabled(client, &bucket)
+        .await
+        .unwrap();
+    bucket
+}
+
 macro_rules! with_sse_c_headers {
     ($op:expr, $key_b64:expr, $key_md5_b64:expr) => {{
         $op.customize().mutate_request({
@@ -269,8 +278,7 @@ fn test_get_sse_c_encrypted_object_attributes() {
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = setup_sse_c_bucket().await;
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -314,8 +322,7 @@ fn test_get_sse_c_object_attributes_requires_headers() {
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = setup_sse_c_bucket().await;
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -353,8 +360,7 @@ fn test_get_sse_c_object_attributes_rejects_wrong_key() {
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = setup_sse_c_bucket().await;
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -398,8 +404,7 @@ fn test_get_sse_c_checksum_object_attributes() {
     require_https_endpoint();
     s3_tests::run(async {
         let client = CTX.client();
-        let bucket = unique_bucket();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        let bucket = setup_sse_c_bucket().await;
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);

@@ -169,6 +169,30 @@ async fn assert_get_object_expiration_header_eventually(bucket: &str, key: &str,
     }
 }
 
+async fn assert_lifecycle_deleted_eventually(bucket: &str) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .client()
+            .get_bucket_lifecycle_configuration()
+            .bucket(bucket)
+            .send()
+            .await;
+        if result.is_err() && err_status(&result) == 404 {
+            s3_tests::assert_s3_err_code(&result, "NoSuchLifecycleConfiguration");
+            return;
+        }
+        if attempt + 1 == MAX_ATTEMPTS {
+            panic!(
+                "GetBucketLifecycleConfiguration did not converge to NoSuchLifecycleConfiguration for {bucket}: {:?}",
+                result
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
 fn sha256_hex(data: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, data);
     digest
@@ -714,13 +738,7 @@ fn test_delete_bucket_lifecycle_is_idempotent() {
             .await
             .unwrap();
 
-        let get_deleted = client
-            .get_bucket_lifecycle_configuration()
-            .bucket(&bucket)
-            .send()
-            .await;
-        assert_eq!(err_status(&get_deleted), 404);
-        s3_tests::assert_s3_err_code(&get_deleted, "NoSuchLifecycleConfiguration");
+        assert_lifecycle_deleted_eventually(&bucket).await;
 
         cleanup_bucket(&bucket).await;
     });
@@ -841,13 +859,7 @@ fn test_bucket_lifecycle_crud_round_trip() {
             .await
             .unwrap();
 
-        let get_deleted = client
-            .get_bucket_lifecycle_configuration()
-            .bucket(&bucket)
-            .send()
-            .await;
-        assert_eq!(err_status(&get_deleted), 404);
-        s3_tests::assert_s3_err_code(&get_deleted, "NoSuchLifecycleConfiguration");
+        assert_lifecycle_deleted_eventually(&bucket).await;
 
         cleanup_bucket(&bucket).await;
     });

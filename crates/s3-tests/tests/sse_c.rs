@@ -311,7 +311,9 @@ fn patterned_bytes(len: usize, seed: u8) -> Vec<u8> {
 
 async fn setup_sse_c_object(bucket: &str, key: &str, body: Vec<u8>) -> (String, String, Vec<u8>) {
     let client = CTX.client();
-    s3_tests::create_bucket(client, bucket).await.unwrap();
+    s3_tests::create_bucket_with_sse_c_enabled(client, bucket)
+        .await
+        .unwrap();
 
     let customer_key = test_sse_c_key();
     let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);

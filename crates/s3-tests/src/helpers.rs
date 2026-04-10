@@ -89,6 +89,7 @@ pub async fn disable_bucket_public_access_block(client: &Client, bucket: &str) {
         .send()
         .await
         .expect("disable bucket public access block");
+    wait_for_bucket_public_access_block_disabled(client, bucket).await;
 }
 
 fn timestamp_millis() -> u64 {
@@ -108,6 +109,30 @@ async fn create_test_bucket(client: &Client, bucket: &str) {
         );
     }
     request.send().await.expect("create bucket");
+}
+
+async fn wait_for_bucket_public_access_block_disabled(client: &Client, bucket: &str) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = client.get_public_access_block().bucket(bucket).send().await;
+        if let Ok(resp) = result {
+            if let Some(config) = resp.public_access_block_configuration() {
+                if config.block_public_acls() == Some(false)
+                    && config.ignore_public_acls() == Some(false)
+                    && config.block_public_policy() == Some(false)
+                    && config.restrict_public_buckets() == Some(false)
+                {
+                    return;
+                }
+            }
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!("bucket public access block disablement did not converge for {bucket}");
+    }
 }
 
 fn sse_c_enabled_bucket_encryption() -> ServerSideEncryptionConfiguration {
@@ -130,6 +155,41 @@ fn sse_c_enabled_bucket_encryption() -> ServerSideEncryptionConfiguration {
         .unwrap()
 }
 
+fn bucket_encryption_blocks_sse_c(config: &ServerSideEncryptionConfiguration) -> Option<bool> {
+    let rule = config.rules().first()?;
+    let blocked = rule
+        .blocked_encryption_types()
+        .map(|types| {
+            types
+                .encryption_type()
+                .iter()
+                .map(|value| value.as_str())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(blocked.contains(&"SSE-C"))
+}
+
+async fn wait_for_bucket_sse_c_enabled(client: &Client, bucket: &str) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = client.get_bucket_encryption().bucket(bucket).send().await;
+        if let Ok(resp) = result {
+            if let Some(config) = resp.server_side_encryption_configuration() {
+                if bucket_encryption_blocks_sse_c(config) == Some(false) {
+                    return;
+                }
+            }
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!("bucket SSE-C enablement did not converge for {bucket}");
+    }
+}
+
 /// Explicitly allow SSE-C on a bucket.
 ///
 /// AWS announced on April 6, 2026 that new buckets in rolled-out Regions may
@@ -144,6 +204,7 @@ pub async fn enable_bucket_sse_c(client: &Client, bucket: &str) {
         .send()
         .await
         .expect("enable bucket SSE-C");
+    wait_for_bucket_sse_c_enabled(client, bucket).await;
 }
 
 /// Create a bucket and explicitly allow SSE-C on it.
@@ -151,21 +212,8 @@ pub async fn create_bucket_with_sse_c_enabled(
     client: &Client,
     bucket: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut request = client.create_bucket().bucket(bucket);
-    if CTX.region() != "us-east-1" {
-        request = request.create_bucket_configuration(
-            CreateBucketConfiguration::builder()
-                .location_constraint(BucketLocationConstraint::from(CTX.region()))
-                .build(),
-        );
-    }
-    request.send().await?;
-    client
-        .put_bucket_encryption()
-        .bucket(bucket)
-        .server_side_encryption_configuration(sse_c_enabled_bucket_encryption())
-        .send()
-        .await?;
+    create_test_bucket(client, bucket).await;
+    enable_bucket_sse_c(client, bucket).await;
     Ok(())
 }
 

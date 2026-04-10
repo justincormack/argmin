@@ -85,6 +85,13 @@ async fn setup_acl_enabled_bucket() -> String {
         .send()
         .await
         .unwrap();
+    client
+        .get_bucket_ownership_controls()
+        .bucket(&bucket)
+        .send()
+        .await
+        .unwrap();
+    wait_for_bucket_ownership_controls(&bucket, ObjectOwnership::ObjectWriter).await;
     bucket
 }
 
@@ -118,7 +125,7 @@ async fn object_owner_id(bucket: &str, key: &str) -> String {
 }
 
 async fn alt_get_object_access_denied_eventually(bucket: &str, key: &str) {
-    const MAX_ATTEMPTS: usize = 20;
+    const MAX_ATTEMPTS: usize = 60;
 
     for attempt in 0..MAX_ATTEMPTS {
         let result = CTX
@@ -135,7 +142,7 @@ async fn alt_get_object_access_denied_eventually(bucket: &str, key: &str) {
             return;
         }
         if attempt + 1 < MAX_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         }
         panic!(
@@ -148,7 +155,7 @@ async fn alt_get_object_access_denied_eventually(bucket: &str, key: &str) {
 }
 
 async fn alt_list_bucket_access_denied_eventually(bucket: &str) {
-    const MAX_ATTEMPTS: usize = 20;
+    const MAX_ATTEMPTS: usize = 60;
 
     for attempt in 0..MAX_ATTEMPTS {
         let result = CTX
@@ -164,7 +171,7 @@ async fn alt_list_bucket_access_denied_eventually(bucket: &str) {
             return;
         }
         if attempt + 1 < MAX_ATTEMPTS {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             continue;
         }
         panic!(
@@ -174,6 +181,62 @@ async fn alt_list_bucket_access_denied_eventually(bucket: &str) {
     }
 
     unreachable!()
+}
+
+async fn wait_for_ignore_public_acls(bucket: &str, expected: bool) {
+    const MAX_ATTEMPTS: usize = 60;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .client()
+            .get_public_access_block()
+            .bucket(bucket)
+            .send()
+            .await;
+        if let Ok(resp) = result {
+            if resp
+                .public_access_block_configuration()
+                .and_then(|config| config.ignore_public_acls())
+                == Some(expected)
+            {
+                return;
+            }
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            continue;
+        }
+        panic!("IgnorePublicAcls={expected} did not converge for {bucket}");
+    }
+}
+
+async fn wait_for_bucket_ownership_controls(bucket: &str, expected: ObjectOwnership) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .client()
+            .get_bucket_ownership_controls()
+            .bucket(bucket)
+            .send()
+            .await;
+        if let Ok(resp) = result {
+            if resp.ownership_controls().map(|controls| {
+                controls
+                    .rules()
+                    .iter()
+                    .any(|rule| rule.object_ownership() == &expected)
+            }) == Some(true)
+            {
+                return;
+            }
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!("ObjectOwnership={expected:?} did not converge for {bucket}");
+    }
 }
 
 fn authenticated_users_group_grant(permission: Permission) -> Grant {
@@ -535,6 +598,7 @@ fn test_ignore_public_acls() {
             .send()
             .await
             .unwrap();
+        wait_for_ignore_public_acls(&bucket, true).await;
 
         // Re-apply public-read ACL (matching Ceph test: ACL still set, but ignored)
         client
@@ -628,6 +692,7 @@ fn test_ignore_public_acls_disables_authenticated_read_object_acl() {
             .send()
             .await
             .unwrap();
+        wait_for_ignore_public_acls(&bucket, true).await;
 
         alt_get_object_access_denied_eventually(&bucket, "key1").await;
 
@@ -689,6 +754,7 @@ fn test_ignore_public_acls_disables_authenticated_read_bucket_acl() {
             .send()
             .await
             .unwrap();
+        wait_for_ignore_public_acls(&bucket, true).await;
 
         alt_list_bucket_access_denied_eventually(&bucket).await;
 
@@ -748,6 +814,7 @@ fn test_ignore_public_acls_disables_authenticated_read_put_object_acl() {
             .send()
             .await
             .unwrap();
+        wait_for_ignore_public_acls(&bucket, true).await;
 
         alt_get_object_access_denied_eventually(&bucket, "key1").await;
 
