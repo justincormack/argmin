@@ -200,6 +200,25 @@ pub struct AuthorizedPutObjectWrite {
     write_encryption: ActiveWriteEncryption,
 }
 
+#[derive(Debug)]
+struct AuthorizedBucketSubresourcePut {
+    bucket: String,
+    kind: storage::BucketSubresourceKind,
+    body: String,
+}
+
+#[derive(Debug)]
+struct AuthorizedBucketSubresourceGet {
+    bucket: String,
+    kind: storage::BucketSubresourceKind,
+}
+
+#[derive(Debug)]
+struct AuthorizedBucketSubresourceDelete {
+    bucket: String,
+    kind: storage::BucketSubresourceKind,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthorizedPutObjectAcl {
     None,
@@ -5907,11 +5926,8 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        self.put_opaque_bucket_subresource(
-            req,
-            auth::PolicyAction::PutBucketCors,
-            storage::BucketSubresourceKind::Cors,
-        )
+        let authorized = self.authorize_put_bucket_cors(req)?;
+        self.store_authorized_bucket_subresource(&authorized)
     }
 
     pub fn get_bucket_cors(&self, req: &BucketRequest<'_>) -> Result<Option<String>, ServerError> {
@@ -5921,11 +5937,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        self.get_opaque_bucket_subresource(
-            req,
-            auth::PolicyAction::GetBucketCors,
-            storage::BucketSubresourceKind::Cors,
-        )
+        let authorized = self.authorize_get_bucket_cors(req)?;
+        self.load_authorized_bucket_subresource(&authorized)
     }
 
     /// Loads the raw bucket CORS configuration for HTTP CORS evaluation.
@@ -5941,7 +5954,8 @@ impl Coordinator {
             "bucket={:?}",
             name
         );
-        self.load_opaque_bucket_subresource(name, storage::BucketSubresourceKind::Cors)
+        let authorized = self.authorize_load_bucket_cors_config(name);
+        self.load_authorized_bucket_subresource(&authorized)
     }
 
     pub fn delete_bucket_cors(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
@@ -5951,11 +5965,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        self.delete_opaque_bucket_subresource(
-            req,
-            auth::PolicyAction::PutBucketCors,
-            storage::BucketSubresourceKind::Cors,
-        )
+        let authorized = self.authorize_delete_bucket_cors(req)?;
+        self.remove_authorized_bucket_subresource(&authorized)
     }
 
     pub fn put_bucket_tags(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
@@ -5966,11 +5977,8 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        self.put_opaque_bucket_subresource(
-            req,
-            auth::PolicyAction::PutBucketTagging,
-            storage::BucketSubresourceKind::Tagging,
-        )
+        let authorized = self.authorize_put_bucket_tagging(req)?;
+        self.store_authorized_bucket_subresource(&authorized)
     }
 
     pub fn get_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<Option<String>, ServerError> {
@@ -5980,11 +5988,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        self.get_opaque_bucket_subresource(
-            req,
-            auth::PolicyAction::GetBucketTagging,
-            storage::BucketSubresourceKind::Tagging,
-        )
+        let authorized = self.authorize_get_bucket_tagging(req)?;
+        self.load_authorized_bucket_subresource(&authorized)
     }
 
     pub fn delete_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
@@ -5994,11 +5999,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        self.delete_opaque_bucket_subresource(
-            req,
-            auth::PolicyAction::PutBucketTagging,
-            storage::BucketSubresourceKind::Tagging,
-        )
+        let authorized = self.authorize_delete_bucket_tagging(req)?;
+        self.remove_authorized_bucket_subresource(&authorized)
     }
 
     pub fn put_bucket_policy(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
@@ -6252,21 +6254,11 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            &req.bucket,
-            auth::PolicyAction::PutBucketPublicAccessBlock,
-        )?;
-        self.store_bucket_subresource(
-            req.bucket.name,
-            storage::PutBucketSubresource {
-                kind: storage::BucketSubresourceKind::PublicAccessBlock,
-                body: req.config,
-                aux: storage::BucketSubresourceAux::None,
-            },
-        )?;
-        let config = req.config.to_string();
+        let authorized = self.authorize_put_bucket_public_access_block(req)?;
+        let config = authorized.body.clone();
+        self.store_authorized_bucket_subresource(&authorized)?;
         self.storage_node
-            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
+            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
                 info.public_access_block = Some(config.clone());
             });
         Ok(())
@@ -6282,19 +6274,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let bucket_info = self.active_bucket_summary_for(req)?;
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !Self::requester_can_get_bucket_public_access_block_with_bucket_policy(
-            &req.requester,
-            &bucket_info,
-            bucket_policy.as_deref(),
-        ) {
-            return Err(ServerError::AccessDenied);
-        }
-        self.load_opaque_bucket_subresource(
-            req.name,
-            storage::BucketSubresourceKind::PublicAccessBlock,
-        )
+        let authorized = self.authorize_get_bucket_public_access_block(req)?;
+        self.load_authorized_bucket_subresource(&authorized)
     }
 
     pub fn delete_bucket_public_access_block(
@@ -6307,16 +6288,12 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            req,
-            auth::PolicyAction::PutBucketPublicAccessBlock,
-        )?;
-        self.remove_bucket_subresource(
-            req.name,
-            storage::BucketSubresourceKind::PublicAccessBlock,
-        )?;
+        let authorized = self.authorize_delete_bucket_public_access_block(req)?;
+        self.remove_authorized_bucket_subresource(&authorized)?;
         self.storage_node
-            .update_bucket_fast_path_if_present(req.name, |info| info.public_access_block = None);
+            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
+                info.public_access_block = None
+            });
         Ok(())
     }
 
@@ -6331,29 +6308,11 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            &req.bucket,
-            auth::PolicyAction::PutBucketOwnershipControls,
-        )?;
-        if Self::is_bucket_owner_enforced(Some(req.config))
-            && !Self::acl_grants_owner_full_control_only(
-                &bucket_info.owner_canonical_id,
-                &bucket_info.acl_grants,
-            )
-        {
-            return Err(ServerError::InvalidBucketAclWithObjectOwnership);
-        }
-        self.store_bucket_subresource(
-            req.bucket.name,
-            storage::PutBucketSubresource {
-                kind: storage::BucketSubresourceKind::OwnershipControls,
-                body: req.config,
-                aux: storage::BucketSubresourceAux::None,
-            },
-        )?;
-        let config = req.config.to_string();
+        let authorized = self.authorize_put_bucket_ownership_controls(req)?;
+        let config = authorized.body.clone();
+        self.store_authorized_bucket_subresource(&authorized)?;
         self.storage_node
-            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
+            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
                 info.ownership_controls = Some(config.clone());
             });
         Ok(())
@@ -6369,11 +6328,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        self.get_opaque_bucket_subresource(
-            req,
-            auth::PolicyAction::GetBucketOwnershipControls,
-            storage::BucketSubresourceKind::OwnershipControls,
-        )
+        let authorized = self.authorize_get_bucket_ownership_controls(req)?;
+        self.load_authorized_bucket_subresource(&authorized)
     }
 
     pub fn delete_bucket_ownership_controls(
@@ -6386,16 +6342,12 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            req,
-            auth::PolicyAction::PutBucketOwnershipControls,
-        )?;
-        self.remove_bucket_subresource(
-            req.name,
-            storage::BucketSubresourceKind::OwnershipControls,
-        )?;
+        let authorized = self.authorize_delete_bucket_ownership_controls(req)?;
+        self.remove_authorized_bucket_subresource(&authorized)?;
         self.storage_node
-            .update_bucket_fast_path_if_present(req.name, |info| info.ownership_controls = None);
+            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
+                info.ownership_controls = None
+            });
         Ok(())
     }
 
@@ -6522,52 +6474,20 @@ impl Coordinator {
         Ok(())
     }
 
-    fn put_opaque_bucket_subresource(
+    fn store_authorized_bucket_subresource(
         &self,
-        req: &PutBucketConfigRequest<'_>,
-        action: auth::PolicyAction,
-        kind: storage::BucketSubresourceKind,
+        authorized: &AuthorizedBucketSubresourcePut,
     ) -> Result<(), ServerError> {
-        let _bucket_info =
-            self.authorize_bucket_admin_or_bucket_policy_action_for(&req.bucket, action)?;
-        self.store_bucket_subresource(
-            req.bucket.name,
-            storage::PutBucketSubresource {
-                kind,
-                body: req.config,
-                aux: storage::BucketSubresourceAux::None,
-            },
-        )
-    }
-
-    fn get_opaque_bucket_subresource(
-        &self,
-        req: &BucketRequest<'_>,
-        action: auth::PolicyAction,
-        kind: storage::BucketSubresourceKind,
-    ) -> Result<Option<String>, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(req, action)?;
-        self.load_opaque_bucket_subresource(req.name, kind)
-    }
-
-    fn delete_opaque_bucket_subresource(
-        &self,
-        req: &BucketRequest<'_>,
-        action: auth::PolicyAction,
-        kind: storage::BucketSubresourceKind,
-    ) -> Result<(), ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(req, action)?;
-        self.remove_bucket_subresource(req.name, kind)
-    }
-
-    fn store_bucket_subresource(
-        &self,
-        name: &str,
-        req: storage::PutBucketSubresource<'_>,
-    ) -> Result<(), ServerError> {
-        let bucket_pg = self.get_bucket_pg(name)?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
         bucket_pg
-            .put_bucket_subresource(name, req)
+            .put_bucket_subresource(
+                &authorized.bucket,
+                storage::PutBucketSubresource {
+                    kind: authorized.kind,
+                    body: &authorized.body,
+                    aux: storage::BucketSubresourceAux::None,
+                },
+            )
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -6576,31 +6496,29 @@ impl Coordinator {
             })
     }
 
-    fn remove_bucket_subresource(
+    fn load_authorized_bucket_subresource(
         &self,
-        name: &str,
-        kind: storage::BucketSubresourceKind,
-    ) -> Result<(), ServerError> {
-        let bucket_pg = self.get_bucket_pg(name)?;
-        bucket_pg
-            .delete_bucket_subresource(name, kind)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
-    }
-
-    fn load_opaque_bucket_subresource(
-        &self,
-        name: &str,
-        kind: storage::BucketSubresourceKind,
+        authorized: &AuthorizedBucketSubresourceGet,
     ) -> Result<Option<String>, ServerError> {
-        let bucket_pg = self.get_bucket_pg(name)?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
         bucket_pg
-            .get_bucket_subresource(name, kind)
+            .get_bucket_subresource(&authorized.bucket, authorized.kind)
             .map(|stored| stored.map(|stored| stored.body))
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    fn remove_authorized_bucket_subresource(
+        &self,
+        authorized: &AuthorizedBucketSubresourceDelete,
+    ) -> Result<(), ServerError> {
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        bucket_pg
+            .delete_bucket_subresource(&authorized.bucket, authorized.kind)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -17529,6 +17447,34 @@ mod tests {
     }
 
     #[test]
+    fn authorize_get_bucket_public_access_block_bucket_policy_deny_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_public_access_block_test(&coord,
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                test_helpers::requester("111122223333"), None)
+            .unwrap();
+        put_bucket_policy_test(&coord,
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketPublicAccessBlock","Resource":"arn:aws:s3:::bucket"}]}"#,
+                test_helpers::requester("111122223333"), None)
+            .unwrap();
+
+        let err = coord
+            .authorize_get_bucket_public_access_block(&bucket_request_with_expected_owner(
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
     fn get_bucket_public_access_block_bucket_policy_allow_applies() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -17651,6 +17597,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config, Some(cors.to_string()));
+    }
+
+    #[test]
+    fn authorize_get_bucket_cors_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetBucketCORS","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let authorized = coord
+            .authorize_get_bucket_cors(&bucket_request_with_expected_owner(
+                "bucket",
+                test_helpers::requester("444455556666"),
+                None,
+            ))
+            .unwrap();
+        assert_eq!(authorized.bucket, "bucket");
+        assert_eq!(authorized.kind, storage::BucketSubresourceKind::Cors);
     }
 
     #[test]
@@ -18139,6 +18112,41 @@ mod tests {
             None,
         )
         .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn authorize_get_bucket_ownership_controls_bucket_policy_deny_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let controls = "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            controls,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketOwnershipControls","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let err = coord
+            .authorize_get_bucket_ownership_controls(&bucket_request_with_expected_owner(
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None,
+            ))
+            .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
@@ -22993,6 +23001,28 @@ mod tests {
                 "bucket",
                 "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
                 test_helpers::requester("owner-a"), None)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::InvalidBucketAclWithObjectOwnership
+        ));
+    }
+
+    #[test]
+    fn authorize_put_bucket_ownership_controls_rejects_public_read_bucket() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", true)
+            .unwrap();
+
+        let err = coord
+            .authorize_put_bucket_ownership_controls(&put_bucket_config_request_with_expected_owner(
+                "bucket",
+                "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+                test_helpers::requester("owner-a"),
+                None,
+            ))
             .unwrap_err();
         assert!(matches!(
             err,

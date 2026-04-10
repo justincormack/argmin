@@ -1555,6 +1555,207 @@ impl Coordinator {
         )
     }
 
+    pub(super) fn authorize_put_bucket_cors(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourcePut, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutBucketCors,
+        )?;
+        Ok(AuthorizedBucketSubresourcePut {
+            bucket: req.bucket.name.to_string(),
+            kind: storage::BucketSubresourceKind::Cors,
+            body: req.config.to_string(),
+        })
+    }
+
+    pub(super) fn authorize_get_bucket_cors(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::GetBucketCors,
+        )?;
+        Ok(AuthorizedBucketSubresourceGet {
+            bucket: req.name.to_string(),
+            kind: storage::BucketSubresourceKind::Cors,
+        })
+    }
+
+    /// Creates an internal authorization token for HTTP CORS evaluation.
+    ///
+    /// This intentionally bypasses normal bucket-config authorization because
+    /// CORS preflight handling and actual-response header decoration need the
+    /// stored CORS rules without turning those paths into authenticated bucket
+    /// config reads.
+    pub(super) fn authorize_load_bucket_cors_config(
+        &self,
+        name: &str,
+    ) -> AuthorizedBucketSubresourceGet {
+        AuthorizedBucketSubresourceGet {
+            bucket: name.to_string(),
+            kind: storage::BucketSubresourceKind::Cors,
+        }
+    }
+
+    pub(super) fn authorize_delete_bucket_cors(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::PutBucketCors,
+        )?;
+        Ok(AuthorizedBucketSubresourceDelete {
+            bucket: req.name.to_string(),
+            kind: storage::BucketSubresourceKind::Cors,
+        })
+    }
+
+    pub(super) fn authorize_put_bucket_tagging(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourcePut, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutBucketTagging,
+        )?;
+        Ok(AuthorizedBucketSubresourcePut {
+            bucket: req.bucket.name.to_string(),
+            kind: storage::BucketSubresourceKind::Tagging,
+            body: req.config.to_string(),
+        })
+    }
+
+    pub(super) fn authorize_get_bucket_tagging(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::GetBucketTagging,
+        )?;
+        Ok(AuthorizedBucketSubresourceGet {
+            bucket: req.name.to_string(),
+            kind: storage::BucketSubresourceKind::Tagging,
+        })
+    }
+
+    pub(super) fn authorize_delete_bucket_tagging(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::PutBucketTagging,
+        )?;
+        Ok(AuthorizedBucketSubresourceDelete {
+            bucket: req.name.to_string(),
+            kind: storage::BucketSubresourceKind::Tagging,
+        })
+    }
+
+    pub(super) fn authorize_put_bucket_public_access_block(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourcePut, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutBucketPublicAccessBlock,
+        )?;
+        Ok(AuthorizedBucketSubresourcePut {
+            bucket: req.bucket.name.to_string(),
+            kind: storage::BucketSubresourceKind::PublicAccessBlock,
+            body: req.config.to_string(),
+        })
+    }
+
+    pub(super) fn authorize_get_bucket_public_access_block(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
+        let bucket_info = self.active_bucket_summary_for(req)?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        if !Self::requester_can_get_bucket_public_access_block_with_bucket_policy(
+            &req.requester,
+            &bucket_info,
+            bucket_policy.as_deref(),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedBucketSubresourceGet {
+            bucket: req.name.to_string(),
+            kind: storage::BucketSubresourceKind::PublicAccessBlock,
+        })
+    }
+
+    pub(super) fn authorize_delete_bucket_public_access_block(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::PutBucketPublicAccessBlock,
+        )?;
+        Ok(AuthorizedBucketSubresourceDelete {
+            bucket: req.name.to_string(),
+            kind: storage::BucketSubresourceKind::PublicAccessBlock,
+        })
+    }
+
+    pub(super) fn authorize_put_bucket_ownership_controls(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourcePut, ServerError> {
+        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutBucketOwnershipControls,
+        )?;
+        if Self::is_bucket_owner_enforced(Some(req.config))
+            && !Self::acl_grants_owner_full_control_only(
+                &bucket_info.owner_canonical_id,
+                &bucket_info.acl_grants,
+            )
+        {
+            return Err(ServerError::InvalidBucketAclWithObjectOwnership);
+        }
+        Ok(AuthorizedBucketSubresourcePut {
+            bucket: req.bucket.name.to_string(),
+            kind: storage::BucketSubresourceKind::OwnershipControls,
+            body: req.config.to_string(),
+        })
+    }
+
+    pub(super) fn authorize_get_bucket_ownership_controls(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::GetBucketOwnershipControls,
+        )?;
+        Ok(AuthorizedBucketSubresourceGet {
+            bucket: req.name.to_string(),
+            kind: storage::BucketSubresourceKind::OwnershipControls,
+        })
+    }
+
+    pub(super) fn authorize_delete_bucket_ownership_controls(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::PutBucketOwnershipControls,
+        )?;
+        Ok(AuthorizedBucketSubresourceDelete {
+            bucket: req.name.to_string(),
+            kind: storage::BucketSubresourceKind::OwnershipControls,
+        })
+    }
+
     pub(super) fn requester_can_bypass_governance_retention(
         requester: &Requester,
         bucket: &BucketSummary,

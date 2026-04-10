@@ -254,6 +254,24 @@ The coordinator should continue to own:
 The main change is that it will call generic subresource storage helpers
 instead of per-feature store methods.
 
+For authorization, the coordinator should move away from shared
+auth-and-storage wrappers like "get opaque subresource". Those helpers become
+awkward as soon as S3 operations diverge in small but important ways.
+
+The working direction is:
+
+1. keep only raw generic bucket-subresource persistence helpers at the storage
+   call boundary
+2. add one authorization entrypoint per S3 bucket-subresource operation, even
+   when several delegate internally to a common rule
+3. return typed authorized request/token values with private construction, so
+   storage and mutation helpers cannot be reached from an unauthorized path
+4. unit test those per-operation authorization functions directly
+
+This matches the pattern already used for authorized object writes and should
+make bucket-config authorization easier to review, easier to test, and less
+error-prone as AWS-compatible edge cases accumulate.
+
 Important behavior to preserve:
 
 1. `BucketSummary` and `BucketFastPathInfo` remain explicit typed structures
@@ -334,6 +352,40 @@ Exit criteria:
 
 1. no migrated feature still has dedicated store trait methods
 2. all bucket subresource APIs still pass existing tests
+
+### Phase 3b: Refactor Bucket-Subresource Authorization
+
+After the first coordinator migration lands, normalize authorization around S3
+operation boundaries instead of shared "generic subresource" helpers.
+
+Deliver:
+
+1. raw coordinator helpers for `store/load/delete` bucket subresources remain
+   persistence-only and do not perform authorization
+2. add one auth function per migrated S3 operation, for example:
+   `authorize_get_bucket_cors`, `authorize_put_bucket_tagging`,
+   `authorize_get_bucket_public_access_block`,
+   `authorize_put_bucket_ownership_controls`
+3. those auth functions return typed authorized values whose fields are not
+   constructible outside the auth path
+4. operation handlers consume those authorized values when calling storage or
+   applying fast-path/cache updates
+5. common bucket-admin or bucket-policy logic remains shared internally inside
+   `authz.rs`, but no longer leaks as the public operation shape
+
+Design requirement:
+
+1. operation-specific semantic validation that is part of request acceptance
+   should live in the per-operation auth path
+2. examples include ownership-controls ACL compatibility, special
+   public-access-block reads, and any future per-call AWS edge conditions
+
+Exit criteria:
+
+1. migrated bucket-subresource calls no longer depend on shared
+   auth-and-storage wrappers
+2. each migrated S3 call has a directly testable auth entrypoint
+3. storage mutation helpers can only be reached from a typed authorized flow
 
 ### Phase 3a: Bucket Creation Seeding Rules
 
