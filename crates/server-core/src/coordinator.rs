@@ -340,6 +340,37 @@ struct AuthorizedObjectRead<'a> {
     locked: LockedReadObject<'a>,
 }
 
+struct AuthorizedCopyObject<'a> {
+    source: LockedReadObject<'a>,
+    destination: AuthorizedPutObjectWrite,
+}
+
+enum AuthorizedDeleteObject<'a> {
+    UnversionedMissing,
+    UnversionedStored {
+        bucket: String,
+        key: String,
+        stored: StoredObject,
+        pgs: ObjectPgGuards<'a>,
+    },
+    SpecificVersionMissing {
+        version_id: VersionId,
+    },
+    SpecificVersionStored {
+        bucket: String,
+        key: String,
+        version_id: VersionId,
+        stored: StoredObject,
+        pgs: ObjectPgGuards<'a>,
+    },
+    CurrentDeleteMarkerInsert {
+        bucket: String,
+        key: String,
+        owner: OwnerIdentity,
+        current: Option<LockedReadObject<'a>>,
+    },
+}
+
 impl std::fmt::Debug for AuthorizedObjectTagsAccess<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedObjectTagsAccess")
@@ -388,6 +419,47 @@ impl std::fmt::Debug for AuthorizedObjectRead<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedObjectRead")
             .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for AuthorizedCopyObject<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizedCopyObject")
+            .field("destination", &self.destination)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for AuthorizedDeleteObject<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnversionedMissing => f.write_str("AuthorizedDeleteObject::UnversionedMissing"),
+            Self::UnversionedStored { bucket, key, .. } => f
+                .debug_struct("AuthorizedDeleteObject::UnversionedStored")
+                .field("bucket", bucket)
+                .field("key", key)
+                .finish_non_exhaustive(),
+            Self::SpecificVersionMissing { version_id } => f
+                .debug_struct("AuthorizedDeleteObject::SpecificVersionMissing")
+                .field("version_id", version_id)
+                .finish(),
+            Self::SpecificVersionStored {
+                bucket,
+                key,
+                version_id,
+                ..
+            } => f
+                .debug_struct("AuthorizedDeleteObject::SpecificVersionStored")
+                .field("bucket", bucket)
+                .field("key", key)
+                .field("version_id", version_id)
+                .finish_non_exhaustive(),
+            Self::CurrentDeleteMarkerInsert { bucket, key, .. } => f
+                .debug_struct("AuthorizedDeleteObject::CurrentDeleteMarkerInsert")
+                .field("bucket", bucket)
+                .field("key", key)
+                .finish_non_exhaustive(),
+        }
     }
 }
 
@@ -2807,12 +2879,6 @@ impl<'a> GetObjectPartRequest<'a> {
 }
 
 impl<'a> GetObjectRangeRequest<'a> {
-    fn expected_bucket_owner(&self) -> Option<&str> {
-        self.object.expected_bucket_owner()
-    }
-}
-
-impl<'a> DeleteObjectRequest<'a> {
     fn expected_bucket_owner(&self) -> Option<&str> {
         self.object.expected_bucket_owner()
     }
@@ -8978,8 +9044,6 @@ impl Coordinator {
         let src_cond = req.source.condition;
         let dst_cond = req.dst_condition;
         let directive = &req.directive;
-        let requester = &req.destination.bucket.requester;
-        let acl = req.acl.clone();
         let source_sse_customer = req.source_sse_customer;
         let dst_explicit_sse_customer = self.prepare_sse_customer_write_context(
             req.destination_encryption.sse_customer_request(),
@@ -8987,65 +9051,17 @@ impl Coordinator {
         let dst_response_sse_customer = dst_explicit_sse_customer
             .as_ref()
             .map(|ctx| ctx.request().response_headers());
-        let copy_source_policy_value = req.source.version_id.map_or_else(
-            || format!("{}/{}", req.source.bucket, req.source.key),
-            |version_id| {
-                format!(
-                    "{}/{}?versionId={}",
-                    req.source.bucket, req.source.key, version_id
-                )
-            },
-        );
-        let metadata_directive = req.directive.policy_condition_value();
-        let canned_acl = acl.policy_condition_value();
-        let request_object_tags_xml = match &req.tagging {
-            TaggingDirective::Copy => None,
-            TaggingDirective::Replace(tags) => *tags,
-        };
-        let copy_policy_context = PutObjectPolicyContext::new(
-            Some(copy_source_policy_value.as_str()),
-            metadata_directive,
-            canned_acl,
-        )
-        .with_acl_grant_headers(
-            req.policy_context.grant_read,
-            req.policy_context.grant_write,
-            req.policy_context.grant_read_acp,
-            req.policy_context.grant_write_acp,
-            req.policy_context.grant_full_control,
-        )
-        .with_request_object_tags_xml(request_object_tags_xml);
-        let dst_policy_context = req
-            .destination_encryption
-            .with_policy_context(copy_policy_context);
-        let dst_authorized = self.authorize_put_object_write(&AuthorizePutObjectRequest {
-            object: ObjectRequest::new(
-                dst_bucket,
-                dst_key,
-                requester.clone(),
-                req.expected_bucket_owner(),
-            ),
-            acl: acl.clone(),
-            policy_context: dst_policy_context,
-            object_lock: req.object_lock,
-            tags: request_object_tags_xml,
-            encryption: req.destination_encryption,
-        })?;
+        let AuthorizedCopyObject {
+            source:
+                LockedReadObject {
+                    record: src_stored,
+                    pgs,
+                },
+            destination: dst_authorized,
+        } = self.authorize_copy_object(req)?;
 
         // Phase 1: Snapshot source metadata and prepare a read handle.
         let (src_metadata, src_system_metadata, src_tags, mut source_body) = {
-            let LockedReadObject {
-                record: src_stored,
-                pgs,
-            } = self.lock_object_for_authorized_read_with_policy(
-                requester,
-                src_bucket,
-                src_key,
-                src_version_id,
-                Self::get_object_policy_action(src_version_id),
-                req.source.expected_bucket_owner(),
-            )?;
-
             // Reject delete markers — they are not copyable objects.
             // AWS returns 400/InvalidRequest when an explicit versionId targets a
             // delete marker, and 404/NoSuchKey when current version is a delete marker.
@@ -10940,6 +10956,169 @@ impl Coordinator {
         })
     }
 
+    fn apply_authorized_delete_object(
+        &self,
+        authorized: AuthorizedDeleteObject<'_>,
+        cond: &DeleteCondition,
+    ) -> Result<DeleteObjectResult, ServerError> {
+        match authorized {
+            AuthorizedDeleteObject::UnversionedMissing => {
+                if !cond.is_empty() {
+                    return Err(ServerError::PreconditionFailed);
+                }
+                Ok(DeleteObjectResult {
+                    version_id: VersionId::Null,
+                    delete_marker: false,
+                })
+            }
+            AuthorizedDeleteObject::UnversionedStored {
+                bucket,
+                key,
+                stored,
+                pgs,
+            } => {
+                let StoredObject::Live(record) = stored else {
+                    return Ok(DeleteObjectResult {
+                        version_id: VersionId::Null,
+                        delete_marker: false,
+                    });
+                };
+
+                if !cond.is_empty() {
+                    let etag_str = record.etag.format();
+                    check_delete_conditions(cond, &etag_str)?;
+                }
+
+                let meta_pg = pgs.meta();
+                let reclaim =
+                    Self::permanently_delete_live_object_locked(meta_pg, &bucket, &key, &record)?;
+                drop(pgs);
+                #[cfg(test)]
+                match record.layout {
+                    ObjectLayout::MultipartManifest { .. } => {
+                        maybe_run_multipart_delete_metadata_hook(&bucket, &key);
+                    }
+                    ObjectLayout::Standard => {
+                        maybe_run_object_segments_delete_metadata_hook(&bucket, &key);
+                    }
+                }
+                if let Some(reclaim) = reclaim {
+                    self.read_runtime().enqueue_object_payload_reclaim(
+                        &bucket,
+                        &key,
+                        reclaim.generation_id,
+                    );
+                }
+
+                Ok(DeleteObjectResult {
+                    version_id: VersionId::Null,
+                    delete_marker: false,
+                })
+            }
+            AuthorizedDeleteObject::SpecificVersionMissing { version_id } => {
+                Ok(DeleteObjectResult {
+                    version_id,
+                    delete_marker: false,
+                })
+            }
+            AuthorizedDeleteObject::SpecificVersionStored {
+                bucket,
+                key,
+                version_id,
+                stored,
+                pgs,
+            } => {
+                if !cond.is_empty() {
+                    return Err(ServerError::NotImplemented {
+                        feature: "conditional delete with versionId".to_string(),
+                    });
+                }
+
+                let meta_pg = pgs.meta();
+                match stored {
+                    StoredObject::Live(record) => {
+                        let reclaim = Self::permanently_delete_live_object_locked(
+                            meta_pg, &bucket, &key, &record,
+                        )?;
+                        drop(pgs);
+                        #[cfg(test)]
+                        match record.layout {
+                            ObjectLayout::MultipartManifest { .. } => {
+                                maybe_run_multipart_delete_metadata_hook(&bucket, &key);
+                            }
+                            ObjectLayout::Standard => {
+                                maybe_run_object_segments_delete_metadata_hook(&bucket, &key);
+                            }
+                        }
+                        if let Some(reclaim) = reclaim {
+                            self.read_runtime().enqueue_object_payload_reclaim(
+                                &bucket,
+                                &key,
+                                reclaim.generation_id,
+                            );
+                        }
+
+                        Ok(DeleteObjectResult {
+                            version_id,
+                            delete_marker: false,
+                        })
+                    }
+                    StoredObject::DeleteMarker(_) => {
+                        meta_pg.delete_object_version(&bucket, &key, version_id)?;
+                        Ok(DeleteObjectResult {
+                            version_id,
+                            delete_marker: true,
+                        })
+                    }
+                }
+            }
+            AuthorizedDeleteObject::CurrentDeleteMarkerInsert {
+                bucket,
+                key,
+                owner,
+                current,
+            } => {
+                let marker_vid = match current {
+                    Some(LockedReadObject {
+                        record: stored,
+                        pgs,
+                    }) => {
+                        if !cond.is_empty() {
+                            let record = match stored {
+                                StoredObject::Live(record) => record,
+                                StoredObject::DeleteMarker(_) => {
+                                    return Err(ServerError::PreconditionFailed);
+                                }
+                            };
+                            let etag_str = record.etag.format();
+                            check_delete_conditions(cond, &etag_str)?;
+                        }
+
+                        let meta_pg = pgs.meta();
+                        let marker_vid = meta_pg.next_version_id(&bucket, &key)?;
+                        Self::put_delete_marker_locked(meta_pg, &bucket, &key, marker_vid, owner)?;
+                        marker_vid
+                    }
+                    None => {
+                        if !cond.is_empty() {
+                            return Err(ServerError::PreconditionFailed);
+                        }
+                        let meta_pg_id = self.object_pg_id(&bucket, &key);
+                        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+                        let marker_vid = meta_pg.next_version_id(&bucket, &key)?;
+                        Self::put_delete_marker_locked(&meta_pg, &bucket, &key, marker_vid, owner)?;
+                        marker_vid
+                    }
+                };
+
+                Ok(DeleteObjectResult {
+                    version_id: marker_vid,
+                    delete_marker: true,
+                })
+            }
+        }
+    }
+
     /// Delete an object.
     pub fn delete_object(
         &self,
@@ -10954,383 +11133,8 @@ impl Coordinator {
             req.object.version_id,
             req.bypass_governance
         );
-        let bucket = req.object.bucket_name();
-        let key = req.object.key();
-        let request_version_id = req.object.version_id;
-        let cond = req.cond;
-        let requester = req.object.requester();
-        let bucket_info =
-            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-
-        match (bucket_info.versioning, request_version_id) {
-            // Unversioned bucket: physical delete (current behavior)
-            (BucketVersioningState::Disabled, _) => {
-                let LockedReadObject {
-                    record: stored,
-                    pgs,
-                } = match self.lock_object_pgs_for_read(bucket, key, None) {
-                    Ok(locked) => locked,
-                    Err(ServerError::ObjectNotFound { .. }) => {
-                        if !Self::requester_can_delete_object_with_bucket_policy(
-                            requester,
-                            &bucket_info,
-                            key,
-                            None,
-                            Self::delete_object_policy_action(None),
-                            bucket_policy.as_deref(),
-                        )? {
-                            return Err(ServerError::AccessDenied);
-                        }
-                        if !cond.is_empty() {
-                            return Err(ServerError::PreconditionFailed);
-                        }
-                        return Ok(DeleteObjectResult {
-                            version_id: VersionId::Null,
-                            delete_marker: false,
-                        });
-                    }
-                    Err(other) => return Err(other),
-                };
-
-                if !Self::requester_can_delete_object_with_bucket_policy(
-                    requester,
-                    &bucket_info,
-                    key,
-                    Some(&stored),
-                    Self::delete_object_policy_action(None),
-                    bucket_policy.as_deref(),
-                )? {
-                    return Err(ServerError::AccessDenied);
-                }
-
-                // Unversioned bucket objects are always live (no delete markers).
-                let record = match stored {
-                    StoredObject::Live(r) => r,
-                    StoredObject::DeleteMarker(_) => {
-                        return Ok(DeleteObjectResult {
-                            version_id: VersionId::Null,
-                            delete_marker: false,
-                        });
-                    }
-                };
-
-                let meta_pg = pgs.meta();
-
-                // Check delete conditions
-                if !cond.is_empty() {
-                    let etag_str = record.etag.format();
-                    check_delete_conditions(cond, &etag_str)?;
-                }
-
-                if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
-                    // Multipart: collect parts, delete metadata under lock,
-                    // then reclaim part payloads after releasing the lock.
-                    let obj_parts = meta_pg
-                        .get_object_parts(bucket, key, record.version_id)
-                        .map_err(ServerError::Metadata)?;
-                    // Collect object segments for streaming parts before deleting metadata.
-                    let mut streaming_segments: Vec<MultipartPartSegmentRecord> = Vec::new();
-                    for part in &obj_parts {
-                        if part.part_okh == [0u8; 16] {
-                            let segments = meta_pg
-                                .get_multipart_part_segments(
-                                    bucket,
-                                    key,
-                                    record.version_id,
-                                    part.part_number,
-                                )
-                                .map_err(ServerError::Metadata)?;
-                            streaming_segments.extend(segments);
-                        }
-                    }
-                    Self::enqueue_multipart_reclaim(
-                        meta_pg,
-                        bucket,
-                        key,
-                        record.generation_id,
-                        &obj_parts,
-                        &streaming_segments,
-                    )?;
-                    if !streaming_segments.is_empty() {
-                        meta_pg
-                            .delete_multipart_part_segments(bucket, key, record.version_id)
-                            .map_err(ServerError::Metadata)?;
-                    }
-                    meta_pg.delete_object_parts(bucket, key, record.version_id)?;
-                    meta_pg.delete_object_meta(bucket, key)?;
-                    drop(pgs);
-                    #[cfg(test)]
-                    maybe_run_multipart_delete_metadata_hook(bucket, key);
-                    self.read_runtime().enqueue_object_payload_reclaim(
-                        bucket,
-                        key,
-                        record.generation_id,
-                    );
-                } else {
-                    let vid = record.version_id;
-
-                    // Segment-manifest payloads are now the only non-multipart layout.
-                    let segments = meta_pg
-                        .get_object_segments(bucket, key, vid)
-                        .map_err(ServerError::Metadata)?;
-
-                    Self::enqueue_object_segments_reclaim(
-                        meta_pg,
-                        bucket,
-                        key,
-                        record.generation_id,
-                        &segments,
-                    )?;
-                    meta_pg
-                        .delete_object_segments(bucket, key, vid)
-                        .map_err(ServerError::Metadata)?;
-                    meta_pg.delete_object_meta(bucket, key)?;
-                    drop(pgs);
-                    #[cfg(test)]
-                    maybe_run_object_segments_delete_metadata_hook(bucket, key);
-                    self.read_runtime().enqueue_object_payload_reclaim(
-                        bucket,
-                        key,
-                        record.generation_id,
-                    );
-                }
-
-                Ok(DeleteObjectResult {
-                    version_id: VersionId::Null,
-                    delete_marker: false,
-                })
-            }
-
-            // Versioned/Suspended + specific versionId: permanent delete that version
-            (_, Some(vid)) => {
-                let LockedReadObject {
-                    record: stored,
-                    pgs,
-                } = match self.lock_object_pgs_for_read(bucket, key, Some(vid)) {
-                    Ok(locked) => locked,
-                    Err(
-                        ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. },
-                    ) => {
-                        if !Self::requester_can_delete_object_with_bucket_policy(
-                            requester,
-                            &bucket_info,
-                            key,
-                            None,
-                            Self::delete_object_policy_action(Some(vid)),
-                            bucket_policy.as_deref(),
-                        )? {
-                            return Err(ServerError::AccessDenied);
-                        }
-                        return Ok(DeleteObjectResult {
-                            version_id: vid,
-                            delete_marker: false,
-                        });
-                    }
-                    Err(other) => return Err(other),
-                };
-
-                if !Self::requester_can_delete_object_with_bucket_policy(
-                    requester,
-                    &bucket_info,
-                    key,
-                    Some(&stored),
-                    Self::delete_object_policy_action(Some(vid)),
-                    bucket_policy.as_deref(),
-                )? {
-                    return Err(ServerError::AccessDenied);
-                }
-
-                let meta_pg = pgs.meta();
-                let is_delete_marker = stored.is_delete_marker();
-
-                if !cond.is_empty() {
-                    return Err(ServerError::NotImplemented {
-                        feature: "conditional delete with versionId".to_string(),
-                    });
-                }
-
-                // Delete shards if it's a live object (not a delete marker)
-                if let StoredObject::Live(record) = &stored {
-                    let can_bypass_governance =
-                        Self::requester_can_bypass_governance_retention_with_bucket_policy(
-                            requester,
-                            &bucket_info,
-                            &stored,
-                            bucket_policy.as_deref(),
-                        )?;
-                    Self::validate_delete_against_object_lock(
-                        record.object_lock,
-                        req.bypass_governance,
-                        can_bypass_governance,
-                        Self::current_unix_seconds()?,
-                    )?;
-                    if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
-                        let obj_parts = meta_pg
-                            .get_object_parts(bucket, key, vid)
-                            .map_err(ServerError::Metadata)?;
-                        // Collect object segments for streaming parts.
-                        let mut streaming_segments: Vec<MultipartPartSegmentRecord> = Vec::new();
-                        for part in &obj_parts {
-                            if part.part_okh == [0u8; 16] {
-                                let segments = meta_pg
-                                    .get_multipart_part_segments(bucket, key, vid, part.part_number)
-                                    .map_err(ServerError::Metadata)?;
-                                streaming_segments.extend(segments);
-                            }
-                        }
-                        Self::enqueue_multipart_reclaim(
-                            meta_pg,
-                            bucket,
-                            key,
-                            record.generation_id,
-                            &obj_parts,
-                            &streaming_segments,
-                        )?;
-                        if !streaming_segments.is_empty() {
-                            meta_pg
-                                .delete_multipart_part_segments(bucket, key, vid)
-                                .map_err(ServerError::Metadata)?;
-                        }
-                        meta_pg.delete_object_parts(bucket, key, vid)?;
-                        meta_pg.delete_object_version(bucket, key, vid)?;
-                        drop(pgs);
-                        #[cfg(test)]
-                        maybe_run_multipart_delete_metadata_hook(bucket, key);
-                        self.read_runtime().enqueue_object_payload_reclaim(
-                            bucket,
-                            key,
-                            record.generation_id,
-                        );
-
-                        return Ok(DeleteObjectResult {
-                            version_id: vid,
-                            delete_marker: false,
-                        });
-                    }
-
-                    // Segment-manifest payloads are now the only non-multipart layout.
-                    let segments = meta_pg
-                        .get_object_segments(bucket, key, vid)
-                        .map_err(ServerError::Metadata)?;
-
-                    Self::enqueue_object_segments_reclaim(
-                        meta_pg,
-                        bucket,
-                        key,
-                        record.generation_id,
-                        &segments,
-                    )?;
-                    meta_pg
-                        .delete_object_segments(bucket, key, vid)
-                        .map_err(ServerError::Metadata)?;
-                    meta_pg.delete_object_version(bucket, key, vid)?;
-                    drop(pgs);
-                    #[cfg(test)]
-                    maybe_run_object_segments_delete_metadata_hook(bucket, key);
-                    self.read_runtime().enqueue_object_payload_reclaim(
-                        bucket,
-                        key,
-                        record.generation_id,
-                    );
-                    return Ok(DeleteObjectResult {
-                        version_id: vid,
-                        delete_marker: false,
-                    });
-                }
-
-                meta_pg.delete_object_version(bucket, key, vid)?;
-
-                Ok(DeleteObjectResult {
-                    version_id: vid,
-                    delete_marker: is_delete_marker,
-                })
-            }
-
-            // Versioned/Suspended + no versionId: insert delete marker
-            (_, None) => match self.lock_object_pgs_for_read(bucket, key, None) {
-                Ok(LockedReadObject {
-                    record: stored,
-                    pgs,
-                }) => {
-                    if !Self::requester_can_delete_object_with_bucket_policy(
-                        requester,
-                        &bucket_info,
-                        key,
-                        Some(&stored),
-                        Self::delete_object_policy_action(None),
-                        bucket_policy.as_deref(),
-                    )? {
-                        return Err(ServerError::AccessDenied);
-                    }
-
-                    if !cond.is_empty() {
-                        let record = match stored {
-                            StoredObject::Live(record) => record,
-                            StoredObject::DeleteMarker(_) => {
-                                return Err(ServerError::PreconditionFailed);
-                            }
-                        };
-
-                        let etag_str = record.etag.format();
-                        check_delete_conditions(cond, &etag_str)?;
-                    }
-
-                    let meta_pg = pgs.meta();
-                    let marker_vid = meta_pg.next_version_id(bucket, key)?;
-                    meta_pg.put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-                        bucket: BucketName::from(bucket),
-                        key: ObjectKey::from(key),
-                        version_id: marker_vid,
-                        owner: Self::effective_object_owner(
-                            &bucket_info,
-                            req.object.requester(),
-                            PutObjectAcl::None,
-                        ),
-                    }))?;
-
-                    Ok(DeleteObjectResult {
-                        version_id: marker_vid,
-                        delete_marker: true,
-                    })
-                }
-                Err(ServerError::ObjectNotFound { .. }) => {
-                    if !Self::requester_can_delete_object_with_bucket_policy(
-                        requester,
-                        &bucket_info,
-                        key,
-                        None,
-                        Self::delete_object_policy_action(None),
-                        bucket_policy.as_deref(),
-                    )? {
-                        return Err(ServerError::AccessDenied);
-                    }
-                    if !cond.is_empty() {
-                        return Err(ServerError::PreconditionFailed);
-                    }
-
-                    let meta_pg_id = self.object_pg_id(bucket, key);
-                    let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-                    let marker_vid = meta_pg.next_version_id(bucket, key)?;
-                    meta_pg.put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-                        bucket: BucketName::from(bucket),
-                        key: ObjectKey::from(key),
-                        version_id: marker_vid,
-                        owner: Self::effective_object_owner(
-                            &bucket_info,
-                            req.object.requester(),
-                            PutObjectAcl::None,
-                        ),
-                    }))?;
-
-                    Ok(DeleteObjectResult {
-                        version_id: marker_vid,
-                        delete_marker: true,
-                    })
-                }
-                Err(other) => Err(other),
-            },
-        }
+        let authorized = self.authorize_delete_object(req)?;
+        self.apply_authorized_delete_object(authorized, req.cond)
     }
 
     /// List objects in a bucket (ListObjectsV2).
@@ -11811,26 +11615,16 @@ impl Coordinator {
         );
         let bucket = req.bucket.name;
         let entries = req.entries;
-        let requester = &req.bucket.requester;
         self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
 
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
 
         for entry in entries {
-            match self.delete_object(&DeleteObjectRequest {
-                object: ObjectVersionRequest::from_object(
-                    ObjectRequest::new(
-                        bucket,
-                        entry.key,
-                        requester.clone(),
-                        req.expected_bucket_owner(),
-                    ),
-                    entry.version_id,
-                ),
-                bypass_governance: req.bypass_governance,
-                cond: &entry.cond,
-            }) {
+            match self
+                .authorize_delete_objects_entry(req, entry)
+                .and_then(|authorized| self.apply_authorized_delete_object(authorized, &entry.cond))
+            {
                 Ok(result) => {
                     deleted.push(DeletedObject {
                         key: entry.key.to_string(),
@@ -24124,6 +23918,28 @@ mod tests {
                 encryption: WriteEncryptionRequest::none(),
             })
             .unwrap();
+        let authorized = coord
+            .authorize_copy_object(&CopyObjectRequest {
+                source: copy_source("src", "public/foo", None),
+                destination: object_request_with_expected_owner(
+                    "dst",
+                    "copied",
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
+
+                acl: PutObjectAcl::None.into(),
+                policy_context: PutObjectPolicyContext::default(),
+                source_sse_customer: None,
+                destination_encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+            })
+            .unwrap();
+        assert!(matches!(authorized.source.record, StoredObject::Live(_)));
+        drop(authorized);
 
         let copied = coord
             .copy_object(&CopyObjectRequest {
@@ -26519,6 +26335,36 @@ mod tests {
         assert_eq!(result.errors.len(), 1);
         assert_eq!(result.errors[0].key, "key");
         assert_eq!(result.errors[0].code, "AccessDenied");
+    }
+
+    #[test]
+    fn authorize_delete_objects_entry_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let entries = vec![DeleteEntry {
+            key: "key",
+            version_id: None,
+            cond: DeleteCondition::None,
+        }];
+        let err = coord
+            .authorize_delete_objects_entry(
+                &DeleteObjectsRequest {
+                    bucket: bucket_request_with_expected_owner(
+                        "bucket",
+                        test_helpers::requester("other-user"),
+                        None,
+                    ),
+                    entries: &entries,
+                    bypass_governance: false,
+                },
+                &entries[0],
+            )
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
     }
 
     #[test]
@@ -31661,6 +31507,81 @@ mod tests {
                 NO_DELETE,
             ))
             .unwrap();
+    }
+
+    #[test]
+    fn authorize_delete_object_bucket_policy_allows_cross_account_bypass() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_requester = test_helpers::requester("owner-a");
+        let other_requester = test_helpers::requester("other-user");
+        let now = Coordinator::current_unix_seconds().unwrap();
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
+            .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        put_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: now + 200,
+            },
+            false,
+            owner_requester.clone(),
+        )
+        .unwrap();
+        put_bucket_policy_test(&coord,
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:DeleteObjectVersion","s3:BypassGovernanceRetention"],"Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                owner_requester, None)
+            .unwrap();
+
+        let authorized = coord
+            .authorize_delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                other_requester,
+                true,
+                NO_DELETE,
+            ))
+            .unwrap();
+        assert!(matches!(
+            authorized,
+            AuthorizedDeleteObject::SpecificVersionStored { version_id, .. } if version_id == put.version_id
+        ));
     }
 
     #[test]

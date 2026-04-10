@@ -2482,6 +2482,261 @@ impl Coordinator {
         })
     }
 
+    fn authorize_delete_object_impl<'a>(
+        &'a self,
+        object: &ObjectVersionRequest<'_>,
+        bypass_governance: bool,
+    ) -> Result<AuthorizedDeleteObject<'a>, ServerError> {
+        let bucket = object.bucket_name();
+        let key = object.key();
+        let request_version_id = object.version_id();
+        let requester = object.requester();
+        let bucket_info =
+            self.checked_active_bucket_summary(bucket, object.expected_bucket_owner())?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+
+        match (bucket_info.versioning, request_version_id) {
+            (BucketVersioningState::Disabled, _) => {
+                let locked = match self.lock_object_pgs_for_read(bucket, key, None) {
+                    Ok(locked) => locked,
+                    Err(ServerError::ObjectNotFound { .. }) => {
+                        if !Self::requester_can_delete_object_with_bucket_policy(
+                            requester,
+                            &bucket_info,
+                            key,
+                            None,
+                            Self::delete_object_policy_action(None),
+                            bucket_policy.as_deref(),
+                        )? {
+                            return Err(ServerError::AccessDenied);
+                        }
+                        return Ok(AuthorizedDeleteObject::UnversionedMissing);
+                    }
+                    Err(other) => return Err(other),
+                };
+
+                if !Self::requester_can_delete_object_with_bucket_policy(
+                    requester,
+                    &bucket_info,
+                    key,
+                    Some(&locked.record),
+                    Self::delete_object_policy_action(None),
+                    bucket_policy.as_deref(),
+                )? {
+                    return Err(ServerError::AccessDenied);
+                }
+
+                let LockedReadObject {
+                    record: stored,
+                    pgs,
+                } = locked;
+                Ok(AuthorizedDeleteObject::UnversionedStored {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    stored,
+                    pgs,
+                })
+            }
+            (_, Some(version_id)) => {
+                let locked = match self.lock_object_pgs_for_read(bucket, key, Some(version_id)) {
+                    Ok(locked) => locked,
+                    Err(
+                        ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. },
+                    ) => {
+                        if !Self::requester_can_delete_object_with_bucket_policy(
+                            requester,
+                            &bucket_info,
+                            key,
+                            None,
+                            Self::delete_object_policy_action(Some(version_id)),
+                            bucket_policy.as_deref(),
+                        )? {
+                            return Err(ServerError::AccessDenied);
+                        }
+                        return Ok(AuthorizedDeleteObject::SpecificVersionMissing { version_id });
+                    }
+                    Err(other) => return Err(other),
+                };
+
+                if !Self::requester_can_delete_object_with_bucket_policy(
+                    requester,
+                    &bucket_info,
+                    key,
+                    Some(&locked.record),
+                    Self::delete_object_policy_action(Some(version_id)),
+                    bucket_policy.as_deref(),
+                )? {
+                    return Err(ServerError::AccessDenied);
+                }
+
+                if let StoredObject::Live(record) = &locked.record {
+                    let can_bypass_governance =
+                        Self::requester_can_bypass_governance_retention_with_bucket_policy(
+                            requester,
+                            &bucket_info,
+                            &locked.record,
+                            bucket_policy.as_deref(),
+                        )?;
+                    Self::validate_delete_against_object_lock(
+                        record.object_lock,
+                        bypass_governance,
+                        can_bypass_governance,
+                        Self::current_unix_seconds()?,
+                    )?;
+                }
+
+                let LockedReadObject {
+                    record: stored,
+                    pgs,
+                } = locked;
+                Ok(AuthorizedDeleteObject::SpecificVersionStored {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version_id,
+                    stored,
+                    pgs,
+                })
+            }
+            (_, None) => {
+                let owner =
+                    Self::effective_object_owner(&bucket_info, requester, PutObjectAcl::None);
+                match self.lock_object_pgs_for_read(bucket, key, None) {
+                    Ok(locked) => {
+                        if !Self::requester_can_delete_object_with_bucket_policy(
+                            requester,
+                            &bucket_info,
+                            key,
+                            Some(&locked.record),
+                            Self::delete_object_policy_action(None),
+                            bucket_policy.as_deref(),
+                        )? {
+                            return Err(ServerError::AccessDenied);
+                        }
+                        Ok(AuthorizedDeleteObject::CurrentDeleteMarkerInsert {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                            owner,
+                            current: Some(locked),
+                        })
+                    }
+                    Err(ServerError::ObjectNotFound { .. }) => {
+                        if !Self::requester_can_delete_object_with_bucket_policy(
+                            requester,
+                            &bucket_info,
+                            key,
+                            None,
+                            Self::delete_object_policy_action(None),
+                            bucket_policy.as_deref(),
+                        )? {
+                            return Err(ServerError::AccessDenied);
+                        }
+                        Ok(AuthorizedDeleteObject::CurrentDeleteMarkerInsert {
+                            bucket: bucket.to_string(),
+                            key: key.to_string(),
+                            owner,
+                            current: None,
+                        })
+                    }
+                    Err(other) => Err(other),
+                }
+            }
+        }
+    }
+
+    pub(super) fn authorize_delete_object<'a>(
+        &'a self,
+        req: &DeleteObjectRequest<'_>,
+    ) -> Result<AuthorizedDeleteObject<'a>, ServerError> {
+        self.authorize_delete_object_impl(&req.object, req.bypass_governance)
+    }
+
+    pub(super) fn authorize_delete_objects_entry<'a>(
+        &'a self,
+        req: &DeleteObjectsRequest<'_>,
+        entry: &DeleteEntry<'_>,
+    ) -> Result<AuthorizedDeleteObject<'a>, ServerError> {
+        let object = ObjectVersionRequest::from_object(
+            ObjectRequest::new(
+                req.bucket.name,
+                entry.key,
+                req.bucket.requester.clone(),
+                req.expected_bucket_owner(),
+            ),
+            entry.version_id,
+        );
+        self.authorize_delete_object_impl(&object, req.bypass_governance)
+    }
+
+    pub(super) fn authorize_copy_object<'a>(
+        &'a self,
+        req: &CopyObjectRequest<'_>,
+    ) -> Result<AuthorizedCopyObject<'a>, ServerError> {
+        let src_bucket = req.source.bucket;
+        let src_key = req.source.key;
+        let src_version_id = req.source.version_id;
+        let dst_bucket = req.destination.bucket.name;
+        let dst_key = req.destination.key;
+        let requester = &req.destination.bucket.requester;
+        let acl = req.acl.clone();
+        let copy_source_policy_value = req.source.version_id.map_or_else(
+            || format!("{}/{}", req.source.bucket, req.source.key),
+            |version_id| {
+                format!(
+                    "{}/{}?versionId={}",
+                    req.source.bucket, req.source.key, version_id
+                )
+            },
+        );
+        let metadata_directive = req.directive.policy_condition_value();
+        let canned_acl = acl.policy_condition_value();
+        let request_object_tags_xml = match &req.tagging {
+            TaggingDirective::Copy => None,
+            TaggingDirective::Replace(tags) => *tags,
+        };
+        let copy_policy_context = PutObjectPolicyContext::new(
+            Some(copy_source_policy_value.as_str()),
+            metadata_directive,
+            canned_acl,
+        )
+        .with_acl_grant_headers(
+            req.policy_context.grant_read,
+            req.policy_context.grant_write,
+            req.policy_context.grant_read_acp,
+            req.policy_context.grant_write_acp,
+            req.policy_context.grant_full_control,
+        )
+        .with_request_object_tags_xml(request_object_tags_xml);
+        let dst_policy_context = req
+            .destination_encryption
+            .with_policy_context(copy_policy_context);
+        let destination = self.authorize_put_object_write(&AuthorizePutObjectRequest {
+            object: ObjectRequest::new(
+                dst_bucket,
+                dst_key,
+                requester.clone(),
+                req.expected_bucket_owner(),
+            ),
+            acl,
+            policy_context: dst_policy_context,
+            object_lock: req.object_lock,
+            tags: request_object_tags_xml,
+            encryption: req.destination_encryption,
+        })?;
+        let source = self.lock_object_for_authorized_read_with_policy(
+            requester,
+            src_bucket,
+            src_key,
+            src_version_id,
+            Self::get_object_policy_action(src_version_id),
+            req.source.expected_bucket_owner(),
+        )?;
+
+        Ok(AuthorizedCopyObject {
+            source,
+            destination,
+        })
+    }
+
     pub(super) fn lock_object_for_authorized_read<'a>(
         &'a self,
         requester: &Requester,
