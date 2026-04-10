@@ -2236,6 +2236,54 @@ impl Coordinator {
         })
     }
 
+    pub(super) fn authorize_list_objects_v2(
+        &self,
+        req: &ListObjectsV2Request<'_>,
+    ) -> Result<AuthorizedListObjectsV2, ServerError> {
+        let bucket_info =
+            self.checked_active_bucket_summary(req.bucket.name, req.expected_bucket_owner())?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        if !Self::requester_can_list_bucket_with_bucket_policy(
+            &req.bucket.requester,
+            &bucket_info,
+            bucket_policy.as_deref(),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedListObjectsV2 {
+            bucket_info: bucket_info.into_inner(),
+        })
+    }
+
+    pub(super) fn authorize_list_buckets(
+        &self,
+        req: &ListBucketsRequest,
+    ) -> Result<AuthorizedListBuckets, ServerError> {
+        Ok(AuthorizedListBuckets {
+            owner_principal: Self::requester_principal_required(&req.requester)?.to_string(),
+        })
+    }
+
+    pub(super) fn authorize_list_object_versions(
+        &self,
+        req: &ListObjectVersionsRequest<'_>,
+    ) -> Result<AuthorizedListObjectVersions, ServerError> {
+        let bucket_info = self.authorize_bucket_read_for(&req.bucket)?;
+        Ok(AuthorizedListObjectVersions {
+            bucket_info: bucket_info.into_inner(),
+        })
+    }
+
+    pub(super) fn authorize_list_multipart_uploads(
+        &self,
+        req: &ListMultipartUploadsRequest<'_>,
+    ) -> Result<AuthorizedListMultipartUploads, ServerError> {
+        let _bucket_info = self.authorize_bucket_read_for(&req.bucket)?;
+        Ok(AuthorizedListMultipartUploads {
+            bucket: req.bucket.name.to_string(),
+        })
+    }
+
     pub(super) fn authorize_put_bucket_object_lock_configuration(
         &self,
         req: &PutBucketObjectLockConfigurationRequest<'_>,

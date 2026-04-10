@@ -412,6 +412,26 @@ struct AuthorizedListParts<'a> {
     meta_pg: MutexGuard<'a, storage::PgStore>,
 }
 
+#[derive(Debug)]
+struct AuthorizedListObjectsV2 {
+    bucket_info: BucketSummary,
+}
+
+#[derive(Debug)]
+struct AuthorizedListObjectVersions {
+    bucket_info: BucketSummary,
+}
+
+#[derive(Debug)]
+struct AuthorizedListMultipartUploads {
+    bucket: String,
+}
+
+#[derive(Debug)]
+struct AuthorizedListBuckets {
+    owner_principal: String,
+}
+
 enum AuthorizedDeleteObject<'a> {
     UnversionedMissing,
     UnversionedStored {
@@ -6201,11 +6221,11 @@ impl Coordinator {
         req: &ListBucketsRequest,
     ) -> Result<Vec<BucketSummary>, ServerError> {
         observability::trace_scope!(TRACE_TARGET, "Coordinator::list_buckets");
-        let owner_principal = Self::requester_principal_required(&req.requester)?;
+        let AuthorizedListBuckets { owner_principal } = self.authorize_list_buckets(req)?;
         let mut out = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
-            let mut buckets = pg.list_buckets(owner_principal)?;
+            let mut buckets = pg.list_buckets(owner_principal.as_str())?;
             out.extend(buckets.drain(..).map(Self::bucket_summary));
             Ok::<(), ServerError>(())
         })?;
@@ -11256,16 +11276,7 @@ impl Coordinator {
         let delimiter = req.delimiter;
         let continuation_token = req.continuation_token;
         let max_keys = req.max_keys.min(S3_MAX_LIST_KEYS);
-        let bucket_info =
-            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !Self::requester_can_list_bucket_with_bucket_policy(
-            &req.bucket.requester,
-            &bucket_info,
-            bucket_policy.as_deref(),
-        ) {
-            return Err(ServerError::AccessDenied);
-        }
+        let AuthorizedListObjectsV2 { bucket_info } = self.authorize_list_objects_v2(req)?;
         let owner_principal = bucket_info.owner_principal.clone();
         let owner_canonical_id = bucket_info.owner_canonical_id.clone();
 
@@ -11548,7 +11559,8 @@ impl Coordinator {
         let prefix = req.prefix;
         let key_marker = req.key_marker;
         let version_id_marker = req.version_id_marker;
-        let bucket_info = self.authorize_bucket_read_for(&req.bucket)?;
+        let AuthorizedListObjectVersions { bucket_info } =
+            self.authorize_list_object_versions(req)?;
         let owner_principal = bucket_info.owner_principal.clone();
         let owner_canonical_id = bucket_info.owner_canonical_id.clone();
 
@@ -12657,12 +12669,12 @@ impl Coordinator {
             req.bucket.name,
             req.max_uploads
         );
-        let bucket = req.bucket.name;
         let prefix = req.prefix;
         let key_marker = req.key_marker;
         let upload_id_marker = req.upload_id_marker;
         let max_uploads = req.max_uploads;
-        let _bucket_info = self.authorize_bucket_read_for(&req.bucket)?;
+        let AuthorizedListMultipartUploads { bucket } =
+            self.authorize_list_multipart_uploads(req)?;
 
         if max_uploads == 0 {
             return Ok(ListMultipartUploadsResult {
@@ -12682,7 +12694,7 @@ impl Coordinator {
             }
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: BucketName::from(bucket),
+                bucket: BucketName::from(bucket.as_str()),
                 prefix: prefix.map(ObjectKey::from),
                 key_marker: key_marker.map(ObjectKey::from),
                 upload_id_marker: upload_id_marker.map(UploadId::from),
@@ -14533,6 +14545,19 @@ mod tests {
 
         let err = coord
             .list_buckets(&ListBucketsRequest {
+                requester: Requester::anonymous(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn authorize_list_buckets_rejects_anonymous() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        let err = coord
+            .authorize_list_buckets(&ListBucketsRequest {
                 requester: Requester::anonymous(),
             })
             .unwrap_err();
@@ -27023,6 +27048,58 @@ mod tests {
     }
 
     #[test]
+    fn authorize_list_objects_v2_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .authorize_list_objects_v2(&ListObjectsV2Request {
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn authorize_list_objects_v2_allows_explicit_bucket_policy_allow() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(&coord,
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
+                test_helpers::requester("owner-a"), None)
+            .unwrap();
+
+        coord
+            .authorize_list_objects_v2(&ListObjectsV2Request {
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                prefix: None,
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 1000,
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn list_objects_allows_explicit_bucket_policy_allow() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -27072,6 +27149,30 @@ mod tests {
             .unwrap();
         assert_eq!(result.objects.len(), 1);
         assert_eq!(result.objects[0].key, "key");
+    }
+
+    #[test]
+    fn authorize_list_object_versions_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .authorize_list_object_versions(&ListObjectVersionsRequest {
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 1000,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
     }
 
     #[test]
@@ -34522,6 +34623,30 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketNotFound { .. }));
+    }
+
+    #[test]
+    fn authorize_list_multipart_uploads_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .authorize_list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 1000,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
     }
 
     #[test]
