@@ -682,31 +682,23 @@ impl Coordinator {
         policy: Option<&auth::BucketPolicy>,
         default_allowed: bool,
     ) -> Result<bool, ServerError> {
-        Ok(
-            match Self::bucket_policy_decision_for_put_object_action(
-                requester,
-                bucket,
-                key,
-                action,
-                policy_context,
-                policy,
-            )? {
-                auth::PolicyEvaluation::ExplicitDeny => false,
-                auth::PolicyEvaluation::ExplicitAllow
-                    if Self::bucket_policy_allow_survives_restrict_public_buckets(
-                        requester, bucket,
-                    ) =>
-                {
-                    true
-                }
-                auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
-                    default_allowed
-                }
-            },
-        )
+        let decision = Self::bucket_policy_decision_for_put_object_action(
+            requester,
+            bucket,
+            key,
+            action,
+            policy_context,
+            policy,
+        )?;
+        Ok(Self::bucket_policy_allows_with_fallback(
+            requester,
+            bucket,
+            decision,
+            || default_allowed,
+        ))
     }
 
-    fn object_policy_allows<F>(
+    fn bucket_policy_allows_with_fallback<F>(
         requester: &Requester,
         bucket: &BucketSummary,
         decision: auth::PolicyEvaluation,
@@ -728,6 +720,31 @@ impl Coordinator {
         }
     }
 
+    fn requester_can_object_action_with_bucket_policy<F>(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy_context: PutObjectPolicyContext<'_>,
+        policy: Option<&auth::BucketPolicy>,
+        fallback: F,
+    ) -> Result<bool, ServerError>
+    where
+        F: FnOnce() -> bool,
+    {
+        let decision = Self::bucket_policy_decision_for_object(
+            requester,
+            bucket,
+            object,
+            action,
+            policy_context,
+            policy,
+        )?;
+        Ok(Self::bucket_policy_allows_with_fallback(
+            requester, bucket, decision, fallback,
+        ))
+    }
+
     pub(super) fn requester_can_read_object_with_bucket_policy(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -735,20 +752,15 @@ impl Coordinator {
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
-        let decision = Self::bucket_policy_decision_for_object(
+        Self::requester_can_object_action_with_bucket_policy(
             requester,
             bucket,
             object,
             action,
             PutObjectPolicyContext::default(),
             policy,
-        )?;
-        Ok(Self::object_policy_allows(
-            requester,
-            bucket,
-            decision,
             || Self::requester_can_read_object(requester, bucket, object),
-        ))
+        )
     }
 
     pub(super) fn requester_can_manage_object_tags_with_bucket_policy(
@@ -759,20 +771,15 @@ impl Coordinator {
         request_object_tags_xml: Option<&str>,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
-        let decision = Self::bucket_policy_decision_for_object(
+        Self::requester_can_object_action_with_bucket_policy(
             requester,
             bucket,
             object,
             action,
             PutObjectPolicyContext::default().with_request_object_tags_xml(request_object_tags_xml),
             policy,
-        )?;
-        Ok(Self::object_policy_allows(
-            requester,
-            bucket,
-            decision,
             || Self::requester_can_manage_object_tags(requester, bucket, object),
-        ))
+        )
     }
 
     pub(super) fn requester_can_manage_object_lock_with_bucket_policy(
@@ -782,20 +789,15 @@ impl Coordinator {
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
-        let decision = Self::bucket_policy_decision_for_object(
+        Self::requester_can_object_action_with_bucket_policy(
             requester,
             bucket,
             object,
             action,
             PutObjectPolicyContext::default(),
             policy,
-        )?;
-        Ok(Self::object_policy_allows(
-            requester,
-            bucket,
-            decision,
             || Self::requester_can_bucket_admin(requester, &bucket.owner_principal),
-        ))
+        )
     }
 
     pub(super) fn requester_can_delete_object_with_bucket_policy(
@@ -818,7 +820,7 @@ impl Coordinator {
             None => Self::bucket_policy_decision_for_key(requester, bucket, key, action, policy),
         };
 
-        Ok(Self::object_policy_allows(
+        Ok(Self::bucket_policy_allows_with_fallback(
             requester,
             bucket,
             decision,
@@ -840,20 +842,15 @@ impl Coordinator {
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
-        let decision = Self::bucket_policy_decision_for_object(
+        Self::requester_can_object_action_with_bucket_policy(
             requester,
             bucket,
             object,
             action,
             PutObjectPolicyContext::default(),
             policy,
-        )?;
-        Ok(Self::object_policy_allows(
-            requester,
-            bucket,
-            decision,
             || Self::requester_can_read_object_acl(requester, bucket, object),
-        ))
+        )
     }
 
     pub(super) fn requester_can_write_object_acl_with_bucket_policy(
@@ -864,20 +861,15 @@ impl Coordinator {
         policy_context: PutObjectPolicyContext<'_>,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
-        let decision = Self::bucket_policy_decision_for_object(
+        Self::requester_can_object_action_with_bucket_policy(
             requester,
             bucket,
             object,
             action,
             policy_context,
             policy,
-        )?;
-        Ok(Self::object_policy_allows(
-            requester,
-            bucket,
-            decision,
             || Self::requester_can_write_object_acl(requester, bucket, object),
-        ))
+        )
     }
 
     pub(super) fn requester_can_put_object_with_bucket_policy(
@@ -954,19 +946,8 @@ impl Coordinator {
         policy: Option<&auth::BucketPolicy>,
         default_allowed: bool,
     ) -> bool {
-        match Self::bucket_policy_decision_for_bucket(requester, bucket, action, policy) {
-            auth::PolicyEvaluation::ExplicitDeny => false,
-            auth::PolicyEvaluation::ExplicitAllow
-                if Self::bucket_policy_allow_survives_restrict_public_buckets(
-                    requester, bucket,
-                ) =>
-            {
-                true
-            }
-            auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
-                default_allowed
-            }
-        }
+        let decision = Self::bucket_policy_decision_for_bucket(requester, bucket, action, policy);
+        Self::bucket_policy_allows_with_fallback(requester, bucket, decision, || default_allowed)
     }
 
     pub(super) fn requester_can_get_bucket_policy_status_with_bucket_policy(
@@ -2470,27 +2451,14 @@ impl Coordinator {
         object: &StoredObject,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
-        Ok(
-            match Self::bucket_policy_decision_for_object(
-                requester,
-                bucket,
-                object,
-                auth::PolicyAction::BypassGovernanceRetention,
-                PutObjectPolicyContext::default(),
-                policy,
-            )? {
-                auth::PolicyEvaluation::ExplicitDeny => false,
-                auth::PolicyEvaluation::ExplicitAllow
-                    if Self::bucket_policy_allow_survives_restrict_public_buckets(
-                        requester, bucket,
-                    ) =>
-                {
-                    true
-                }
-                auth::PolicyEvaluation::ExplicitAllow | auth::PolicyEvaluation::NoMatch => {
-                    Self::requester_can_bypass_governance_retention(requester, bucket)
-                }
-            },
+        Self::requester_can_object_action_with_bucket_policy(
+            requester,
+            bucket,
+            object,
+            auth::PolicyAction::BypassGovernanceRetention,
+            PutObjectPolicyContext::default(),
+            policy,
+            || Self::requester_can_bypass_governance_retention(requester, bucket),
         )
     }
 
