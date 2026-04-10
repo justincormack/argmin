@@ -269,6 +269,28 @@ struct AuthorizedDeleteBucketEncryption {
 }
 
 #[derive(Debug)]
+struct AuthorizedCreateBucket {
+    name: String,
+    requester: Requester,
+    owner: OwnerIdentity,
+    locked_to_account_region: bool,
+    acl: CreateBucketAcl,
+    ownership: BucketObjectOwnership,
+    object_lock_enabled: bool,
+    acl_grants: AclGrants,
+}
+
+#[derive(Debug)]
+struct AuthorizedHeadBucket {
+    bucket_info: BucketSummary,
+}
+
+#[derive(Debug)]
+struct AuthorizedDeleteBucket {
+    name: String,
+}
+
+#[derive(Debug)]
 struct AuthorizedGetBucketObjectLockConfiguration {
     config: BucketObjectLockConfig,
 }
@@ -5895,57 +5917,38 @@ impl Coordinator {
             req.name,
             req.object_lock_enabled
         );
-        let owner_account = req.requester.account().ok_or(ServerError::AccessDenied)?;
-        let locked_to_account_region =
-            self.validate_create_bucket_namespace(req.name, req.namespace, owner_account)?;
-        if req.ownership == BucketObjectOwnership::BucketOwnerEnforced && req.acl.is_explicit() {
-            return Err(ServerError::InvalidBucketAclWithObjectOwnership);
-        }
-        let owner = OwnerIdentity::new(
-            owner_account.principal(),
-            owner_account.canonical_user_id().clone(),
-        );
-        let acl_grants = match &req.acl {
-            CreateBucketAcl::DefaultPrivate => Self::owner_full_control_grants(&owner),
-            CreateBucketAcl::Canned(acl) => Self::bucket_acl_grants_from_canned(&owner, *acl)?,
-            CreateBucketAcl::Grants(acl_grants) => {
-                Self::ensure_supported_bucket_acl_grants(acl_grants)?;
-                acl_grants.clone()
-            }
-        };
-        if Self::acl_grants_grant_public_read(&acl_grants)
-            || Self::acl_grants_grant_public_write(&acl_grants)
-        {
-            return Err(ServerError::InvalidBucketAclWithBlockPublicAccessError);
-        }
+        let authorized = self.authorize_create_bucket(req)?;
 
         let create_outcome = self.create_bucket_with_acl_grants(
-            &owner,
-            req.name,
-            acl_grants,
-            req.object_lock_enabled,
+            &authorized.owner,
+            &authorized.name,
+            authorized.acl_grants,
+            authorized.object_lock_enabled,
         )?;
         match create_outcome {
             BucketCreateOutcome::Created => {
                 self.put_bucket_ownership_controls(&PutBucketConfigRequest {
                     bucket: BucketRequest {
-                        name: req.name,
-                        requester: req.requester.clone(),
+                        name: &authorized.name,
+                        requester: authorized.requester.clone(),
                         expected_bucket_owner: None,
                     },
-                    config: &Self::ownership_controls_xml(req.ownership),
+                    config: &Self::ownership_controls_xml(authorized.ownership),
                 })
             }
             BucketCreateOutcome::AlreadyOwned => {
-                if locked_to_account_region
+                if authorized.locked_to_account_region
                     || !s3_types::is_legacy_create_bucket_region(&self.region)
                 {
                     return Err(ServerError::BucketAlreadyOwnedByYou);
                 }
-                let existing = self.unchecked_active_bucket_summary(req.name)?;
-                let authorized =
-                    self.resolve_create_bucket_recreate_acl_update(&existing, &owner, &req.acl)?;
-                self.apply_authorized_bucket_acl_update(&authorized)
+                let existing = self.unchecked_active_bucket_summary(&authorized.name)?;
+                let authorized_acl = self.resolve_create_bucket_recreate_acl_update(
+                    &existing,
+                    &authorized.owner,
+                    &authorized.acl,
+                )?;
+                self.apply_authorized_bucket_acl_update(&authorized_acl)
             }
         }
     }
@@ -6127,8 +6130,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let name = req.name;
-        let _bucket_info = self.authorize_bucket_admin_for(req)?;
+        let AuthorizedDeleteBucket { name } = self.authorize_delete_bucket(req)?;
+        let name = name.as_str();
         self.begin_bucket_write_drain(name)?;
 
         let mut marked_deleting = false;
@@ -6198,8 +6201,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        self.authorize_bucket_read_for(req)
-            .map(ValidatedBucket::into_inner)
+        let AuthorizedHeadBucket { bucket_info } = self.authorize_head_bucket(req)?;
+        Ok(bucket_info)
     }
 
     pub fn bucket_exists(&self, name: &str) -> Result<bool, ServerError> {
@@ -14477,6 +14480,45 @@ mod tests {
             .create_bucket_for_owner("owner-b", "bucket", false)
             .unwrap_err();
         assert!(matches!(err, ServerError::BucketAlreadyExists));
+    }
+
+    #[test]
+    fn authorize_create_bucket_rejects_anonymous() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        let err = coord
+            .authorize_create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::anonymous(),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn authorize_create_bucket_rejects_explicit_private_with_owner_enforced() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        let err = coord
+            .authorize_create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::Canned(BucketAcl::Private),
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::InvalidBucketAclWithObjectOwnership
+        ));
     }
 
     #[test]
@@ -26945,6 +26987,24 @@ mod tests {
     }
 
     #[test]
+    fn authorize_head_bucket_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .authorize_head_bucket(&bucket_request_with_expected_owner(
+                "bucket",
+                test_helpers::requester("owner-b"),
+                None,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
     fn head_bucket_allows_matching_expected_bucket_owner() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -27236,6 +27296,24 @@ mod tests {
                 requester: test_helpers::requester("other-user"),
                 expected_bucket_owner: None,
             })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn authorize_delete_bucket_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let err = coord
+            .authorize_delete_bucket(&bucket_request_with_expected_owner(
+                "bucket",
+                test_helpers::requester("owner-b"),
+                None,
+            ))
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }

@@ -1857,6 +1857,65 @@ impl Coordinator {
         )
     }
 
+    pub(super) fn authorize_create_bucket(
+        &self,
+        req: &CreateBucketRequest<'_>,
+    ) -> Result<AuthorizedCreateBucket, ServerError> {
+        let owner_account = req.requester.account().ok_or(ServerError::AccessDenied)?;
+        let locked_to_account_region =
+            self.validate_create_bucket_namespace(req.name, req.namespace, owner_account)?;
+        if req.ownership == BucketObjectOwnership::BucketOwnerEnforced && req.acl.is_explicit() {
+            return Err(ServerError::InvalidBucketAclWithObjectOwnership);
+        }
+        let owner = OwnerIdentity::new(
+            owner_account.principal(),
+            owner_account.canonical_user_id().clone(),
+        );
+        let acl_grants = match &req.acl {
+            CreateBucketAcl::DefaultPrivate => Self::owner_full_control_grants(&owner),
+            CreateBucketAcl::Canned(acl) => Self::bucket_acl_grants_from_canned(&owner, *acl)?,
+            CreateBucketAcl::Grants(acl_grants) => {
+                Self::ensure_supported_bucket_acl_grants(acl_grants)?;
+                acl_grants.clone()
+            }
+        };
+        if Self::acl_grants_grant_public_read(&acl_grants)
+            || Self::acl_grants_grant_public_write(&acl_grants)
+        {
+            return Err(ServerError::InvalidBucketAclWithBlockPublicAccessError);
+        }
+        Ok(AuthorizedCreateBucket {
+            name: req.name.to_string(),
+            requester: req.requester.clone(),
+            owner,
+            locked_to_account_region,
+            acl: req.acl.clone(),
+            ownership: req.ownership,
+            object_lock_enabled: req.object_lock_enabled,
+            acl_grants,
+        })
+    }
+
+    pub(super) fn authorize_head_bucket(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedHeadBucket, ServerError> {
+        let info = self.authorize_bucket_read_for(req)?;
+        Ok(AuthorizedHeadBucket {
+            bucket_info: info.into_inner(),
+        })
+    }
+
+    pub(super) fn authorize_delete_bucket(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedDeleteBucket, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_for(req)?;
+        Ok(AuthorizedDeleteBucket {
+            name: req.name.to_string(),
+        })
+    }
+
     pub(super) fn authorize_put_bucket_cors(
         &self,
         req: &PutBucketConfigRequest<'_>,
