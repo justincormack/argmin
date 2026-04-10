@@ -1525,22 +1525,18 @@ pub struct BucketInfo {
     pub public_write: bool,
     pub write_reservations_blocked: bool,
     pub active_write_reservations: u32,
-    /// Serialized CORS configuration XML (None = no CORS config).
-    pub cors_config: Option<String>,
-    /// Serialized tagging XML (None = no tags).
-    pub tags: Option<SerializedTagSet>,
     /// Serialized public access block configuration XML (None = no config).
     pub public_access_block: Option<String>,
     /// Ownership controls value (None = not set).
     pub ownership_controls: Option<String>,
-    /// Original bucket policy JSON document (None = no policy).
-    pub bucket_policy: Option<String>,
+    /// Whether a bucket policy subresource is currently stored.
+    pub bucket_policy_present: bool,
     /// Whether the stored bucket policy is classified as public.
     pub bucket_policy_public: bool,
     /// Monotonic generation incremented on every bucket policy update/delete.
     pub bucket_policy_generation: u64,
-    /// Canonical lifecycle configuration XML (None = no lifecycle config).
-    pub bucket_lifecycle: Option<String>,
+    /// Whether a lifecycle configuration subresource is currently stored.
+    pub bucket_lifecycle_present: bool,
     /// Monotonic generation incremented on every lifecycle update/delete.
     pub bucket_lifecycle_generation: u64,
     /// Effective bucket encryption semantics used on hot paths.
@@ -1570,11 +1566,6 @@ impl std::fmt::Debug for BucketInfo {
             )
             .field("active_write_reservations", &self.active_write_reservations)
             .field(
-                "cors_config_len",
-                &self.cors_config.as_ref().map(String::len),
-            )
-            .field("tags", &self.tags)
-            .field(
                 "public_access_block_len",
                 &self.public_access_block.as_ref().map(String::len),
             )
@@ -1582,16 +1573,10 @@ impl std::fmt::Debug for BucketInfo {
                 "ownership_controls_len",
                 &self.ownership_controls.as_ref().map(String::len),
             )
-            .field(
-                "bucket_policy_len",
-                &self.bucket_policy.as_ref().map(String::len),
-            )
+            .field("bucket_policy_present", &self.bucket_policy_present)
             .field("bucket_policy_public", &self.bucket_policy_public)
             .field("bucket_policy_generation", &self.bucket_policy_generation)
-            .field(
-                "bucket_lifecycle_len",
-                &self.bucket_lifecycle.as_ref().map(String::len),
-            )
+            .field("bucket_lifecycle_present", &self.bucket_lifecycle_present)
             .field(
                 "bucket_lifecycle_generation",
                 &self.bucket_lifecycle_generation,
@@ -1730,10 +1715,10 @@ impl From<BucketInfo> for BucketFastPathInfo {
             public_write: info.public_write,
             public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls,
-            bucket_policy_present: info.bucket_policy.is_some(),
+            bucket_policy_present: info.bucket_policy_present,
             bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
-            bucket_lifecycle_present: info.bucket_lifecycle.is_some(),
+            bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
             encryption: info.encryption,
         }
@@ -1755,10 +1740,10 @@ impl From<&BucketInfo> for BucketFastPathInfo {
             public_write: info.public_write,
             public_access_block: info.public_access_block.clone(),
             ownership_controls: info.ownership_controls.clone(),
-            bucket_policy_present: info.bucket_policy.is_some(),
+            bucket_policy_present: info.bucket_policy_present,
             bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
-            bucket_lifecycle_present: info.bucket_lifecycle.is_some(),
+            bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
             encryption: info.encryption,
         }
@@ -2434,27 +2419,21 @@ mod tests {
             public_write: false,
             write_reservations_blocked: false,
             active_write_reservations: 0,
-            cors_config: Some("<CORS>secret</CORS>".to_string()),
-            tags: Some(SerializedTagSet::from("<Tagging>secret-tag</Tagging>")),
             public_access_block: Some("<PublicAccessBlock>secret</PublicAccessBlock>".to_string()),
             ownership_controls: Some("<OwnershipControls>secret</OwnershipControls>".to_string()),
-            bucket_policy: Some("{\"Statement\":\"secret-policy\"}".to_string()),
+            bucket_policy_present: true,
             bucket_policy_public: false,
             bucket_policy_generation: 7,
-            bucket_lifecycle: Some(
-                "<LifecycleConfiguration>secret</LifecycleConfiguration>".to_string(),
-            ),
+            bucket_lifecycle_present: true,
             bucket_lifecycle_generation: 8,
             encryption: EffectiveBucketEncryptionConfig::default(),
         };
         let debug = format!("{info:?}");
         assert!(debug.contains(r#""own\ner""#));
-        assert!(debug.contains("cors_config_len"));
-        assert!(debug.contains("bucket_policy_len"));
-        assert!(debug.contains("bucket_lifecycle_len"));
+        assert!(debug.contains("bucket_policy_present"));
+        assert!(debug.contains("bucket_lifecycle_present"));
         assert!(!debug.contains("secret-policy"));
-        assert!(!debug.contains("<CORS>secret</CORS>"));
-        assert!(!debug.contains("secret-tag"));
+        assert!(!debug.contains("<LifecycleConfiguration>secret</LifecycleConfiguration>"));
 
         let fast_debug = format!("{:?}", BucketFastPathInfo::from(&info));
         assert!(fast_debug.contains(r#""own\ner""#));

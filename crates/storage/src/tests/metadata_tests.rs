@@ -690,46 +690,81 @@ fn file_bucket_metadata_config_roundtrip() {
         )
         .unwrap();
 
-    store.put_bucket_cors("bucket", "<Cors/>").unwrap();
-    assert_eq!(
-        store.get_bucket_cors("bucket").unwrap(),
-        Some("<Cors/>".to_string())
-    );
-    store.delete_bucket_cors("bucket").unwrap();
-    assert_eq!(store.get_bucket_cors("bucket").unwrap(), None);
+    for kind in [BucketSubresourceKind::Cors, BucketSubresourceKind::Tagging] {
+        let body = match kind {
+            BucketSubresourceKind::Cors => "<Cors/>",
+            BucketSubresourceKind::Tagging => "<Tagging/>",
+            _ => unreachable!(),
+        };
+        store
+            .put_bucket_subresource(
+                "bucket",
+                PutBucketSubresource {
+                    kind,
+                    body,
+                    aux: BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_bucket_subresource("bucket", kind)
+                .unwrap()
+                .map(|stored| stored.body),
+            Some(body.to_string())
+        );
+        store.delete_bucket_subresource("bucket", kind).unwrap();
+        assert_eq!(store.get_bucket_subresource("bucket", kind).unwrap(), None);
+    }
 
-    store.put_bucket_tags("bucket", "<Tagging/>").unwrap();
-    assert_eq!(
-        store.get_bucket_tags("bucket").unwrap(),
-        Some("<Tagging/>".to_string())
-    );
-    store.delete_bucket_tags("bucket").unwrap();
-    assert_eq!(store.get_bucket_tags("bucket").unwrap(), None);
+    for kind in [
+        BucketSubresourceKind::PublicAccessBlock,
+        BucketSubresourceKind::OwnershipControls,
+    ] {
+        let body = match kind {
+            BucketSubresourceKind::PublicAccessBlock => "<PublicAccessBlock/>",
+            BucketSubresourceKind::OwnershipControls => "<OwnershipControls/>",
+            _ => unreachable!(),
+        };
+        store
+            .put_bucket_subresource(
+                "bucket",
+                PutBucketSubresource {
+                    kind,
+                    body,
+                    aux: BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .get_bucket_subresource("bucket", kind)
+                .unwrap()
+                .map(|stored| stored.body),
+            Some(body.to_string())
+        );
+        store.delete_bucket_subresource("bucket", kind).unwrap();
+        assert_eq!(store.get_bucket_subresource("bucket", kind).unwrap(), None);
+    }
 
     store
-        .put_bucket_public_access_block("bucket", "<PublicAccessBlock/>")
+        .put_bucket_subresource(
+            "bucket",
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Policy,
+                body: "{\"Version\":\"2012-10-17\"}",
+                aux: BucketSubresourceAux::policy(true),
+            },
+        )
         .unwrap();
     assert_eq!(
-        store.get_bucket_public_access_block("bucket").unwrap(),
-        Some("<PublicAccessBlock/>".to_string())
-    );
-    store.delete_bucket_public_access_block("bucket").unwrap();
-    assert_eq!(
-        store.get_bucket_public_access_block("bucket").unwrap(),
-        None
-    );
-
-    store
-        .put_bucket_policy("bucket", "{\"Version\":\"2012-10-17\"}", true)
-        .unwrap();
-    assert_eq!(
-        store.get_bucket_policy("bucket").unwrap(),
+        store
+            .get_bucket_subresource("bucket", BucketSubresourceKind::Policy)
+            .unwrap()
+            .map(|stored| stored.body),
         Some("{\"Version\":\"2012-10-17\"}".to_string())
     );
-    assert_eq!(
-        store.head_bucket("bucket").unwrap().bucket_policy,
-        Some("{\"Version\":\"2012-10-17\"}".to_string())
-    );
+    assert!(store.head_bucket("bucket").unwrap().bucket_policy_present);
     assert!(store.head_bucket("bucket").unwrap().bucket_policy_public);
     assert_eq!(
         store
@@ -738,8 +773,16 @@ fn file_bucket_metadata_config_roundtrip() {
             .bucket_policy_generation,
         1
     );
-    store.delete_bucket_policy("bucket").unwrap();
-    assert_eq!(store.get_bucket_policy("bucket").unwrap(), None);
+    store
+        .delete_bucket_subresource("bucket", BucketSubresourceKind::Policy)
+        .unwrap();
+    assert_eq!(
+        store
+            .get_bucket_subresource("bucket", BucketSubresourceKind::Policy)
+            .unwrap(),
+        None
+    );
+    assert!(!store.head_bucket("bucket").unwrap().bucket_policy_present);
     assert!(!store.head_bucket("bucket").unwrap().bucket_policy_public);
     assert_eq!(
         store
@@ -750,15 +793,27 @@ fn file_bucket_metadata_config_roundtrip() {
     );
 
     store
-        .put_bucket_lifecycle("bucket", "<LifecycleConfiguration/>")
+        .put_bucket_subresource(
+            "bucket",
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Lifecycle,
+                body: "<LifecycleConfiguration/>",
+                aux: BucketSubresourceAux::None,
+            },
+        )
         .unwrap();
     assert_eq!(
-        store.get_bucket_lifecycle("bucket").unwrap(),
+        store
+            .get_bucket_subresource("bucket", BucketSubresourceKind::Lifecycle)
+            .unwrap()
+            .map(|stored| stored.body),
         Some("<LifecycleConfiguration/>".to_string())
     );
-    assert_eq!(
-        store.head_bucket("bucket").unwrap().bucket_lifecycle,
-        Some("<LifecycleConfiguration/>".to_string())
+    assert!(
+        store
+            .head_bucket("bucket")
+            .unwrap()
+            .bucket_lifecycle_present
     );
     assert_eq!(
         store
@@ -768,13 +823,20 @@ fn file_bucket_metadata_config_roundtrip() {
         1
     );
     store
-        .put_bucket_lifecycle(
+        .put_bucket_subresource(
             "bucket",
-            "<LifecycleConfiguration><Rule/></LifecycleConfiguration>",
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Lifecycle,
+                body: "<LifecycleConfiguration><Rule/></LifecycleConfiguration>",
+                aux: BucketSubresourceAux::None,
+            },
         )
         .unwrap();
     assert_eq!(
-        store.get_bucket_lifecycle("bucket").unwrap(),
+        store
+            .get_bucket_subresource("bucket", BucketSubresourceKind::Lifecycle)
+            .unwrap()
+            .map(|stored| stored.body),
         Some("<LifecycleConfiguration><Rule/></LifecycleConfiguration>".to_string())
     );
     assert_eq!(
@@ -784,8 +846,21 @@ fn file_bucket_metadata_config_roundtrip() {
             .bucket_lifecycle_generation,
         2
     );
-    store.delete_bucket_lifecycle("bucket").unwrap();
-    assert_eq!(store.get_bucket_lifecycle("bucket").unwrap(), None);
+    store
+        .delete_bucket_subresource("bucket", BucketSubresourceKind::Lifecycle)
+        .unwrap();
+    assert_eq!(
+        store
+            .get_bucket_subresource("bucket", BucketSubresourceKind::Lifecycle)
+            .unwrap(),
+        None
+    );
+    assert!(
+        !store
+            .head_bucket("bucket")
+            .unwrap()
+            .bucket_lifecycle_present
+    );
     assert_eq!(
         store
             .head_bucket("bucket")
@@ -796,16 +871,6 @@ fn file_bucket_metadata_config_roundtrip() {
 
     let lifecycle_buckets = store.list_buckets_with_lifecycle().unwrap();
     assert!(lifecycle_buckets.is_empty());
-
-    store
-        .put_bucket_ownership_controls("bucket", "<OwnershipControls/>")
-        .unwrap();
-    assert_eq!(
-        store.get_bucket_ownership_controls("bucket").unwrap(),
-        Some("<OwnershipControls/>".to_string())
-    );
-    store.delete_bucket_ownership_controls("bucket").unwrap();
-    assert_eq!(store.get_bucket_ownership_controls("bucket").unwrap(), None);
 
     assert_eq!(
         store.get_bucket_encryption("bucket").unwrap(),
@@ -1072,7 +1137,16 @@ fn file_bucket_subresource_generations_bump_across_overwrite_and_delete() {
         )
         .unwrap();
 
-    store.put_bucket_cors("bucket", "<Cors/>").unwrap();
+    store
+        .put_bucket_subresource(
+            "bucket",
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Cors,
+                body: "<Cors/>",
+                aux: BucketSubresourceAux::None,
+            },
+        )
+        .unwrap();
     assert_eq!(
         store
             .get_bucket_subresource("bucket", BucketSubresourceKind::Cors)
@@ -1104,7 +1178,9 @@ fn file_bucket_subresource_generations_bump_across_overwrite_and_delete() {
         }
     );
 
-    store.delete_bucket_cors("bucket").unwrap();
+    store
+        .delete_bucket_subresource("bucket", BucketSubresourceKind::Cors)
+        .unwrap();
     assert_eq!(
         store
             .get_bucket_subresource("bucket", BucketSubresourceKind::Cors)
@@ -1113,7 +1189,14 @@ fn file_bucket_subresource_generations_bump_across_overwrite_and_delete() {
     );
 
     store
-        .put_bucket_cors("bucket", "<Cors><Rule>again</Rule></Cors>")
+        .put_bucket_subresource(
+            "bucket",
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Cors,
+                body: "<Cors><Rule>again</Rule></Cors>",
+                aux: BucketSubresourceAux::None,
+            },
+        )
         .unwrap();
     assert_eq!(
         store
@@ -1142,7 +1225,14 @@ fn delete_bucket_cascades_bucket_subresources() {
         )
         .unwrap();
     store
-        .put_bucket_policy("bucket", "{\"Version\":\"2012-10-17\"}", true)
+        .put_bucket_subresource(
+            "bucket",
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Policy,
+                body: "{\"Version\":\"2012-10-17\"}",
+                aux: BucketSubresourceAux::policy(true),
+            },
+        )
         .unwrap();
     assert!(store
         .get_bucket_subresource("bucket", BucketSubresourceKind::Policy)
@@ -1185,15 +1275,24 @@ fn list_buckets_with_lifecycle_returns_only_active_lifecycle_buckets() {
             .unwrap();
     }
 
-    store
-        .put_bucket_lifecycle("alpha", "<LifecycleConfiguration/>")
-        .unwrap();
-    store
-        .put_bucket_lifecycle(
+    for (bucket, body) in [
+        ("alpha", "<LifecycleConfiguration/>"),
+        (
             "beta",
             "<LifecycleConfiguration><Rule/></LifecycleConfiguration>",
-        )
-        .unwrap();
+        ),
+    ] {
+        store
+            .put_bucket_subresource(
+                bucket,
+                PutBucketSubresource {
+                    kind: BucketSubresourceKind::Lifecycle,
+                    body,
+                    aux: BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+    }
     store.begin_bucket_write_drain("beta").unwrap();
     store.mark_bucket_deleting("beta").unwrap();
 
@@ -1261,47 +1360,42 @@ fn list_buckets_with_aborting_multipart_uploads_returns_distinct_bucket_names() 
 }
 
 #[test]
-fn file_bucket_metadata_config_on_nonexistent_bucket() {
+fn file_bucket_subresource_operations_on_nonexistent_bucket() {
     let (_dir, store) = make_pg_store();
 
-    let err = store.put_bucket_cors("nope", "<Cors/>").unwrap_err();
-    assert!(matches!(
-        err,
-        crate::error::MetadataError::BucketNotFound { .. }
-    ));
-
-    let err = store.get_bucket_tags("nope").unwrap_err();
-    assert!(matches!(
-        err,
-        crate::error::MetadataError::BucketNotFound { .. }
-    ));
-
-    let err = store.get_bucket_policy("nope").unwrap_err();
-    assert!(matches!(
-        err,
-        crate::error::MetadataError::BucketNotFound { .. }
-    ));
-
-    let err = store.delete_bucket_policy("nope").unwrap_err();
-    assert!(matches!(
-        err,
-        crate::error::MetadataError::BucketNotFound { .. }
-    ));
-
-    let err = store.get_bucket_lifecycle("nope").unwrap_err();
-    assert!(matches!(
-        err,
-        crate::error::MetadataError::BucketNotFound { .. }
-    ));
-
-    let err = store.delete_bucket_lifecycle("nope").unwrap_err();
+    let err = store
+        .put_bucket_subresource(
+            "nope",
+            PutBucketSubresource {
+                kind: BucketSubresourceKind::Cors,
+                body: "<Cors/>",
+                aux: BucketSubresourceAux::None,
+            },
+        )
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }
     ));
 
     let err = store
-        .get_bucket_subresource("nope", BucketSubresourceKind::Cors)
+        .get_bucket_subresource("nope", BucketSubresourceKind::Tagging)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+
+    let err = store
+        .get_bucket_subresource("nope", BucketSubresourceKind::Policy)
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::BucketNotFound { .. }
+    ));
+
+    let err = store
+        .delete_bucket_subresource("nope", BucketSubresourceKind::Lifecycle)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -1322,7 +1416,9 @@ fn file_bucket_metadata_config_on_nonexistent_bucket() {
         crate::error::MetadataError::BucketNotFound { .. }
     ));
 
-    let err = store.delete_bucket_public_access_block("nope").unwrap_err();
+    let err = store
+        .delete_bucket_subresource("nope", BucketSubresourceKind::PublicAccessBlock)
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }

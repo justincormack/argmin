@@ -463,7 +463,19 @@ Exit criteria:
 
 ### Phase 4: Simplify Bucket Types and Loading Paths
 
-Status: pending.
+Status: complete.
+
+Completed in this phase:
+
+1. `BucketInfo` no longer carries opaque CORS/tagging/policy/lifecycle payload
+   bodies
+2. bucket loads now expose explicit policy/lifecycle presence bits instead of
+   inferring presence from in-row payload columns
+3. `head_bucket` / `list_buckets` / `list_buckets_with_lifecycle` now load
+   typed bucket state plus summary fields only
+4. lifecycle sweep paths now load lifecycle configuration through the generic
+   bucket-subresource storage path on demand instead of depending on
+   `BucketInfo.bucket_lifecycle`
 
 After migration, clean up `BucketInfo` and related loading logic.
 
@@ -485,7 +497,20 @@ Exit criteria:
 
 ### Phase 5: Remove Obsolete Schema and APIs
 
-Status: pending.
+Status: complete.
+
+Completed in this phase:
+
+1. removed obsolete bucket payload columns from the fresh `buckets` schema:
+   `cors_config`, `tags`, `bucket_policy`, and `bucket_lifecycle`
+2. removed the corresponding legacy feature-specific `PgMetadataStore` methods
+   and `PgStore` implementations for bucket subresources
+3. removed the old bucket-policy / lifecycle additive schema migration helpers,
+   consistent with the pre-release clean-cut assumption
+4. updated storage tests to use the generic bucket-subresource API directly
+5. added a `bucket_subresources(kind, bucket_name)` index for efficient
+   lifecycle fanout after removing the old `bucket_lifecycle IS NOT NULL`
+   filter path
 
 Deliver:
 

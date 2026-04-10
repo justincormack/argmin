@@ -3314,6 +3314,41 @@ impl ReadRuntime {
         self.storage_node.enqueue_bucket_delete_finalize(bucket);
     }
 
+    fn lifecycle_config_for_bucket_info(
+        &self,
+        bucket_info: &BucketInfo,
+    ) -> Result<Option<Arc<BucketLifecycleConfiguration>>, ServerError> {
+        if !bucket_info.bucket_lifecycle_present {
+            return Ok(None);
+        }
+
+        let bucket_pg = self
+            .storage_node
+            .get_pg(self.pg_topology.bucket_pg(bucket_info.name.as_str()))?;
+        let raw_config = bucket_pg
+            .get_bucket_subresource(
+                bucket_info.name.as_str(),
+                storage::BucketSubresourceKind::Lifecycle,
+            )
+            .map_err(ServerError::Metadata)?
+            .map(|stored| stored.body);
+        drop(bucket_pg);
+
+        raw_config
+            .map(|config_xml| {
+                storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(
+                    |error| ServerError::InternalError {
+                        reason: format!(
+                            "stored lifecycle configuration for {} failed to parse at sweep time: {error}",
+                            bucket_info.name
+                        ),
+                    },
+                )
+            })
+            .transpose()
+            .map(|config| config.map(Arc::new))
+    }
+
     fn run_lifecycle_sweep_at(&self, now_millis: u64) -> Result<LifecycleSweepStats, ServerError> {
         let mut stats = LifecycleSweepStats {
             scanned_buckets: 0,
@@ -3360,18 +3395,9 @@ impl ReadRuntime {
         now_millis: u64,
         stats: &mut LifecycleSweepStats,
     ) -> Result<(), ServerError> {
-        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+        let Some(config) = self.lifecycle_config_for_bucket_info(bucket_info)? else {
             return Ok(());
         };
-        let config =
-            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
-                ServerError::InternalError {
-                    reason: format!(
-                    "stored lifecycle configuration for {} failed to parse at sweep time: {error}",
-                    bucket_info.name
-                ),
-                }
-            })?;
 
         let mut candidates = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
@@ -3464,18 +3490,9 @@ impl ReadRuntime {
         now_millis: u64,
         stats: &mut LifecycleSweepStats,
     ) -> Result<(), ServerError> {
-        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+        let Some(config) = self.lifecycle_config_for_bucket_info(bucket_info)? else {
             return Ok(());
         };
-        let config =
-            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
-                ServerError::InternalError {
-                    reason: format!(
-                    "stored lifecycle configuration for {} failed to parse at sweep time: {error}",
-                    bucket_info.name
-                ),
-                }
-            })?;
 
         let mut candidate_keys = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
@@ -3543,18 +3560,9 @@ impl ReadRuntime {
         };
         drop(bucket_pg);
 
-        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+        let Some(config) = self.lifecycle_config_for_bucket_info(&bucket_info)? else {
             return Ok(false);
         };
-        let config =
-            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
-                ServerError::InternalError {
-                    reason: format!(
-                    "stored lifecycle configuration for {} failed to parse at expiry time: {error}",
-                    bucket
-                ),
-                }
-            })?;
 
         let meta_pg = self
             .storage_node
@@ -3631,18 +3639,9 @@ impl ReadRuntime {
         };
         drop(bucket_pg);
 
-        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+        let Some(config) = self.lifecycle_config_for_bucket_info(&bucket_info)? else {
             return Ok(0);
         };
-        let config =
-            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
-                ServerError::InternalError {
-                    reason: format!(
-                    "stored lifecycle configuration for {} failed to parse at expiry time: {error}",
-                    bucket
-                ),
-                }
-            })?;
 
         let meta_pg = self
             .storage_node
@@ -3703,18 +3702,9 @@ impl ReadRuntime {
         now_millis: u64,
         stats: &mut LifecycleSweepStats,
     ) -> Result<(), ServerError> {
-        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+        let Some(config) = self.lifecycle_config_for_bucket_info(bucket_info)? else {
             return Ok(());
         };
-        let config =
-            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
-                ServerError::InternalError {
-                    reason: format!(
-                    "stored lifecycle configuration for {} failed to parse at sweep time: {error}",
-                    bucket_info.name
-                ),
-                }
-            })?;
 
         let mut candidates = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
@@ -3783,18 +3773,9 @@ impl ReadRuntime {
         };
         drop(bucket_pg);
 
-        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+        let Some(config) = self.lifecycle_config_for_bucket_info(&bucket_info)? else {
             return Ok(false);
         };
-        let config =
-            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
-                ServerError::InternalError {
-                    reason: format!(
-                    "stored lifecycle configuration for {} failed to parse at expiry time: {error}",
-                    bucket
-                ),
-                }
-            })?;
 
         let meta_pg = self
             .storage_node
@@ -3823,18 +3804,9 @@ impl ReadRuntime {
         now_millis: u64,
         stats: &mut LifecycleSweepStats,
     ) -> Result<(), ServerError> {
-        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+        let Some(config) = self.lifecycle_config_for_bucket_info(bucket_info)? else {
             return Ok(());
         };
-        let config =
-            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
-                ServerError::InternalError {
-                    reason: format!(
-                    "stored lifecycle configuration for {} failed to parse at sweep time: {error}",
-                    bucket_info.name
-                ),
-                }
-            })?;
 
         let mut candidates = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
@@ -3919,18 +3891,9 @@ impl ReadRuntime {
             return Ok(false);
         }
 
-        let Some(config_xml) = bucket_info.bucket_lifecycle.as_deref() else {
+        let Some(config) = self.lifecycle_config_for_bucket_info(&bucket_info)? else {
             return Ok(false);
         };
-        let config =
-            storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(|error| {
-                ServerError::InternalError {
-                    reason: format!(
-                    "stored lifecycle configuration for {} failed to parse at abort time: {error}",
-                    bucket
-                ),
-                }
-            })?;
 
         let Some(headers) = Coordinator::evaluate_multipart_lifecycle_abort_headers(
             &config,
@@ -5326,22 +5289,26 @@ impl Coordinator {
     }
 
     fn bucket_summary(info: BucketInfo) -> BucketSummary {
+        Self::bucket_summary_ref(&info)
+    }
+
+    fn bucket_summary_ref(info: &BucketInfo) -> BucketSummary {
         BucketSummary {
-            name: info.name.into_string(),
-            owner_principal: info.owner_principal,
-            owner_canonical_id: info.owner_canonical_id,
+            name: info.name.to_string(),
+            owner_principal: info.owner_principal.clone(),
+            owner_canonical_id: info.owner_canonical_id.clone(),
             created_at: info.created_at,
-            acl_grants: info.acl_grants,
+            acl_grants: info.acl_grants.clone(),
             public_read: info.public_read,
             public_write: info.public_write,
             versioning: info.versioning,
             object_lock: info.object_lock,
-            public_access_block: info.public_access_block,
-            ownership_controls: info.ownership_controls,
-            bucket_policy_present: info.bucket_policy.is_some(),
+            public_access_block: info.public_access_block.clone(),
+            ownership_controls: info.ownership_controls.clone(),
+            bucket_policy_present: info.bucket_policy_present,
             bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
-            bucket_lifecycle_present: info.bucket_lifecycle.is_some(),
+            bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
             encryption: info.encryption,
         }

@@ -107,57 +107,6 @@ pub trait PgMetadataStore {
         config: BucketObjectLockConfig,
     ) -> Result<(), MetadataError>;
 
-    /// Store a CORS configuration for a bucket (serialized XML string).
-    fn put_bucket_cors(&self, name: &str, config: &str) -> Result<(), MetadataError>;
-
-    /// Retrieve a bucket's CORS configuration. Returns None if not set.
-    fn get_bucket_cors(&self, name: &str) -> Result<Option<String>, MetadataError>;
-
-    /// Delete a bucket's CORS configuration. Idempotent.
-    fn delete_bucket_cors(&self, name: &str) -> Result<(), MetadataError>;
-
-    /// Store tags for a bucket (serialized XML string).
-    fn put_bucket_tags(&self, name: &str, tags: &str) -> Result<(), MetadataError>;
-
-    /// Retrieve a bucket's tags. Returns None if not set.
-    fn get_bucket_tags(&self, name: &str) -> Result<Option<String>, MetadataError>;
-
-    /// Delete a bucket's tags. Idempotent.
-    fn delete_bucket_tags(&self, name: &str) -> Result<(), MetadataError>;
-
-    /// Store a public access block configuration for a bucket (serialized XML string).
-    fn put_bucket_public_access_block(&self, name: &str, config: &str)
-        -> Result<(), MetadataError>;
-
-    /// Retrieve a bucket's public access block configuration. Returns None if not set.
-    fn get_bucket_public_access_block(&self, name: &str) -> Result<Option<String>, MetadataError>;
-
-    /// Delete a bucket's public access block configuration. Idempotent.
-    fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError>;
-
-    /// Store a bucket policy document and its derived public/non-public summary.
-    fn put_bucket_policy(
-        &self,
-        name: &str,
-        policy: &str,
-        is_public: bool,
-    ) -> Result<(), MetadataError>;
-
-    /// Retrieve a bucket's policy document. Returns None if not set.
-    fn get_bucket_policy(&self, name: &str) -> Result<Option<String>, MetadataError>;
-
-    /// Delete a bucket's policy document. Idempotent.
-    fn delete_bucket_policy(&self, name: &str) -> Result<(), MetadataError>;
-
-    /// Replace a bucket's lifecycle configuration XML.
-    fn put_bucket_lifecycle(&self, name: &str, config: &str) -> Result<(), MetadataError>;
-
-    /// Retrieve a bucket's lifecycle configuration XML. Returns None if not set.
-    fn get_bucket_lifecycle(&self, name: &str) -> Result<Option<String>, MetadataError>;
-
-    /// Delete a bucket's lifecycle configuration. Idempotent.
-    fn delete_bucket_lifecycle(&self, name: &str) -> Result<(), MetadataError>;
-
     /// Update a bucket's public ACL flags.
     fn put_bucket_acl(
         &self,
@@ -166,15 +115,6 @@ pub trait PgMetadataStore {
         public_read: bool,
         public_write: bool,
     ) -> Result<(), MetadataError>;
-
-    /// Store ownership controls for a bucket.
-    fn put_bucket_ownership_controls(&self, name: &str, config: &str) -> Result<(), MetadataError>;
-
-    /// Retrieve a bucket's ownership controls. Returns None if not set.
-    fn get_bucket_ownership_controls(&self, name: &str) -> Result<Option<String>, MetadataError>;
-
-    /// Delete a bucket's ownership controls. Idempotent.
-    fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError>;
 
     /// Store an opaque bucket subresource with typed auxiliary summary data.
     ///

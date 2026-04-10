@@ -367,14 +367,10 @@ CREATE TABLE IF NOT EXISTS buckets (
     public_write     INTEGER NOT NULL DEFAULT 0 CHECK (public_write IN (0, 1)),
     write_reservations_blocked INTEGER NOT NULL DEFAULT 0 CHECK (write_reservations_blocked IN (0, 1)),
     active_write_reservations INTEGER NOT NULL DEFAULT 0 CHECK (active_write_reservations >= 0),
-    cors_config      TEXT,
-    tags             TEXT,
     public_access_block TEXT,
     ownership_controls TEXT,
-    bucket_policy    TEXT,
     bucket_policy_public INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_public IN (0, 1)),
     bucket_policy_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_generation >= 0),
-    bucket_lifecycle TEXT,
     bucket_lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_lifecycle_generation >= 0),
     completed_multipart_upload_sequence INTEGER NOT NULL DEFAULT 0 CHECK (completed_multipart_upload_sequence >= 0),
     default_encryption_type INTEGER CHECK (
@@ -410,6 +406,11 @@ CREATE TABLE IF NOT EXISTS bucket_subresources (
     FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE,
     CHECK (aux_int_1 IS NULL OR aux_int_1 IN (0, 1))
 )";
+
+/// Index for scanning buckets by subresource kind without touching tombstones.
+const CREATE_BUCKET_SUBRESOURCES_KIND_BUCKET_INDEX: &str = "\
+CREATE INDEX IF NOT EXISTS idx_bucket_subresources_kind_bucket \
+ON bucket_subresources (kind, bucket_name) WHERE body IS NOT NULL";
 
 /// SQLite pragmas for per-PG databases: WAL mode, NORMAL synchronous.
 const PG_PRAGMAS: &str = "\
@@ -448,14 +449,13 @@ pub fn init_pg_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute(CREATE_BUCKETS_TABLE, [])?;
     conn.execute(CREATE_BUCKETS_OWNER_LIST_INDEX, [])?;
     conn.execute(CREATE_BUCKET_SUBRESOURCES_TABLE, [])?;
+    conn.execute(CREATE_BUCKET_SUBRESOURCES_KIND_BUCKET_INDEX, [])?;
     conn.execute(CREATE_OBJECT_PARTS_OFFSET_INDEX, [])?;
     migrate_checksum_columns(conn)?;
     migrate_segment_crc_columns(conn)?;
     migrate_owner_identity_columns(conn)?;
     migrate_acl_grant_columns(conn)?;
     migrate_bucket_write_reservation_columns(conn)?;
-    migrate_bucket_policy_columns(conn)?;
-    migrate_bucket_lifecycle_columns(conn)?;
     migrate_object_write_sequence_columns(conn)?;
     migrate_object_became_noncurrent_columns(conn)?;
     migrate_multipart_upload_tag_columns(conn)?;
@@ -520,37 +520,6 @@ fn migrate_checksum_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
          END;",
     )?;
 
-    Ok(())
-}
-
-/// Add bucket policy storage to bucket metadata.
-///
-/// Idempotent — silently ignores "duplicate column name" errors.
-fn migrate_bucket_policy_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    match conn.execute("ALTER TABLE buckets ADD COLUMN bucket_policy TEXT", []) {
-        Ok(_) => Ok(()),
-        Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
-            if msg.contains("duplicate column name") =>
-        {
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
-}
-
-fn migrate_bucket_lifecycle_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
-    add_column_if_missing(
-        conn,
-        "buckets",
-        "bucket_lifecycle",
-        "ALTER TABLE buckets ADD COLUMN bucket_lifecycle TEXT",
-    )?;
-    add_column_if_missing(
-        conn,
-        "buckets",
-        "bucket_lifecycle_generation",
-        "ALTER TABLE buckets ADD COLUMN bucket_lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_lifecycle_generation >= 0)",
-    )?;
     Ok(())
 }
 
