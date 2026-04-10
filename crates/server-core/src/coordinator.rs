@@ -219,6 +219,21 @@ struct AuthorizedBucketSubresourceDelete {
     kind: storage::BucketSubresourceKind,
 }
 
+#[derive(Debug)]
+struct AuthorizedPutBucketPolicy {
+    bucket: String,
+    body: String,
+    parsed_policy: Arc<auth::BucketPolicy>,
+    policy_is_public: bool,
+}
+
+#[derive(Debug)]
+struct AuthorizedPutBucketLifecycle {
+    bucket: String,
+    body: String,
+    parsed_config: Arc<BucketLifecycleConfiguration>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthorizedPutObjectAcl {
     None,
@@ -4528,15 +4543,8 @@ impl Coordinator {
             }
         }
 
-        let bucket_pg = self.get_bucket_pg(&bucket.name)?;
-        let raw_config = bucket_pg
-            .get_bucket_lifecycle(&bucket.name)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        let authorized = self.authorize_load_bucket_lifecycle(&bucket.name);
+        let raw_config = self.load_authorized_bucket_subresource(&authorized)?;
         let parsed_config = match raw_config {
             Some(config_xml) => Arc::new(
                 storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(
@@ -6011,31 +6019,16 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let bucket_info = self.authorize_bucket_admin_for(&req.bucket)?;
-        let parsed_policy =
-            auth::parse_bucket_policy(req.config).map_err(|e| ServerError::MalformedPolicy {
-                reason: e.reason().to_string(),
-            })?;
-        parsed_policy
-            .validate_evaluable_object_conditions()
-            .map_err(|e| ServerError::MalformedPolicy {
-                reason: e.reason().to_string(),
-            })?;
-        let policy_is_public = parsed_policy.is_public();
-        if Self::blocks_public_policy(bucket_info.public_access_block.as_deref())
-            && policy_is_public
-        {
-            return Err(ServerError::AccessDenied);
-        }
-        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
-        bucket_pg
-            .put_bucket_policy(req.bucket.name, req.config, policy_is_public)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        let authorized = self.authorize_put_bucket_policy(req)?;
+        self.store_bucket_subresource(
+            &authorized.bucket,
+            storage::PutBucketSubresource {
+                kind: storage::BucketSubresourceKind::Policy,
+                body: &authorized.body,
+                aux: storage::BucketSubresourceAux::policy(authorized.policy_is_public),
+            },
+        )?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
         let info = bucket_pg
             .head_bucket_raw(req.bucket.name)
             .map_err(|e| match e {
@@ -6046,9 +6039,9 @@ impl Coordinator {
             })?;
         self.storage_node.upsert_bucket_fast_path((&info).into());
         self.cache_bucket_policy(
-            req.bucket.name,
+            &authorized.bucket,
             info.bucket_policy_generation,
-            Arc::new(parsed_policy),
+            Arc::clone(&authorized.parsed_policy),
         );
         Ok(())
     }
@@ -6063,14 +6056,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_for(req)?;
-        let bucket_pg = self.get_bucket_pg(req.name)?;
-        bucket_pg.get_bucket_policy(req.name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })
+        let authorized = self.authorize_get_bucket_policy(req)?;
+        self.load_authorized_bucket_subresource(&authorized)
     }
 
     pub fn get_bucket_policy_status(&self, req: &BucketRequest<'_>) -> Result<bool, ServerError> {
@@ -6107,24 +6094,19 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_for(req)?;
-        let bucket_pg = self.get_bucket_pg(req.name)?;
-        bucket_pg
-            .delete_bucket_policy(req.name)
+        let authorized = self.authorize_delete_bucket_policy(req)?;
+        self.remove_authorized_bucket_subresource(&authorized)?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let info = bucket_pg
+            .head_bucket_raw(&authorized.bucket)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
                 },
                 other => ServerError::Metadata(other),
             })?;
-        let info = bucket_pg.head_bucket_raw(req.name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
         self.storage_node.upsert_bucket_fast_path((&info).into());
-        self.clear_bucket_policy_cache(req.name);
+        self.clear_bucket_policy_cache(&authorized.bucket);
         Ok(())
     }
 
@@ -6139,39 +6121,18 @@ impl Coordinator {
             req.bucket.name,
             req.config.len()
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            &req.bucket,
-            auth::PolicyAction::PutLifecycleConfiguration,
+        let authorized = self.authorize_put_bucket_lifecycle(req)?;
+        self.store_bucket_subresource(
+            &authorized.bucket,
+            storage::PutBucketSubresource {
+                kind: storage::BucketSubresourceKind::Lifecycle,
+                body: &authorized.body,
+                aux: storage::BucketSubresourceAux::None,
+            },
         )?;
-        let parsed_config = Arc::new(
-            storage::parse_lifecycle_configuration_xml(req.config.as_bytes()).map_err(|error| {
-                match error {
-                    storage::LifecycleConfigError::MalformedXml { reason } => {
-                        ServerError::MalformedXML { reason }
-                    }
-                    storage::LifecycleConfigError::InvalidRequest { reason } => {
-                        ServerError::InvalidRequest { reason }
-                    }
-                    storage::LifecycleConfigError::InvalidArgument { reason } => {
-                        ServerError::InvalidArgument { reason }
-                    }
-                    storage::LifecycleConfigError::NotImplemented { feature } => {
-                        ServerError::NotImplemented { feature }
-                    }
-                }
-            })?,
-        );
-        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
-        bucket_pg
-            .put_bucket_lifecycle(req.bucket.name, req.config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
         let info = bucket_pg
-            .head_bucket_raw(req.bucket.name)
+            .head_bucket_raw(&authorized.bucket)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -6180,9 +6141,9 @@ impl Coordinator {
             })?;
         self.storage_node.upsert_bucket_fast_path((&info).into());
         self.cache_bucket_lifecycle(
-            req.bucket.name,
+            &authorized.bucket,
             info.bucket_lifecycle_generation,
-            parsed_config,
+            Arc::clone(&authorized.parsed_config),
         );
         Ok(())
     }
@@ -6197,19 +6158,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            req,
-            auth::PolicyAction::GetLifecycleConfiguration,
-        )?;
-        let bucket_pg = self.get_bucket_pg(req.name)?;
-        bucket_pg
-            .get_bucket_lifecycle(req.name)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+        let authorized = self.authorize_get_bucket_lifecycle(req)?;
+        self.load_authorized_bucket_subresource(&authorized)
     }
 
     pub fn delete_bucket_lifecycle(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
@@ -6219,27 +6169,19 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            req,
-            auth::PolicyAction::PutLifecycleConfiguration,
-        )?;
-        let bucket_pg = self.get_bucket_pg(req.name)?;
-        bucket_pg
-            .delete_bucket_lifecycle(req.name)
+        let authorized = self.authorize_delete_bucket_lifecycle(req)?;
+        self.remove_authorized_bucket_subresource(&authorized)?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let info = bucket_pg
+            .head_bucket_raw(&authorized.bucket)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
                 },
                 other => ServerError::Metadata(other),
             })?;
-        let info = bucket_pg.head_bucket_raw(req.name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
         self.storage_node.upsert_bucket_fast_path((&info).into());
-        self.clear_bucket_lifecycle_cache(req.name);
+        self.clear_bucket_lifecycle_cache(&authorized.bucket);
         Ok(())
     }
 
@@ -6478,16 +6420,24 @@ impl Coordinator {
         &self,
         authorized: &AuthorizedBucketSubresourcePut,
     ) -> Result<(), ServerError> {
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        self.store_bucket_subresource(
+            &authorized.bucket,
+            storage::PutBucketSubresource {
+                kind: authorized.kind,
+                body: &authorized.body,
+                aux: storage::BucketSubresourceAux::None,
+            },
+        )
+    }
+
+    fn store_bucket_subresource(
+        &self,
+        name: &str,
+        req: storage::PutBucketSubresource<'_>,
+    ) -> Result<(), ServerError> {
+        let bucket_pg = self.get_bucket_pg(name)?;
         bucket_pg
-            .put_bucket_subresource(
-                &authorized.bucket,
-                storage::PutBucketSubresource {
-                    kind: authorized.kind,
-                    body: &authorized.body,
-                    aux: storage::BucketSubresourceAux::None,
-                },
-            )
+            .put_bucket_subresource(name, req)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -17016,6 +16966,38 @@ mod tests {
     }
 
     #[test]
+    fn authorize_put_bucket_policy_rejects_public_policy_when_block_public_policy_enabled() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: test_helpers::requester("owner-a"),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+        put_bucket_public_access_block_test(&coord,
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                test_helpers::requester("owner-a"), None)
+            .unwrap();
+
+        let err = coord
+            .authorize_put_bucket_policy(&put_bucket_config_request_with_expected_owner(
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                test_helpers::requester("owner-a"),
+                None,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
     fn put_bucket_policy_rejects_broad_source_ip_policy_when_block_public_policy_enabled() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -17987,6 +17969,48 @@ mod tests {
             None,
         )
         .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn authorize_get_bucket_lifecycle_bucket_policy_deny_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let lifecycle = "<LifecycleConfiguration>\
+            <Rule>\
+                <ID>expire</ID>\
+                <Filter><Prefix>logs/</Prefix></Filter>\
+                <Status>Enabled</Status>\
+                <Expiration><Days>3</Days></Expiration>\
+            </Rule>\
+        </LifecycleConfiguration>";
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            lifecycle,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetLifecycleConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let err = coord
+            .authorize_get_bucket_lifecycle(&bucket_request_with_expected_owner(
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None,
+            ))
+            .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 

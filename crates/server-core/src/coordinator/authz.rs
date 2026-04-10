@@ -431,15 +431,8 @@ impl Coordinator {
             }
         }
 
-        let bucket_pg = self.get_bucket_pg(&bucket.name)?;
-        let raw_policy = bucket_pg
-            .get_bucket_policy(&bucket.name)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        let authorized = self.authorize_load_bucket_policy(&bucket.name);
+        let raw_policy = self.load_authorized_bucket_subresource(&authorized)?;
         let parsed_policy = match raw_policy {
             Some(policy) => Arc::new(auth::parse_bucket_policy(&policy).map_err(|e| {
                 ServerError::InternalError {
@@ -1657,6 +1650,70 @@ impl Coordinator {
         })
     }
 
+    pub(super) fn authorize_put_bucket_policy(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<AuthorizedPutBucketPolicy, ServerError> {
+        let bucket_info = self.authorize_bucket_admin_for(&req.bucket)?;
+        let parsed_policy =
+            auth::parse_bucket_policy(req.config).map_err(|e| ServerError::MalformedPolicy {
+                reason: e.reason().to_string(),
+            })?;
+        parsed_policy
+            .validate_evaluable_object_conditions()
+            .map_err(|e| ServerError::MalformedPolicy {
+                reason: e.reason().to_string(),
+            })?;
+        let policy_is_public = parsed_policy.is_public();
+        if Self::blocks_public_policy(bucket_info.public_access_block.as_deref())
+            && policy_is_public
+        {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedPutBucketPolicy {
+            bucket: req.bucket.name.to_string(),
+            body: req.config.to_string(),
+            parsed_policy: Arc::new(parsed_policy),
+            policy_is_public,
+        })
+    }
+
+    pub(super) fn authorize_get_bucket_policy(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_for(req)?;
+        Ok(AuthorizedBucketSubresourceGet {
+            bucket: req.name.to_string(),
+            kind: storage::BucketSubresourceKind::Policy,
+        })
+    }
+
+    /// Creates an internal authorization token for bucket policy cache fills.
+    ///
+    /// This intentionally bypasses request auth because the coordinator is
+    /// loading already-authoritative stored state for cache population.
+    pub(super) fn authorize_load_bucket_policy(
+        &self,
+        name: &str,
+    ) -> AuthorizedBucketSubresourceGet {
+        AuthorizedBucketSubresourceGet {
+            bucket: name.to_string(),
+            kind: storage::BucketSubresourceKind::Policy,
+        }
+    }
+
+    pub(super) fn authorize_delete_bucket_policy(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_for(req)?;
+        Ok(AuthorizedBucketSubresourceDelete {
+            bucket: req.name.to_string(),
+            kind: storage::BucketSubresourceKind::Policy,
+        })
+    }
+
     pub(super) fn authorize_put_bucket_public_access_block(
         &self,
         req: &PutBucketConfigRequest<'_>,
@@ -1753,6 +1810,81 @@ impl Coordinator {
         Ok(AuthorizedBucketSubresourceDelete {
             bucket: req.name.to_string(),
             kind: storage::BucketSubresourceKind::OwnershipControls,
+        })
+    }
+
+    pub(super) fn authorize_put_bucket_lifecycle(
+        &self,
+        req: &PutBucketConfigRequest<'_>,
+    ) -> Result<AuthorizedPutBucketLifecycle, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutLifecycleConfiguration,
+        )?;
+        let parsed_config = Arc::new(
+            storage::parse_lifecycle_configuration_xml(req.config.as_bytes()).map_err(|error| {
+                match error {
+                    storage::LifecycleConfigError::MalformedXml { reason } => {
+                        ServerError::MalformedXML { reason }
+                    }
+                    storage::LifecycleConfigError::InvalidRequest { reason } => {
+                        ServerError::InvalidRequest { reason }
+                    }
+                    storage::LifecycleConfigError::InvalidArgument { reason } => {
+                        ServerError::InvalidArgument { reason }
+                    }
+                    storage::LifecycleConfigError::NotImplemented { feature } => {
+                        ServerError::NotImplemented { feature }
+                    }
+                }
+            })?,
+        );
+        Ok(AuthorizedPutBucketLifecycle {
+            bucket: req.bucket.name.to_string(),
+            body: req.config.to_string(),
+            parsed_config,
+        })
+    }
+
+    pub(super) fn authorize_get_bucket_lifecycle(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::GetLifecycleConfiguration,
+        )?;
+        Ok(AuthorizedBucketSubresourceGet {
+            bucket: req.name.to_string(),
+            kind: storage::BucketSubresourceKind::Lifecycle,
+        })
+    }
+
+    /// Creates an internal authorization token for lifecycle cache fills.
+    ///
+    /// This intentionally bypasses request auth because the coordinator is
+    /// loading already-authoritative stored state for cache population.
+    pub(super) fn authorize_load_bucket_lifecycle(
+        &self,
+        name: &str,
+    ) -> AuthorizedBucketSubresourceGet {
+        AuthorizedBucketSubresourceGet {
+            bucket: name.to_string(),
+            kind: storage::BucketSubresourceKind::Lifecycle,
+        }
+    }
+
+    pub(super) fn authorize_delete_bucket_lifecycle(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::PutLifecycleConfiguration,
+        )?;
+        Ok(AuthorizedBucketSubresourceDelete {
+            bucket: req.name.to_string(),
+            kind: storage::BucketSubresourceKind::Lifecycle,
         })
     }
 
