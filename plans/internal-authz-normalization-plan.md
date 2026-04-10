@@ -15,6 +15,23 @@ The remaining work in workstream 1 is to carry that cleanup further through the
 read-family helpers and decide whether the resulting internal token shapes
 should be tightened before moving on to the ACL/tagging/object-lock families.
 
+Workstream 2 is also now in progress:
+
+1. object tagging, object ACL, and object-lock authorization now share the
+   same raw loaded-object state pattern instead of each carrying their own
+   mixed load-and-authorize helper
+2. object-lock authorization still preserves the security-sensitive ordering:
+   authorize first, then validate that the bucket has object lock configured
+
+Workstream 3 has started in a limited way:
+
+1. the repeated object bucket-policy allow/deny/fallback shape is now shared by
+   a common internal helper for object read, tagging, ACL, object lock, and
+   delete-style object authorization
+2. the remaining bucket-policy consolidation work is to extend that cleanup to
+   the rest of the internal predicate families without obscuring operation
+   semantics
+
 Public S3 handlers now consistently use operation-specific `authorize_*`
 entrypoints with typed authorized values. The remaining cleanup is internal to
 `crates/server-core/src/coordinator/authz.rs`: shared bucket/object auth

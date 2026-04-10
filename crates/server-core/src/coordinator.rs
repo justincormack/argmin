@@ -362,7 +362,7 @@ struct AuthorizedObjectRead<'a> {
     locked: LockedReadObject<'a>,
 }
 
-struct LoadedObjectReadState<'a> {
+struct LoadedObjectState<'a> {
     bucket_info: ValidatedBucket,
     bucket_policy: Option<Arc<auth::BucketPolicy>>,
     locked: LockedReadObject<'a>,
@@ -7063,53 +7063,6 @@ impl Coordinator {
             }
         }
         Ok(resolved)
-    }
-
-    fn lock_object_for_authorized_object_lock<'a>(
-        &'a self,
-        requester: &Requester,
-        bucket: &str,
-        key: &str,
-        version_id: Option<VersionId>,
-        policy_action: auth::PolicyAction,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<
-        (
-            ValidatedBucket,
-            Option<Arc<auth::BucketPolicy>>,
-            LockedReadObject<'a>,
-        ),
-        ServerError,
-    > {
-        let bucket_info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
-        let can_discover_missing =
-            Self::requester_can_bucket_admin(requester, &bucket_info.owner_principal);
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        let locked = match self.lock_object_pgs_for_read(bucket, key, version_id) {
-            Ok(locked) => locked,
-            Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
-                if !can_discover_missing =>
-            {
-                return Err(ServerError::AccessDenied);
-            }
-            Err(other) => return Err(other),
-        };
-
-        if Self::requester_can_manage_object_lock_with_bucket_policy(
-            requester,
-            &bucket_info,
-            &locked.record,
-            policy_action,
-            bucket_policy.as_deref(),
-        )? {
-            Self::ensure_object_lock_bucket(&bucket_info)?;
-            // Return the policy snapshot fetched before taking object locks so
-            // later authorization checks do not re-enter bucket metadata and
-            // invert the bucket/object lock order.
-            Ok((bucket_info, bucket_policy, locked))
-        } else {
-            Err(ServerError::AccessDenied)
-        }
     }
 
     fn validate_retention_update(
