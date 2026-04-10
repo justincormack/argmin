@@ -1931,6 +1931,115 @@ impl Coordinator {
         })
     }
 
+    pub(super) fn authorize_put_bucket_encryption(
+        &self,
+        req: &PutBucketEncryptionRequest<'_>,
+    ) -> Result<AuthorizedPutBucketEncryption, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutEncryptionConfiguration,
+        )?;
+        Ok(AuthorizedPutBucketEncryption {
+            bucket: req.bucket.name.to_string(),
+            config: req.config,
+            effective_config: req.config.effective(),
+        })
+    }
+
+    pub(super) fn authorize_get_bucket_encryption(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketEncryption, ServerError> {
+        let info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::GetEncryptionConfiguration,
+        )?;
+        Ok(AuthorizedGetBucketEncryption {
+            config: info.encryption,
+        })
+    }
+
+    pub(super) fn authorize_delete_bucket_encryption(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedDeleteBucketEncryption, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::PutEncryptionConfiguration,
+        )?;
+        Ok(AuthorizedDeleteBucketEncryption {
+            bucket: req.name.to_string(),
+        })
+    }
+
+    pub(super) fn authorize_get_bucket_acl(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketAcl, ServerError> {
+        let bucket = self.checked_active_bucket_summary(req.name, req.expected_bucket_owner())?;
+        if !Self::requester_can_read_bucket_acl(&req.requester, &bucket) {
+            return Err(ServerError::AccessDenied);
+        }
+        let result = if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+            let owner = Self::bucket_owner_identity(&bucket);
+            GetBucketAclResult {
+                owner_principal: owner.principal,
+                owner_canonical_id: owner.canonical_id.clone(),
+                acl_grants: AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::CanonicalUser(owner.canonical_id),
+                    AclPermission::FullControl,
+                )]),
+            }
+        } else {
+            let bucket = bucket.into_inner();
+            GetBucketAclResult {
+                owner_principal: bucket.owner_principal,
+                owner_canonical_id: bucket.owner_canonical_id,
+                acl_grants: bucket.acl_grants,
+            }
+        };
+        Ok(AuthorizedGetBucketAcl { result })
+    }
+
+    pub(super) fn authorize_put_bucket_acl(
+        &self,
+        req: &PutBucketAclRequest<'_>,
+    ) -> Result<AuthorizedPutBucketAcl, ServerError> {
+        let bucket_info = self
+            .checked_active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
+        if !Self::requester_can_write_bucket_acl(&req.bucket.requester, &bucket_info) {
+            return Err(ServerError::AccessDenied);
+        }
+        let owner = Self::bucket_owner_identity(&bucket_info);
+        let acl_grants = match &req.acl {
+            PutBucketAclInput::Canned(acl) => {
+                Self::ensure_put_bucket_acl_supported(&bucket_info, *acl)?;
+                Self::bucket_acl_grants_from_canned(&owner, *acl)?
+            }
+            PutBucketAclInput::Grants(acl_grants) => {
+                if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
+                    return Err(ServerError::AccessControlListNotSupported);
+                }
+                Self::ensure_supported_bucket_acl_grants(acl_grants)?;
+                acl_grants.clone()
+            }
+        };
+        let public_read = Self::acl_grants_public_read(&acl_grants);
+        let public_write = Self::acl_grants_public_write(&acl_grants);
+        if Self::blocks_public_acls(bucket_info.public_access_block.as_deref())
+            && (Self::acl_grants_grant_public_read(&acl_grants)
+                || Self::acl_grants_grant_public_write(&acl_grants))
+        {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedPutBucketAcl {
+            bucket: req.bucket.name.to_string(),
+            acl_grants,
+            public_read,
+            public_write,
+        })
+    }
+
     pub(super) fn requester_can_bypass_governance_retention(
         requester: &Requester,
         bucket: &BucketSummary,

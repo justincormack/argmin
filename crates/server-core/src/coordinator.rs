@@ -234,6 +234,36 @@ struct AuthorizedPutBucketLifecycle {
     parsed_config: Arc<BucketLifecycleConfiguration>,
 }
 
+#[derive(Debug)]
+struct AuthorizedPutBucketEncryption {
+    bucket: String,
+    config: BucketEncryptionConfig,
+    effective_config: EffectiveBucketEncryptionConfig,
+}
+
+#[derive(Debug)]
+struct AuthorizedGetBucketEncryption {
+    config: EffectiveBucketEncryptionConfig,
+}
+
+#[derive(Debug)]
+struct AuthorizedDeleteBucketEncryption {
+    bucket: String,
+}
+
+#[derive(Debug)]
+struct AuthorizedGetBucketAcl {
+    result: GetBucketAclResult,
+}
+
+#[derive(Debug)]
+struct AuthorizedPutBucketAcl {
+    bucket: String,
+    acl_grants: AclGrants,
+    public_read: bool,
+    public_write: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthorizedPutObjectAcl {
     None,
@@ -1977,12 +2007,6 @@ pub enum PutBucketAclInput {
 pub struct PutBucketAclRequest<'a> {
     pub bucket: BucketRequest<'a>,
     pub acl: PutBucketAclInput,
-}
-
-struct ResolvedBucketAclUpdate {
-    acl_grants: AclGrants,
-    public_read: bool,
-    public_write: bool,
 }
 
 /// Request for an object or object-version-scoped operation.
@@ -5609,9 +5633,9 @@ impl Coordinator {
                     return Err(ServerError::BucketAlreadyOwnedByYou);
                 }
                 let existing = self.unchecked_active_bucket_summary(req.name)?;
-                let resolved =
+                let authorized =
                     self.resolve_create_bucket_recreate_acl_update(&existing, &owner, &req.acl)?;
-                self.apply_bucket_acl_update(req.name, &resolved)
+                self.apply_authorized_bucket_acl_update(&authorized)
             }
         }
     }
@@ -5755,7 +5779,7 @@ impl Coordinator {
         bucket: &BucketSummary,
         owner: &OwnerIdentity,
         acl: &CreateBucketAcl,
-    ) -> Result<ResolvedBucketAclUpdate, ServerError> {
+    ) -> Result<AuthorizedPutBucketAcl, ServerError> {
         let acl_grants = match acl {
             CreateBucketAcl::DefaultPrivate => Self::owner_full_control_grants(owner),
             CreateBucketAcl::Canned(acl) => {
@@ -5778,7 +5802,8 @@ impl Coordinator {
         {
             return Err(ServerError::AccessDenied);
         }
-        Ok(ResolvedBucketAclUpdate {
+        Ok(AuthorizedPutBucketAcl {
+            bucket: bucket.name.clone(),
             acl_grants,
             public_read,
             public_write,
@@ -6034,14 +6059,10 @@ impl Coordinator {
             req.bucket.name,
             req.config.sse_c_blocked
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            &req.bucket,
-            auth::PolicyAction::PutEncryptionConfiguration,
-        )?;
-        let effective_config = req.config.effective();
-        let bucket_pg = self.get_bucket_pg(req.bucket.name)?;
+        let authorized = self.authorize_put_bucket_encryption(req)?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
         bucket_pg
-            .put_bucket_encryption(req.bucket.name, req.config)
+            .put_bucket_encryption(&authorized.bucket, authorized.config)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -6049,8 +6070,8 @@ impl Coordinator {
                 other => ServerError::Metadata(other),
             })?;
         self.storage_node
-            .update_bucket_fast_path_if_present(req.bucket.name, |info| {
-                info.encryption = effective_config
+            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
+                info.encryption = authorized.effective_config
             });
         Ok(())
     }
@@ -6065,11 +6086,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            req,
-            auth::PolicyAction::GetEncryptionConfiguration,
-        )?;
-        Ok(info.encryption)
+        let authorized = self.authorize_get_bucket_encryption(req)?;
+        Ok(authorized.config)
     }
 
     pub fn delete_bucket_encryption(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
@@ -6079,13 +6097,10 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            req,
-            auth::PolicyAction::PutEncryptionConfiguration,
-        )?;
-        let bucket_pg = self.get_bucket_pg(req.name)?;
+        let authorized = self.authorize_delete_bucket_encryption(req)?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
         bucket_pg
-            .put_bucket_encryption(req.name, BucketEncryptionConfig::default())
+            .put_bucket_encryption(&authorized.bucket, BucketEncryptionConfig::default())
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -6093,7 +6108,7 @@ impl Coordinator {
                 other => ServerError::Metadata(other),
             })?;
         self.storage_node
-            .update_bucket_fast_path_if_present(req.name, |info| {
+            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
                 info.encryption = EffectiveBucketEncryptionConfig::default()
             });
         Ok(())
@@ -6476,27 +6491,8 @@ impl Coordinator {
             "bucket={:?}",
             req.name
         );
-        let bucket = self.checked_active_bucket_summary(req.name, req.expected_bucket_owner())?;
-        if !Self::requester_can_read_bucket_acl(&req.requester, &bucket) {
-            return Err(ServerError::AccessDenied);
-        }
-        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
-            let owner = Self::bucket_owner_identity(&bucket);
-            return Ok(GetBucketAclResult {
-                owner_principal: owner.principal,
-                owner_canonical_id: owner.canonical_id.clone(),
-                acl_grants: AclGrants::new(vec![AclGrant::new(
-                    AclGrantee::CanonicalUser(owner.canonical_id),
-                    AclPermission::FullControl,
-                )]),
-            });
-        }
-        let bucket = bucket.into_inner();
-        Ok(GetBucketAclResult {
-            owner_principal: bucket.owner_principal,
-            owner_canonical_id: bucket.owner_canonical_id,
-            acl_grants: bucket.acl_grants,
-        })
+        let authorized = self.authorize_get_bucket_acl(req)?;
+        Ok(authorized.result)
     }
 
     pub fn put_bucket_acl(&self, req: &PutBucketAclRequest<'_>) -> Result<(), ServerError> {
@@ -6510,69 +6506,28 @@ impl Coordinator {
                 PutBucketAclInput::Grants(_) => "grants",
             }
         );
-        let resolved = self.resolve_put_bucket_acl_update(req)?;
-        self.apply_bucket_acl_update(req.bucket.name, &resolved)
+        let authorized = self.authorize_put_bucket_acl(req)?;
+        self.apply_authorized_bucket_acl_update(&authorized)
     }
 
     pub fn validate_put_bucket_acl_request(
         &self,
         req: &PutBucketAclRequest<'_>,
     ) -> Result<(), ServerError> {
-        self.resolve_put_bucket_acl_update(req).map(|_| ())
+        self.authorize_put_bucket_acl(req).map(|_| ())
     }
 
-    fn resolve_put_bucket_acl_update(
+    fn apply_authorized_bucket_acl_update(
         &self,
-        req: &PutBucketAclRequest<'_>,
-    ) -> Result<ResolvedBucketAclUpdate, ServerError> {
-        let bucket_info = self
-            .checked_active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
-        if !Self::requester_can_write_bucket_acl(&req.bucket.requester, &bucket_info) {
-            return Err(ServerError::AccessDenied);
-        }
-        let acl_grants = match &req.acl {
-            PutBucketAclInput::Canned(acl) => {
-                Self::ensure_put_bucket_acl_supported(&bucket_info, *acl)?;
-                Self::bucket_acl_grants_from_canned(
-                    &Self::bucket_owner_identity(&bucket_info),
-                    *acl,
-                )?
-            }
-            PutBucketAclInput::Grants(acl_grants) => {
-                if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
-                    return Err(ServerError::AccessControlListNotSupported);
-                }
-                Self::ensure_supported_bucket_acl_grants(acl_grants)?;
-                acl_grants.clone()
-            }
-        };
-        let public_read = Self::acl_grants_public_read(&acl_grants);
-        let public_write = Self::acl_grants_public_write(&acl_grants);
-        if Self::blocks_public_acls(bucket_info.public_access_block.as_deref())
-            && (Self::acl_grants_grant_public_read(&acl_grants)
-                || Self::acl_grants_grant_public_write(&acl_grants))
-        {
-            return Err(ServerError::AccessDenied);
-        }
-        Ok(ResolvedBucketAclUpdate {
-            acl_grants,
-            public_read,
-            public_write,
-        })
-    }
-
-    fn apply_bucket_acl_update(
-        &self,
-        bucket_name: &str,
-        resolved: &ResolvedBucketAclUpdate,
+        authorized: &AuthorizedPutBucketAcl,
     ) -> Result<(), ServerError> {
-        let bucket_pg = self.get_bucket_pg(bucket_name)?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
         bucket_pg
             .put_bucket_acl(
-                bucket_name,
-                &resolved.acl_grants,
-                resolved.public_read,
-                resolved.public_write,
+                &authorized.bucket,
+                &authorized.acl_grants,
+                authorized.public_read,
+                authorized.public_write,
             )
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
@@ -6581,10 +6536,10 @@ impl Coordinator {
                 other => ServerError::Metadata(other),
             })?;
         self.storage_node
-            .update_bucket_fast_path_if_present(bucket_name, |info| {
-                info.acl_grants = resolved.acl_grants.clone();
-                info.public_read = resolved.public_read;
-                info.public_write = resolved.public_write;
+            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
+                info.acl_grants = authorized.acl_grants.clone();
+                info.public_read = authorized.public_read;
+                info.public_write = authorized.public_write;
             });
         Ok(())
     }
@@ -18472,6 +18427,32 @@ mod tests {
     }
 
     #[test]
+    fn authorize_get_bucket_encryption_bucket_policy_deny_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetEncryptionConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        let err = coord
+            .authorize_get_bucket_encryption(&bucket_request_with_expected_owner(
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
     fn get_bucket_policy_status_defaults_private() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -19076,6 +19057,63 @@ mod tests {
         );
         assert_eq!(boe_acl.acl_grants.iter().count(), 1);
         assert!(boe_acl.acl_grants.iter().any(|grant| {
+            grant
+                == &AclGrant::new(
+                    AclGrantee::CanonicalUser(bucket_owner.canonical_user_id().clone()),
+                    AclPermission::FullControl,
+                )
+        }));
+    }
+
+    #[test]
+    fn authorize_get_bucket_acl_bucket_owner_enforced_allows_same_account_owner_view() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let bucket_owner = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            CanonicalUserId::from_principal("bucket-owner-acl-canonical"),
+            "Bucket Owner",
+        );
+        let same_account_user = AccountIdentity::new(
+            "arn:aws:iam::111122223333:user/reader",
+            CanonicalUserId::from_principal("bucket-same-account-acl-canonical"),
+            "Same Account Reader",
+        );
+        let owner_requester = Requester::authenticated(bucket_owner.clone());
+        let same_account_requester = Requester::authenticated(same_account_user);
+
+        create_bucket_for_owner_with_flags(
+            &coord,
+            bucket_owner.principal(),
+            bucket_owner.canonical_user_id(),
+            "bucket",
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        put_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+            owner_requester,
+            None,
+        )
+        .unwrap();
+
+        let authorized = coord
+            .authorize_get_bucket_acl(&bucket_request_with_expected_owner(
+                "bucket",
+                same_account_requester,
+                None,
+            ))
+            .unwrap();
+        assert_eq!(
+            authorized.result.owner_canonical_id,
+            bucket_owner.canonical_user_id().clone()
+        );
+        assert_eq!(authorized.result.acl_grants.iter().count(), 1);
+        assert!(authorized.result.acl_grants.iter().any(|grant| {
             grant
                 == &AclGrant::new(
                     AclGrantee::CanonicalUser(bucket_owner.canonical_user_id().clone()),
@@ -23262,6 +23300,44 @@ mod tests {
             None,
         )
         .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn authorize_put_bucket_acl_rejects_block_public_acls() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_public_access_block_test(&coord,
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>false</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                test_helpers::requester("owner-a"), None)
+            .unwrap();
+
+        let err = coord
+            .authorize_put_bucket_acl(&PutBucketAclRequest {
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                acl: PutBucketAclInput::Canned(BucketAcl::PublicRead),
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = coord
+            .authorize_put_bucket_acl(&PutBucketAclRequest {
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                acl: PutBucketAclInput::Canned(BucketAcl::AuthenticatedRead),
+            })
+            .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
     }
 
