@@ -1,0 +1,162 @@
+PutObjectAcl bucket policy ignores ACL/grant conditions
+Link: https://chatgpt.com/codex/cloud/security/findings/2415e98d19fc8191b7020e01d29341b3?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 172cf0a
+Author: justin@specialbusservice.com
+Created: 10/04/2026, 00:09:49
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced authorization gap: PutObjectAcl policy evaluation omits request ACL/grant details, so bucket policy conditions on x-amz-acl/x-amz-grant-* are ineffective and can be bypassed.
+The commit adds bucket-policy authorization for PutObjectAcl/PutObjectVersionAcl, but the evaluation path uses bucket_policy_decision_for_object, which only supplies existing/request tags to PolicyRequest. It never populates x-amz-acl or x-amz-grant-* values from the PutObjectAcl request. Because bucket policies now support those condition keys for evaluable object actions, explicit Allow/Deny rules that depend on ACL/grant headers will not match. A delegated principal allowed to call PutObjectAcl can therefore bypass policy conditions (e.g., a deny on public-read) and set more permissive ACLs than intended, potentially exposing objects publicly or granting access to other accounts.
+
+# Validation
+## Rubric
+- [x] Confirm PutObjectAcl is treated as an evaluable object action in bucket policy (bucket_policy.rs:593-604).
+- [x] Confirm bucket policy condition evaluator supports s3:x-amz-acl and s3:x-amz-grant-* keys (bucket_policy.rs:1088-1128).
+- [x] Trace PutObjectAcl authorization path and verify ACL/grant headers are not added to PolicyRequest (authz.rs:483-526, 796-806).
+- [x] Verify PolicyRequest has ACL/grant fields but StringEquals conditions fail when actual is None (bucket_policy.rs:191-239, 1133-1157).
+- [x] Attempt dynamic validation (cargo test build, valgrind missing, debugger via lldb) before code-understanding conclusion.
+## Report
+Rubric-guided validation: I first attempted dynamic validation (compiled stack). `cargo test -p auth --lib` built and ran 299 tests successfully (no crash). Valgrind is unavailable (`valgrind --version` -> command not found). gdb is unavailable; lldb is available and I ran a single test under lldb with no crash (process exited 0, bt unavailable once exited). 
+
+Code analysis shows the authorization gap. `bucket_policy_decision_for_object` constructs a `PolicyRequest` with only existing/request object tags (authz.rs:483-526) and never sets canned ACL or grant fields. The PutObjectAcl path uses this function: `requester_can_write_object_acl_with_bucket_policy` calls `bucket_policy_decision_for_object(..., None, policy)` (authz.rs:796-806), so request ACL/grant headers are not supplied for policy evaluation. By contrast, `bucket_policy_decision_for_put_object_action` does populate `PolicyRequest` with `.with_canned_acl(...)` and `.with_grant_*` (authz.rs:569-614), showing the intended mechanism exists but is not used for PutObjectAcl. 
+
+Bucket policy evaluation explicitly supports `s3:x-amz-acl` and `s3:x-amz-grant-*` condition keys (bucket_policy.rs:1088-1128) and treats `PutObjectAcl` as an evaluable object action (bucket_policy.rs:593-604). `PolicyRequest` contains fields for canned ACL and grant values (bucket_policy.rs:191-239). However, when those fields are `None`, `StringEquals` conditions do not match (bucket_policy.rs:1133-1157), so deny/allow statements based on `s3:x-amz-acl` or grants are ignored. This confirms the reported bypass: bucket policies that restrict ACL/grant headers on PutObjectAcl are ineffective because the request context is never populated.
+
+# Evidence
+/workspace/argmin/crates/auth/src/bucket_policy.rs (L1110 to 1127)
+  Note: Bucket policy conditions support x-amz-acl and x-amz-grant-* keys, but these values are never supplied for PutObjectAcl requests, leading to ignored conditions.
+```
+fn condition_clause_supported_for_evaluable_object_actions(clause: &PolicyConditionClause) -> bool {
+    (matches!(
+        clause.operator.as_str(),
+        "StringEquals" | "StringEqualsIfExists"
+    ) && clause.key.starts_with("s3:ExistingObjectTag/"))
+        || (evaluable_string_condition_operator_supported(clause.operator.as_str())
+            && matches!(
+                clause.key.as_str(),
+                "s3:x-amz-copy-source"
+                    | "s3:x-amz-metadata-directive"
+                    | "s3:x-amz-acl"
+                    | "s3:x-amz-server-side-encryption"
+                    | "s3:x-amz-server-side-encryption-customer-algorithm"
+                    | "s3:x-amz-grant-read"
+                    | "s3:x-amz-grant-write"
+                    | "s3:x-amz-grant-read-acp"
+                    | "s3:x-amz-grant-write-acp"
+                    | "s3:x-amz-grant-full-control"
+```
+
+/workspace/argmin/crates/auth/src/bucket_policy.rs (L593 to 604)
+  Note: PutObjectAcl and PutObjectVersionAcl are now considered evaluable actions, so bucket policies can include conditions for them.
+```
+const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 20] = [
+    PolicyAction::GetObject,
+    PolicyAction::GetObjectVersion,
+    PolicyAction::GetObjectAcl,
+    PolicyAction::GetObjectVersionAcl,
+    PolicyAction::GetObjectTagging,
+    PolicyAction::GetObjectVersionTagging,
+    PolicyAction::GetObjectRetention,
+    PolicyAction::GetObjectLegalHold,
+    PolicyAction::PutObject,
+    PolicyAction::PutObjectAcl,
+    PolicyAction::PutObjectVersionAcl,
+```
+
+/workspace/argmin/crates/server-core/src/coordinator/authz.rs (L500 to 526)
+  Note: bucket_policy_decision_for_object only adds existing/request tags to PolicyRequest; no ACL/grant headers are included for policy evaluation.
+```
+        let existing_tags: Vec<auth::PolicyTag<'_>> = existing_tags
+            .iter()
+            .map(|(key, value)| auth::PolicyTag::new(key, value))
+            .collect();
+        let request_object_tags = if policy.requires_request_object_tags_for_action(action) {
+            match request_object_tags_xml {
+                Some(tags_xml) => Self::parse_serialized_tag_set(tags_xml)?,
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        let request_object_tags: Vec<auth::PolicyTag<'_>> = request_object_tags
+            .iter()
+            .map(|(key, value)| auth::PolicyTag::new(key, value))
+            .collect();
+        let request = auth::PolicyRequest::new(
+            action,
+            &bucket.name,
+            object.key().as_str(),
+            requester.principal_opt(),
+            requester.canonical_user_id(),
+        );
+        let request = request
+            .with_existing_object_tags(&existing_tags)
+            .with_request_object_tags(&request_object_tags);
+        Ok(policy.evaluate(&request))
+```
+
+/workspace/argmin/crates/server-core/src/coordinator/authz.rs (L796 to 806)
+  Note: PutObjectAcl authorization now uses bucket_policy_decision_for_object with no request ACL/grant context, so ACL/grant conditions cannot be enforced.
+```
+    pub(super) fn requester_can_write_object_acl_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        Ok(
+            match Self::bucket_policy_decision_for_object(
+                requester, bucket, object, action, None, policy,
+            )? {
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: low | Policy adjusted: low
+## Rationale
+The bug is a real authorization gap: PutObjectAcl policy evaluation omits request ACL/grant values, so s3:x-amz-acl and s3:x-amz-grant-* conditions are ineffective. However, exploitation requires valid credentials with PutObjectAcl permission and a bucket policy that relies on those conditions. The project is typically single-tenant and defaults to localhost binding, reducing likelihood and breadth of impact versus a public, multi-tenant service. These factors justify lowering from high to medium.
+## Likelihood
+medium - Exploitation is straightforward once a principal has PutObjectAcl permission and a policy relies on ACL/grant conditions, but it requires authenticated access and specific policy configuration.
+## Impact
+medium - A delegated principal can set more permissive ACLs than allowed by bucket policy conditions, potentially making objects public or granting other accounts access.
+## Assumptions
+- Service is reachable by the attacker over HTTP (ARGMIN_LISTEN_ADDR may be configured beyond localhost).
+- Attacker possesses valid SigV4 credentials that allow PutObjectAcl on a bucket/object.
+- A bucket policy exists that uses s3:x-amz-acl or s3:x-amz-grant-* conditions to restrict ACL changes.
+- Objects exist whose ACL changes meaningfully affect access (e.g., turning private into public-read).
+- Valid SigV4 credentials
+- Permission to call PutObjectAcl
+- Bucket policy with ACL/grant conditions
+## Path
+PUT ?acl -> PutObjectAcl handler -> authz bucket policy -> PolicyRequest missing ACL/grant -> policy condition ignored -> ACL set
+## Path evidence
+- `crates/server-http/src/http/router.rs:444-452` - HTTP PUT with ?acl is routed to S3Operation::PutObjectAcl (network-reachable entrypoint).
+- `crates/server-http/src/http/mod.rs:1983-2023` - PutObjectAcl handler reads x-amz-acl or x-amz-grant-* headers and forwards them to coordinator.
+- `crates/server-core/src/coordinator/authz.rs:486-526` - bucket_policy_decision_for_object builds PolicyRequest with tags only; no ACL/grant fields are set.
+- `crates/server-core/src/coordinator/authz.rs:796-806` - PutObjectAcl authorization uses bucket_policy_decision_for_object with request_object_tags_xml=None.
+- `crates/auth/src/bucket_policy.rs:1090-1127` - Bucket policy conditions support s3:x-amz-acl and s3:x-amz-grant-* for evaluable object actions.
+- `crates/auth/src/bucket_policy.rs:1133-1152` - StringEquals conditions return NoMatch when the actual value is None, so missing ACL/grant context disables condition matching.
+## Narrative
+PutObjectAcl is routed via HTTP PUT with ?acl and accepts attacker-controlled x-amz-acl or x-amz-grant-* headers. Authorization for PutObjectAcl uses bucket_policy_decision_for_object, which builds a PolicyRequest with only existing/request tags and omits ACL/grant fields. Bucket policy evaluation explicitly supports s3:x-amz-acl and s3:x-amz-grant-* condition keys, and StringEquals returns NoMatch when the actual value is None, so ACL/grant-based conditions do not match. This allows a principal who can call PutObjectAcl to bypass policy conditions intended to prevent public-read or cross-account grants, potentially exposing objects.
+## Controls
+- SigV4 authentication
+- Bucket policy evaluation
+- Public-access restriction checks (restrict public buckets)
+## Blindspots
+- No deployment manifests to confirm actual network exposure or public ingress.
+- No runtime verification of policy behavior in a live service environment.
+- Unclear how commonly bucket policies with ACL/grant conditions are used in real deployments.
+
+# Fix note
+- Fixed in commit `9e284c7` (`server-core: fix put object acl policy conditions`).
+- `PutObjectAcl` now derives authorization context from the ACL being written and rejects any caller-supplied policy context that does not exactly match the persisted ACL shape.
+- For canned ACLs, conflicting `canned_acl` policy context and any grant-header context are rejected.
+- For explicit grants, any supplied grant-header policy context must parse back to the same `AclGrants` that will be written, and unrelated `PutObjectPolicyContext` fields are rejected.
+- Added regression coverage in `server-core`, `server-http`, and `s3-tests`, including canned ACL deny and grant-header allow cases, plus the empty-payload `PutObjectAcl` request error path.
