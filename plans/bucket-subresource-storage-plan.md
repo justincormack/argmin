@@ -285,6 +285,8 @@ Important behavior to preserve:
 
 ### Phase 1: Add Generic Subresource Types
 
+Status: completed in `d5a6514` (`storage: add generic bucket subresource API`).
+
 Deliver:
 
 1. `BucketSubresourceKind`
@@ -301,6 +303,8 @@ Exit criteria:
    path internally if useful
 
 ### Phase 2: Add Storage Table and `PgStore` Support
+
+Status: completed in `c5bad6a` (`storage: persist bucket subresources separately`).
 
 Deliver:
 
@@ -324,6 +328,22 @@ Exit criteria:
 3. lifecycle presence remains queryable without scanning all subresource blobs
 
 ### Phase 3: Migrate Existing Bucket Subresources
+
+Status: in progress.
+
+Completed so far:
+
+1. CORS migrated in `6d2c9e2` / `2979255`
+2. tagging migrated in `6d2c9e2` / `2979255`
+3. public access block migrated in `2979255`
+4. ownership controls migrated in `2979255`
+
+Remaining in this phase:
+
+1. bucket policy
+2. lifecycle
+3. removal of the old feature-specific storage trait/store methods once all
+   migrated features are off them
 
 Migrate feature by feature:
 
@@ -354,6 +374,27 @@ Exit criteria:
 2. all bucket subresource APIs still pass existing tests
 
 ### Phase 3b: Refactor Bucket-Subresource Authorization
+
+Status: in progress.
+
+Completed so far in `7b2facb` (`server-core: add bucket subresource auth tokens`):
+
+1. typed auth tokens added for migrated bucket subresource operations
+2. per-operation auth entrypoints added for CORS, tagging, public access block,
+   and ownership controls
+3. coordinator call sites updated to use authorized token flows
+4. the special internal CORS config load now uses an explicit internal auth
+   token instead of a raw storage-read bypass
+5. direct auth tests added for the nontrivial migrated cases
+
+Remaining in this phase:
+
+1. apply the same per-operation auth pattern to bucket policy and lifecycle as
+   they migrate
+2. continue collapsing any remaining generic bucket-subresource auth wrappers
+   that leak operation shape
+3. expand direct auth-unit coverage as more bucket subresource operations move
+   over
 
 After the first coordinator migration lands, normalize authorization around S3
 operation boundaries instead of shared "generic subresource" helpers.
@@ -388,6 +429,9 @@ Exit criteria:
 3. storage mutation helpers can only be reached from a typed authorized flow
 
 ### Phase 3a: Bucket Creation Seeding Rules
+
+Status: complete for ownership controls behavior, but should still be kept in
+scope while policy/lifecycle migration continues.
 
 Ownership controls are not just a normal PUT/GET/DELETE bucket subresource.
 Bucket creation currently seeds them immediately, and the refactor must keep
