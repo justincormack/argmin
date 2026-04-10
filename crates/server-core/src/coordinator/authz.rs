@@ -1529,6 +1529,272 @@ impl Coordinator {
         }
     }
 
+    pub(super) fn authorize_put_object_tags<'a>(
+        &'a self,
+        req: &PutObjectTagsRequest<'_>,
+    ) -> Result<AuthorizedObjectTagsAccess<'a>, ServerError> {
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_for_authorized_tagging(
+            &req.object,
+            Self::put_object_tagging_policy_action(req.object.version_id),
+            Some(req.tags),
+        )?;
+        if stored.is_delete_marker() {
+            return Err(ServerError::MethodNotAllowed);
+        }
+        Ok(AuthorizedObjectTagsAccess {
+            bucket: req.object.bucket_name().to_string(),
+            key: req.object.key().to_string(),
+            version_id: stored.version_id(),
+            pgs,
+        })
+    }
+
+    pub(super) fn authorize_get_object_tags<'a>(
+        &'a self,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<AuthorizedObjectTagsAccess<'a>, ServerError> {
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_for_authorized_tagging(
+            req,
+            Self::get_object_tagging_policy_action(req.version_id),
+            None,
+        )?;
+        if stored.is_delete_marker() {
+            return Err(ServerError::MethodNotAllowed);
+        }
+        Ok(AuthorizedObjectTagsAccess {
+            bucket: req.object.bucket_name().to_string(),
+            key: req.object.key.to_string(),
+            version_id: stored.version_id(),
+            pgs,
+        })
+    }
+
+    pub(super) fn authorize_delete_object_tags<'a>(
+        &'a self,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<AuthorizedObjectTagsAccess<'a>, ServerError> {
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = self.lock_object_for_authorized_tagging(
+            req,
+            Self::delete_object_tagging_policy_action(req.version_id),
+            None,
+        )?;
+        if stored.is_delete_marker() {
+            return Err(ServerError::MethodNotAllowed);
+        }
+        Ok(AuthorizedObjectTagsAccess {
+            bucket: req.object.bucket_name().to_string(),
+            key: req.object.key.to_string(),
+            version_id: stored.version_id(),
+            pgs,
+        })
+    }
+
+    pub(super) fn authorize_get_object_acl(
+        &self,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<AuthorizedGetObjectAcl, ServerError> {
+        let (bucket_info, locked) = self.lock_object_for_authorized_acl(
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key,
+            req.version_id,
+            ObjectAclAuthorization::ReadWithPolicy(Self::get_object_acl_policy_action(
+                req.version_id,
+            )),
+            req.expected_bucket_owner(),
+        )?;
+        let LockedReadObject { record: stored, .. } = locked;
+        let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        let result = if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
+            let owner = Self::bucket_owner_identity(&bucket_info);
+            GetObjectAclResult {
+                owner_principal: owner.principal,
+                owner_canonical_id: owner.canonical_id.clone(),
+                acl_grants: AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::CanonicalUser(owner.canonical_id),
+                    AclPermission::FullControl,
+                )]),
+                version_id: live.version_id,
+            }
+        } else {
+            GetObjectAclResult {
+                owner_principal: live.owner.principal.clone(),
+                owner_canonical_id: live.owner.canonical_id.clone(),
+                acl_grants: live.acl_grants.clone(),
+                version_id: live.version_id,
+            }
+        };
+        Ok(AuthorizedGetObjectAcl { result })
+    }
+
+    pub(super) fn authorize_put_object_acl<'a>(
+        &'a self,
+        req: &PutObjectAclRequest<'_>,
+    ) -> Result<AuthorizedPutObjectAclUpdate<'a>, ServerError> {
+        let (bucket_info, locked) = self.lock_object_for_authorized_acl(
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key(),
+            req.object.version_id,
+            ObjectAclAuthorization::WriteWithPolicy {
+                action: Self::put_object_acl_policy_action(req.object.version_id),
+                policy_context: req.authorization_policy_context()?,
+            },
+            req.object.expected_bucket_owner(),
+        )?;
+        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
+            return Err(ServerError::AccessControlListNotSupported);
+        }
+        let LockedReadObject {
+            record: stored,
+            pgs,
+        } = locked;
+        let acl_grants = match &req.acl {
+            PutObjectAclInput::Canned(acl) => {
+                Self::ensure_put_object_acl_supported(&bucket_info, *acl)?;
+                let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+                Self::object_acl_grants_for_write(&bucket_info, &live.owner, *acl)
+            }
+            PutObjectAclInput::Grants(acl_grants) => {
+                Self::ensure_supported_object_acl_grants(acl_grants)?;
+                acl_grants.clone()
+            }
+        };
+        let public_read = Self::acl_grants_public_read(&acl_grants);
+        if Self::blocks_public_acls(bucket_info.public_access_block.as_deref())
+            && (Self::acl_grants_grant_public_read(&acl_grants)
+                || Self::acl_grants_grant_public_write(&acl_grants))
+        {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedPutObjectAclUpdate {
+            bucket: req.object.bucket_name().to_string(),
+            key: req.object.key().to_string(),
+            version_id: stored.version_id(),
+            acl_grants,
+            public_read,
+            pgs,
+        })
+    }
+
+    pub(super) fn authorize_put_object_retention<'a>(
+        &'a self,
+        req: &PutObjectRetentionRequest<'_>,
+    ) -> Result<AuthorizedPutObjectRetention<'a>, ServerError> {
+        let (
+            bucket_info,
+            bucket_policy,
+            LockedReadObject {
+                record: stored,
+                pgs,
+            },
+        ) = self.lock_object_for_authorized_object_lock(
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key(),
+            req.object.version_id,
+            auth::PolicyAction::PutObjectRetention,
+            req.object.expected_bucket_owner(),
+        )?;
+        let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        let can_bypass_governance =
+            Self::requester_can_bypass_governance_retention_with_bucket_policy(
+                req.object.requester(),
+                &bucket_info,
+                &stored,
+                bucket_policy.as_deref(),
+            )?;
+        Self::validate_retention_update(
+            live.object_lock.retention,
+            req.retention,
+            req.bypass_governance,
+            can_bypass_governance,
+        )?;
+        Ok(AuthorizedPutObjectRetention {
+            bucket: req.object.bucket_name().to_string(),
+            key: req.object.key().to_string(),
+            version_id: live.version_id,
+            retention: req.retention,
+            pgs,
+        })
+    }
+
+    pub(super) fn authorize_get_object_retention(
+        &self,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<AuthorizedGetObjectRetention, ServerError> {
+        let (_bucket_info, _bucket_policy, LockedReadObject { record: stored, .. }) = self
+            .lock_object_for_authorized_object_lock(
+                req.object.requester(),
+                req.object.bucket_name(),
+                req.object.key,
+                req.version_id,
+                auth::PolicyAction::GetObjectRetention,
+                req.expected_bucket_owner(),
+            )?;
+        let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        Ok(AuthorizedGetObjectRetention {
+            retention: live.object_lock.retention,
+        })
+    }
+
+    pub(super) fn authorize_put_object_legal_hold<'a>(
+        &'a self,
+        req: &PutObjectLegalHoldRequest<'_>,
+    ) -> Result<AuthorizedPutObjectLegalHold<'a>, ServerError> {
+        let (
+            _bucket_info,
+            _bucket_policy,
+            LockedReadObject {
+                record: stored,
+                pgs,
+            },
+        ) = self.lock_object_for_authorized_object_lock(
+            req.object.requester(),
+            req.object.bucket_name(),
+            req.object.key(),
+            req.object.version_id,
+            auth::PolicyAction::PutObjectLegalHold,
+            req.object.expected_bucket_owner(),
+        )?;
+        let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        Ok(AuthorizedPutObjectLegalHold {
+            bucket: req.object.bucket_name().to_string(),
+            key: req.object.key().to_string(),
+            version_id: live.version_id,
+            legal_hold: StoredLegalHoldStatus::from_legal_hold_status(Some(req.legal_hold)),
+            pgs,
+        })
+    }
+
+    pub(super) fn authorize_get_object_legal_hold(
+        &self,
+        req: &ObjectVersionRequest<'_>,
+    ) -> Result<AuthorizedGetObjectLegalHold, ServerError> {
+        let (_bucket_info, _bucket_policy, LockedReadObject { record: stored, .. }) = self
+            .lock_object_for_authorized_object_lock(
+                req.object.requester(),
+                req.object.bucket_name(),
+                req.object.key,
+                req.version_id,
+                auth::PolicyAction::GetObjectLegalHold,
+                req.expected_bucket_owner(),
+            )?;
+        let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
+        Ok(AuthorizedGetObjectLegalHold {
+            legal_hold: live.object_lock.legal_hold.as_legal_hold_status(),
+        })
+    }
+
     pub(super) fn authorize_bucket_read_requester(
         &self,
         requester: &Requester,
@@ -1969,6 +2235,55 @@ impl Coordinator {
         )?;
         Ok(AuthorizedDeleteBucketEncryption {
             bucket: req.name.to_string(),
+        })
+    }
+
+    pub(super) fn authorize_get_bucket_object_lock_configuration(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketObjectLockConfiguration, ServerError> {
+        let info = self.active_bucket_summary_for(req)?;
+        let bucket_policy = self.cached_bucket_policy(&info)?;
+        if !Self::requester_can_get_bucket_object_lock_configuration_with_bucket_policy(
+            &req.requester,
+            &info,
+            bucket_policy.as_deref(),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        if !info.object_lock.enabled {
+            return Err(ServerError::ObjectLockConfigurationNotFound {
+                bucket: req.name.to_string(),
+            });
+        }
+        Ok(AuthorizedGetBucketObjectLockConfiguration {
+            config: info.object_lock,
+        })
+    }
+
+    pub(super) fn authorize_get_bucket_policy_status(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketPolicyStatus, ServerError> {
+        let bucket_info = self.active_bucket_summary_for(req)?;
+        if !bucket_info.bucket_policy_present {
+            if !Self::requester_can_bucket_admin(&req.requester, &bucket_info.owner_principal) {
+                return Err(ServerError::AccessDenied);
+            }
+            return Err(ServerError::NoSuchBucketPolicy {
+                bucket: req.name.to_string(),
+            });
+        }
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        if !Self::requester_can_get_bucket_policy_status_with_bucket_policy(
+            &req.requester,
+            &bucket_info,
+            bucket_policy.as_deref(),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedGetBucketPolicyStatus {
+            is_public: bucket_info.bucket_policy_public,
         })
     }
 
