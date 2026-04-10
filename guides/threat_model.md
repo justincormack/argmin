@@ -76,6 +76,7 @@ assumption is transitional, not the intended end state for `SSE-C`.
 - CSRF/XSS risks are limited because the API is not a session-based web app; XML responses are escaped.
 - SSRF is not applicable; the server does not perform outbound fetches.
 - SQL injection risk is low due to parameterized queries and no dynamic SQL generation.
+- Database migrations are not currently supported or implemented, and older schemas are not supported until a future date when stability will be declared.
 
 ## 4. Criticality calibration (critical, high, medium, low)
 - **Critical:** remote code execution (e.g., unsafe FFI memory corruption), SigV4 auth bypass allowing unauthenticated read/write/delete of private buckets, or leakage of access keys/secrets.
