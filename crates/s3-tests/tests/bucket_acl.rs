@@ -8,7 +8,8 @@ use aws_sdk_s3::types::{
     OwnershipControls, OwnershipControlsRule, Permission, Type,
 };
 use s3_tests::{
-    assert_s3_err_code, disable_bucket_public_access_block, err_status, unique_bucket, CTX,
+    assert_s3_err_code, disable_bucket_public_access_block, err_status, send_signed_request,
+    unique_bucket, CTX,
 };
 
 const ALL_USERS_GROUP_URI: &str = "http://acs.amazonaws.com/groups/global/AllUsers";
@@ -558,6 +559,43 @@ fn test_put_bucket_acl_grant_all_users_read_via_xml() {
         assert!(
             body.contains("ListBucketResult"),
             "expected anonymous bucket list response, got {body}"
+        );
+
+        cleanup(&bucket).await;
+    });
+}
+
+#[test]
+fn test_put_bucket_acl_rejects_canned_acl_with_explicit_grant_headers() {
+    run_bucket_acl_test(async {
+        let bucket = setup_acl_enabled_bucket().await;
+        let url = format!("{}/{bucket}?acl", CTX.endpoint());
+
+        let response = send_signed_request(
+            "PUT",
+            &url,
+            b"",
+            vec![
+                ("x-amz-acl".to_string(), "private".to_string()),
+                (
+                    "x-amz-grant-read".to_string(),
+                    format!("uri=\"{ALL_USERS_GROUP_URI}\""),
+                ),
+            ],
+        );
+
+        assert_eq!(response.status, 400, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<Code>InvalidRequest</Code>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response
+                .body
+                .contains("Specifying both Canned ACLs and Header Grants is not allowed"),
+            "unexpected body: {}",
+            response.body
         );
 
         cleanup(&bucket).await;

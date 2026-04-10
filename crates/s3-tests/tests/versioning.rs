@@ -1293,6 +1293,55 @@ fn test_versioning_list_object_versions_pagination_and_markers() {
 }
 
 #[test]
+fn test_versioning_list_object_versions_rejects_version_id_marker_without_key_marker() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+
+        let alpha_v1 = client
+            .put_object()
+            .bucket(&bucket)
+            .key("alpha")
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("alpha v1 version id")
+            .to_string();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("alpha")
+            .body(ByteStream::from_static(b"v2"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("beta")
+            .body(ByteStream::from_static(b"v1"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .list_object_versions()
+            .bucket(&bucket)
+            .max_keys(10)
+            .version_id_marker(alpha_v1)
+            .send()
+            .await;
+
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
 fn test_versioning_list_object_versions_oversized_max_keys_echoed_by_aws() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1391,6 +1440,61 @@ fn test_versioning_list_object_versions_oversized_max_keys_returns_at_most_1000_
         assert_eq!(resp.is_truncated(), Some(true));
         assert!(resp.next_key_marker().is_some());
         assert!(resp.next_version_id_marker().is_some());
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_versioning_head_delete_marker_version_returns_method_not_allowed() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_versioned_bucket().await;
+        let key = "delete-marker-head";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"payload"))
+            .send()
+            .await
+            .unwrap();
+
+        let delete_marker_version = client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("delete marker version id")
+            .to_string();
+
+        let url = format!(
+            "{}/{bucket}/{key}?versionId={delete_marker_version}",
+            CTX.endpoint()
+        );
+        let response = send_signed_request("HEAD", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 405, "unexpected body: {}", response.body);
+        assert_eq!(response.body, "");
+        assert!(
+            response.headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("x-amz-delete-marker") && value == "true"
+            }),
+            "missing x-amz-delete-marker header: {:?}",
+            response.headers
+        );
+        assert!(
+            response
+                .headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("allow") && value == "DELETE"),
+            "missing Allow: DELETE header: {:?}",
+            response.headers
+        );
 
         cleanup_versioned_bucket(client, &bucket).await;
     });

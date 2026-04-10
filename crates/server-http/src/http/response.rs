@@ -603,6 +603,19 @@ impl S3Response {
         resp
     }
 
+    /// Build a response for `HeadObject` against a delete-marker version.
+    #[must_use]
+    pub fn head_delete_marker_method_not_allowed(
+        version_id: VersionId,
+        last_modified: u64,
+    ) -> Self {
+        Self::new(405)
+            .header("Allow", "DELETE")
+            .header("x-amz-delete-marker", "true")
+            .header("x-amz-version-id", &format_version_id(version_id))
+            .header("Last-Modified", &format_http_date(last_modified))
+    }
+
     /// Build a response for `CreateBucket`.
     #[must_use]
     pub fn create_bucket(location: &str) -> Self {
@@ -1193,6 +1206,12 @@ impl S3Response {
                 let body =
                     xml::no_such_key_error_xml(key, Self::TEST_REQUEST_ID, Self::TEST_HOST_ID);
                 return Self::new(404).chunked_xml_body(body);
+            }
+            ServerError::HeadDeleteMarkerMethodNotAllowed {
+                version_id,
+                last_modified,
+            } => {
+                return Self::head_delete_marker_method_not_allowed(*version_id, *last_modified);
             }
             ServerError::NoSuchBucketPolicy { bucket } => {
                 let body = xml::no_such_bucket_policy_error_xml(
@@ -2243,6 +2262,23 @@ mod tests {
         assert_eq!(resp.status_code, 204);
         assert_eq!(find_header(&resp, "x-amz-version-id"), Some("5"));
         assert_eq!(find_header(&resp, "x-amz-delete-marker"), Some("true"));
+    }
+
+    #[test]
+    fn head_delete_marker_method_not_allowed_response() {
+        let resp = S3Response::head_delete_marker_method_not_allowed(
+            VersionId::from_u64(5),
+            1_705_321_845_000,
+        );
+        assert_eq!(resp.status_code, 405);
+        assert_eq!(find_header(&resp, "Allow"), Some("DELETE"));
+        assert_eq!(find_header(&resp, "x-amz-delete-marker"), Some("true"));
+        assert_eq!(find_header(&resp, "x-amz-version-id"), Some("5"));
+        assert_eq!(
+            find_header(&resp, "Last-Modified"),
+            Some("Mon, 15 Jan 2024 12:30:45 GMT")
+        );
+        assert!(resp.body.is_empty());
     }
 
     // ── create_bucket ─────────────────────────────────────────────────

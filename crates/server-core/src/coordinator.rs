@@ -10636,10 +10636,17 @@ impl Coordinator {
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
             StoredObject::Live(r) => r,
-            StoredObject::DeleteMarker(_) => {
-                return Err(ServerError::DeleteMarkerHit {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
+            StoredObject::DeleteMarker(marker) => {
+                return Err(if version_id.is_some() {
+                    ServerError::HeadDeleteMarkerMethodNotAllowed {
+                        version_id: marker.version_id,
+                        last_modified: marker.last_modified,
+                    }
+                } else {
+                    ServerError::DeleteMarkerHit {
+                        bucket: bucket.to_string(),
+                        key: key.to_string(),
+                    }
                 });
             }
         };

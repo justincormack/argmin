@@ -2,6 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use auth::canonical::{canonical_query_string, uri_encode};
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::ObjectCannedAcl;
 use base64::Engine;
 use ring::{digest, hmac};
 use s3_tests::{unique_bucket, CTX};
@@ -359,6 +360,32 @@ fn signed_get(bucket: &str, key: &str, query: &str) -> (u16, Vec<(String, String
         .header("x-amz-content-sha256", &s.amz_content_sha256)
         .call()
         .expect("transport error");
+    let status = resp.status().as_u16();
+    let headers = resp
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value
+                    .to_str()
+                    .expect("response header is valid utf-8")
+                    .to_string(),
+            )
+        })
+        .collect();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, headers, body)
+}
+
+fn anonymous_get(bucket: &str, key: &str, query: &str) -> (u16, Vec<(String, String)>, String) {
+    let path = format!("/{}/{}", bucket, key);
+    let url = if query.is_empty() {
+        format!("{}{}", CTX.endpoint(), path)
+    } else {
+        format!("{}{}?{}", CTX.endpoint(), path, query)
+    };
+    let mut resp = agent().get(&url).call().expect("transport error");
     let status = resp.status().as_u16();
     let headers = resp
         .headers()
@@ -940,6 +967,53 @@ fn test_get_invalid_response_override_headers_sanitized_or_ignored() {
             response_header(&headers, "Expires"),
             Some("not-a-date".to_string())
         );
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_get_response_override_headers_require_signed_requests() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_public_bucket().await;
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("obj")
+            .acl(ObjectCannedAcl::PublicRead)
+            .content_type("application/octet-stream")
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let query = "response-content-type=text%2Fplain";
+
+        let (signed_status, signed_headers, signed_body) = signed_get(&bucket, "obj", query);
+        assert_eq!(signed_status, 200);
+        assert_eq!(signed_body, "data");
+        assert_eq!(
+            response_header(&signed_headers, "Content-Type"),
+            Some("text/plain".to_string())
+        );
+
+        let (anon_status, anon_headers, anon_body) = anonymous_get(&bucket, "obj", query);
+        assert_eq!(
+            anon_status, 400,
+            "unexpected anonymous response status={anon_status} body={anon_body}"
+        );
+        assert!(
+            anon_body.contains("<Code>InvalidRequest</Code>"),
+            "unexpected anonymous response body: {anon_body}"
+        );
+        assert!(
+            anon_body.contains(
+                "Request specific response headers cannot be used for anonymous GET requests."
+            ),
+            "unexpected anonymous response body: {anon_body}"
+        );
+        assert!(response_header(&anon_headers, "Content-Type").is_some());
 
         cleanup(&bucket, &["obj"]).await;
     });

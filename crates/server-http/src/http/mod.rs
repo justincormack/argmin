@@ -116,6 +116,12 @@ fn parse_u32_or_default<S: AsRef<str>>(
     Ok(parse_optional_u32(raw, invalid_reason)?.unwrap_or(default))
 }
 
+fn canned_acl_and_header_grants_conflict() -> ServerError {
+    ServerError::InvalidRequest {
+        reason: "Specifying both Canned ACLs and Header Grants is not allowed".to_string(),
+    }
+}
+
 fn parse_request_metadata<'a, I>(headers: I) -> Result<(MetadataBlob, SystemMetadata), ServerError>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -1209,6 +1215,7 @@ impl HttpFrontend {
             }
             S3Operation::GetObject { bucket, key } => {
                 reject_managed_encryption_read_headers(req)?;
+                reject_anonymous_response_overrides(req, auth)?;
                 let sse_customer = parse_sse_customer_request(req)?;
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
@@ -1993,10 +2000,7 @@ impl HttpFrontend {
                         });
                     }
                     if has_acl_grant_headers(req) {
-                        return Err(ServerError::InvalidArgument {
-                            reason: "x-amz-acl cannot be combined with x-amz-grant-* headers"
-                                .to_string(),
-                        });
+                        return Err(canned_acl_and_header_grants_conflict());
                     }
                     let acl = parse_put_object_acl(req.header("x-amz-acl"));
                     self.coordinator
@@ -2206,10 +2210,7 @@ impl HttpFrontend {
                         });
                     }
                     if has_acl_grant_headers(req) {
-                        return Err(ServerError::InvalidArgument {
-                            reason: "x-amz-acl cannot be combined with x-amz-grant-* headers"
-                                .to_string(),
-                        });
+                        return Err(canned_acl_and_header_grants_conflict());
                     }
                     let acl = match parse_create_bucket_acl(req)? {
                         crate::coordinator::CreateBucketAcl::Canned(acl) => acl,
@@ -2508,6 +2509,12 @@ impl HttpFrontend {
                     req.query_param_lossy("version-id-marker"),
                     "version-id-marker",
                 )?;
+                if version_id_marker.is_some() && key_marker.is_none() {
+                    return Err(ServerError::InvalidArgument {
+                        reason: "A version-id marker cannot be specified without a key marker."
+                            .to_string(),
+                    });
+                }
                 let requested_max_keys =
                     parse_requested_max_keys(req.query_param_lossy("max-keys"))?;
                 let requester = Self::requester_from_auth(auth);
@@ -4697,15 +4704,7 @@ fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
         }
     }
 
-    let overrides: &[(&str, &str)] = &[
-        ("response-content-type", "Content-Type"),
-        ("response-content-disposition", "Content-Disposition"),
-        ("response-content-encoding", "Content-Encoding"),
-        ("response-content-language", "Content-Language"),
-        ("response-cache-control", "Cache-Control"),
-        ("response-expires", "Expires"),
-    ];
-    for &(param, header_name) in overrides {
+    for &(param, header_name) in RESPONSE_OVERRIDE_HEADERS {
         if let Some(value) = req.query_param_lossy(param) {
             let Some(value) = validated_override_value(header_name, value.as_ref()) else {
                 continue;
@@ -4715,6 +4714,34 @@ fn apply_response_overrides(resp: &mut S3Response, req: &S3Request) {
             resp.headers.push((header_name.to_string(), value));
         }
     }
+}
+
+const RESPONSE_OVERRIDE_HEADERS: &[(&str, &str)] = &[
+    ("response-content-type", "Content-Type"),
+    ("response-content-disposition", "Content-Disposition"),
+    ("response-content-encoding", "Content-Encoding"),
+    ("response-content-language", "Content-Language"),
+    ("response-cache-control", "Cache-Control"),
+    ("response-expires", "Expires"),
+];
+
+fn has_response_override_params(req: &S3Request) -> bool {
+    RESPONSE_OVERRIDE_HEADERS
+        .iter()
+        .any(|(param, _)| req.query_param_lossy(param).is_some())
+}
+
+fn reject_anonymous_response_overrides(
+    req: &S3Request,
+    auth: &AuthContext,
+) -> Result<(), ServerError> {
+    if auth.mode == AuthMode::Anonymous && has_response_override_params(req) {
+        return Err(ServerError::InvalidRequest {
+            reason: "Request specific response headers cannot be used for anonymous GET requests."
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn add_tagging_count_header(resp: &mut S3Response, tags_xml: &str) -> Result<(), ServerError> {
@@ -8520,6 +8547,56 @@ mod tests {
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidArgument { .. }) => {}
             Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn list_object_versions_rejects_version_id_marker_without_key_marker() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = make_req("versions&version-id-marker=1");
+        let op = S3Operation::ListObjectVersions {
+            bucket: "mybucket".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert_eq!(
+                    reason,
+                    "A version-id marker cannot be specified without a key marker."
+                );
+            }
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn anonymous_get_rejects_response_override_params() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+
+        let req = new_req(
+            http::Method::GET,
+            "/mybucket/key",
+            "response-content-type=text%2Fplain",
+            vec![],
+            vec![],
+        );
+        let op = S3Operation::GetObject {
+            bucket: "mybucket".to_string(),
+            key: "key".to_string(),
+        };
+        match fe.dispatch_routed(&req, &auth::AuthContext::anonymous(), op) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(
+                    reason,
+                    "Request specific response headers cannot be used for anonymous GET requests."
+                );
+            }
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }

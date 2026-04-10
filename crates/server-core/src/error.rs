@@ -1,4 +1,5 @@
 /// Unified error type for the server crate.
+use s3_types::VersionId;
 use storage::error::{MetadataError, StoreError};
 
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +84,12 @@ pub enum ServerError {
 
     #[error("method not allowed")]
     MethodNotAllowed,
+
+    #[error("head on delete marker version not allowed")]
+    HeadDeleteMarkerMethodNotAllowed {
+        version_id: VersionId,
+        last_modified: u64,
+    },
 
     #[error("invalid range")]
     InvalidRange { total_size: u64 },
@@ -265,7 +272,9 @@ impl ServerError {
             Self::MetadataBlobError { .. } => "InternalError",
             Self::ObjectTooLarge { .. } => "EntityTooLarge",
             Self::MetadataTooLarge => "MetadataTooLarge",
-            Self::MethodNotAllowed => "MethodNotAllowed",
+            Self::MethodNotAllowed | Self::HeadDeleteMarkerMethodNotAllowed { .. } => {
+                "MethodNotAllowed"
+            }
             Self::InvalidRange { .. } => "InvalidRange",
             Self::SlowDown => "SlowDown",
             Self::BadDigest => "BadDigest",
@@ -377,7 +386,7 @@ impl ServerError {
             | Self::QueryParameterNotImplemented { .. } => 501,
             Self::InternalError { .. } => 500,
             Self::ObjectTooLarge { .. } | Self::MetadataTooLarge => 400,
-            Self::MethodNotAllowed => 405,
+            Self::MethodNotAllowed | Self::HeadDeleteMarkerMethodNotAllowed { .. } => 405,
             Self::InvalidRange { .. } => 416,
             Self::PreconditionFailed => 412,
             Self::NotModified { .. } => 304,

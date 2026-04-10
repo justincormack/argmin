@@ -7,7 +7,7 @@ use aws_sdk_s3::Client;
 use ring::{digest, hmac};
 use s3_tests::{
     assert_s3_err_code, create_public_write_bucket, delete_all_and_bucket,
-    disable_bucket_public_access_block, err_status, unique_bucket, CTX,
+    disable_bucket_public_access_block, err_status, send_signed_request, unique_bucket, CTX,
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2593,6 +2593,54 @@ fn test_object_header_acl_grants_authenticated_users_read() {
         assert!(
             anon_body.contains("AccessDenied"),
             "expected AccessDenied for anonymous GET, got {anon_body}"
+        );
+
+        delete_all_and_bucket(client, &bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_put_object_acl_rejects_canned_acl_with_explicit_grant_headers() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_acl_enabled_bucket().await;
+        let key = "put-object-acl-conflict";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let url = format!("{}/{bucket}/{key}?acl", CTX.endpoint());
+        let response = send_signed_request(
+            "PUT",
+            &url,
+            b"",
+            vec![
+                ("x-amz-acl".to_string(), "private".to_string()),
+                (
+                    "x-amz-grant-read".to_string(),
+                    format!("uri=\"{AUTHENTICATED_USERS_GROUP_URI}\""),
+                ),
+            ],
+        );
+
+        assert_eq!(response.status, 400, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<Code>InvalidRequest</Code>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response
+                .body
+                .contains("Specifying both Canned ACLs and Header Grants is not allowed"),
+            "unexpected body: {}",
+            response.body
         );
 
         delete_all_and_bucket(client, &bucket, &[key.to_string()]).await;
