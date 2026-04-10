@@ -1,7 +1,7 @@
 use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CorsConfiguration, CorsRule, ObjectCannedAcl};
-use s3_tests::{unique_bucket, CTX};
+use s3_tests::{content_md5_header, send_signed_request, unique_bucket, CTX};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -47,6 +47,38 @@ fn preflight_snapshot(
     let _ = resp.body_mut().read_to_string();
 
     PreflightSnapshot { status, headers }
+}
+
+fn assert_error_code(body: &str, code: &str) {
+    let expected = format!("<Code>{code}</Code>");
+    assert!(
+        body.contains(&expected),
+        "expected {expected} in body: {body}"
+    );
+}
+
+fn cors_config_xml_with_rules(rule_count: usize) -> String {
+    let mut xml = String::from("<CORSConfiguration>");
+    for i in 0..rule_count {
+        xml.push_str("<CORSRule><AllowedOrigin>https://");
+        xml.push_str(&i.to_string());
+        xml.push_str(".example.com</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule>");
+    }
+    xml.push_str("</CORSConfiguration>");
+    xml
+}
+
+fn oversized_cors_config_xml() -> String {
+    let mut xml = String::from("<CORSConfiguration><CORSRule><AllowedOrigin>https://");
+    xml.push_str(&"a".repeat(65 * 1024));
+    xml.push_str(".example.com</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>");
+    xml
+}
+
+fn put_bucket_cors_raw(bucket: &str, body: &[u8]) -> s3_tests::RawResponse {
+    let url = format!("{}/{bucket}?cors", CTX.endpoint());
+    let md5 = content_md5_header(body);
+    send_signed_request("PUT", &url, body, [md5])
 }
 
 async fn preflight_status_eventually(
@@ -298,6 +330,73 @@ fn test_cors_get_round_trip_multiple_rules_and_headers() {
             .expose_headers()
             .contains(&"x-amz-version-id".to_string()));
         assert_eq!(rules[1].max_age_seconds(), Some(60));
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_cors_put_max_rules() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let body = cors_config_xml_with_rules(100);
+        let response = put_bucket_cors_raw(&bucket, body.as_bytes());
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+
+        let result = client
+            .get_bucket_cors()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(result.cors_rules().len(), 100);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_cors_put_too_many_rules_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let body = cors_config_xml_with_rules(101);
+        let response = put_bucket_cors_raw(&bucket, body.as_bytes());
+        assert_eq!(response.status, 400, "unexpected body: {}", response.body);
+        assert_error_code(&response.body, "InvalidRequest");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_cors_put_oversized_config_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let body = oversized_cors_config_xml();
+        assert!(
+            body.len() > 64 * 1024,
+            "test body must exceed 64 KiB, got {}",
+            body.len()
+        );
+        let response = put_bucket_cors_raw(&bucket, body.as_bytes());
+        assert_eq!(response.status, 400, "unexpected body: {}", response.body);
+        assert_error_code(&response.body, "MaxMessageLengthExceeded");
+        assert!(
+            response
+                .body
+                .contains("<MaxMessageLengthBytes>65536</MaxMessageLengthBytes>"),
+            "unexpected body: {}",
+            response.body
+        );
 
         cleanup(&bucket, &[]).await;
     });

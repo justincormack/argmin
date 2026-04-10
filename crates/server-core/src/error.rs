@@ -82,6 +82,9 @@ pub enum ServerError {
     #[error("metadata too large")]
     MetadataTooLarge,
 
+    #[error("request too large (max {max_message_length_bytes} bytes)")]
+    MaxMessageLengthExceeded { max_message_length_bytes: usize },
+
     #[error("method not allowed")]
     MethodNotAllowed,
 
@@ -272,6 +275,7 @@ impl ServerError {
             Self::MetadataBlobError { .. } => "InternalError",
             Self::ObjectTooLarge { .. } => "EntityTooLarge",
             Self::MetadataTooLarge => "MetadataTooLarge",
+            Self::MaxMessageLengthExceeded { .. } => "MaxMessageLengthExceeded",
             Self::MethodNotAllowed | Self::HeadDeleteMarkerMethodNotAllowed { .. } => {
                 "MethodNotAllowed"
             }
@@ -352,6 +356,7 @@ impl ServerError {
             | Self::InvalidBucketName { .. }
             | Self::KeyTooLongError { .. }
             | Self::InvalidBucketNamespace { .. }
+            | Self::MaxMessageLengthExceeded { .. }
             | Self::BadDigest
             | Self::InvalidDigest
             | Self::InvalidSseCustomerKeyMd5

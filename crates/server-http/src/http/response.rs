@@ -1298,6 +1298,24 @@ impl S3Response {
                 );
                 return Self::new(501).chunked_xml_body(body);
             }
+            ServerError::MaxMessageLengthExceeded {
+                max_message_length_bytes,
+            } => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>MaxMessageLengthExceeded</Code>\
+                     <Message>Your request was too big.</Message>\
+                     <MaxMessageLengthBytes>{}</MaxMessageLengthBytes>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    max_message_length_bytes,
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                return Self::new(400).chunked_xml_body(body);
+            }
             ServerError::HeaderNotImplemented { ref header } => {
                 let body = xml::header_not_implemented_xml(header, resource, Self::TEST_REQUEST_ID);
                 return Self::new(501).chunked_xml_body(body);

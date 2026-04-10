@@ -2285,6 +2285,8 @@ pub fn xml_escape(s: &str) -> String {
 /// </CORSConfiguration>
 /// ```
 pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfiguration, ServerError> {
+    const MAX_CORS_CONFIGURATION_BYTES: usize = 64 * 1024;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum State {
         Start,
@@ -2310,6 +2312,12 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
             "invalid UTF-8 in CORS XML body",
             "invalid XML entity in CORS XML body",
         )
+    }
+
+    if data.len() > MAX_CORS_CONFIGURATION_BYTES {
+        return Err(ServerError::MaxMessageLengthExceeded {
+            max_message_length_bytes: MAX_CORS_CONFIGURATION_BYTES,
+        });
     }
 
     let valid_methods = ["GET", "PUT", "POST", "DELETE", "HEAD"];
@@ -2479,9 +2487,11 @@ pub fn parse_cors_config_xml(data: &[u8]) -> Result<crate::cors::CorsConfigurati
                                 "CORS configuration must contain at least one rule",
                             ))
                         } else if rules.len() > 100 {
-                            Err(malformed_cors_xml(
-                                "CORS configuration must contain at most 100 rules",
-                            ))
+                            Err(ServerError::InvalidRequest {
+                                reason:
+                                    "The number of CORS rules should not exceed allowed limit of 100 rules."
+                                        .to_string(),
+                            })
                         } else {
                             Ok(crate::cors::CorsConfiguration { rules })
                         }
@@ -5245,6 +5255,34 @@ mod tests {
     fn parse_cors_config_missing_wrapper() {
         let xml = b"<CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule>";
         assert!(parse_cors_config_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_cors_config_rejects_more_than_100_rules() {
+        let mut xml = String::from("<CORSConfiguration>");
+        for i in 0..101 {
+            xml.push_str("<CORSRule><AllowedOrigin>https://");
+            xml.push_str(&i.to_string());
+            xml.push_str(
+                ".example.com</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule>",
+            );
+        }
+        xml.push_str("</CORSConfiguration>");
+        assert!(matches!(
+            parse_cors_config_xml(xml.as_bytes()),
+            Err(ServerError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_cors_config_rejects_over_64k_document() {
+        let mut xml = String::from("<CORSConfiguration><CORSRule><AllowedOrigin>https://");
+        xml.push_str(&"a".repeat(65 * 1024));
+        xml.push_str(".example.com</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>");
+        assert!(matches!(
+            parse_cors_config_xml(xml.as_bytes()),
+            Err(ServerError::MaxMessageLengthExceeded { .. })
+        ));
     }
 
     #[test]
