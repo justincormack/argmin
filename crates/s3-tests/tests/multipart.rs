@@ -1051,6 +1051,46 @@ fn test_multipart_part_too_small() {
     });
 }
 
+#[test]
+fn test_upload_part_invalid_part_number_exceeds_max() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "invalid-upload-part-number";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let result = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(10_001)
+            .body(ByteStream::from_static(b"hello"))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
 // ── Overwrite existing object ───────────────────────────────────────
 
 #[test]
@@ -2260,6 +2300,56 @@ fn test_multipart_copy_improper_range() {
             .await;
         let status = err_status(&result);
         assert!(status == 400, "expected 400, got {status}");
+        assert_s3_err_code(&result, "InvalidArgument");
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[src_key]).await;
+    });
+}
+
+#[test]
+fn test_multipart_copy_invalid_part_number_exceeds_max() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let src_key = "copy-src-invalid-part-number";
+        let dst_key = "copy-dst-invalid-part-number";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(src_key)
+            .body(ByteStream::from_static(b"hello"))
+            .send()
+            .await
+            .unwrap();
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(dst_key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap();
+
+        let result = client
+            .upload_part_copy()
+            .bucket(&bucket)
+            .key(dst_key)
+            .upload_id(upload_id)
+            .part_number(10_001)
+            .copy_source(format!("{}/{}", bucket, src_key))
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
         assert_s3_err_code(&result, "InvalidArgument");
 
         client

@@ -8080,14 +8080,7 @@ impl Coordinator {
             req.upload.upload_id,
             req.part_number
         );
-        let part_number = req.part_number;
-
-        // Validate part number range.
-        if part_number == 0 || part_number > 10_000 {
-            return Err(ServerError::InvalidArgument {
-                reason: format!("part number must be between 1 and 10000, got {part_number}"),
-            });
-        }
+        Self::validate_upload_part_number(req.part_number)?;
         let AuthorizedBeginStreamPart {
             bucket,
             key,
@@ -8114,6 +8107,15 @@ impl Coordinator {
         })
     }
 
+    fn validate_upload_part_number(part_number: u32) -> Result<(), ServerError> {
+        if !(1..=MAX_PARTS as u32).contains(&part_number) {
+            return Err(ServerError::InvalidArgument {
+                reason: format!("part number must be between 1 and {MAX_PARTS}, got {part_number}"),
+            });
+        }
+        Ok(())
+    }
+
     fn create_upload_part_stream_session(
         &self,
         pg: &storage::PgStore,
@@ -8123,6 +8125,8 @@ impl Coordinator {
         part_number: u32,
         upload: &MultipartUploadRecord,
     ) -> Result<String, ServerError> {
+        Self::validate_upload_part_number(part_number)?;
+
         let rng = ring::rand::SystemRandom::new();
         let mut id_bytes = [0u8; 16];
         ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
@@ -11795,6 +11799,7 @@ impl Coordinator {
             req.upload.upload_id,
             req.part_number
         );
+        Self::validate_upload_part_number(req.part_number)?;
         let src_bucket = req.source.bucket;
         let src_key = req.source.key;
         let src_version_id = req.source.version_id;
@@ -41369,6 +41374,64 @@ mod tests {
             })
             .unwrap();
         assert_eq!(copied.body.read_all().unwrap(), data);
+    }
+
+    #[test]
+    fn upload_part_copy_invalid_part_number_exceeds_max() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+                data: b"source-data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner("bucket", "dst", test_requester(), None),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let err = coord
+            .upload_part_copy(&UploadPartCopyRequest {
+                source: copy_source("bucket", "src", None),
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    &upload.upload_id,
+                    test_requester(),
+                    None,
+                ),
+                part_number: 10_001,
+                copy_source_range: None,
+                source_sse_customer: None,
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
 
     #[test]
