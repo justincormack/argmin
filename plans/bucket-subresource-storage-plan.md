@@ -329,7 +329,7 @@ Exit criteria:
 
 ### Phase 3: Migrate Existing Bucket Subresources
 
-Status: in progress.
+Status: complete.
 
 Completed so far:
 
@@ -337,12 +337,12 @@ Completed so far:
 2. tagging migrated in `6d2c9e2` / `2979255`
 3. public access block migrated in `2979255`
 4. ownership controls migrated in `2979255`
+5. bucket policy migrated in `de4523b`
+6. lifecycle migrated in `de4523b`
 
 Remaining in this phase:
 
-1. bucket policy
-2. lifecycle
-3. removal of the old feature-specific storage trait/store methods once all
+1. removal of the old feature-specific storage trait/store methods once all
    migrated features are off them
 
 Migrate feature by feature:
@@ -370,12 +370,14 @@ Recommended order:
 
 Exit criteria:
 
-1. no migrated feature still has dedicated store trait methods
+1. all migrated bucket subresources use the generic persistence path
 2. all bucket subresource APIs still pass existing tests
+3. the remaining dedicated storage methods are clearly obsolete and can be
+   removed in the cleanup phase
 
 ### Phase 3b: Refactor Bucket-Subresource Authorization
 
-Status: in progress.
+Status: complete.
 
 Completed so far in `7b2facb` (`server-core: add bucket subresource auth tokens`):
 
@@ -386,15 +388,15 @@ Completed so far in `7b2facb` (`server-core: add bucket subresource auth tokens`
 4. the special internal CORS config load now uses an explicit internal auth
    token instead of a raw storage-read bypass
 5. direct auth tests added for the nontrivial migrated cases
+6. bucket policy and lifecycle moved onto the same per-operation auth/token
+   pattern in `de4523b`
+7. `PutObjectAcl` policy-condition handling was later tightened in `9e284c7`
+   so the policy-visible ACL context must exactly match the ACL being written
 
 Remaining in this phase:
 
-1. apply the same per-operation auth pattern to bucket policy and lifecycle as
-   they migrate
-2. continue collapsing any remaining generic bucket-subresource auth wrappers
-   that leak operation shape
-3. expand direct auth-unit coverage as more bucket subresource operations move
-   over
+1. no planned remaining work in this phase; future auth cleanup can be tracked
+   separately if more bucket subresource operations are added
 
 After the first coordinator migration lands, normalize authorization around S3
 operation boundaries instead of shared "generic subresource" helpers.
@@ -461,6 +463,8 @@ Exit criteria:
 
 ### Phase 4: Simplify Bucket Types and Loading Paths
 
+Status: pending.
+
 After migration, clean up `BucketInfo` and related loading logic.
 
 Possible end state:
@@ -480,6 +484,8 @@ Exit criteria:
 2. no hot path pays extra subresource load cost unnecessarily
 
 ### Phase 5: Remove Obsolete Schema and APIs
+
+Status: pending.
 
 Deliver:
 
