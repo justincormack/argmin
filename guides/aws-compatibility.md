@@ -14,6 +14,20 @@ This guide is a short list of currently known gaps. It is intentionally
 non-exhaustive, but anything listed here should be treated as an explicit,
 temporary compatibility exception rather than a surprise.
 
+## Bucket scope
+
+Argmin currently supports the normal S3 API surface for standard buckets.
+It does not implement AWS S3 directory buckets / S3 Express One Zone as a
+bucket class.
+
+That said, directory-bucket-only request features still need to behave like
+AWS when they are sent to a standard bucket. We keep explicit compatibility
+coverage for that behavior in
+[crates/s3-tests/tests/directory_bucket_features.rs](/home/justin/src/github.com/justincormack/argmin/crates/s3-tests/tests/directory_bucket_features.rs),
+including cases where AWS ignores a directory-bucket-specific query and cases
+where AWS rejects a directory-bucket-specific header or parameter with the
+corresponding error.
+
 ## Current known gaps
 
 ### 1. Single-part `ETag` is not AWS MD5
