@@ -345,6 +345,73 @@ struct AuthorizedCopyObject<'a> {
     destination: AuthorizedPutObjectWrite,
 }
 
+#[derive(Debug)]
+struct AuthorizedCreateMultipartUpload {
+    bucket_info: BucketSummary,
+    bucket: String,
+    key: String,
+    tags: Option<String>,
+    checksum: Option<MultipartChecksumConfig>,
+    initiator: Option<OwnerIdentity>,
+    owner: OwnerIdentity,
+    acl_grants: AclGrants,
+    public_read: bool,
+    object_lock: ObjectLockState,
+    write_encryption: ActiveWriteEncryption,
+}
+
+struct AuthorizedBeginStreamPart<'a> {
+    bucket: String,
+    key: String,
+    upload_id: String,
+    part_number: u32,
+    upload: MultipartUploadRecord,
+    sse_customer: Option<SseCustomerWriteContext>,
+    meta_pg: MutexGuard<'a, storage::PgStore>,
+}
+
+#[derive(Debug)]
+struct AuthorizedMultipartPartWrite {
+    bucket: String,
+    key: String,
+    upload_id: String,
+    part_number: u32,
+    upload: MultipartUploadRecord,
+    sse_customer: Option<SseCustomerWriteContext>,
+}
+
+struct AuthorizedUploadPartCopy<'a> {
+    source: LockedReadObject<'a>,
+    destination: AuthorizedMultipartPartWrite,
+}
+
+#[derive(Debug)]
+struct AuthorizedCompleteMultipartUpload {
+    bucket_info: BucketSummary,
+    bucket: String,
+    key: String,
+    upload_id: String,
+    upload: MultipartUploadRecord,
+    multipart_write_encryption: ActiveWriteEncryption,
+}
+
+#[derive(Debug)]
+enum AuthorizedAbortMultipartUpload {
+    InProgress {
+        bucket: String,
+        key: String,
+        upload_id: String,
+    },
+    Completed,
+}
+
+struct AuthorizedListParts<'a> {
+    bucket_info: BucketSummary,
+    key: String,
+    upload: MultipartUploadRecord,
+    meta_pg: MutexGuard<'a, storage::PgStore>,
+}
+
 enum AuthorizedDeleteObject<'a> {
     UnversionedMissing,
     UnversionedStored {
@@ -425,6 +492,36 @@ impl std::fmt::Debug for AuthorizedObjectRead<'_> {
 impl std::fmt::Debug for AuthorizedCopyObject<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedCopyObject")
+            .field("destination", &self.destination)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for AuthorizedBeginStreamPart<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizedBeginStreamPart")
+            .field("bucket", &self.bucket)
+            .field("key", &self.key)
+            .field("upload_id", &self.upload_id)
+            .field("part_number", &self.part_number)
+            .field("upload", &self.upload)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for AuthorizedListParts<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizedListParts")
+            .field("bucket_info", &self.bucket_info)
+            .field("key", &self.key)
+            .field("upload", &self.upload)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for AuthorizedUploadPartCopy<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizedUploadPartCopy")
             .field("destination", &self.destination)
             .finish_non_exhaustive()
     }
@@ -8001,11 +8098,7 @@ impl Coordinator {
             req.upload.upload_id,
             req.part_number
         );
-        let bucket = req.upload.bucket_name();
-        let key = req.upload.key();
-        let upload_id = req.upload.upload_id;
         let part_number = req.part_number;
-        let policy_context = req.effective_policy_context();
 
         // Validate part number range.
         if part_number == 0 || part_number > 10_000 {
@@ -8013,47 +8106,41 @@ impl Coordinator {
                 reason: format!("part number must be between 1 and 10000, got {part_number}"),
             });
         }
+        let AuthorizedBeginStreamPart {
+            bucket,
+            key,
+            upload_id,
+            part_number,
+            upload,
+            sse_customer,
+            meta_pg: pg,
+        } = self.authorize_begin_stream_part(req)?;
 
-        let bucket_info =
-            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-
-        // Lock metadata PG and validate upload exists.
-        let meta_pg_id = self.object_pg_id(bucket, key);
-        let pg = self.storage_node.get_pg(meta_pg_id)?;
-
-        let upload = pg.get_multipart_upload(upload_id)?;
-        if upload.bucket != bucket || upload.key != key {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        if upload.state != UploadState::InProgress {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        let policy_context =
-            Self::with_multipart_upload_managed_encryption_policy_context(policy_context, &upload);
-        if !Self::requester_can_write_multipart_upload_with_bucket_policy(
-            req.upload.requester(),
-            &bucket_info,
+        let session_id = self.create_upload_part_stream_session(
+            &pg,
+            bucket.as_str(),
+            key.as_str(),
+            upload_id.as_str(),
+            part_number,
             &upload,
-            policy_context,
-            bucket_policy.as_deref(),
-        )? {
-            return Err(ServerError::AccessDenied);
-        }
-        Self::ensure_sse_c_allowed(&bucket_info, upload.encryption.uses_sse_customer_headers())?;
-        self.ensure_write_encryption_supported(&upload.encryption)?;
-        let sse_customer = self.prepare_existing_sse_customer_write_context(
-            &upload.encryption,
-            req.sse_customer,
-            SseCustomerSegmentScope::multipart_part(part_number)?,
-            true,
         )?;
 
-        // Generate session ID.
+        Ok(BeginStreamPartResult {
+            session_id,
+            checksum_algorithm: upload.checksum.map(MultipartChecksumConfig::algorithm),
+            sse_customer,
+        })
+    }
+
+    fn create_upload_part_stream_session(
+        &self,
+        pg: &storage::PgStore,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        upload: &MultipartUploadRecord,
+    ) -> Result<String, ServerError> {
         let rng = ring::rand::SystemRandom::new();
         let mut id_bytes = [0u8; 16];
         ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
@@ -8078,11 +8165,7 @@ impl Coordinator {
             encryption: upload.encryption.clone(),
         })?;
 
-        Ok(BeginStreamPartResult {
-            session_id,
-            checksum_algorithm: upload.checksum.map(MultipartChecksumConfig::algorithm),
-            sse_customer,
-        })
+        Ok(session_id)
     }
 
     fn validate_stream_session_binding(
@@ -11663,84 +11746,62 @@ impl Coordinator {
             req.object.bucket_name(),
             req.object.key
         );
-        let bucket = req.object.bucket_name();
-        let key = req.object.key;
-        let policy_context = req.effective_policy_context();
-        self.with_bucket_write_reservation_for(&req.object, |bucket_info| {
-            if req.object.requester().is_anonymous() {
-                return Err(ServerError::AccessDenied);
+        let AuthorizedCreateMultipartUpload {
+            bucket_info,
+            bucket,
+            key,
+            tags,
+            checksum,
+            initiator,
+            owner,
+            acl_grants,
+            public_read,
+            object_lock,
+            write_encryption,
+        } = self.authorize_create_multipart_upload(req)?;
+
+        let rng = ring::rand::SystemRandom::new();
+        let mut id_bytes = [0u8; 16];
+        ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
+            ServerError::InternalError {
+                reason: "failed to generate upload ID".to_string(),
             }
-            let existing_object = self.put_target_existing_live_object(bucket, key)?;
-            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-            if !Self::requester_can_put_object_with_bucket_policy(
-                req.object.requester(),
-                &bucket_info,
-                key,
-                policy_context,
-                bucket_policy.as_deref(),
-                existing_object.as_ref(),
-            )? {
-                return Err(ServerError::AccessDenied);
-            }
-            Self::ensure_sse_c_allowed(
-                &bucket_info,
-                req.encryption.sse_customer_request().is_some(),
-            )?;
+        })?;
+        let upload_id = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+            use std::fmt::Write;
+            write!(s, "{b:02x}").unwrap();
+            s
+        });
 
-            // Generate 16 random bytes → 32-char hex upload ID.
-            let rng = ring::rand::SystemRandom::new();
-            let mut id_bytes = [0u8; 16];
-            ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
-                ServerError::InternalError {
-                    reason: "failed to generate upload ID".to_string(),
-                }
-            })?;
-            let upload_id = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
-                use std::fmt::Write;
-                write!(s, "{b:02x}").unwrap();
-                s
-            });
+        let metadata_blob = req.metadata.serialize()?;
+        let system_metadata_blob = req.system_metadata.serialize()?;
+        let meta_pg_id = self.object_pg_id(&bucket, &key);
+        let pg = self.storage_node.get_pg(meta_pg_id)?;
+        pg.create_multipart_upload(&CreateMultipartUploadReq {
+            upload_id: UploadId::from(upload_id.as_str()),
+            bucket: BucketName::from(bucket.as_str()),
+            key: ObjectKey::from(key.as_str()),
+            tags: tags.as_deref().map(SerializedTagSet::from),
+            metadata_blob: SerializedMetadataBlob::from(metadata_blob),
+            system_metadata_blob: SerializedSystemMetadataBlob::from(system_metadata_blob),
+            initiator,
+            owner,
+            acl_grants,
+            public_read,
+            object_lock,
+            checksum,
+            encryption: write_encryption.object_encryption(),
+        })?;
+        let upload = pg.get_multipart_upload(&UploadId::from(upload_id.as_str()))?;
+        let initiated_at = upload.initiated_at;
+        drop(pg);
+        let lifecycle_abort =
+            self.multipart_lifecycle_abort_headers(&bucket_info, &key, initiated_at)?;
 
-            let metadata_blob = req.metadata.serialize()?;
-            let system_metadata_blob = req.system_metadata.serialize()?;
-            let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
-            Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
-            let initiator = Self::requester_owner_identity(req.object.requester());
-            let owner =
-                Self::effective_put_object_owner(&bucket_info, req.object.requester(), &req.acl);
-            let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
-            let public_read = Self::acl_grants_public_read(&acl_grants);
-            Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
-            Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
-
-            let meta_pg_id = self.object_pg_id(bucket, key);
-            let pg = self.storage_node.get_pg(meta_pg_id)?;
-            pg.create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: UploadId::from(upload_id.as_str()),
-                bucket: BucketName::from(bucket),
-                key: ObjectKey::from(key),
-                tags: req.tags.map(SerializedTagSet::from),
-                metadata_blob: SerializedMetadataBlob::from(metadata_blob),
-                system_metadata_blob: SerializedSystemMetadataBlob::from(system_metadata_blob),
-                initiator,
-                owner,
-                acl_grants,
-                public_read,
-                object_lock: req.object_lock,
-                checksum: req.checksum,
-                encryption: write_encryption.object_encryption(),
-            })?;
-            let upload = pg.get_multipart_upload(&UploadId::from(upload_id.as_str()))?;
-            let initiated_at = upload.initiated_at;
-            drop(pg);
-            let lifecycle_abort =
-                self.multipart_lifecycle_abort_headers(&bucket_info, key, initiated_at)?;
-
-            Ok(CreateMultipartUploadResult {
-                upload_id,
-                managed_encryption: upload.encryption.managed_encryption_algorithm(),
-                lifecycle_abort,
-            })
+        Ok(CreateMultipartUploadResult {
+            upload_id,
+            managed_encryption: upload.encryption.managed_encryption_algorithm(),
+            lifecycle_abort,
         })
     }
 
@@ -11749,18 +11810,6 @@ impl Coordinator {
         &self,
         req: &UploadPartCopyRequest,
     ) -> Result<UploadPartCopyResult, ServerError> {
-        let copy_source_policy_value = req.source.version_id.map_or_else(
-            || format!("{}/{}", req.source.bucket, req.source.key),
-            |version_id| {
-                format!(
-                    "{}/{}?versionId={}",
-                    req.source.bucket, req.source.key, version_id
-                )
-            },
-        );
-        let policy_context =
-            PutObjectPolicyContext::new(Some(copy_source_policy_value.as_str()), None, None)
-                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm));
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::upload_part_copy",
@@ -11775,46 +11824,13 @@ impl Coordinator {
         let src_bucket = req.source.bucket;
         let src_key = req.source.key;
         let src_version_id = req.source.version_id;
-        let dst_bucket = req.upload.bucket_name();
-        let dst_key = req.upload.key();
-        let upload_id = req.upload.upload_id;
-        let part_number = req.part_number;
         let src_cond = req.source.condition;
         let copy_source_range = req.copy_source_range;
-        let requester = req.upload.requester();
         let source_sse_customer = req.source_sse_customer;
-
-        let dst_bucket_info =
-            self.checked_active_bucket_summary(dst_bucket, req.expected_bucket_owner())?;
-        let dst_bucket_policy = self.cached_bucket_policy(&dst_bucket_info)?;
-        let dst_meta_pg = self
-            .storage_node
-            .get_pg(self.object_pg_id(dst_bucket, dst_key))?;
-        let dst_upload = dst_meta_pg.get_multipart_upload(upload_id)?;
-        if dst_upload.bucket != dst_bucket || dst_upload.key != dst_key {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        if dst_upload.state != UploadState::InProgress {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
-            policy_context,
-            &dst_upload,
-        );
-        if !Self::requester_can_write_multipart_upload_with_bucket_policy(
-            requester,
-            &dst_bucket_info,
-            &dst_upload,
-            policy_context,
-            dst_bucket_policy.as_deref(),
-        )? {
-            return Err(ServerError::AccessDenied);
-        }
-        drop(dst_meta_pg);
+        let AuthorizedUploadPartCopy {
+            source,
+            destination,
+        } = self.authorize_upload_part_copy(req)?;
         let not_found = |e: ServerError| match e {
             ServerError::Store(storage::StoreError::NotFound) => ServerError::ObjectNotFound {
                 bucket: src_bucket.to_string(),
@@ -11828,14 +11844,7 @@ impl Coordinator {
             let LockedReadObject {
                 record: src_stored,
                 pgs,
-            } = self.lock_object_for_authorized_read_with_policy(
-                requester,
-                src_bucket,
-                src_key,
-                src_version_id,
-                Self::get_object_policy_action(src_version_id),
-                req.source.expected_bucket_owner(),
-            )?;
+            } = source;
 
             // Reject delete markers — they are not copyable objects.
             let src_record = match src_stored {
@@ -11937,18 +11946,36 @@ impl Coordinator {
         }; // source locks dropped here
 
         // Phase 2: Stream into the destination multipart part session.
-        let session = self.begin_stream_part(&BeginStreamPartRequest {
-            upload: MultipartObjectRequest::new(
-                dst_bucket,
-                dst_key,
-                upload_id,
-                requester.clone(),
-                req.expected_bucket_owner(),
-            ),
+        let AuthorizedMultipartPartWrite {
+            bucket,
+            key,
+            upload_id,
             part_number,
-            policy_context,
-            sse_customer: req.sse_customer,
-        })?;
+            upload,
+            sse_customer,
+        } = destination;
+        let dst_meta_pg = self.storage_node.get_pg(self.object_pg_id(&bucket, &key))?;
+        let current_upload = dst_meta_pg.get_multipart_upload(upload_id.as_str())?;
+        if current_upload.bucket != bucket || current_upload.key != key {
+            return Err(ServerError::NoSuchUpload { upload_id });
+        }
+        if current_upload.state != UploadState::InProgress {
+            return Err(ServerError::NoSuchUpload { upload_id });
+        }
+        let session_id = self.create_upload_part_stream_session(
+            &dst_meta_pg,
+            &bucket,
+            &key,
+            upload_id.as_str(),
+            part_number,
+            &upload,
+        )?;
+        drop(dst_meta_pg);
+        let session = BeginStreamPartResult {
+            session_id,
+            checksum_algorithm: upload.checksum.map(MultipartChecksumConfig::algorithm),
+            sse_customer,
+        };
         let session_id = &session.session_id;
         let sse_customer_headers = session
             .sse_customer
@@ -11956,8 +11983,8 @@ impl Coordinator {
             .map(|ctx| ctx.request().response_headers());
         let result = (|| {
             let write_encryption = self.load_stream_part_write_encryption(
-                dst_bucket,
-                dst_key,
+                &bucket,
+                &key,
                 session_id,
                 part_number,
                 req.sse_customer,
@@ -11984,8 +12011,8 @@ impl Coordinator {
                 }
                 let storage_chunk = write_encryption.encrypt_segment(segment_index, &chunk)?;
                 self.append_stream_segment(
-                    dst_bucket,
-                    dst_key,
+                    &bucket,
+                    &key,
                     session_id,
                     segment_index,
                     &storage_chunk,
@@ -12008,10 +12035,10 @@ impl Coordinator {
 
             self.finalize_stream_part(FinalizeStreamPartRequest {
                 upload: MultipartObjectRequest::new(
-                    dst_bucket,
-                    dst_key,
-                    upload_id,
-                    requester.clone(),
+                    &bucket,
+                    &key,
+                    upload_id.as_str(),
+                    req.upload.requester().clone(),
                     req.expected_bucket_owner(),
                 ),
                 session_id,
@@ -12023,14 +12050,12 @@ impl Coordinator {
             })
         })();
         if result.is_err() {
-            let _ = self.abort_stream_put(dst_bucket, dst_key, session_id);
+            let _ = self.abort_stream_put(&bucket, &key, session_id);
         }
         let inner = result?;
-        let meta_pg = self
-            .storage_node
-            .get_pg(self.object_pg_id(dst_bucket, dst_key))?;
+        let meta_pg = self.storage_node.get_pg(self.object_pg_id(&bucket, &key))?;
         let last_modified = meta_pg
-            .get_multipart_part(upload_id, part_number)
+            .get_multipart_part(upload_id.as_str(), part_number)
             .map_err(ServerError::Metadata)?
             .last_modified;
         Ok(UploadPartCopyResult {
@@ -12059,202 +12084,189 @@ impl Coordinator {
             req.upload.upload_id,
             req.parts.len()
         );
-        let bucket = req.upload.bucket_name();
-        let key = req.upload.key();
-        let upload_id = req.upload.upload_id;
+        let AuthorizedCompleteMultipartUpload {
+            bucket_info,
+            bucket,
+            key,
+            upload_id,
+            upload,
+            multipart_write_encryption,
+        } = self.authorize_complete_multipart_upload(req)?;
         let parts = req.parts;
         let claimed_checksum = req.claimed_checksum;
-        self.with_bucket_write_reservation_for(&req.upload, |bucket_info| {
-            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-            let _completion_guard = self.storage_node.lock_multipart_completion_bucket(bucket);
-            let completion_order = self.next_completed_multipart_upload_order_for_bucket(bucket)?;
-            let meta_pg_id = self.object_pg_id(bucket, key);
-            let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-            let upload = meta_pg.get_multipart_upload(upload_id)?;
-            if upload.bucket != bucket || upload.key != key {
-                return Err(ServerError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                });
-            }
-            if upload.state != UploadState::InProgress {
-                return Err(ServerError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                });
-            }
-            let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
-                PutObjectPolicyContext::default()
-                    .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm)),
-                &upload,
-            );
-            if !Self::requester_can_write_multipart_upload_with_bucket_policy(
-                req.upload.requester(),
-                &bucket_info,
-                &upload,
-                policy_context,
-                bucket_policy.as_deref(),
-            )? {
-                return Err(ServerError::AccessDenied);
-            }
-            if !req.cond.is_empty() {
-                let existing_etag = match meta_pg.get_object_meta(bucket, key) {
-                    Ok(stored) => stored.as_live().map(|record| record.etag.format()),
-                    Err(storage::MetadataError::ObjectNotFound) => None,
-                    Err(e) => return Err(ServerError::Metadata(e)),
-                };
-                if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
-                    return Err(ServerError::ObjectNotFound {
-                        bucket: bucket.to_string(),
-                        key: key.to_string(),
-                    });
-                }
-                check_write_conditions(req.cond, existing_etag.as_deref())?;
-            }
-            if parts.is_empty() {
-                return Err(ServerError::InvalidRequest {
-                    reason: "part list must not be empty".to_string(),
-                });
-            }
-            if parts.len() > MAX_PARTS {
-                return Err(ServerError::InvalidRequest {
-                    reason: format!(
-                        "part list exceeds maximum of {MAX_PARTS} parts, got {}",
-                        parts.len()
-                    ),
-                });
-            }
-            for window in parts.windows(2) {
-                if window[0].part_number >= window[1].part_number {
-                    return Err(ServerError::InvalidPartOrder);
-                }
-            }
-            Self::ensure_sse_c_allowed(
-                &bucket_info,
-                upload.encryption.uses_sse_customer_headers(),
-            )?;
-            let multipart_write_encryption = self.resume_write_encryption(
-                &upload.encryption,
-                req.sse_customer,
-                SseCustomerSegmentScope::object(),
-                false,
-            )?;
+        let _completion_guard = self
+            .storage_node
+            .lock_multipart_completion_bucket(bucket.as_str());
+        let completion_order =
+            self.next_completed_multipart_upload_order_for_bucket(bucket.as_str())?;
+        let meta_pg_id = self.object_pg_id(bucket.as_str(), key.as_str());
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
+        let current_upload = meta_pg.get_multipart_upload(upload_id.as_str())?;
+        if current_upload.bucket != bucket.as_str() || current_upload.key != key.as_str() {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.clone(),
+            });
+        }
+        if current_upload.state != UploadState::InProgress {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.clone(),
+            });
+        }
 
-            let checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
-            let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);
+        if !req.cond.is_empty() {
+            let existing_etag = match meta_pg.get_object_meta(bucket.as_str(), key.as_str()) {
+                Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+                Err(storage::MetadataError::ObjectNotFound) => None,
+                Err(e) => return Err(ServerError::Metadata(e)),
+            };
+            if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
+                return Err(ServerError::ObjectNotFound {
+                    bucket: bucket.clone(),
+                    key: key.clone(),
+                });
+            }
+            check_write_conditions(req.cond, existing_etag.as_deref())?;
+        }
+        if parts.is_empty() {
+            return Err(ServerError::InvalidRequest {
+                reason: "part list must not be empty".to_string(),
+            });
+        }
+        if parts.len() > MAX_PARTS {
+            return Err(ServerError::InvalidRequest {
+                reason: format!(
+                    "part list exceeds maximum of {MAX_PARTS} parts, got {}",
+                    parts.len()
+                ),
+            });
+        }
+        for window in parts.windows(2) {
+            if window[0].part_number >= window[1].part_number {
+                return Err(ServerError::InvalidPartOrder);
+            }
+        }
 
-            let mut part_records: Vec<MultipartPartRecord> = Vec::with_capacity(parts.len());
-            for cp in parts {
-                if let (Some(upload_algo), Some(ChecksumType::Composite), None) =
-                    (checksum_algo, checksum_type, cp.checksum.as_ref())
-                {
-                    return Err(ServerError::InvalidRequest {
+        let checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
+        let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);
+
+        let mut part_records: Vec<MultipartPartRecord> = Vec::with_capacity(parts.len());
+        for cp in parts {
+            if let (Some(upload_algo), Some(ChecksumType::Composite), None) =
+                (checksum_algo, checksum_type, cp.checksum.as_ref())
+            {
+                return Err(ServerError::InvalidRequest {
                         reason: format!(
                             "The upload was created using a {} checksum. The complete request must include the checksum for each part. It was missing for part {} in the request.",
                             upload_algo.as_str(),
                             cp.part_number
                         ),
                     });
-                }
-                let part = match meta_pg.get_multipart_part(upload_id, cp.part_number) {
-                    Ok(p) => p,
-                    Err(storage::MetadataError::PartNotFound { .. }) => {
-                        return Err(ServerError::InvalidPart {
-                            part_number: cp.part_number,
-                        });
-                    }
-                    Err(e) => return Err(ServerError::Metadata(e)),
-                };
-
-                let stored_etag = etag_bytes_to_crc64(&part.etag)
-                    .map(format_etag)
-                    .unwrap_or_default();
-                if stored_etag != cp.etag {
+            }
+            let part = match meta_pg.get_multipart_part(upload_id.as_str(), cp.part_number) {
+                Ok(p) => p,
+                Err(storage::MetadataError::PartNotFound { .. }) => {
                     return Err(ServerError::InvalidPart {
                         part_number: cp.part_number,
                     });
                 }
+                Err(e) => return Err(ServerError::Metadata(e)),
+            };
 
-                if let Some(ref claim) = cp.checksum {
-                    if let Some(upload_algo) = checksum_algo {
-                        if claim.algorithm() != upload_algo {
-                            return Err(ServerError::InvalidRequest {
-                                reason: format!(
-                                    "checksum element type {} does not match upload algorithm {}",
-                                    claim.algorithm().as_str(),
-                                    upload_algo.as_str()
-                                ),
-                            });
-                        }
+            let stored_etag = etag_bytes_to_crc64(&part.etag)
+                .map(format_etag)
+                .unwrap_or_default();
+            if stored_etag != cp.etag {
+                return Err(ServerError::InvalidPart {
+                    part_number: cp.part_number,
+                });
+            }
+
+            if let Some(ref claim) = cp.checksum {
+                if let Some(upload_algo) = checksum_algo {
+                    if claim.algorithm() != upload_algo {
+                        return Err(ServerError::InvalidRequest {
+                            reason: format!(
+                                "checksum element type {} does not match upload algorithm {}",
+                                claim.algorithm().as_str(),
+                                upload_algo.as_str()
+                            ),
+                        });
                     }
-                    match &part.checksum {
-                        Some(stored_bytes) => {
-                            if claim.expected_bytes() != stored_bytes.as_slice() {
-                                return Err(ServerError::InvalidRequest {
-                                    reason: "part checksum mismatch".to_string(),
-                                });
-                            }
-                        }
-                        None => {
+                }
+                match &part.checksum {
+                    Some(stored_bytes) => {
+                        if claim.expected_bytes() != stored_bytes.as_slice() {
                             return Err(ServerError::InvalidRequest {
                                 reason: "part checksum mismatch".to_string(),
                             });
                         }
                     }
-                }
-
-                part_records.push(part);
-            }
-
-            if part_records.len() > 1 {
-                for part in &part_records[..part_records.len() - 1] {
-                    if part.size < MIN_PART_SIZE {
-                        return Err(ServerError::EntityTooSmall {
-                            part_number: part.part_number,
-                            size: part.size,
-                            min: MIN_PART_SIZE,
+                    None => {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "part checksum mismatch".to_string(),
                         });
                     }
                 }
             }
 
-            let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
-                meta_pg.next_version_id(bucket, key)?
-            } else {
-                VersionId::Null
-            };
-            let generation_id = meta_pg.next_generation_id(bucket, key)?;
-            let stale_payload = if version_id.is_null() {
-                Self::snapshot_overwritten_null_version_payload(&meta_pg, bucket, key)?
-            } else {
-                None
-            };
+            part_records.push(part);
+        }
 
-            let part_etags: Vec<&[u8]> = part_records.iter().map(|p| p.etag.as_slice()).collect();
-            let (etag_bytes_vec, etag_str) = compute_multipart_etag(&part_etags);
-            let mut etag_crc64 = [0u8; 8];
-            etag_crc64.copy_from_slice(&etag_bytes_vec);
+        if part_records.len() > 1 {
+            for part in &part_records[..part_records.len() - 1] {
+                if part.size < MIN_PART_SIZE {
+                    return Err(ServerError::EntityTooSmall {
+                        part_number: part.part_number,
+                        size: part.size,
+                        min: MIN_PART_SIZE,
+                    });
+                }
+            }
+        }
 
-            let total_size: u64 = part_records.iter().map(|p| p.size).sum();
-            if let Some(trace) = observability::current_context() {
+        let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
+            meta_pg.next_version_id(bucket.as_str(), key.as_str())?
+        } else {
+            VersionId::Null
+        };
+        let generation_id = meta_pg.next_generation_id(bucket.as_str(), key.as_str())?;
+        let stale_payload = if version_id.is_null() {
+            Self::snapshot_overwritten_null_version_payload(
+                &meta_pg,
+                bucket.as_str(),
+                key.as_str(),
+            )?
+        } else {
+            None
+        };
+
+        let part_etags: Vec<&[u8]> = part_records.iter().map(|p| p.etag.as_slice()).collect();
+        let (etag_bytes_vec, etag_str) = compute_multipart_etag(&part_etags);
+        let mut etag_crc64 = [0u8; 8];
+        etag_crc64.copy_from_slice(&etag_bytes_vec);
+
+        let total_size: u64 = part_records.iter().map(|p| p.size).sum();
+        if let Some(trace) = observability::current_context() {
+            let _ = observability::event_in_context(
+                &trace,
+                TRACE_TARGET,
+                "complete_multipart_layout",
+                Some(format_args!(
+                    "bucket={:?} key={:?} upload_id={:?} parts={} total_size={}",
+                    bucket,
+                    key,
+                    upload_id,
+                    part_records.len(),
+                    total_size
+                )),
+            );
+            let mut object_offset_start = 0u64;
+            for (part_order, (requested_part, stored_part)) in
+                parts.iter().zip(part_records.iter()).enumerate()
+            {
+                let object_offset_len = stored_part.size;
+                let object_offset_end_exclusive = object_offset_start + object_offset_len;
                 let _ = observability::event_in_context(
-                    &trace,
-                    TRACE_TARGET,
-                    "complete_multipart_layout",
-                    Some(format_args!(
-                        "bucket={:?} key={:?} upload_id={:?} parts={} total_size={}",
-                        bucket,
-                        key,
-                        upload_id,
-                        part_records.len(),
-                        total_size
-                    )),
-                );
-                let mut object_offset_start = 0u64;
-                for (part_order, (requested_part, stored_part)) in
-                    parts.iter().zip(part_records.iter()).enumerate()
-                {
-                    let object_offset_len = stored_part.size;
-                    let object_offset_end_exclusive = object_offset_start + object_offset_len;
-                    let _ = observability::event_in_context(
                         &trace,
                         TRACE_TARGET,
                         "complete_multipart_part_layout",
@@ -12272,30 +12284,37 @@ impl Coordinator {
                             requested_part.etag
                         )),
                     );
-                    object_offset_start = object_offset_end_exclusive;
-                }
+                object_offset_start = object_offset_end_exclusive;
             }
+        }
 
-            let checksum_value = if let (Some(algo), Some(ctype)) = (checksum_algo, checksum_type) {
-                use base64::Engine;
-                let b64 = base64::engine::general_purpose::STANDARD;
-                match ctype {
-                    ChecksumType::Composite => {
-                        let mut concat = Vec::new();
-                        for part in &part_records {
-                            match &part.checksum {
-                                Some(bytes) => concat.extend_from_slice(bytes.as_slice()),
-                                None => {
-                                    return Err(ServerError::InvalidRequest {
-                                        reason: "COMPOSITE checksum requires all parts to have checksums".to_string(),
-                                    });
-                                }
+        let checksum_value = if let (Some(algo), Some(ctype)) = (checksum_algo, checksum_type) {
+            use base64::Engine;
+            let b64 = base64::engine::general_purpose::STANDARD;
+            match ctype {
+                ChecksumType::Composite => {
+                    let mut concat = Vec::new();
+                    for part in &part_records {
+                        match &part.checksum {
+                            Some(bytes) => concat.extend_from_slice(bytes.as_slice()),
+                            None => {
+                                return Err(ServerError::InvalidRequest {
+                                    reason:
+                                        "COMPOSITE checksum requires all parts to have checksums"
+                                            .to_string(),
+                                });
                             }
                         }
-                        let hash = compute_checksum(algo, &concat);
-                        Some(format!("{}-{}", b64.encode(hash.bytes()), part_records.len()))
                     }
-                    ChecksumType::FullObject => match algo {
+                    let hash = compute_checksum(algo, &concat);
+                    Some(format!(
+                        "{}-{}",
+                        b64.encode(hash.bytes()),
+                        part_records.len()
+                    ))
+                }
+                ChecksumType::FullObject => {
+                    match algo {
                         ChecksumAlgorithm::Crc32 => {
                             let mut combined: u32 = 0;
                             for part in &part_records {
@@ -12304,11 +12323,12 @@ impl Coordinator {
                                         reason: "FULL_OBJECT checksum requires all parts to have checksums".to_string(),
                                     }
                                 })?;
-                                let part_crc = u32::from_be_bytes(bytes.as_slice().try_into().map_err(
-                                    |_| ServerError::InvalidRequest {
-                                        reason: "invalid CRC32 checksum length".to_string(),
-                                    },
-                                )?);
+                                let part_crc =
+                                    u32::from_be_bytes(bytes.as_slice().try_into().map_err(
+                                        |_| ServerError::InvalidRequest {
+                                            reason: "invalid CRC32 checksum length".to_string(),
+                                        },
+                                    )?);
                                 combined = checksum::crc32::combine(combined, part_crc, part.size);
                             }
                             Some(b64.encode(combined.to_be_bytes()))
@@ -12321,11 +12341,12 @@ impl Coordinator {
                                         reason: "FULL_OBJECT checksum requires all parts to have checksums".to_string(),
                                     }
                                 })?;
-                                let part_crc = u32::from_be_bytes(bytes.as_slice().try_into().map_err(
-                                    |_| ServerError::InvalidRequest {
-                                        reason: "invalid CRC32C checksum length".to_string(),
-                                    },
-                                )?);
+                                let part_crc =
+                                    u32::from_be_bytes(bytes.as_slice().try_into().map_err(
+                                        |_| ServerError::InvalidRequest {
+                                            reason: "invalid CRC32C checksum length".to_string(),
+                                        },
+                                    )?);
                                 combined = checksum::crc32c::combine(combined, part_crc, part.size);
                             }
                             Some(b64.encode(combined.to_be_bytes()))
@@ -12338,11 +12359,12 @@ impl Coordinator {
                                         reason: "FULL_OBJECT checksum requires all parts to have checksums".to_string(),
                                     }
                                 })?;
-                                let part_crc = u64::from_be_bytes(bytes.as_slice().try_into().map_err(
-                                    |_| ServerError::InvalidRequest {
-                                        reason: "invalid CRC64NVME checksum length".to_string(),
-                                    },
-                                )?);
+                                let part_crc =
+                                    u64::from_be_bytes(bytes.as_slice().try_into().map_err(
+                                        |_| ServerError::InvalidRequest {
+                                            reason: "invalid CRC64NVME checksum length".to_string(),
+                                        },
+                                    )?);
                                 combined = checksum::crc64::combine(combined, part_crc, part.size);
                             }
                             Some(b64.encode(combined.to_be_bytes()))
@@ -12355,162 +12377,168 @@ impl Coordinator {
                                 ),
                             });
                         }
-                    },
-                }
-            } else {
-                None
-            };
-
-            if let Some(claimed) = claimed_checksum {
-                match checksum_algo {
-                    Some(upload_algo) if claimed.algorithm() != upload_algo => {
-                        return Err(ServerError::InvalidRequest {
-                            reason: format!(
-                                "checksum header algorithm {} does not match upload algorithm {}",
-                                claimed.algorithm().as_str(),
-                                upload_algo.as_str()
-                            ),
-                        });
-                    }
-                    None => {
-                        return Err(ServerError::InvalidRequest {
-                            reason: "checksum header sent but upload has no checksum algorithm"
-                                .to_string(),
-                        });
-                    }
-                    _ => {}
-                }
-                if let Some(ref computed) = checksum_value {
-                    if computed != claimed.encoded_value() {
-                        return Err(ServerError::InvalidRequest {
-                            reason: "checksum mismatch".to_string(),
-                        });
                     }
                 }
             }
+        } else {
+            None
+        };
 
-            let mut system_metadata = SystemMetadata::deserialize(upload.system_metadata_blob.as_slice())?;
-            if let (Some(algo), Some(ref val)) = (checksum_algo, &checksum_value) {
-                system_metadata.set_checksum(algo, checksum_type, val.clone());
+        if let Some(claimed) = claimed_checksum {
+            match checksum_algo {
+                Some(upload_algo) if claimed.algorithm() != upload_algo => {
+                    return Err(ServerError::InvalidRequest {
+                        reason: format!(
+                            "checksum header algorithm {} does not match upload algorithm {}",
+                            claimed.algorithm().as_str(),
+                            upload_algo.as_str()
+                        ),
+                    });
+                }
+                None => {
+                    return Err(ServerError::InvalidRequest {
+                        reason: "checksum header sent but upload has no checksum algorithm"
+                            .to_string(),
+                    });
+                }
+                _ => {}
             }
-            self.ensure_write_encryption_supported(&upload.encryption)?;
-            let (system_metadata_bytes, final_encryption) =
-                Self::prepare_stored_system_metadata(&system_metadata, &multipart_write_encryption)?;
-            let managed_encryption = final_encryption.managed_encryption_algorithm();
+            if let Some(ref computed) = checksum_value {
+                if computed != claimed.encoded_value() {
+                    return Err(ServerError::InvalidRequest {
+                        reason: "checksum mismatch".to_string(),
+                    });
+                }
+            }
+        }
 
-            let obj_req = CommitMultipartReq {
-                bucket: BucketName::from(bucket),
-                key: ObjectKey::from(key),
-                version_id,
-                owner: upload.owner.clone(),
-                acl_grants: upload.acl_grants.clone(),
-                public_read: upload.public_read,
-                generation_id,
-                size: total_size,
-                etag_crc64,
-                ec: EcShape { k: 0, m: 0 },
-                tags: upload.tags.clone(),
-                metadata_blob: Some(upload.metadata_blob.clone()),
-                system_metadata_blob: Some(system_metadata_bytes),
-                object_lock: Self::resolve_new_object_lock_state(&bucket_info, upload.object_lock)?,
-                encryption: final_encryption,
-            };
+        let mut system_metadata =
+            SystemMetadata::deserialize(upload.system_metadata_blob.as_slice())?;
+        if let (Some(algo), Some(ref val)) = (checksum_algo, &checksum_value) {
+            system_metadata.set_checksum(algo, checksum_type, val.clone());
+        }
+        self.ensure_write_encryption_supported(&upload.encryption)?;
+        let (system_metadata_bytes, final_encryption) =
+            Self::prepare_stored_system_metadata(&system_metadata, &multipart_write_encryption)?;
+        let managed_encryption = final_encryption.managed_encryption_algorithm();
 
-            let object_parts: Vec<ObjectPartRecord> = part_records
-                .iter()
-                .map(|p| {
-                    let shard_pg_id = self.shard_pg_id_raw(
-                        &format!("mpu/{}", p.upload_id),
-                        &format!("{}/{}", p.part_number, p.generation),
-                        p.part_vid.get(),
-                    );
-                    ObjectPartRecord {
-                        bucket: BucketName::from(bucket),
-                        key: ObjectKey::from(key),
-                        version_id,
-                        part_number: p.part_number,
-                        size: p.size,
-                        etag: p.etag.clone(),
-                        etag_kind: p.etag_kind,
-                        part_okh: p.part_okh,
-                        part_vid: p.part_vid,
-                        ec_k: p.ec_k,
-                        ec_m: p.ec_m,
-                        shard_pg_id,
-                        checksum: p.checksum.clone(),
-                    }
-                })
-                .collect();
+        let obj_req = CommitMultipartReq {
+            bucket: BucketName::from(bucket.as_str()),
+            key: ObjectKey::from(key.as_str()),
+            version_id,
+            owner: upload.owner.clone(),
+            acl_grants: upload.acl_grants.clone(),
+            public_read: upload.public_read,
+            generation_id,
+            size: total_size,
+            etag_crc64,
+            ec: EcShape { k: 0, m: 0 },
+            tags: upload.tags.clone(),
+            metadata_blob: Some(upload.metadata_blob.clone()),
+            system_metadata_blob: Some(system_metadata_bytes),
+            object_lock: Self::resolve_new_object_lock_state(&bucket_info, upload.object_lock)?,
+            encryption: final_encryption,
+        };
 
-            meta_pg
-                .complete_multipart_commit(upload_id, completion_order, &obj_req, &object_parts)
-                .map_err(ServerError::Metadata)?;
-            let stored = meta_pg
-                .get_object_meta(bucket, key)
-                .map_err(ServerError::Metadata)?;
-            let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
-                reason: format!(
-                    "stored object {} / {} is not live immediately after CompleteMultipartUpload",
-                    bucket, key
-                ),
-            })?;
-            let lifecycle_tags = live_record.tags.clone();
-            let lifecycle_size = live_record.size;
-            let lifecycle_last_modified = live_record.last_modified;
+        let object_parts: Vec<ObjectPartRecord> = part_records
+            .iter()
+            .map(|p| {
+                let shard_pg_id = self.shard_pg_id_raw(
+                    &format!("mpu/{}", p.upload_id),
+                    &format!("{}/{}", p.part_number, p.generation),
+                    p.part_vid.get(),
+                );
+                ObjectPartRecord {
+                    bucket: BucketName::from(bucket.as_str()),
+                    key: ObjectKey::from(key.as_str()),
+                    version_id,
+                    part_number: p.part_number,
+                    size: p.size,
+                    etag: p.etag.clone(),
+                    etag_kind: p.etag_kind,
+                    part_okh: p.part_okh,
+                    part_vid: p.part_vid,
+                    ec_k: p.ec_k,
+                    ec_m: p.ec_m,
+                    shard_pg_id,
+                    checksum: p.checksum.clone(),
+                }
+            })
+            .collect();
 
-            if let Some(ref payload) = stale_payload {
-                match payload {
-                    StaleObjectPayload::Multipart {
-                        generation_id,
+        meta_pg
+            .complete_multipart_commit(
+                upload_id.as_str(),
+                completion_order,
+                &obj_req,
+                &object_parts,
+            )
+            .map_err(ServerError::Metadata)?;
+        let stored = meta_pg
+            .get_object_meta(bucket.as_str(), key.as_str())
+            .map_err(ServerError::Metadata)?;
+        let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
+            reason: format!(
+                "stored object {} / {} is not live immediately after CompleteMultipartUpload",
+                bucket, key
+            ),
+        })?;
+        let lifecycle_tags = live_record.tags.clone();
+        let lifecycle_size = live_record.size;
+        let lifecycle_last_modified = live_record.last_modified;
+
+        if let Some(ref payload) = stale_payload {
+            match payload {
+                StaleObjectPayload::Multipart {
+                    generation_id,
+                    parts,
+                    streaming_segments,
+                } => {
+                    Self::enqueue_multipart_reclaim(
+                        &meta_pg,
+                        bucket.as_str(),
+                        key.as_str(),
+                        *generation_id,
                         parts,
                         streaming_segments,
-                    } => {
-                        Self::enqueue_multipart_reclaim(
-                            &meta_pg,
-                            bucket,
-                            key,
-                            *generation_id,
-                            parts,
-                            streaming_segments,
-                        )?;
-                    }
-                    StaleObjectPayload::Segments { .. } => {
-                        Self::delete_stale_object_payload_metadata(
-                            &meta_pg,
-                            bucket,
-                            key,
-                            version_id,
-                            payload,
-                        )?;
-                    }
+                    )?;
+                }
+                StaleObjectPayload::Segments { .. } => {
+                    Self::delete_stale_object_payload_metadata(
+                        &meta_pg,
+                        bucket.as_str(),
+                        key.as_str(),
+                        version_id,
+                        payload,
+                    )?;
                 }
             }
+        }
 
-            drop(meta_pg);
-            self.prune_completed_multipart_uploads_for_bucket_with_limit(
-                bucket,
-                COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,
-            )?;
-            let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
-                &bucket_info,
-                key,
-                lifecycle_tags.as_deref(),
-                lifecycle_size,
-                lifecycle_last_modified,
-            )?;
-            if let Some(ref payload) = stale_payload {
-                self.delete_stale_object_payload(bucket, key, payload);
-            }
+        drop(meta_pg);
+        self.prune_completed_multipart_uploads_for_bucket_with_limit(
+            bucket.as_str(),
+            COMPLETED_MULTIPART_UPLOADS_PER_BUCKET_LIMIT,
+        )?;
+        let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
+            &bucket_info,
+            key.as_str(),
+            lifecycle_tags.as_deref(),
+            lifecycle_size,
+            lifecycle_last_modified,
+        )?;
+        if let Some(ref payload) = stale_payload {
+            self.delete_stale_object_payload(bucket.as_str(), key.as_str(), payload);
+        }
 
-            Ok(CompleteMultipartUploadResult {
-                etag: etag_str,
-                version_id,
-                managed_encryption,
-                checksum_algorithm: checksum_algo,
-                checksum_type,
-                checksum_value,
-                lifecycle_expiration,
-            })
+        Ok(CompleteMultipartUploadResult {
+            etag: etag_str,
+            version_id,
+            managed_encryption,
+            checksum_algorithm: checksum_algo,
+            checksum_type,
+            checksum_value,
+            lifecycle_expiration,
         })
     }
 
@@ -12527,61 +12555,22 @@ impl Coordinator {
             req.object.key,
             req.upload_id
         );
-        let bucket = req.object.bucket_name();
-        let key = req.object.key;
-        let upload_id = req.upload_id;
-        let bucket_info =
-            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
-        // 1. Lock meta PG and validate upload.
-        let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
-        match meta_pg.get_multipart_upload(upload_id) {
-            Ok(upload) => {
-                if upload.bucket != bucket || upload.key != key {
-                    return Err(ServerError::NoSuchUpload {
-                        upload_id: upload_id.to_string(),
-                    });
-                }
-                if !Self::requester_can_manage_multipart_upload(
-                    req.object.requester(),
-                    &bucket_info,
-                    &upload,
-                ) {
-                    return Err(ServerError::AccessDenied);
+        match self.authorize_abort_multipart_upload(req)? {
+            AuthorizedAbortMultipartUpload::Completed => Ok(()),
+            AuthorizedAbortMultipartUpload::InProgress {
+                bucket,
+                key,
+                upload_id,
+            } => {
+                if self
+                    .read_runtime()
+                    .abort_multipart_upload_internal(&bucket, &key, &upload_id)?
+                {
+                    Ok(())
+                } else {
+                    Err(ServerError::NoSuchUpload { upload_id })
                 }
             }
-            Err(storage::MetadataError::NoSuchUpload { .. }) => {
-                let Some(completed) = meta_pg.get_completed_multipart_upload(upload_id)? else {
-                    return Err(ServerError::NoSuchUpload {
-                        upload_id: upload_id.to_string(),
-                    });
-                };
-                if completed.bucket != bucket || completed.key != key {
-                    return Err(ServerError::NoSuchUpload {
-                        upload_id: upload_id.to_string(),
-                    });
-                }
-                if !Self::requester_can_manage_completed_multipart_upload(
-                    req.object.requester(),
-                    &bucket_info,
-                    &completed,
-                ) {
-                    return Err(ServerError::AccessDenied);
-                }
-                return Ok(());
-            }
-            Err(error) => return Err(ServerError::Metadata(error)),
-        }
-
-        drop(meta_pg);
-        if self
-            .read_runtime()
-            .abort_multipart_upload_internal(bucket, key, upload_id)?
-        {
-            Ok(())
-        } else {
-            Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            })
         }
     }
 
@@ -12596,40 +12585,19 @@ impl Coordinator {
             req.upload.upload_id,
             req.max_parts
         );
-        let bucket = req.upload.bucket_name();
-        let key = req.upload.key();
-        let upload_id = req.upload.upload_id;
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
-        let bucket_info =
-            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
-        // 1. Lock meta PG and validate upload.
-        let meta_pg_id = self.object_pg_id(bucket, key);
-        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-
-        let upload = meta_pg.get_multipart_upload(upload_id)?;
-        if upload.bucket != bucket || upload.key != key {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        if upload.state != UploadState::InProgress {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        if !Self::requester_can_manage_multipart_upload(
-            req.upload.requester(),
-            &bucket_info,
-            &upload,
-        ) {
-            return Err(ServerError::AccessDenied);
-        }
+        let AuthorizedListParts {
+            bucket_info,
+            key,
+            upload,
+            meta_pg,
+        } = self.authorize_list_parts(req)?;
 
         // 2. Delegate to storage layer.
         let resp = meta_pg
             .list_multipart_parts(&ListPartsReq {
-                upload_id: UploadId::from(upload_id),
+                upload_id: upload.upload_id.clone(),
                 part_number_marker,
                 max_parts,
             })
@@ -12668,7 +12636,7 @@ impl Coordinator {
             checksum_type,
             lifecycle_abort: self.multipart_lifecycle_abort_headers(
                 &bucket_info,
-                key,
+                &key,
                 upload_initiated_at,
             )?,
         })
@@ -24547,6 +24515,45 @@ mod tests {
     }
 
     #[test]
+    fn authorize_create_multipart_upload_bucket_policy_request_object_tag_controls_access() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(&coord,
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
+                test_helpers::requester("owner-a"), None)
+            .unwrap();
+
+        let authorized = coord
+            .authorize_create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "public-key",
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(
+                    "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+                ),
+                checksum: None,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+        assert_eq!(authorized.bucket, "bucket");
+        assert_eq!(authorized.key, "public-key");
+        assert!(authorized.tags.is_some());
+    }
+
+    #[test]
     fn create_multipart_upload_bucket_policy_request_object_tag_requires_put_object_tagging_action()
     {
         let tmp = test_util::tempdir();
@@ -27294,6 +27301,54 @@ mod tests {
     }
 
     #[test]
+    fn authorize_complete_multipart_upload_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let err = coord
+            .authorize_complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                parts: &[],
+                claimed_checksum: None,
+
+                cond: &WriteCondition::default(),
+
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
     fn abort_multipart_upload_rejects_non_owner_requester() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -27323,6 +27378,46 @@ mod tests {
 
         let err = coord
             .abort_multipart_upload(&multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload.upload_id,
+                test_helpers::requester("other-user"),
+                None,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn authorize_abort_multipart_upload_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let err = coord
+            .authorize_abort_multipart_upload(&multipart_object_request_with_expected_owner(
                 "bucket",
                 "key",
                 &upload.upload_id,
@@ -27412,6 +27507,51 @@ mod tests {
 
         let err = coord
             .begin_stream_part(&BeginStreamPartRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &upload.upload_id,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                part_number: 1,
+                policy_context: PutObjectPolicyContext::default(),
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn authorize_begin_stream_part_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let err = coord
+            .authorize_begin_stream_part(&BeginStreamPartRequest {
                 upload: multipart_object_request_with_expected_owner(
                     "bucket",
                     "key",
@@ -36838,6 +36978,51 @@ mod tests {
     }
 
     #[test]
+    fn authorize_list_parts_rejects_non_owner_requester() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        let metadata = MetadataBlob::new();
+        let create = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                metadata: &metadata,
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let err = coord
+            .authorize_list_parts(&ListPartsRequest {
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    &create.upload_id,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                part_number_marker: None,
+                max_parts: 100,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
     fn list_parts_after_reupload_shows_latest() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -41043,6 +41228,67 @@ mod tests {
 
         let err = coord
             .upload_part_copy(&UploadPartCopyRequest {
+                source: copy_source("bucket", "src", None),
+                upload: multipart_object_request_with_expected_owner(
+                    "bucket",
+                    "dst",
+                    &upload.upload_id,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                part_number: 1,
+                copy_source_range: None,
+
+                source_sse_customer: None,
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn authorize_upload_part_copy_rejects_non_owner_requester() {
+        let dir = test_util::tempdir();
+        let coord = setup_coordinator(dir.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+                data: b"source-data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let upload = coord
+            .create_multipart_upload(&CreateMultipartUploadRequest {
+                object: object_request_with_expected_owner("bucket", "dst", test_requester(), None),
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                checksum: None,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+                encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+                policy_context: PutObjectPolicyContext::default(),
+            })
+            .unwrap();
+
+        let err = coord
+            .authorize_upload_part_copy(&UploadPartCopyRequest {
                 source: copy_source("bucket", "src", None),
                 upload: multipart_object_request_with_expected_owner(
                     "bucket",

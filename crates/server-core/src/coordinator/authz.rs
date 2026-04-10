@@ -2737,6 +2737,357 @@ impl Coordinator {
         })
     }
 
+    pub(super) fn authorize_create_multipart_upload(
+        &self,
+        req: &CreateMultipartUploadRequest<'_>,
+    ) -> Result<AuthorizedCreateMultipartUpload, ServerError> {
+        let bucket = req.object.bucket_name();
+        let key = req.object.key;
+        let policy_context = req.effective_policy_context();
+        self.with_bucket_write_reservation_for(&req.object, |bucket_info| {
+            if req.object.requester().is_anonymous() {
+                return Err(ServerError::AccessDenied);
+            }
+            let existing_object = self.put_target_existing_live_object(bucket, key)?;
+            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+            if !Self::requester_can_put_object_with_bucket_policy(
+                req.object.requester(),
+                &bucket_info,
+                key,
+                policy_context,
+                bucket_policy.as_deref(),
+                existing_object.as_ref(),
+            )? {
+                return Err(ServerError::AccessDenied);
+            }
+            Self::ensure_sse_c_allowed(
+                &bucket_info,
+                req.encryption.sse_customer_request().is_some(),
+            )?;
+            let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
+            Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
+            let initiator = Self::requester_owner_identity(req.object.requester());
+            let owner =
+                Self::effective_put_object_owner(&bucket_info, req.object.requester(), &req.acl);
+            let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
+            let public_read = Self::acl_grants_public_read(&acl_grants);
+            Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
+            Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
+
+            Ok(AuthorizedCreateMultipartUpload {
+                bucket_info: bucket_info.into_inner(),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                tags: req.tags.map(str::to_string),
+                checksum: req.checksum,
+                initiator,
+                owner,
+                acl_grants,
+                public_read,
+                object_lock: req.object_lock,
+                write_encryption,
+            })
+        })
+    }
+
+    pub(super) fn authorize_upload_part_copy<'a>(
+        &'a self,
+        req: &UploadPartCopyRequest<'_>,
+    ) -> Result<AuthorizedUploadPartCopy<'a>, ServerError> {
+        let src_bucket = req.source.bucket;
+        let src_key = req.source.key;
+        let src_version_id = req.source.version_id;
+        let dst_bucket = req.upload.bucket_name();
+        let dst_key = req.upload.key();
+        let upload_id = req.upload.upload_id;
+        let part_number = req.part_number;
+        let requester = req.upload.requester();
+        let copy_source_policy_value = req.source.version_id.map_or_else(
+            || format!("{}/{}", req.source.bucket, req.source.key),
+            |version_id| {
+                format!(
+                    "{}/{}?versionId={}",
+                    req.source.bucket, req.source.key, version_id
+                )
+            },
+        );
+        let policy_context =
+            PutObjectPolicyContext::new(Some(copy_source_policy_value.as_str()), None, None)
+                .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm));
+
+        let dst_bucket_info =
+            self.checked_active_bucket_summary(dst_bucket, req.expected_bucket_owner())?;
+        let dst_bucket_policy = self.cached_bucket_policy(&dst_bucket_info)?;
+        {
+            let dst_meta_pg = self
+                .storage_node
+                .get_pg(self.object_pg_id(dst_bucket, dst_key))?;
+            let dst_upload = dst_meta_pg.get_multipart_upload(upload_id)?;
+            if dst_upload.bucket != dst_bucket || dst_upload.key != dst_key {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            if dst_upload.state != UploadState::InProgress {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
+                policy_context,
+                &dst_upload,
+            );
+            if !Self::requester_can_write_multipart_upload_with_bucket_policy(
+                requester,
+                &dst_bucket_info,
+                &dst_upload,
+                policy_context,
+                dst_bucket_policy.as_deref(),
+            )? {
+                return Err(ServerError::AccessDenied);
+            }
+            Self::ensure_sse_c_allowed(
+                &dst_bucket_info,
+                dst_upload.encryption.uses_sse_customer_headers(),
+            )?;
+            self.ensure_write_encryption_supported(&dst_upload.encryption)?;
+            let sse_customer = self.prepare_existing_sse_customer_write_context(
+                &dst_upload.encryption,
+                req.sse_customer,
+                SseCustomerSegmentScope::multipart_part(part_number)?,
+                true,
+            )?;
+            drop(dst_meta_pg);
+
+            let source = self.lock_object_for_authorized_read_with_policy(
+                requester,
+                src_bucket,
+                src_key,
+                src_version_id,
+                Self::get_object_policy_action(src_version_id),
+                req.source.expected_bucket_owner(),
+            )?;
+            Ok(AuthorizedUploadPartCopy {
+                source,
+                destination: AuthorizedMultipartPartWrite {
+                    bucket: dst_bucket.to_string(),
+                    key: dst_key.to_string(),
+                    upload_id: upload_id.to_string(),
+                    part_number,
+                    upload: dst_upload,
+                    sse_customer,
+                },
+            })
+        }
+    }
+
+    pub(super) fn authorize_begin_stream_part<'a>(
+        &'a self,
+        req: &BeginStreamPartRequest<'_>,
+    ) -> Result<AuthorizedBeginStreamPart<'a>, ServerError> {
+        let bucket = req.upload.bucket_name();
+        let key = req.upload.key();
+        let upload_id = req.upload.upload_id;
+        let part_number = req.part_number;
+        let policy_context = req.effective_policy_context();
+        let bucket_info =
+            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
+        let upload = meta_pg.get_multipart_upload(upload_id)?;
+        if upload.bucket != bucket || upload.key != key {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        if upload.state != UploadState::InProgress {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        let policy_context =
+            Self::with_multipart_upload_managed_encryption_policy_context(policy_context, &upload);
+        if !Self::requester_can_write_multipart_upload_with_bucket_policy(
+            req.upload.requester(),
+            &bucket_info,
+            &upload,
+            policy_context,
+            bucket_policy.as_deref(),
+        )? {
+            return Err(ServerError::AccessDenied);
+        }
+        Self::ensure_sse_c_allowed(&bucket_info, upload.encryption.uses_sse_customer_headers())?;
+        self.ensure_write_encryption_supported(&upload.encryption)?;
+        let sse_customer = self.prepare_existing_sse_customer_write_context(
+            &upload.encryption,
+            req.sse_customer,
+            SseCustomerSegmentScope::multipart_part(part_number)?,
+            true,
+        )?;
+
+        Ok(AuthorizedBeginStreamPart {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            upload_id: upload_id.to_string(),
+            part_number,
+            upload,
+            sse_customer,
+            meta_pg,
+        })
+    }
+
+    pub(super) fn authorize_complete_multipart_upload(
+        &self,
+        req: &CompleteMultipartUploadRequest<'_>,
+    ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
+        let bucket = req.upload.bucket_name();
+        let key = req.upload.key();
+        let upload_id = req.upload.upload_id;
+        self.with_bucket_write_reservation_for(&req.upload, |bucket_info| {
+            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+            let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
+            let upload = meta_pg.get_multipart_upload(upload_id)?;
+            if upload.bucket != bucket || upload.key != key {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            if upload.state != UploadState::InProgress {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
+                PutObjectPolicyContext::default().with_sse_customer_algorithm(
+                    req.sse_customer.map(SseCustomerRequest::algorithm),
+                ),
+                &upload,
+            );
+            if !Self::requester_can_write_multipart_upload_with_bucket_policy(
+                req.upload.requester(),
+                &bucket_info,
+                &upload,
+                policy_context,
+                bucket_policy.as_deref(),
+            )? {
+                return Err(ServerError::AccessDenied);
+            }
+            Self::ensure_sse_c_allowed(
+                &bucket_info,
+                upload.encryption.uses_sse_customer_headers(),
+            )?;
+            let multipart_write_encryption = self.resume_write_encryption(
+                &upload.encryption,
+                req.sse_customer,
+                SseCustomerSegmentScope::object(),
+                false,
+            )?;
+            drop(meta_pg);
+
+            Ok(AuthorizedCompleteMultipartUpload {
+                bucket_info: bucket_info.into_inner(),
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                upload_id: upload_id.to_string(),
+                upload,
+                multipart_write_encryption,
+            })
+        })
+    }
+
+    pub(super) fn authorize_abort_multipart_upload(
+        &self,
+        req: &MultipartObjectRequest<'_>,
+    ) -> Result<AuthorizedAbortMultipartUpload, ServerError> {
+        let bucket = req.object.bucket_name();
+        let key = req.object.key;
+        let upload_id = req.upload_id;
+        let bucket_info =
+            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
+        let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
+        let authorized = match meta_pg.get_multipart_upload(upload_id) {
+            Ok(upload) => {
+                if upload.bucket != bucket || upload.key != key {
+                    return Err(ServerError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    });
+                }
+                if !Self::requester_can_manage_multipart_upload(
+                    req.object.requester(),
+                    &bucket_info,
+                    &upload,
+                ) {
+                    return Err(ServerError::AccessDenied);
+                }
+                AuthorizedAbortMultipartUpload::InProgress {
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    upload_id: upload_id.to_string(),
+                }
+            }
+            Err(storage::MetadataError::NoSuchUpload { .. }) => {
+                let Some(completed) = meta_pg.get_completed_multipart_upload(upload_id)? else {
+                    return Err(ServerError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    });
+                };
+                if completed.bucket != bucket || completed.key != key {
+                    return Err(ServerError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    });
+                }
+                if !Self::requester_can_manage_completed_multipart_upload(
+                    req.object.requester(),
+                    &bucket_info,
+                    &completed,
+                ) {
+                    return Err(ServerError::AccessDenied);
+                }
+                AuthorizedAbortMultipartUpload::Completed
+            }
+            Err(error) => return Err(ServerError::Metadata(error)),
+        };
+        drop(meta_pg);
+        Ok(authorized)
+    }
+
+    pub(super) fn authorize_list_parts<'a>(
+        &'a self,
+        req: &ListPartsRequest<'_>,
+    ) -> Result<AuthorizedListParts<'a>, ServerError> {
+        let bucket = req.upload.bucket_name();
+        let key = req.upload.key();
+        let upload_id = req.upload.upload_id;
+        let bucket_info =
+            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
+        let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
+        let upload = meta_pg.get_multipart_upload(upload_id)?;
+        if upload.bucket != bucket || upload.key != key {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        if upload.state != UploadState::InProgress {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        if !Self::requester_can_manage_multipart_upload(
+            req.upload.requester(),
+            &bucket_info,
+            &upload,
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+
+        Ok(AuthorizedListParts {
+            bucket_info: bucket_info.into_inner(),
+            key: key.to_string(),
+            upload,
+            meta_pg,
+        })
+    }
+
     pub(super) fn lock_object_for_authorized_read<'a>(
         &'a self,
         requester: &Requester,
