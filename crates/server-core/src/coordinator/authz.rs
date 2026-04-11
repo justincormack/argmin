@@ -126,7 +126,7 @@ impl Coordinator {
         acl_grants: &AclGrants,
         public_read: bool,
     ) -> bool {
-        let acl_allows_read = if Self::ignores_public_acls(bucket.public_access_block.as_deref()) {
+        let acl_allows_read = if Self::ignores_public_acls(bucket.public_access_block.as_ref()) {
             Self::requester_has_nonpublic_bucket_acl_permission(
                 requester,
                 acl_grants,
@@ -149,7 +149,7 @@ impl Coordinator {
         }
 
         let acl_allows_read = object.acl_grants().is_some_and(|grants| {
-            if Self::ignores_public_acls(bucket.public_access_block.as_deref()) {
+            if Self::ignores_public_acls(bucket.public_access_block.as_ref()) {
                 Self::requester_has_nonpublic_object_acl_permission(
                     requester,
                     grants,
@@ -163,7 +163,7 @@ impl Coordinator {
         requester.principal_opt() == Some(object.owner().principal.as_str())
             || acl_allows_read
             || (object.public_read()
-                && !Self::ignores_public_acls(bucket.public_access_block.as_deref()))
+                && !Self::ignores_public_acls(bucket.public_access_block.as_ref()))
     }
 
     pub(super) fn requester_can_read_bucket_acl(
@@ -366,29 +366,28 @@ impl Coordinator {
         })
     }
 
-    pub(super) fn ignores_public_acls(config_xml: Option<&str>) -> bool {
-        config_xml.is_some_and(|xml| xml.contains("<IgnorePublicAcls>true</IgnorePublicAcls>"))
+    pub(super) fn ignores_public_acls(config: Option<&PublicAccessBlockConfig>) -> bool {
+        config.is_some_and(|config| config.ignore_public_acls)
     }
 
-    pub(super) fn blocks_public_acls(config_xml: Option<&str>) -> bool {
-        config_xml.is_some_and(|xml| xml.contains("<BlockPublicAcls>true</BlockPublicAcls>"))
+    pub(super) fn blocks_public_acls(config: Option<&PublicAccessBlockConfig>) -> bool {
+        config.is_some_and(|config| config.block_public_acls)
     }
 
-    pub(super) fn blocks_public_policy(config_xml: Option<&str>) -> bool {
-        config_xml.is_some_and(|xml| xml.contains("<BlockPublicPolicy>true</BlockPublicPolicy>"))
+    pub(super) fn blocks_public_policy(config: Option<&PublicAccessBlockConfig>) -> bool {
+        config.is_some_and(|config| config.block_public_policy)
     }
 
-    pub(super) fn restricts_public_buckets(config_xml: Option<&str>) -> bool {
-        config_xml
-            .is_some_and(|xml| xml.contains("<RestrictPublicBuckets>true</RestrictPublicBuckets>"))
+    pub(super) fn restricts_public_buckets(config: Option<&PublicAccessBlockConfig>) -> bool {
+        config.is_some_and(|config| config.restrict_public_buckets)
     }
 
     pub(super) fn effective_public_read(bucket: &BucketSummary) -> bool {
-        bucket.public_read && !Self::ignores_public_acls(bucket.public_access_block.as_deref())
+        bucket.public_read && !Self::ignores_public_acls(bucket.public_access_block.as_ref())
     }
 
     pub(super) fn effective_public_write(bucket: &BucketSummary) -> bool {
-        bucket.public_write && !Self::ignores_public_acls(bucket.public_access_block.as_deref())
+        bucket.public_write && !Self::ignores_public_acls(bucket.public_access_block.as_ref())
     }
 
     pub(super) fn bucket_policy_allow_survives_restrict_public_buckets(
@@ -396,7 +395,7 @@ impl Coordinator {
         bucket: &BucketSummary,
     ) -> bool {
         if !bucket.bucket_policy_public
-            || !Self::restricts_public_buckets(bucket.public_access_block.as_deref())
+            || !Self::restricts_public_buckets(bucket.public_access_block.as_ref())
         {
             return true;
         }
@@ -1264,7 +1263,7 @@ impl Coordinator {
         if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
             return Err(ServerError::AccessControlListNotSupported);
         }
-        if Self::blocks_public_acls(bucket.public_access_block.as_deref()) && acl.is_public() {
+        if Self::blocks_public_acls(bucket.public_access_block.as_ref()) && acl.is_public() {
             return Err(ServerError::AccessDenied);
         }
         Ok(())
@@ -1316,7 +1315,7 @@ impl Coordinator {
         {
             return Err(ServerError::AccessControlListNotSupported);
         }
-        if Self::blocks_public_acls(bucket.public_access_block.as_deref()) && acl.is_public() {
+        if Self::blocks_public_acls(bucket.public_access_block.as_ref()) && acl.is_public() {
             return Err(ServerError::AccessDenied);
         }
         match acl {
@@ -1357,7 +1356,7 @@ impl Coordinator {
                     return Err(ServerError::AccessControlListNotSupported);
                 }
                 Self::ensure_supported_object_acl_grants(acl_grants)?;
-                if Self::blocks_public_acls(bucket.public_access_block.as_deref())
+                if Self::blocks_public_acls(bucket.public_access_block.as_ref())
                     && (Self::acl_grants_grant_public_read(acl_grants)
                         || Self::acl_grants_grant_public_write(acl_grants))
                 {
@@ -1615,7 +1614,7 @@ impl Coordinator {
             }
         };
         let public_read = Self::acl_grants_public_read(&acl_grants);
-        if Self::blocks_public_acls(bucket_info.public_access_block.as_deref())
+        if Self::blocks_public_acls(bucket_info.public_access_block.as_ref())
             && (Self::acl_grants_grant_public_read(&acl_grants)
                 || Self::acl_grants_grant_public_write(&acl_grants))
         {
@@ -1992,8 +1991,7 @@ impl Coordinator {
             });
         }
         let policy_is_public = parsed_policy.is_public();
-        if Self::blocks_public_policy(bucket_info.public_access_block.as_deref())
-            && policy_is_public
+        if Self::blocks_public_policy(bucket_info.public_access_block.as_ref()) && policy_is_public
         {
             return Err(ServerError::AccessDenied);
         }
@@ -2043,16 +2041,15 @@ impl Coordinator {
 
     pub(super) fn authorize_put_bucket_public_access_block(
         &self,
-        req: &PutBucketConfigRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourcePut, ServerError> {
+        req: &PutBucketPublicAccessBlockRequest<'_>,
+    ) -> Result<AuthorizedPutBucketPublicAccessBlock, ServerError> {
         let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
             &req.bucket,
             auth::PolicyAction::PutBucketPublicAccessBlock,
         )?;
-        Ok(AuthorizedBucketSubresourcePut {
+        Ok(AuthorizedPutBucketPublicAccessBlock {
             bucket: req.bucket.name.to_string(),
-            kind: storage::BucketSubresourceKind::PublicAccessBlock,
-            body: req.config.to_string(),
+            config: req.config,
         })
     }
 
@@ -2460,7 +2457,7 @@ impl Coordinator {
         };
         let public_read = Self::acl_grants_public_read(&acl_grants);
         let public_write = Self::acl_grants_public_write(&acl_grants);
-        if Self::blocks_public_acls(bucket_info.public_access_block.as_deref())
+        if Self::blocks_public_acls(bucket_info.public_access_block.as_ref())
             && (Self::acl_grants_grant_public_read(&acl_grants)
                 || Self::acl_grants_grant_public_write(&acl_grants))
         {

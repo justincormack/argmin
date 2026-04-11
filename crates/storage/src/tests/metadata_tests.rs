@@ -717,35 +717,27 @@ fn file_bucket_metadata_config_roundtrip() {
         assert_eq!(store.get_bucket_subresource("bucket", kind).unwrap(), None);
     }
 
-    for kind in [
-        BucketSubresourceKind::PublicAccessBlock,
-        BucketSubresourceKind::OwnershipControls,
-    ] {
-        let body = match kind {
-            BucketSubresourceKind::PublicAccessBlock => "<PublicAccessBlock/>",
-            BucketSubresourceKind::OwnershipControls => "<OwnershipControls/>",
-            _ => unreachable!(),
-        };
+    let kind = BucketSubresourceKind::OwnershipControls;
+    let body = "<OwnershipControls/>";
+    store
+        .put_bucket_subresource(
+            "bucket",
+            PutBucketSubresource {
+                kind,
+                body,
+                aux: BucketSubresourceAux::None,
+            },
+        )
+        .unwrap();
+    assert_eq!(
         store
-            .put_bucket_subresource(
-                "bucket",
-                PutBucketSubresource {
-                    kind,
-                    body,
-                    aux: BucketSubresourceAux::None,
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            store
-                .get_bucket_subresource("bucket", kind)
-                .unwrap()
-                .map(|stored| stored.body),
-            Some(body.to_string())
-        );
-        store.delete_bucket_subresource("bucket", kind).unwrap();
-        assert_eq!(store.get_bucket_subresource("bucket", kind).unwrap(), None);
-    }
+            .get_bucket_subresource("bucket", kind)
+            .unwrap()
+            .map(|stored| stored.body),
+        Some(body.to_string())
+    );
+    store.delete_bucket_subresource("bucket", kind).unwrap();
+    assert_eq!(store.get_bucket_subresource("bucket", kind).unwrap(), None);
 
     store
         .put_bucket_subresource(
@@ -987,27 +979,6 @@ fn file_bucket_subresource_roundtrip() {
         .put_bucket_subresource(
             "bucket",
             PutBucketSubresource {
-                kind: BucketSubresourceKind::PublicAccessBlock,
-                body: "<PublicAccessBlock/>",
-                aux: BucketSubresourceAux::None,
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::PublicAccessBlock)
-            .unwrap(),
-        Some(StoredBucketSubresource {
-            body: "<PublicAccessBlock/>".to_string(),
-            generation: Some(1),
-            aux: BucketSubresourceAux::None,
-        })
-    );
-
-    store
-        .put_bucket_subresource(
-            "bucket",
-            PutBucketSubresource {
                 kind: BucketSubresourceKind::OwnershipControls,
                 body: "<OwnershipControls/>",
                 aux: BucketSubresourceAux::None,
@@ -1023,6 +994,50 @@ fn file_bucket_subresource_roundtrip() {
             generation: Some(1),
             aux: BucketSubresourceAux::None,
         })
+    );
+
+    let public_access_block = PublicAccessBlockConfig {
+        block_public_acls: true,
+        ignore_public_acls: false,
+        block_public_policy: true,
+        restrict_public_buckets: false,
+    };
+    store
+        .put_bucket_public_access_block("bucket", public_access_block)
+        .unwrap();
+    assert_eq!(
+        store.get_bucket_public_access_block("bucket").unwrap(),
+        Some(public_access_block)
+    );
+    assert!(matches!(
+        store
+            .put_bucket_subresource(
+                "bucket",
+                PutBucketSubresource {
+                    kind: BucketSubresourceKind::PublicAccessBlock,
+                    body: "<PublicAccessBlock/>",
+                    aux: BucketSubresourceAux::None,
+                },
+            )
+            .unwrap_err(),
+        crate::error::MetadataError::NotImplemented { .. }
+    ));
+    assert!(matches!(
+        store
+            .get_bucket_subresource("bucket", BucketSubresourceKind::PublicAccessBlock)
+            .unwrap_err(),
+        crate::error::MetadataError::NotImplemented { .. }
+    ));
+    assert!(matches!(
+        store
+            .delete_bucket_subresource("bucket", BucketSubresourceKind::PublicAccessBlock)
+            .unwrap_err(),
+        crate::error::MetadataError::NotImplemented { .. }
+    ));
+    store.delete_bucket_public_access_block("bucket").unwrap();
+    assert_eq!(
+        store.get_bucket_public_access_block("bucket").unwrap(),
+        None
     );
 
     store
@@ -1416,9 +1431,7 @@ fn file_bucket_subresource_operations_on_nonexistent_bucket() {
         crate::error::MetadataError::BucketNotFound { .. }
     ));
 
-    let err = store
-        .delete_bucket_subresource("nope", BucketSubresourceKind::PublicAccessBlock)
-        .unwrap_err();
+    let err = store.delete_bucket_public_access_block("nope").unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }

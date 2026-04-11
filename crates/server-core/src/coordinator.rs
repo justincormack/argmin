@@ -30,10 +30,10 @@ use storage::{
     MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
     ObjectEncryption, ObjectKey, ObjectLayout, ObjectLockState, ObjectPartRecord,
     ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
-    OwnerIdentity, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq, ReclaimWorkItem,
-    SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey,
-    SharedStorageNode, StoredObject, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    OwnerIdentity, PublicAccessBlockConfig, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq,
+    ReclaimWorkItem, SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet,
+    SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
 
 pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
@@ -130,7 +130,7 @@ pub struct BucketSummary {
     pub public_write: bool,
     pub versioning: BucketVersioningState,
     pub object_lock: BucketObjectLockConfig,
-    pub public_access_block: Option<String>,
+    pub public_access_block: Option<PublicAccessBlockConfig>,
     pub ownership_controls: Option<String>,
     pub bucket_policy_present: bool,
     pub bucket_policy_public: bool,
@@ -217,6 +217,12 @@ struct AuthorizedBucketSubresourceGet {
 struct AuthorizedBucketSubresourceDelete {
     bucket: String,
     kind: storage::BucketSubresourceKind,
+}
+
+#[derive(Debug)]
+struct AuthorizedPutBucketPublicAccessBlock {
+    bucket: String,
+    config: PublicAccessBlockConfig,
 }
 
 #[derive(Debug)]
@@ -2309,6 +2315,13 @@ pub struct ObjectRequest<'a> {
 pub struct PutBucketConfigRequest<'a> {
     pub bucket: BucketRequest<'a>,
     pub config: &'a str,
+}
+
+/// Request for a PutBucketPublicAccessBlock operation.
+#[derive(Debug)]
+pub struct PutBucketPublicAccessBlockRequest<'a> {
+    pub bucket: BucketRequest<'a>,
+    pub config: PublicAccessBlockConfig,
 }
 
 /// Request for a PutBucketVersioning operation.
@@ -5665,7 +5678,7 @@ impl Coordinator {
             public_write: info.public_write,
             versioning: info.versioning,
             object_lock: info.object_lock,
-            public_access_block: info.public_access_block.clone(),
+            public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls.clone(),
             bucket_policy_present: info.bucket_policy_present,
             bucket_policy_public: info.bucket_policy_public,
@@ -6115,7 +6128,7 @@ impl Coordinator {
         };
         let public_read = Self::acl_grants_public_read(&acl_grants);
         let public_write = Self::acl_grants_public_write(&acl_grants);
-        if Self::blocks_public_acls(bucket.public_access_block.as_deref())
+        if Self::blocks_public_acls(bucket.public_access_block.as_ref())
             && (Self::acl_grants_grant_public_read(&acl_grants)
                 || Self::acl_grants_grant_public_write(&acl_grants))
         {
@@ -6643,21 +6656,28 @@ impl Coordinator {
 
     pub fn put_bucket_public_access_block(
         &self,
-        req: &PutBucketConfigRequest<'_>,
+        req: &PutBucketPublicAccessBlockRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_public_access_block",
-            "bucket={:?} bytes={}",
+            "bucket={:?} config={:?}",
             req.bucket.name,
-            req.config.len()
+            req.config
         );
         let authorized = self.authorize_put_bucket_public_access_block(req)?;
-        let config = authorized.body.clone();
-        self.store_authorized_bucket_subresource(&authorized)?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        bucket_pg
+            .put_bucket_public_access_block(&authorized.bucket, authorized.config)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
         self.storage_node
             .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
-                info.public_access_block = Some(config.clone());
+                info.public_access_block = Some(authorized.config);
             });
         Ok(())
     }
@@ -6665,7 +6685,7 @@ impl Coordinator {
     pub fn get_bucket_public_access_block(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<Option<String>, ServerError> {
+    ) -> Result<Option<PublicAccessBlockConfig>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_public_access_block",
@@ -6673,7 +6693,15 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_get_bucket_public_access_block(req)?;
-        self.load_authorized_bucket_subresource(&authorized)
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        bucket_pg
+            .get_bucket_public_access_block(&authorized.bucket)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
     }
 
     pub fn delete_bucket_public_access_block(
@@ -6687,7 +6715,15 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_delete_bucket_public_access_block(req)?;
-        self.remove_authorized_bucket_subresource(&authorized)?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        bucket_pg
+            .delete_bucket_public_access_block(&authorized.bucket)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
         self.storage_node
             .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
                 info.public_access_block = None
@@ -13538,6 +13574,16 @@ mod tests {
         ))
     }
 
+    fn parse_test_public_access_block_config(config: &str) -> PublicAccessBlockConfig {
+        PublicAccessBlockConfig {
+            block_public_acls: config.contains("<BlockPublicAcls>true</BlockPublicAcls>"),
+            ignore_public_acls: config.contains("<IgnorePublicAcls>true</IgnorePublicAcls>"),
+            block_public_policy: config.contains("<BlockPublicPolicy>true</BlockPublicPolicy>"),
+            restrict_public_buckets: config
+                .contains("<RestrictPublicBuckets>true</RestrictPublicBuckets>"),
+        }
+    }
+
     fn put_bucket_public_access_block_test(
         coord: &Coordinator,
         name: &str,
@@ -13545,12 +13591,10 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
-        coord.put_bucket_public_access_block(&put_bucket_config_request_with_expected_owner(
-            name,
-            config,
-            requester,
-            expected_bucket_owner,
-        ))
+        coord.put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
+            bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+            config: parse_test_public_access_block_config(config),
+        })
     }
 
     fn get_bucket_public_access_block_test(
@@ -13558,7 +13602,7 @@ mod tests {
         name: &str,
         requester: Requester,
         expected_bucket_owner: Option<&str>,
-    ) -> Result<Option<String>, ServerError> {
+    ) -> Result<Option<PublicAccessBlockConfig>, ServerError> {
         coord.get_bucket_public_access_block(&bucket_request_with_expected_owner(
             name,
             requester,
@@ -17320,7 +17364,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(read_back, Some(config.to_string()));
+        assert_eq!(
+            read_back,
+            Some(parse_test_public_access_block_config(config))
+        );
     }
 
     #[test]
@@ -17356,7 +17403,7 @@ mod tests {
                 None
             )
             .unwrap(),
-            Some(config.to_string())
+            Some(parse_test_public_access_block_config(config))
         );
 
         delete_bucket_public_access_block_test(

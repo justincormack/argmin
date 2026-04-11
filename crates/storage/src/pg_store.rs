@@ -24,7 +24,8 @@ use crate::types::*;
 const TRACE_TARGET: &str = "storage";
 const LIFECYCLE_SUBRESOURCE_KIND_SQL: i64 = BucketSubresourceKind::Lifecycle as u8 as i64;
 const BUCKET_INFO_SELECT: &str = "\
-SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, public_access_block, ownership_controls, \
+SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, \
+       public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls, \
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 4 AND body IS NOT NULL) AS bucket_policy_present, \
        bucket_policy_public, bucket_policy_generation, \
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 5 AND body IS NOT NULL) AS bucket_lifecycle_present, \
@@ -36,6 +37,7 @@ FROM buckets";
 /// in-progress staging rows are invisible to reads of completed objects.
 const PART_SEGMENT_STAGING_VERSION_ID: VersionId = MULTIPART_PART_SEGMENT_STAGING_VERSION_ID;
 type StreamSessionRow = (u8, u8, BucketName, ObjectKey, Option<UploadId>, Option<i64>);
+type PublicAccessBlockSqlValues = (i64, i64, i64, i64, i64);
 type BucketObjectLockSqlValues = (i64, Option<u8>, Option<i64>, Option<i64>);
 type ObjectLockSqlValues = (Option<u8>, Option<i64>, u8);
 
@@ -789,6 +791,56 @@ impl PgStore {
         })
     }
 
+    fn parse_public_access_block(
+        (
+            present_raw,
+            block_public_acls_raw,
+            ignore_public_acls_raw,
+            block_public_policy_raw,
+            restrict_public_buckets_raw,
+        ): PublicAccessBlockSqlValues,
+        [present_col, block_public_acls_col, ignore_public_acls_col, block_public_policy_col, restrict_public_buckets_col]: [usize; 5],
+    ) -> Result<Option<PublicAccessBlockConfig>, rusqlite::Error> {
+        fn parse_flag(raw: i64, col: usize, field: &'static str) -> Result<bool, rusqlite::Error> {
+            match raw {
+                0 => Ok(false),
+                1 => Ok(true),
+                _ => Err(rusqlite::Error::FromSqlConversionFailure(
+                    col,
+                    rusqlite::types::Type::Integer,
+                    Box::from(format!("invalid {field}: {raw}")),
+                )),
+            }
+        }
+
+        if !parse_flag(present_raw, present_col, "public_access_block_present")? {
+            return Ok(None);
+        }
+
+        Ok(Some(PublicAccessBlockConfig {
+            block_public_acls: parse_flag(
+                block_public_acls_raw,
+                block_public_acls_col,
+                "public_access_block_block_public_acls",
+            )?,
+            ignore_public_acls: parse_flag(
+                ignore_public_acls_raw,
+                ignore_public_acls_col,
+                "public_access_block_ignore_public_acls",
+            )?,
+            block_public_policy: parse_flag(
+                block_public_policy_raw,
+                block_public_policy_col,
+                "public_access_block_block_public_policy",
+            )?,
+            restrict_public_buckets: parse_flag(
+                restrict_public_buckets_raw,
+                restrict_public_buckets_col,
+                "public_access_block_restrict_public_buckets",
+            )?,
+        }))
+    }
+
     fn parse_object_lock_state(
         retention_mode_raw: Option<u8>,
         retain_until_raw: Option<i64>,
@@ -885,18 +937,43 @@ impl PgStore {
         Ok((retention_mode, retain_until, object_lock.legal_hold as u8))
     }
 
+    fn public_access_block_sql_values(
+        config: Option<PublicAccessBlockConfig>,
+    ) -> PublicAccessBlockSqlValues {
+        match config {
+            None => (0, 0, 0, 0, 0),
+            Some(config) => (
+                1,
+                i64::from(config.block_public_acls),
+                i64::from(config.ignore_public_acls),
+                i64::from(config.block_public_policy),
+                i64::from(config.restrict_public_buckets),
+            ),
+        }
+    }
+
     fn row_to_bucket_info(row: &rusqlite::Row<'_>) -> Result<BucketInfo, rusqlite::Error> {
         let owner_canonical_id_raw: String = row.get(2)?;
         let owner_canonical_id =
             Self::parse_canonical_user_id(owner_canonical_id_raw, 2, "owner_canonical_id")?;
+        let public_access_block = Self::parse_public_access_block(
+            (
+                row.get::<_, i64>(12)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, i64>(14)?,
+                row.get::<_, i64>(15)?,
+                row.get::<_, i64>(16)?,
+            ),
+            [12, 13, 14, 15, 16],
+        )?;
         let object_lock = Self::parse_bucket_object_lock(
             (
-                row.get::<_, i64>(21)?,
-                row.get::<_, Option<u8>>(22)?,
-                row.get::<_, Option<i64>>(23)?,
-                row.get::<_, Option<i64>>(24)?,
+                row.get::<_, i64>(25)?,
+                row.get::<_, Option<u8>>(26)?,
+                row.get::<_, Option<i64>>(27)?,
+                row.get::<_, Option<i64>>(28)?,
             ),
-            [21, 22, 23, 24],
+            [25, 26, 27, 28],
         )?;
         let acl_grants = Self::parse_acl_grants(row.get::<_, String>(7)?, 7, "acl_grants")?;
         Ok(BucketInfo {
@@ -922,27 +999,27 @@ impl PgStore {
                 11,
                 "active_write_reservations",
             )?,
-            public_access_block: row.get(12)?,
-            ownership_controls: row.get(13)?,
-            bucket_policy_present: row.get::<_, i64>(14)? != 0,
-            bucket_policy_public: row.get::<_, i64>(15)? != 0,
-            bucket_policy_generation: row.get::<_, i64>(16)? as u64,
-            bucket_lifecycle_present: row.get::<_, i64>(17)? != 0,
-            bucket_lifecycle_generation: row.get::<_, i64>(18)? as u64,
+            public_access_block,
+            ownership_controls: row.get(17)?,
+            bucket_policy_present: row.get::<_, i64>(18)? != 0,
+            bucket_policy_public: row.get::<_, i64>(19)? != 0,
+            bucket_policy_generation: row.get::<_, i64>(20)? as u64,
+            bucket_lifecycle_present: row.get::<_, i64>(21)? != 0,
+            bucket_lifecycle_generation: row.get::<_, i64>(22)? as u64,
             encryption: BucketEncryptionConfig {
                 default_encryption: row
-                    .get::<_, Option<u8>>(19)?
+                    .get::<_, Option<u8>>(23)?
                     .map(|value| {
                         ManagedEncryptionAlgorithm::from_u8(value).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                19,
+                                23,
                                 rusqlite::types::Type::Integer,
                                 Box::from(format!("invalid default_encryption_type: {value}")),
                             )
                         })
                     })
                     .transpose()?,
-                sse_c_blocked: row.get::<_, i64>(20)? != 0,
+                sse_c_blocked: row.get::<_, i64>(24)? != 0,
             }
             .effective(),
         })
@@ -971,6 +1048,23 @@ impl PgStore {
             source: rusqlite::Error::InvalidParameterName(format!(
                 "{kind:?} does not support aux {aux:?}"
             )),
+        }
+    }
+
+    fn bucket_subresource_not_opaque(kind: BucketSubresourceKind) -> MetadataError {
+        MetadataError::NotImplemented {
+            context: match kind {
+                BucketSubresourceKind::PublicAccessBlock => {
+                    "public access block uses typed storage"
+                }
+                BucketSubresourceKind::Cors
+                | BucketSubresourceKind::Tagging
+                | BucketSubresourceKind::OwnershipControls
+                | BucketSubresourceKind::Policy
+                | BucketSubresourceKind::Lifecycle => {
+                    "bucket subresource kind unexpectedly missing opaque storage support"
+                }
+            },
         }
     }
 
@@ -1048,17 +1142,7 @@ impl PgStore {
 
             match kind {
                 BucketSubresourceKind::Cors | BucketSubresourceKind::Tagging => {}
-                BucketSubresourceKind::PublicAccessBlock => {
-                    self.conn
-                        .execute(
-                            "UPDATE buckets SET public_access_block = ?1 WHERE name = ?2",
-                            params![body, name],
-                        )
-                        .map_err(|e| MetadataError::Db {
-                            context: "put bucket subresource (update public access block mirror)",
-                            source: e,
-                        })?;
-                }
+                BucketSubresourceKind::PublicAccessBlock => {}
                 BucketSubresourceKind::OwnershipControls => {
                     self.conn
                         .execute(
@@ -1186,17 +1270,7 @@ impl PgStore {
 
             match kind {
                 BucketSubresourceKind::Cors | BucketSubresourceKind::Tagging => {}
-                BucketSubresourceKind::PublicAccessBlock => {
-                    self.conn
-                        .execute(
-                            "UPDATE buckets SET public_access_block = NULL WHERE name = ?1",
-                            params![name],
-                        )
-                        .map_err(|e| MetadataError::Db {
-                            context: "delete bucket subresource (clear public access block mirror)",
-                            source: e,
-                        })?;
-                }
+                BucketSubresourceKind::PublicAccessBlock => {}
                 BucketSubresourceKind::OwnershipControls => {
                     self.conn
                         .execute(
@@ -2555,6 +2629,9 @@ impl PgMetadataStore for PgStore {
         name: &str,
         req: PutBucketSubresource<'_>,
     ) -> Result<(), MetadataError> {
+        if matches!(req.kind, BucketSubresourceKind::PublicAccessBlock) {
+            return Err(Self::bucket_subresource_not_opaque(req.kind));
+        }
         self.put_bucket_subresource_internal(name, req.kind, req.body, req.aux)
     }
 
@@ -2563,6 +2640,9 @@ impl PgMetadataStore for PgStore {
         name: &str,
         kind: BucketSubresourceKind,
     ) -> Result<Option<StoredBucketSubresource>, MetadataError> {
+        if matches!(kind, BucketSubresourceKind::PublicAccessBlock) {
+            return Err(Self::bucket_subresource_not_opaque(kind));
+        }
         self.get_bucket_subresource_internal(name, kind)
     }
 
@@ -2571,7 +2651,129 @@ impl PgMetadataStore for PgStore {
         name: &str,
         kind: BucketSubresourceKind,
     ) -> Result<(), MetadataError> {
+        if matches!(kind, BucketSubresourceKind::PublicAccessBlock) {
+            return Err(Self::bucket_subresource_not_opaque(kind));
+        }
         self.delete_bucket_subresource_internal(name, kind)
+    }
+
+    fn put_bucket_public_access_block(
+        &self,
+        name: &str,
+        config: PublicAccessBlockConfig,
+    ) -> Result<(), MetadataError> {
+        let (
+            present,
+            block_public_acls,
+            ignore_public_acls,
+            block_public_policy,
+            restrict_public_buckets,
+        ) = Self::public_access_block_sql_values(Some(config));
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET \
+                     public_access_block_present = ?1, \
+                     public_access_block_block_public_acls = ?2, \
+                     public_access_block_ignore_public_acls = ?3, \
+                     public_access_block_block_public_policy = ?4, \
+                     public_access_block_restrict_public_buckets = ?5 \
+                 WHERE name = ?6",
+                params![
+                    present,
+                    block_public_acls,
+                    ignore_public_acls,
+                    block_public_policy,
+                    restrict_public_buckets,
+                    name,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket public access block",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_bucket_public_access_block(
+        &self,
+        name: &str,
+    ) -> Result<Option<PublicAccessBlockConfig>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT \
+                     public_access_block_present, \
+                     public_access_block_block_public_acls, \
+                     public_access_block_ignore_public_acls, \
+                     public_access_block_block_public_policy, \
+                     public_access_block_restrict_public_buckets \
+                 FROM buckets WHERE name = ?1",
+                params![name],
+                |row| {
+                    Self::parse_public_access_block(
+                        (
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ),
+                        [0, 1, 2, 3, 4],
+                    )
+                },
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket public access block",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            })
+    }
+
+    fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError> {
+        let (
+            present,
+            block_public_acls,
+            ignore_public_acls,
+            block_public_policy,
+            restrict_public_buckets,
+        ) = Self::public_access_block_sql_values(None);
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET \
+                     public_access_block_present = ?1, \
+                     public_access_block_block_public_acls = ?2, \
+                     public_access_block_ignore_public_acls = ?3, \
+                     public_access_block_block_public_policy = ?4, \
+                     public_access_block_restrict_public_buckets = ?5 \
+                 WHERE name = ?6",
+                params![
+                    present,
+                    block_public_acls,
+                    ignore_public_acls,
+                    block_public_policy,
+                    restrict_public_buckets,
+                    name,
+                ],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket public access block",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(())
     }
 
     fn put_bucket_encryption(

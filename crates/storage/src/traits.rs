@@ -140,6 +140,22 @@ pub trait PgMetadataStore {
         kind: BucketSubresourceKind,
     ) -> Result<(), MetadataError>;
 
+    /// Store the bucket public access block configuration.
+    fn put_bucket_public_access_block(
+        &self,
+        name: &str,
+        config: PublicAccessBlockConfig,
+    ) -> Result<(), MetadataError>;
+
+    /// Retrieve the bucket public access block configuration.
+    fn get_bucket_public_access_block(
+        &self,
+        name: &str,
+    ) -> Result<Option<PublicAccessBlockConfig>, MetadataError>;
+
+    /// Delete the bucket public access block configuration. Idempotent.
+    fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError>;
+
     /// Store the currently supported bucket encryption configuration subset.
     fn put_bucket_encryption(
         &self,

@@ -2063,16 +2063,15 @@ impl HttpFrontend {
             S3Operation::PutBucketPublicAccessBlock { bucket } => {
                 validate_request_checksum_headers(req, true, false)?;
                 let config = xml::parse_public_access_block_xml(&req.body)?;
-                let config_xml = xml::get_public_access_block_xml(&config);
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_public_access_block(
-                    &crate::coordinator::PutBucketConfigRequest {
+                    &crate::coordinator::PutBucketPublicAccessBlockRequest {
                         bucket: crate::coordinator::BucketRequest::new(
                             &bucket,
                             requester,
                             expected_bucket_owner,
                         ),
-                        config: &config_xml,
+                        config,
                     },
                 )?;
                 Ok(S3Response::put_bucket_public_access_block())
@@ -2086,7 +2085,9 @@ impl HttpFrontend {
                         expected_bucket_owner,
                     ),
                 )? {
-                    Some(config_xml) => Ok(S3Response::get_bucket_public_access_block(&config_xml)),
+                    Some(config) => Ok(S3Response::get_bucket_public_access_block(
+                        &xml::get_public_access_block_xml(&config),
+                    )),
                     None => Err(ServerError::NoSuchPublicAccessBlockConfiguration {
                         bucket: bucket.clone(),
                     }),

@@ -1397,6 +1397,15 @@ pub struct MultipartReclaimRecord {
     pub parts: Vec<MultipartReclaimPartRecord>,
 }
 
+/// Public access block configuration for a bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PublicAccessBlockConfig {
+    pub block_public_acls: bool,
+    pub ignore_public_acls: bool,
+    pub block_public_policy: bool,
+    pub restrict_public_buckets: bool,
+}
+
 /// Bucket lifecycle state.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1417,6 +1426,9 @@ impl BucketState {
 }
 
 /// Typed bucket subresources whose payloads are stored opaquely.
+///
+/// `PublicAccessBlock` is handled via dedicated typed storage APIs instead of
+/// this generic opaque payload path.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketSubresourceKind {
@@ -1525,8 +1537,8 @@ pub struct BucketInfo {
     pub public_write: bool,
     pub write_reservations_blocked: bool,
     pub active_write_reservations: u32,
-    /// Serialized public access block configuration XML (None = no config).
-    pub public_access_block: Option<String>,
+    /// Typed public access block configuration (None = no config).
+    pub public_access_block: Option<PublicAccessBlockConfig>,
     /// Ownership controls value (None = not set).
     pub ownership_controls: Option<String>,
     /// Whether a bucket policy subresource is currently stored.
@@ -1565,10 +1577,7 @@ impl std::fmt::Debug for BucketInfo {
                 &self.write_reservations_blocked,
             )
             .field("active_write_reservations", &self.active_write_reservations)
-            .field(
-                "public_access_block_len",
-                &self.public_access_block.as_ref().map(String::len),
-            )
+            .field("public_access_block", &self.public_access_block)
             .field(
                 "ownership_controls_len",
                 &self.ownership_controls.as_ref().map(String::len),
@@ -1612,7 +1621,7 @@ pub struct BucketFastPathInfo {
     pub acl_grants: AclGrants,
     pub public_read: bool,
     pub public_write: bool,
-    pub public_access_block: Option<String>,
+    pub public_access_block: Option<PublicAccessBlockConfig>,
     pub ownership_controls: Option<String>,
     pub bucket_policy_present: bool,
     pub bucket_policy_public: bool,
@@ -1638,10 +1647,7 @@ impl std::fmt::Debug for BucketFastPathInfo {
             .field("acl_grants", &self.acl_grants)
             .field("public_read", &self.public_read)
             .field("public_write", &self.public_write)
-            .field(
-                "public_access_block_len",
-                &self.public_access_block.as_ref().map(String::len),
-            )
+            .field("public_access_block", &self.public_access_block)
             .field(
                 "ownership_controls_len",
                 &self.ownership_controls.as_ref().map(String::len),
@@ -1738,7 +1744,7 @@ impl From<&BucketInfo> for BucketFastPathInfo {
             acl_grants: info.acl_grants.clone(),
             public_read: info.public_read,
             public_write: info.public_write,
-            public_access_block: info.public_access_block.clone(),
+            public_access_block: info.public_access_block,
             ownership_controls: info.ownership_controls.clone(),
             bucket_policy_present: info.bucket_policy_present,
             bucket_policy_public: info.bucket_policy_public,
@@ -2419,7 +2425,12 @@ mod tests {
             public_write: false,
             write_reservations_blocked: false,
             active_write_reservations: 0,
-            public_access_block: Some("<PublicAccessBlock>secret</PublicAccessBlock>".to_string()),
+            public_access_block: Some(PublicAccessBlockConfig {
+                block_public_acls: true,
+                ignore_public_acls: false,
+                block_public_policy: true,
+                restrict_public_buckets: false,
+            }),
             ownership_controls: Some("<OwnershipControls>secret</OwnershipControls>".to_string()),
             bucket_policy_present: true,
             bucket_policy_public: false,

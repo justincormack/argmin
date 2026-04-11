@@ -17,7 +17,7 @@ use s3_types::{
 use server_core::system_metadata::SystemMetadata;
 use storage::{
     BucketEncryptionConfig, BucketLifecycleConfiguration, EffectiveBucketEncryptionConfig,
-    ManagedEncryptionAlgorithm,
+    ManagedEncryptionAlgorithm, PublicAccessBlockConfig,
 };
 
 use super::response::format_version_id;
@@ -3007,15 +3007,6 @@ fn decode_hex_pair(hi: u8, lo: u8) -> Option<u8> {
         _ => return None,
     };
     Some(h << 4 | l)
-}
-
-/// Public access block configuration for a bucket.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicAccessBlockConfig {
-    pub block_public_acls: bool,
-    pub ignore_public_acls: bool,
-    pub block_public_policy: bool,
-    pub restrict_public_buckets: bool,
 }
 
 /// Parse a `<PublicAccessBlockConfiguration>` XML request body.
