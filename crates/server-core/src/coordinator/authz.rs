@@ -144,7 +144,7 @@ impl Coordinator {
         bucket: &BucketSummary,
         object: &StoredObject,
     ) -> bool {
-        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
             return Self::requester_is_bucket_owner_account(requester, bucket);
         }
 
@@ -170,7 +170,7 @@ impl Coordinator {
         requester: &Requester,
         bucket: &BucketSummary,
     ) -> bool {
-        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
             return Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
                 || Self::requester_is_bucket_owner_account(requester, bucket);
         }
@@ -187,7 +187,7 @@ impl Coordinator {
         requester: &Requester,
         bucket: &BucketSummary,
     ) -> bool {
-        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
             return Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
                 || Self::requester_is_bucket_owner_account(requester, bucket);
         }
@@ -205,7 +205,7 @@ impl Coordinator {
         bucket: &BucketSummary,
         object: &StoredObject,
     ) -> bool {
-        (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+        (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
             && Self::requester_is_bucket_owner_account(requester, bucket))
             || requester.principal_opt() == Some(object.owner().principal.as_str())
             || object.acl_grants().is_some_and(|grants| {
@@ -218,7 +218,7 @@ impl Coordinator {
         bucket: &BucketSummary,
         object: &StoredObject,
     ) -> bool {
-        (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+        (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
             && Self::requester_is_bucket_owner_account(requester, bucket))
             || requester.principal_opt() == Some(object.owner().principal.as_str())
             || object.acl_grants().is_some_and(|grants| {
@@ -263,7 +263,7 @@ impl Coordinator {
             &bucket.owner_principal,
             &bucket.acl_grants,
             Self::effective_public_read(bucket),
-        ) || (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+        ) || (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
             && Self::requester_is_bucket_owner_account(requester, bucket))
     }
 
@@ -272,7 +272,7 @@ impl Coordinator {
         bucket: &BucketSummary,
     ) -> bool {
         Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
-            || (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+            || (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
                 && Self::requester_is_bucket_owner_account(requester, bucket))
     }
 
@@ -354,15 +354,15 @@ impl Coordinator {
             || requester.principal_opt() == Some(object.owner().principal.as_str())
     }
 
-    pub(super) fn is_bucket_owner_enforced(config_xml: Option<&str>) -> bool {
-        config_xml.is_some_and(|xml| {
-            xml.contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>")
+    pub(super) fn is_bucket_owner_enforced(config: Option<&BucketOwnershipControls>) -> bool {
+        config.is_some_and(|config| {
+            config.object_ownership == BucketObjectOwnership::BucketOwnerEnforced
         })
     }
 
-    pub(super) fn is_bucket_owner_preferred(config_xml: Option<&str>) -> bool {
-        config_xml.is_some_and(|xml| {
-            xml.contains("<ObjectOwnership>BucketOwnerPreferred</ObjectOwnership>")
+    pub(super) fn is_bucket_owner_preferred(config: Option<&BucketOwnershipControls>) -> bool {
+        config.is_some_and(|config| {
+            config.object_ownership == BucketObjectOwnership::BucketOwnerPreferred
         })
     }
 
@@ -1260,7 +1260,7 @@ impl Coordinator {
         bucket: &BucketSummary,
         acl: BucketAcl,
     ) -> Result<(), ServerError> {
-        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
             return Err(ServerError::AccessControlListNotSupported);
         }
         if Self::blocks_public_acls(bucket.public_access_block.as_ref()) && acl.is_public() {
@@ -1283,8 +1283,8 @@ impl Coordinator {
         requester: &Requester,
         acl: PutObjectAcl<'_>,
     ) -> OwnerIdentity {
-        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
-            || (Self::is_bucket_owner_preferred(bucket.ownership_controls.as_deref())
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
+            || (Self::is_bucket_owner_preferred(bucket.ownership_controls.as_ref())
                 && matches!(acl, PutObjectAcl::BucketOwnerFullControl))
         {
             return Self::bucket_owner_identity(bucket);
@@ -1310,7 +1310,7 @@ impl Coordinator {
         bucket: &BucketSummary,
         acl: PutObjectAcl<'_>,
     ) -> Result<(), ServerError> {
-        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
             && !acl.is_supported_with_bucket_owner_enforced()
         {
             return Err(ServerError::AccessControlListNotSupported);
@@ -1347,7 +1347,7 @@ impl Coordinator {
             }
             PutObjectWriteAcl::Canned(acl) => Self::ensure_put_object_acl_supported(bucket, *acl),
             PutObjectWriteAcl::Grants(acl_grants) => {
-                if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref())
+                if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
                     && !Self::acl_grants_owner_full_control_only(
                         &bucket.owner_canonical_id,
                         acl_grants,
@@ -1554,7 +1554,7 @@ impl Coordinator {
         )?;
         let LockedReadObject { record: stored, .. } = locked;
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
-        let result = if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
+        let result = if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
             let owner = Self::bucket_owner_identity(&bucket_info);
             GetObjectAclResult {
                 owner_principal: owner.principal,
@@ -1595,7 +1595,7 @@ impl Coordinator {
             },
             req.object.expected_bucket_owner(),
         )?;
-        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
+        if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
             return Err(ServerError::AccessControlListNotSupported);
         }
         let LockedReadObject {
@@ -2088,13 +2088,13 @@ impl Coordinator {
 
     pub(super) fn authorize_put_bucket_ownership_controls(
         &self,
-        req: &PutBucketConfigRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourcePut, ServerError> {
+        req: &PutBucketOwnershipControlsRequest<'_>,
+    ) -> Result<AuthorizedPutBucketOwnershipControls, ServerError> {
         let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
             &req.bucket,
             auth::PolicyAction::PutBucketOwnershipControls,
         )?;
-        if Self::is_bucket_owner_enforced(Some(req.config))
+        if Self::is_bucket_owner_enforced(Some(&req.config))
             && !Self::acl_grants_owner_full_control_only(
                 &bucket_info.owner_canonical_id,
                 &bucket_info.acl_grants,
@@ -2102,10 +2102,9 @@ impl Coordinator {
         {
             return Err(ServerError::InvalidBucketAclWithObjectOwnership);
         }
-        Ok(AuthorizedBucketSubresourcePut {
+        Ok(AuthorizedPutBucketOwnershipControls {
             bucket: req.bucket.name.to_string(),
-            kind: storage::BucketSubresourceKind::OwnershipControls,
-            body: req.config.to_string(),
+            config: req.config,
         })
     }
 
@@ -2411,7 +2410,7 @@ impl Coordinator {
         if !Self::requester_can_read_bucket_acl(&req.requester, &bucket) {
             return Err(ServerError::AccessDenied);
         }
-        let result = if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+        let result = if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
             let owner = Self::bucket_owner_identity(&bucket);
             GetBucketAclResult {
                 owner_principal: owner.principal,
@@ -2448,7 +2447,7 @@ impl Coordinator {
                 Self::bucket_acl_grants_from_canned(&owner, *acl)?
             }
             PutBucketAclInput::Grants(acl_grants) => {
-                if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_deref()) {
+                if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
                     return Err(ServerError::AccessControlListNotSupported);
                 }
                 Self::ensure_supported_bucket_acl_grants(acl_grants)?;

@@ -2107,16 +2107,15 @@ impl HttpFrontend {
             S3Operation::PutBucketOwnershipControls { bucket } => {
                 validate_request_checksum_headers(req, true, false)?;
                 let value = xml::parse_ownership_controls_xml(&req.body)?;
-                let config_xml = xml::get_ownership_controls_xml(&value);
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_ownership_controls(
-                    &crate::coordinator::PutBucketConfigRequest {
+                    &crate::coordinator::PutBucketOwnershipControlsRequest {
                         bucket: crate::coordinator::BucketRequest::new(
                             &bucket,
                             requester,
                             expected_bucket_owner,
                         ),
-                        config: &config_xml,
+                        config: value,
                     },
                 )?;
                 Ok(S3Response::put_bucket_ownership_controls())
@@ -2130,7 +2129,9 @@ impl HttpFrontend {
                         expected_bucket_owner,
                     ),
                 )? {
-                    Some(config_xml) => Ok(S3Response::get_bucket_ownership_controls(&config_xml)),
+                    Some(config) => Ok(S3Response::get_bucket_ownership_controls(
+                        &xml::get_ownership_controls_xml(&config),
+                    )),
                     None => Err(ServerError::OwnershipControlsNotFound {
                         bucket: bucket.clone(),
                     }),
@@ -8710,12 +8711,12 @@ mod tests {
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
         fe.coordinator
-            .put_bucket_ownership_controls(
-                &crate::coordinator::PutBucketConfigRequest {
-                    bucket: test_bucket_request("mybucket"),
-                    config: "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+            .put_bucket_ownership_controls(&crate::coordinator::PutBucketOwnershipControlsRequest {
+                bucket: test_bucket_request("mybucket"),
+                config: storage::BucketOwnershipControls {
+                    object_ownership: storage::BucketObjectOwnership::BucketOwnerEnforced,
                 },
-            )
+            })
             .unwrap();
 
         let req = new_req(

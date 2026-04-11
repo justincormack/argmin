@@ -21,19 +21,20 @@ use storage::traits::{PgMetadataStore, ShardStore};
 use storage::SimplePayloadReclaimRecord;
 use storage::{
     key_prefix_upper_bound, BucketEncryptionConfig, BucketFastPathInfo, BucketInfo,
-    BucketLifecycleConfiguration, BucketName, BucketObjectLockConfig, BucketState,
-    CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq, CreateStreamUploadReq,
-    EcShape, EffectiveBucketEncryptionConfig, GenerationId, LifecycleDate, LifecycleExpiration,
-    LifecycleRule, LifecycleRuleStatus, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListObjectsReq, ListPartsReq, LiveObjectRecord, ManagedEncryptionAlgorithm,
-    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
-    ObjectEncryption, ObjectKey, ObjectLayout, ObjectLockState, ObjectPartRecord,
-    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
-    OwnerIdentity, PublicAccessBlockConfig, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq,
-    ReclaimWorkItem, SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet,
-    SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    BucketLifecycleConfiguration, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
+    BucketState, CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq,
+    CreateStreamUploadReq, EcShape, EffectiveBucketEncryptionConfig, GenerationId, LifecycleDate,
+    LifecycleExpiration, LifecycleRule, LifecycleRuleStatus, ListMultipartUploadsReq,
+    ListObjectVersionsReq, ListObjectsReq, ListPartsReq, LiveObjectRecord,
+    ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
+    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectLockState,
+    ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PublicAccessBlockConfig, PutDeleteMarkerReq,
+    PutLiveObjectReq, PutObjectReq, ReclaimWorkItem, SerializedMetadataBlob,
+    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey, SharedStorageNode,
+    StoredObject, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
+    StreamUploadTarget, UploadId, UploadState,
 };
 
 pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
@@ -42,6 +43,7 @@ use crate::conditional::{
     check_write_conditions, DeleteCondition, ReadCondition, WriteCondition,
 };
 use crate::error::ServerError;
+pub use storage::BucketObjectOwnership;
 
 fn lock_mutex_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
@@ -131,7 +133,7 @@ pub struct BucketSummary {
     pub versioning: BucketVersioningState,
     pub object_lock: BucketObjectLockConfig,
     pub public_access_block: Option<PublicAccessBlockConfig>,
-    pub ownership_controls: Option<String>,
+    pub ownership_controls: Option<BucketOwnershipControls>,
     pub bucket_policy_present: bool,
     pub bucket_policy_public: bool,
     pub bucket_policy_generation: u64,
@@ -223,6 +225,12 @@ struct AuthorizedBucketSubresourceDelete {
 struct AuthorizedPutBucketPublicAccessBlock {
     bucket: String,
     config: PublicAccessBlockConfig,
+}
+
+#[derive(Debug)]
+struct AuthorizedPutBucketOwnershipControls {
+    bucket: String,
+    config: BucketOwnershipControls,
 }
 
 #[derive(Debug)]
@@ -2253,25 +2261,6 @@ impl CreateBucketAcl {
     }
 }
 
-/// Object ownership mode relevant to CreateBucket semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BucketObjectOwnership {
-    BucketOwnerEnforced,
-    BucketOwnerPreferred,
-    ObjectWriter,
-}
-
-impl BucketObjectOwnership {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::BucketOwnerEnforced => "BucketOwnerEnforced",
-            Self::BucketOwnerPreferred => "BucketOwnerPreferred",
-            Self::ObjectWriter => "ObjectWriter",
-        }
-    }
-}
-
 /// Request for a CreateBucket operation.
 #[derive(Debug)]
 pub struct CreateBucketRequest<'a> {
@@ -2322,6 +2311,13 @@ pub struct PutBucketConfigRequest<'a> {
 pub struct PutBucketPublicAccessBlockRequest<'a> {
     pub bucket: BucketRequest<'a>,
     pub config: PublicAccessBlockConfig,
+}
+
+/// Request for a PutBucketOwnershipControls operation.
+#[derive(Debug)]
+pub struct PutBucketOwnershipControlsRequest<'a> {
+    pub bucket: BucketRequest<'a>,
+    pub config: BucketOwnershipControls,
 }
 
 /// Request for a PutBucketVersioning operation.
@@ -5457,13 +5453,6 @@ impl Coordinator {
         days.checked_mul(86_400_000)
     }
 
-    fn ownership_controls_xml(ownership: BucketObjectOwnership) -> String {
-        format!(
-            "<OwnershipControls><Rule><ObjectOwnership>{}</ObjectOwnership></Rule></OwnershipControls>",
-            ownership.as_str()
-        )
-    }
-
     fn now_millis() -> u64 {
         storage::clock::current_time_millis()
     }
@@ -5679,7 +5668,7 @@ impl Coordinator {
             versioning: info.versioning,
             object_lock: info.object_lock,
             public_access_block: info.public_access_block,
-            ownership_controls: info.ownership_controls.clone(),
+            ownership_controls: info.ownership_controls,
             bucket_policy_present: info.bucket_policy_present,
             bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
@@ -5946,13 +5935,15 @@ impl Coordinator {
         )?;
         match create_outcome {
             BucketCreateOutcome::Created => {
-                self.put_bucket_ownership_controls(&PutBucketConfigRequest {
+                self.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
                     bucket: BucketRequest {
                         name: &authorized.name,
                         requester: authorized.requester.clone(),
                         expected_bucket_owner: None,
                     },
-                    config: &Self::ownership_controls_xml(authorized.ownership),
+                    config: BucketOwnershipControls {
+                        object_ownership: authorized.ownership,
+                    },
                 })
             }
             BucketCreateOutcome::AlreadyOwned => {
@@ -6119,7 +6110,7 @@ impl Coordinator {
                 Self::bucket_acl_grants_from_canned(owner, *acl)?
             }
             CreateBucketAcl::Grants(acl_grants) => {
-                if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_deref()) {
+                if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
                     return Err(ServerError::AccessControlListNotSupported);
                 }
                 Self::ensure_supported_bucket_acl_grants(acl_grants)?;
@@ -6733,21 +6724,28 @@ impl Coordinator {
 
     pub fn put_bucket_ownership_controls(
         &self,
-        req: &PutBucketConfigRequest<'_>,
+        req: &PutBucketOwnershipControlsRequest<'_>,
     ) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_ownership_controls",
-            "bucket={:?} bytes={}",
+            "bucket={:?} config={:?}",
             req.bucket.name,
-            req.config.len()
+            req.config
         );
         let authorized = self.authorize_put_bucket_ownership_controls(req)?;
-        let config = authorized.body.clone();
-        self.store_authorized_bucket_subresource(&authorized)?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        bucket_pg
+            .put_bucket_ownership_controls(&authorized.bucket, authorized.config)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
         self.storage_node
             .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
-                info.ownership_controls = Some(config.clone());
+                info.ownership_controls = Some(authorized.config);
             });
         Ok(())
     }
@@ -6755,7 +6753,7 @@ impl Coordinator {
     pub fn get_bucket_ownership_controls(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<Option<String>, ServerError> {
+    ) -> Result<Option<BucketOwnershipControls>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::get_bucket_ownership_controls",
@@ -6763,7 +6761,15 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_get_bucket_ownership_controls(req)?;
-        self.load_authorized_bucket_subresource(&authorized)
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        bucket_pg
+            .get_bucket_ownership_controls(&authorized.bucket)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
     }
 
     pub fn delete_bucket_ownership_controls(
@@ -6777,7 +6783,15 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_delete_bucket_ownership_controls(req)?;
-        self.remove_authorized_bucket_subresource(&authorized)?;
+        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        bucket_pg
+            .delete_bucket_ownership_controls(&authorized.bucket)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
         self.storage_node
             .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
                 info.ownership_controls = None
@@ -13623,6 +13637,20 @@ mod tests {
         ))
     }
 
+    fn parse_test_ownership_controls(config: &str) -> BucketOwnershipControls {
+        let object_ownership =
+            if config.contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>") {
+                BucketObjectOwnership::BucketOwnerEnforced
+            } else if config.contains("<ObjectOwnership>BucketOwnerPreferred</ObjectOwnership>") {
+                BucketObjectOwnership::BucketOwnerPreferred
+            } else if config.contains("<ObjectOwnership>ObjectWriter</ObjectOwnership>") {
+                BucketObjectOwnership::ObjectWriter
+            } else {
+                panic!("unknown ownership controls test config: {config}");
+            };
+        BucketOwnershipControls { object_ownership }
+    }
+
     fn put_bucket_ownership_controls_test(
         coord: &Coordinator,
         name: &str,
@@ -13630,12 +13658,10 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
-        coord.put_bucket_ownership_controls(&put_bucket_config_request_with_expected_owner(
-            name,
-            config,
-            requester,
-            expected_bucket_owner,
-        ))
+        coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
+            bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+            config: parse_test_ownership_controls(config),
+        })
     }
 
     fn get_bucket_ownership_controls_test(
@@ -13643,7 +13669,7 @@ mod tests {
         name: &str,
         requester: Requester,
         expected_bucket_owner: Option<&str>,
-    ) -> Result<Option<String>, ServerError> {
+    ) -> Result<Option<BucketOwnershipControls>, ServerError> {
         coord.get_bucket_ownership_controls(&bucket_request_with_expected_owner(
             name,
             requester,
@@ -14378,8 +14404,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(controls.contains("<ObjectOwnership>ObjectWriter</ObjectOwnership>"));
-        assert!(!controls.contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>"));
+        assert_eq!(
+            controls,
+            BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::ObjectWriter,
+            }
+        );
     }
 
     #[test]
@@ -14645,7 +14675,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(controls.contains("<ObjectOwnership>ObjectWriter</ObjectOwnership>"));
+        assert_eq!(
+            controls,
+            BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::ObjectWriter,
+            }
+        );
     }
 
     #[test]
@@ -17925,7 +17960,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(config, Some(controls.to_string()));
+        assert_eq!(config, Some(parse_test_ownership_controls(controls)));
     }
 
     #[test]
@@ -17961,7 +17996,7 @@ mod tests {
                 None
             )
             .unwrap(),
-            Some(controls.to_string())
+            Some(parse_test_ownership_controls(controls))
         );
 
         delete_bucket_ownership_controls_test(
@@ -18711,8 +18746,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(controls.contains("<ObjectOwnership>ObjectWriter</ObjectOwnership>"));
-        assert!(!controls.contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>"));
+        assert_eq!(
+            controls,
+            BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::ObjectWriter,
+            }
+        );
     }
 
     #[test]
@@ -18781,7 +18820,12 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(controls.contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>"));
+        assert_eq!(
+            controls,
+            BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            }
+        );
     }
 
     #[test]
@@ -23026,12 +23070,16 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .authorize_put_bucket_ownership_controls(&put_bucket_config_request_with_expected_owner(
-                "bucket",
-                "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
-                test_helpers::requester("owner-a"),
-                None,
-            ))
+            .authorize_put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                config: BucketOwnershipControls {
+                    object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                },
+            })
             .unwrap_err();
         assert!(matches!(
             err,

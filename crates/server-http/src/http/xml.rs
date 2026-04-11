@@ -16,8 +16,9 @@ use s3_types::{
 };
 use server_core::system_metadata::SystemMetadata;
 use storage::{
-    BucketEncryptionConfig, BucketLifecycleConfiguration, EffectiveBucketEncryptionConfig,
-    ManagedEncryptionAlgorithm, PublicAccessBlockConfig,
+    BucketEncryptionConfig, BucketLifecycleConfiguration, BucketObjectOwnership,
+    BucketOwnershipControls, EffectiveBucketEncryptionConfig, ManagedEncryptionAlgorithm,
+    PublicAccessBlockConfig,
 };
 
 use super::response::format_version_id;
@@ -3225,7 +3226,7 @@ pub fn get_public_access_block_xml(config: &PublicAccessBlockConfig) -> String {
 /// Extracts the `ObjectOwnership` value from
 /// `<OwnershipControls><Rule><ObjectOwnership>VALUE</ObjectOwnership></Rule></OwnershipControls>`.
 /// Validates VALUE is one of `BucketOwnerEnforced`, `BucketOwnerPreferred`, or `ObjectWriter`.
-pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<String, ServerError> {
+pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<BucketOwnershipControls, ServerError> {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum State {
         Start,
@@ -3328,11 +3329,15 @@ pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<String, ServerError> 
             Ok(Event::Eof) => {
                 return match state {
                     State::Done => match object_ownership.as_deref().map(str::trim) {
-                        Some(
-                            value @ ("BucketOwnerEnforced"
-                            | "BucketOwnerPreferred"
-                            | "ObjectWriter"),
-                        ) => Ok(value.to_string()),
+                        Some("BucketOwnerEnforced") => Ok(BucketOwnershipControls {
+                            object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                        }),
+                        Some("BucketOwnerPreferred") => Ok(BucketOwnershipControls {
+                            object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
+                        }),
+                        Some("ObjectWriter") => Ok(BucketOwnershipControls {
+                            object_ownership: BucketObjectOwnership::ObjectWriter,
+                        }),
                         Some(value) => Err(ServerError::InvalidArgument {
                             reason: format!("invalid ObjectOwnership value: {value}"),
                         }),
@@ -3356,13 +3361,13 @@ pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<String, ServerError> 
 
 /// Serialize an `ObjectOwnership` value into S3 response XML.
 #[must_use]
-pub fn get_ownership_controls_xml(object_ownership: &str) -> String {
+pub fn get_ownership_controls_xml(config: &BucketOwnershipControls) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <OwnershipControls xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Rule><ObjectOwnership>{}</ObjectOwnership></Rule>\
          </OwnershipControls>",
-        xml_escape(object_ownership),
+        config.object_ownership.as_str(),
     )
 }
 
@@ -5626,23 +5631,44 @@ mod tests {
 
     #[test]
     fn ownership_controls_xml_round_trip_enforced() {
-        let xml = get_ownership_controls_xml("BucketOwnerEnforced");
+        let xml = get_ownership_controls_xml(&BucketOwnershipControls {
+            object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+        });
         let parsed = parse_ownership_controls_xml(xml.as_bytes()).unwrap();
-        assert_eq!(parsed, "BucketOwnerEnforced");
+        assert_eq!(
+            parsed,
+            BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            }
+        );
     }
 
     #[test]
     fn ownership_controls_xml_round_trip_preferred() {
-        let xml = get_ownership_controls_xml("BucketOwnerPreferred");
+        let xml = get_ownership_controls_xml(&BucketOwnershipControls {
+            object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
+        });
         let parsed = parse_ownership_controls_xml(xml.as_bytes()).unwrap();
-        assert_eq!(parsed, "BucketOwnerPreferred");
+        assert_eq!(
+            parsed,
+            BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
+            }
+        );
     }
 
     #[test]
     fn ownership_controls_xml_round_trip_object_writer() {
-        let xml = get_ownership_controls_xml("ObjectWriter");
+        let xml = get_ownership_controls_xml(&BucketOwnershipControls {
+            object_ownership: BucketObjectOwnership::ObjectWriter,
+        });
         let parsed = parse_ownership_controls_xml(xml.as_bytes()).unwrap();
-        assert_eq!(parsed, "ObjectWriter");
+        assert_eq!(
+            parsed,
+            BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::ObjectWriter,
+            }
+        );
     }
 
     #[test]
@@ -5655,7 +5681,12 @@ mod tests {
     fn parse_ownership_controls_xml_trims_value() {
         let xml = b"<OwnershipControls><Rule><ObjectOwnership> BucketOwnerEnforced </ObjectOwnership></Rule></OwnershipControls>";
         let parsed = parse_ownership_controls_xml(xml).unwrap();
-        assert_eq!(parsed, "BucketOwnerEnforced");
+        assert_eq!(
+            parsed,
+            BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+            }
+        );
     }
 
     #[test]

@@ -372,7 +372,7 @@ CREATE TABLE IF NOT EXISTS buckets (
     public_access_block_ignore_public_acls INTEGER NOT NULL DEFAULT 0 CHECK (public_access_block_ignore_public_acls IN (0, 1)),
     public_access_block_block_public_policy INTEGER NOT NULL DEFAULT 0 CHECK (public_access_block_block_public_policy IN (0, 1)),
     public_access_block_restrict_public_buckets INTEGER NOT NULL DEFAULT 0 CHECK (public_access_block_restrict_public_buckets IN (0, 1)),
-    ownership_controls TEXT,
+    ownership_controls_mode INTEGER CHECK (ownership_controls_mode IN (0, 1, 2)),
     bucket_policy_public INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_public IN (0, 1)),
     bucket_policy_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_generation >= 0),
     bucket_lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_lifecycle_generation >= 0),

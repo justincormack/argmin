@@ -156,6 +156,22 @@ pub trait PgMetadataStore {
     /// Delete the bucket public access block configuration. Idempotent.
     fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError>;
 
+    /// Store the bucket ownership controls configuration.
+    fn put_bucket_ownership_controls(
+        &self,
+        name: &str,
+        config: BucketOwnershipControls,
+    ) -> Result<(), MetadataError>;
+
+    /// Retrieve the bucket ownership controls configuration.
+    fn get_bucket_ownership_controls(
+        &self,
+        name: &str,
+    ) -> Result<Option<BucketOwnershipControls>, MetadataError>;
+
+    /// Delete the bucket ownership controls configuration. Idempotent.
+    fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError>;
+
     /// Store the currently supported bucket encryption configuration subset.
     fn put_bucket_encryption(
         &self,

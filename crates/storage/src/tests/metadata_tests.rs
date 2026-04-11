@@ -717,27 +717,43 @@ fn file_bucket_metadata_config_roundtrip() {
         assert_eq!(store.get_bucket_subresource("bucket", kind).unwrap(), None);
     }
 
-    let kind = BucketSubresourceKind::OwnershipControls;
-    let body = "<OwnershipControls/>";
+    let ownership_controls = BucketOwnershipControls {
+        object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
+    };
     store
-        .put_bucket_subresource(
-            "bucket",
-            PutBucketSubresource {
-                kind,
-                body,
-                aux: BucketSubresourceAux::None,
-            },
-        )
+        .put_bucket_ownership_controls("bucket", ownership_controls)
         .unwrap();
     assert_eq!(
-        store
-            .get_bucket_subresource("bucket", kind)
-            .unwrap()
-            .map(|stored| stored.body),
-        Some(body.to_string())
+        store.get_bucket_ownership_controls("bucket").unwrap(),
+        Some(ownership_controls)
     );
-    store.delete_bucket_subresource("bucket", kind).unwrap();
-    assert_eq!(store.get_bucket_subresource("bucket", kind).unwrap(), None);
+    assert!(matches!(
+        store
+            .put_bucket_subresource(
+                "bucket",
+                PutBucketSubresource {
+                    kind: BucketSubresourceKind::OwnershipControls,
+                    body: "<OwnershipControls/>",
+                    aux: BucketSubresourceAux::None,
+                },
+            )
+            .unwrap_err(),
+        crate::error::MetadataError::NotImplemented { .. }
+    ));
+    assert!(matches!(
+        store
+            .get_bucket_subresource("bucket", BucketSubresourceKind::OwnershipControls)
+            .unwrap_err(),
+        crate::error::MetadataError::NotImplemented { .. }
+    ));
+    assert!(matches!(
+        store
+            .delete_bucket_subresource("bucket", BucketSubresourceKind::OwnershipControls)
+            .unwrap_err(),
+        crate::error::MetadataError::NotImplemented { .. }
+    ));
+    store.delete_bucket_ownership_controls("bucket").unwrap();
+    assert_eq!(store.get_bucket_ownership_controls("bucket").unwrap(), None);
 
     store
         .put_bucket_subresource(
@@ -975,25 +991,15 @@ fn file_bucket_subresource_roundtrip() {
         })
     );
 
+    let ownership_controls = BucketOwnershipControls {
+        object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+    };
     store
-        .put_bucket_subresource(
-            "bucket",
-            PutBucketSubresource {
-                kind: BucketSubresourceKind::OwnershipControls,
-                body: "<OwnershipControls/>",
-                aux: BucketSubresourceAux::None,
-            },
-        )
+        .put_bucket_ownership_controls("bucket", ownership_controls)
         .unwrap();
     assert_eq!(
-        store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::OwnershipControls)
-            .unwrap(),
-        Some(StoredBucketSubresource {
-            body: "<OwnershipControls/>".to_string(),
-            generation: Some(1),
-            aux: BucketSubresourceAux::None,
-        })
+        store.get_bucket_ownership_controls("bucket").unwrap(),
+        Some(ownership_controls)
     );
 
     let public_access_block = PublicAccessBlockConfig {

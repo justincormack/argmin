@@ -1406,6 +1406,42 @@ pub struct PublicAccessBlockConfig {
     pub restrict_public_buckets: bool,
 }
 
+/// Object ownership mode relevant to bucket ownership controls.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketObjectOwnership {
+    BucketOwnerEnforced = 0,
+    BucketOwnerPreferred = 1,
+    ObjectWriter = 2,
+}
+
+impl BucketObjectOwnership {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BucketOwnerEnforced => "BucketOwnerEnforced",
+            Self::BucketOwnerPreferred => "BucketOwnerPreferred",
+            Self::ObjectWriter => "ObjectWriter",
+        }
+    }
+
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::BucketOwnerEnforced),
+            1 => Some(Self::BucketOwnerPreferred),
+            2 => Some(Self::ObjectWriter),
+            _ => None,
+        }
+    }
+}
+
+/// Ownership controls configuration for a bucket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BucketOwnershipControls {
+    pub object_ownership: BucketObjectOwnership,
+}
+
 /// Bucket lifecycle state.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1427,8 +1463,8 @@ impl BucketState {
 
 /// Typed bucket subresources whose payloads are stored opaquely.
 ///
-/// `PublicAccessBlock` is handled via dedicated typed storage APIs instead of
-/// this generic opaque payload path.
+/// `PublicAccessBlock` and `OwnershipControls` are handled via dedicated typed
+/// storage APIs instead of this generic opaque payload path.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketSubresourceKind {
@@ -1539,8 +1575,8 @@ pub struct BucketInfo {
     pub active_write_reservations: u32,
     /// Typed public access block configuration (None = no config).
     pub public_access_block: Option<PublicAccessBlockConfig>,
-    /// Ownership controls value (None = not set).
-    pub ownership_controls: Option<String>,
+    /// Typed ownership controls value (None = not set).
+    pub ownership_controls: Option<BucketOwnershipControls>,
     /// Whether a bucket policy subresource is currently stored.
     pub bucket_policy_present: bool,
     /// Whether the stored bucket policy is classified as public.
@@ -1578,10 +1614,7 @@ impl std::fmt::Debug for BucketInfo {
             )
             .field("active_write_reservations", &self.active_write_reservations)
             .field("public_access_block", &self.public_access_block)
-            .field(
-                "ownership_controls_len",
-                &self.ownership_controls.as_ref().map(String::len),
-            )
+            .field("ownership_controls", &self.ownership_controls)
             .field("bucket_policy_present", &self.bucket_policy_present)
             .field("bucket_policy_public", &self.bucket_policy_public)
             .field("bucket_policy_generation", &self.bucket_policy_generation)
@@ -1622,7 +1655,7 @@ pub struct BucketFastPathInfo {
     pub public_read: bool,
     pub public_write: bool,
     pub public_access_block: Option<PublicAccessBlockConfig>,
-    pub ownership_controls: Option<String>,
+    pub ownership_controls: Option<BucketOwnershipControls>,
     pub bucket_policy_present: bool,
     pub bucket_policy_public: bool,
     pub bucket_policy_generation: u64,
@@ -1648,10 +1681,7 @@ impl std::fmt::Debug for BucketFastPathInfo {
             .field("public_read", &self.public_read)
             .field("public_write", &self.public_write)
             .field("public_access_block", &self.public_access_block)
-            .field(
-                "ownership_controls_len",
-                &self.ownership_controls.as_ref().map(String::len),
-            )
+            .field("ownership_controls", &self.ownership_controls)
             .field("bucket_policy_present", &self.bucket_policy_present)
             .field("bucket_policy_public", &self.bucket_policy_public)
             .field("bucket_policy_generation", &self.bucket_policy_generation)
@@ -1745,7 +1775,7 @@ impl From<&BucketInfo> for BucketFastPathInfo {
             public_read: info.public_read,
             public_write: info.public_write,
             public_access_block: info.public_access_block,
-            ownership_controls: info.ownership_controls.clone(),
+            ownership_controls: info.ownership_controls,
             bucket_policy_present: info.bucket_policy_present,
             bucket_policy_public: info.bucket_policy_public,
             bucket_policy_generation: info.bucket_policy_generation,
@@ -2431,7 +2461,9 @@ mod tests {
                 block_public_policy: true,
                 restrict_public_buckets: false,
             }),
-            ownership_controls: Some("<OwnershipControls>secret</OwnershipControls>".to_string()),
+            ownership_controls: Some(BucketOwnershipControls {
+                object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
+            }),
             bucket_policy_present: true,
             bucket_policy_public: false,
             bucket_policy_generation: 7,
@@ -2449,7 +2481,7 @@ mod tests {
         let fast_debug = format!("{:?}", BucketFastPathInfo::from(&info));
         assert!(fast_debug.contains(r#""own\ner""#));
         assert!(!fast_debug.contains("secret-policy"));
-        assert!(!fast_debug.contains("<OwnershipControls>secret</OwnershipControls>"));
+        assert!(!fast_debug.contains("secret"));
     }
 
     #[test]

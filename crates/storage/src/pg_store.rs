@@ -25,7 +25,7 @@ const TRACE_TARGET: &str = "storage";
 const LIFECYCLE_SUBRESOURCE_KIND_SQL: i64 = BucketSubresourceKind::Lifecycle as u8 as i64;
 const BUCKET_INFO_SELECT: &str = "\
 SELECT name, owner_principal, owner_canonical_id, created_at, region, state, versioning, acl_grants, public_read, public_write, write_reservations_blocked, active_write_reservations, \
-       public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls, \
+       public_access_block_present, public_access_block_block_public_acls, public_access_block_ignore_public_acls, public_access_block_block_public_policy, public_access_block_restrict_public_buckets, ownership_controls_mode, \
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 4 AND body IS NOT NULL) AS bucket_policy_present, \
        bucket_policy_public, bucket_policy_generation, \
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 5 AND body IS NOT NULL) AS bucket_lifecycle_present, \
@@ -841,6 +841,31 @@ impl PgStore {
         }))
     }
 
+    fn parse_ownership_controls(
+        raw: Option<i64>,
+        col: usize,
+    ) -> Result<Option<BucketOwnershipControls>, rusqlite::Error> {
+        let raw = match raw {
+            Some(raw) => raw,
+            None => return Ok(None),
+        };
+        let raw = u8::try_from(raw).map_err(|_| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid ownership_controls_mode: {raw}")),
+            )
+        })?;
+        let object_ownership = BucketObjectOwnership::from_u8(raw).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                col,
+                rusqlite::types::Type::Integer,
+                Box::from(format!("invalid ownership_controls_mode: {raw}")),
+            )
+        })?;
+        Ok(Some(BucketOwnershipControls { object_ownership }))
+    }
+
     fn parse_object_lock_state(
         retention_mode_raw: Option<u8>,
         retain_until_raw: Option<i64>,
@@ -952,6 +977,10 @@ impl PgStore {
         }
     }
 
+    fn ownership_controls_sql_value(config: Option<BucketOwnershipControls>) -> Option<i64> {
+        config.map(|config| config.object_ownership as u8 as i64)
+    }
+
     fn row_to_bucket_info(row: &rusqlite::Row<'_>) -> Result<BucketInfo, rusqlite::Error> {
         let owner_canonical_id_raw: String = row.get(2)?;
         let owner_canonical_id =
@@ -966,6 +995,7 @@ impl PgStore {
             ),
             [12, 13, 14, 15, 16],
         )?;
+        let ownership_controls = Self::parse_ownership_controls(row.get(17)?, 17)?;
         let object_lock = Self::parse_bucket_object_lock(
             (
                 row.get::<_, i64>(25)?,
@@ -1000,7 +1030,7 @@ impl PgStore {
                 "active_write_reservations",
             )?,
             public_access_block,
-            ownership_controls: row.get(17)?,
+            ownership_controls,
             bucket_policy_present: row.get::<_, i64>(18)? != 0,
             bucket_policy_public: row.get::<_, i64>(19)? != 0,
             bucket_policy_generation: row.get::<_, i64>(20)? as u64,
@@ -1057,9 +1087,9 @@ impl PgStore {
                 BucketSubresourceKind::PublicAccessBlock => {
                     "public access block uses typed storage"
                 }
+                BucketSubresourceKind::OwnershipControls => "ownership controls use typed storage",
                 BucketSubresourceKind::Cors
                 | BucketSubresourceKind::Tagging
-                | BucketSubresourceKind::OwnershipControls
                 | BucketSubresourceKind::Policy
                 | BucketSubresourceKind::Lifecycle => {
                     "bucket subresource kind unexpectedly missing opaque storage support"
@@ -1143,17 +1173,7 @@ impl PgStore {
             match kind {
                 BucketSubresourceKind::Cors | BucketSubresourceKind::Tagging => {}
                 BucketSubresourceKind::PublicAccessBlock => {}
-                BucketSubresourceKind::OwnershipControls => {
-                    self.conn
-                        .execute(
-                            "UPDATE buckets SET ownership_controls = ?1 WHERE name = ?2",
-                            params![body, name],
-                        )
-                        .map_err(|e| MetadataError::Db {
-                            context: "put bucket subresource (update ownership controls mirror)",
-                            source: e,
-                        })?;
-                }
+                BucketSubresourceKind::OwnershipControls => {}
                 BucketSubresourceKind::Policy => {
                     self.conn
                         .execute(
@@ -1271,17 +1291,7 @@ impl PgStore {
             match kind {
                 BucketSubresourceKind::Cors | BucketSubresourceKind::Tagging => {}
                 BucketSubresourceKind::PublicAccessBlock => {}
-                BucketSubresourceKind::OwnershipControls => {
-                    self.conn
-                        .execute(
-                            "UPDATE buckets SET ownership_controls = NULL WHERE name = ?1",
-                            params![name],
-                        )
-                        .map_err(|e| MetadataError::Db {
-                            context: "delete bucket subresource (clear ownership controls mirror)",
-                            source: e,
-                        })?;
-                }
+                BucketSubresourceKind::OwnershipControls => {}
                 BucketSubresourceKind::Policy => {
                     self.conn
                         .execute(
@@ -2629,7 +2639,10 @@ impl PgMetadataStore for PgStore {
         name: &str,
         req: PutBucketSubresource<'_>,
     ) -> Result<(), MetadataError> {
-        if matches!(req.kind, BucketSubresourceKind::PublicAccessBlock) {
+        if matches!(
+            req.kind,
+            BucketSubresourceKind::PublicAccessBlock | BucketSubresourceKind::OwnershipControls
+        ) {
             return Err(Self::bucket_subresource_not_opaque(req.kind));
         }
         self.put_bucket_subresource_internal(name, req.kind, req.body, req.aux)
@@ -2640,7 +2653,10 @@ impl PgMetadataStore for PgStore {
         name: &str,
         kind: BucketSubresourceKind,
     ) -> Result<Option<StoredBucketSubresource>, MetadataError> {
-        if matches!(kind, BucketSubresourceKind::PublicAccessBlock) {
+        if matches!(
+            kind,
+            BucketSubresourceKind::PublicAccessBlock | BucketSubresourceKind::OwnershipControls
+        ) {
             return Err(Self::bucket_subresource_not_opaque(kind));
         }
         self.get_bucket_subresource_internal(name, kind)
@@ -2651,7 +2667,10 @@ impl PgMetadataStore for PgStore {
         name: &str,
         kind: BucketSubresourceKind,
     ) -> Result<(), MetadataError> {
-        if matches!(kind, BucketSubresourceKind::PublicAccessBlock) {
+        if matches!(
+            kind,
+            BucketSubresourceKind::PublicAccessBlock | BucketSubresourceKind::OwnershipControls
+        ) {
             return Err(Self::bucket_subresource_not_opaque(kind));
         }
         self.delete_bucket_subresource_internal(name, kind)
@@ -2766,6 +2785,68 @@ impl PgMetadataStore for PgStore {
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete bucket public access block",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(())
+    }
+
+    fn put_bucket_ownership_controls(
+        &self,
+        name: &str,
+        config: BucketOwnershipControls,
+    ) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET ownership_controls_mode = ?1 WHERE name = ?2",
+                params![Self::ownership_controls_sql_value(Some(config)), name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket ownership controls",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            });
+        }
+        Ok(())
+    }
+
+    fn get_bucket_ownership_controls(
+        &self,
+        name: &str,
+    ) -> Result<Option<BucketOwnershipControls>, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT ownership_controls_mode FROM buckets WHERE name = ?1",
+                params![name],
+                |row| Self::parse_ownership_controls(row.get(0)?, 0),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "get bucket ownership controls",
+                source: e,
+            })?
+            .ok_or(MetadataError::BucketNotFound {
+                name: BucketName::from(name),
+            })
+    }
+
+    fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET ownership_controls_mode = ?1 WHERE name = ?2",
+                params![Self::ownership_controls_sql_value(None), name],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "delete bucket ownership controls",
                 source: e,
             })?;
         if updated == 0 {
