@@ -3364,7 +3364,7 @@ pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<BucketOwnershipContro
             Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_)) => {}
             Ok(Event::Eof) => {
                 return match state {
-                    State::Done => match object_ownership.as_deref().map(str::trim) {
+                    State::Done => match object_ownership.as_deref() {
                         Some("BucketOwnerEnforced") => Ok(BucketOwnershipControls {
                             object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
                         }),
@@ -3374,9 +3374,9 @@ pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<BucketOwnershipContro
                         Some("ObjectWriter") => Ok(BucketOwnershipControls {
                             object_ownership: BucketObjectOwnership::ObjectWriter,
                         }),
-                        Some(value) => Err(ServerError::InvalidArgument {
-                            reason: format!("invalid ObjectOwnership value: {value}"),
-                        }),
+                        Some(_) => Err(malformed_ownership_xml(
+                            "invalid ObjectOwnership value in OwnershipControls",
+                        )),
                         None => Err(malformed_ownership_xml(
                             "missing Rule element in OwnershipControls",
                         )),
@@ -5718,15 +5718,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_ownership_controls_xml_trims_value() {
+    fn parse_ownership_controls_xml_rejects_whitespace_padded_value() {
         let xml = b"<OwnershipControls><Rule><ObjectOwnership> BucketOwnerEnforced </ObjectOwnership></Rule></OwnershipControls>";
-        let parsed = parse_ownership_controls_xml(xml).unwrap();
-        assert_eq!(
-            parsed,
-            BucketOwnershipControls {
-                object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
-            }
-        );
+        assert!(parse_ownership_controls_xml(xml).is_err());
     }
 
     #[test]

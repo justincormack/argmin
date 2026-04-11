@@ -1016,9 +1016,10 @@ fn test_oversized_xml_body_limits_match_aws() {
 
         let bucket = create_bucket_in_test_region(None, false).await;
         let delete_url = format!("{}/{}?delete", CTX.endpoint(), bucket);
-        let delete_body =
-            format!("<Delete>{delete_pad}<Object><Key>delete-me</Key></Object>{delete_pad}</Delete>")
-                .into_bytes();
+        let delete_body = format!(
+            "<Delete>{delete_pad}<Object><Key>delete-me</Key></Object>{delete_pad}</Delete>"
+        )
+        .into_bytes();
         let delete = send_signed_request(
             "POST",
             &delete_url,

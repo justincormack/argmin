@@ -5,7 +5,7 @@ use aws_sdk_s3::types::{
     VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version,
+    assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, copy_source_with_version,
     delete_objects_with_md5, err_status, send_signed_request, unique_bucket, CTX,
 };
 use tokio::time::{sleep, Duration};
@@ -68,6 +68,40 @@ async fn setup_versioned_bucket() -> String {
         .await
         .unwrap();
     bucket
+}
+
+#[test]
+fn test_bucket_versioning_raw_get_returns_canonical_xml() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(CTX.client(), &bucket)
+            .await
+            .unwrap();
+
+        let body = br#"
+            <VersioningConfiguration>
+                <Status>Enabled</Status>
+            </VersioningConfiguration>
+        "#;
+
+        let parsed = server_http::http::xml::parse_versioning_config_xml(body).unwrap();
+        let expected = server_http::http::xml::get_bucket_versioning_xml(parsed);
+
+        let url = format!("{}/{}?versioning", CTX.endpoint(), bucket);
+        let put = send_signed_request("PUT", &url, body, [content_md5_header(body)]);
+        assert_eq!(put.status, 200, "unexpected body: {}", put.body);
+
+        let get = send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
+        CTX.client()
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(get.status, 200, "unexpected body: {}", get.body);
+        assert_eq!(get.body, expected);
+    });
 }
 
 fn put_raw_object(bucket: &str, encoded_key: &str) {

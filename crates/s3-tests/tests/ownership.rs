@@ -5,8 +5,8 @@ use aws_sdk_s3::types::{
     OwnershipControlsRule, Permission,
 };
 use s3_tests::{
-    assert_s3_err_code, create_public_write_bucket, disable_bucket_public_access_block, err_status,
-    unique_bucket, CTX,
+    assert_s3_err_code, content_md5_header, create_public_write_bucket,
+    disable_bucket_public_access_block, err_status, unique_bucket, CTX,
 };
 use serde_json::json;
 
@@ -118,6 +118,65 @@ async fn canonical_owner_id(client: &aws_sdk_s3::Client) -> String {
         .to_string();
     client.delete_bucket().bucket(&bucket).send().await.unwrap();
     owner_id
+}
+
+#[test]
+fn test_bucket_ownership_controls_raw_get_returns_canonical_xml() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        create_bucket_in_test_region(CTX.client(), &bucket).await;
+
+        let body = br#"
+            <OwnershipControls>
+                <Rule>
+                    <ObjectOwnership>BucketOwnerPreferred</ObjectOwnership>
+                </Rule>
+            </OwnershipControls>
+        "#;
+
+        let parsed = server_http::http::xml::parse_ownership_controls_xml(body).unwrap();
+        let expected = server_http::http::xml::get_ownership_controls_xml(&parsed);
+
+        let url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
+        let put = s3_tests::send_signed_request("PUT", &url, body, [content_md5_header(body)]);
+        assert_eq!(put.status, 200, "unexpected body: {}", put.body);
+
+        let get =
+            s3_tests::send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
+
+        cleanup(&bucket).await;
+
+        assert_eq!(get.status, 200, "unexpected body: {}", get.body);
+        assert_eq!(get.body, expected);
+    });
+}
+
+#[test]
+fn test_bucket_ownership_controls_rejects_whitespace_padded_object_ownership() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        create_bucket_in_test_region(CTX.client(), &bucket).await;
+
+        let body = br#"
+            <OwnershipControls>
+                <Rule>
+                    <ObjectOwnership> BucketOwnerPreferred </ObjectOwnership>
+                </Rule>
+            </OwnershipControls>
+        "#;
+
+        let url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
+        let put = s3_tests::send_signed_request("PUT", &url, body, [content_md5_header(body)]);
+
+        cleanup(&bucket).await;
+
+        assert_eq!(put.status, 400, "unexpected body: {}", put.body);
+        assert!(
+            put.body.contains("<Code>MalformedXML</Code>"),
+            "unexpected body: {}",
+            put.body
+        );
+    });
 }
 
 async fn object_owner_id(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -> String {

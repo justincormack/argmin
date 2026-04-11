@@ -336,6 +336,49 @@ fn test_cors_get_round_trip_multiple_rules_and_headers() {
 }
 
 #[test]
+fn test_cors_raw_get_returns_canonical_xml() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(CTX.client(), &bucket)
+            .await
+            .unwrap();
+
+        let body = br#"
+            <CORSConfiguration>
+                <CORSRule>
+                    <ExposeHeader>x-amz-request-id</ExposeHeader>
+                    <AllowedMethod>PUT</AllowedMethod>
+                    <AllowedOrigin>https://example.org</AllowedOrigin>
+                    <AllowedHeader>x-amz-meta-*</AllowedHeader>
+                    <AllowedMethod>GET</AllowedMethod>
+                    <ExposeHeader>etag</ExposeHeader>
+                    <AllowedHeader>content-type</AllowedHeader>
+                    <MaxAgeSeconds>3600</MaxAgeSeconds>
+                </CORSRule>
+                <CORSRule>
+                    <AllowedMethod>HEAD</AllowedMethod>
+                    <AllowedOrigin>*</AllowedOrigin>
+                </CORSRule>
+            </CORSConfiguration>
+        "#;
+
+        let parsed = server_http::http::xml::parse_cors_config_xml(body).unwrap();
+        let expected = server_http::http::xml::get_cors_config_xml(&parsed);
+
+        let put = put_bucket_cors_raw(&bucket, body);
+        assert_eq!(put.status, 200, "unexpected body: {}", put.body);
+
+        let url = format!("{}/{}?cors", CTX.endpoint(), bucket);
+        let get = send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
+
+        cleanup(&bucket, &[]).await;
+
+        assert_eq!(get.status, 200, "unexpected body: {}", get.body);
+        assert_eq!(get.body, expected);
+    });
+}
+
+#[test]
 fn test_cors_put_max_rules() {
     s3_tests::run(async {
         let client = CTX.client();

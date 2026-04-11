@@ -5,8 +5,8 @@ use aws_sdk_s3::types::{
     VersioningConfiguration,
 };
 use s3_tests::{
-    assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket, err_status, unique_bucket,
-    CTX,
+    assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, create_public_bucket,
+    err_status, send_signed_request, unique_bucket, CTX,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -115,8 +115,52 @@ fn bucket_wildcard_resource(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}/*")
 }
 
+fn put_bucket_tagging_raw(bucket: &str, body: &[u8]) -> s3_tests::RawResponse {
+    let url = format!("{}/{bucket}?tagging", CTX.endpoint());
+    send_signed_request("PUT", &url, body, [content_md5_header(body)])
+}
+
 fn alt_policy_principal() -> serde_json::Value {
     json!({ "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) })
+}
+
+#[test]
+fn test_bucket_tagging_raw_get_returns_canonical_xml() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(CTX.client(), &bucket)
+            .await
+            .unwrap();
+
+        let body = br#"
+            <Tagging>
+                <TagSet>
+                    <Tag>
+                        <Key>env</Key>
+                        <Value>prod</Value>
+                    </Tag>
+                    <Tag>
+                        <Key>team</Key>
+                        <Value>storage</Value>
+                    </Tag>
+                </TagSet>
+            </Tagging>
+        "#;
+
+        let parsed = server_http::http::xml::parse_tagging_xml(body, 50).unwrap();
+        let expected = server_http::http::xml::get_tagging_xml(&parsed);
+
+        let put = put_bucket_tagging_raw(&bucket, body);
+        assert_eq!(put.status, 204, "unexpected body: {}", put.body);
+
+        let url = format!("{}/{}?tagging", CTX.endpoint(), bucket);
+        let get = send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
+
+        cleanup(&bucket, &[]).await;
+
+        assert_eq!(get.status, 200, "unexpected body: {}", get.body);
+        assert_eq!(get.body, expected);
+    });
 }
 
 fn bucket_policy_document(

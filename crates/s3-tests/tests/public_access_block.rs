@@ -3,7 +3,8 @@ use aws_sdk_s3::types::{
     OwnershipControls, OwnershipControlsRule, Permission, Type,
 };
 use s3_tests::{
-    assert_s3_err_code, disable_bucket_public_access_block, err_status, unique_bucket, CTX,
+    assert_s3_err_code, content_md5_header, disable_bucket_public_access_block, err_status,
+    send_signed_request, unique_bucket, CTX,
 };
 use std::time::Duration;
 
@@ -94,6 +95,39 @@ async fn setup_acl_enabled_bucket() -> String {
         .unwrap();
     wait_for_bucket_ownership_controls(&bucket, ObjectOwnership::ObjectWriter).await;
     bucket
+}
+
+#[test]
+fn test_public_access_block_raw_get_returns_canonical_xml() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(CTX.client(), &bucket)
+            .await
+            .unwrap();
+
+        let body = br#"
+            <PublicAccessBlockConfiguration>
+                <RestrictPublicBuckets>true</RestrictPublicBuckets>
+                <BlockPublicPolicy>true</BlockPublicPolicy>
+                <IgnorePublicAcls>true</IgnorePublicAcls>
+                <BlockPublicAcls>true</BlockPublicAcls>
+            </PublicAccessBlockConfiguration>
+        "#;
+
+        let parsed = server_http::http::xml::parse_public_access_block_xml(body).unwrap();
+        let expected = server_http::http::xml::get_public_access_block_xml(&parsed);
+
+        let url = format!("{}/{}?publicAccessBlock", CTX.endpoint(), bucket);
+        let put = send_signed_request("PUT", &url, body, [content_md5_header(body)]);
+        assert_eq!(put.status, 200, "unexpected body: {}", put.body);
+
+        let get = send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
+
+        cleanup(&bucket).await;
+
+        assert_eq!(get.status, 200, "unexpected body: {}", get.body);
+        assert_eq!(get.body, expected);
+    });
 }
 
 async fn bucket_owner_id(bucket: &str) -> String {

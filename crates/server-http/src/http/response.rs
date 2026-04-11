@@ -851,10 +851,10 @@ impl S3Response {
         Self::new(204)
     }
 
-    /// Build a response for `PutBucketTagging` (200 OK, no body).
+    /// Build a response for `PutBucketTagging` (204 No Content).
     #[must_use]
     pub fn put_bucket_tagging() -> Self {
-        Self::new(200)
+        Self::new(204)
     }
 
     /// Build a response for `GetBucketTagging` (200 OK, XML body).

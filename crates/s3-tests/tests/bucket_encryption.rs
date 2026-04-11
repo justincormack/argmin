@@ -4,8 +4,8 @@ use aws_sdk_s3::types::{
     ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
 };
 use s3_tests::{
-    assert_s3_err_code, create_bucket_with_sse_c_enabled, err_status, sse_c_header_values,
-    test_sse_c_key, unique_bucket, CTX,
+    assert_s3_err_code, content_md5_header, create_bucket_with_sse_c_enabled, err_status,
+    send_signed_request, sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
 };
 
 fn endpoint_is_https() -> bool {
@@ -82,6 +82,44 @@ async fn cleanup(bucket: &str, key: Option<&str>) {
         let _ = client.delete_object().bucket(bucket).key(key).send().await;
     }
     client.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+#[test]
+fn test_bucket_encryption_raw_get_returns_canonical_xml() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(CTX.client(), &bucket)
+            .await
+            .unwrap();
+
+        let body = br#"
+            <ServerSideEncryptionConfiguration>
+                <Rule>
+                    <BucketKeyEnabled>false</BucketKeyEnabled>
+                    <BlockedEncryptionTypes>
+                        <EncryptionType>SSE-C</EncryptionType>
+                    </BlockedEncryptionTypes>
+                    <ApplyServerSideEncryptionByDefault>
+                        <SSEAlgorithm>AES256</SSEAlgorithm>
+                    </ApplyServerSideEncryptionByDefault>
+                </Rule>
+            </ServerSideEncryptionConfiguration>
+        "#;
+
+        let parsed = server_http::http::xml::parse_bucket_encryption_xml(body).unwrap();
+        let expected = server_http::http::xml::get_bucket_encryption_xml(parsed.effective());
+
+        let url = format!("{}/{}?encryption", CTX.endpoint(), bucket);
+        let put = send_signed_request("PUT", &url, body, [content_md5_header(body)]);
+        assert_eq!(put.status, 200, "unexpected body: {}", put.body);
+
+        let get = send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
+
+        cleanup(&bucket, None).await;
+
+        assert_eq!(get.status, 200, "unexpected body: {}", get.body);
+        assert_eq!(get.body, expected);
+    });
 }
 
 #[test]

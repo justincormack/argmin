@@ -12,7 +12,8 @@ use aws_sdk_s3::types::{
 use base64::Engine;
 use ring::hmac;
 use s3_tests::{
-    assert_s3_err_code, disable_bucket_public_access_block, err_status, unique_bucket, CTX,
+    assert_s3_err_code, content_md5_header, disable_bucket_public_access_block, err_status,
+    send_signed_request, unique_bucket, CTX,
 };
 use serde_json::json;
 
@@ -590,6 +591,45 @@ fn sign_request(
         amz_date,
         payload_hash,
     }
+}
+
+#[test]
+fn test_bucket_object_lock_configuration_raw_get_returns_canonical_xml() {
+    s3_tests::run(async {
+        let bucket = setup_object_lock_bucket().await;
+
+        let body = br#"
+            <ObjectLockConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                <ObjectLockEnabled>Enabled</ObjectLockEnabled>
+                <Rule>
+                    <DefaultRetention>
+                        <Mode>GOVERNANCE</Mode>
+                        <Days>1</Days>
+                    </DefaultRetention>
+                </Rule>
+            </ObjectLockConfiguration>
+        "#;
+
+        let parsed =
+            server_http::http::xml::parse_bucket_object_lock_configuration_xml(body).unwrap();
+        let expected = server_http::http::xml::get_bucket_object_lock_configuration_xml(
+            s3_types::BucketObjectLockConfig {
+                enabled: parsed.object_lock_enabled.unwrap_or(false),
+                default_retention: parsed.default_retention,
+            },
+        );
+
+        let url = format!("{}/{}?object-lock", CTX.endpoint(), bucket);
+        let put = send_signed_request("PUT", &url, body, [content_md5_header(body)]);
+        assert_eq!(put.status, 200, "unexpected body: {}", put.body);
+
+        let get = send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
+
+        cleanup_object_lock_bucket(&bucket).await;
+
+        assert_eq!(get.status, 200, "unexpected body: {}", get.body);
+        assert_eq!(get.body, expected);
+    });
 }
 
 fn signed_put_xml(url: &str, body: &[u8]) -> (u16, String) {
