@@ -2740,6 +2740,7 @@ pub struct CompleteMultipartUploadRequest<'a> {
     pub upload: MultipartObjectRequest<'a>,
     pub parts: &'a [CompletePart],
     pub claimed_checksum: Option<&'a EncodedChecksumClaim>,
+    pub expected_object_size: Option<u64>,
     pub cond: &'a WriteCondition,
     pub sse_customer: Option<&'a SseCustomerRequest>,
 }
@@ -12135,6 +12136,7 @@ impl Coordinator {
         } = self.authorize_complete_multipart_upload(req)?;
         let parts = req.parts;
         let claimed_checksum = req.claimed_checksum;
+        let expected_object_size = req.expected_object_size;
         let _completion_guard = self
             .storage_node
             .lock_multipart_completion_bucket(bucket.as_str());
@@ -12287,6 +12289,15 @@ impl Coordinator {
         etag_crc64.copy_from_slice(&etag_bytes_vec);
 
         let total_size: u64 = part_records.iter().map(|p| p.size).sum();
+        if let Some(expected) = expected_object_size {
+            if expected != total_size {
+                return Err(ServerError::InvalidRequest {
+                    reason: format!(
+                        "x-amz-mp-object-size {expected} does not match actual object size {total_size}"
+                    ),
+                });
+            }
+        }
         if let Some(trace) = observability::current_context() {
             let _ = observability::event_in_context(
                 &trace,
@@ -18617,6 +18628,7 @@ mod tests {
                     checksum: None,
                 }],
                 claimed_checksum: None,
+                expected_object_size: None,
                 cond: &WriteCondition::default(),
                 sse_customer: None,
             })
@@ -19806,6 +19818,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -19848,6 +19862,7 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+                expected_object_size: None,
                 cond: &WriteCondition::default(),
                 sse_customer: None,
             });
@@ -19911,6 +19926,7 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+                expected_object_size: None,
                 cond: &WriteCondition::default(),
                 sse_customer: None,
             });
@@ -22470,6 +22486,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -27566,6 +27584,8 @@ mod tests {
                 parts: &[],
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -27613,6 +27633,8 @@ mod tests {
                 ),
                 parts: &[],
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -33140,6 +33162,7 @@ mod tests {
                     }],
                     sse_customer: None,
                     claimed_checksum: None,
+                    expected_object_size: None,
                     cond: &WriteCondition::default(),
                 })
                 .unwrap();
@@ -34364,6 +34387,7 @@ mod tests {
                     checksum: None,
                 }],
                 claimed_checksum: None,
+                expected_object_size: None,
                 cond: &WriteCondition::default(),
                 sse_customer: None,
             })
@@ -34459,6 +34483,8 @@ mod tests {
                     checksum: None,
                 }],
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -35855,6 +35881,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -35912,6 +35940,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -35984,6 +36014,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -36018,6 +36050,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -36050,6 +36084,8 @@ mod tests {
                 ),
                 parts: &reversed,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -36087,6 +36123,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -36120,6 +36158,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -36165,6 +36205,8 @@ mod tests {
                 parts: &[],
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -36197,6 +36239,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -36246,6 +36290,8 @@ mod tests {
                 parts: &retry_parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -36279,6 +36325,8 @@ mod tests {
                 parts: &duped,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -36310,6 +36358,8 @@ mod tests {
                 parts: &parts1,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -36336,6 +36386,8 @@ mod tests {
                 ),
                 parts: &parts2,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -36380,6 +36432,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -36435,6 +36489,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -36659,6 +36715,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -36712,6 +36770,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -36759,6 +36819,8 @@ mod tests {
                 parts: &first_parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -36778,6 +36840,8 @@ mod tests {
                 ),
                 parts: &second_parts,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -36849,6 +36913,8 @@ mod tests {
                 parts: &older_parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -36868,6 +36934,8 @@ mod tests {
                 ),
                 parts: &newer_parts,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -36926,6 +36994,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -36968,6 +37038,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -37574,6 +37646,7 @@ mod tests {
                 upload: multipart_object_request(bucket, key, &create.upload_id, test_requester()),
                 parts: &complete_parts,
                 claimed_checksum: None,
+                expected_object_size: None,
                 cond: &WriteCondition::default(),
                 sse_customer: None,
             })
@@ -37648,6 +37721,7 @@ mod tests {
                 ],
                 sse_customer: None,
                 claimed_checksum: None,
+                expected_object_size: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -38389,6 +38463,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -38445,6 +38521,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -38495,6 +38573,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -38543,6 +38623,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -38677,6 +38759,7 @@ mod tests {
                     checksum: None,
                 }],
                 claimed_checksum: None,
+                expected_object_size: None,
                 cond: &WriteCondition::default(),
                 sse_customer: None,
             })
@@ -38755,6 +38838,7 @@ mod tests {
                     checksum: None,
                 }],
                 claimed_checksum: None,
+                expected_object_size: None,
                 cond: &WriteCondition::default(),
                 sse_customer: None,
             })
@@ -38796,6 +38880,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -38854,6 +38940,8 @@ mod tests {
                 parts: &parts,
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -38889,6 +38977,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -38940,6 +39030,8 @@ mod tests {
                 ),
                 parts: &parts,
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 
@@ -39019,6 +39111,7 @@ mod tests {
                 ),
                 parts: &complete_parts,
                 claimed_checksum: Some(&object_checksum_claim),
+                expected_object_size: None,
                 cond: &WriteCondition::default(),
                 sse_customer: None,
             })
@@ -41463,6 +41556,7 @@ mod tests {
                 }],
                 sse_customer: None,
                 claimed_checksum: None,
+                expected_object_size: None,
                 cond: &WriteCondition::default(),
             })
             .unwrap();
@@ -42024,6 +42118,7 @@ mod tests {
                     checksum: None,
                 }],
                 claimed_checksum: None,
+                expected_object_size: None,
                 cond: &WriteCondition::default(),
                 sse_customer: None,
             })
@@ -42378,6 +42473,8 @@ mod tests {
                 parts: &[part_a],
                 claimed_checksum: None,
 
+                expected_object_size: None,
+
                 cond: &WriteCondition::default(),
 
                 sse_customer: None,
@@ -42417,6 +42514,8 @@ mod tests {
                 ),
                 parts: &[part_b],
                 claimed_checksum: None,
+
+                expected_object_size: None,
 
                 cond: &WriteCondition::default(),
 

@@ -2417,6 +2417,16 @@ impl HttpFrontend {
                 // string. CompleteMultipartUpload checksums may be composite ("base64-N"),
                 // so we cannot decode them as plain base64.
                 let claimed_checksum = extract_encoded_checksum_header(req)?;
+                let expected_object_size = req
+                    .header("x-amz-mp-object-size")
+                    .map(|value| {
+                        value
+                            .parse::<u64>()
+                            .map_err(|_| ServerError::InvalidRequest {
+                                reason: format!("invalid x-amz-mp-object-size: {value}"),
+                            })
+                    })
+                    .transpose()?;
                 let sse_customer = parse_sse_customer_request(req)?;
                 let requester = Self::requester_from_auth(auth);
                 let result = self.coordinator.complete_multipart_upload(
@@ -2430,6 +2440,7 @@ impl HttpFrontend {
                         ),
                         parts: &parts,
                         claimed_checksum: claimed_checksum.as_ref(),
+                        expected_object_size,
                         cond: &cond,
                         sse_customer: sse_customer.as_ref(),
                     },
@@ -8366,6 +8377,38 @@ mod tests {
             "",
             &format!("uploadId={upload_id}"),
             vec![("x-amz-checksum-sha256".to_string(), "AAAAAA==".to_string())],
+            xml.into_bytes(),
+        );
+        let op = S3Operation::CompleteMultipartUpload {
+            bucket: "mybucket".to_string(),
+            key: "k".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidRequest { .. }) => {}
+            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn complete_multipart_invalid_mp_object_size_header_rejected() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let upload_id = create_upload_with_checksum(&fe, "mybucket", "k", None);
+        let xml = "<CompleteMultipartUpload>\
+               <Part><PartNumber>1</PartNumber><ETag>\"x\"</ETag></Part>\
+             </CompleteMultipartUpload>"
+            .to_string();
+        let req = new_req(
+            http::Method::GET,
+            "",
+            &format!("uploadId={upload_id}"),
+            vec![(
+                "x-amz-mp-object-size".to_string(),
+                "not-a-number".to_string(),
+            )],
             xml.into_bytes(),
         );
         let op = S3Operation::CompleteMultipartUpload {

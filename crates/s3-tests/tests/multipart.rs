@@ -1327,6 +1327,121 @@ fn test_multipart_concurrent_uploads_same_key() {
     });
 }
 
+#[test]
+fn test_complete_multipart_upload_accepts_matching_expected_object_size() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "mp-object-size-match";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let body = b"hello world";
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(body.to_vec()))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .mpu_object_size(body.len() as i64)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let object = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(object.content_length(), Some(body.len() as i64));
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_upload_rejects_mismatched_expected_object_size() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "mp-object-size-mismatch";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let body = b"hello world";
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(body.to_vec()))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .mpu_object_size((body.len() as i64) + 1)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await;
+
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "InvalidRequest");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
 // ── Part overwrite (re-upload same part number) ─────────────────────
 
 #[test]
