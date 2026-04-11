@@ -10,8 +10,8 @@ use aws_sdk_s3::types::{
 };
 use ring::hmac;
 use s3_tests::{
-    cleanup_versioned_bucket, delete_all_and_bucket, err_status, put_bucket_lifecycle_with_md5,
-    unique_bucket, CTX,
+    cleanup_versioned_bucket, content_md5_header, delete_all_and_bucket, err_status,
+    put_bucket_lifecycle_with_md5, send_signed_request, unique_bucket, CTX,
 };
 
 fn agent() -> ureq::Agent {
@@ -1152,6 +1152,217 @@ fn test_bucket_lifecycle_round_trip_tag_filter_rule() {
         assert_eq!(tag.value(), "prod");
 
         cleanup_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_lifecycle_raw_get_returns_canonical_xml() {
+    s3_tests::run(async {
+        let bucket = unique_bucket();
+        create_bucket_in_test_region(&bucket).await;
+
+        let body = br#"
+            <LifecycleConfiguration>
+                <Rule>
+                    <Status>Enabled</Status>
+                    <Expiration>
+                        <Days>30</Days>
+                    </Expiration>
+                    <Filter>
+                        <And>
+                            <Tag>
+                                <Key>env</Key>
+                                <Value>prod</Value>
+                            </Tag>
+                            <Prefix>logs/</Prefix>
+                        </And>
+                    </Filter>
+                    <ID>rule-a</ID>
+                </Rule>
+                <Rule>
+                    <AbortIncompleteMultipartUpload>
+                        <DaysAfterInitiation>7</DaysAfterInitiation>
+                    </AbortIncompleteMultipartUpload>
+                    <Status>Disabled</Status>
+                    <Filter>
+                        <Prefix>uploads/</Prefix>
+                    </Filter>
+                    <ID>rule-b</ID>
+                </Rule>
+            </LifecycleConfiguration>
+        "#;
+
+        let parsed = storage::parse_lifecycle_configuration_xml(body)
+            .expect("test lifecycle XML should parse");
+        let expected = storage::render_lifecycle_configuration_xml(&parsed);
+
+        let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
+        let put = send_signed_request("PUT", &url, body, [content_md5_header(body)]);
+        assert_eq!(
+            put.status, 200,
+            "unexpected lifecycle PUT body: {}",
+            put.body
+        );
+
+        let get = send_signed_request("GET", &url, b"", std::iter::empty::<(String, String)>());
+        cleanup_bucket(&bucket).await;
+
+        assert_eq!(
+            get.status, 200,
+            "unexpected lifecycle GET body: {}",
+            get.body
+        );
+        assert_eq!(get.body, expected);
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_mixed_filter_and_legacy_prefix() {
+    s3_tests::run(async {
+        assert_invalid_lifecycle_put_rejected_with_message(
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>filter-rule</ID>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>30</Days></Expiration>\
+                </Rule>\
+                <Rule>\
+                    <ID>legacy-prefix</ID>\
+                    <Prefix>logs/</Prefix>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>30</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>",
+            "InvalidRequest",
+            "Base level prefix cannot be used in Lifecycle V2, prefixes are only supported in the Filter.",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_prefix_over_1024_bytes() {
+    s3_tests::run(async {
+        let prefix = "a".repeat(1025);
+        let body = format!(
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>long-prefix</ID>\
+                    <Filter><Prefix>{prefix}</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>30</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>"
+        );
+
+        assert_invalid_lifecycle_put_rejected_with_message(
+            &body,
+            "InvalidRequest",
+            "The maximum size of a prefix is 1024",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_tag_key_over_128_chars() {
+    s3_tests::run(async {
+        let key = "k".repeat(129);
+        let body = format!(
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>tag-key-too-long</ID>\
+                    <Filter><Tag><Key>{key}</Key><Value>v</Value></Tag></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>30</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>"
+        );
+
+        assert_invalid_lifecycle_put_rejected_with_message(
+            &body,
+            "InvalidRequest",
+            "A Tag's Key must be a length between 1 and 128.",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_rejects_tag_value_over_256_chars() {
+    s3_tests::run(async {
+        let value = "v".repeat(257);
+        let body = format!(
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>tag-value-too-long</ID>\
+                    <Filter><Tag><Key>env</Key><Value>{value}</Value></Tag></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>30</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>"
+        );
+
+        assert_invalid_lifecycle_put_rejected_with_message(
+            &body,
+            "InvalidRequest",
+            "A Tag's Value must be a length between 0 and 256.",
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_put_bucket_lifecycle_accepts_51_filter_tags() {
+    s3_tests::run(async {
+        let tags = (0..51)
+            .map(|idx| format!("<Tag><Key>k{idx}</Key><Value>v{idx}</Value></Tag>"))
+            .collect::<String>();
+        let body = format!(
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>too-many-tags</ID>\
+                    <Filter><And>{tags}</And></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>30</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>"
+        );
+
+        let bucket = unique_bucket();
+        let client = CTX.client();
+        create_bucket_in_test_region(&bucket).await;
+
+        let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
+        let put = send_signed_request(
+            "PUT",
+            &url,
+            body.as_bytes(),
+            [content_md5_header(body.as_bytes())],
+        );
+        assert_eq!(
+            put.status, 200,
+            "unexpected lifecycle PUT body: {}",
+            put.body
+        );
+
+        let get = client
+            .get_bucket_lifecycle_configuration()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup_bucket(&bucket).await;
+
+        assert_eq!(get.rules().len(), 1);
+        let rule = &get.rules()[0];
+        let filter = rule.filter().expect("expected filter");
+        let and = filter.and().expect("expected And filter");
+        assert_eq!(and.tags().len(), 51);
+        assert_eq!(and.tags()[0].key(), "k0");
+        assert_eq!(and.tags()[50].key(), "k50");
     });
 }
 

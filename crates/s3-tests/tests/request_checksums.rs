@@ -30,6 +30,20 @@ fn assert_error_message(body: &str, message: &str) {
     );
 }
 
+fn assert_max_message_length(body: &str, expected_bytes: usize) {
+    assert_error_code(body, "MaxMessageLengthExceeded");
+    assert_error_message(body, "Your request was too big.");
+    let expected = format!("<MaxMessageLengthBytes>{expected_bytes}</MaxMessageLengthBytes>");
+    assert!(
+        body.contains(&expected),
+        "expected {expected} in body, got {body}"
+    );
+}
+
+fn comment_pad(size: usize) -> String {
+    format!("<!--{}-->", "x".repeat(size))
+}
+
 async fn create_bucket_in_test_region(
     object_ownership: Option<ObjectOwnership>,
     object_lock_enabled: bool,
@@ -895,5 +909,187 @@ fn test_checksum_algorithm_without_value_header_is_rejected() {
         assert_error_code(&response.body, "InvalidRequest");
         assert_error_message(&response.body, LIFECYCLE_REQUIRED_CHECKSUM_MESSAGE);
         cleanup_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_oversized_xml_body_limits_match_aws() {
+    s3_tests::run(async {
+        let versioning_pad = comment_pad(600);
+        let tagging_pad = comment_pad(41_000);
+        let ownership_pad = comment_pad(1_900);
+        let public_access_block_pad = comment_pad(420_000);
+        let object_lock_pad = comment_pad(700_000);
+        let lifecycle_pad = comment_pad(1024 * 1024);
+        let delete_pad = comment_pad(1024 * 1024);
+
+        let bucket = create_bucket_in_test_region(None, false).await;
+        let versioning_url = format!("{}/{}?versioning", CTX.endpoint(), bucket);
+        let versioning_body = format!(
+            "<VersioningConfiguration>{versioning_pad}<Status>Enabled</Status>{versioning_pad}</VersioningConfiguration>"
+        )
+        .into_bytes();
+        let versioning = send_signed_request(
+            "PUT",
+            &versioning_url,
+            &versioning_body,
+            [content_md5_header(&versioning_body)],
+        );
+        cleanup_bucket(&bucket).await;
+        assert_eq!(versioning.status, 400, "body: {}", versioning.body);
+        assert_max_message_length(&versioning.body, 1024);
+
+        let bucket = create_bucket_in_test_region(None, false).await;
+        let tagging_url = format!("{}/{}?tagging", CTX.endpoint(), bucket);
+        let tagging_body = format!(
+            "<Tagging>{tagging_pad}<TagSet>{tagging_pad}<Tag><Key>a</Key><Value>b</Value></Tag>{tagging_pad}</TagSet>{tagging_pad}</Tagging>"
+        )
+        .into_bytes();
+        let tagging = send_signed_request(
+            "PUT",
+            &tagging_url,
+            &tagging_body,
+            [content_md5_header(&tagging_body)],
+        );
+        cleanup_bucket(&bucket).await;
+        assert_eq!(tagging.status, 400, "body: {}", tagging.body);
+        assert_max_message_length(&tagging.body, 163_840);
+
+        let bucket = create_bucket_in_test_region(None, false).await;
+        let ownership_url = format!("{}/{}?ownershipControls", CTX.endpoint(), bucket);
+        let ownership_body = format!(
+            "<OwnershipControls>{ownership_pad}<Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule>{ownership_pad}</OwnershipControls>"
+        )
+        .into_bytes();
+        let ownership = send_signed_request(
+            "PUT",
+            &ownership_url,
+            &ownership_body,
+            [content_md5_header(&ownership_body)],
+        );
+        cleanup_bucket(&bucket).await;
+        assert_eq!(ownership.status, 400, "body: {}", ownership.body);
+        assert_max_message_length(&ownership.body, 2048);
+
+        let bucket = create_bucket_in_test_region(None, false).await;
+        let pab_url = format!("{}/{}?publicAccessBlock", CTX.endpoint(), bucket);
+        let pab_body = format!(
+            "<PublicAccessBlockConfiguration>{public_access_block_pad}<BlockPublicAcls>true</BlockPublicAcls>{public_access_block_pad}<IgnorePublicAcls>true</IgnorePublicAcls>{public_access_block_pad}<BlockPublicPolicy>true</BlockPublicPolicy>{public_access_block_pad}<RestrictPublicBuckets>true</RestrictPublicBuckets>{public_access_block_pad}</PublicAccessBlockConfiguration>"
+        )
+        .into_bytes();
+        let pab = send_signed_request("PUT", &pab_url, &pab_body, [content_md5_header(&pab_body)]);
+        cleanup_bucket(&bucket).await;
+        assert_eq!(pab.status, 400, "body: {}", pab.body);
+        assert_max_message_length(&pab.body, 2_097_152);
+
+        let bucket = create_bucket_in_test_region(None, true).await;
+        let object_lock_url = format!("{}/{}?object-lock", CTX.endpoint(), bucket);
+        let object_lock_body = format!(
+            "<ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{object_lock_pad}<ObjectLockEnabled>Enabled</ObjectLockEnabled>{object_lock_pad}<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule>{object_lock_pad}</ObjectLockConfiguration>"
+        )
+        .into_bytes();
+        let object_lock = send_signed_request(
+            "PUT",
+            &object_lock_url,
+            &object_lock_body,
+            [content_md5_header(&object_lock_body)],
+        );
+        cleanup_bucket(&bucket).await;
+        assert_eq!(object_lock.status, 400, "body: {}", object_lock.body);
+        assert_max_message_length(&object_lock.body, 2_097_152);
+
+        let bucket = create_bucket_in_test_region(None, false).await;
+        let lifecycle_url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
+        let lifecycle_body = format!(
+            "<LifecycleConfiguration>{lifecycle_pad}<Rule><ID>rule1</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule>{lifecycle_pad}</LifecycleConfiguration>"
+        )
+        .into_bytes();
+        let lifecycle = send_signed_request(
+            "PUT",
+            &lifecycle_url,
+            &lifecycle_body,
+            [content_md5_header(&lifecycle_body)],
+        );
+        cleanup_bucket(&bucket).await;
+        assert_eq!(lifecycle.status, 400, "body: {}", lifecycle.body);
+        assert_max_message_length(&lifecycle.body, 2_097_152);
+
+        let bucket = create_bucket_in_test_region(None, false).await;
+        let delete_url = format!("{}/{}?delete", CTX.endpoint(), bucket);
+        let delete_body =
+            format!("<Delete>{delete_pad}<Object><Key>delete-me</Key></Object>{delete_pad}</Delete>")
+                .into_bytes();
+        let delete = send_signed_request(
+            "POST",
+            &delete_url,
+            &delete_body,
+            [content_md5_header(&delete_body)],
+        );
+        cleanup_bucket(&bucket).await;
+        assert_eq!(delete.status, 400, "body: {}", delete.body);
+        assert_max_message_length(&delete.body, 2_048_000);
+    });
+}
+
+#[test]
+fn test_complete_multipart_upload_body_limit_matches_aws() {
+    s3_tests::run(async {
+        let cases = [
+            ("pad-1310k", 1_310_000usize, true),
+            ("pad-1400k", 1_400_000usize, false),
+        ];
+
+        for (label, pad_size, should_succeed) in cases {
+            let bucket = create_bucket_in_test_region(None, false).await;
+            let key = format!("complete-{label}");
+            let upload = CTX
+                .client()
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .unwrap();
+            let upload_id = upload.upload_id().unwrap().to_string();
+            let part = CTX
+                .client()
+                .upload_part()
+                .bucket(&bucket)
+                .key(&key)
+                .upload_id(&upload_id)
+                .part_number(1)
+                .body(ByteStream::from_static(b"hello multipart"))
+                .send()
+                .await
+                .unwrap();
+            let etag = part.e_tag().unwrap();
+            let pad = comment_pad(pad_size);
+            let body = format!(
+                "<CompleteMultipartUpload>{pad}<Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>{pad}</CompleteMultipartUpload>"
+            );
+            let complete_url = format!(
+                "{}/{}/{}?uploadId={}",
+                CTX.endpoint(),
+                bucket,
+                key,
+                url::form_urlencoded::byte_serialize(upload_id.as_bytes()).collect::<String>()
+            );
+            let response = send_signed_request(
+                "POST",
+                &complete_url,
+                body.as_bytes(),
+                [content_md5_header(body.as_bytes())],
+            );
+
+            if should_succeed {
+                assert_eq!(response.status, 200, "body: {}", response.body);
+                cleanup_bucket_with_keys(&bucket, &[key.as_str()]).await;
+            } else {
+                assert_eq!(response.status, 400, "body: {}", response.body);
+                assert_max_message_length(&response.body, 2_621_440);
+                abort_multipart_upload(&bucket, &key, &upload_id).await;
+                cleanup_bucket(&bucket).await;
+            }
+        }
     });
 }

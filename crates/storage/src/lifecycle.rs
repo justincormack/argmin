@@ -350,6 +350,18 @@ fn validate_configuration(rules: &[LifecycleRule]) -> Result<(), LifecycleConfig
         });
     }
 
+    let has_explicit_filter = rules.iter().any(|rule| rule.filter.explicit_filter);
+    let has_legacy_prefix = rules
+        .iter()
+        .any(|rule| !rule.filter.explicit_filter && rule.filter.prefix.is_some());
+    if has_explicit_filter && has_legacy_prefix {
+        return Err(LifecycleConfigError::InvalidRequest {
+            reason:
+                "Base level prefix cannot be used in Lifecycle V2, prefixes are only supported in the Filter."
+                    .to_string(),
+        });
+    }
+
     let mut seen_ids = HashSet::new();
     for rule in rules {
         if let Some(id) = &rule.id {
@@ -420,6 +432,33 @@ fn validate_configuration(rules: &[LifecycleRule]) -> Result<(), LifecycleConfig
         }
     }
 
+    Ok(())
+}
+
+fn validate_prefix(prefix: &str) -> Result<(), LifecycleConfigError> {
+    if prefix.len() > 1024 {
+        return Err(LifecycleConfigError::InvalidRequest {
+            reason: "The maximum size of a prefix is 1024".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_tag_key(key: &str) -> Result<(), LifecycleConfigError> {
+    if key.is_empty() || key.len() > 128 {
+        return Err(LifecycleConfigError::InvalidRequest {
+            reason: "A Tag's Key must be a length between 1 and 128.".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_tag_value(value: &str) -> Result<(), LifecycleConfigError> {
+    if value.len() > 256 {
+        return Err(LifecycleConfigError::InvalidRequest {
+            reason: "A Tag's Value must be a length between 0 and 256.".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -504,6 +543,7 @@ fn parse_rule(element: &XmlElement) -> Result<LifecycleRule, LifecycleConfigErro
                 reason: "lifecycle rule may not contain both Prefix and Filter".to_string(),
             });
         }
+        validate_prefix(&prefix)?;
         filter.prefix = Some(prefix);
     }
 
@@ -532,12 +572,10 @@ fn parse_filter(element: &XmlElement) -> Result<LifecycleRuleFilter, LifecycleCo
     for child in &element.children {
         match child.name.as_str() {
             "Prefix" => {
+                let prefix = child.trimmed_text()?.to_string();
+                validate_prefix(&prefix)?;
                 mark_filter_predicate(&mut predicate, "Prefix")?;
-                set_once(
-                    &mut filter.prefix,
-                    child.trimmed_text()?.to_string(),
-                    "Prefix",
-                )?;
+                set_once(&mut filter.prefix, prefix, "Prefix")?;
             }
             "Tag" => {
                 mark_filter_predicate(&mut predicate, "Tag")?;
@@ -582,11 +620,9 @@ fn parse_and(
     for child in &element.children {
         match child.name.as_str() {
             "Prefix" => {
-                set_once(
-                    &mut filter.prefix,
-                    child.trimmed_text()?.to_string(),
-                    "Prefix",
-                )?;
+                let prefix = child.trimmed_text()?.to_string();
+                validate_prefix(&prefix)?;
+                set_once(&mut filter.prefix, prefix, "Prefix")?;
             }
             "Tag" => {
                 filter.add_tag(parse_tag(child)?)?;
@@ -636,14 +672,16 @@ fn parse_tag(element: &XmlElement) -> Result<LifecycleTag, LifecycleConfigError>
         }
     }
 
-    Ok(LifecycleTag {
-        key: key.ok_or_else(|| LifecycleConfigError::MalformedXml {
-            reason: format!("missing <Key> in <{}>", element.name),
-        })?,
-        value: value.ok_or_else(|| LifecycleConfigError::MalformedXml {
-            reason: format!("missing <Value> in <{}>", element.name),
-        })?,
-    })
+    let key = key.ok_or_else(|| LifecycleConfigError::MalformedXml {
+        reason: format!("missing <Key> in <{}>", element.name),
+    })?;
+    let value = value.ok_or_else(|| LifecycleConfigError::MalformedXml {
+        reason: format!("missing <Value> in <{}>", element.name),
+    })?;
+    validate_tag_key(&key)?;
+    validate_tag_value(&value)?;
+
+    Ok(LifecycleTag { key, value })
 }
 
 fn parse_expiration(element: &XmlElement) -> Result<LifecycleExpiration, LifecycleConfigError> {
@@ -1339,6 +1377,33 @@ mod tests {
     }
 
     #[test]
+    fn rejects_mixed_explicit_filter_and_legacy_prefix_rules() {
+        let err = parse_lifecycle_configuration_xml(
+            b"<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>filter-rule</ID>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>1</Days></Expiration>\
+                </Rule>\
+                <Rule>\
+                    <ID>legacy-prefix</ID>\
+                    <Prefix>logs/</Prefix>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>1</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            LifecycleConfigError::InvalidRequest {
+                reason: "Base level prefix cannot be used in Lifecycle V2, prefixes are only supported in the Filter.".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn rejects_filter_with_multiple_top_level_predicates() {
         let err = parse_lifecycle_configuration_xml(
             b"<LifecycleConfiguration>\
@@ -1354,6 +1419,84 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, LifecycleConfigError::MalformedXml { .. }));
+    }
+
+    #[test]
+    fn rejects_prefix_over_1024_bytes() {
+        let prefix = "a".repeat(1025);
+        let xml = format!(
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <Status>Enabled</Status>\
+                    <Filter><Prefix>{prefix}</Prefix></Filter>\
+                    <Expiration><Days>1</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>"
+        );
+        let err = parse_lifecycle_configuration_xml(xml.as_bytes()).unwrap_err();
+        assert_eq!(
+            err,
+            LifecycleConfigError::InvalidRequest {
+                reason: "The maximum size of a prefix is 1024".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_tag_key_outside_1_to_128_chars() {
+        let key = "k".repeat(129);
+        let xml = format!(
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <Status>Enabled</Status>\
+                    <Filter><Tag><Key>{key}</Key><Value>v</Value></Tag></Filter>\
+                    <Expiration><Days>1</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>"
+        );
+        let err = parse_lifecycle_configuration_xml(xml.as_bytes()).unwrap_err();
+        assert_eq!(
+            err,
+            LifecycleConfigError::InvalidRequest {
+                reason: "A Tag's Key must be a length between 1 and 128.".to_string(),
+            }
+        );
+
+        let empty_key_xml = b"<LifecycleConfiguration>\
+                <Rule>\
+                    <Status>Enabled</Status>\
+                    <Filter><Tag><Key></Key><Value>v</Value></Tag></Filter>\
+                    <Expiration><Days>1</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>";
+        let err = parse_lifecycle_configuration_xml(empty_key_xml).unwrap_err();
+        assert_eq!(
+            err,
+            LifecycleConfigError::InvalidRequest {
+                reason: "A Tag's Key must be a length between 1 and 128.".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_tag_value_over_256_chars() {
+        let value = "v".repeat(257);
+        let xml = format!(
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <Status>Enabled</Status>\
+                    <Filter><Tag><Key>env</Key><Value>{value}</Value></Tag></Filter>\
+                    <Expiration><Days>1</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>"
+        );
+        let err = parse_lifecycle_configuration_xml(xml.as_bytes()).unwrap_err();
+        assert_eq!(
+            err,
+            LifecycleConfigError::InvalidRequest {
+                reason: "A Tag's Value must be a length between 0 and 256.".to_string(),
+            }
+        );
     }
 
     #[test]

@@ -24,6 +24,15 @@ use storage::{
 use super::response::format_version_id;
 use super::router::validate_object_key;
 
+fn ensure_xml_body_size(data: &[u8], max_message_length_bytes: usize) -> Result<(), ServerError> {
+    if data.len() > max_message_length_bytes {
+        return Err(ServerError::MaxMessageLengthExceeded {
+            max_message_length_bytes,
+        });
+    }
+    Ok(())
+}
+
 /// Format a POST Object 201 response XML.
 #[must_use]
 pub fn post_response_xml(bucket: &str, key: &str, etag: &str) -> String {
@@ -772,6 +781,8 @@ pub struct DeleteObjectEntry {
 pub fn parse_delete_objects_xml(
     data: &[u8],
 ) -> Result<(Vec<DeleteObjectEntry>, bool), ServerError> {
+    const MAX_DELETE_OBJECTS_XML_BYTES: usize = 2_048_000;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum State {
         Start,
@@ -791,6 +802,8 @@ pub fn parse_delete_objects_xml(
             reason: reason.to_string(),
         }
     }
+
+    ensure_xml_body_size(data, MAX_DELETE_OBJECTS_XML_BYTES)?;
 
     let mut reader = Reader::from_reader(data);
     let mut buf = Vec::new();
@@ -1040,6 +1053,8 @@ pub fn delete_objects_result_xml(
 ///
 /// Returns the versioning state as a `BucketVersioningState` enum.
 pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState, ServerError> {
+    const MAX_VERSIONING_CONFIGURATION_BYTES: usize = 1024;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum State {
         Start,
@@ -1055,6 +1070,8 @@ pub fn parse_versioning_config_xml(data: &[u8]) -> Result<BucketVersioningState,
                     .to_string(),
         }
     }
+
+    ensure_xml_body_size(data, MAX_VERSIONING_CONFIGURATION_BYTES)?;
 
     let mut reader = Reader::from_reader(data);
     let mut buf = Vec::new();
@@ -1187,6 +1204,8 @@ fn invalid_object_lock_configuration_xml() -> ServerError {
 pub fn parse_bucket_object_lock_configuration_xml(
     data: &[u8],
 ) -> Result<BucketObjectLockConfigurationUpdate, ServerError> {
+    const MAX_OBJECT_LOCK_CONFIGURATION_BYTES: usize = 2 * 1024 * 1024;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum State {
         Start,
@@ -1207,6 +1226,8 @@ pub fn parse_bucket_object_lock_configuration_xml(
             "invalid XML entity in object lock configuration XML body",
         )
     }
+
+    ensure_xml_body_size(data, MAX_OBJECT_LOCK_CONFIGURATION_BYTES)?;
 
     fn parse_mode(text: &str) -> Result<ObjectLockMode, ServerError> {
         match text.trim() {
@@ -2003,6 +2024,9 @@ pub fn get_bucket_encryption_xml(config: EffectiveBucketEncryptionConfig) -> Str
 pub fn parse_bucket_lifecycle_configuration_xml(
     data: &[u8],
 ) -> Result<BucketLifecycleConfiguration, ServerError> {
+    const MAX_LIFECYCLE_CONFIGURATION_BYTES: usize = 2 * 1024 * 1024;
+
+    ensure_xml_body_size(data, MAX_LIFECYCLE_CONFIGURATION_BYTES)?;
     storage::parse_lifecycle_configuration_xml(data).map_err(|error| match error {
         storage::LifecycleConfigError::MalformedXml { reason } => {
             ServerError::MalformedXML { reason }
@@ -2714,6 +2738,8 @@ pub fn parse_tagging_xml(
     data: &[u8],
     max_tags: usize,
 ) -> Result<Vec<(String, String)>, ServerError> {
+    const MAX_TAGGING_XML_BYTES: usize = 160 * 1024;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum State {
         Start,
@@ -2724,6 +2750,8 @@ pub fn parse_tagging_xml(
         InValue,
         Done,
     }
+
+    ensure_xml_body_size(data, MAX_TAGGING_XML_BYTES)?;
 
     let mut reader = Reader::from_reader(data);
     let mut buf = Vec::new();
@@ -3014,6 +3042,8 @@ fn decode_hex_pair(hi: u8, lo: u8) -> Option<u8> {
 ///
 /// Missing boolean elements default to `false`.
 pub fn parse_public_access_block_xml(data: &[u8]) -> Result<PublicAccessBlockConfig, ServerError> {
+    const MAX_PUBLIC_ACCESS_BLOCK_CONFIGURATION_BYTES: usize = 2 * 1024 * 1024;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum State {
         Start,
@@ -3042,6 +3072,8 @@ pub fn parse_public_access_block_xml(data: &[u8]) -> Result<PublicAccessBlockCon
     fn parse_bool_text(text: &str) -> bool {
         text.trim().eq_ignore_ascii_case("true")
     }
+
+    ensure_xml_body_size(data, MAX_PUBLIC_ACCESS_BLOCK_CONFIGURATION_BYTES)?;
 
     let mut reader = Reader::from_reader(data);
     let mut buf = Vec::new();
@@ -3227,6 +3259,8 @@ pub fn get_public_access_block_xml(config: &PublicAccessBlockConfig) -> String {
 /// `<OwnershipControls><Rule><ObjectOwnership>VALUE</ObjectOwnership></Rule></OwnershipControls>`.
 /// Validates VALUE is one of `BucketOwnerEnforced`, `BucketOwnerPreferred`, or `ObjectWriter`.
 pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<BucketOwnershipControls, ServerError> {
+    const MAX_OWNERSHIP_CONTROLS_XML_BYTES: usize = 2048;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum State {
         Start,
@@ -3249,6 +3283,8 @@ pub fn parse_ownership_controls_xml(data: &[u8]) -> Result<BucketOwnershipContro
             "invalid XML entity in ownership controls XML body",
         )
     }
+
+    ensure_xml_body_size(data, MAX_OWNERSHIP_CONTROLS_XML_BYTES)?;
 
     let mut reader = Reader::from_reader(data);
     let mut buf = Vec::new();
@@ -3796,6 +3832,8 @@ const CHECKSUM_ELEMENTS: &[(&str, ChecksumAlgorithm)] = &[
 /// </CompleteMultipartUpload>
 /// ```
 pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePart>, ServerError> {
+    const MAX_COMPLETE_MULTIPART_UPLOAD_XML_BYTES: usize = 2_621_440;
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum State {
         Start,
@@ -3826,6 +3864,8 @@ pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePa
             "malformed CompleteMultipartUpload XML",
         )
     }
+
+    ensure_xml_body_size(body, MAX_COMPLETE_MULTIPART_UPLOAD_XML_BYTES)?;
 
     let mut reader = Reader::from_reader(body);
     let mut buf = Vec::new();
@@ -6836,5 +6876,117 @@ mod tests {
                 None,
             ))
             .unwrap();
+    }
+
+    #[test]
+    fn parse_versioning_config_rejects_over_1k_document() {
+        let xml = format!(
+            "<VersioningConfiguration>{}<Status>Enabled</Status></VersioningConfiguration>",
+            " ".repeat(1025)
+        );
+        assert!(matches!(
+            parse_versioning_config_xml(xml.as_bytes()),
+            Err(ServerError::MaxMessageLengthExceeded {
+                max_message_length_bytes: 1024
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_ownership_controls_rejects_over_2k_document() {
+        let xml = format!(
+            "<OwnershipControls>{}<Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>",
+            " ".repeat(2049)
+        );
+        assert!(matches!(
+            parse_ownership_controls_xml(xml.as_bytes()),
+            Err(ServerError::MaxMessageLengthExceeded {
+                max_message_length_bytes: 2048
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_delete_objects_rejects_over_2048000_document() {
+        let xml = format!(
+            "<Delete>{}<Object><Key>k</Key></Object></Delete>",
+            " ".repeat(2_048_001)
+        );
+        assert!(matches!(
+            parse_delete_objects_xml(xml.as_bytes()),
+            Err(ServerError::MaxMessageLengthExceeded {
+                max_message_length_bytes: 2_048_000
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_lifecycle_configuration_rejects_over_2m_document() {
+        let xml = format!(
+            "<LifecycleConfiguration>{}<Rule><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+            " ".repeat(2_097_153)
+        );
+        assert!(matches!(
+            parse_bucket_lifecycle_configuration_xml(xml.as_bytes()),
+            Err(ServerError::MaxMessageLengthExceeded {
+                max_message_length_bytes: 2_097_152
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_tagging_xml_rejects_over_160k_document() {
+        let xml = format!(
+            "<Tagging><TagSet><Tag><Key>a</Key><Value>{}</Value></Tag></TagSet></Tagging>",
+            "v".repeat(163_841)
+        );
+        assert!(matches!(
+            parse_tagging_xml(xml.as_bytes(), 50),
+            Err(ServerError::MaxMessageLengthExceeded {
+                max_message_length_bytes: 163_840
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_public_access_block_rejects_over_2m_document() {
+        let xml = format!(
+            "<PublicAccessBlockConfiguration>{}<BlockPublicAcls>true</BlockPublicAcls></PublicAccessBlockConfiguration>",
+            " ".repeat(2_097_153)
+        );
+        assert!(matches!(
+            parse_public_access_block_xml(xml.as_bytes()),
+            Err(ServerError::MaxMessageLengthExceeded {
+                max_message_length_bytes: 2_097_152
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_object_lock_configuration_rejects_over_2m_document() {
+        let xml = format!(
+            "<ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}<ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>",
+            " ".repeat(2_097_153)
+        );
+        assert!(matches!(
+            parse_bucket_object_lock_configuration_xml(xml.as_bytes()),
+            Err(ServerError::MaxMessageLengthExceeded {
+                max_message_length_bytes: 2_097_152
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_complete_multipart_rejects_over_2621440_document() {
+        let xml = format!(
+            "<CompleteMultipartUpload>{}<Part><PartNumber>1</PartNumber><ETag>etag</ETag></Part></CompleteMultipartUpload>",
+            " ".repeat(2_621_441)
+        );
+        assert!(matches!(
+            parse_complete_multipart_upload_xml(xml.as_bytes()),
+            Err(ServerError::MaxMessageLengthExceeded {
+                max_message_length_bytes: 2_621_440
+            })
+        ));
     }
 }

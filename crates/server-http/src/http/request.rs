@@ -11,7 +11,11 @@ use auth::HeaderSource;
 /// `CompleteMultipartUpload`). Data-plane writes (`PutObject`, `UploadPart`,
 /// and POST Object file uploads) are routed through streaming handlers and are
 /// not limited by this constant.
-pub(crate) const MAX_BUFFERED_CONTROL_BODY_SIZE: usize = 10 * 1024 * 1024;
+///
+/// AWS's largest measured XML control-plane body limit is
+/// `CompleteMultipartUpload` at 2,621,440 bytes, so the generic fallback cap
+/// should not exceed that.
+pub(crate) const MAX_BUFFERED_CONTROL_BODY_SIZE: usize = 2_621_440;
 
 /// Validate a Content-Length header value. Rejects negative and non-numeric values.
 fn validate_content_length(value: &str) -> Result<u64, ServerError> {

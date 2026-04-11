@@ -2874,9 +2874,8 @@ async fn collect_body_with_limit(
             // Body stream error (includes size limit exceeded)
             Ok(Some(Err(e))) => {
                 if e.downcast_ref::<LengthLimitError>().is_some() {
-                    return Err(ServerError::ObjectTooLarge {
-                        size: 0,
-                        max: max_size as u64,
+                    return Err(ServerError::MaxMessageLengthExceeded {
+                        max_message_length_bytes: max_size,
                     });
                 }
                 return Err(ServerError::InvalidRequest {
