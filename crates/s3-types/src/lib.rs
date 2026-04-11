@@ -11,6 +11,8 @@ pub const AWS_ACCOUNT_ID_LEN: usize = 12;
 
 /// S3 canonical user IDs are 64 lowercase hex characters.
 pub const CANONICAL_USER_ID_LEN: usize = 64;
+/// AWS's special canonical user ID for anonymous public-write uploads.
+pub const ANONYMOUS_UPLOAD_CANONICAL_USER_ID: &str = "65a011a29cdf8ec533ec3d1ccaae921c";
 
 const LEGACY_SIGV2_REGIONS: &[&str] = &[
     "us-east-1",
@@ -406,6 +408,18 @@ impl CanonicalUserId {
         Some(Self(id.to_ascii_lowercase()))
     }
 
+    /// Validate and construct from a stored canonical ID string.
+    ///
+    /// Stored ownership/ACL state may legitimately contain AWS's special
+    /// anonymous-upload owner ID in addition to normal canonical user IDs.
+    #[must_use]
+    pub fn parse_stored(id: &str) -> Option<Self> {
+        Self::new(id).or_else(|| {
+            id.eq_ignore_ascii_case(ANONYMOUS_UPLOAD_CANONICAL_USER_ID)
+                .then(|| Self(ANONYMOUS_UPLOAD_CANONICAL_USER_ID.to_string()))
+        })
+    }
+
     /// Borrow the underlying canonical ID string.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -423,6 +437,12 @@ impl CanonicalUserId {
     pub fn aws_exec_read() -> Self {
         Self::new(Self::AWS_EXEC_READ_CANONICAL_ID)
             .expect("aws-exec-read canonical user id must stay valid")
+    }
+
+    /// Canonical user ID AWS uses as the shared owner for anonymous uploads.
+    #[must_use]
+    pub fn anonymous_upload() -> Self {
+        Self(ANONYMOUS_UPLOAD_CANONICAL_USER_ID.to_string())
     }
 }
 
@@ -692,9 +712,9 @@ impl AclGrants {
 
             let grantee = match kind {
                 "cu" => {
-                    AclGrantee::CanonicalUser(CanonicalUserId::new(value).ok_or_else(|| {
-                        format!("invalid canonical user id in ACL grant on line {}", idx + 1)
-                    })?)
+                    AclGrantee::CanonicalUser(CanonicalUserId::parse_stored(value).ok_or_else(
+                        || format!("invalid canonical user id in ACL grant on line {}", idx + 1),
+                    )?)
                 }
                 "group" if value == AclGrantee::ALL_USERS_TOKEN => AclGrantee::AllUsers,
                 "group" if value == AclGrantee::AUTHENTICATED_USERS_TOKEN => {
@@ -720,7 +740,8 @@ mod tests {
         supports_legacy_sigv2, AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission,
         BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, LegalHoldStatus,
         ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState, ObjectRetention,
-        RetentionPeriod, StoredLegalHoldStatus, VersionId, CANONICAL_USER_ID_LEN,
+        RetentionPeriod, StoredLegalHoldStatus, VersionId, ANONYMOUS_UPLOAD_CANONICAL_USER_ID,
+        CANONICAL_USER_ID_LEN,
     };
 
     #[test]
@@ -885,8 +906,26 @@ mod tests {
     fn canonical_user_id_new_validates_shape() {
         let good = "a".repeat(CANONICAL_USER_ID_LEN);
         assert_eq!(CanonicalUserId::new(&good).unwrap().as_str(), good.as_str());
+        assert!(CanonicalUserId::new(ANONYMOUS_UPLOAD_CANONICAL_USER_ID).is_none());
         assert!(CanonicalUserId::new("short").is_none());
         assert!(CanonicalUserId::new(&"z".repeat(CANONICAL_USER_ID_LEN)).is_none());
+    }
+
+    #[test]
+    fn canonical_user_id_parse_stored_accepts_aws_anonymous_special_case_only() {
+        let good = "a".repeat(CANONICAL_USER_ID_LEN);
+        assert_eq!(
+            CanonicalUserId::parse_stored(&good).unwrap().as_str(),
+            good.as_str()
+        );
+        assert_eq!(
+            CanonicalUserId::parse_stored(ANONYMOUS_UPLOAD_CANONICAL_USER_ID)
+                .unwrap()
+                .as_str(),
+            ANONYMOUS_UPLOAD_CANONICAL_USER_ID
+        );
+        assert!(CanonicalUserId::parse_stored(&"a".repeat(32)).is_none());
+        assert!(CanonicalUserId::parse_stored("short").is_none());
     }
 
     #[test]

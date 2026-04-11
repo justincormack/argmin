@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS objects (
     encryption_type INTEGER NOT NULL DEFAULT 0,
     encryption_state BLOB,
     owner_principal TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
-    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) = 64),
+    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
     acl_grants TEXT NOT NULL DEFAULT '',
     public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
     object_lock_retention_mode INTEGER CHECK (
@@ -82,12 +82,12 @@ CREATE TABLE IF NOT EXISTS multipart_uploads (
     owner_principal  TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
     encryption_type  INTEGER NOT NULL DEFAULT 0 CHECK (encryption_type IN (0, 1, 2)),
     encryption_state BLOB,
-    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) = 64),
+    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
     initiator_principal TEXT CHECK (
         initiator_principal IS NULL OR length(initiator_principal) BETWEEN 1 AND 256
     ),
     initiator_canonical_id TEXT CHECK (
-        initiator_canonical_id IS NULL OR length(initiator_canonical_id) = 64
+        initiator_canonical_id IS NULL OR length(initiator_canonical_id) IN (32, 64)
     ),
     acl_grants TEXT NOT NULL DEFAULT '',
     public_read INTEGER NOT NULL DEFAULT 0 CHECK (public_read IN (0, 1)),
@@ -109,12 +109,12 @@ CREATE TABLE IF NOT EXISTS completed_multipart_uploads (
     completion_order INTEGER NOT NULL CHECK (completion_order > 0),
     completed_at     INTEGER NOT NULL,
     owner_principal  TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
-    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) = 64),
+    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
     initiator_principal TEXT CHECK (
         initiator_principal IS NULL OR length(initiator_principal) BETWEEN 1 AND 256
     ),
     initiator_canonical_id TEXT CHECK (
-        initiator_canonical_id IS NULL OR length(initiator_canonical_id) = 64
+        initiator_canonical_id IS NULL OR length(initiator_canonical_id) IN (32, 64)
     )
 )";
 
@@ -357,7 +357,7 @@ const CREATE_BUCKETS_TABLE: &str = "\
 CREATE TABLE IF NOT EXISTS buckets (
     name             TEXT PRIMARY KEY,
     owner_principal  TEXT NOT NULL CHECK (length(owner_principal) BETWEEN 1 AND 256),
-    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) = 64),
+    owner_canonical_id TEXT NOT NULL CHECK (length(owner_canonical_id) IN (32, 64)),
     created_at       INTEGER NOT NULL,
     region           INTEGER NOT NULL DEFAULT 0,
     state            INTEGER NOT NULL DEFAULT 0 CHECK (state IN (0, 1)),

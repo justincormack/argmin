@@ -1425,7 +1425,7 @@ impl PgStore {
         col_idx: usize,
         field_name: &'static str,
     ) -> Result<CanonicalUserId, rusqlite::Error> {
-        CanonicalUserId::new(&raw).ok_or_else(|| {
+        CanonicalUserId::parse_stored(&raw).ok_or_else(|| {
             rusqlite::Error::FromSqlConversionFailure(
                 col_idx,
                 rusqlite::types::Type::Text,

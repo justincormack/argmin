@@ -8,6 +8,7 @@ use s3_tests::{
     assert_s3_err_code, content_md5_header, create_public_write_bucket,
     disable_bucket_public_access_block, err_status, unique_bucket, CTX,
 };
+use s3_types::ANONYMOUS_UPLOAD_CANONICAL_USER_ID;
 use serde_json::json;
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
@@ -20,6 +21,13 @@ fn anonymous_get_status(url: &str) -> u16 {
     let status = resp.status().as_u16();
     let _ = resp.body_mut().read_to_string();
     status
+}
+
+fn anonymous_put(url: &str, body: &'static [u8]) -> (u16, String) {
+    let mut resp = agent().put(url).send(body).expect("transport error");
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, body)
 }
 
 /// Cleanup helper.
@@ -200,6 +208,46 @@ fn has_grant(grants: &[Grant], permission: Permission, canonical_user_id: &str) 
                 .grantee()
                 .is_some_and(|grantee| grantee.id() == Some(canonical_user_id))
     })
+}
+
+#[test]
+fn test_anonymous_public_write_put_uses_special_anonymous_owner_id() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_public_write_bucket(client).await;
+        let key = "anonymous-owner";
+        let url = format!("{}/{bucket}/{key}", CTX.endpoint());
+
+        let (status, body) = anonymous_put(&url, b"data");
+        assert_eq!(status, 200, "unexpected body: {body}");
+
+        let acl_url = format!("{}/{bucket}/{key}?acl", CTX.endpoint());
+        let mut acl = agent().get(&acl_url).call().expect("transport error");
+        let acl_status = acl.status().as_u16();
+        let acl_body = acl.body_mut().read_to_string().unwrap_or_default();
+        assert_eq!(acl_status, 200, "unexpected body: {acl_body}");
+        assert!(
+            acl_body.contains(&format!(
+                "<Owner><ID>{ANONYMOUS_UPLOAD_CANONICAL_USER_ID}</ID></Owner>"
+            )),
+            "unexpected body: {acl_body}"
+        );
+        assert!(
+            acl_body.contains(&format!(
+                "<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>{ANONYMOUS_UPLOAD_CANONICAL_USER_ID}</ID></Grantee><Permission>FULL_CONTROL</Permission>"
+            )),
+            "unexpected body: {acl_body}"
+        );
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
 }
 
 fn assert_acl_not_supported<T, E: std::fmt::Debug>(

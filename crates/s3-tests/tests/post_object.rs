@@ -7,6 +7,7 @@ use s3_tests::{
     sigv4_post_sse_c_fields_for_credentials, sse_c_header_values, test_sse_c_key, unique_bucket,
     RawResponse, CTX,
 };
+use s3_types::ANONYMOUS_UPLOAD_CANONICAL_USER_ID;
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -1025,6 +1026,26 @@ async fn assert_post_object_anonymous_public_write_bucket() {
         .unwrap();
     let data = out.body.collect().await.unwrap().into_bytes();
     assert_eq!(&data[..], b"data");
+
+    let acl_url = format!("{}/{bucket}/{key}?acl", CTX.endpoint());
+    let mut acl = s3_tests::test_agent()
+        .get(&acl_url)
+        .call()
+        .expect("transport error");
+    assert_eq!(acl.status().as_u16(), 200);
+    let acl_body = acl.body_mut().read_to_string().unwrap_or_default();
+    assert!(
+        acl_body.contains(&format!(
+            "<Owner><ID>{ANONYMOUS_UPLOAD_CANONICAL_USER_ID}</ID></Owner>"
+        )),
+        "unexpected body: {acl_body}"
+    );
+    assert!(
+        acl_body.contains(&format!(
+            "<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>{ANONYMOUS_UPLOAD_CANONICAL_USER_ID}</ID></Grantee><Permission>FULL_CONTROL</Permission>"
+        )),
+        "unexpected body: {acl_body}"
+    );
 
     client
         .delete_object()

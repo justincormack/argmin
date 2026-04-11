@@ -1237,6 +1237,8 @@ impl std::fmt::Debug for OwnerIdentity {
 }
 
 impl OwnerIdentity {
+    pub const ANONYMOUS_UPLOAD_PRINCIPAL: &'static str = "__aws_anonymous_upload__";
+
     #[must_use]
     pub fn new(principal: impl Into<String>, canonical_id: CanonicalUserId) -> Self {
         Self {
@@ -1251,6 +1253,14 @@ impl OwnerIdentity {
         Self {
             canonical_id: CanonicalUserId::from_principal(&principal),
             principal,
+        }
+    }
+
+    #[must_use]
+    pub fn anonymous_upload() -> Self {
+        Self {
+            principal: Self::ANONYMOUS_UPLOAD_PRINCIPAL.to_string(),
+            canonical_id: CanonicalUserId::anonymous_upload(),
         }
     }
 }

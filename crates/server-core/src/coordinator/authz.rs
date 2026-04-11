@@ -160,7 +160,7 @@ impl Coordinator {
             }
         });
 
-        requester.principal_opt() == Some(object.owner().principal.as_str())
+        Self::requester_matches_owner_identity(requester, object.owner())
             || acl_allows_read
             || (object.public_read()
                 && !Self::ignores_public_acls(bucket.public_access_block.as_ref()))
@@ -207,7 +207,7 @@ impl Coordinator {
     ) -> bool {
         (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
             && Self::requester_is_bucket_owner_account(requester, bucket))
-            || requester.principal_opt() == Some(object.owner().principal.as_str())
+            || Self::requester_matches_owner_identity(requester, object.owner())
             || object.acl_grants().is_some_and(|grants| {
                 Self::requester_has_acl_permission(requester, grants, AclPermission::ReadAcp)
             })
@@ -220,7 +220,7 @@ impl Coordinator {
     ) -> bool {
         (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
             && Self::requester_is_bucket_owner_account(requester, bucket))
-            || requester.principal_opt() == Some(object.owner().principal.as_str())
+            || Self::requester_matches_owner_identity(requester, object.owner())
             || object.acl_grants().is_some_and(|grants| {
                 Self::requester_has_acl_permission(requester, grants, AclPermission::WriteAcp)
             })
@@ -230,6 +230,10 @@ impl Coordinator {
         requester: &Requester,
         owner: &OwnerIdentity,
     ) -> bool {
+        if requester.is_anonymous() {
+            return owner.principal == OwnerIdentity::ANONYMOUS_UPLOAD_PRINCIPAL
+                && owner.canonical_id == CanonicalUserId::anonymous_upload();
+        }
         requester.account().is_some_and(|account| {
             account.canonical_user_id() == &owner.canonical_id
                 || account.principal() == owner.principal
@@ -351,7 +355,7 @@ impl Coordinator {
         object: &StoredObject,
     ) -> bool {
         requester.principal_opt() == Some(bucket.owner_principal.as_str())
-            || requester.principal_opt() == Some(object.owner().principal.as_str())
+            || Self::requester_matches_owner_identity(requester, object.owner())
     }
 
     pub(super) fn is_bucket_owner_enforced(config: Option<&BucketOwnershipControls>) -> bool {
@@ -1270,6 +1274,9 @@ impl Coordinator {
     }
 
     pub(super) fn requester_owner_identity(requester: &Requester) -> Option<OwnerIdentity> {
+        if requester.is_anonymous() {
+            return Some(OwnerIdentity::anonymous_upload());
+        }
         requester.account().map(|account| {
             OwnerIdentity::new(
                 account.principal().to_string(),
