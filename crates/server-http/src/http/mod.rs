@@ -2470,6 +2470,7 @@ impl HttpFrontend {
                 let prefix = req.query_param_lossy("prefix");
                 let key_marker = req.query_param_lossy("key-marker");
                 let upload_id_marker = req.query_param_lossy("upload-id-marker");
+                let encoding_type = req.query_param_lossy("encoding-type");
                 let max_uploads = parse_u32_or_default(
                     req.query_param_lossy("max-uploads"),
                     1000,
@@ -2491,6 +2492,7 @@ impl HttpFrontend {
                     prefix.as_deref(),
                     key_marker.as_deref(),
                     upload_id_marker.as_deref(),
+                    encoding_type.as_deref(),
                     max_uploads,
                     &rendered,
                 ))

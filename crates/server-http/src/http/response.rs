@@ -1135,6 +1135,7 @@ impl S3Response {
         prefix: Option<&str>,
         key_marker: Option<&str>,
         upload_id_marker: Option<&str>,
+        encoding_type: Option<&str>,
         max_uploads: u32,
         result: &xml::RenderedListMultipartUploadsResult,
     ) -> Self {
@@ -1143,6 +1144,7 @@ impl S3Response {
             prefix,
             key_marker,
             upload_id_marker,
+            encoding_type,
             max_uploads,
             result,
         );

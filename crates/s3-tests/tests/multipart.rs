@@ -8,12 +8,12 @@ use std::collections::BTreeMap;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    CompletedMultipartUpload, CompletedPart, ObjectCannedAcl, ObjectOwnership, Permission,
-    PublicAccessBlockConfiguration,
+    CompletedMultipartUpload, CompletedPart, EncodingType, ObjectCannedAcl, ObjectOwnership,
+    Permission, PublicAccessBlockConfiguration,
 };
 use s3_tests::{
     assert_s3_err_code, copy_source_with_version, create_public_write_bucket, err_status,
-    unique_bucket, CTX,
+    send_signed_request, unique_bucket, CTX,
 };
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
@@ -116,6 +116,41 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     }
 
     client.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+fn expected_raw_list_value(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\u{0001}'..='\u{0008}' | '\u{000B}' | '\u{000C}' | '\u{000E}'..='\u{001F}' => {
+                escaped.push_str(&format!("&#x{:x};", ch as u32));
+            }
+            '&' => escaped.push_str("&amp;"),
+            '<' => escaped.push_str("&lt;"),
+            '>' => escaped.push_str("&gt;"),
+            '"' => escaped.push_str("&quot;"),
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+fn expected_url_list_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(byte as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+fn query_encode_value(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
 fn anon_agent() -> ureq::Agent {
@@ -782,6 +817,302 @@ fn test_list_multipart_uploads_pagination_and_markers() {
                 .await
                 .unwrap();
         }
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_list_multipart_uploads_encoding_type_url() {
+    const KEY: &str = "multi part <>&\"+";
+
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(KEY)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let resp = client
+            .list_multipart_uploads()
+            .bucket(&bucket)
+            .encoding_type(EncodingType::Url)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.encoding_type(), Some(&EncodingType::Url));
+        assert_eq!(resp.uploads().len(), 1);
+        let encoded_key = expected_url_list_value(KEY);
+        assert_eq!(resp.uploads()[0].key(), Some(encoded_key.as_str()));
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(KEY)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_list_multipart_uploads_raw_response_encodes_key_fields() {
+    const KEY: &str = "multi<>&\"";
+    const PREFIX: &str = "multi<>&\"";
+
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(KEY)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+        let url = format!(
+            "{}/{bucket}?uploads&encoding-type=url&prefix={}",
+            CTX.endpoint(),
+            query_encode_value(PREFIX)
+        );
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<Prefix>{}</Prefix>",
+                expected_url_list_value(PREFIX)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response
+                .body
+                .contains(&format!("<Key>{}</Key>", expected_url_list_value(KEY))),
+            "unexpected body: {}",
+            response.body
+        );
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(KEY)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_list_multipart_uploads_raw_response_without_encoding_type_keeps_raw_key_fields() {
+    const KEY: &str = "multi<>&\"";
+    const PREFIX: &str = "multi<>&\"";
+
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(KEY)
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let url = format!(
+            "{}/{bucket}?uploads&prefix={}",
+            CTX.endpoint(),
+            query_encode_value(PREFIX)
+        );
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            !response.body.contains("<EncodingType>url</EncodingType>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<Prefix>{}</Prefix>",
+                expected_raw_list_value(PREFIX)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response
+                .body
+                .contains(&format!("<Key>{}</Key>", expected_raw_list_value(KEY))),
+            "unexpected body: {}",
+            response.body
+        );
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(KEY)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_list_multipart_uploads_raw_response_encodes_key_marker() {
+    const FIRST_KEY: &str = "a<>&\"";
+    const SECOND_KEY: &str = "b";
+
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let create_first = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(FIRST_KEY)
+            .send()
+            .await
+            .unwrap();
+        let first_upload_id = create_first.upload_id().unwrap().to_string();
+
+        let create_second = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(SECOND_KEY)
+            .send()
+            .await
+            .unwrap();
+        let second_upload_id = create_second.upload_id().unwrap().to_string();
+
+        let url = format!(
+            "{}/{bucket}?uploads&encoding-type=url&key-marker={}&max-uploads=1",
+            CTX.endpoint(),
+            query_encode_value(FIRST_KEY)
+        );
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains(&format!(
+                "<KeyMarker>{}</KeyMarker>",
+                expected_url_list_value(FIRST_KEY)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains("<Key>b</Key>"),
+            "unexpected body: {}",
+            response.body
+        );
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(FIRST_KEY)
+            .upload_id(&first_upload_id)
+            .send()
+            .await
+            .unwrap();
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(SECOND_KEY)
+            .upload_id(&second_upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_list_multipart_uploads_raw_response_encodes_next_markers() {
+    const FIRST_KEY: &str = "a<>&\"";
+    const SECOND_KEY: &str = "b";
+
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let create_first = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(FIRST_KEY)
+            .send()
+            .await
+            .unwrap();
+        let first_upload_id = create_first.upload_id().unwrap().to_string();
+
+        let create_second = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(SECOND_KEY)
+            .send()
+            .await
+            .unwrap();
+        let second_upload_id = create_second.upload_id().unwrap().to_string();
+
+        let url = format!(
+            "{}/{bucket}?uploads&encoding-type=url&max-uploads=1",
+            CTX.endpoint(),
+        );
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 200, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains(&format!(
+                "<NextKeyMarker>{}</NextKeyMarker>",
+                expected_url_list_value(FIRST_KEY)
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response.body.contains(&format!(
+                "<NextUploadIdMarker>{first_upload_id}</NextUploadIdMarker>"
+            )),
+            "unexpected body: {}",
+            response.body
+        );
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(FIRST_KEY)
+            .upload_id(&first_upload_id)
+            .send()
+            .await
+            .unwrap();
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(SECOND_KEY)
+            .upload_id(&second_upload_id)
+            .send()
+            .await
+            .unwrap();
         cleanup(&bucket, &[]).await;
     });
 }
