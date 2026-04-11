@@ -8,6 +8,7 @@ use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, copy_source_with_version, err_status,
     send_signed_request, unique_bucket, CTX,
 };
+use std::time::Duration;
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -123,6 +124,60 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
     client.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+async fn get_object_eventually_after_copy(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> aws_sdk_s3::operation::get_object::GetObjectOutput {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match client.get_object().bucket(bucket).key(key).send().await {
+            Ok(output) => return output,
+            Err(err)
+                if err
+                    .raw_response()
+                    .is_some_and(|resp| resp.status().as_u16() == 404)
+                    && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(err) => {
+                panic!("GetObject after copy failed unexpectedly for {bucket}/{key}: {err:?}")
+            }
+        }
+    }
+
+    unreachable!()
+}
+
+async fn head_object_eventually_after_copy(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+) -> aws_sdk_s3::operation::head_object::HeadObjectOutput {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match client.head_object().bucket(bucket).key(key).send().await {
+            Ok(output) => return output,
+            Err(err)
+                if err
+                    .raw_response()
+                    .is_some_and(|resp| resp.status().as_u16() == 404)
+                    && attempt + 1 < MAX_ATTEMPTS =>
+            {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(err) => {
+                panic!("HeadObject after copy failed unexpectedly for {bucket}/{key}: {err:?}")
+            }
+        }
+    }
+
+    unreachable!()
 }
 
 // ── Basic copy ────────────────────────────────────────────────────────
@@ -605,13 +660,7 @@ fn test_object_copy_versioned_bucket() {
             .await
             .unwrap();
 
-        let resp = client
-            .get_object()
-            .bucket(&bucket1)
-            .key("bar321foo")
-            .send()
-            .await
-            .unwrap();
+        let resp = get_object_eventually_after_copy(client, &bucket1, "bar321foo").await;
         let version_id2 = resp.version_id().unwrap().to_string();
         assert_eq!(resp.content_length(), Some(data.len() as i64));
         let body = resp.body.collect().await.unwrap().into_bytes();
@@ -629,13 +678,7 @@ fn test_object_copy_versioned_bucket() {
             .await
             .unwrap();
 
-        let resp = client
-            .get_object()
-            .bucket(&bucket1)
-            .key("bar321foo2")
-            .send()
-            .await
-            .unwrap();
+        let resp = get_object_eventually_after_copy(client, &bucket1, "bar321foo2").await;
         assert_eq!(resp.content_length(), Some(data.len() as i64));
 
         // Copy to another versioned bucket
@@ -661,13 +704,7 @@ fn test_object_copy_versioned_bucket() {
             .await
             .unwrap();
 
-        let resp = client
-            .get_object()
-            .bucket(&bucket2)
-            .key("bar321foo3")
-            .send()
-            .await
-            .unwrap();
+        let resp = get_object_eventually_after_copy(client, &bucket2, "bar321foo3").await;
         assert_eq!(resp.content_length(), Some(data.len() as i64));
 
         // Copy to a non-versioned bucket
@@ -681,13 +718,7 @@ fn test_object_copy_versioned_bucket() {
             .await
             .unwrap();
 
-        let resp = client
-            .get_object()
-            .bucket(&bucket3)
-            .key("bar321foo4")
-            .send()
-            .await
-            .unwrap();
+        let resp = get_object_eventually_after_copy(client, &bucket3, "bar321foo4").await;
         assert_eq!(resp.content_length(), Some(data.len() as i64));
 
         // Copy from non-versioned bucket to versioned bucket
@@ -700,13 +731,7 @@ fn test_object_copy_versioned_bucket() {
             .await
             .unwrap();
 
-        let resp = client
-            .get_object()
-            .bucket(&bucket1)
-            .key("foo123bar2")
-            .send()
-            .await
-            .unwrap();
+        let resp = get_object_eventually_after_copy(client, &bucket1, "foo123bar2").await;
         assert_eq!(resp.content_length(), Some(data.len() as i64));
 
         cleanup(&bucket3, &["bar321foo4"]).await;
@@ -766,13 +791,7 @@ fn test_object_copy_versioned_url_encoding() {
             .unwrap();
 
         // Verify destination exists
-        client
-            .head_object()
-            .bucket(&bucket)
-            .key(dst_key)
-            .send()
-            .await
-            .unwrap();
+        head_object_eventually_after_copy(client, &bucket, dst_key).await;
 
         cleanup_versioned_bucket(client, &bucket).await;
     });
