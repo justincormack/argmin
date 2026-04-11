@@ -1,4 +1,4 @@
-# argmin2
+# argmin
 
 S3-compatible object storage written in Rust. Single-node, synchronous IO,
 erasure-coded with ISA-L.
