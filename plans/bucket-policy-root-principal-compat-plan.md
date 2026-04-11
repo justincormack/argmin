@@ -9,8 +9,11 @@ This plan covers one specific AWS S3 compatibility gap:
 
 AWS documents that the bucket owner's account `root` principal can still perform
 those three bucket-policy APIs even if the bucket policy explicitly denies that
-root principal. That carveout does not extend to arbitrary IAM principals in the
-same account.
+root principal. AWS also documents the `PutBucketPolicy` header
+`x-amz-confirm-remove-self-bucket-access`; argmin currently ignores that
+header, and any real support for it belongs with this same self-lockout/root
+principal behavior. That carveout does not extend to arbitrary IAM principals
+in the same account.
 
 This plan does not cover:
 - `GetBucketPolicyStatus`
