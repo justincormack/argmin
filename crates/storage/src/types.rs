@@ -1461,17 +1461,12 @@ impl BucketState {
     }
 }
 
-/// Typed bucket subresources whose payloads are stored opaquely.
-///
-/// `PublicAccessBlock` and `OwnershipControls` are handled via dedicated typed
-/// storage APIs instead of this generic opaque payload path.
+/// Bucket subresources whose payloads are stored opaquely.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketSubresourceKind {
     Cors = 0,
     Tagging = 1,
-    PublicAccessBlock = 2,
-    OwnershipControls = 3,
     Policy = 4,
     Lifecycle = 5,
 }
@@ -1482,8 +1477,6 @@ impl BucketSubresourceKind {
         match v {
             0 => Some(Self::Cors),
             1 => Some(Self::Tagging),
-            2 => Some(Self::PublicAccessBlock),
-            3 => Some(Self::OwnershipControls),
             4 => Some(Self::Policy),
             5 => Some(Self::Lifecycle),
             _ => None,
@@ -1523,14 +1516,6 @@ impl BucketSubresourceKind {
             (self, aux),
             (BucketSubresourceKind::Cors, BucketSubresourceAux::None)
                 | (BucketSubresourceKind::Tagging, BucketSubresourceAux::None)
-                | (
-                    BucketSubresourceKind::PublicAccessBlock,
-                    BucketSubresourceAux::None
-                )
-                | (
-                    BucketSubresourceKind::OwnershipControls,
-                    BucketSubresourceAux::None
-                )
                 | (
                     BucketSubresourceKind::Policy,
                     BucketSubresourceAux::Policy { .. }

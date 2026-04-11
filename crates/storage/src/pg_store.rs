@@ -1081,23 +1081,6 @@ impl PgStore {
         }
     }
 
-    fn bucket_subresource_not_opaque(kind: BucketSubresourceKind) -> MetadataError {
-        MetadataError::NotImplemented {
-            context: match kind {
-                BucketSubresourceKind::PublicAccessBlock => {
-                    "public access block uses typed storage"
-                }
-                BucketSubresourceKind::OwnershipControls => "ownership controls use typed storage",
-                BucketSubresourceKind::Cors
-                | BucketSubresourceKind::Tagging
-                | BucketSubresourceKind::Policy
-                | BucketSubresourceKind::Lifecycle => {
-                    "bucket subresource kind unexpectedly missing opaque storage support"
-                }
-            },
-        }
-    }
-
     fn bucket_subresource_aux_to_sql(aux: BucketSubresourceAux) -> Option<i64> {
         match aux {
             BucketSubresourceAux::None => None,
@@ -1172,8 +1155,6 @@ impl PgStore {
 
             match kind {
                 BucketSubresourceKind::Cors | BucketSubresourceKind::Tagging => {}
-                BucketSubresourceKind::PublicAccessBlock => {}
-                BucketSubresourceKind::OwnershipControls => {}
                 BucketSubresourceKind::Policy => {
                     self.conn
                         .execute(
@@ -1290,8 +1271,6 @@ impl PgStore {
 
             match kind {
                 BucketSubresourceKind::Cors | BucketSubresourceKind::Tagging => {}
-                BucketSubresourceKind::PublicAccessBlock => {}
-                BucketSubresourceKind::OwnershipControls => {}
                 BucketSubresourceKind::Policy => {
                     self.conn
                         .execute(
@@ -2639,12 +2618,6 @@ impl PgMetadataStore for PgStore {
         name: &str,
         req: PutBucketSubresource<'_>,
     ) -> Result<(), MetadataError> {
-        if matches!(
-            req.kind,
-            BucketSubresourceKind::PublicAccessBlock | BucketSubresourceKind::OwnershipControls
-        ) {
-            return Err(Self::bucket_subresource_not_opaque(req.kind));
-        }
         self.put_bucket_subresource_internal(name, req.kind, req.body, req.aux)
     }
 
@@ -2653,12 +2626,6 @@ impl PgMetadataStore for PgStore {
         name: &str,
         kind: BucketSubresourceKind,
     ) -> Result<Option<StoredBucketSubresource>, MetadataError> {
-        if matches!(
-            kind,
-            BucketSubresourceKind::PublicAccessBlock | BucketSubresourceKind::OwnershipControls
-        ) {
-            return Err(Self::bucket_subresource_not_opaque(kind));
-        }
         self.get_bucket_subresource_internal(name, kind)
     }
 
@@ -2667,12 +2634,6 @@ impl PgMetadataStore for PgStore {
         name: &str,
         kind: BucketSubresourceKind,
     ) -> Result<(), MetadataError> {
-        if matches!(
-            kind,
-            BucketSubresourceKind::PublicAccessBlock | BucketSubresourceKind::OwnershipControls
-        ) {
-            return Err(Self::bucket_subresource_not_opaque(kind));
-        }
         self.delete_bucket_subresource_internal(name, kind)
     }
 

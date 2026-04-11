@@ -727,31 +727,6 @@ fn file_bucket_metadata_config_roundtrip() {
         store.get_bucket_ownership_controls("bucket").unwrap(),
         Some(ownership_controls)
     );
-    assert!(matches!(
-        store
-            .put_bucket_subresource(
-                "bucket",
-                PutBucketSubresource {
-                    kind: BucketSubresourceKind::OwnershipControls,
-                    body: "<OwnershipControls/>",
-                    aux: BucketSubresourceAux::None,
-                },
-            )
-            .unwrap_err(),
-        crate::error::MetadataError::NotImplemented { .. }
-    ));
-    assert!(matches!(
-        store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::OwnershipControls)
-            .unwrap_err(),
-        crate::error::MetadataError::NotImplemented { .. }
-    ));
-    assert!(matches!(
-        store
-            .delete_bucket_subresource("bucket", BucketSubresourceKind::OwnershipControls)
-            .unwrap_err(),
-        crate::error::MetadataError::NotImplemented { .. }
-    ));
     store.delete_bucket_ownership_controls("bucket").unwrap();
     assert_eq!(store.get_bucket_ownership_controls("bucket").unwrap(), None);
 
@@ -1015,31 +990,6 @@ fn file_bucket_subresource_roundtrip() {
         store.get_bucket_public_access_block("bucket").unwrap(),
         Some(public_access_block)
     );
-    assert!(matches!(
-        store
-            .put_bucket_subresource(
-                "bucket",
-                PutBucketSubresource {
-                    kind: BucketSubresourceKind::PublicAccessBlock,
-                    body: "<PublicAccessBlock/>",
-                    aux: BucketSubresourceAux::None,
-                },
-            )
-            .unwrap_err(),
-        crate::error::MetadataError::NotImplemented { .. }
-    ));
-    assert!(matches!(
-        store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::PublicAccessBlock)
-            .unwrap_err(),
-        crate::error::MetadataError::NotImplemented { .. }
-    ));
-    assert!(matches!(
-        store
-            .delete_bucket_subresource("bucket", BucketSubresourceKind::PublicAccessBlock)
-            .unwrap_err(),
-        crate::error::MetadataError::NotImplemented { .. }
-    ));
     store.delete_bucket_public_access_block("bucket").unwrap();
     assert_eq!(
         store.get_bucket_public_access_block("bucket").unwrap(),

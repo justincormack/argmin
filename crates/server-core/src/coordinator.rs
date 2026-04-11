@@ -222,6 +222,11 @@ struct AuthorizedBucketSubresourceDelete {
 }
 
 #[derive(Debug)]
+struct AuthorizedBucketConfigAccess {
+    bucket: String,
+}
+
+#[derive(Debug)]
 struct AuthorizedPutBucketPublicAccessBlock {
     bucket: String,
     config: PublicAccessBlockConfig,

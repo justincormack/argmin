@@ -2056,7 +2056,7 @@ impl Coordinator {
     pub(super) fn authorize_get_bucket_public_access_block(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
         let bucket_info = self.active_bucket_summary_for(req)?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_get_bucket_public_access_block_with_bucket_policy(
@@ -2066,23 +2066,21 @@ impl Coordinator {
         ) {
             return Err(ServerError::AccessDenied);
         }
-        Ok(AuthorizedBucketSubresourceGet {
+        Ok(AuthorizedBucketConfigAccess {
             bucket: req.name.to_string(),
-            kind: storage::BucketSubresourceKind::PublicAccessBlock,
         })
     }
 
     pub(super) fn authorize_delete_bucket_public_access_block(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
         let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
             req,
             auth::PolicyAction::PutBucketPublicAccessBlock,
         )?;
-        Ok(AuthorizedBucketSubresourceDelete {
+        Ok(AuthorizedBucketConfigAccess {
             bucket: req.name.to_string(),
-            kind: storage::BucketSubresourceKind::PublicAccessBlock,
         })
     }
 
@@ -2111,28 +2109,26 @@ impl Coordinator {
     pub(super) fn authorize_get_bucket_ownership_controls(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
         let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
             req,
             auth::PolicyAction::GetBucketOwnershipControls,
         )?;
-        Ok(AuthorizedBucketSubresourceGet {
+        Ok(AuthorizedBucketConfigAccess {
             bucket: req.name.to_string(),
-            kind: storage::BucketSubresourceKind::OwnershipControls,
         })
     }
 
     pub(super) fn authorize_delete_bucket_ownership_controls(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
         let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
             req,
             auth::PolicyAction::PutBucketOwnershipControls,
         )?;
-        Ok(AuthorizedBucketSubresourceDelete {
+        Ok(AuthorizedBucketConfigAccess {
             bucket: req.name.to_string(),
-            kind: storage::BucketSubresourceKind::OwnershipControls,
         })
     }
 
