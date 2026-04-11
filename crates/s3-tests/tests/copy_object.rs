@@ -760,11 +760,7 @@ fn test_object_copy_versioned_url_encoding() {
             .copy_object()
             .bucket(&bucket)
             .key(dst_key)
-            .copy_source(copy_source_with_version(
-                &bucket,
-                &src_key.replace('?', "%3F").replace('&', "%26"),
-                &version_id,
-            ))
+            .copy_source(copy_source_with_version(&bucket, src_key, &version_id))
             .send()
             .await
             .unwrap();
