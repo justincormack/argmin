@@ -2360,6 +2360,14 @@ pub struct PutBucketConfigRequest<'a> {
     pub config: &'a str,
 }
 
+/// Request for a PutBucketPolicy operation.
+#[derive(Debug)]
+pub struct PutBucketPolicyRequest<'a> {
+    pub bucket: BucketRequest<'a>,
+    pub config: &'a str,
+    pub confirm_remove_self_bucket_access: bool,
+}
+
 /// Request for a PutBucketPublicAccessBlock operation.
 #[derive(Debug)]
 pub struct PutBucketPublicAccessBlockRequest<'a> {
@@ -6542,7 +6550,7 @@ impl Coordinator {
         self.remove_authorized_bucket_subresource(&authorized)
     }
 
-    pub fn put_bucket_policy(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
+    pub fn put_bucket_policy(&self, req: &PutBucketPolicyRequest<'_>) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::put_bucket_policy",
@@ -12969,6 +12977,23 @@ mod tests {
         test_helpers::requester("default-owner")
     }
 
+    fn same_account_root_and_user() -> (AccountIdentity, Requester, AccountIdentity, Requester) {
+        let canonical_id = CanonicalUserId::from_principal("111122223333");
+        let root = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            canonical_id.clone(),
+            "Owner Root",
+        );
+        let user = AccountIdentity::new(
+            "arn:aws:iam::111122223333:user/admin",
+            canonical_id,
+            "Owner User",
+        );
+        let root_requester = Requester::authenticated_owner_account_admin(root.clone());
+        let user_requester = Requester::authenticated_owner_account_admin(user.clone());
+        (root, root_requester, user, user_requester)
+    }
+
     fn read_all_body(mut body: ReadHandle) -> Result<Vec<u8>, ServerError> {
         let mut out = Vec::new();
         while let Some(chunk) = body.next_chunk(INTERNAL_SEGMENT_SIZE)? {
@@ -13263,6 +13288,20 @@ mod tests {
         PutBucketConfigRequest {
             bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
             config,
+        }
+    }
+
+    fn put_bucket_policy_request_with_expected_owner<'a>(
+        name: &'a str,
+        config: &'a str,
+        confirm_remove_self_bucket_access: bool,
+        requester: Requester,
+        expected_bucket_owner: Option<&'a str>,
+    ) -> PutBucketPolicyRequest<'a> {
+        PutBucketPolicyRequest {
+            bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+            config,
+            confirm_remove_self_bucket_access,
         }
     }
 
@@ -13565,9 +13604,10 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&str>,
     ) -> Result<(), ServerError> {
-        coord.put_bucket_policy(&put_bucket_config_request_with_expected_owner(
+        coord.put_bucket_policy(&put_bucket_policy_request_with_expected_owner(
             name,
             policy,
+            false,
             requester,
             expected_bucket_owner,
         ))
@@ -13597,6 +13637,16 @@ mod tests {
             requester,
             expected_bucket_owner,
         ))
+    }
+
+    fn deny_bucket_policy_action_for_principal(
+        bucket: &str,
+        principal: &str,
+        action: &str,
+    ) -> String {
+        format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":{{"AWS":"{principal}"}},"Action":"{action}","Resource":"arn:aws:s3:::{bucket}"}}]}}"#
+        )
     }
 
     fn put_bucket_lifecycle_test(
@@ -17060,9 +17110,10 @@ mod tests {
             .unwrap();
 
         let err = coord
-            .authorize_put_bucket_policy(&put_bucket_config_request_with_expected_owner(
+            .authorize_put_bucket_policy(&put_bucket_policy_request_with_expected_owner(
                 "bucket",
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                false,
                 test_helpers::requester("owner-a"),
                 None,
             ))
@@ -18433,6 +18484,234 @@ mod tests {
 
         let err = get_bucket_policy_status_test(&coord, "bucket", owner, None).unwrap_err();
         assert!(matches!(err, ServerError::NoSuchBucketPolicy { .. }));
+    }
+
+    #[test]
+    fn get_bucket_policy_owner_root_bypasses_explicit_deny() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let (root, root_requester, _user, user_requester) = same_account_root_and_user();
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: user_requester.clone(),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+
+        let deny_policy = deny_bucket_policy_action_for_principal(
+            "bucket",
+            root.principal(),
+            "s3:GetBucketPolicy",
+        );
+        put_bucket_policy_test(&coord, "bucket", &deny_policy, user_requester, None).unwrap();
+
+        assert_eq!(
+            get_bucket_policy_test(&coord, "bucket", root_requester, None).unwrap(),
+            Some(deny_policy),
+        );
+    }
+
+    #[test]
+    fn get_bucket_policy_explicit_deny_blocks_same_account_non_root() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let (_root, _root_requester, user, user_requester) = same_account_root_and_user();
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: user_requester.clone(),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+
+        let deny_policy = deny_bucket_policy_action_for_principal(
+            "bucket",
+            user.principal(),
+            "s3:GetBucketPolicy",
+        );
+        put_bucket_policy_test(&coord, "bucket", &deny_policy, user_requester.clone(), None)
+            .unwrap();
+
+        let err = get_bucket_policy_test(&coord, "bucket", user_requester, None).unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn put_bucket_policy_owner_root_bypasses_explicit_deny() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let (root, root_requester, _user, user_requester) = same_account_root_and_user();
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: user_requester.clone(),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+
+        let deny_policy = deny_bucket_policy_action_for_principal(
+            "bucket",
+            root.principal(),
+            "s3:PutBucketPolicy",
+        );
+        put_bucket_policy_test(&coord, "bucket", &deny_policy, user_requester.clone(), None)
+            .unwrap();
+
+        let replacement = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#;
+        put_bucket_policy_test(&coord, "bucket", replacement, root_requester, None).unwrap();
+        assert_eq!(
+            get_bucket_policy_test(&coord, "bucket", user_requester, None).unwrap(),
+            Some(replacement.to_string()),
+        );
+    }
+
+    #[test]
+    fn delete_bucket_policy_owner_root_bypasses_explicit_deny() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let (root, root_requester, _user, user_requester) = same_account_root_and_user();
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: user_requester.clone(),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+
+        let deny_policy = deny_bucket_policy_action_for_principal(
+            "bucket",
+            root.principal(),
+            "s3:DeleteBucketPolicy",
+        );
+        put_bucket_policy_test(&coord, "bucket", &deny_policy, user_requester.clone(), None)
+            .unwrap();
+
+        delete_bucket_policy_test(&coord, "bucket", root_requester, None).unwrap();
+        assert_eq!(
+            get_bucket_policy_test(&coord, "bucket", user_requester, None).unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn get_bucket_policy_status_owner_root_has_no_carveout() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let (root, root_requester, _user, user_requester) = same_account_root_and_user();
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: user_requester.clone(),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+
+        let deny_policy = deny_bucket_policy_action_for_principal(
+            "bucket",
+            root.principal(),
+            "s3:GetBucketPolicyStatus",
+        );
+        put_bucket_policy_test(&coord, "bucket", &deny_policy, user_requester, None).unwrap();
+
+        let err =
+            get_bucket_policy_status_test(&coord, "bucket", root_requester, None).unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn put_bucket_policy_owner_root_still_blocked_by_block_public_policy() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let (_root, root_requester, _user, user_requester) = same_account_root_and_user();
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: user_requester.clone(),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+        put_bucket_public_access_block_test(&coord,
+                "bucket",
+                "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
+                user_requester, None)
+            .unwrap();
+
+        let err = put_bucket_policy_test(&coord,
+                "bucket",
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                root_requester, None)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::BlockPublicPolicyAccessDenied { .. }
+        ));
+    }
+
+    #[test]
+    fn put_bucket_policy_confirm_remove_self_bucket_access_does_not_disable_root_carveout() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let (_root, root_requester, _user, _user_requester) = same_account_root_and_user();
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: root_requester.clone(),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+
+        coord.put_bucket_policy(&put_bucket_policy_request_with_expected_owner(
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":["s3:PutBucketPolicy","s3:GetBucketPolicy","s3:DeleteBucketPolicy"],"Resource":"arn:aws:s3:::bucket"}]}"#,
+            true,
+            root_requester.clone(),
+            None,
+        ))
+        .unwrap();
+
+        let fetched =
+            get_bucket_policy_test(&coord, "bucket", root_requester.clone(), None).unwrap();
+        assert!(fetched.unwrap().contains(r#""s3:GetBucketPolicy""#));
+
+        delete_bucket_policy_test(&coord, "bucket", root_requester.clone(), None).unwrap();
+
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
+            root_requester,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]

@@ -1514,7 +1514,7 @@ impl BucketSubresourceAux {
     pub const fn policy_is_public(self) -> Option<bool> {
         match self {
             Self::None => None,
-            Self::Policy { is_public } => Some(is_public),
+            Self::Policy { is_public, .. } => Some(is_public),
         }
     }
 }

@@ -1,5 +1,7 @@
 # Bucket Policy Root Principal Compatibility Plan
 
+Status: complete.
+
 ## Scope
 
 This plan covers one specific AWS S3 compatibility gap:
@@ -10,10 +12,10 @@ This plan covers one specific AWS S3 compatibility gap:
 AWS documents that the bucket owner's account `root` principal can still perform
 those three bucket-policy APIs even if the bucket policy explicitly denies that
 root principal. AWS also documents the `PutBucketPolicy` header
-`x-amz-confirm-remove-self-bucket-access`; argmin currently ignores that
-header, and any real support for it belongs with this same self-lockout/root
-principal behavior. That carveout does not extend to arbitrary IAM principals
-in the same account.
+`x-amz-confirm-remove-self-bucket-access`. In current AWS testing, that header
+is accepted by `PutBucketPolicy` but does not disable the owner-root carveout
+for later `GetBucketPolicy`, `PutBucketPolicy`, or `DeleteBucketPolicy` calls.
+That carveout does not extend to arbitrary IAM principals in the same account.
 
 This plan does not cover:
 - `GetBucketPolicyStatus`
@@ -35,17 +37,20 @@ Completed:
   - same-account non-root denied for those same operations
   - `GetBucketPolicyStatus` not inheriting the carveout
   - `BlockPublicPolicy` still blocking root `PutBucketPolicy`
+- `GetBucketPolicy`, `PutBucketPolicy`, and `DeleteBucketPolicy` modeled in
+  `auth::PolicyAction`
+- dedicated bucket-policy CRUD authorization in `server-core`
+- local/server regression coverage for the same root/non-root matrix
+- AWS-aligned `x-amz-confirm-remove-self-bucket-access` request parsing and
+  conformance coverage, without any durable self-lockout state
 - local/AWS response-shape alignment for the `BlockPublicPolicy` denial path
 
 Still open:
-- the server does not yet implement the full dedicated bucket-policy CRUD
-  authorizer described below
-- `GetBucketPolicy`, `PutBucketPolicy`, and `DeleteBucketPolicy` are still not
-  modeled as bucket-policy actions in `auth::PolicyAction`
-- local coverage is still only an approximation of the AWS root/non-root split
-  because the local harness cannot yet create a bucket as same-account non-root
-  and then exercise the true owner-root carveout against that bucket
-- `x-amz-confirm-remove-self-bucket-access` remains unimplemented
+- nothing within this plan's scope
+
+Broader account/credential modeling remains relevant long term, but it is no
+longer required to match the AWS bucket-policy root-principal behavior covered
+here.
 
 ## Problem
 
@@ -216,7 +221,7 @@ or testing shows a distinct special-case rule there too.
 
 ### Phase 1: Ownership / Principal Modeling Prerequisite
 
-Status: partially complete.
+Status: complete for this plan's needs.
 
 Delivered so far:
 - privileged owner-root credentials in the external harness
@@ -225,16 +230,17 @@ Delivered so far:
 - enough identity distinction to test same-account root, same-account
   non-root, and constrained same-account callers in the current fixture
 
-Still needed for this plan's full local/server shape:
-- bucket owner account identity separate from creator principal
-- requester helpers for same-account and root-principal classification
+Delivered for this plan's scope:
+- same-account and root-principal classification helpers in the current
+  requester/account model
+- enough local/server identity distinction to exercise owner non-root, owner
+  root, and cross-account paths for bucket-policy CRUD
 
-This phase may land as part of the broader account-structure work rather than
-as an isolated bucket-policy change.
+Longer-term durable account ownership work can still evolve separately.
 
 ### Phase 2: Bucket Policy Action Support
 
-Status: open.
+Status: complete.
 
 Deliver:
 - `GetBucketPolicy`, `PutBucketPolicy`, `DeleteBucketPolicy` in
@@ -243,7 +249,7 @@ Deliver:
 
 ### Phase 3: CRUD Authorization Split
 
-Status: open.
+Status: complete.
 
 Deliver:
 - dedicated authorizer for bucket-policy CRUD
@@ -253,15 +259,17 @@ Deliver:
 
 ### Phase 4: Conformance / Regression Coverage
 
-Status: partially complete.
+Status: complete.
 
 Delivered:
 - AWS-backed regression tests in `crates/s3-tests/tests/bucket_policy_root.rs`
 - harness support for dedicated owner-root credentials
 
-Still needed:
-- local regression tests that exercise the true same-account non-root owner vs
-  owner-root split instead of the current local approximation
+Delivered:
+- local regression tests for same-account non-root owner vs owner-root bucket
+  policy CRUD behavior
+- AWS-backed and local coverage for
+  `x-amz-confirm-remove-self-bucket-access`
 
 ## Test Plan
 
@@ -291,9 +299,8 @@ external harness.
 
 ### What Still Remains
 
-The remaining test gap is local/server conformance for the true same-account
-non-root-owner versus owner-root distinction, plus the
-`x-amz-confirm-remove-self-bucket-access` header behavior.
+No remaining test gaps are tracked in this plan. Any future work should be
+driven by newly discovered AWS mismatches rather than this original gap.
 
 ## Exit Criteria
 
@@ -305,3 +312,5 @@ This plan is done when:
   APIs
 - local regression coverage exists for the true root-vs-non-root split
 - `x-amz-confirm-remove-self-bucket-access` matches AWS
+
+Status: met.

@@ -1081,21 +1081,20 @@ impl PgStore {
         }
     }
 
-    fn bucket_subresource_aux_to_sql(aux: BucketSubresourceAux) -> Option<i64> {
+    fn bucket_subresource_aux_int_1_to_sql(aux: BucketSubresourceAux) -> Option<i64> {
         match aux {
             BucketSubresourceAux::None => None,
-            BucketSubresourceAux::Policy { is_public } => Some(i64::from(is_public)),
+            BucketSubresourceAux::Policy { is_public, .. } => Some(i64::from(is_public)),
         }
     }
 
     fn bucket_subresource_aux_from_sql(
         kind: BucketSubresourceKind,
-        raw: Option<i64>,
+        raw_int_1: Option<i64>,
     ) -> Result<BucketSubresourceAux, rusqlite::Error> {
         match kind {
-            BucketSubresourceKind::Policy => match raw {
-                Some(0) => Ok(BucketSubresourceAux::policy(false)),
-                Some(1) => Ok(BucketSubresourceAux::policy(true)),
+            BucketSubresourceKind::Policy => match raw_int_1 {
+                Some(0 | 1) => Ok(BucketSubresourceAux::policy(raw_int_1 == Some(1))),
                 Some(value) => Err(rusqlite::Error::FromSqlConversionFailure(
                     2,
                     rusqlite::types::Type::Integer,
@@ -1107,7 +1106,7 @@ impl PgStore {
                     Box::from("missing policy aux_int_1"),
                 )),
             },
-            _ => match raw {
+            _ => match raw_int_1 {
                 None => Ok(BucketSubresourceAux::None),
                 Some(value) => Err(rusqlite::Error::FromSqlConversionFailure(
                     2,
@@ -1181,7 +1180,7 @@ impl PgStore {
                         name,
                         kind as u8 as i64,
                         body,
-                        Self::bucket_subresource_aux_to_sql(aux),
+                        Self::bucket_subresource_aux_int_1_to_sql(aux),
                     ],
                 )
                 .map_err(|e| MetadataError::Db {
@@ -1383,7 +1382,7 @@ impl PgStore {
                 |row| {
                     let body = row.get::<_, Option<String>>(0)?;
                     let generation = row.get::<_, Option<i64>>(1)?;
-                    let aux = row.get::<_, Option<i64>>(2)?;
+                    let aux_int_1 = row.get::<_, Option<i64>>(2)?;
                     match body {
                         Some(body) => Ok(Some(StoredBucketSubresource {
                             body,
@@ -1397,7 +1396,7 @@ impl PgStore {
                                 })?,
                                 1,
                             )?),
-                            aux: Self::bucket_subresource_aux_from_sql(kind, aux)?,
+                            aux: Self::bucket_subresource_aux_from_sql(kind, aux_int_1)?,
                         })),
                         None => Ok(None),
                     }

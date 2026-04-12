@@ -103,6 +103,9 @@ impl BucketPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyAction {
+    GetBucketPolicy,
+    PutBucketPolicy,
+    DeleteBucketPolicy,
     GetBucketCors,
     GetBucketOwnershipControls,
     GetBucketTagging,
@@ -145,6 +148,9 @@ impl PolicyAction {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::GetBucketPolicy => "s3:GetBucketPolicy",
+            Self::PutBucketPolicy => "s3:PutBucketPolicy",
+            Self::DeleteBucketPolicy => "s3:DeleteBucketPolicy",
             Self::GetBucketCors => "s3:GetBucketCORS",
             Self::GetBucketOwnershipControls => "s3:GetBucketOwnershipControls",
             Self::GetBucketTagging => "s3:GetBucketTagging",
@@ -1051,7 +1057,10 @@ fn validate_resource_applicability(
     Ok(())
 }
 
-const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 16] = [
+const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 19] = [
+    PolicyAction::GetBucketPolicy,
+    PolicyAction::PutBucketPolicy,
+    PolicyAction::DeleteBucketPolicy,
     PolicyAction::GetBucketCors,
     PolicyAction::GetBucketOwnershipControls,
     PolicyAction::GetBucketTagging,
@@ -2370,6 +2379,39 @@ mod tests {
     }
 
     #[test]
+    fn get_bucket_policy_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketPolicy","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(PolicyAction::GetBucketPolicy, "bucket", Some("caller"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn put_bucket_policy_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutBucketPolicy","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(PolicyAction::PutBucketPolicy, "bucket", Some("caller"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn delete_bucket_policy_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:DeleteBucketPolicy","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(PolicyAction::DeleteBucketPolicy, "bucket", Some("caller"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
     fn get_bucket_cors_matches_bucket_resource() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketCORS","Resource":"arn:aws:s3:::bucket"}]}"#,
@@ -2563,6 +2605,51 @@ mod tests {
     fn get_bucket_policy_status_object_only_resource_is_rejected() {
         let err = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketPolicyStatus","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_policy_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketPolicy","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_policy_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutBucketPolicy","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
+    }
+
+    #[test]
+    fn delete_bucket_policy_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:DeleteBucketPolicy","Resource":"arn:aws:s3:::bucket/*"}]}"#,
         )
         .unwrap_err();
 

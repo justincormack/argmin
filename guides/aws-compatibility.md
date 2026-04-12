@@ -185,24 +185,7 @@ Related plan:
 
 - [plans/aws-auth-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/aws-auth-compat-plan.md)
 
-### 11. Bucket policy CRUD does not yet match AWS root-principal behavior
-
-For `GetBucketPolicy`, `PutBucketPolicy`, and `DeleteBucketPolicy`, AWS allows
-the bucket owner's account `root` principal to perform the operation even if
-the bucket policy explicitly denies that root principal. This same gap also
-covers the documented `PutBucketPolicy` header
-`x-amz-confirm-remove-self-bucket-access`, which argmin currently ignores
-rather than modeling as part of AWS's self-lockout behavior.
-
-Argmin does not yet model that carveout precisely. Current behavior is broader
-than AWS because it does not fully distinguish the owner account root principal
-from other principals in the same account.
-
-Related plan:
-
-- [plans/bucket-policy-root-principal-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/bucket-policy-root-principal-compat-plan.md)
-
-### 12. `AccessDenied` does not yet match AWS principal-specific error text
+### 11. `AccessDenied` does not yet match AWS principal-specific error text
 
 Argmin now matches the generic XML error shape for several `AccessDenied`
 cases, but it does not yet reproduce AWS's more specific denial messages that

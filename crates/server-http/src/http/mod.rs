@@ -2157,15 +2157,24 @@ impl HttpFrontend {
                     std::str::from_utf8(&req.body).map_err(|_| ServerError::InvalidArgument {
                         reason: "invalid UTF-8 in bucket policy JSON body".to_string(),
                     })?;
+                let confirm_remove_self_bucket_access = parse_confirm_remove_self_bucket_access(
+                    req.headers
+                        .get("x-amz-confirm-remove-self-bucket-access")
+                        .map(|value| {
+                            std::str::from_utf8(value.as_bytes())
+                                .expect("S3Request stores only validated UTF-8")
+                        }),
+                )?;
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator.put_bucket_policy(
-                    &crate::coordinator::PutBucketConfigRequest {
+                    &crate::coordinator::PutBucketPolicyRequest {
                         bucket: crate::coordinator::BucketRequest::new(
                             &bucket,
                             requester,
                             expected_bucket_owner,
                         ),
                         config: policy,
+                        confirm_remove_self_bucket_access,
                     },
                 )?;
                 Ok(S3Response::put_bucket_policy())
@@ -5088,6 +5097,17 @@ fn parse_bucket_object_lock_enabled(value: Option<&str>) -> Result<bool, ServerE
     }
 }
 
+fn parse_confirm_remove_self_bucket_access(value: Option<&str>) -> Result<bool, ServerError> {
+    match value {
+        None => Ok(false),
+        Some("true") => Ok(true),
+        Some("false") => Ok(false),
+        Some(other) => Err(ServerError::InvalidArgument {
+            reason: format!("invalid x-amz-confirm-remove-self-bucket-access value: {other}"),
+        }),
+    }
+}
+
 fn parse_object_lock_headers(req: &S3Request) -> Result<ObjectLockState, ServerError> {
     const MODE_HEADER: &str = "x-amz-object-lock-mode";
     const RETAIN_UNTIL_HEADER: &str = "x-amz-object-lock-retain-until-date";
@@ -6089,6 +6109,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_confirm_remove_self_bucket_access_accepts_supported_values() {
+        assert!(!parse_confirm_remove_self_bucket_access(None).unwrap());
+        assert!(parse_confirm_remove_self_bucket_access(Some("true")).unwrap());
+        assert!(!parse_confirm_remove_self_bucket_access(Some("false")).unwrap());
+    }
+
+    #[test]
+    fn parse_confirm_remove_self_bucket_access_rejects_invalid_value() {
+        match parse_confirm_remove_self_bucket_access(Some("True")) {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert!(reason.contains("x-amz-confirm-remove-self-bucket-access"));
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_acl_grants_rejects_body_and_headers_together() {
         let req = new_req(
             http::Method::PUT,
@@ -6441,9 +6478,10 @@ mod tests {
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
         fe.coordinator
-            .put_bucket_policy(&crate::coordinator::PutBucketConfigRequest {
+            .put_bucket_policy(&crate::coordinator::PutBucketPolicyRequest {
                 bucket: test_bucket_request("mybucket"),
                 config: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::mybucket"}]}"#,
+                confirm_remove_self_bucket_access: false,
             })
             .unwrap();
 

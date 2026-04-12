@@ -309,6 +309,31 @@ impl Coordinator {
         aws_account_id_from_principal(&bucket.owner_principal) == Some(requester_account_id)
     }
 
+    pub(super) fn requester_is_bucket_owner_account_root_principal(
+        requester: &Requester,
+        bucket: &BucketSummary,
+    ) -> bool {
+        if requester.authorization_profile() != auth::AuthorizationProfile::OwnerAccountAdmin {
+            return false;
+        }
+
+        let Some(account) = requester.account() else {
+            return false;
+        };
+        let Some(requester_account_id) = aws_account_id_from_principal(account.principal()) else {
+            return false;
+        };
+        let Some(bucket_owner_account_id) = aws_account_id_from_principal(&bucket.owner_principal)
+        else {
+            return false;
+        };
+        if requester_account_id != bucket_owner_account_id {
+            return false;
+        }
+
+        account.principal() == format!("arn:aws:iam::{requester_account_id}:root")
+    }
+
     pub(super) fn requester_can_discover_missing_object(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -780,6 +805,25 @@ impl Coordinator {
         }
     }
 
+    fn bucket_policy_allows_with_root_principal_bypass<F>(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        decision: auth::PolicyEvaluation,
+        fallback: F,
+    ) -> bool
+    where
+        F: FnOnce() -> bool,
+    {
+        match decision {
+            auth::PolicyEvaluation::ExplicitDeny
+                if Self::requester_is_bucket_owner_account_root_principal(requester, bucket) =>
+            {
+                fallback()
+            }
+            _ => Self::bucket_policy_allows_with_fallback(requester, bucket, decision, fallback),
+        }
+    }
+
     fn requester_can_object_action_with_bucket_policy<F>(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -1032,6 +1076,19 @@ impl Coordinator {
     ) -> bool {
         let decision = Self::bucket_policy_decision_for_bucket(requester, bucket, action, policy);
         Self::bucket_policy_allows_with_fallback(requester, bucket, decision, || default_allowed)
+    }
+
+    pub(super) fn requester_can_bucket_policy_action_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+        default_allowed: bool,
+    ) -> bool {
+        let decision = Self::bucket_policy_decision_for_bucket(requester, bucket, action, policy);
+        Self::bucket_policy_allows_with_root_principal_bypass(requester, bucket, decision, || {
+            default_allowed
+        })
     }
 
     pub(super) fn requester_can_get_bucket_policy_status_with_bucket_policy(
@@ -1841,20 +1898,6 @@ impl Coordinator {
         )
     }
 
-    pub(super) fn authorize_bucket_admin_requester(
-        &self,
-        requester: &Requester,
-        bucket: &str,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<ValidatedBucket, ServerError> {
-        let info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
-        if Self::requester_can_bucket_admin(requester, &info.owner_principal) {
-            Ok(info)
-        } else {
-            Err(ServerError::AccessDenied)
-        }
-    }
-
     pub(super) fn authorize_bucket_owner_account_admin_requester(
         &self,
         requester: &Requester,
@@ -1867,20 +1910,6 @@ impl Coordinator {
         } else {
             Err(ServerError::AccessDenied)
         }
-    }
-
-    pub(super) fn authorize_bucket_admin_for<R>(
-        &self,
-        req: &R,
-    ) -> Result<ValidatedBucket, ServerError>
-    where
-        R: BucketScopedAuthorizationRequest + ?Sized,
-    {
-        self.authorize_bucket_admin_requester(
-            req.requester(),
-            req.bucket_name(),
-            req.expected_bucket_owner(),
-        )
     }
 
     pub(super) fn authorize_bucket_owner_account_admin_for<R>(
@@ -2060,9 +2089,20 @@ impl Coordinator {
 
     pub(super) fn authorize_put_bucket_policy(
         &self,
-        req: &PutBucketConfigRequest<'_>,
+        req: &PutBucketPolicyRequest<'_>,
     ) -> Result<AuthorizedPutBucketPolicy, ServerError> {
-        let bucket_info = self.authorize_bucket_admin_for(&req.bucket)?;
+        let bucket_info =
+            self.checked_active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner)?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        if !Self::requester_can_bucket_policy_action_with_bucket_policy(
+            &req.bucket.requester,
+            &bucket_info,
+            auth::PolicyAction::PutBucketPolicy,
+            bucket_policy.as_deref(),
+            Self::requester_can_bucket_owner_account_admin(&req.bucket.requester, &bucket_info),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
         let parsed_policy =
             auth::parse_bucket_policy(req.config).map_err(|e| ServerError::MalformedPolicy {
                 reason: e.reason().to_string(),
@@ -2102,7 +2142,18 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_for(req)?;
+        let bucket_info =
+            self.checked_active_bucket_summary(req.name, req.expected_bucket_owner)?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        if !Self::requester_can_bucket_policy_action_with_bucket_policy(
+            &req.requester,
+            &bucket_info,
+            auth::PolicyAction::GetBucketPolicy,
+            bucket_policy.as_deref(),
+            Self::requester_can_bucket_owner_account_admin(&req.requester, &bucket_info),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
         Ok(AuthorizedBucketSubresourceGet {
             bucket: req.name.to_string(),
             kind: storage::BucketSubresourceKind::Policy,
@@ -2127,7 +2178,18 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_for(req)?;
+        let bucket_info =
+            self.checked_active_bucket_summary(req.name, req.expected_bucket_owner)?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        if !Self::requester_can_bucket_policy_action_with_bucket_policy(
+            &req.requester,
+            &bucket_info,
+            auth::PolicyAction::DeleteBucketPolicy,
+            bucket_policy.as_deref(),
+            Self::requester_can_bucket_owner_account_admin(&req.requester, &bucket_info),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
         Ok(AuthorizedBucketSubresourceDelete {
             bucket: req.name.to_string(),
             kind: storage::BucketSubresourceKind::Policy,

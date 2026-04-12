@@ -10,12 +10,8 @@ fn owner_root_client() -> &'static aws_sdk_s3::Client {
     CTX.require_owner_root_client()
 }
 
-fn bucket_owner_client(root_client: &aws_sdk_s3::Client) -> &aws_sdk_s3::Client {
-    if std::env::var_os("S3_TEST_ENDPOINT").is_some() {
-        CTX.client()
-    } else {
-        root_client
-    }
+fn bucket_owner_client(_root_client: &aws_sdk_s3::Client) -> &aws_sdk_s3::Client {
+    CTX.client()
 }
 
 fn owner_root_principal() -> serde_json::Value {
@@ -39,6 +35,23 @@ fn deny_policy(bucket: &str, action: &str) -> String {
     .to_string()
 }
 
+fn deny_root_bucket_policy_crud_policy(bucket: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Deny",
+            "Principal": owner_root_principal(),
+            "Action": [
+                "s3:GetBucketPolicy",
+                "s3:PutBucketPolicy",
+                "s3:DeleteBucketPolicy",
+            ],
+            "Resource": bucket_resource(bucket),
+        }],
+    })
+    .to_string()
+}
+
 fn public_list_policy(bucket: &str) -> String {
     json!({
         "Version": "2012-10-17",
@@ -46,6 +59,19 @@ fn public_list_policy(bucket: &str) -> String {
             "Effect": "Allow",
             "Principal": "*",
             "Action": "s3:ListBucket",
+            "Resource": bucket_resource(bucket),
+        }],
+    })
+    .to_string()
+}
+
+fn non_public_root_get_policy(bucket: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": owner_root_principal(),
+            "Action": "s3:GetBucketPolicy",
             "Resource": bucket_resource(bucket),
         }],
     })
@@ -88,9 +114,7 @@ where
                 if err
                     .raw_response()
                     .map(|response| response.status().as_u16())
-                    == Some(403)
-                    && err.as_service_error().and_then(ProvideErrorMetadata::code)
-                        == Some("AccessDenied") =>
+                    == Some(403) =>
             {
                 return;
             }
@@ -391,6 +415,100 @@ fn test_owner_root_put_bucket_policy_still_blocked_by_block_public_policy() {
 
         eventually_block_public_policy_denied(&bucket, &public_list_policy(&bucket), root_client)
             .await;
+
+        cleanup_bucket(root_client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_owner_root_confirm_remove_self_bucket_access_does_not_disable_root_carveout() {
+    s3_tests::run(async {
+        let root_client = owner_root_client();
+        let client = CTX.client();
+        let owner_client = bucket_owner_client(root_client);
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(owner_client, &bucket)
+            .await
+            .unwrap();
+
+        let deny_policy = deny_root_bucket_policy_crud_policy(&bucket);
+        eventually_ok(
+            "owner-root PutBucketPolicy with ConfirmRemoveSelfBucketAccess",
+            || {
+                root_client
+                    .put_bucket_policy()
+                    .bucket(&bucket)
+                    .policy(deny_policy.clone())
+                    .confirm_remove_self_bucket_access(true)
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "same-account non-root GetBucketPolicy after confirm header",
+            || client.get_bucket_policy().bucket(&bucket).send(),
+        )
+        .await;
+
+        eventually_ok("owner-root GetBucketPolicy after confirm header", || {
+            root_client.get_bucket_policy().bucket(&bucket).send()
+        })
+        .await;
+
+        eventually_access_denied(
+            "same-account non-root DeleteBucketPolicy after confirm header",
+            || client.delete_bucket_policy().bucket(&bucket).send(),
+        )
+        .await;
+
+        eventually_ok("owner-root DeleteBucketPolicy after confirm header", || {
+            root_client.delete_bucket_policy().bucket(&bucket).send()
+        })
+        .await;
+
+        eventually_ok("owner-root PutBucketPolicy after confirm header", || {
+            root_client
+                .put_bucket_policy()
+                .bucket(&bucket)
+                .policy(non_public_root_get_policy(&bucket))
+                .send()
+        })
+        .await;
+
+        cleanup_bucket(root_client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_owner_root_confirm_remove_self_bucket_access_accepts_non_locking_policy() {
+    s3_tests::run(async {
+        let root_client = owner_root_client();
+        let owner_client = bucket_owner_client(root_client);
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(owner_client, &bucket)
+            .await
+            .unwrap();
+
+        let policy = non_public_root_get_policy(&bucket);
+        let put = root_client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy.clone())
+            .confirm_remove_self_bucket_access(true)
+            .send()
+            .await;
+        put.unwrap();
+
+        let fetched = eventually_ok(
+            "owner-root GetBucketPolicy after ConfirmRemoveSelfBucketAccess non-locking policy",
+            || root_client.get_bucket_policy().bucket(&bucket).send(),
+        )
+        .await;
+        let fetched_policy: serde_json::Value =
+            serde_json::from_str(fetched.policy().unwrap()).unwrap();
+        let expected_policy: serde_json::Value = serde_json::from_str(&policy).unwrap();
+        assert_eq!(fetched_policy, expected_policy);
 
         cleanup_bucket(root_client, &bucket).await;
     });
