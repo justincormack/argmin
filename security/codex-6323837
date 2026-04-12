@@ -1,0 +1,122 @@
+Anonymous owner match grants access to anonymous uploads
+Link: https://chatgpt.com/codex/cloud/security/findings/4978dcbe305481919391b5ded71c50de?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium
+Status: resolved
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 6323837
+Author: justin@specialbusservice.com
+Created: 11/04/2026, 20:47:49
+Assignee: Unassigned
+Signals: Security, Validated
+
+# Summary
+Introduced an authorization bypass where any anonymous requester is considered the owner of objects created by anonymous uploads, enabling unauthorized reads and ACL/tag changes.
+The commit introduces a special anonymous owner identity and uses it for objects uploaded without authentication. The authorization helper now treats any anonymous requester as matching that special owner identity, and ownership checks are used to grant read, ACL, and tag-management access. As a result, any unauthenticated client can access or modify objects that were uploaded anonymously (e.g., to public-write buckets) even if the object ACL is private. This undermines the intended ACL/ownership isolation for anonymous uploads and makes those objects effectively public to anyone who knows the key.
+
+# Resolution
+Resolved in commit `288d42c` (`Match AWS anonymous object auth behavior`).
+
+The original report overstated the issue by treating anonymous object reads as a bug. AWS documents a shared anonymous uploader owner model for anonymous uploads to public-write buckets, and `GetObjectAcl` on those objects is consistent with that model.
+
+The concrete mismatches we fixed were:
+- anonymous `PutObjectAcl` was incorrectly allowed for anonymously owned objects; it now returns `403 AccessDenied` with the AWS message `Anonymous users cannot invoke this API. Please authenticate.`
+- anonymous object tagging access was incorrectly allowed through owner matching; anonymous `GetObjectTagging` and `PutObjectTagging` now return generic `403 AccessDenied`, matching AWS
+- cross-account writer object-tagging assumptions in local tests were corrected to match AWS: bucket owner access remains allowed, uploader ownership alone does not grant tagging access
+
+So the real security issue was anonymous ACL and tagging management, and that is what `288d42c` resolves.
+
+# Validation
+## Rubric
+- [x] Confirm anonymous uploads are assigned the shared anonymous owner identity (authz.rs:1276-1301; coordinator.rs:7974-7976)
+- [x] Confirm anonymous requesters match that owner identity (authz.rs:229-236)
+- [x] Verify read authorization uses owner match (authz.rs:142-166)
+- [x] Verify ACL/tag authorization uses owner match (authz.rs:203-227; 352-359; 797-813)
+- [ ] Demonstrate a runtime PoC of unauthorized access (not achieved)
+## Report
+Rubric-driven validation completed. Crash attempt: `cargo test -p server-core --lib` failed because libisal was missing; rebuilt with `cargo test -p server-core --lib --no-default-features --features "null-ec,pure-rust-crc"` and tests passed (no crash). Valgrind not available (`valgrind: command not found`). Debugger attempt: `lldb -b -o "run coordinator::tests::get_object_rejects_private_read_for_non_owner --exact"` executed a single test (no crash; backtrace unavailable because process exited). Code analysis shows the authorization bypass: (1) Object reads allow access when requester matches object owner identity (authz.rs:142-166). (2) Object ACL read/write checks also allow access if requester matches owner identity (authz.rs:203-227). (3) Object tag management relies on `requester_can_manage_object_tags`, which grants access when requester matches owner identity (authz.rs:352-359), and the bucket-policy wrapper delegates to that check (authz.rs:797-813). (4) Anonymous requesters are treated as matching a special anonymous owner identity: `requester_matches_owner_identity` returns true for any anonymous requester if the owner is the anonymous-upload principal/canonical id (authz.rs:229-236). (5) Anonymous uploads are assigned that owner identity: `requester_owner_identity` returns `OwnerIdentity::anonymous_upload()` for anonymous requesters (authz.rs:1276-1279), used by `effective_object_owner` (authz.rs:1288-1301). During put-object commit, owner is set via `effective_put_object_owner` (coordinator.rs:7974-7976), which uses that anonymous owner identity. The shared anonymous owner identity is defined in storage/types.rs (types.rs:1240-1264). Therefore any anonymous requester is treated as the owner of any anonymously uploaded object, bypassing intended ACL isolation for read/ACL/tag operations.
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator/authz.rs (L1276 to 1284)
+  Note: Anonymous uploads are assigned the special anonymous owner identity, so the above matching logic applies to all such objects.
+```
+    pub(super) fn requester_owner_identity(requester: &Requester) -> Option<OwnerIdentity> {
+        if requester.is_anonymous() {
+            return Some(OwnerIdentity::anonymous_upload());
+        }
+        requester.account().map(|account| {
+            OwnerIdentity::new(
+                account.principal().to_string(),
+                account.canonical_user_id().clone(),
+            )
+```
+
+/workspace/argmin/crates/server-core/src/coordinator/authz.rs (L151 to 166)
+  Note: Object read authorization grants access if the requester matches the object's owner identity.
+```
+        let acl_allows_read = object.acl_grants().is_some_and(|grants| {
+            if Self::ignores_public_acls(bucket.public_access_block.as_ref()) {
+                Self::requester_has_nonpublic_object_acl_permission(
+                    requester,
+                    grants,
+                    AclPermission::Read,
+                )
+            } else {
+                Self::requester_has_acl_permission(requester, grants, AclPermission::Read)
+            }
+        });
+
+        Self::requester_matches_owner_identity(requester, object.owner())
+            || acl_allows_read
+            || (object.public_read()
+                && !Self::ignores_public_acls(bucket.public_access_block.as_ref()))
+```
+
+/workspace/argmin/crates/server-core/src/coordinator/authz.rs (L229 to 240)
+  Note: Anonymous requesters are treated as matching the special anonymous owner identity, effectively granting owner privileges to any unauthenticated request.
+```
+    pub(super) fn requester_matches_owner_identity(
+        requester: &Requester,
+        owner: &OwnerIdentity,
+    ) -> bool {
+        if requester.is_anonymous() {
+            return owner.principal == OwnerIdentity::ANONYMOUS_UPLOAD_PRINCIPAL
+                && owner.canonical_id == CanonicalUserId::anonymous_upload();
+        }
+        requester.account().is_some_and(|account| {
+            account.canonical_user_id() == &owner.canonical_id
+                || account.principal() == owner.principal
+        })
+```
+
+/workspace/argmin/crates/storage/src/types.rs (L1239 to 1264)
+  Note: Defines the shared anonymous owner identity used for anonymous uploads.
+```
+impl OwnerIdentity {
+    pub const ANONYMOUS_UPLOAD_PRINCIPAL: &'static str = "__aws_anonymous_upload__";
+
+    #[must_use]
+    pub fn new(principal: impl Into<String>, canonical_id: CanonicalUserId) -> Self {
+        Self {
+            principal: principal.into(),
+            canonical_id,
+        }
+    }
+
+    #[must_use]
+    pub fn from_principal(principal: impl Into<String>) -> Self {
+        let principal = principal.into();
+        Self {
+            canonical_id: CanonicalUserId::from_principal(&principal),
+            principal,
+        }
+    }
+
+    #[must_use]
+    pub fn anonymous_upload() -> Self {
+        Self {
+            principal: Self::ANONYMOUS_UPLOAD_PRINCIPAL.to_string(),
+            canonical_id: CanonicalUserId::anonymous_upload(),
+        }
+```
