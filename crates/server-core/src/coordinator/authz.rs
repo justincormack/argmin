@@ -61,6 +61,14 @@ impl Coordinator {
         requester.principal_opt() == Some(owner_principal)
     }
 
+    pub(super) fn requester_can_bucket_owner_account_admin(
+        requester: &Requester,
+        bucket: &BucketSummary,
+    ) -> bool {
+        Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+            || Self::requester_is_bucket_owner_account(requester, bucket)
+    }
+
     pub(super) fn requester_has_acl_permission(
         requester: &Requester,
         acl_grants: &AclGrants,
@@ -968,7 +976,7 @@ impl Coordinator {
             bucket,
             auth::PolicyAction::GetBucketPublicAccessBlock,
             policy,
-            Self::requester_can_bucket_admin(requester, &bucket.owner_principal),
+            Self::requester_can_bucket_owner_account_admin(requester, bucket),
         )
     }
 
@@ -1007,7 +1015,7 @@ impl Coordinator {
             bucket,
             auth::PolicyAction::GetBucketObjectLockConfiguration,
             policy,
-            Self::requester_can_bucket_admin(requester, &bucket.owner_principal),
+            Self::requester_can_bucket_owner_account_admin(requester, bucket),
         )
     }
 
@@ -1045,7 +1053,7 @@ impl Coordinator {
             &info,
             action,
             bucket_policy.as_deref(),
-            Self::requester_can_bucket_admin(requester, &info.owner_principal),
+            Self::requester_can_bucket_owner_account_admin(requester, &info),
         ) {
             Ok(info)
         } else {
@@ -1804,6 +1812,20 @@ impl Coordinator {
         }
     }
 
+    pub(super) fn authorize_bucket_owner_account_admin_requester(
+        &self,
+        requester: &Requester,
+        bucket: &str,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<ValidatedBucket, ServerError> {
+        let info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
+        if Self::requester_can_bucket_owner_account_admin(requester, &info) {
+            Ok(info)
+        } else {
+            Err(ServerError::AccessDenied)
+        }
+    }
+
     pub(super) fn authorize_bucket_admin_for<R>(
         &self,
         req: &R,
@@ -1812,6 +1834,20 @@ impl Coordinator {
         R: BucketScopedAuthorizationRequest + ?Sized,
     {
         self.authorize_bucket_admin_requester(
+            req.requester(),
+            req.bucket_name(),
+            req.expected_bucket_owner(),
+        )
+    }
+
+    pub(super) fn authorize_bucket_owner_account_admin_for<R>(
+        &self,
+        req: &R,
+    ) -> Result<ValidatedBucket, ServerError>
+    where
+        R: BucketScopedAuthorizationRequest + ?Sized,
+    {
+        self.authorize_bucket_owner_account_admin_requester(
             req.requester(),
             req.bucket_name(),
             req.expected_bucket_owner(),
@@ -1871,7 +1907,7 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedDeleteBucket, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_for(req)?;
+        let _bucket_info = self.authorize_bucket_owner_account_admin_for(req)?;
         Ok(AuthorizedDeleteBucket {
             name: req.name.to_string(),
         })
@@ -2242,7 +2278,7 @@ impl Coordinator {
         &self,
         req: &PutBucketVersioningRequest<'_>,
     ) -> Result<AuthorizedPutBucketVersioning, ServerError> {
-        let bucket_info = self.authorize_bucket_admin_for(&req.bucket)?;
+        let bucket_info = self.authorize_bucket_owner_account_admin_for(&req.bucket)?;
         if bucket_info.object_lock.enabled && req.state != BucketVersioningState::Enabled {
             return Err(ServerError::InvalidBucketState);
         }
@@ -2256,7 +2292,7 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketVersioning, ServerError> {
-        let info = self.authorize_bucket_read_for(req)?;
+        let info = self.authorize_bucket_owner_account_admin_for(req)?;
         Ok(AuthorizedGetBucketVersioning {
             state: info.versioning,
         })
@@ -2285,8 +2321,9 @@ impl Coordinator {
         &self,
         req: &ListBucketsRequest,
     ) -> Result<AuthorizedListBuckets, ServerError> {
+        let requester = req.requester.account().ok_or(ServerError::AccessDenied)?;
         Ok(AuthorizedListBuckets {
-            owner_principal: Self::requester_principal_required(&req.requester)?.to_string(),
+            owner_canonical_id: requester.canonical_user_id().clone(),
         })
     }
 

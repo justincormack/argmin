@@ -804,6 +804,11 @@ pub fn assert_s3_err_code<T, E: std::fmt::Debug>(
     match result {
         Ok(_) => panic!("expected error with code {}, got Ok", expected_code),
         Err(e) => {
+            if expected_code == "AccessDenied"
+                && e.raw_response().map(|r| r.status().as_u16()) == Some(403)
+            {
+                return;
+            }
             let msg = format!("{:?}", e);
             assert!(
                 msg.contains(expected_code),

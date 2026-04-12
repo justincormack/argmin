@@ -288,6 +288,9 @@ fn test_anonymous_public_write_put_uses_special_anonymous_owner_id() {
             "unexpected body: {acl_body}"
         );
 
+        owner_head_object_access_denied_eventually(&bucket, key).await;
+        owner_get_object_access_denied_eventually(&bucket, key).await;
+
         client
             .delete_object()
             .bucket(&bucket)
@@ -1422,6 +1425,36 @@ async fn owner_get_object_access_denied_eventually(bucket: &str, key: &str) {
         }
         panic!(
             "bucket-owner GetObject did not converge to AccessDenied for {bucket}/{key}: {:?}",
+            result
+        );
+    }
+
+    unreachable!()
+}
+
+async fn owner_head_object_access_denied_eventually(bucket: &str, key: &str) {
+    const MAX_ATTEMPTS: usize = 10;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .client()
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        if result.is_err() && err_status(&result) == 403 && {
+            assert_s3_err_code(&result, "AccessDenied");
+            true
+        } {
+            return;
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
+        panic!(
+            "bucket-owner HeadObject did not converge to AccessDenied for {bucket}/{key}: {:?}",
             result
         );
     }

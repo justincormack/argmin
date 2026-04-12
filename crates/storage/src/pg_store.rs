@@ -2274,18 +2274,18 @@ impl PgMetadataStore for PgStore {
             })
     }
 
-    fn list_buckets(&self, owner_principal: &str) -> Result<Vec<BucketInfo>, MetadataError> {
+    fn list_buckets(&self, owner_canonical_id: &str) -> Result<Vec<BucketInfo>, MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::list_buckets",
-            "pg_id={} owner={}",
+            "pg_id={} owner_canonical_id={}",
             self.pg_id,
-            owner_principal
+            owner_canonical_id
         );
         let mut stmt = self
             .conn
             .prepare(&format!(
-                "{BUCKET_INFO_SELECT} WHERE owner_principal = ?1 AND state = ?2 ORDER BY name ASC"
+                "{BUCKET_INFO_SELECT} WHERE owner_canonical_id = ?1 AND state = ?2 ORDER BY name ASC"
             ))
             .map_err(|e| MetadataError::Db {
                 context: "prepare list buckets",
@@ -2293,7 +2293,7 @@ impl PgMetadataStore for PgStore {
             })?;
         let rows = stmt
             .query_map(
-                params![owner_principal, BucketState::Active as u8],
+                params![owner_canonical_id, BucketState::Active as u8],
                 Self::row_to_bucket_info,
             )
             .map_err(|e| MetadataError::Db {

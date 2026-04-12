@@ -476,7 +476,7 @@ struct AuthorizedListMultipartUploads {
 
 #[derive(Debug)]
 struct AuthorizedListBuckets {
-    owner_principal: String,
+    owner_canonical_id: CanonicalUserId,
 }
 
 enum AuthorizedDeleteObject<'a> {
@@ -6240,11 +6240,11 @@ impl Coordinator {
         req: &ListBucketsRequest,
     ) -> Result<Vec<BucketSummary>, ServerError> {
         observability::trace_scope!(TRACE_TARGET, "Coordinator::list_buckets");
-        let AuthorizedListBuckets { owner_principal } = self.authorize_list_buckets(req)?;
+        let AuthorizedListBuckets { owner_canonical_id } = self.authorize_list_buckets(req)?;
         let mut out = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
-            let mut buckets = pg.list_buckets(owner_principal.as_str())?;
+            let mut buckets = pg.list_buckets(owner_canonical_id.as_str())?;
             out.extend(buckets.drain(..).map(Self::bucket_summary));
             Ok::<(), ServerError>(())
         })?;
@@ -14614,6 +14614,64 @@ mod tests {
     }
 
     #[test]
+    fn list_buckets_scoped_by_owner_account_canonical_id() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let same_account_canonical_id = CanonicalUserId::from_principal("111122223333");
+        let owner_root = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            same_account_canonical_id.clone(),
+            "Owner Root",
+        );
+        let owner_user = AccountIdentity::new(
+            "arn:aws:iam::111122223333:user/admin",
+            same_account_canonical_id,
+            "Owner User",
+        );
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket-root",
+                requester: Requester::authenticated(owner_root.clone()),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket-user",
+                requester: Requester::authenticated(owner_user.clone()),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+
+        let root_names: Vec<String> = coord
+            .list_buckets(&ListBucketsRequest {
+                requester: Requester::authenticated(owner_root),
+            })
+            .unwrap()
+            .into_iter()
+            .map(|bucket| bucket.name)
+            .collect();
+        assert_eq!(root_names, vec!["bucket-root", "bucket-user"]);
+
+        let user_names: Vec<String> = coord
+            .list_buckets(&ListBucketsRequest {
+                requester: Requester::authenticated(owner_user),
+            })
+            .unwrap()
+            .into_iter()
+            .map(|bucket| bucket.name)
+            .collect();
+        assert_eq!(user_names, vec!["bucket-root", "bucket-user"]);
+    }
+
+    #[test]
     fn list_buckets_globally_sorted() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -14665,6 +14723,42 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn authorize_delete_bucket_allows_same_account_owner_account() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let same_account_canonical_id = CanonicalUserId::from_principal("111122223333");
+        let bucket_owner = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            same_account_canonical_id.clone(),
+            "Bucket Owner",
+        );
+        let same_account_user = AccountIdentity::new(
+            "arn:aws:iam::111122223333:user/admin",
+            same_account_canonical_id,
+            "Same Account User",
+        );
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(bucket_owner),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+
+        coord
+            .authorize_delete_bucket(&bucket_request_with_expected_owner(
+                "bucket",
+                Requester::authenticated(same_account_user),
+                None,
+            ))
+            .unwrap();
     }
 
     #[test]

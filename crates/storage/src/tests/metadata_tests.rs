@@ -518,7 +518,9 @@ fn file_bucket_metadata_create_head_list_delete() {
     );
     assert!(beta.public_read);
 
-    let owner1 = store.list_buckets("owner-1").unwrap();
+    let owner1 = store
+        .list_buckets(CanonicalUserId::from_principal("owner-1").as_str())
+        .unwrap();
     assert_eq!(owner1.len(), 2);
     assert_eq!(owner1[0].name, "alpha");
     assert_eq!(owner1[1].name, "beta");

@@ -59,7 +59,7 @@ pub trait PgMetadataStore {
     fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError>;
 
     /// List all buckets owned by the given owner within this PG.
-    fn list_buckets(&self, owner_principal: &str) -> Result<Vec<BucketInfo>, MetadataError>;
+    fn list_buckets(&self, owner_canonical_id: &str) -> Result<Vec<BucketInfo>, MetadataError>;
 
     /// List all active buckets in this PG with lifecycle configuration set.
     fn list_buckets_with_lifecycle(&self) -> Result<Vec<BucketInfo>, MetadataError>;

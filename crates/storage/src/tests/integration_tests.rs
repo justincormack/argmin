@@ -957,7 +957,9 @@ fn bucket_deletion_lifecycle() {
     assert_eq!(info.state, BucketState::Deleting);
 
     // list_buckets does not include it.
-    let buckets = store.list_buckets("owner").unwrap();
+    let buckets = store
+        .list_buckets(CanonicalUserId::from_principal("owner").as_str())
+        .unwrap();
     assert!(buckets.is_empty());
 
     // Final delete.
