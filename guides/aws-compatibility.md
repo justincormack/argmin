@@ -172,21 +172,7 @@ Related note:
 
 - [plans/sigv2-compat-note.md](/home/justin/src/github.com/justincormack/argmin/plans/sigv2-compat-note.md)
 
-### 10. Object ownership and object ACL behavior are incomplete
-
-Argmin does not yet implement full AWS object ownership semantics or the full
-object ACL API surface.
-
-This is an AWS-visible compatibility gap for objects written by a different
-principal than the bucket owner. In particular, AWS distinguishes the object
-owner from the bucket owner for anonymous or public-write uploads, and bucket
-owner read/delete behavior can differ from Argmin's current simplified model.
-
-Related plan:
-
-- [plans/aws-auth-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/aws-auth-compat-plan.md)
-
-### 11. Account-level Block Public Access is not implemented
+### 10. Account-level Block Public Access is not implemented
 
 Argmin supports the bucket-level public access block surface needed by the
 current feature set, but it does not implement AWS account-level Block Public
@@ -199,7 +185,7 @@ Related plan:
 
 - [plans/aws-auth-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/aws-auth-compat-plan.md)
 
-### 12. Bucket policy CRUD does not yet match AWS root-principal behavior
+### 11. Bucket policy CRUD does not yet match AWS root-principal behavior
 
 For `GetBucketPolicy`, `PutBucketPolicy`, and `DeleteBucketPolicy`, AWS allows
 the bucket owner's account `root` principal to perform the operation even if
@@ -216,7 +202,7 @@ Related plan:
 
 - [plans/bucket-policy-root-principal-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/bucket-policy-root-principal-compat-plan.md)
 
-### 13. `AccessDenied` does not yet match AWS principal-specific error text
+### 12. `AccessDenied` does not yet match AWS principal-specific error text
 
 Argmin now matches the generic XML error shape for several `AccessDenied`
 cases, but it does not yet reproduce AWS's more specific denial messages that

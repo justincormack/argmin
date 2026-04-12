@@ -21,9 +21,36 @@ This plan does not cover:
 - AWS Organizations / SCP behavior
 - a full IAM identity-policy model
 
+## Current Status
+
+Completed:
+- dedicated AWS-backed root-principal conformance coverage in
+  `crates/s3-tests/tests/bucket_policy_root.rs`
+- privileged harness support for a same-account owner root credential in
+  `crates/s3-tests`
+- AWS-verified coverage for:
+  - owner root `GetBucketPolicy` despite explicit deny
+  - owner root `PutBucketPolicy` despite explicit deny
+  - owner root `DeleteBucketPolicy` despite explicit deny
+  - same-account non-root denied for those same operations
+  - `GetBucketPolicyStatus` not inheriting the carveout
+  - `BlockPublicPolicy` still blocking root `PutBucketPolicy`
+- local/AWS response-shape alignment for the `BlockPublicPolicy` denial path
+
+Still open:
+- the server does not yet implement the full dedicated bucket-policy CRUD
+  authorizer described below
+- `GetBucketPolicy`, `PutBucketPolicy`, and `DeleteBucketPolicy` are still not
+  modeled as bucket-policy actions in `auth::PolicyAction`
+- local coverage is still only an approximation of the AWS root/non-root split
+  because the local harness cannot yet create a bucket as same-account non-root
+  and then exercise the true owner-root carveout against that bucket
+- `x-amz-confirm-remove-self-bucket-access` remains unimplemented
+
 ## Problem
 
-Current argmin behavior is too permissive for bucket-policy CRUD.
+Current argmin behavior in the server is still too permissive / too coarse for
+bucket-policy CRUD, even though the external AWS conformance suite now exists.
 
 Today, those APIs all go through the generic bucket-admin path in
 [coordinator.rs](/home/justin/src/github.com/justincormack/argmin/crates/server-core/src/coordinator.rs),
@@ -46,7 +73,7 @@ That is broader than AWS.
 
 This is not just a one-line auth tweak.
 
-There are three coupled gaps:
+There are still three coupled implementation gaps:
 - bucket ownership is stored as an arbitrary `owner_principal`, not as durable
   account ownership plus a distinct creating principal
 - `Requester` / `AccountIdentity` does not currently model principal kind
@@ -189,7 +216,16 @@ or testing shows a distinct special-case rule there too.
 
 ### Phase 1: Ownership / Principal Modeling Prerequisite
 
-Deliver:
+Status: partially complete.
+
+Delivered so far:
+- privileged owner-root credentials in the external harness
+- explicit authorization scope on credentials/requesters via
+  `AuthorizationProfile`
+- enough identity distinction to test same-account root, same-account
+  non-root, and constrained same-account callers in the current fixture
+
+Still needed for this plan's full local/server shape:
 - bucket owner account identity separate from creator principal
 - requester helpers for same-account and root-principal classification
 
@@ -198,12 +234,16 @@ as an isolated bucket-policy change.
 
 ### Phase 2: Bucket Policy Action Support
 
+Status: open.
+
 Deliver:
 - `GetBucketPolicy`, `PutBucketPolicy`, `DeleteBucketPolicy` in
   `auth::PolicyAction`
 - bucket-resource policy evaluation coverage for those actions
 
 ### Phase 3: CRUD Authorization Split
+
+Status: open.
 
 Deliver:
 - dedicated authorizer for bucket-policy CRUD
@@ -213,16 +253,22 @@ Deliver:
 
 ### Phase 4: Conformance / Regression Coverage
 
-Deliver:
-- local regression tests for the intended authorization split
-- deferred AWS verification once the harness can represent the required
-  principal distinctions
+Status: partially complete.
+
+Delivered:
+- AWS-backed regression tests in `crates/s3-tests/tests/bucket_policy_root.rs`
+- harness support for dedicated owner-root credentials
+
+Still needed:
+- local regression tests that exercise the true same-account non-root owner vs
+  owner-root split instead of the current local approximation
 
 ## Test Plan
 
 ### What We Can Test Early
 
-Once the account model is in place, add local tests in `server-core` for:
+Once the remaining account/root modeling is in place, add local tests in
+`server-core` for:
 - owner-account root principal can `GetBucketPolicy` despite explicit deny
 - owner-account root principal can `PutBucketPolicy` despite explicit deny
 - owner-account root principal can `DeleteBucketPolicy` despite explicit deny
@@ -237,19 +283,17 @@ These can be deterministic local tests once the model can represent:
 - same-account non-root principal
 - cross-account principal
 
-### What We Should Defer
+### What Is No Longer Deferred
 
-AWS-backed verification is awkward in the current harness because `s3-tests`
-uses IAM user credentials, not true account root credentials.
+AWS-backed verification is now part of the repo test surface via the dedicated
+privileged `bucket_policy_root` binary and owner-root credentials in the
+external harness.
 
-So the external part should be deferred until we have one of:
-- a dedicated AWS manual verification procedure using real root credentials
-- a separate privileged harness for these cases
-- a fuller local account-structure model we trust enough to cover the rule
-  without immediate AWS automation
+### What Still Remains
 
-Until then, the most useful thing is to have the local regression structure and
-to document the exact AWS rule we are matching.
+The remaining test gap is local/server conformance for the true same-account
+non-root-owner versus owner-root distinction, plus the
+`x-amz-confirm-remove-self-bucket-access` header behavior.
 
 ## Exit Criteria
 
@@ -259,6 +303,5 @@ This plan is done when:
   `GetBucketPolicy`, `PutBucketPolicy`, and `DeleteBucketPolicy`
 - the bucket owner account root principal bypass exists only for those three
   APIs
-- local regression coverage exists for the root-vs-non-root split
-- the remaining AWS external verification gap is either executed or explicitly
-  documented as deferred due to harness limitations
+- local regression coverage exists for the true root-vs-non-root split
+- `x-amz-confirm-remove-self-bucket-access` matches AWS

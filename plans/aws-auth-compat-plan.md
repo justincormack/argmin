@@ -10,10 +10,9 @@ remaining is limited and should be treated as a follow-up plan, not a greenfield
 auth design.
 
 This follow-up covers:
-- remaining ACL/authz gaps
-- owner identity compatibility gaps
-- full object ownership compatibility gaps
-- conformance tests for the above
+- remaining account-level public-access/authz gaps
+- credential-scope / same-account authorization compatibility
+- conformance tests and documentation for the above
 
 This still does not cover:
 - full IAM policy language
@@ -44,55 +43,49 @@ Completed:
 - Auth, presigned, public-access, and owner-XML integration coverage
 
 Still open:
-- Full object ownership compatibility
-- Object ACL APIs / semantics
 - Account-level Block Public Access controls
 - Final compatibility/conformance documentation
 
 ## Remaining Work
 
-### 1. Full Ownership Model Compatibility
+### 1. Account-Level Block Public Access
 
 Still missing:
-- durable object-level owner identity distinct from bucket owner
-- object-owner semantics for anonymous/public-write uploads
-- bucket-owner access rules that match AWS for objects written by other principals
-- object ACL semantics sufficient to express owner/grantee behavior
-
-Confirmed AWS behavior that still differs locally:
-- bucket-level `public-read-write` allows anonymous `PUT` and `POST`
-- the bucket owner cannot subsequently `HEAD`/`GET` that uploaded object
-- the bucket owner can still delete it
-
-Current argmin behavior:
-- anonymous/public write itself is implemented
-- argmin does not yet model per-object owner identity for these writes
-- local bucket-owner readback therefore still differs from AWS
-
-Longer-term identity note:
-- canonical owner IDs should ultimately come from durable account metadata, not
-  be derived from principal strings
-- that implies a real account/account-metadata service in the later ownership
-  design, rather than treating principal strings as the permanent identity substrate
-
-### 2. ACL Surface Beyond Bucket ACLs
-
-Still missing:
-- object ACL APIs / semantics
-- any ACL-driven authorization beyond the current bucket-level ACL model
-- account-level Block Public Access controls and their interaction with
-  bucket-level ACL/public-access behavior
+- account-level Block Public Access controls
+- account-scoped enforcement of `BlockPublicAcls`, `IgnorePublicAcls`,
+  `BlockPublicPolicy`, and `RestrictPublicBuckets`
+- AWS-matching interaction between account-level controls and the already
+  implemented bucket-level ACL / public-access behavior
 
 Explicitly still out of scope for this plan:
 - full bucket policy evaluation
 - full IAM policy language
 
+### 2. Constrained Same-Account Authorization Shape
+
+Completed since the previous revision:
+- credentials now carry an explicit `AuthorizationProfile`
+- auth, HTTP, and coordinator request propagation preserve that scope
+- default `Requester` construction is now least-privileged
+- owner-account admin behavior must be opted into explicitly
+- same-account constrained credentials are denied for ordinary object writes and
+  multipart write flows unless separately allowed
+- same-account root / broad owner-account credentials retain the AWS-aligned
+  bucket-admin and object-admin behavior covered by the current fixture
+
+This closes the review-driven gap where local behavior had started to treat any
+same-account principal as a generic implicit writer.
+
+Longer-term identity note:
+- canonical owner IDs should ultimately come from durable account metadata, not
+  be derived from principal strings
+- `AuthorizationProfile` is the current coarse credential-scope model, not the
+  end-state account/credential service
+
 ### 3. Conformance Cleanup
 
 Still missing:
 - a short documented auth/public-access compatibility subset against AWS
-- a short written record of the confirmed AWS ownership behavior for anonymous
-  public-write uploads
 - folding in the remaining auth/header-related Ceph `s3-tests` porting work so
   it is tracked here rather than in the old integration-framework bootstrap plan
 
@@ -101,6 +94,11 @@ Already covered:
 - wrong-service header auth coverage
 - duplicate `Authorization` rejection coverage
 - AWS validation for bucket-level public write and admin-operation denial
+- AWS validation for anonymous public-write ownership behavior on plain `PUT`
+  and `POST`
+- AWS validation for same-account root/non-root bucket-admin and object-admin
+  behavior
+- AWS validation for constrained same-account write denial
 
 ## Target Behavior
 
@@ -127,12 +125,15 @@ Minimal intended behavior after this follow-up:
 - owner: full bucket/object access
 - anonymous: read-only on explicitly public-read buckets
 - anonymous/public write only when explicitly enabled by the supported ACL model
+- anonymous public-write uploads must retain AWS-compatible owner/read/delete
+  behavior for the bucket owner
+- same-account constrained credentials must remain denied unless an implemented
+  ACL or policy path explicitly allows them
+- same-account owner-account admin credentials may perform only the
+  AWS-compatible bucket/object admin operations that are explicitly modeled
 - account-level Block Public Access controls override bucket-level public ACL
   behavior where AWS does
 - non-owner authenticated callers remain denied unless allowed by supported ACL or later policy work
-
-This is still intentionally weaker than full AWS ownership behavior until the
-object-ownership work lands.
 
 ## Implementation Phases
 
@@ -148,22 +149,31 @@ Status: complete for bucket-level ACL behavior.
 
 Status: complete for current bucket/list/version-list XML surfaces.
 
-### Phase 4: Full Ownership Model
+### Phase 4: Ownership And ACL Compatibility
+
+Status: complete for the current supported surface.
+
+Completed:
+- explicit object-level owner identity on stored objects, delete markers, and
+  multipart uploads
+- object ACL API support and the required owner/grantee authorization behavior
+- AWS-aligned anonymous public-write ownership behavior for plain `PUT` and
+  plain `POST`
+- AWS-aligned `bucket-owner-full-control` behavior for anonymous `PUT` and
+  anonymous `POST`
+- same-account root/non-root bucket-admin and object-admin coverage
+- same-account constrained write denial coverage
+
+### Phase 5: Account-Level Public Access Block
 
 Status: open.
 
 Deliver:
-- explicit object-level owner identity
-- correct bucket-owner behavior for anonymously/publicly uploaded objects
-- enough object ACL support to make those semantics coherent
+- account-level Block Public Access controls
+- AWS-aligned interaction between account-level and bucket-level public-access
+  enforcement
 
-Success criteria:
-- external AWS-aligned tests for anonymous public-write uploads match locally:
-  - upload succeeds
-  - bucket-owner read is denied where appropriate
-  - bucket-owner cleanup still succeeds
-
-### Phase 5: Conformance Cleanup
+### Phase 6: Conformance Cleanup
 
 Status: open.
 
@@ -172,7 +182,6 @@ Deliver:
 - account for the remaining auth/header-related Ceph test coverage that is not
   yet ported into `crates/s3-tests`
 - document remaining intentional incompatibilities:
-  - object ACLs, if still deferred
   - account-level Block Public Access, if still deferred
   - policy evaluation, if still deferred
 
@@ -186,26 +195,34 @@ Targeted integration tests:
 - `cargo test -p s3-tests --test presigned`
 - `cargo test -p s3-tests --test public_access_block`
 - `cargo test -p s3-tests --test bucket_anon`
+- `cargo test -p s3-tests --test ownership`
 - `cargo test -p s3-tests --test post_object`
 - `cargo test -p s3-tests --test versioning`
+- `cargo test -p s3-tests --test bucket_admin_root`
+- `cargo test -p s3-tests --test object_admin_root`
+- `cargo test -p s3-tests --test object_write_root`
+- `cargo test -p s3-tests --test object_write_constrained`
 
 AWS checks:
 - rerun the narrowed auth/public-access subset against AWS while working on
-  Phase 4 ownership behavior
+  Phase 5 account-level public-access behavior
 
 ## Open Decisions
 
-1. Object owner identity source
-- whether to persist authenticated writer principal first, or introduce a
-  canonical object-owner identifier at the same time
+1. Account-level Block Public Access rollout shape
+- whether to mirror the AWS account-level control surface directly in the
+  current local/server model, or defer part of that to later durable account
+  management work
 
-2. Object ACL rollout shape
-- whether to start with the minimum object-owner semantics needed for the AWS
-  public-write behavior, or implement a broader object-ACL surface together
+2. Authorization-profile evolution
+- whether `AuthorizationProfile` remains the long-lived compatibility mechanism
+  for current credentials, or becomes an implementation detail once durable
+  account / credential metadata exists
 
 ## Recommended Default Decisions
 
 - Keep region strictness enabled
 - Keep bucket-level public write as the current supported bucket-ACL surface
-- Finish object ownership semantics before widening object ACL scope
+- Keep `AuthorizationProfile` explicit at auth boundaries rather than inferring
+  broad rights from same-account identity
 - Keep `owner_canonical_id` explicitly stored rather than deriving it ad hoc in XML rendering
