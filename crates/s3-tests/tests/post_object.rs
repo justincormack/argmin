@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::types::ServerSideEncryption;
 use ring::hmac;
@@ -345,6 +345,66 @@ fn assert_error_code(body: &str, code: &str) {
         body.contains(&expected),
         "expected {expected} in body: {body}"
     );
+}
+
+async fn owner_get_object_access_denied_eventually(bucket: &str, key: &str) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .client()
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        if result.is_err() {
+            assert_eq!(err_status(&result), 403);
+            assert_s3_err_code(&result, "AccessDenied");
+            return;
+        }
+
+        if attempt + 1 == MAX_ATTEMPTS {
+            panic!(
+                "bucket-owner GetObject did not converge to AccessDenied for {bucket}/{key}: {:?}",
+                result
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    unreachable!()
+}
+
+async fn owner_head_object_access_denied_eventually(bucket: &str, key: &str) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .client()
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        if result.is_err() {
+            assert_eq!(err_status(&result), 403);
+            assert_s3_err_code(&result, "AccessDenied");
+            return;
+        }
+
+        if attempt + 1 == MAX_ATTEMPTS {
+            panic!(
+                "bucket-owner HeadObject did not converge to AccessDenied for {bucket}/{key}: {:?}",
+                result
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    unreachable!()
 }
 
 // ── Basic upload ────────────────────────────────────────────────────────
@@ -1003,6 +1063,57 @@ fn test_post_object_set_content_type() {
 async fn assert_post_object_anonymous_public_write_bucket() {
     let client = CTX.client();
     let bucket = s3_tests::create_public_write_bucket(client).await;
+    let key = "post-anon-owner";
+
+    let fields = [("key", key), ("Content-Type", "text/plain")];
+    let (status, body) = post_object(&bucket, &fields, b"data", "test.txt");
+    assert_eq!(
+        status, 204,
+        "expected 204 for anonymous POST on public-read-write bucket, got {} body={}",
+        status, body
+    );
+
+    let acl_url = format!("{}/{bucket}/{key}?acl", CTX.endpoint());
+    let mut acl = s3_tests::test_agent()
+        .get(&acl_url)
+        .call()
+        .expect("transport error");
+    assert_eq!(acl.status().as_u16(), 200);
+    let acl_body = acl.body_mut().read_to_string().unwrap_or_default();
+    assert!(
+        acl_body.contains(&format!(
+            "<Owner><ID>{ANONYMOUS_UPLOAD_CANONICAL_USER_ID}</ID></Owner>"
+        )),
+        "unexpected body: {acl_body}"
+    );
+    assert!(
+        acl_body.contains(&format!(
+            "<Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\"><ID>{ANONYMOUS_UPLOAD_CANONICAL_USER_ID}</ID></Grantee><Permission>FULL_CONTROL</Permission>"
+        )),
+        "unexpected body: {acl_body}"
+    );
+
+    owner_head_object_access_denied_eventually(&bucket, key).await;
+    owner_get_object_access_denied_eventually(&bucket, key).await;
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+}
+
+#[test]
+fn test_post_object_anonymous_public_write_uses_special_anonymous_owner_id() {
+    s3_tests::run(assert_post_object_anonymous_public_write_bucket());
+}
+
+async fn assert_post_object_anonymous_public_read_request() {
+    let client = CTX.client();
+    let bucket = s3_tests::create_public_write_bucket(client).await;
     let key = "post-anon";
 
     let fields = [
@@ -1058,8 +1169,8 @@ async fn assert_post_object_anonymous_public_write_bucket() {
 }
 
 #[test]
-fn test_post_object_anonymous_request() {
-    s3_tests::run(assert_post_object_anonymous_public_write_bucket());
+fn test_post_object_anonymous_public_read_request() {
+    s3_tests::run(assert_post_object_anonymous_public_read_request());
 }
 
 #[test]
