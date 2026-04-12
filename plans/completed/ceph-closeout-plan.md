@@ -18,7 +18,7 @@ Out of scope:
 - the remaining encryption roadmap already tracked in
   `plans/encryption-compat-plan.md`
 - the bucket-policy owner-root carveout tracked in
-  `plans/bucket-policy-root-principal-compat-plan.md`
+  `plans/completed/bucket-policy-root-principal-compat-plan.md`
 - any Ceph-only RGW extensions or non-AWS namespace behavior
 
 ## Current Assessment
