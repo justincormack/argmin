@@ -1063,6 +1063,78 @@ fn test_post_object_anonymous_request() {
 }
 
 #[test]
+fn test_post_object_anonymous_bucket_owner_full_control_request() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = s3_tests::create_public_write_bucket(client).await;
+        let key = "post-anon-bofc";
+        let bucket_owner = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap()
+            .owner()
+            .and_then(|owner| owner.id())
+            .expect("expected owner ID in GetBucketAcl")
+            .to_string();
+
+        let fields = [
+            ("key", key),
+            ("acl", "bucket-owner-full-control"),
+            ("Content-Type", "text/plain"),
+        ];
+        let (status, body) = post_object(&bucket, &fields, b"data", "test.txt");
+        assert_eq!(
+            status, 204,
+            "expected 204 for anonymous POST with bucket-owner-full-control, got {} body={}",
+            status, body
+        );
+
+        let out = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let data = out.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"data");
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            acl.owner().and_then(|owner| owner.id()),
+            Some(bucket_owner.as_str())
+        );
+        assert!(
+            acl.grants().iter().any(|grant| {
+                grant.permission() == Some(&aws_sdk_s3::types::Permission::FullControl)
+                    && grant
+                        .grantee()
+                        .is_some_and(|grantee| grantee.id() == Some(bucket_owner.as_str()))
+            }),
+            "expected bucket owner FULL_CONTROL grant, got {:?}",
+            acl.grants()
+        );
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
 fn test_post_object_empty_body() {
     s3_tests::run(async {
         let client = CTX.client();

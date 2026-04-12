@@ -348,6 +348,63 @@ fn test_anonymous_public_write_put_object_acl_denied_for_anonymous_owner() {
     });
 }
 
+#[test]
+fn test_anonymous_public_write_put_bucket_owner_full_control_makes_bucket_owner_object_owner() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_public_write_bucket(client).await;
+        let key = "anonymous-owner-bofc";
+        let object_url = format!("{}/{bucket}/{key}", CTX.endpoint());
+        let bucket_owner = bucket_owner_id(&bucket).await;
+
+        let put = anonymous_put_with_headers(
+            &object_url,
+            b"data",
+            &[(
+                "x-amz-acl".to_string(),
+                "bucket-owner-full-control".to_string(),
+            )],
+        );
+        assert_eq!(put.0, 200, "unexpected body: {}", put.1);
+
+        assert_eq!(object_owner_id(client, &bucket, key).await, bucket_owner);
+        let body = owner_get_object_eventually(&bucket, key)
+            .await
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .into_bytes();
+        assert_eq!(&body[..], b"data");
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            acl.owner().and_then(|owner| owner.id()),
+            Some(bucket_owner.as_str())
+        );
+        assert!(
+            has_grant(acl.grants(), Permission::FullControl, &bucket_owner),
+            "expected bucket owner FULL_CONTROL grant, got {:?}",
+            acl.grants()
+        );
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
 fn assert_acl_not_supported<T, E: std::fmt::Debug>(
     result: &Result<T, aws_sdk_s3::error::SdkError<E>>,
     context: &str,
