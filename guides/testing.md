@@ -86,6 +86,18 @@ The external `s3-tests` harness hard-fails if any of these are missing:
   - Required for external runs. The committed IAM policy below assumes
     `claude-s3-`.
 
+The dedicated privileged root-principal suite in
+`crates/s3-tests/tests/bucket_policy_root.rs` requires:
+
+- `S3_TEST_OWNER_ROOT_ACCESS_KEY`
+- `S3_TEST_OWNER_ROOT_SECRET_KEY`
+
+Those root credentials must belong to the same AWS account as
+`S3_TEST_ACCESS_KEY` / `S3_TEST_SECRET_KEY`. A full
+`cargo test -p s3-tests --no-fail-fast` run includes the `bucket_policy_root`
+binary, so it will fail fast with a focused setup error if they are absent.
+Targeted non-root test binaries can still be run without them.
+
 Recommended command:
 
 ```bash
@@ -94,6 +106,8 @@ S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
 S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
 S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
 S3_TEST_ACCOUNT_ID="$AWS_ACCOUNT_ID" \
+S3_TEST_OWNER_ROOT_ACCESS_KEY="$AWS_OWNER_ROOT_ACCESS_KEY" \
+S3_TEST_OWNER_ROOT_SECRET_KEY="$AWS_OWNER_ROOT_SECRET_KEY" \
 S3_TEST_ALT_ACCESS_KEY="$AWS_ALT_ACCESS_KEY" \
 S3_TEST_ALT_SECRET_KEY="$AWS_ALT_SECRET_KEY" \
 S3_TEST_ALT_ACCOUNT_ID="$AWS_ALT_ACCOUNT_ID" \
@@ -101,6 +115,25 @@ S3_TEST_REGION=us-east-1 \
 S3_TEST_BUCKET_PREFIX=claude-s3- \
 S3_TEST_TIMEOUT_SECS=30 \
 cargo test -p s3-tests --no-fail-fast
+```
+
+Privileged bucket-policy root-principal coverage:
+
+```bash
+eval "$(grep = .env)" && \
+S3_TEST_ENDPOINT=https://s3.us-east-1.amazonaws.com \
+S3_TEST_ACCESS_KEY="$AWS_ACCESS_KEY" \
+S3_TEST_SECRET_KEY="$AWS_SECRET_KEY" \
+S3_TEST_ACCOUNT_ID="$AWS_ACCOUNT_ID" \
+S3_TEST_OWNER_ROOT_ACCESS_KEY="$AWS_OWNER_ROOT_ACCESS_KEY" \
+S3_TEST_OWNER_ROOT_SECRET_KEY="$AWS_OWNER_ROOT_SECRET_KEY" \
+S3_TEST_ALT_ACCESS_KEY="$AWS_ALT_ACCESS_KEY" \
+S3_TEST_ALT_SECRET_KEY="$AWS_ALT_SECRET_KEY" \
+S3_TEST_ALT_ACCOUNT_ID="$AWS_ALT_ACCOUNT_ID" \
+S3_TEST_REGION=us-east-1 \
+S3_TEST_BUCKET_PREFIX=claude-s3- \
+S3_TEST_TIMEOUT_SECS=30 \
+cargo test -p s3-tests --test bucket_policy_root -- --nocapture
 ```
 
 When `S3_TEST_ENDPOINT` is set, `s3-tests` defaults to a 30 second client
@@ -271,6 +304,9 @@ after-failure cleanup tool, not part of the normal test invocation.
 - A second IAM user in the same AWS account is not sufficient.
 - The harness probes S3 canonical owner IDs during setup and fails fast if the
   primary and alternate credentials resolve to the same owner.
+- When owner-root credentials are provided, the harness also probes S3
+  canonical owner IDs and fails fast unless the root credentials resolve to the
+  same owner as the primary credentials.
 
 ### IAM policy
 

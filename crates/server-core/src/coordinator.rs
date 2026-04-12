@@ -16884,7 +16884,10 @@ mod tests {
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 test_helpers::requester("owner-a"), None)
             .unwrap_err();
-        assert!(matches!(err, ServerError::AccessDenied));
+        assert!(matches!(
+            err,
+            ServerError::BlockPublicPolicyAccessDenied { .. }
+        ));
         assert_eq!(
             get_bucket_policy_test(&coord, "bucket", test_helpers::requester("owner-a"), None)
                 .unwrap(),
@@ -16921,7 +16924,10 @@ mod tests {
                 None,
             ))
             .unwrap_err();
-        assert!(matches!(err, ServerError::AccessDenied));
+        assert!(matches!(
+            err,
+            ServerError::BlockPublicPolicyAccessDenied { .. }
+        ));
     }
 
     #[test]
@@ -16950,7 +16956,10 @@ mod tests {
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"IpAddress":{"aws:SourceIp":"0.0.0.0/0"}}}]}"#,
                 test_helpers::requester("owner-a"), None)
             .unwrap_err();
-        assert!(matches!(err, ServerError::AccessDenied));
+        assert!(matches!(
+            err,
+            ServerError::BlockPublicPolicyAccessDenied { .. }
+        ));
         assert_eq!(
             get_bucket_policy_test(&coord, "bucket", test_helpers::requester("owner-a"), None)
                 .unwrap(),

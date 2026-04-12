@@ -11,6 +11,8 @@ use storage::CanonicalUserId;
 pub const TEST_ACCOUNT_ID: &str = "111122223333";
 pub const TEST_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 pub const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+pub const TEST_OWNER_ROOT_ACCESS_KEY: &str = "AKIAIROOTOWNEREXAMPLE";
+pub const TEST_OWNER_ROOT_SECRET_KEY: &str = "rootOwnerSecretKeyExampleDontUse";
 pub const TEST_REGION: &str = "us-east-1";
 
 /// Alternate test credentials (non-owner user).
@@ -176,6 +178,18 @@ impl TestServer {
                         TEST_ACCOUNT_ID,
                         CanonicalUserId::from_principal(TEST_ACCOUNT_ID),
                         "test-account",
+                    ),
+                    session_token: None,
+                    expires_at_epoch_secs: None,
+                    enabled: true,
+                });
+                credentials.add_record(auth::CredentialRecord {
+                    access_key_id: TEST_OWNER_ROOT_ACCESS_KEY.to_string(),
+                    secret_key: auth::SecretKey::new(TEST_OWNER_ROOT_SECRET_KEY.to_string()),
+                    account: AccountIdentity::new(
+                        format!("arn:aws:iam::{TEST_ACCOUNT_ID}:root"),
+                        CanonicalUserId::from_principal(TEST_ACCOUNT_ID),
+                        "test-account-root",
                     ),
                     session_token: None,
                     expires_at_epoch_secs: None,

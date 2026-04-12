@@ -2005,7 +2005,11 @@ impl Coordinator {
         let policy_is_public = parsed_policy.is_public();
         if Self::blocks_public_policy(bucket_info.public_access_block.as_ref()) && policy_is_public
         {
-            return Err(ServerError::AccessDenied);
+            return Err(ServerError::BlockPublicPolicyAccessDenied {
+                requester_principal: Self::requester_principal_required(&req.bucket.requester)?
+                    .to_string(),
+                bucket: req.bucket.name.to_string(),
+            });
         }
         Ok(AuthorizedPutBucketPolicy {
             bucket: req.bucket.name.to_string(),

@@ -58,6 +58,7 @@ pub fn run<F: std::future::Future>(f: F) -> F::Output {
 /// random port with well-known test credentials.
 pub struct TestContext {
     client: Client,
+    owner_root_client: Option<Client>,
     alt_client: Client,
     endpoint: String,
     access_key: String,
@@ -81,6 +82,8 @@ impl TestContext {
     /// - `S3_TEST_ALT_ACCESS_KEY`: alternate access key from a different AWS account
     /// - `S3_TEST_ALT_SECRET_KEY`: alternate secret key from a different AWS account
     /// - `S3_TEST_ALT_ACCOUNT_ID`: alternate AWS account ID
+    /// - `S3_TEST_OWNER_ROOT_ACCESS_KEY`: optional owner-account root access key
+    /// - `S3_TEST_OWNER_ROOT_SECRET_KEY`: optional owner-account root secret key
     /// - `S3_TEST_BUCKET_PREFIX`: required prefix for external test buckets
     /// - `S3_TEST_REGION`: region (defaults to "us-east-1")
     ///
@@ -115,17 +118,46 @@ impl TestContext {
             let alt_account_id = std::env::var("S3_TEST_ALT_ACCOUNT_ID").expect(
                 "S3_TEST_ALT_ACCOUNT_ID required with S3_TEST_ENDPOINT; full external s3-tests runs need the alternate AWS account ID",
             );
+            let region =
+                std::env::var("S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+            let owner_root_client = match (
+                std::env::var("S3_TEST_OWNER_ROOT_ACCESS_KEY"),
+                std::env::var("S3_TEST_OWNER_ROOT_SECRET_KEY"),
+            ) {
+                (Ok(owner_root_access_key), Ok(owner_root_secret_key)) => Some(
+                    build_client(
+                        &endpoint,
+                        &owner_root_access_key,
+                        &owner_root_secret_key,
+                        &region,
+                    )
+                    .await,
+                ),
+                (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
+                (Err(std::env::VarError::NotPresent), Ok(_)) => {
+                    panic!(
+                        "S3_TEST_OWNER_ROOT_ACCESS_KEY required with S3_TEST_OWNER_ROOT_SECRET_KEY"
+                    );
+                }
+                (Ok(_), Err(std::env::VarError::NotPresent)) => {
+                    panic!(
+                        "S3_TEST_OWNER_ROOT_SECRET_KEY required with S3_TEST_OWNER_ROOT_ACCESS_KEY"
+                    );
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    panic!("read owner-root AWS test credentials: {err}");
+                }
+            };
             let _bucket_prefix = std::env::var("S3_TEST_BUCKET_PREFIX").expect(
                 "S3_TEST_BUCKET_PREFIX required with S3_TEST_ENDPOINT; use a dedicated prefix such as claude-s3- that matches the test IAM policy",
             );
-            let region =
-                std::env::var("S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
 
             let client = build_client(&endpoint, &access_key, &secret_key, &region).await;
             let alt_client =
                 build_client(&endpoint, &alt_access_key, &alt_secret_key, &region).await;
             assert_distinct_external_s3_owners(
                 &client,
+                owner_root_client.as_ref(),
                 &alt_client,
                 &account_id,
                 &alt_account_id,
@@ -134,6 +166,7 @@ impl TestContext {
             .await;
             TestContext {
                 client,
+                owner_root_client,
                 alt_client,
                 endpoint,
                 access_key,
@@ -163,8 +196,19 @@ impl TestContext {
                 server.tls_ca_pem(),
             )
             .await;
+            let owner_root_client = Some(
+                build_client_with_ca(
+                    &endpoint,
+                    server::TEST_OWNER_ROOT_ACCESS_KEY,
+                    server::TEST_OWNER_ROOT_SECRET_KEY,
+                    server::TEST_REGION,
+                    server.tls_ca_pem(),
+                )
+                .await,
+            );
             TestContext {
                 client,
+                owner_root_client,
                 alt_client,
                 endpoint,
                 access_key: server::TEST_ACCESS_KEY.to_string(),
@@ -180,6 +224,20 @@ impl TestContext {
     /// The S3 client (bucket owner).
     pub fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// An owner-account root S3 client, when configured for external AWS tests.
+    pub fn owner_root_client(&self) -> Option<&Client> {
+        self.owner_root_client.as_ref()
+    }
+
+    /// The owner-account root S3 client, or panic with a focused setup message.
+    pub fn require_owner_root_client(&self) -> &Client {
+        self.owner_root_client.as_ref().unwrap_or_else(|| {
+            panic!(
+                "S3_TEST_OWNER_ROOT_ACCESS_KEY/S3_TEST_OWNER_ROOT_SECRET_KEY required for bucket_policy_root AWS tests"
+            )
+        })
     }
 
     /// An alternate S3 client (different user, not the bucket owner).
@@ -290,6 +348,7 @@ pub async fn build_client_with_ca(
 
 async fn assert_distinct_external_s3_owners(
     client: &Client,
+    owner_root_client: Option<&Client>,
     alt_client: &Client,
     account_id: &str,
     alt_account_id: &str,
@@ -322,6 +381,44 @@ async fn assert_distinct_external_s3_owners(
         .id()
         .expect("expected owner ID in primary probe GetBucketAcl during external s3-tests setup")
         .to_string();
+    if let Some(owner_root_client) = owner_root_client {
+        let owner_root_bucket = unique_bucket();
+        if let Err(err) =
+            create_bucket_in_region(owner_root_client, &owner_root_bucket, region).await
+        {
+            let _ = client.delete_bucket().bucket(&primary_bucket).send().await;
+            let _ = alt_client.delete_bucket().bucket(&alt_bucket).send().await;
+            panic!("create owner-root probe bucket for external s3-tests setup: {err:?}");
+        }
+
+        let owner_root_id = owner_root_client
+            .get_bucket_acl()
+            .bucket(&owner_root_bucket)
+            .send()
+            .await
+            .expect("get owner-root probe bucket ACL during external s3-tests setup")
+            .owner()
+            .expect(
+                "expected owner in owner-root probe GetBucketAcl during external s3-tests setup",
+            )
+            .id()
+            .expect(
+                "expected owner ID in owner-root probe GetBucketAcl during external s3-tests setup",
+            )
+            .to_string();
+
+        owner_root_client
+            .delete_bucket()
+            .bucket(&owner_root_bucket)
+            .send()
+            .await
+            .expect("delete owner-root probe bucket during external s3-tests setup");
+
+        assert_eq!(
+            owner_root_id, primary_owner_id,
+            "S3_TEST_OWNER_ROOT_ACCESS_KEY/S3_TEST_OWNER_ROOT_SECRET_KEY must resolve to the same S3 canonical owner ID as the primary credentials"
+        );
+    }
     let alt_owner_id = alt_client
         .get_bucket_acl()
         .bucket(&alt_bucket)

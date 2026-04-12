@@ -1232,6 +1232,21 @@ impl S3Response {
                 );
                 return Self::new(403).chunked_xml_body(body);
             }
+            ServerError::BlockPublicPolicyAccessDenied {
+                requester_principal,
+                bucket,
+            } => {
+                let body = xml::error_xml_with_host_id(
+                    "AccessDenied",
+                    &format!(
+                        "User: {} is not authorized to perform: s3:PutBucketPolicy on resource: \"arn:aws:s3:::{}\" because public policies are prevented by the BlockPublicPolicy setting in S3 Block Public Access.",
+                        requester_principal, bucket
+                    ),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                return Self::new(403).chunked_xml_body(body);
+            }
             ServerError::AccessDenied
             | ServerError::Auth(auth::AuthError::MissingAuth)
             | ServerError::Auth(auth::AuthError::AccessDenied) => {
