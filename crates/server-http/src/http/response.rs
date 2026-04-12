@@ -1223,6 +1223,15 @@ impl S3Response {
                 );
                 return Self::new(404).chunked_xml_body(body);
             }
+            ServerError::AnonymousApiAccessDenied => {
+                let body = xml::error_xml_with_host_id(
+                    "AccessDenied",
+                    "Anonymous users cannot invoke this API. Please authenticate.",
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                return Self::new(403).chunked_xml_body(body);
+            }
             ServerError::AccessDenied
             | ServerError::Auth(auth::AuthError::MissingAuth)
             | ServerError::Auth(auth::AuthError::AccessDenied) => {

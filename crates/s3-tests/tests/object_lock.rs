@@ -30,6 +30,29 @@ fn agent() -> ureq::Agent {
     s3_tests::test_agent()
 }
 
+fn anonymous_get(url: &str) -> (u16, String) {
+    let mut resp = agent().get(url).call().expect("transport error");
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, body)
+}
+
+fn anonymous_put_with_headers(
+    url: &str,
+    body: &[u8],
+    headers: &[(String, String)],
+) -> (u16, String) {
+    let request = headers
+        .iter()
+        .fold(agent().put(url), |request, (name, value)| {
+            request.header(name, value)
+        });
+    let mut resp = request.send(body).expect("transport error");
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, body)
+}
+
 fn future_date(seconds_from_now: u64) -> DateTime {
     DateTime::from_secs(now_epoch_secs() + seconds_from_now as i64)
 }
@@ -2216,6 +2239,105 @@ fn test_object_lock_delete_object_bypass_requires_bucket_admin() {
 
         delete_version_with_bypass(&bucket, key, &version_id).await;
         cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_anonymous_get_object_retention_denied_message() {
+    s3_tests::run(async {
+        let bucket = setup_public_write_object_lock_bucket().await;
+        let key = "anon-get-retention";
+        put_object_bytes(&bucket, key, b"locked").await;
+
+        let url = format!("{}/{bucket}/{key}?retention", CTX.endpoint());
+        let response = anonymous_get(&url);
+
+        cleanup_object_lock_bucket(&bucket).await;
+
+        assert_eq!(response.0, 403, "unexpected body: {}", response.1);
+        assert!(
+            response.1.contains("AccessDenied"),
+            "unexpected body: {}",
+            response.1
+        );
+    });
+}
+
+#[test]
+fn test_object_lock_anonymous_put_object_retention_denied_message() {
+    s3_tests::run(async {
+        let bucket = setup_public_write_object_lock_bucket().await;
+        let key = "anon-put-retention";
+        put_object_bytes(&bucket, key, b"locked").await;
+
+        let retention_body = format!(
+            "<ObjectLockRetention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Mode>GOVERNANCE</Mode><RetainUntilDate>{}</RetainUntilDate></ObjectLockRetention>",
+            future_date(GOVERNANCE_RETENTION_SECS)
+                .fmt(DateTimeFormat::DateTime)
+                .unwrap()
+        );
+        let url = format!("{}/{bucket}/{key}?retention", CTX.endpoint());
+        let response = anonymous_put_with_headers(
+            &url,
+            retention_body.as_bytes(),
+            &[content_md5_header(retention_body.as_bytes())],
+        );
+
+        cleanup_object_lock_bucket(&bucket).await;
+
+        assert_eq!(response.0, 403, "unexpected body: {}", response.1);
+        assert!(
+            response.1.contains("AccessDenied"),
+            "unexpected body: {}",
+            response.1
+        );
+    });
+}
+
+#[test]
+fn test_object_lock_anonymous_get_object_legal_hold_denied_message() {
+    s3_tests::run(async {
+        let bucket = setup_public_write_object_lock_bucket().await;
+        let key = "anon-get-legal-hold";
+        put_object_bytes(&bucket, key, b"locked").await;
+
+        let url = format!("{}/{bucket}/{key}?legal-hold", CTX.endpoint());
+        let response = anonymous_get(&url);
+
+        cleanup_object_lock_bucket(&bucket).await;
+
+        assert_eq!(response.0, 403, "unexpected body: {}", response.1);
+        assert!(
+            response.1.contains("AccessDenied"),
+            "unexpected body: {}",
+            response.1
+        );
+    });
+}
+
+#[test]
+fn test_object_lock_anonymous_put_object_legal_hold_denied_message() {
+    s3_tests::run(async {
+        let bucket = setup_public_write_object_lock_bucket().await;
+        let key = "anon-put-legal-hold";
+        put_object_bytes(&bucket, key, b"locked").await;
+
+        let legal_hold_body = br#"<LegalHold xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>ON</Status></LegalHold>"#;
+        let url = format!("{}/{bucket}/{key}?legal-hold", CTX.endpoint());
+        let response = anonymous_put_with_headers(
+            &url,
+            legal_hold_body,
+            &[content_md5_header(legal_hold_body)],
+        );
+
+        cleanup_object_lock_bucket(&bucket).await;
+
+        assert_eq!(response.0, 403, "unexpected body: {}", response.1);
+        assert!(
+            response.1.contains("AccessDenied"),
+            "unexpected body: {}",
+            response.1
+        );
     });
 }
 

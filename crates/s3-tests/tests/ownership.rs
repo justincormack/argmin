@@ -30,6 +30,22 @@ fn anonymous_put(url: &str, body: &'static [u8]) -> (u16, String) {
     (status, body)
 }
 
+fn anonymous_put_with_headers(
+    url: &str,
+    body: &[u8],
+    headers: &[(String, String)],
+) -> (u16, String) {
+    let request = headers
+        .iter()
+        .fold(agent().put(url), |request, (name, value)| {
+            request.header(name, value)
+        });
+    let mut resp = request.send(body).expect("transport error");
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, body)
+}
+
 /// Cleanup helper.
 async fn cleanup(bucket: &str) {
     let client = CTX.client();
@@ -201,6 +217,39 @@ async fn object_owner_id(client: &aws_sdk_s3::Client, bucket: &str, key: &str) -
         .to_string()
 }
 
+async fn assert_alt_get_object_tagging_denied(bucket: &str, key: &str) {
+    let result = CTX
+        .alt_client()
+        .get_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await;
+    assert_eq!(err_status(&result), 403);
+}
+
+async fn assert_alt_put_object_tagging_denied(bucket: &str, key: &str) {
+    let tagging = aws_sdk_s3::types::Tagging::builder()
+        .tag_set(
+            aws_sdk_s3::types::Tag::builder()
+                .key("alt")
+                .value("denied")
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    let result = CTX
+        .alt_client()
+        .put_object_tagging()
+        .bucket(bucket)
+        .key(key)
+        .tagging(tagging)
+        .send()
+        .await;
+    assert_eq!(err_status(&result), 403);
+}
+
 fn has_grant(grants: &[Grant], permission: Permission, canonical_user_id: &str) -> bool {
     grants.iter().any(|grant| {
         grant.permission() == Some(&permission)
@@ -247,6 +296,55 @@ fn test_anonymous_public_write_put_uses_special_anonymous_owner_id() {
             .await
             .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_anonymous_public_write_put_object_acl_denied_for_anonymous_owner() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_public_write_bucket(client).await;
+        let key = "anonymous-owner-acl-write";
+        let object_url = format!("{}/{bucket}/{key}", CTX.endpoint());
+        let acl_url = format!("{object_url}?acl");
+
+        let (status, body) = anonymous_put(&object_url, b"data");
+        assert_eq!(status, 200, "unexpected body: {body}");
+
+        let acl_put = anonymous_put_with_headers(
+            &acl_url,
+            b"",
+            &[("x-amz-acl".to_string(), "public-read".to_string())],
+        );
+        assert_eq!(acl_put.0, 403, "unexpected body: {}", acl_put.1);
+        assert!(
+            acl_put
+                .1
+                .contains("Anonymous users cannot invoke this API. Please authenticate."),
+            "unexpected body: {}",
+            acl_put.1
+        );
+
+        let mut acl = agent().get(&acl_url).call().expect("transport error");
+        let acl_status = acl.status().as_u16();
+        let acl_body = acl.body_mut().read_to_string().unwrap_or_default();
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+
+        assert_eq!(acl_status, 200, "unexpected body: {acl_body}");
+        assert!(
+            !acl_body.contains(
+                "<URI>http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission>READ</Permission>"
+            ),
+            "unexpected body: {acl_body}"
+        );
     });
 }
 
@@ -359,6 +457,73 @@ async fn create_bucket_with_alt_object_access(ownership: ObjectOwnership) -> Str
     bucket
 }
 
+async fn run_cross_account_object_tagging_matrix_case(ownership: ObjectOwnership) {
+    let client = CTX.client();
+    let alt = CTX.alt_client();
+    let bucket = create_bucket_with_alt_object_access(ownership).await;
+    let key = "writer-owned-tags";
+
+    alt.put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"data"))
+        .send()
+        .await
+        .unwrap();
+
+    let owner_initial = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    assert!(owner_initial.tag_set().is_empty());
+
+    assert_alt_get_object_tagging_denied(&bucket, key).await;
+    assert_alt_put_object_tagging_denied(&bucket, key).await;
+
+    let tagging = aws_sdk_s3::types::Tagging::builder()
+        .tag_set(
+            aws_sdk_s3::types::Tag::builder()
+                .key("owner")
+                .value("updated")
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap();
+    client
+        .put_object_tagging()
+        .bucket(&bucket)
+        .key(key)
+        .tagging(tagging)
+        .send()
+        .await
+        .unwrap();
+
+    let owner_updated = client
+        .get_object_tagging()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    assert!(owner_updated
+        .tag_set()
+        .iter()
+        .any(|tag| tag.key() == "owner" && tag.value() == "updated"));
+
+    client
+        .delete_object()
+        .bucket(&bucket)
+        .key(key)
+        .send()
+        .await
+        .unwrap();
+    client.delete_bucket().bucket(&bucket).send().await.unwrap();
+}
+
 // ── test_create_bucket_no_ownership_controls ────────────────────────
 
 /// A fresh bucket (no ownership header) should default to BucketOwnerEnforced.
@@ -450,6 +615,20 @@ fn test_bucket_owner_cannot_get_private_object_written_by_other_user() {
             .await
             .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_object_writer_cross_account_object_tagging_matrix() {
+    s3_tests::run(async {
+        run_cross_account_object_tagging_matrix_case(ObjectOwnership::ObjectWriter).await;
+    });
+}
+
+#[test]
+fn test_bucket_owner_preferred_cross_account_object_tagging_matrix() {
+    s3_tests::run(async {
+        run_cross_account_object_tagging_matrix_case(ObjectOwnership::BucketOwnerPreferred).await;
     });
 }
 
@@ -1261,8 +1440,8 @@ async fn anonymous_get_body_eventually(url: &str, expected_body: &str, descripti
     unreachable!()
 }
 
-async fn alt_get_object_access_denied_eventually(bucket: &str, key: &str) {
-    const MAX_ATTEMPTS: usize = 10;
+async fn alt_get_object_access_denied_after_boe_eventually(bucket: &str, key: &str) {
+    const MAX_ATTEMPTS: usize = 50;
 
     for attempt in 0..MAX_ATTEMPTS {
         let result = CTX
@@ -1283,9 +1462,37 @@ async fn alt_get_object_access_denied_eventually(bucket: &str, key: &str) {
             continue;
         }
         panic!(
-            "alternate GetObject did not converge to AccessDenied for {bucket}/{key}: {:?}",
+            "alternate GetObject did not converge to AccessDenied after BOE for {bucket}/{key}: {:?}",
             result
         );
+    }
+
+    unreachable!()
+}
+
+async fn alt_get_object_restored_after_boe_eventually(
+    bucket: &str,
+    key: &str,
+) -> aws_sdk_s3::operation::get_object::GetObjectOutput {
+    const MAX_ATTEMPTS: usize = 50;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match CTX
+            .alt_client()
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+        {
+            Ok(output) => return output,
+            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!(
+                "alternate GetObject did not converge to restored access after BOE removal for {bucket}/{key}: {err:?}"
+            ),
+        }
     }
 
     unreachable!()
@@ -1712,7 +1919,7 @@ fn test_bucket_owner_enforced_disables_legacy_explicit_grantee_read_acl() {
 
         set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
 
-        alt_get_object_access_denied_eventually(&bucket, "pre-boe-grant-read").await;
+        alt_get_object_access_denied_after_boe_eventually(&bucket, "pre-boe-grant-read").await;
 
         cleanup_keys(&bucket, &["pre-boe-grant-read"]).await;
     });
@@ -1872,11 +2079,12 @@ fn test_bucket_owner_enforced_restores_legacy_explicit_grantee_read_acl() {
 
         set_bucket_ownership(&bucket, ObjectOwnership::BucketOwnerEnforced).await;
 
-        alt_get_object_access_denied_eventually(&bucket, "pre-boe-grant-read").await;
+        alt_get_object_access_denied_after_boe_eventually(&bucket, "pre-boe-grant-read").await;
 
         delete_bucket_ownership(&bucket).await;
 
-        let after = alt_get_object_eventually(&bucket, "pre-boe-grant-read").await;
+        let after =
+            alt_get_object_restored_after_boe_eventually(&bucket, "pre-boe-grant-read").await;
         let after_body = after.body.collect().await.unwrap().into_bytes();
         assert_eq!(&after_body[..], b"granted");
 

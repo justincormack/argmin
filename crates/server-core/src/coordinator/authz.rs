@@ -220,7 +220,9 @@ impl Coordinator {
     ) -> bool {
         (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
             && Self::requester_is_bucket_owner_account(requester, bucket))
-            || Self::requester_matches_owner_identity(requester, object.owner())
+            || requester
+                .account()
+                .is_some_and(|_| Self::requester_matches_owner_identity(requester, object.owner()))
             || object.acl_grants().is_some_and(|grants| {
                 Self::requester_has_acl_permission(requester, grants, AclPermission::WriteAcp)
             })
@@ -352,10 +354,10 @@ impl Coordinator {
     pub(super) fn requester_can_manage_object_tags(
         requester: &Requester,
         bucket: &BucketSummary,
-        object: &StoredObject,
+        _object: &StoredObject,
     ) -> bool {
-        requester.principal_opt() == Some(bucket.owner_principal.as_str())
-            || Self::requester_matches_owner_identity(requester, object.owner())
+        Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+            || Self::requester_is_bucket_owner_account(requester, bucket)
     }
 
     pub(super) fn is_bucket_owner_enforced(config: Option<&BucketOwnershipControls>) -> bool {
@@ -1587,6 +1589,9 @@ impl Coordinator {
         &'a self,
         req: &PutObjectAclRequest<'_>,
     ) -> Result<AuthorizedPutObjectAclUpdate<'a>, ServerError> {
+        if req.object.requester().is_anonymous() {
+            return Err(ServerError::AnonymousApiAccessDenied);
+        }
         let LoadedObjectState {
             bucket_info,
             locked,

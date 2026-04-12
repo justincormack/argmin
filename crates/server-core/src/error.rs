@@ -170,6 +170,9 @@ pub enum ServerError {
     #[error("access denied")]
     AccessDenied,
 
+    #[error("anonymous users cannot invoke this API")]
+    AnonymousApiAccessDenied,
+
     #[error("no such upload: {upload_id}")]
     NoSuchUpload { upload_id: String },
 
@@ -307,7 +310,7 @@ impl ServerError {
             Self::InvalidBucketState => "InvalidBucketState",
             Self::AccessControlListNotSupported => "AccessControlListNotSupported",
             Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
-            Self::AccessDenied => "AccessDenied",
+            Self::AccessDenied | Self::AnonymousApiAccessDenied => "AccessDenied",
             Self::NoSuchUpload { .. } => "NoSuchUpload",
             Self::InvalidPart { .. } => "InvalidPart",
             Self::InvalidPartOrder => "InvalidPartOrder",
@@ -387,7 +390,7 @@ impl ServerError {
             | Self::IncompleteBody
             | Self::MalformedTrailerError { .. } => 400,
             Self::MissingContentLength => 411,
-            Self::AccessDenied => 403,
+            Self::AccessDenied | Self::AnonymousApiAccessDenied => 403,
             Self::NoSuchUpload { .. } => 404,
             Self::InvalidPart { .. } | Self::InvalidPartOrder | Self::EntityTooSmall { .. } => 400,
             Self::NotImplemented { .. }

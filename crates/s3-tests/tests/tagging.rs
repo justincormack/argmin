@@ -6,7 +6,7 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, content_md5_header, create_public_bucket,
-    err_status, send_signed_request, unique_bucket, CTX,
+    create_public_write_bucket, err_status, send_signed_request, unique_bucket, CTX,
 };
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -22,6 +22,28 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
         let _ = client.delete_object().bucket(bucket).key(*key).send().await;
     }
     client.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+fn anonymous_get(url: &str) -> (u16, String) {
+    let mut resp = s3_tests::test_agent()
+        .get(url)
+        .call()
+        .expect("transport error");
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, body)
+}
+
+fn anonymous_put(url: &str, body: &[u8], headers: &[(String, String)]) -> (u16, String) {
+    let request = headers
+        .iter()
+        .fold(s3_tests::test_agent().put(url), |request, (name, value)| {
+            request.header(name, value)
+        });
+    let mut resp = request.send(body).expect("transport error");
+    let status = resp.status().as_u16();
+    let body = resp.body_mut().read_to_string().unwrap_or_default();
+    (status, body)
 }
 
 fn tag(key: &str, value: &str) -> Tag {
@@ -652,6 +674,88 @@ fn test_public_read_object_does_not_make_get_object_tagging_public() {
         );
 
         cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_anonymous_public_write_object_get_object_tagging_behavior() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_public_write_bucket(client).await;
+        let key = "anonymous-owner-tagging";
+        let object_url = format!("{}/{bucket}/{key}", CTX.endpoint());
+        let tagging_url = format!("{object_url}?tagging");
+
+        let put = anonymous_put(&object_url, b"hello", &[]);
+        assert_eq!(put.0, 200, "unexpected anonymous PUT body: {}", put.1);
+
+        let owner_view = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(owner_view.tag_set().is_empty());
+
+        let anonymous_get = anonymous_get(&tagging_url);
+
+        cleanup(&bucket, &[key]).await;
+
+        assert_eq!(
+            anonymous_get.0, 403,
+            "unexpected anonymous GetObjectTagging body={}",
+            anonymous_get.1
+        );
+        assert!(
+            anonymous_get.1.contains("AccessDenied"),
+            "unexpected anonymous GetObjectTagging body={}",
+            anonymous_get.1
+        );
+    });
+}
+
+#[test]
+fn test_anonymous_public_write_object_put_object_tagging_behavior() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_public_write_bucket(client).await;
+        let key = "anonymous-owner-put-tagging";
+        let object_url = format!("{}/{bucket}/{key}", CTX.endpoint());
+        let tagging_url = format!("{object_url}?tagging");
+
+        let put = anonymous_put(&object_url, b"hello", &[]);
+        assert_eq!(put.0, 200, "unexpected anonymous PUT body: {}", put.1);
+
+        let tagging_body =
+            br#"<Tagging><TagSet><Tag><Key>env</Key><Value>anon</Value></Tag></TagSet></Tagging>"#;
+        let tagging_put = anonymous_put(
+            &tagging_url,
+            tagging_body,
+            &[content_md5_header(tagging_body)],
+        );
+
+        let owner_view = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+
+        cleanup(&bucket, &[key]).await;
+
+        assert_eq!(
+            tagging_put.0, 403,
+            "unexpected anonymous PutObjectTagging body={}",
+            tagging_put.1
+        );
+        assert!(
+            tagging_put.1.contains("AccessDenied"),
+            "unexpected anonymous PutObjectTagging body={}",
+            tagging_put.1
+        );
+        let owner_view = owner_view.unwrap();
+        assert!(owner_view.tag_set().is_empty());
     });
 }
 

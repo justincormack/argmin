@@ -26388,7 +26388,7 @@ mod tests {
     }
 
     #[test]
-    fn get_object_tags_allows_bucket_owner_for_cross_owned_object() {
+    fn bucket_owner_can_manage_object_tags_for_cross_owned_object() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         let owner_canonical_id = CanonicalUserId::from_principal("owner-a");
@@ -26426,13 +26426,25 @@ mod tests {
             },
         )
         .unwrap();
-        put_object_tags_test(
+        let denied = put_object_tags_test(
             &coord,
             "bucket",
             "key",
             None,
             tags_xml,
             test_helpers::requester("writer-a"),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(denied, ServerError::AccessDenied));
+
+        put_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            tags_xml,
+            test_helpers::requester("owner-a"),
             None,
         )
         .unwrap();
