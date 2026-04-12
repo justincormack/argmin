@@ -32,7 +32,7 @@ impl MissingObjectDiscovery {
                 Coordinator::requester_can_discover_missing_object(requester, bucket)
             }
             Self::BucketAdmin => {
-                Coordinator::requester_can_bucket_admin(requester, &bucket.owner_principal)
+                Coordinator::requester_can_bucket_owner_account_admin(requester, bucket)
             }
             Self::ObjectAcl => {
                 Coordinator::requester_can_discover_missing_object_acl(requester, bucket)
@@ -66,16 +66,21 @@ impl Coordinator {
         bucket: &BucketSummary,
     ) -> bool {
         Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
-            || Self::requester_is_bucket_owner_account(requester, bucket)
+            || (requester.authorization_profile() == auth::AuthorizationProfile::OwnerAccountAdmin
+                && Self::requester_is_bucket_owner_account(requester, bucket))
     }
 
     pub(super) fn requester_has_acl_permission(
         requester: &Requester,
         acl_grants: &AclGrants,
+        owner_canonical_id: &CanonicalUserId,
         permission: AclPermission,
     ) -> bool {
         requester.canonical_user_id().is_some_and(|id| {
-            acl_grants.allows_canonical_user(id, permission)
+            (acl_grants.allows_canonical_user(id, permission)
+                && (id != owner_canonical_id
+                    || requester.authorization_profile()
+                        == auth::AuthorizationProfile::OwnerAccountAdmin))
                 || acl_grants.allows_authenticated_users(permission)
         })
     }
@@ -83,21 +88,29 @@ impl Coordinator {
     pub(super) fn requester_has_nonpublic_object_acl_permission(
         requester: &Requester,
         acl_grants: &AclGrants,
+        owner_canonical_id: &CanonicalUserId,
         permission: AclPermission,
     ) -> bool {
-        requester
-            .canonical_user_id()
-            .is_some_and(|id| acl_grants.allows_canonical_user(id, permission))
+        requester.canonical_user_id().is_some_and(|id| {
+            acl_grants.allows_canonical_user(id, permission)
+                && (id != owner_canonical_id
+                    || requester.authorization_profile()
+                        == auth::AuthorizationProfile::OwnerAccountAdmin)
+        })
     }
 
     pub(super) fn requester_has_nonpublic_bucket_acl_permission(
         requester: &Requester,
         acl_grants: &AclGrants,
+        owner_canonical_id: &CanonicalUserId,
         permission: AclPermission,
     ) -> bool {
-        requester
-            .canonical_user_id()
-            .is_some_and(|id| acl_grants.allows_canonical_user(id, permission))
+        requester.canonical_user_id().is_some_and(|id| {
+            acl_grants.allows_canonical_user(id, permission)
+                && (id != owner_canonical_id
+                    || requester.authorization_profile()
+                        == auth::AuthorizationProfile::OwnerAccountAdmin)
+        })
     }
 
     pub(super) fn acl_grants_public_read(acl_grants: &AclGrants) -> bool {
@@ -118,12 +131,17 @@ impl Coordinator {
 
     pub(super) fn requester_can_object_write(
         requester: &Requester,
-        owner_principal: &str,
+        bucket: &BucketSummary,
         acl_grants: &AclGrants,
         public_write: bool,
     ) -> bool {
-        requester.principal_opt() == Some(owner_principal)
-            || Self::requester_has_acl_permission(requester, acl_grants, AclPermission::Write)
+        Self::requester_can_bucket_owner_account_admin(requester, bucket)
+            || Self::requester_has_acl_permission(
+                requester,
+                acl_grants,
+                &bucket.owner_canonical_id,
+                AclPermission::Write,
+            )
             || public_write
     }
 
@@ -138,10 +156,16 @@ impl Coordinator {
             Self::requester_has_nonpublic_bucket_acl_permission(
                 requester,
                 acl_grants,
+                &bucket.owner_canonical_id,
                 AclPermission::Read,
             )
         } else {
-            Self::requester_has_acl_permission(requester, acl_grants, AclPermission::Read)
+            Self::requester_has_acl_permission(
+                requester,
+                acl_grants,
+                &bucket.owner_canonical_id,
+                AclPermission::Read,
+            )
         };
 
         requester.principal_opt() == Some(owner_principal) || acl_allows_read || public_read
@@ -161,10 +185,16 @@ impl Coordinator {
                 Self::requester_has_nonpublic_object_acl_permission(
                     requester,
                     grants,
+                    &object.owner().canonical_id,
                     AclPermission::Read,
                 )
             } else {
-                Self::requester_has_acl_permission(requester, grants, AclPermission::Read)
+                Self::requester_has_acl_permission(
+                    requester,
+                    grants,
+                    &object.owner().canonical_id,
+                    AclPermission::Read,
+                )
             }
         });
 
@@ -187,6 +217,7 @@ impl Coordinator {
             || Self::requester_has_acl_permission(
                 requester,
                 &bucket.acl_grants,
+                &bucket.owner_canonical_id,
                 AclPermission::ReadAcp,
             )
     }
@@ -204,6 +235,7 @@ impl Coordinator {
             || Self::requester_has_acl_permission(
                 requester,
                 &bucket.acl_grants,
+                &bucket.owner_canonical_id,
                 AclPermission::WriteAcp,
             )
     }
@@ -217,7 +249,12 @@ impl Coordinator {
             && Self::requester_is_bucket_owner_account(requester, bucket))
             || Self::requester_matches_owner_identity(requester, object.owner())
             || object.acl_grants().is_some_and(|grants| {
-                Self::requester_has_acl_permission(requester, grants, AclPermission::ReadAcp)
+                Self::requester_has_acl_permission(
+                    requester,
+                    grants,
+                    &object.owner().canonical_id,
+                    AclPermission::ReadAcp,
+                )
             })
     }
 
@@ -232,7 +269,12 @@ impl Coordinator {
                 .account()
                 .is_some_and(|_| Self::requester_matches_owner_identity(requester, object.owner()))
             || object.acl_grants().is_some_and(|grants| {
-                Self::requester_has_acl_permission(requester, grants, AclPermission::WriteAcp)
+                Self::requester_has_acl_permission(
+                    requester,
+                    grants,
+                    &object.owner().canonical_id,
+                    AclPermission::WriteAcp,
+                )
             })
     }
 
@@ -295,7 +337,7 @@ impl Coordinator {
         bucket: &BucketSummary,
         upload: &MultipartUploadRecord,
     ) -> bool {
-        Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+        Self::requester_can_bucket_owner_account_admin(requester, bucket)
             || Self::requester_matches_owner_identity(requester, &upload.owner)
             || upload.initiator.as_ref().is_some_and(|initiator| {
                 Self::requester_matches_owner_identity(requester, initiator)
@@ -307,7 +349,7 @@ impl Coordinator {
         bucket: &BucketSummary,
         upload: &storage::CompletedMultipartUploadRecord,
     ) -> bool {
-        Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+        Self::requester_can_bucket_owner_account_admin(requester, bucket)
             || Self::requester_matches_owner_identity(requester, &upload.owner)
             || upload.initiator.as_ref().is_some_and(|initiator| {
                 Self::requester_matches_owner_identity(requester, initiator)
@@ -321,7 +363,7 @@ impl Coordinator {
     ) -> bool {
         Self::requester_can_object_write(
             requester,
-            &bucket.owner_principal,
+            bucket,
             &bucket.acl_grants,
             Self::effective_public_write(bucket),
         ) && Self::requester_can_manage_multipart_upload(requester, bucket, upload)
@@ -837,7 +879,7 @@ impl Coordinator {
             action,
             PutObjectPolicyContext::default(),
             policy,
-            || Self::requester_can_bucket_admin(requester, &bucket.owner_principal),
+            || Self::requester_can_bucket_owner_account_admin(requester, bucket),
         )
     }
 
@@ -868,7 +910,7 @@ impl Coordinator {
             || {
                 Self::requester_can_object_write(
                     requester,
-                    &bucket.owner_principal,
+                    bucket,
                     &bucket.acl_grants,
                     Self::effective_public_write(bucket),
                 )
@@ -922,10 +964,11 @@ impl Coordinator {
         existing_object: Option<&StoredObject>,
     ) -> Result<bool, ServerError> {
         let default_allowed = if let Some(object) = existing_object {
-            requester.principal_opt() == Some(bucket.owner_principal.as_str())
+            Self::requester_can_bucket_owner_account_admin(requester, bucket)
                 || Self::requester_has_acl_permission(
                     requester,
                     &bucket.acl_grants,
+                    &bucket.owner_canonical_id,
                     AclPermission::Write,
                 )
                 || (Self::effective_public_write(bucket)
@@ -933,7 +976,7 @@ impl Coordinator {
         } else {
             Self::requester_can_object_write(
                 requester,
-                &bucket.owner_principal,
+                bucket,
                 &bucket.acl_grants,
                 Self::effective_public_write(bucket),
             )
@@ -962,7 +1005,7 @@ impl Coordinator {
             auth::PolicyAction::PutObjectTagging,
             policy_context,
             policy,
-            Self::requester_can_bucket_admin(requester, &bucket.owner_principal),
+            Self::requester_can_bucket_owner_account_admin(requester, bucket),
         )
     }
 

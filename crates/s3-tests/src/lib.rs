@@ -58,6 +58,7 @@ pub fn run<F: std::future::Future>(f: F) -> F::Output {
 /// random port with well-known test credentials.
 pub struct TestContext {
     client: Client,
+    second_client: Option<Client>,
     owner_root_client: Option<Client>,
     alt_client: Client,
     endpoint: String,
@@ -82,6 +83,8 @@ impl TestContext {
     /// - `S3_TEST_ALT_ACCESS_KEY`: alternate access key from a different AWS account
     /// - `S3_TEST_ALT_SECRET_KEY`: alternate secret key from a different AWS account
     /// - `S3_TEST_ALT_ACCOUNT_ID`: alternate AWS account ID
+    /// - `S3_TEST_SECOND_ACCESS_KEY`: optional same-account constrained access key
+    /// - `S3_TEST_SECOND_SECRET_KEY`: optional same-account constrained secret key
     /// - `S3_TEST_OWNER_ROOT_ACCESS_KEY`: optional owner-account root access key
     /// - `S3_TEST_OWNER_ROOT_SECRET_KEY`: optional owner-account root secret key
     /// - `S3_TEST_BUCKET_PREFIX`: required prefix for external test buckets
@@ -120,6 +123,24 @@ impl TestContext {
             );
             let region =
                 std::env::var("S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+            let second_client = match (
+                std::env::var("S3_TEST_SECOND_ACCESS_KEY"),
+                std::env::var("S3_TEST_SECOND_SECRET_KEY"),
+            ) {
+                (Ok(second_access_key), Ok(second_secret_key)) => Some(
+                    build_client(&endpoint, &second_access_key, &second_secret_key, &region).await,
+                ),
+                (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
+                (Err(std::env::VarError::NotPresent), Ok(_)) => {
+                    panic!("S3_TEST_SECOND_ACCESS_KEY required with S3_TEST_SECOND_SECRET_KEY");
+                }
+                (Ok(_), Err(std::env::VarError::NotPresent)) => {
+                    panic!("S3_TEST_SECOND_SECRET_KEY required with S3_TEST_SECOND_ACCESS_KEY");
+                }
+                (Err(err), _) | (_, Err(err)) => {
+                    panic!("read second same-account AWS test credentials: {err}");
+                }
+            };
             let owner_root_client = match (
                 std::env::var("S3_TEST_OWNER_ROOT_ACCESS_KEY"),
                 std::env::var("S3_TEST_OWNER_ROOT_SECRET_KEY"),
@@ -166,6 +187,7 @@ impl TestContext {
             .await;
             TestContext {
                 client,
+                second_client,
                 owner_root_client,
                 alt_client,
                 endpoint,
@@ -196,6 +218,16 @@ impl TestContext {
                 server.tls_ca_pem(),
             )
             .await;
+            let second_client = Some(
+                build_client_with_ca(
+                    &endpoint,
+                    server::TEST_SECOND_ACCESS_KEY,
+                    server::TEST_SECOND_SECRET_KEY,
+                    server::TEST_REGION,
+                    server.tls_ca_pem(),
+                )
+                .await,
+            );
             let owner_root_client = Some(
                 build_client_with_ca(
                     &endpoint,
@@ -208,6 +240,7 @@ impl TestContext {
             );
             TestContext {
                 client,
+                second_client,
                 owner_root_client,
                 alt_client,
                 endpoint,
@@ -226,6 +259,20 @@ impl TestContext {
         &self.client
     }
 
+    /// An optional same-account constrained S3 client.
+    pub fn second_client(&self) -> Option<&Client> {
+        self.second_client.as_ref()
+    }
+
+    /// The same-account constrained S3 client, or panic with a focused setup message.
+    pub fn require_second_client(&self) -> &Client {
+        self.second_client.as_ref().unwrap_or_else(|| {
+            panic!(
+                "S3_TEST_SECOND_ACCESS_KEY/S3_TEST_SECOND_SECRET_KEY required for constrained same-account AWS tests"
+            )
+        })
+    }
+
     /// An owner-account root S3 client, when configured for external AWS tests.
     pub fn owner_root_client(&self) -> Option<&Client> {
         self.owner_root_client.as_ref()
@@ -235,7 +282,7 @@ impl TestContext {
     pub fn require_owner_root_client(&self) -> &Client {
         self.owner_root_client.as_ref().unwrap_or_else(|| {
             panic!(
-                "S3_TEST_OWNER_ROOT_ACCESS_KEY/S3_TEST_OWNER_ROOT_SECRET_KEY required for bucket_policy_root AWS tests"
+                "S3_TEST_OWNER_ROOT_ACCESS_KEY/S3_TEST_OWNER_ROOT_SECRET_KEY required for privileged owner-root AWS tests"
             )
         })
     }

@@ -3,6 +3,16 @@ use std::collections::HashMap;
 
 use s3_types::AccountIdentity;
 
+/// Coarse-grained authorization scope attached to an authenticated credential.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AuthorizationProfile {
+    /// No implicit owner-account administrative permissions beyond principal/ACL/policy checks.
+    #[default]
+    Standard,
+    /// Broad owner-account administrative permissions for the credential's own account.
+    OwnerAccountAdmin,
+}
+
 /// A secret access key. Deliberately does not implement Debug to avoid leaking secrets.
 /// Field is private — use [`SecretKey::as_str()`] to access the value.
 pub struct SecretKey(String);
@@ -30,6 +40,7 @@ pub struct CredentialRecord {
     pub access_key_id: String,
     pub secret_key: SecretKey,
     pub account: AccountIdentity,
+    pub authorization_profile: AuthorizationProfile,
     pub session_token: Option<String>,
     pub expires_at_epoch_secs: Option<u64>,
     pub enabled: bool,
@@ -48,6 +59,7 @@ impl std::fmt::Debug for CredentialRecord {
             )
             .field("secret_key", &self.secret_key)
             .field("account", &self.account)
+            .field("authorization_profile", &self.authorization_profile)
             .field("session_token", &session_token)
             .field("expires_at_epoch_secs", &self.expires_at_epoch_secs)
             .field("enabled", &self.enabled)
@@ -158,6 +170,7 @@ impl CredentialStore {
             access_key_id,
             secret_key,
             account,
+            authorization_profile: AuthorizationProfile::Standard,
             session_token: None,
             expires_at_epoch_secs: None,
             enabled: true,
@@ -232,6 +245,7 @@ mod tests {
                 s3_types::CanonicalUserId::from_principal("user-123"),
                 "User 123",
             ),
+            authorization_profile: AuthorizationProfile::Standard,
             session_token: Some("token".into()),
             expires_at_epoch_secs: Some(1234),
             enabled: true,
@@ -303,6 +317,7 @@ mod tests {
             access_key_id: "AK\r\nID".into(),
             secret_key: SecretKey::new("super-secret".into()),
             account: AccountIdentity::from_principal("user-123"),
+            authorization_profile: AuthorizationProfile::Standard,
             session_token: Some("token-value".into()),
             expires_at_epoch_secs: Some(1234),
             enabled: true,

@@ -2118,18 +2118,23 @@ enum AuthorizedWriteTags<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Requester {
     account: Option<AccountIdentity>,
+    authorization_profile: auth::AuthorizationProfile,
 }
 
 impl Requester {
     #[must_use]
     pub const fn anonymous() -> Self {
-        Self { account: None }
+        Self {
+            account: None,
+            authorization_profile: auth::AuthorizationProfile::Standard,
+        }
     }
 
     #[must_use]
     pub fn authenticated(account: AccountIdentity) -> Self {
         Self {
             account: Some(account),
+            authorization_profile: auth::AuthorizationProfile::Standard,
         }
     }
 
@@ -2137,6 +2142,45 @@ impl Requester {
     pub fn from_account(account: Option<&AccountIdentity>) -> Self {
         Self {
             account: account.cloned(),
+            authorization_profile: auth::AuthorizationProfile::Standard,
+        }
+    }
+
+    #[must_use]
+    pub fn authenticated_owner_account_admin(account: AccountIdentity) -> Self {
+        Self {
+            account: Some(account),
+            authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
+        }
+    }
+
+    #[must_use]
+    pub fn from_account_owner_account_admin(account: Option<&AccountIdentity>) -> Self {
+        Self {
+            account: account.cloned(),
+            authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
+        }
+    }
+
+    #[must_use]
+    pub fn authenticated_with_profile(
+        account: AccountIdentity,
+        authorization_profile: auth::AuthorizationProfile,
+    ) -> Self {
+        Self {
+            account: Some(account),
+            authorization_profile,
+        }
+    }
+
+    #[must_use]
+    pub fn from_account_with_profile(
+        account: Option<&AccountIdentity>,
+        authorization_profile: auth::AuthorizationProfile,
+    ) -> Self {
+        Self {
+            account: account.cloned(),
+            authorization_profile,
         }
     }
 
@@ -2158,6 +2202,11 @@ impl Requester {
     #[must_use]
     pub fn is_anonymous(&self) -> bool {
         self.account.is_none()
+    }
+
+    #[must_use]
+    pub const fn authorization_profile(&self) -> auth::AuthorizationProfile {
+        self.authorization_profile
     }
 }
 
@@ -14735,10 +14784,10 @@ mod tests {
             same_account_canonical_id.clone(),
             "Bucket Owner",
         );
-        let same_account_user = AccountIdentity::new(
-            "arn:aws:iam::111122223333:user/admin",
+        let same_account_account_principal = AccountIdentity::new(
+            "111122223333",
             same_account_canonical_id,
-            "Same Account User",
+            "Same Account Owner Principal",
         );
 
         coord
@@ -14755,7 +14804,7 @@ mod tests {
         coord
             .authorize_delete_bucket(&bucket_request_with_expected_owner(
                 "bucket",
-                Requester::authenticated(same_account_user),
+                Requester::authenticated_owner_account_admin(same_account_account_principal),
                 None,
             ))
             .unwrap();
@@ -18963,7 +19012,8 @@ mod tests {
             "Same Account Reader",
         );
         let owner_requester = Requester::authenticated(bucket_owner.clone());
-        let same_account_requester = Requester::authenticated(same_account_user);
+        let same_account_requester =
+            Requester::authenticated_owner_account_admin(same_account_user);
 
         create_bucket_for_owner_with_flags(
             &coord,
@@ -19014,7 +19064,8 @@ mod tests {
             "Same Account Reader",
         );
         let owner_requester = Requester::authenticated(bucket_owner.clone());
-        let same_account_requester = Requester::authenticated(same_account_user);
+        let same_account_requester =
+            Requester::authenticated_owner_account_admin(same_account_user);
 
         create_bucket_for_owner_with_flags(
             &coord,
@@ -19573,6 +19624,69 @@ mod tests {
             })
             .unwrap();
         assert_eq!(obj.tags.as_deref(), Some(tags_xml));
+    }
+
+    #[test]
+    fn put_object_with_tags_allows_same_account_owner_account() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let same_account_canonical_id = CanonicalUserId::from_principal("111122223333");
+        let bucket_owner = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            same_account_canonical_id.clone(),
+            "Bucket Owner",
+        );
+        let same_account_account_principal = AccountIdentity::new(
+            "111122223333",
+            same_account_canonical_id,
+            "Same Account Owner Principal",
+        );
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(bucket_owner.clone()),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+
+        let tags_xml =
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Requester::authenticated_owner_account_admin(same_account_account_principal),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(tags_xml),
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let tags = get_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            Requester::authenticated(bucket_owner),
+            None,
+        )
+        .unwrap();
+        assert_eq!(tags.as_deref(), Some(tags_xml));
     }
 
     #[test]
@@ -26275,7 +26389,8 @@ mod tests {
             "Same Account Reader",
         );
         let owner_requester = Requester::authenticated(bucket_owner.clone());
-        let same_account_requester = Requester::authenticated(same_account_user);
+        let same_account_requester =
+            Requester::authenticated_owner_account_admin(same_account_user);
 
         create_bucket_for_owner_with_flags(
             &coord,
@@ -31497,6 +31612,88 @@ mod tests {
     }
 
     #[test]
+    fn put_object_retention_allows_same_account_owner_account() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let same_account_canonical_id = CanonicalUserId::from_principal("111122223333");
+        let bucket_owner = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            same_account_canonical_id.clone(),
+            "Bucket Owner",
+        );
+        let same_account_account_principal = AccountIdentity::new(
+            "111122223333",
+            same_account_canonical_id,
+            "Same Account Owner Principal",
+        );
+        let bucket_owner_requester = Requester::authenticated(bucket_owner);
+        let same_account_user_requester =
+            Requester::authenticated_owner_account_admin(same_account_account_principal);
+        let now = Coordinator::current_unix_seconds().unwrap();
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: bucket_owner_requester.clone(),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
+            .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    bucket_owner_requester.clone(),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        put_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: now + 200,
+            },
+            false,
+            same_account_user_requester.clone(),
+        )
+        .unwrap();
+        let fetched = get_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            same_account_user_requester,
+        )
+        .unwrap();
+        assert_eq!(
+            fetched,
+            Some(ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: now + 200,
+            })
+        );
+    }
+
+    #[test]
     fn put_object_legal_hold_bucket_policy_allows_cross_account() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -31556,6 +31753,77 @@ mod tests {
             "key",
             Some(put.version_id),
             test_helpers::requester("other-user"),
+        )
+        .unwrap();
+        assert_eq!(fetched, Some(LegalHoldStatus::On));
+    }
+
+    #[test]
+    fn put_object_legal_hold_allows_same_account_owner_account() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let same_account_canonical_id = CanonicalUserId::from_principal("111122223333");
+        let bucket_owner = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            same_account_canonical_id.clone(),
+            "Bucket Owner",
+        );
+        let same_account_account_principal = AccountIdentity::new(
+            "111122223333",
+            same_account_canonical_id,
+            "Same Account Owner Principal",
+        );
+        let bucket_owner_requester = Requester::authenticated(bucket_owner);
+        let same_account_user_requester =
+            Requester::authenticated_owner_account_admin(same_account_account_principal);
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: bucket_owner_requester.clone(),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
+            .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    bucket_owner_requester.clone(),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        put_object_legal_hold_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            LegalHoldStatus::On,
+            same_account_user_requester.clone(),
+        )
+        .unwrap();
+        let fetched = get_object_legal_hold_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            same_account_user_requester,
         )
         .unwrap();
         assert_eq!(fetched, Some(LegalHoldStatus::On));
@@ -32133,6 +32401,83 @@ mod tests {
             authorized,
             AuthorizedDeleteObject::SpecificVersionStored { version_id, .. } if version_id == put.version_id
         ));
+    }
+
+    #[test]
+    fn delete_object_allows_same_account_owner_account_bypass() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let same_account_canonical_id = CanonicalUserId::from_principal("111122223333");
+        let bucket_owner = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            same_account_canonical_id.clone(),
+            "Bucket Owner",
+        );
+        let same_account_account_principal = AccountIdentity::new(
+            "111122223333",
+            same_account_canonical_id,
+            "Same Account Owner Principal",
+        );
+        let bucket_owner_requester = Requester::authenticated(bucket_owner);
+        let same_account_user_requester =
+            Requester::authenticated_owner_account_admin(same_account_account_principal);
+        let now = Coordinator::current_unix_seconds().unwrap();
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: bucket_owner_requester.clone(),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
+            .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    bucket_owner_requester.clone(),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        put_object_retention_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: now + 200,
+            },
+            false,
+            bucket_owner_requester,
+        )
+        .unwrap();
+
+        coord
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                same_account_user_requester,
+                true,
+                NO_DELETE,
+            ))
+            .unwrap();
     }
 
     #[test]

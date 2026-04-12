@@ -59,7 +59,9 @@ pub use bucket_policy::{
     PolicyVersion,
 };
 pub use canonical::parse_amz_date;
-pub use credential::{CredentialRecord, CredentialScope, CredentialStore, SecretKey};
+pub use credential::{
+    AuthorizationProfile, CredentialRecord, CredentialScope, CredentialStore, SecretKey,
+};
 pub use error::AuthError;
 pub use post::{authenticate_post_sigv4, validate_post_policy, PostPolicyError};
 pub use request::{

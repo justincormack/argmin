@@ -132,6 +132,7 @@ async fn main() {
             access_key_id: config.access_key_id.clone(),
             secret_key: SecretKey::new(config.secret_access_key.clone()),
             account,
+            authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
             session_token: None,
             expires_at_epoch_secs: None,
             enabled: true,

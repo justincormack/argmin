@@ -11,6 +11,8 @@ use storage::CanonicalUserId;
 pub const TEST_ACCOUNT_ID: &str = "111122223333";
 pub const TEST_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
 pub const TEST_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+pub const TEST_SECOND_ACCESS_KEY: &str = "AKIAISECONDUSEREXAMPLE";
+pub const TEST_SECOND_SECRET_KEY: &str = "secondUserSecretKeyExampleDontUse";
 pub const TEST_OWNER_ROOT_ACCESS_KEY: &str = "AKIAIROOTOWNEREXAMPLE";
 pub const TEST_OWNER_ROOT_SECRET_KEY: &str = "rootOwnerSecretKeyExampleDontUse";
 pub const TEST_REGION: &str = "us-east-1";
@@ -179,6 +181,20 @@ impl TestServer {
                         CanonicalUserId::from_principal(TEST_ACCOUNT_ID),
                         "test-account",
                     ),
+                    authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
+                    session_token: None,
+                    expires_at_epoch_secs: None,
+                    enabled: true,
+                });
+                credentials.add_record(auth::CredentialRecord {
+                    access_key_id: TEST_SECOND_ACCESS_KEY.to_string(),
+                    secret_key: auth::SecretKey::new(TEST_SECOND_SECRET_KEY.to_string()),
+                    account: AccountIdentity::new(
+                        format!("arn:aws:iam::{TEST_ACCOUNT_ID}:user/limited"),
+                        CanonicalUserId::from_principal(TEST_ACCOUNT_ID),
+                        "test-account-limited",
+                    ),
+                    authorization_profile: auth::AuthorizationProfile::Standard,
                     session_token: None,
                     expires_at_epoch_secs: None,
                     enabled: true,
@@ -191,6 +207,7 @@ impl TestServer {
                         CanonicalUserId::from_principal(TEST_ACCOUNT_ID),
                         "test-account-root",
                     ),
+                    authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
                     session_token: None,
                     expires_at_epoch_secs: None,
                     enabled: true,
@@ -203,6 +220,7 @@ impl TestServer {
                         CanonicalUserId::from_principal(ALT_ACCOUNT_ID),
                         "alt-account",
                     ),
+                    authorization_profile: auth::AuthorizationProfile::OwnerAccountAdmin,
                     session_token: None,
                     expires_at_epoch_secs: None,
                     enabled: true,

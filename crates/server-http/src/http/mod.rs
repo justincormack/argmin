@@ -782,7 +782,10 @@ impl HttpFrontend {
     }
 
     fn requester_from_auth(auth: &AuthContext) -> crate::coordinator::Requester {
-        crate::coordinator::Requester::from_account(auth.account.as_ref())
+        crate::coordinator::Requester::from_account_with_profile(
+            auth.account.as_ref(),
+            auth.authorization_profile,
+        )
     }
 
     fn authenticated_account(
@@ -5212,6 +5215,7 @@ mod tests {
             mode: auth::AuthMode::HeaderSigV4,
             access_key_id: Some("AKID".to_string()),
             account: Some(auth::AccountIdentity::from_principal("testuser")),
+            authorization_profile: auth::AuthorizationProfile::Standard,
             request_epoch_secs: Some(0),
             signing_region: Some("us-east-1".to_string()),
             streaming: None,
@@ -5385,6 +5389,7 @@ mod tests {
             mode: auth::AuthMode::HeaderSigV4,
             access_key_id: Some("AKID".to_string()),
             account: Some(auth::AccountIdentity::from_principal("testuser")),
+            authorization_profile: auth::AuthorizationProfile::Standard,
             request_epoch_secs: Some(0),
             signing_region: Some("us-west-2".to_string()),
             streaming: None,
@@ -5417,6 +5422,7 @@ mod tests {
             mode: auth::AuthMode::HeaderSigV4,
             access_key_id: Some("AKID".to_string()),
             account: Some(auth::AccountIdentity::from_principal("testuser")),
+            authorization_profile: auth::AuthorizationProfile::Standard,
             request_epoch_secs: Some(0),
             signing_region: Some("us-west-2".to_string()),
             streaming: None,
@@ -5494,6 +5500,7 @@ mod tests {
             mode: auth::AuthMode::HeaderSigV4,
             access_key_id: Some("AKID".to_string()),
             account: Some(account),
+            authorization_profile: auth::AuthorizationProfile::Standard,
             request_epoch_secs: Some(0),
             signing_region: Some("us-east-1".to_string()),
             streaming: None,
@@ -9430,6 +9437,7 @@ mod tests {
             mode: auth::AuthMode::HeaderSigV4,
             access_key_id: Some("AKID".to_string()),
             account: Some(auth::AccountIdentity::from_principal("testuser")),
+            authorization_profile: auth::AuthorizationProfile::Standard,
             request_epoch_secs: Some(0),
             signing_region: Some("us-east-1".to_string()),
             streaming: None, // missing!
