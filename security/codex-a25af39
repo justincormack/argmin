@@ -1,0 +1,112 @@
+Constrained same-account users still read/manage data as owners
+Link: https://chatgpt.com/codex/cloud/security/findings/aac3812d7e2c8191a699417215ba12bb?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: new
+
+# Metadata
+Repo: justincormack/argmin
+Commit: a25af39
+Author: justin@specialbusservice.com
+Created: 12/04/2026, 19:18:06
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+The new AuthorizationProfile was not consistently enforced. Functions like requester_can_read_object and requester_can_manage_object_tags still authorize any same-account requester when ownership is BucketOwnerEnforced, so a Standard-profile credential can read objects and modify tags despite being intended as constrained. This is an authorization bypass introduced with the new profile model.
+The commit introduces AuthorizationProfile to distinguish owner-account administrators from constrained same-account credentials. However, several authorization paths still use requester_is_bucket_owner_account without checking the profile. In particular, when bucket ownership controls are BucketOwnerEnforced (the default for new buckets), requester_can_read_object returns true for any same-account principal, so a constrained credential can read objects without ACL or policy grants. The same issue affects object tag management, which also treats any same-account principal as authorized. This bypasses the intended restrictions for Standard credentials and allows unauthorized data access within the same account.
+
+# Validation
+## Rubric
+- [x] Identify AuthorizationProfile semantics (Standard vs OwnerAccountAdmin) in auth credential definition
+- [x] Confirm requester_can_bucket_owner_account_admin uses authorization_profile gating
+- [x] Verify requester_can_read_object BucketOwnerEnforced branch uses requester_is_bucket_owner_account without profile check
+- [x] Verify requester_can_manage_object_tags uses requester_is_bucket_owner_account without profile check
+- [x] Confirm requester_is_bucket_owner_account only checks account/principal equality
+## Report
+Build attempt for dynamic validation failed because the ec-sys crate requires the system libisal dependency (see /workspace/validation_artifacts/argmin-authz-bypass/build_attempt.log: cargo build stops with “libisal not found”). Valgrind and gdb are not installed in the container, so crash/valgrind/debugger validation could not be performed.
+
+Code inspection confirms the bypass. AuthorizationProfile::Standard is documented as “No implicit owner-account administrative permissions” while OwnerAccountAdmin has broad owner-account permissions (crates/auth/src/credential.rs:6-13). The intended profile gating is implemented in requester_can_bucket_owner_account_admin, which only grants same-account admin rights when authorization_profile == OwnerAccountAdmin (crates/server-core/src/coordinator/authz.rs:64-70). However, requester_can_read_object short-circuits for BucketOwnerEnforced buckets to requester_is_bucket_owner_account without any profile check (crates/server-core/src/coordinator/authz.rs:174-181). requester_is_bucket_owner_account only compares principals/account IDs (crates/server-core/src/coordinator/authz.rs:295-314), so any same-account credential (including Standard) is treated as authorized. The same pattern exists in requester_can_manage_object_tags, which allows any same-account requester via requester_is_bucket_owner_account (crates/server-core/src/coordinator/authz.rs:404-411). This matches the reported authorization bypass: Standard-profile credentials gain read/tag management capabilities in owner-enforced buckets despite the profile’s intended constraints.
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator/authz.rs (L174 to 181)
+  Note: BucketOwnerEnforced path allows any same-account principal via requester_is_bucket_owner_account without checking AuthorizationProfile, letting constrained credentials read objects.
+```
+    pub(super) fn requester_can_read_object(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+    ) -> bool {
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
+            return Self::requester_is_bucket_owner_account(requester, bucket);
+        }
+```
+
+/workspace/argmin/crates/server-core/src/coordinator/authz.rs (L404 to 411)
+  Note: Object tag management still allows any same-account principal (requester_is_bucket_owner_account) without AuthorizationProfile checks, enabling constrained credentials to modify tags.
+```
+    pub(super) fn requester_can_manage_object_tags(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        _object: &StoredObject,
+    ) -> bool {
+        Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
+            || Self::requester_is_bucket_owner_account(requester, bucket)
+    }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: low | Policy adjusted: low
+## Rationale
+Impact is unauthorized data access and tag modification within the same account (not cross-tenant) and requires a valid same-account Standard credential. BucketOwnerEnforced is the default for CreateBucket, making the path likely when constrained credentials are used. Overall probability and impact align with medium severity rather than high/critical.
+## Likelihood
+medium - Exploitation is straightforward once a Standard-profile same-account credential exists; however, such constrained credentials are optional and not created by default in main configuration.
+## Impact
+medium - A same-account Standard-profile credential can read private object data and manage object tags without ACL/policy grants under BucketOwnerEnforced buckets, violating intended privilege boundaries within the account.
+## Assumptions
+- A same-account credential is provisioned with AuthorizationProfile::Standard (constrained credentials are used in deployment).
+- Affected buckets use BucketOwnerEnforced ownership controls (the default when x-amz-object-ownership is omitted).
+- The S3 HTTP endpoint is reachable by the attacker (ARGMIN_LISTEN_ADDR may be set beyond localhost).
+- Valid SigV4 credential for the same AWS account with AuthorizationProfile::Standard
+- Bucket ownership controls set to BucketOwnerEnforced (default for CreateBucket without x-amz-object-ownership)
+## Path
+attacker(Standard cred) -> S3 HTTP -> BucketOwnerEnforced short-circuit -> object data/tags
+## Path evidence
+- `crates/auth/src/credential.rs:6-13` - AuthorizationProfile::Standard is defined as having no implicit owner-account administrative permissions, while OwnerAccountAdmin has broad permissions.
+- `crates/auth/src/request.rs:385-390` - AuthContext carries authorization_profile from the credential record used for SigV4 authentication.
+- `crates/server-http/src/http/mod.rs:784-788` - HTTP layer passes AuthContext.authorization_profile into core Requester via from_account_with_profile.
+- `crates/server-core/src/coordinator/authz.rs:174-181` - BucketOwnerEnforced path in requester_can_read_object returns requester_is_bucket_owner_account without AuthorizationProfile gating.
+- `crates/server-core/src/coordinator/authz.rs:404-411` - requester_can_manage_object_tags allows any same-account principal via requester_is_bucket_owner_account.
+- `crates/server-core/src/coordinator/authz.rs:295-309` - requester_is_bucket_owner_account only compares principals/account IDs, not authorization profile.
+- `crates/server-http/src/http/mod.rs:5062-5067` - parse_bucket_ownership defaults to BucketOwnerEnforced when header is absent.
+- `crates/argmin-s3/src/config.rs:24-62` - Default listen address is 127.0.0.1:9000; exposure depends on ARGMIN_LISTEN_ADDR.
+## Narrative
+AuthorizationProfile::Standard is documented as having no implicit owner-account permissions, yet BucketOwnerEnforced read/tagging paths grant access to any same-account principal. In requester_can_read_object, BucketOwnerEnforced short-circuits to requester_is_bucket_owner_account, which only checks account/principal match and ignores AuthorizationProfile. requester_can_manage_object_tags similarly allows any same-account principal. Because CreateBucket defaults to BucketOwnerEnforced when x-amz-object-ownership is absent, a Standard-profile same-account credential can read object data or manage tags without ACL or policy grants.
+## Controls
+- SigV4 authentication
+- ACL and public access block checks
+- Bucket ownership controls
+- Optional TLS
+## Blindspots
+- Static-only analysis; no runtime PoC due to build limitations.
+- No deployment manifests to confirm whether ARGMIN_LISTEN_ADDR exposes the service publicly.
+- Credential provisioning mechanisms beyond the single OwnerAccountAdmin in main are not shown; constrained credentials are inferred from tests and auth profile support.
+
+# Remediation
+Fixed in commit `c7dc864` (`Align BOE and GetObjectAttributes auth with AWS`).
+
+The fix tightened BucketOwnerEnforced authorization in
+`crates/server-core/src/coordinator/authz.rs` so BOE-only implicit
+owner-account access consistently requires
+`requester_can_bucket_owner_account_admin(...)` rather than raw same-account
+checks. It also narrowed owner-identity matching so an exact owner principal
+still works for `Standard`, but a same-canonical-id different principal only
+counts as owner on the intended `OwnerAccountAdmin` surfaces.
+
+Follow-up coverage was added in:
+- `crates/s3-tests/tests/boe_constrained.rs`
+- `crates/s3-tests/tests/boe_admin_root.rs`
+- `crates/s3-tests/tests/object_attributes_auth.rs`
+
+Those suites now pin the AWS-observed BOE boundaries for constrained
+same-account denial, intended owner-account-admin/root allow paths, and the
+separate `GetObjectAttributes` permission/missing-key behavior.
