@@ -385,6 +385,21 @@ Filtering rules should live in one helper so the matrix boundary is reviewable.
 
 ### Phase 1: Scaffolding and Existing-Object Read Core
 
+Status: completed
+
+Implemented:
+
+- `crates/server-core/src/coordinator/authz_model_tests.rs`
+- pure phase-1 authz model for existing-object `GetObject` and
+  `GetObjectAttributes`
+- shared-coordinator harness with per-scenario bucket isolation for fast
+  exhaustive matrix execution
+- explicit coverage for:
+  - BOE root versus non-root bucket-owner principal behavior
+  - same-account canonical-match versus distinct-principal behavior
+  - split `GetObject` versus `GetObjectAttributes` bucket-policy gates
+  - `RestrictPublicBuckets` interactions on public allows
+
 Deliver:
 
 - new `authz_model_tests.rs`

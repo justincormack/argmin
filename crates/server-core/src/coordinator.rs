@@ -12945,6 +12945,8 @@ impl StreamingChecksumAccumulator {
 pub mod test_helpers;
 
 mod authz;
+#[cfg(test)]
+mod authz_model_tests;
 
 #[cfg(test)]
 #[allow(clippy::useless_conversion)]
