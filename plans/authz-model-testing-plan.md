@@ -431,6 +431,22 @@ Acceptance criteria:
 
 ### Phase 2: Existing-Object ACL and Tagging Surface
 
+Status: completed
+
+Implemented:
+
+- extended `crates/server-core/src/coordinator/authz_model_tests.rs` to cover:
+  - `GetObjectAcl`
+  - `GetObjectTagging`
+  - `PutObjectTagging`
+  - `DeleteObjectTagging`
+- reused the existing-object shared-coordinator harness and scenario substrate
+  from phase 1
+- added an explicit non-owner `ReadAcp` ACL-grant shape for `GetObjectAcl`
+  outside BOE so requester-role versus object-owner-role mismatches are modeled
+- encoded BOE tagging as bucket-owner-account-admin authorization rather than
+  inferring it from read-object behavior
+
 Expand the matrix to:
 
 - `GetObjectAcl`

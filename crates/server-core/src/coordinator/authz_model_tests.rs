@@ -18,6 +18,8 @@ const NO_READ: &ReadCondition = &ReadCondition {
 const NO_WRITE: &WriteCondition = &WriteCondition::None;
 const BUCKET_PREFIX: &str = "authz-phase1";
 const KEY: &str = "key";
+const TAGS_XML: &str =
+    "<Tagging><TagSet><Tag><Key>env</Key><Value>phase2</Value></Tag></TagSet></Tagging>";
 const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
 
 mod model {
@@ -27,6 +29,10 @@ mod model {
     pub(super) enum Action {
         GetObject,
         GetObjectAttributes,
+        GetObjectAcl,
+        GetObjectTagging,
+        PutObjectTagging,
+        DeleteObjectTagging,
     }
 
     impl fmt::Display for Action {
@@ -34,6 +40,10 @@ mod model {
             match self {
                 Self::GetObject => f.write_str("GetObject"),
                 Self::GetObjectAttributes => f.write_str("GetObjectAttributes"),
+                Self::GetObjectAcl => f.write_str("GetObjectAcl"),
+                Self::GetObjectTagging => f.write_str("GetObjectTagging"),
+                Self::PutObjectTagging => f.write_str("PutObjectTagging"),
+                Self::DeleteObjectTagging => f.write_str("DeleteObjectTagging"),
             }
         }
     }
@@ -270,16 +280,30 @@ mod model {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) enum ObjectAclShape {
         Private,
+        GrantReadAcpToRequester,
     }
 
     impl ObjectAclShape {
-        const ALL: [Self; 1] = [Self::Private];
+        const PRIVATE_ONLY: [Self; 1] = [Self::Private];
+        const GET_OBJECT_ACL_ALL: [Self; 2] = [Self::Private, Self::GrantReadAcpToRequester];
+
+        fn all_for(action: Action) -> &'static [Self] {
+            match action {
+                Action::GetObjectAcl => &Self::GET_OBJECT_ACL_ALL,
+                Action::GetObject
+                | Action::GetObjectAttributes
+                | Action::GetObjectTagging
+                | Action::PutObjectTagging
+                | Action::DeleteObjectTagging => &Self::PRIVATE_ONLY,
+            }
+        }
     }
 
     impl fmt::Display for ObjectAclShape {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             match self {
                 Self::Private => f.write_str("private"),
+                Self::GrantReadAcpToRequester => f.write_str("grant-read-acp-to-requester"),
             }
         }
     }
@@ -291,12 +315,15 @@ mod model {
     }
 
     impl ObjectShape {
-        fn all() -> impl Iterator<Item = Self> {
-            ObjectOwnerKind::ALL.into_iter().flat_map(|owner_kind| {
-                ObjectAclShape::ALL
-                    .into_iter()
-                    .map(move |acl| Self { owner_kind, acl })
-            })
+        fn all_for(action: Action) -> impl Iterator<Item = Self> {
+            ObjectOwnerKind::ALL
+                .into_iter()
+                .flat_map(move |owner_kind| {
+                    ObjectAclShape::all_for(action)
+                        .iter()
+                        .copied()
+                        .map(move |acl| Self { owner_kind, acl })
+                })
         }
     }
 
@@ -347,76 +374,83 @@ mod model {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(super) struct PolicyShape {
-        pub(super) read: PolicyDecisionShape,
+        pub(super) primary: PolicyDecisionShape,
         pub(super) attrs: Option<PolicyDecisionShape>,
     }
 
     impl PolicyShape {
         fn all_for(action: Action) -> Vec<Self> {
             match action {
-                Action::GetObject => PolicyDecisionShape::ALL
+                Action::GetObject
+                | Action::GetObjectAcl
+                | Action::GetObjectTagging
+                | Action::PutObjectTagging
+                | Action::DeleteObjectTagging => PolicyDecisionShape::ALL
                     .into_iter()
-                    .map(|read| Self { read, attrs: None })
+                    .map(|primary| Self {
+                        primary,
+                        attrs: None,
+                    })
                     .collect(),
                 Action::GetObjectAttributes => vec![
                     Self {
-                        read: PolicyDecisionShape::NoPolicy,
+                        primary: PolicyDecisionShape::NoPolicy,
                         attrs: Some(PolicyDecisionShape::NoPolicy),
                     },
                     Self {
-                        read: PolicyDecisionShape::NoMatch,
+                        primary: PolicyDecisionShape::NoMatch,
                         attrs: Some(PolicyDecisionShape::NoMatch),
                     },
                     Self {
-                        read: PolicyDecisionShape::ExplicitAllowPrivate,
+                        primary: PolicyDecisionShape::ExplicitAllowPrivate,
                         attrs: Some(PolicyDecisionShape::ExplicitAllowPrivate),
                     },
                     Self {
-                        read: PolicyDecisionShape::ExplicitAllowPublic,
+                        primary: PolicyDecisionShape::ExplicitAllowPublic,
                         attrs: Some(PolicyDecisionShape::ExplicitAllowPublic),
                     },
                     Self {
-                        read: PolicyDecisionShape::ExplicitDeny,
+                        primary: PolicyDecisionShape::ExplicitDeny,
                         attrs: Some(PolicyDecisionShape::ExplicitDeny),
                     },
                     Self {
-                        read: PolicyDecisionShape::ExplicitAllowPrivate,
+                        primary: PolicyDecisionShape::ExplicitAllowPrivate,
                         attrs: Some(PolicyDecisionShape::NoPolicy),
                     },
                     Self {
-                        read: PolicyDecisionShape::NoPolicy,
+                        primary: PolicyDecisionShape::NoPolicy,
                         attrs: Some(PolicyDecisionShape::ExplicitAllowPrivate),
                     },
                     Self {
-                        read: PolicyDecisionShape::ExplicitAllowPrivate,
+                        primary: PolicyDecisionShape::ExplicitAllowPrivate,
                         attrs: Some(PolicyDecisionShape::ExplicitDeny),
                     },
                     Self {
-                        read: PolicyDecisionShape::ExplicitDeny,
+                        primary: PolicyDecisionShape::ExplicitDeny,
                         attrs: Some(PolicyDecisionShape::ExplicitAllowPrivate),
                     },
                     Self {
-                        read: PolicyDecisionShape::ExplicitAllowPublic,
+                        primary: PolicyDecisionShape::ExplicitAllowPublic,
                         attrs: Some(PolicyDecisionShape::NoPolicy),
                     },
                     Self {
-                        read: PolicyDecisionShape::ExplicitAllowPrivate,
+                        primary: PolicyDecisionShape::ExplicitAllowPrivate,
                         attrs: Some(PolicyDecisionShape::ExplicitAllowPublic),
                     },
                     Self {
-                        read: PolicyDecisionShape::ExplicitAllowPublic,
+                        primary: PolicyDecisionShape::ExplicitAllowPublic,
                         attrs: Some(PolicyDecisionShape::ExplicitAllowPrivate),
                     },
                     Self {
-                        read: PolicyDecisionShape::NoPolicy,
+                        primary: PolicyDecisionShape::NoPolicy,
                         attrs: Some(PolicyDecisionShape::ExplicitAllowPublic),
                     },
                     Self {
-                        read: PolicyDecisionShape::NoMatch,
+                        primary: PolicyDecisionShape::NoMatch,
                         attrs: Some(PolicyDecisionShape::ExplicitAllowPrivate),
                     },
                     Self {
-                        read: PolicyDecisionShape::ExplicitAllowPrivate,
+                        primary: PolicyDecisionShape::ExplicitAllowPrivate,
                         attrs: Some(PolicyDecisionShape::NoMatch),
                     },
                 ],
@@ -429,12 +463,12 @@ mod model {
         }
 
         fn has_public_allow(self) -> bool {
-            self.read.is_public_allow()
+            self.primary.is_public_allow()
                 || self.attrs.is_some_and(PolicyDecisionShape::is_public_allow)
         }
 
         fn has_private_allow(self) -> bool {
-            self.read.is_private_allow()
+            self.primary.is_private_allow()
                 || self
                     .attrs
                     .is_some_and(PolicyDecisionShape::is_private_allow)
@@ -443,7 +477,7 @@ mod model {
 
     impl fmt::Display for PolicyShape {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(f, "read={}", self.read)?;
+            write!(f, "primary={}", self.primary)?;
             if let Some(attrs) = self.attrs {
                 write!(f, " attrs={attrs}")?;
             }
@@ -477,12 +511,12 @@ mod model {
     }
 
     impl Scenario {
-        pub(super) fn phase1_scenarios(action: Action) -> Vec<Self> {
+        pub(super) fn existing_scenarios(action: Action) -> Vec<Self> {
             let mut scenarios = Vec::new();
             for target in ExistingTarget::ALL {
                 for requester in RequesterShape::all() {
                     for bucket in BucketShape::all() {
-                        for object in ObjectShape::all() {
+                        for object in ObjectShape::all_for(action) {
                             for policy in PolicyShape::all_for(action) {
                                 let scenario = Self {
                                     action,
@@ -492,7 +526,7 @@ mod model {
                                     object,
                                     policy,
                                 };
-                                if scenario.phase1_is_possible() {
+                                if scenario.existing_is_possible() {
                                     scenarios.push(scenario);
                                 }
                             }
@@ -506,20 +540,32 @@ mod model {
         pub(super) fn expected_existing_outcome(self) -> Outcome {
             let allowed = match self.action {
                 Action::GetObject => {
-                    self.policy_decision_allows(self.policy.read, self.base_get_object_allowed())
+                    self.policy_decision_allows(self.policy.primary, self.base_get_object_allowed())
                 }
                 Action::GetObjectAttributes => {
                     // GetObjectAttributes must satisfy both the GetObject read policy and the
                     // distinct GetObjectAttributes policy; phase 1 keeps these explicit so a
                     // regression in either half of the conjunction fails the matrix.
-                    let read_allowed = self
-                        .policy_decision_allows(self.policy.read, self.base_get_object_allowed());
+                    let read_allowed = self.policy_decision_allows(
+                        self.policy.primary,
+                        self.base_get_object_allowed(),
+                    );
                     let attrs_allowed = self.policy_decision_allows(
                         self.policy.attrs_decision(),
                         self.base_get_object_attributes_allowed(),
                     );
                     read_allowed && attrs_allowed
                 }
+                Action::GetObjectAcl => self.policy_decision_allows(
+                    self.policy.primary,
+                    self.base_get_object_acl_allowed(),
+                ),
+                Action::GetObjectTagging
+                | Action::PutObjectTagging
+                | Action::DeleteObjectTagging => self.policy_decision_allows(
+                    self.policy.primary,
+                    self.base_object_tagging_allowed(),
+                ),
             };
 
             if allowed {
@@ -529,7 +575,7 @@ mod model {
             }
         }
 
-        fn phase1_is_possible(self) -> bool {
+        fn existing_is_possible(self) -> bool {
             if self.requester.is_anonymous() && self.requester.has_admin_profile() {
                 return false;
             }
@@ -549,11 +595,21 @@ mod model {
             if self.bucket.restrict_public_buckets && !self.policy.has_public_allow() {
                 return false;
             }
+            if self.object.acl == ObjectAclShape::GrantReadAcpToRequester
+                && self.requester.is_anonymous()
+            {
+                return false;
+            }
 
             // Phase 1 materializes BOE objects by enabling BOE before the write.
             // Pre-BOE retained-owner cases belong in the later transition phase.
             if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced
                 && self.object.owner_kind != ObjectOwnerKind::BucketOwner
+            {
+                return false;
+            }
+            if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced
+                && self.object.acl != ObjectAclShape::Private
             {
                 return false;
             }
@@ -568,7 +624,9 @@ mod model {
 
             match self.object.acl {
                 // Phase 1 keeps ACL shape minimal: private objects rely on owner identity only.
-                ObjectAclShape::Private => self.requester_matches_object_owner(),
+                ObjectAclShape::Private | ObjectAclShape::GrantReadAcpToRequester => {
+                    self.requester_matches_object_owner()
+                }
             }
         }
 
@@ -580,6 +638,17 @@ mod model {
             }
 
             self.base_get_object_allowed()
+        }
+
+        fn base_get_object_acl_allowed(self) -> bool {
+            (self.bucket.ownership == OwnershipShape::BucketOwnerEnforced
+                && self.requester.can_bucket_owner_account_admin())
+                || self.requester_matches_object_owner()
+                || self.requester_has_read_acp_grant()
+        }
+
+        fn base_object_tagging_allowed(self) -> bool {
+            self.requester.can_bucket_owner_account_admin()
         }
 
         fn public_policy_allow_survives(self) -> bool {
@@ -603,6 +672,17 @@ mod model {
             self.requester_principal_matches_object_owner()
                 || (self.requester_canonical_matches_object_owner()
                     && self.requester.has_admin_profile())
+        }
+
+        fn requester_has_read_acp_grant(self) -> bool {
+            match self.object.acl {
+                ObjectAclShape::Private => false,
+                ObjectAclShape::GrantReadAcpToRequester => {
+                    !self.requester.is_anonymous()
+                        && (!self.requester_canonical_matches_object_owner()
+                            || self.requester.has_admin_profile())
+                }
+            }
         }
 
         fn requester_principal_matches_object_owner(self) -> bool {
@@ -781,6 +861,20 @@ mod harness {
             }
         }
 
+        fn object_owner_account(
+            &self,
+            owner_principal: BucketOwnerPrincipalShape,
+            owner: ObjectOwnerKind,
+        ) -> &AccountIdentity {
+            match owner {
+                ObjectOwnerKind::BucketOwner => self.bucket_owner_account(owner_principal),
+                ObjectOwnerKind::SameAccountSharedOther => {
+                    self.shared_other_account(owner_principal)
+                }
+                ObjectOwnerKind::SameAccountDistinct => &self.same_account_distinct,
+            }
+        }
+
         fn requester_principal(
             &self,
             owner_principal: BucketOwnerPrincipalShape,
@@ -800,6 +894,26 @@ mod harness {
                 RequesterIdentityShape::CrossAccountPrincipal => {
                     Some(self.cross_account.principal())
                 }
+            }
+        }
+
+        fn requester_account(
+            &self,
+            owner_principal: BucketOwnerPrincipalShape,
+            shape: RequesterShape,
+        ) -> Option<&AccountIdentity> {
+            match shape.identity {
+                RequesterIdentityShape::Anonymous => None,
+                RequesterIdentityShape::BucketOwnerPrincipal => {
+                    Some(self.bucket_owner_account(owner_principal))
+                }
+                RequesterIdentityShape::SameAccountSharedCanonicalOtherPrincipal => {
+                    Some(self.shared_other_account(owner_principal))
+                }
+                RequesterIdentityShape::SameAccountDistinctPrincipal => {
+                    Some(&self.same_account_distinct)
+                }
+                RequesterIdentityShape::CrossAccountPrincipal => Some(&self.cross_account),
             }
         }
 
@@ -883,6 +997,10 @@ mod harness {
         let action_tag = match action {
             Action::GetObject => "go",
             Action::GetObjectAttributes => "goa",
+            Action::GetObjectAcl => "goacl",
+            Action::GetObjectTagging => "gotag",
+            Action::PutObjectTagging => "potag",
+            Action::DeleteObjectTagging => "dotag",
         };
         format!("{BUCKET_PREFIX}-{action_tag}-{index:05}")
     }
@@ -892,9 +1010,7 @@ mod harness {
             ClassifiedResult::Allow => Outcome::Allow,
             ClassifiedResult::AccessDenied => Outcome::Deny,
             ClassifiedResult::NoSuchKey | ClassifiedResult::VersionNotFound => {
-                panic!(
-                    "phase 1 existing-object matrix produced an impossible missing-object result"
-                )
+                panic!("existing-object matrix produced an impossible missing-object result")
             }
         }
     }
@@ -1012,7 +1128,7 @@ mod harness {
                 system_metadata: &SystemMetadata::EMPTY,
                 tags: None,
                 cond: NO_WRITE,
-                acl: object_write_acl(scenario.object.acl),
+                acl: object_write_acl(fixtures, scenario),
             },
         )?;
         Ok(put.version_id)
@@ -1058,12 +1174,13 @@ mod harness {
             ExistingTarget::Current => None,
             ExistingTarget::Versioned => Some(object_version),
         };
+        let object = ObjectVersionRequest::new(bucket, KEY, version_id, requester, None);
 
         match scenario.action {
             Action::GetObject => coord
                 .get_object(&GetObjectRequest {
                     sse_customer: None,
-                    object: ObjectVersionRequest::new(bucket, KEY, version_id, requester, None),
+                    object,
                     cond: NO_READ,
                 })
                 .and_then(|result| {
@@ -1072,7 +1189,7 @@ mod harness {
                 }),
             Action::GetObjectAttributes => coord
                 .get_object_attributes(&GetObjectAttributesRequest {
-                    object: ObjectVersionRequest::new(bucket, KEY, version_id, requester, None),
+                    object,
                     cond: NO_READ,
                     want_parts: false,
                     part_number_marker: None,
@@ -1080,6 +1197,15 @@ mod harness {
                     sse_customer: None,
                 })
                 .map(|_| ()),
+            Action::GetObjectAcl => coord.get_object_acl(&object).map(|_| ()),
+            Action::GetObjectTagging => coord.get_object_tags(&object).map(|_| ()),
+            Action::PutObjectTagging => coord
+                .put_object_tags(&PutObjectTagsRequest {
+                    object,
+                    tags: TAGS_XML,
+                })
+                .map(|_| ()),
+            Action::DeleteObjectTagging => coord.delete_object_tags(&object).map(|_| ()),
         }
     }
 
@@ -1101,9 +1227,31 @@ mod harness {
         Ok(out)
     }
 
-    fn object_write_acl(shape: ObjectAclShape) -> PutObjectWriteAcl<'static> {
-        match shape {
+    fn object_write_acl(
+        fixtures: &IdentityFixtures,
+        scenario: Scenario,
+    ) -> PutObjectWriteAcl<'static> {
+        match scenario.object.acl {
             ObjectAclShape::Private => PutObjectWriteAcl::None,
+            ObjectAclShape::GrantReadAcpToRequester => {
+                let owner = fixtures.object_owner_account(
+                    scenario.bucket.owner_principal,
+                    scenario.object.owner_kind,
+                );
+                let requester = fixtures
+                    .requester_account(scenario.bucket.owner_principal, scenario.requester)
+                    .expect("explicit requester ACL grants require an authenticated requester");
+                PutObjectWriteAcl::Grants(AclGrants::new(vec![
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(owner.canonical_user_id().clone()),
+                        AclPermission::FullControl,
+                    ),
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(requester.canonical_user_id().clone()),
+                        AclPermission::ReadAcp,
+                    ),
+                ]))
+            }
         }
     }
 
@@ -1118,8 +1266,8 @@ mod harness {
             fixtures,
             bucket,
             scenario,
-            get_object_policy_action_name(scenario.target),
-            scenario.policy.read,
+            policy_action_name(scenario.action, scenario.target),
+            scenario.policy.primary,
         );
         if scenario.action == Action::GetObjectAttributes {
             push_policy_statement(
@@ -1186,6 +1334,45 @@ mod harness {
             ExistingTarget::Versioned => "s3:GetObjectVersionAttributes",
         }
     }
+
+    fn get_object_acl_policy_action_name(target: ExistingTarget) -> &'static str {
+        match target {
+            ExistingTarget::Current => "s3:GetObjectAcl",
+            ExistingTarget::Versioned => "s3:GetObjectVersionAcl",
+        }
+    }
+
+    fn get_object_tagging_policy_action_name(target: ExistingTarget) -> &'static str {
+        match target {
+            ExistingTarget::Current => "s3:GetObjectTagging",
+            ExistingTarget::Versioned => "s3:GetObjectVersionTagging",
+        }
+    }
+
+    fn put_object_tagging_policy_action_name(target: ExistingTarget) -> &'static str {
+        match target {
+            ExistingTarget::Current => "s3:PutObjectTagging",
+            ExistingTarget::Versioned => "s3:PutObjectVersionTagging",
+        }
+    }
+
+    fn delete_object_tagging_policy_action_name(target: ExistingTarget) -> &'static str {
+        match target {
+            ExistingTarget::Current => "s3:DeleteObjectTagging",
+            ExistingTarget::Versioned => "s3:DeleteObjectVersionTagging",
+        }
+    }
+
+    fn policy_action_name(action: Action, target: ExistingTarget) -> &'static str {
+        match action {
+            Action::GetObject => get_object_policy_action_name(target),
+            Action::GetObjectAttributes => get_object_policy_action_name(target),
+            Action::GetObjectAcl => get_object_acl_policy_action_name(target),
+            Action::GetObjectTagging => get_object_tagging_policy_action_name(target),
+            Action::PutObjectTagging => put_object_tagging_policy_action_name(target),
+            Action::DeleteObjectTagging => delete_object_tagging_policy_action_name(target),
+        }
+    }
 }
 
 use harness::{bucket_name_for, to_existing_outcome, MatrixHarness};
@@ -1193,19 +1380,39 @@ use model::{Action, Scenario};
 
 #[test]
 fn authz_model_phase1_get_object_existing_matrix() {
-    run_phase1_existing_matrix(Action::GetObject);
+    run_existing_matrix("phase 1", Action::GetObject);
 }
 
 #[test]
 fn authz_model_phase1_get_object_attributes_existing_matrix() {
-    run_phase1_existing_matrix(Action::GetObjectAttributes);
+    run_existing_matrix("phase 1", Action::GetObjectAttributes);
 }
 
-fn run_phase1_existing_matrix(action: Action) {
-    let scenarios = Scenario::phase1_scenarios(action);
+#[test]
+fn authz_model_phase2_get_object_acl_existing_matrix() {
+    run_existing_matrix("phase 2", Action::GetObjectAcl);
+}
+
+#[test]
+fn authz_model_phase2_get_object_tagging_existing_matrix() {
+    run_existing_matrix("phase 2", Action::GetObjectTagging);
+}
+
+#[test]
+fn authz_model_phase2_put_object_tagging_existing_matrix() {
+    run_existing_matrix("phase 2", Action::PutObjectTagging);
+}
+
+#[test]
+fn authz_model_phase2_delete_object_tagging_existing_matrix() {
+    run_existing_matrix("phase 2", Action::DeleteObjectTagging);
+}
+
+fn run_existing_matrix(phase: &str, action: Action) {
+    let scenarios = Scenario::existing_scenarios(action);
     assert!(
         !scenarios.is_empty(),
-        "phase 1 matrix unexpectedly produced no scenarios for {action}"
+        "{phase} matrix unexpectedly produced no scenarios for {action}"
     );
     let harness = MatrixHarness::new();
 
@@ -1215,7 +1422,7 @@ fn run_phase1_existing_matrix(action: Action) {
         let actual = to_existing_outcome(harness.run_existing(&bucket, scenario));
         assert_eq!(
             actual, expected,
-            "phase 1 authz model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+            "{phase} authz model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
         );
     }
 }
