@@ -24082,7 +24082,7 @@ mod tests {
     }
 
     #[test]
-    fn put_object_rejects_write_acl_grants_on_write() {
+    fn put_object_persists_write_acl_grants_on_write() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         let owner = AccountIdentity::new(
@@ -24108,7 +24108,7 @@ mod tests {
             })
             .unwrap();
 
-        let err = test_helpers::put_object(
+        test_helpers::put_object(
             &coord,
             &PutObjectRequest {
                 encryption: WriteEncryptionRequest::none(),
@@ -24132,10 +24132,87 @@ mod tests {
                 )])),
             },
         )
-        .unwrap_err();
-        assert!(
-            matches!(err, ServerError::InvalidArgument { reason } if reason.contains("WRITE grants"))
+        .unwrap();
+
+        let acl =
+            get_object_acl_test(&coord, "bucket", "key", None, owner_requester, None).unwrap();
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
+            AclPermission::Write,
+        ));
+    }
+
+    #[test]
+    fn put_object_acl_persists_write_acl_grants() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner = AccountIdentity::new(
+            "owner-a",
+            CanonicalUserId::from_principal("owner-put-object-acl-write-grant-canonical"),
+            "Owner A",
         );
+        let grantee = AccountIdentity::new(
+            "grantee-a",
+            CanonicalUserId::from_principal("grantee-put-object-acl-write-grant-canonical"),
+            "Grantee A",
+        );
+        let owner_requester = Requester::authenticated(owner);
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: owner_requester.clone(),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        put_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            AclGrants::new(vec![AclGrant::new(
+                AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
+                AclPermission::Write,
+            )]),
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+
+        let acl =
+            get_object_acl_test(&coord, "bucket", "key", None, owner_requester, None).unwrap();
+        assert!(grants_contain(
+            &acl.acl_grants,
+            &AclGrantee::CanonicalUser(grantee.canonical_user_id().clone()),
+            AclPermission::Write,
+        ));
     }
 
     #[test]

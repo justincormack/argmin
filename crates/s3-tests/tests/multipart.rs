@@ -266,6 +266,17 @@ fn has_grant(grants: &[aws_sdk_s3::types::Grant], permission: Permission, uri: &
     })
 }
 
+fn has_canonical_grant(
+    grants: &[aws_sdk_s3::types::Grant],
+    permission: Permission,
+    canonical_user_id: &str,
+) -> bool {
+    grants.iter().any(|grant| {
+        grant.permission() == Some(&permission)
+            && grant.grantee().and_then(|grantee| grantee.id()) == Some(canonical_user_id)
+    })
+}
+
 #[test]
 fn test_create_multipart_upload_rejects_system_metadata_over_limit() {
     s3_tests::run(async {
@@ -388,6 +399,82 @@ fn test_multipart_upload_canned_acl_persists_to_completed_object() {
         );
         let data = resp.body_mut().read_to_vec().unwrap();
         assert_eq!(&data[..], body.as_slice());
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_create_multipart_upload_grant_write_header_persists_write_grant() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multipart-grant-write";
+        let body = vec![b'x'; 1024];
+
+        set_object_writer_ownership(&bucket).await;
+        disable_bucket_public_access_block(&bucket).await;
+
+        let owner_id = canonical_owner_id(client).await;
+        let grant_write_owner_id = owner_id.clone();
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .customize()
+            .mutate_request(move |req| {
+                req.headers_mut().insert(
+                    "x-amz-grant-write",
+                    format!("id=\"{grant_write_owner_id}\""),
+                );
+            })
+            .send()
+            .await
+            .unwrap();
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        let part = client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(body))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .complete_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .multipart_upload(
+                CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .e_tag(part.e_tag().unwrap())
+                            .part_number(1)
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_canonical_grant(acl.grants(), Permission::Write, &owner_id),
+            "expected WRITE grant for object owner, got {:?}",
+            acl.grants()
+        );
 
         cleanup(&bucket, &[key]).await;
     });

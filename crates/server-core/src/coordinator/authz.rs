@@ -1683,15 +1683,8 @@ impl Coordinator {
     }
 
     pub(super) fn ensure_supported_object_acl_grants(
-        acl_grants: &AclGrants,
+        _acl_grants: &AclGrants,
     ) -> Result<(), ServerError> {
-        for grant in acl_grants.iter() {
-            if grant.permission() == AclPermission::Write {
-                return Err(ServerError::InvalidArgument {
-                    reason: "object ACLs do not support WRITE grants".to_string(),
-                });
-            }
-        }
         Ok(())
     }
 

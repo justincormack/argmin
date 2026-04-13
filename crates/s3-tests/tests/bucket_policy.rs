@@ -2444,6 +2444,100 @@ fn test_bucket_policy_copy_object_grant_full_control() {
 }
 
 #[test]
+fn test_bucket_policy_copy_object_grant_write() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        set_object_writer_ownership(&bucket).await;
+        let owner_id = canonical_owner_id(client, &bucket).await;
+        let grant_write_header = format!("id=\"{owner_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal.clone(),
+                    "Action": "s3:GetObject",
+                    "Resource": bucket_wildcard_resource(&bucket)
+                },
+                {
+                    "Effect": "Allow",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:x-amz-grant-write": grant_write_header.clone()
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("src")
+            .body(ByteStream::from_static(b"copy-source"))
+            .send()
+            .await
+            .unwrap();
+
+        let denied = alt_client
+            .copy_object()
+            .bucket(&bucket)
+            .key("denied")
+            .copy_source(format!("{bucket}/src"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        eventually_ok("CopyObject with grant-write", || {
+            let grant_write_header = grant_write_header.clone();
+            alt_client
+                .copy_object()
+                .bucket(&bucket)
+                .key("allowed")
+                .copy_source(format!("{bucket}/src"))
+                .customize()
+                .mutate_request(move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-write", grant_write_header.clone());
+                })
+                .send()
+        })
+        .await;
+
+        let allowed_acl = alt_client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("allowed")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_grant(allowed_acl.grants(), Permission::Write, Some(&owner_id)),
+            "expected WRITE grant for bucket owner, got {:?}",
+            allowed_acl.grants()
+        );
+
+        cleanup(&bucket, &["src", "allowed", "denied"]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_object_acl_cross_account_allow() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
@@ -2614,6 +2708,913 @@ fn test_bucket_policy_put_object_canned_acl_uses_put_object_permission() {
 
         cleanup(&bucket, &["public-read"]).await;
         panic!("anonymous GET did not observe public-read ACL: {last:?}");
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_acl_null_condition_treats_absent_header_as_null() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal.clone(),
+                    "Action": "s3:PutObject",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                    "Condition": {
+                        "Null": {
+                            "s3:x-amz-acl": "true"
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_result_matches(
+            "PutObject denied when x-amz-acl is absent under Null condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("denied")
+                    .body(ByteStream::from_static(b"denied"))
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("AccessDenied")
+                })
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject with explicit private ACL under Null condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("allowed")
+                    .acl(ObjectCannedAcl::Private)
+                    .body(ByteStream::from_static(b"allowed"))
+                    .send()
+            },
+        )
+        .await;
+
+        let allowed = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key("allowed")
+            .send()
+            .await
+            .unwrap();
+        let body = allowed.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), b"allowed");
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_acl_string_not_equals_treats_absent_header_as_not_equal() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal.clone(),
+                    "Action": "s3:PutObject",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": principal,
+                    "Action": "s3:PutObject",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                    "Condition": {
+                        "StringNotEquals": {
+                            "s3:x-amz-acl": "private"
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_result_matches(
+            "PutObject denied when x-amz-acl is absent under StringNotEquals",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("absent")
+                    .body(ByteStream::from_static(b"absent"))
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("AccessDenied")
+                })
+            },
+        )
+        .await;
+
+        eventually_result_matches(
+            "PutObject denied when x-amz-acl does not equal private",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("wrong")
+                    .acl(ObjectCannedAcl::BucketOwnerFullControl)
+                    .body(ByteStream::from_static(b"wrong"))
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("AccessDenied")
+                })
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject with x-amz-acl=private under StringNotEquals",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("allowed")
+                    .acl(ObjectCannedAcl::Private)
+                    .body(ByteStream::from_static(b"allowed"))
+                    .send()
+            },
+        )
+        .await;
+
+        let allowed = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key("allowed")
+            .send()
+            .await
+            .unwrap();
+        let body = allowed.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), b"allowed");
+
+        cleanup(&bucket, &["absent", "wrong", "allowed"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_obj_grant_read_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        let control_bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::create_bucket(client, &control_bucket)
+            .await
+            .unwrap();
+        set_object_writer_ownership(&bucket).await;
+        set_object_writer_ownership(&control_bucket).await;
+
+        let owner_id = canonical_owner_id(client, &bucket).await;
+        let grant_read_header = format!("id=\"{owner_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal.clone(),
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-grant-read": grant_read_header.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&control_bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutObject",
+                bucket_wildcard_resource(&control_bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_result_matches(
+            "PutObject denied without matching grant-read header",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("denied")
+                    .body(ByteStream::from_static(b"denied"))
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("AccessDenied")
+                })
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject with grant-read condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                let grant_read_header = grant_read_header.clone();
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("allowed")
+                    .body(ByteStream::from_static(b"allowed"))
+                    .customize()
+                    .mutate_request(move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-read", grant_read_header.clone());
+                    })
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject control write without grant-read header",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&control_bucket)
+                    .key("control")
+                    .body(ByteStream::from_static(b"control"))
+                    .send()
+            },
+        )
+        .await;
+
+        let allowed = eventually_ok_with_retry(
+            "Bucket owner GetObject after grant-read PutObject",
+            60,
+            std::time::Duration::from_millis(500),
+            || client.get_object().bucket(&bucket).key("allowed").send(),
+        )
+        .await;
+        let body = allowed.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), b"allowed");
+
+        let control_denied = client
+            .get_object()
+            .bucket(&control_bucket)
+            .key("control")
+            .send()
+            .await;
+        assert_eq!(err_status(&control_denied), 403);
+        assert_s3_err_code(&control_denied, "AccessDenied");
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+        cleanup(&control_bucket, &["control"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_obj_grant_read_acp_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        let control_bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::create_bucket(client, &control_bucket)
+            .await
+            .unwrap();
+        set_object_writer_ownership(&bucket).await;
+        set_object_writer_ownership(&control_bucket).await;
+
+        let owner_id = canonical_owner_id(client, &bucket).await;
+        let grant_read_acp_header = format!("id=\"{owner_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal.clone(),
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-grant-read-acp": grant_read_acp_header.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&control_bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutObject",
+                bucket_wildcard_resource(&control_bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_result_matches(
+            "PutObject denied without matching grant-read-acp header",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("denied")
+                    .body(ByteStream::from_static(b"denied"))
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("AccessDenied")
+                })
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject with grant-read-acp condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                let grant_read_acp_header = grant_read_acp_header.clone();
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("allowed")
+                    .body(ByteStream::from_static(b"allowed"))
+                    .customize()
+                    .mutate_request(move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-read-acp", grant_read_acp_header.clone());
+                    })
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject control write without grant-read-acp header",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&control_bucket)
+                    .key("control")
+                    .body(ByteStream::from_static(b"control"))
+                    .send()
+            },
+        )
+        .await;
+
+        let allowed_acl = eventually_ok_with_retry(
+            "Bucket owner GetObjectAcl after grant-read-acp PutObject",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                client
+                    .get_object_acl()
+                    .bucket(&bucket)
+                    .key("allowed")
+                    .send()
+            },
+        )
+        .await;
+        assert!(
+            has_grant(allowed_acl.grants(), Permission::ReadAcp, Some(&owner_id),),
+            "expected READ_ACP grant for bucket owner, got {:?}",
+            allowed_acl.grants()
+        );
+
+        let control_denied = client
+            .get_object_acl()
+            .bucket(&control_bucket)
+            .key("control")
+            .send()
+            .await;
+        assert_eq!(err_status(&control_denied), 403);
+        assert_s3_err_code(&control_denied, "AccessDenied");
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+        cleanup(&control_bucket, &["control"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_obj_grant_write_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        let control_bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::create_bucket(client, &control_bucket)
+            .await
+            .unwrap();
+        set_object_writer_ownership(&bucket).await;
+        set_object_writer_ownership(&control_bucket).await;
+
+        let owner_id = canonical_owner_id(client, &bucket).await;
+        let grant_write_header = format!("id=\"{owner_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal.clone(),
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-grant-write": grant_write_header.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&control_bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutObject",
+                bucket_wildcard_resource(&control_bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_result_matches(
+            "PutObject denied without matching grant-write header",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("denied")
+                    .body(ByteStream::from_static(b"denied"))
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("AccessDenied")
+                })
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject with grant-write condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                let grant_write_header = grant_write_header.clone();
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("allowed")
+                    .body(ByteStream::from_static(b"allowed"))
+                    .customize()
+                    .mutate_request(move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-write", grant_write_header.clone());
+                    })
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject control write without grant-write header",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&control_bucket)
+                    .key("control")
+                    .body(ByteStream::from_static(b"control"))
+                    .send()
+            },
+        )
+        .await;
+
+        let allowed_acl = alt_client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("allowed")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_grant(allowed_acl.grants(), Permission::Write, Some(&owner_id)),
+            "expected WRITE grant for bucket owner, got {:?}",
+            allowed_acl.grants()
+        );
+
+        let control_acl = alt_client
+            .get_object_acl()
+            .bucket(&control_bucket)
+            .key("control")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            !has_grant(control_acl.grants(), Permission::Write, Some(&owner_id)),
+            "did not expect WRITE grant for bucket owner, got {:?}",
+            control_acl.grants()
+        );
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+        cleanup(&control_bucket, &["control"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_obj_grant_write_acp_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        let control_bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::create_bucket(client, &control_bucket)
+            .await
+            .unwrap();
+        set_object_writer_ownership(&bucket).await;
+        set_object_writer_ownership(&control_bucket).await;
+
+        let owner_id = canonical_owner_id(client, &bucket).await;
+        let grant_write_acp_header = format!("id=\"{owner_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal.clone(),
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-grant-write-acp": grant_write_acp_header.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&control_bucket)
+            .policy(bucket_policy_document(
+                principal,
+                "Allow",
+                "s3:PutObject",
+                bucket_wildcard_resource(&control_bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_result_matches(
+            "PutObject denied without matching grant-write-acp header",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("denied")
+                    .body(ByteStream::from_static(b"denied"))
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("AccessDenied")
+                })
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject with grant-write-acp condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                let grant_write_acp_header = grant_write_acp_header.clone();
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("allowed")
+                    .body(ByteStream::from_static(b"allowed"))
+                    .customize()
+                    .mutate_request(move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-write-acp", grant_write_acp_header.clone());
+                    })
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObject control write without grant-write-acp header",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&control_bucket)
+                    .key("control")
+                    .body(ByteStream::from_static(b"control"))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "Bucket owner PutObjectAcl after grant-write-acp PutObject",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                client
+                    .put_object_acl()
+                    .bucket(&bucket)
+                    .key("allowed")
+                    .acl(ObjectCannedAcl::Private)
+                    .send()
+            },
+        )
+        .await;
+
+        let control_denied = client
+            .put_object_acl()
+            .bucket(&control_bucket)
+            .key("control")
+            .acl(ObjectCannedAcl::Private)
+            .send()
+            .await;
+        assert_eq!(err_status(&control_denied), 403);
+        assert_s3_err_code(&control_denied, "AccessDenied");
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+        cleanup(&control_bucket, &["control"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_public_allow_is_blocked_by_restrict_public_buckets() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let public_policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"AWS": "*"},
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+            }],
+        })
+        .to_string();
+        match client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(public_policy)
+            .send()
+            .await
+        {
+            Ok(_) => {}
+            Err(err) => {
+                if std::env::var("S3_TEST_ENDPOINT").is_ok()
+                    && err.raw_response().map(|resp| resp.status().as_u16()) == Some(403)
+                {
+                    cleanup(&bucket, &[]).await;
+                    panic!(
+                        "account-level S3 Block Public Access must allow public bucket policies for AWS s3-tests; put_bucket_policy failed while setting up RestrictPublicBuckets PutObject coverage: {err:?}"
+                    );
+                }
+                panic!("put_bucket_policy failed: {err:?}");
+            }
+        }
+
+        eventually_ok_with_retry(
+            "PutObject with public bucket policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("public-allowed")
+                    .body(ByteStream::from_static(b"public-allowed"))
+                    .send()
+            },
+        )
+        .await;
+
+        let pab = PublicAccessBlockConfiguration::builder()
+            .block_public_acls(false)
+            .ignore_public_acls(false)
+            .block_public_policy(false)
+            .restrict_public_buckets(true)
+            .build();
+        client
+            .put_public_access_block()
+            .bucket(&bucket)
+            .public_access_block_configuration(pab)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_result_matches(
+            "PutObject denied by RestrictPublicBuckets under public policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("restricted")
+                    .body(ByteStream::from_static(b"restricted"))
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("AccessDenied")
+                })
+            },
+        )
+        .await;
+
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                alt_policy_principal(),
+                "Allow",
+                "s3:PutObject",
+                bucket_wildcard_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutObject with fixed principal under RestrictPublicBuckets",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("explicit-allowed")
+                    .body(ByteStream::from_static(b"explicit-allowed"))
+                    .send()
+            },
+        )
+        .await;
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("owner")
+            .body(ByteStream::from_static(b"owner"))
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(
+            &bucket,
+            &["public-allowed", "restricted", "explicit-allowed", "owner"],
+        )
+        .await;
     });
 }
 
@@ -3662,6 +4663,89 @@ fn test_bucket_policy_put_obj_request_object_tag() {
 }
 
 #[test]
+fn test_bucket_policy_put_object_inline_tags_require_put_object_tagging() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal.clone(),
+                "Allow",
+                "s3:PutObject",
+                bucket_wildcard_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_result_matches(
+            "PutObject with inline tags denied without PutObjectTagging permission",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("denied")
+                    .tagging("security=public")
+                    .body(ByteStream::from_static(b"denied"))
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("AccessDenied")
+                })
+            },
+        )
+        .await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                "Resource": bucket_wildcard_resource(&bucket),
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok_with_retry(
+            "PutObject with inline tags under PutObjectTagging policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("allowed")
+                    .tagging("security=public")
+                    .body(ByteStream::from_static(b"allowed"))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_multipart_upload_requires_object_resource() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
@@ -3853,6 +4937,79 @@ fn test_bucket_policy_multipart_upload_request_object_tag() {
         )
         .await;
         let upload_id = upload.upload_id().unwrap().to_string();
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("allowed")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_multipart_upload_grant_write() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+        let owner_id = canonical_owner_id(client, &bucket).await;
+        let grant_write_header = format!("id=\"{owner_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-grant-write": grant_write_header.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("denied")
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let upload = eventually_ok("CreateMultipartUpload with grant-write", || {
+            let grant_write_header = grant_write_header.clone();
+            alt_client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key("allowed")
+                .customize()
+                .mutate_request(move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-write", grant_write_header.clone());
+                })
+                .send()
+        })
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
         alt_client
             .abort_multipart_upload()
             .bucket(&bucket)

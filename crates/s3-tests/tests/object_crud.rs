@@ -2649,6 +2649,196 @@ fn test_object_header_acl_grants_authenticated_users_read() {
 }
 
 #[test]
+fn test_put_object_grant_write_header_persists_write_grant() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_acl_enabled_bucket().await;
+        let owner_id = canonical_owner_id(client).await;
+        let key = "grant-write-header";
+        let grant_write_owner_id = owner_id.clone();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"grant-write-header"))
+            .customize()
+            .mutate_request(move |req| {
+                req.headers_mut().insert(
+                    "x-amz-grant-write",
+                    format!("id=\"{grant_write_owner_id}\""),
+                );
+            })
+            .send()
+            .await
+            .unwrap();
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_grant(acl.grants(), Permission::Write, Some(&owner_id), None),
+            "expected WRITE grant for object owner, got {:?}",
+            acl.grants()
+        );
+
+        delete_all_and_bucket(client, &bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_put_object_acl_grant_write_header_persists_write_grant() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_acl_enabled_bucket().await;
+        let key = "put-object-acl-grant-write";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"put-object-acl-grant-write"))
+            .send()
+            .await
+            .unwrap();
+
+        let owner_id = object_owner_id(client, &bucket, key).await;
+        let grant_write_owner_id = owner_id.clone();
+        client
+            .put_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .customize()
+            .mutate_request(move |req| {
+                req.headers_mut().insert(
+                    "x-amz-grant-write",
+                    format!("id=\"{grant_write_owner_id}\""),
+                );
+            })
+            .send()
+            .await
+            .unwrap();
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_grant(acl.grants(), Permission::Write, Some(&owner_id), None),
+            "expected WRITE grant for object owner, got {:?}",
+            acl.grants()
+        );
+
+        delete_all_and_bucket(client, &bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_put_object_acl_grant_write_xml_persists_write_grant() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = setup_acl_enabled_bucket().await;
+        let key = "put-object-acl-grant-write-xml";
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"put-object-acl-grant-write-xml"))
+            .send()
+            .await
+            .unwrap();
+
+        let owner_id = object_owner_id(client, &bucket, key).await;
+        let alt_owner_id = canonical_owner_id(alt_client).await;
+        client
+            .put_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .access_control_policy(access_control_policy(
+                &owner_id,
+                vec![canonical_user_grant(&alt_owner_id, Permission::Write)],
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_grant(acl.grants(), Permission::Write, Some(&alt_owner_id), None),
+            "expected WRITE grant for alternate canonical user, got {:?}",
+            acl.grants()
+        );
+
+        delete_all_and_bucket(client, &bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_grant_write_header_persists_write_grant() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_acl_enabled_bucket().await;
+        let owner_id = canonical_owner_id(client).await;
+        let grant_write_owner_id = owner_id.clone();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key("src")
+            .body(ByteStream::from_static(b"copy-source"))
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .copy_object()
+            .bucket(&bucket)
+            .key("dst")
+            .copy_source(format!("{bucket}/src"))
+            .customize()
+            .mutate_request(move |req| {
+                req.headers_mut().insert(
+                    "x-amz-grant-write",
+                    format!("id=\"{grant_write_owner_id}\""),
+                );
+            })
+            .send()
+            .await
+            .unwrap();
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key("dst")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            has_grant(acl.grants(), Permission::Write, Some(&owner_id), None),
+            "expected WRITE grant for object owner, got {:?}",
+            acl.grants()
+        );
+
+        delete_all_and_bucket(client, &bucket, &["src".to_string(), "dst".to_string()]).await;
+    });
+}
+
+#[test]
 fn test_put_object_acl_rejects_canned_acl_with_explicit_grant_headers() {
     s3_tests::run(async {
         let client = CTX.client();

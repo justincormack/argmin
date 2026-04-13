@@ -7324,7 +7324,7 @@ mod tests {
     }
 
     #[test]
-    fn put_object_acl_rejects_write_header_grant() {
+    fn put_object_acl_accepts_write_header_grant() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
@@ -7360,20 +7360,31 @@ mod tests {
             },
             vec![],
         );
-        match fe.dispatch_routed(
-            &put_req,
-            &test_auth(),
-            S3Operation::PutObjectAcl {
-                bucket: "mybucket".to_string(),
-                key: "mykey".to_string(),
-            },
-        ) {
-            Err(ServerError::InvalidArgument { reason }) => {
-                assert!(reason.contains("WRITE grants"));
-            }
-            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
-            Ok(_) => panic!("expected InvalidArgument, got Ok"),
-        }
+        let put_resp = fe
+            .dispatch_routed(
+                &put_req,
+                &test_auth(),
+                S3Operation::PutObjectAcl {
+                    bucket: "mybucket".to_string(),
+                    key: "mykey".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(put_resp.status_code, 200);
+
+        let acl = fe
+            .coordinator
+            .get_object_acl(&ObjectVersionRequest::new(
+                "mybucket",
+                "mykey",
+                None,
+                crate::coordinator::test_helpers::requester("testuser"),
+                None,
+            ))
+            .unwrap();
+        assert!(acl
+            .acl_grants
+            .allows_canonical_user(&canonical_id, s3_types::AclPermission::Write));
     }
 
     fn content_md5_value(body: &[u8]) -> String {
