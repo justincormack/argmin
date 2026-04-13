@@ -16,12 +16,12 @@ unsupported here.
   evaluation but appears to check only `s3:PutObject`.
 - Our `PutObject` path checks `s3:PutObject`, and when inline tags are present
   it also requires `s3:PutObjectTagging`.
-- We have local `server-core` coverage for that dual-permission rule, but we do
-  not yet have a clear AWS-backed `crates/s3-tests` case for the negative path.
+- AWS-backed `crates/s3-tests` coverage now confirms that dual-permission rule
+  on the negative path.
 - Ceph always injects `s3:x-amz-acl` into its IAM environment, even when the
   header is absent. Our policy engine treats an absent header as absent.
-- That makes `Null` conditions on `s3:x-amz-acl` a likely compatibility gap and
-  a clear missing external test.
+- AWS-backed tests now confirm our absent-header behavior for `Null` and
+  `StringNotEquals` conditions on `s3:x-amz-acl`.
 - Ceph also exposes `s3:ResourceTag/*` during `PutObject`; our current
   evaluable object-action condition set does not.
 - A separate Ceph/argmin difference around overwriting existing objects in
@@ -36,32 +36,28 @@ Current external coverage already exists for:
 - `s3:RequestObjectTag/*`
 - SSE-S3 and SSE-C `PutObject` conditions
 
-The clearest missing external `PutObject` coverage is:
+AWS-backed external coverage now also includes:
 
 - inline-tagged `PutObject` denial when `s3:PutObjectTagging` is missing
-- `Null` behavior for an absent `s3:x-amz-acl` header
+- `Null` and `StringNotEquals` behavior for an absent `s3:x-amz-acl` header
 - remaining grant-header condition keys
 - `PutObject`-specific `RestrictPublicBuckets`
 
 ## Recommended `PutObject` Tests
 
-Priority order:
+Status:
 
-1. Add an AWS-backed `PutObject` test where bucket policy allows only
-   `s3:PutObject`, the request includes inline tags, and the request is denied
-   until `s3:PutObjectTagging` is also allowed.
-2. Add AWS-backed `PutObject` tests for `Null` / `StringNotEquals` conditions on
-   `s3:x-amz-acl`, with the header absent and present.
-3. Add AWS-backed `PutObject` tests for the remaining grant-header condition
-   keys:
+1. Done. AWS confirms inline-tagged `PutObject` requires
+   `s3:PutObjectTagging` in addition to `s3:PutObject`.
+2. Done. AWS confirms our absent-header handling for `Null` /
+   `StringNotEquals` on `s3:x-amz-acl`.
+3. Done. AWS-backed tests now cover the remaining grant-header condition keys:
    - `s3:x-amz-grant-read`
    - `s3:x-amz-grant-write`
    - `s3:x-amz-grant-read-acp`
    - `s3:x-amz-grant-write-acp`
-4. Add a `PutObject`-specific `RestrictPublicBuckets` test. Current external
-   coverage is centered on `GetObject`.
-5. Investigate `s3:ResourceTag/*` for `PutObject` after the higher-confidence
-   gaps above are covered.
+4. Done. `PutObject`-specific `RestrictPublicBuckets` coverage was added.
+5. Still open. `s3:ResourceTag/*` remains a later investigation.
 
 ## Cross-Cutting Note For Remaining Object Operations
 
@@ -103,8 +99,11 @@ share the same main auth path as standard `GetObject`.
 - One lower-confidence follow-up remains: Ceph checks
   `s3:BypassGovernanceRetention` whenever the bypass header is present on an
   object-lock bucket, while our delete path checks it only when deleting a live
-  specific version. I have not found an AWS-backed test for bypass-header
-  deletes against missing versions or non-version deletes.
+  specific version.
+- AWS-backed tests answered the open question: for version-specific deletes
+  against a missing version, AWS still requires
+  `s3:BypassGovernanceRetention` when the bypass header is present; for
+  non-version deletes, it does not. Our server was updated to match AWS there.
 
 ### `CopyObject`
 
@@ -119,10 +118,10 @@ share the same main auth path as standard `GetObject`.
 - Existing external coverage already catches `grant-full-control`,
   `copy-source`, `metadata-directive`, and destination SSE conditions.
 - Missing copy-specific external tests:
-  - `CopyObject` with `REPLACE` tags should deny until
-    `s3:PutObjectTagging` is allowed.
-  - `CopyObject` destination canned ACL and remaining grant-header condition
-    keys.
+  - These are now covered. AWS confirms `CopyObject` with `REPLACE` tags
+    requires `s3:PutObjectTagging`, and destination canned ACL plus the
+    remaining grant-header condition keys behave as our implementation already
+    expected.
 
 ### `GetObjectAcl`, `PutObjectAcl`
 
@@ -135,8 +134,8 @@ share the same main auth path as standard `GetObject`.
   applies here: Ceph always inserts `s3:x-amz-acl` into its IAM environment,
   while our `PutObjectAcl` policy context leaves it absent when the request
   does not use a canned ACL.
-- I have not found AWS-backed `PutObjectAcl` coverage for `Null` or
-  `StringNotEquals` on absent `s3:x-amz-acl`.
+- AWS-backed `PutObjectAcl` coverage now confirms our absent-header behavior
+  for `Null` and `StringNotEquals` on `s3:x-amz-acl`.
 - I also have not found AWS-backed `PutObjectAcl` coverage for the remaining
   ACL grant condition keys.
 
@@ -166,15 +165,18 @@ share the same main auth path as standard `GetObject`.
 
 ## Next Tests After `PutObject`
 
-- Add a `CopyObject` test where `x-amz-tagging-directive=REPLACE` plus inline
-  tags requires `s3:PutObjectTagging`.
-- Add `PutObjectAcl` tests for `Null` and `StringNotEquals` on absent
-  `s3:x-amz-acl`.
-- Add `CopyObject` destination ACL condition tests for canned ACL plus the
-  remaining grant-header keys.
-- Decide AWS behavior for delete requests that send
-  `x-amz-bypass-governance-retention` against missing versions or non-version
-  deletes, then add a focused test if needed.
+Completed:
+
+- `CopyObject` with `x-amz-tagging-directive=REPLACE` plus inline tags now has
+  AWS-backed coverage, and our current behavior matched AWS.
+- `PutObjectAcl` now has AWS-backed `Null` and `StringNotEquals` coverage for
+  absent `s3:x-amz-acl`, again matching our current behavior.
+- `CopyObject` destination ACL condition coverage now includes canned ACL plus
+  the remaining grant-header keys, and our current behavior matched AWS.
+- AWS behavior for delete requests with
+  `x-amz-bypass-governance-retention` is now pinned for missing-version and
+  non-version deletes; this exposed one real server mismatch, which has been
+  fixed.
 
 ## Reviewed Multipart Operations
 
@@ -192,10 +194,10 @@ share the same main auth path as standard `GetObject`.
   request-object-tag conditions, anonymous denial on public-write buckets, and
   BOE ACL rejection.
 - Missing external coverage:
-  - negative `CreateMultipartUpload` with inline tags when only
-    `s3:PutObject` is allowed
-  - bucket-policy condition coverage for `s3:x-amz-acl`
-  - bucket-policy condition coverage for the ACL grant headers
+  - These are now covered. AWS confirms `CreateMultipartUpload` requires
+    `s3:PutObjectTagging` when inline tags are present, and our current bucket
+    policy handling for `s3:x-amz-acl` and the ACL grant headers already
+    matches AWS.
 
 ### `UploadPart`, `UploadPartCopy`, `CompleteMultipartUpload`
 
@@ -214,48 +216,44 @@ share the same main auth path as standard `GetObject`.
 ### `AbortMultipartUpload`
 
 - Ceph checks the dedicated IAM action `s3:AbortMultipartUpload`.
-- Our auth path does not evaluate bucket policy for aborts at all. It only
-  allows the bucket owner account admin, the upload owner, or the initiator.
-- Our bucket-policy model does not currently represent
-  `s3:AbortMultipartUpload`, so bucket policy cannot allow or deny this
-  operation.
-- This is the clearest multipart auth gap.
-- I did not find AWS-backed `crates/s3-tests` coverage for bucket-policy allow
-  or deny on `AbortMultipartUpload`.
-- Current local coordinator tests encode the ownership and initiator behavior,
-  not the missing bucket-policy action.
+- AWS-backed tests now show that for the MPU initiator, a cross-account caller
+  who could create the MPU with `s3:PutObject` can also abort it without a
+  separate `s3:AbortMultipartUpload` allow.
+- Our current auth path already matches that initiator behavior, so this is not
+  a confirmed gap. On this point, Ceph appears stricter than AWS.
+- I have not yet established whether AWS exposes a separate bucket-policy-only
+  allow path for non-initiators, so that narrower question remains open.
 
 ### `ListParts`
 
 - Ceph checks the dedicated IAM action `s3:ListMultipartUploadParts`.
-- Our auth path does not evaluate bucket policy for `ListParts`. It uses the
-  same ownership and initiator gate as abort.
-- Our bucket-policy model does not currently represent
-  `s3:ListMultipartUploadParts`, so bucket policy cannot allow or deny this
-  operation.
-- This is the other major multipart auth gap.
-- Existing external coverage covers basic `ListParts` behavior and BOE
-  owner/root behavior, but I did not find AWS-backed bucket-policy coverage for
-  `s3:ListMultipartUploadParts`.
-- Current local coordinator tests encode the ownership-only behavior here too.
+- AWS-backed tests now show that for the MPU initiator, a cross-account caller
+  who could create the MPU and upload parts with `s3:PutObject` can also list
+  parts without a separate `s3:ListMultipartUploadParts` allow.
+- Our current auth path already matches that initiator behavior, so this is not
+  a confirmed gap. On this point, Ceph again appears stricter than AWS.
+- I have not yet established whether AWS exposes a separate bucket-policy-only
+  allow path for non-initiators, so that narrower question remains open.
 
 ## Recommended Multipart Tests
 
-Priority order:
+Status:
 
-1. Add an AWS-backed `AbortMultipartUpload` test where a cross-account caller
-   can create an MPU with `s3:PutObject` but cannot abort it until
-   `s3:AbortMultipartUpload` is also allowed.
-2. Add an AWS-backed `ListParts` test where a cross-account caller can create
-   and upload parts with `s3:PutObject` but cannot list them until
-   `s3:ListMultipartUploadParts` is also allowed.
-3. Add an AWS-backed `CreateMultipartUpload` test where inline tags are present
-   and `s3:PutObjectTagging` is required in addition to `s3:PutObject`.
-4. Add `CreateMultipartUpload` bucket-policy condition tests for
-   `s3:x-amz-acl` and the remaining ACL grant headers.
-5. After the high-confidence gaps above, decide whether we need a focused AWS
-   test for cross-principal `UploadPart` or `CompleteMultipartUpload` on an MPU
-   created by another principal.
+1. Done, but the original hypothesis was false. AWS shows the MPU initiator can
+   abort with `s3:PutObject` alone; a separate
+   `s3:AbortMultipartUpload` allow is not required there.
+2. Done, but the original hypothesis was false. AWS shows the MPU initiator can
+   list parts with `s3:PutObject` alone; a separate
+   `s3:ListMultipartUploadParts` allow is not required there.
+3. Done. AWS confirms `CreateMultipartUpload` with inline tags requires
+   `s3:PutObjectTagging` in addition to `s3:PutObject`.
+4. Done. `CreateMultipartUpload` bucket-policy condition coverage now includes
+   `s3:x-amz-acl` and the remaining ACL grant headers, and our current
+   implementation already matches AWS on those cases.
+5. Deferred. After the initiator results above, there is no longer a
+   high-confidence multipart auth gap here. Add a focused
+   `UploadPart` / `CompleteMultipartUpload` cross-principal AWS test only if a
+   more specific mismatch hypothesis emerges.
 
 ## Reviewed Bucket Operations
 

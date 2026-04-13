@@ -5676,6 +5676,382 @@ fn test_bucket_policy_multipart_upload_request_object_tag() {
 }
 
 #[test]
+fn test_bucket_policy_multipart_upload_inline_tags_require_put_object_tagging() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal.clone(),
+                "Allow",
+                "s3:PutObject",
+                bucket_wildcard_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_result_matches(
+            "CreateMultipartUpload with inline tags denied without PutObjectTagging permission",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key("denied")
+                    .tagging("security=public")
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("AccessDenied")
+                })
+            },
+        )
+        .await;
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": ["s3:PutObject", "s3:PutObjectTagging"],
+                "Resource": bucket_wildcard_resource(&bucket),
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok_with_retry(
+            "CreateMultipartUpload with inline tags under PutObjectTagging policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key("allowed")
+                    .tagging("security=public")
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("allowed")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_multipart_upload_acl_condition_applies() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-acl": "private"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("denied")
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let upload = eventually_ok("CreateMultipartUpload with x-amz-acl=private", || {
+            alt_client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key("allowed")
+                .acl(ObjectCannedAcl::Private)
+                .send()
+        })
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("allowed")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_multipart_upload_grant_full_control_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+        let owner_id = canonical_owner_id(client, &bucket).await;
+        let full_control_header = format!("id=\"{owner_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-grant-full-control": full_control_header.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("denied")
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let upload = eventually_ok("CreateMultipartUpload with grant-full-control", || {
+            let full_control_header = full_control_header.clone();
+            alt_client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key("allowed")
+                .customize()
+                .mutate_request(move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-full-control", full_control_header.clone());
+                })
+                .send()
+        })
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("allowed")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_multipart_upload_grant_read_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+        let owner_id = canonical_owner_id(client, &bucket).await;
+        let grant_read_header = format!("id=\"{owner_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-grant-read": grant_read_header.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("denied")
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let upload = eventually_ok("CreateMultipartUpload with grant-read", || {
+            let grant_read_header = grant_read_header.clone();
+            alt_client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key("allowed")
+                .customize()
+                .mutate_request(move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-read", grant_read_header.clone());
+                })
+                .send()
+        })
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("allowed")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_multipart_upload_grant_read_acp_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+        let owner_id = canonical_owner_id(client, &bucket).await;
+        let grant_read_acp_header = format!("id=\"{owner_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-grant-read-acp": grant_read_acp_header.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("denied")
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let upload = eventually_ok("CreateMultipartUpload with grant-read-acp", || {
+            let grant_read_acp_header = grant_read_acp_header.clone();
+            alt_client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key("allowed")
+                .customize()
+                .mutate_request(move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-read-acp", grant_read_acp_header.clone());
+                })
+                .send()
+        })
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("allowed")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_multipart_upload_grant_write() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
@@ -5745,6 +6121,201 @@ fn test_bucket_policy_multipart_upload_grant_write() {
             .unwrap();
 
         cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_multipart_upload_grant_write_acp_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+        let owner_id = canonical_owner_id(client, &bucket).await;
+        let grant_write_acp_header = format!("id=\"{owner_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-grant-write-acp": grant_write_acp_header.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = alt_client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key("denied")
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let upload = eventually_ok("CreateMultipartUpload with grant-write-acp", || {
+            let grant_write_acp_header = grant_write_acp_header.clone();
+            alt_client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key("allowed")
+                .customize()
+                .mutate_request(move |req| {
+                    req.headers_mut()
+                        .insert("x-amz-grant-write-acp", grant_write_acp_header.clone());
+                })
+                .send()
+        })
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key("allowed")
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &["allowed", "denied"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_abort_multipart_upload_initiator_only_requires_put_object() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "cross-account-abort";
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal.clone(),
+                "Allow",
+                "s3:PutObject",
+                bucket_wildcard_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok_with_retry(
+            "CreateMultipartUpload allowed with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_parts_initiator_only_requires_put_object() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "cross-account-list-parts";
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(bucket_policy_document(
+                principal.clone(),
+                "Allow",
+                "s3:PutObject",
+                bucket_wildcard_resource(&bucket),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok_with_retry(
+            "CreateMultipartUpload allowed with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        alt_client
+            .upload_part()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .part_number(1)
+            .body(ByteStream::from(vec![b'x'; 1024]))
+            .send()
+            .await
+            .unwrap();
+
+        let listed = alt_client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(listed.parts().len(), 1);
+        assert_eq!(listed.parts()[0].part_number(), Some(1));
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &[]).await;
     });
 }
 
