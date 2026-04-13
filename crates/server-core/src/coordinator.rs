@@ -10361,7 +10361,17 @@ impl Coordinator {
                     record: stored,
                     pgs,
                 },
-        } = self.authorize_get_object_part(req)?;
+        } = self.authorize_get_object(&GetObjectRequest {
+            object: ObjectVersionRequest::new(
+                req.object.bucket_name(),
+                req.object.key(),
+                req.object.version_id,
+                req.object.requester().clone(),
+                req.expected_bucket_owner(),
+            ),
+            cond: req.cond,
+            sse_customer: req.sse_customer,
+        })?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -10580,7 +10590,17 @@ impl Coordinator {
                     record: stored,
                     pgs,
                 },
-        } = self.authorize_head_object_part(req)?;
+        } = self.authorize_head_object(&GetObjectRequest {
+            object: ObjectVersionRequest::new(
+                req.object.bucket_name(),
+                req.object.key(),
+                req.object.version_id,
+                req.object.requester().clone(),
+                req.expected_bucket_owner(),
+            ),
+            cond: req.cond,
+            sse_customer: req.sse_customer,
+        })?;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -10975,7 +10995,17 @@ impl Coordinator {
                     record: stored,
                     pgs,
                 },
-        } = self.authorize_get_object_range(req)?;
+        } = self.authorize_get_object(&GetObjectRequest {
+            object: ObjectVersionRequest::new(
+                req.object.bucket_name(),
+                req.object.key(),
+                req.object.version_id,
+                req.object.requester().clone(),
+                req.expected_bucket_owner(),
+            ),
+            cond: req.cond,
+            sse_customer: req.sse_customer,
+        })?;
 
         // If latest version is a delete marker, return 404 with x-amz-delete-marker
         let record = match stored {
@@ -24386,6 +24416,133 @@ mod tests {
     }
 
     #[test]
+    fn get_object_part_and_head_part_bucket_policy_allow_cross_account_read() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/key"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"public-via-policy",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let part = coord
+            .get_object_part(&GetObjectPartRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                part_number: 1,
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(part.body.read_all().unwrap(), b"public-via-policy");
+
+        let head = coord
+            .head_object_part(&GetObjectPartRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                part_number: 1,
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(head.part_size, b"public-via-policy".len() as u64);
+        assert_eq!(head.total_size, b"public-via-policy".len() as u64);
+    }
+
+    #[test]
+    fn get_object_range_bucket_policy_allow_cross_account_read() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/key"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"public-via-policy",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let range = coord
+            .get_object_range(&GetObjectRangeRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                range: ByteRange::Range { start: 0, end: 5 },
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(range.body.read_all().unwrap(), b"public");
+        assert_eq!(range.range_start, 0);
+        assert_eq!(range.range_end, 5);
+    }
+
+    #[test]
     fn authorize_get_object_masks_missing_private_object_as_access_denied() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -28050,7 +28207,7 @@ mod tests {
     }
 
     #[test]
-    fn authorize_get_object_range_rejects_private_read_for_non_owner() {
+    fn get_object_range_rejects_private_read_for_non_owner() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord
@@ -28080,7 +28237,7 @@ mod tests {
         .unwrap();
 
         let err = coord
-            .authorize_get_object_range(&GetObjectRangeRequest {
+            .get_object_range(&GetObjectRangeRequest {
                 range: ByteRange::Range { start: 0, end: 0 },
                 sse_customer: None,
                 object: object_version_request_with_expected_owner(

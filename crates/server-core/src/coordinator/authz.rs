@@ -1,20 +1,7 @@
 use super::*;
 
 #[derive(Clone, Copy)]
-enum ObjectReadAuthorization {
-    AclOnly,
-    WithBucketPolicy(auth::PolicyAction),
-}
-
-impl ObjectReadAuthorization {
-    fn needs_bucket_policy(self) -> bool {
-        matches!(self, Self::WithBucketPolicy(_))
-    }
-}
-
-#[derive(Clone, Copy)]
 enum ObjectBucketPolicyRequirement {
-    None,
     Required,
 }
 
@@ -3068,9 +3055,7 @@ impl Coordinator {
             src_key,
             src_version_id,
             req.source.expected_bucket_owner(),
-            ObjectReadAuthorization::WithBucketPolicy(Self::get_object_policy_action(
-                src_version_id,
-            )),
+            Self::get_object_policy_action(src_version_id),
         )?;
 
         Ok(AuthorizedCopyObject {
@@ -3207,9 +3192,7 @@ impl Coordinator {
                 src_key,
                 src_version_id,
                 req.source.expected_bucket_owner(),
-                ObjectReadAuthorization::WithBucketPolicy(Self::get_object_policy_action(
-                    src_version_id,
-                )),
+                Self::get_object_policy_action(src_version_id),
             )?;
             Ok(AuthorizedUploadPartCopy {
                 source,
@@ -3438,13 +3421,8 @@ impl Coordinator {
     ) -> Result<LoadedObjectState<'a>, ServerError> {
         let bucket_info =
             self.checked_active_bucket_summary(req.bucket, req.expected_bucket_owner)?;
-        let bucket_policy = if matches!(
-            req.policy_requirement,
-            ObjectBucketPolicyRequirement::Required
-        ) {
-            self.cached_bucket_policy(&bucket_info)?
-        } else {
-            None
+        let bucket_policy = match req.policy_requirement {
+            ObjectBucketPolicyRequirement::Required => self.cached_bucket_policy(&bucket_info)?,
         };
         let can_discover_missing = req.missing_discovery.requester_can_discover_missing(
             req.requester,
@@ -3473,24 +3451,15 @@ impl Coordinator {
     fn ensure_loaded_object_read_allowed(
         requester: &Requester,
         loaded: &LoadedObjectState<'_>,
-        authorization: ObjectReadAuthorization,
+        policy_action: auth::PolicyAction,
     ) -> Result<(), ServerError> {
-        let allowed = match authorization {
-            ObjectReadAuthorization::AclOnly => Self::requester_can_read_object(
-                requester,
-                &loaded.bucket_info,
-                &loaded.locked.record,
-            ),
-            ObjectReadAuthorization::WithBucketPolicy(policy_action) => {
-                Self::requester_can_read_object_with_bucket_policy(
-                    requester,
-                    &loaded.bucket_info,
-                    &loaded.locked.record,
-                    policy_action,
-                    loaded.bucket_policy.as_deref(),
-                )?
-            }
-        };
+        let allowed = Self::requester_can_read_object_with_bucket_policy(
+            requester,
+            &loaded.bucket_info,
+            &loaded.locked.record,
+            policy_action,
+            loaded.bucket_policy.as_deref(),
+        )?;
         if allowed {
             Ok(())
         } else {
@@ -3525,7 +3494,7 @@ impl Coordinator {
         key: &str,
         version_id: Option<VersionId>,
         expected_bucket_owner: Option<&str>,
-        authorization: ObjectReadAuthorization,
+        policy_action: auth::PolicyAction,
     ) -> Result<LockedReadObject<'a>, ServerError> {
         let loaded = self.load_locked_object_state(ObjectStateLoadRequest {
             requester,
@@ -3533,14 +3502,10 @@ impl Coordinator {
             key,
             version_id,
             expected_bucket_owner,
-            policy_requirement: if authorization.needs_bucket_policy() {
-                ObjectBucketPolicyRequirement::Required
-            } else {
-                ObjectBucketPolicyRequirement::None
-            },
+            policy_requirement: ObjectBucketPolicyRequirement::Required,
             missing_discovery: MissingObjectDiscovery::ReadBucket,
         })?;
-        Self::ensure_loaded_object_read_allowed(requester, &loaded, authorization)?;
+        Self::ensure_loaded_object_read_allowed(requester, &loaded, policy_action)?;
         Ok(loaded.locked)
     }
 
@@ -3695,43 +3660,7 @@ impl Coordinator {
             req.object.key(),
             req.object.version_id,
             req.expected_bucket_owner(),
-            ObjectReadAuthorization::WithBucketPolicy(Self::get_object_policy_action(
-                req.object.version_id,
-            )),
-        )?;
-        Ok(AuthorizedObjectRead { locked })
-    }
-
-    pub(super) fn authorize_get_object_part<'a>(
-        &'a self,
-        req: &GetObjectPartRequest<'_>,
-    ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
-        let locked = self.authorize_object_read(
-            req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key(),
-            req.object.version_id,
-            req.expected_bucket_owner(),
-            ObjectReadAuthorization::WithBucketPolicy(Self::get_object_policy_action(
-                req.object.version_id,
-            )),
-        )?;
-        Ok(AuthorizedObjectRead { locked })
-    }
-
-    pub(super) fn authorize_head_object_part<'a>(
-        &'a self,
-        req: &GetObjectPartRequest<'_>,
-    ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
-        let locked = self.authorize_object_read(
-            req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key(),
-            req.object.version_id,
-            req.expected_bucket_owner(),
-            ObjectReadAuthorization::WithBucketPolicy(Self::get_object_policy_action(
-                req.object.version_id,
-            )),
+            Self::get_object_policy_action(req.object.version_id),
         )?;
         Ok(AuthorizedObjectRead { locked })
     }
@@ -3746,9 +3675,7 @@ impl Coordinator {
             req.object.key(),
             req.object.version_id,
             req.expected_bucket_owner(),
-            ObjectReadAuthorization::WithBucketPolicy(Self::get_object_policy_action(
-                req.object.version_id,
-            )),
+            Self::get_object_policy_action(req.object.version_id),
         )?;
         Ok(AuthorizedObjectRead { locked })
     }
@@ -3772,21 +3699,6 @@ impl Coordinator {
             Self::get_object_attributes_policy_action(req.object.version_id),
         )?;
         let locked = loaded.locked;
-        Ok(AuthorizedObjectRead { locked })
-    }
-
-    pub(super) fn authorize_get_object_range<'a>(
-        &'a self,
-        req: &GetObjectRangeRequest<'_>,
-    ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
-        let locked = self.authorize_object_read(
-            req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key(),
-            req.object.version_id,
-            req.expected_bucket_owner(),
-            ObjectReadAuthorization::AclOnly,
-        )?;
         Ok(AuthorizedObjectRead { locked })
     }
 }
