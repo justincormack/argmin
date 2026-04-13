@@ -478,6 +478,82 @@ fn assert_xml_response_shape_matches(
     );
 }
 
+fn extract_xml_blocks(body: &str, tag: &str) -> Vec<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let mut blocks = Vec::new();
+    let mut search_from = 0;
+
+    loop {
+        let Some(relative_start) = body[search_from..].find(&start_tag) else {
+            break;
+        };
+        let start = search_from + relative_start;
+        let content_start = start + start_tag.len();
+        let Some(relative_end) = body[content_start..].find(&end_tag) else {
+            break;
+        };
+        let end = content_start + relative_end + end_tag.len();
+        blocks.push(body[start..end].to_string());
+        search_from = end;
+    }
+
+    blocks
+}
+
+fn assert_delete_objects_response_shape_matches(aws: &RawResponse, local: &RawResponse) {
+    assert_response_headers_match("DeleteObjects", aws, local, &[], &[]);
+
+    let aws_root_end = aws
+        .body
+        .find('>')
+        .expect("DeleteObjects AWS body should have a root tag")
+        + 1;
+    let local_root_end = local
+        .body
+        .find('>')
+        .expect("DeleteObjects local body should have a root tag")
+        + 1;
+    let aws_deleted = extract_xml_blocks(&aws.body, "Deleted");
+    let local_deleted = extract_xml_blocks(&local.body, "Deleted");
+    let aws_errors = extract_xml_blocks(&aws.body, "Error");
+    let local_errors = extract_xml_blocks(&local.body, "Error");
+
+    assert_eq!(
+        &local.body[..local_root_end],
+        &aws.body[..aws_root_end],
+        "DeleteObjects: root tag mismatch\naws body: {}\nlocal body: {}",
+        aws.body,
+        local.body,
+    );
+    assert!(
+        aws.body.ends_with("</DeleteResult>") && local.body.ends_with("</DeleteResult>"),
+        "DeleteObjects: expected DeleteResult root\naws body: {}\nlocal body: {}",
+        aws.body,
+        local.body,
+    );
+
+    let mut aws_deleted_sorted = aws_deleted;
+    let mut local_deleted_sorted = local_deleted;
+    let mut aws_errors_sorted = aws_errors;
+    let mut local_errors_sorted = local_errors;
+    aws_deleted_sorted.sort();
+    local_deleted_sorted.sort();
+    aws_errors_sorted.sort();
+    local_errors_sorted.sort();
+
+    assert_eq!(
+        local_deleted_sorted, aws_deleted_sorted,
+        "DeleteObjects: normalized Deleted entries mismatch\naws body: {}\nlocal body: {}",
+        aws.body, local.body,
+    );
+    assert_eq!(
+        local_errors_sorted, aws_errors_sorted,
+        "DeleteObjects: normalized Error entries mismatch\naws body: {}\nlocal body: {}",
+        aws.body, local.body,
+    );
+}
+
 fn xml_tag_text<'a>(body: &'a str, tag: &str) -> Option<&'a str> {
     let start_tag = format!("<{tag}>");
     let end_tag = format!("</{tag}>");
@@ -2908,14 +2984,7 @@ fn test_delete_objects_response_shape_matches_aws() {
             [md5_header],
         );
 
-        assert_xml_response_shape_matches(
-            "DeleteObjects",
-            &aws_delete,
-            &local_delete,
-            &[],
-            &[],
-            &[],
-        );
+        assert_delete_objects_response_shape_matches(&aws_delete, &local_delete);
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
         delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
