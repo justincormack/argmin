@@ -530,6 +530,50 @@ Acceptance criteria:
 
 ### Phase 4: Write-Authorization Matrix
 
+Status: completed
+
+Implemented:
+
+- extended `crates/server-core/src/coordinator/authz_model_tests.rs` with a
+  separate phase-4 write model and harness covering:
+  - `PutObject`
+  - `CreateMultipartUpload`
+  - `BeginStreamPut`
+  - `PutObjectAcl`
+  - `PutObjectVersionAcl`
+- split phase 4 into two bounded matrices instead of forcing write entrypoints
+  and ACL updates through one oversized scenario type:
+  - a creation-path write matrix for `PutObject`, multipart creation, and
+    streaming session creation
+  - an existing-object ACL-update matrix for current and versioned
+    `PutObjectAcl`
+- kept the write-entry matrix focused on the authz-relevant creation contract:
+  - BOE-allowed versus BOE-rejected ACL write shapes
+  - `BlockPublicAcls` rejection of public canned ACLs and explicit grants
+  - `IgnorePublicAcls` suppression of bucket public-write fallback without
+    turning into `BlockPublicAcls`
+  - `RestrictPublicBuckets` falling back to the non-policy path when a public
+    allow does not survive
+  - the current anonymous `CreateMultipartUpload` carveout as distinct from
+    `PutObject` and `BeginStreamPut`
+- added a dedicated ACL-update matrix that models:
+  - current versus versioned `PutObjectAcl` policy actions
+  - owner/fallback authorization versus requester-specific `WriteAcp` grants
+  - same-account owner-account-admin requesters for both exact-owner and
+    canonical-owner fallback paths
+  - BOE `AccessControlListNotSupported` ordering after authorization succeeds
+  - `BlockPublicAcls` on ACL updates
+  - `PutObjectAcl` policy-context exactness and conflicting-header rejection as
+    explicit `InvalidArgument` outcomes
+- materialized the ACL-policy regressions through narrow policy snippets rather
+  than reusing the existing one-off tests only:
+  - unconditional private/public allows
+  - public-allow plus `RestrictPublicBuckets`
+  - public-write fallback staying distinct from `BlockPublicAcls` on private
+    ACL requests
+  - allow-plus-conditional-deny on `s3:x-amz-acl`
+  - allow conditioned on exact `s3:x-amz-grant-read`
+
 Add a narrower write-focused matrix for:
 
 - `PutObject`

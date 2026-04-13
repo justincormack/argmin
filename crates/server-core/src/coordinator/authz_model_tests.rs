@@ -402,7 +402,7 @@ mod model {
     }
 
     impl PolicyDecisionShape {
-        const ALL: [Self; 5] = [
+        pub(super) const ALL: [Self; 5] = [
             Self::NoPolicy,
             Self::NoMatch,
             Self::ExplicitAllowPrivate,
@@ -1112,15 +1112,15 @@ mod harness {
     }
 
     #[derive(Clone)]
-    struct IdentityFixtures {
-        root: AccountIdentity,
-        owner_user: AccountIdentity,
-        same_account_distinct: AccountIdentity,
-        cross_account: AccountIdentity,
+    pub(super) struct IdentityFixtures {
+        pub(super) root: AccountIdentity,
+        pub(super) owner_user: AccountIdentity,
+        pub(super) same_account_distinct: AccountIdentity,
+        pub(super) cross_account: AccountIdentity,
     }
 
     impl IdentityFixtures {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let shared_canonical_id = CanonicalUserId::from_principal("111122223333");
             let root = AccountIdentity::new(
                 "arn:aws:iam::111122223333:root",
@@ -1416,7 +1416,7 @@ mod harness {
         }
     }
 
-    fn setup_coordinator(dir: &Path) -> Coordinator {
+    pub(super) fn setup_coordinator(dir: &Path) -> Coordinator {
         let pg_ids: Vec<u32> = (0..4).collect();
         let storage_node = Arc::new(SharedStorageNode::open(dir, &pg_ids).unwrap());
         Coordinator::new_with_managed_key_provider(
@@ -1952,8 +1952,1626 @@ mod harness {
     }
 }
 
+mod phase4_model {
+    use super::model::{OwnershipShape, PolicyDecisionShape};
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum WriteAction {
+        PutObject,
+        CreateMultipartUpload,
+        BeginStreamPut,
+    }
+
+    impl fmt::Display for WriteAction {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::PutObject => f.write_str("PutObject"),
+                Self::CreateMultipartUpload => f.write_str("CreateMultipartUpload"),
+                Self::BeginStreamPut => f.write_str("BeginStreamPut"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum WriteRequesterShape {
+        Anonymous,
+        BucketOwnerPrincipal,
+        SameAccountOtherPrincipal,
+        SameAccountDistinctAdmin,
+        CrossAccountPrincipal,
+    }
+
+    impl WriteRequesterShape {
+        const ALL: [Self; 5] = [
+            Self::Anonymous,
+            Self::BucketOwnerPrincipal,
+            Self::SameAccountOtherPrincipal,
+            Self::SameAccountDistinctAdmin,
+            Self::CrossAccountPrincipal,
+        ];
+
+        fn is_anonymous(self) -> bool {
+            self == Self::Anonymous
+        }
+
+        fn is_bucket_owner_account(self) -> bool {
+            matches!(
+                self,
+                Self::BucketOwnerPrincipal
+                    | Self::SameAccountOtherPrincipal
+                    | Self::SameAccountDistinctAdmin
+            )
+        }
+
+        fn is_bucket_owner_account_admin(self) -> bool {
+            matches!(
+                self,
+                Self::BucketOwnerPrincipal | Self::SameAccountDistinctAdmin
+            )
+        }
+    }
+
+    impl fmt::Display for WriteRequesterShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Anonymous => f.write_str("anonymous"),
+                Self::BucketOwnerPrincipal => f.write_str("bucket-owner-principal"),
+                Self::SameAccountOtherPrincipal => f.write_str("same-account-other"),
+                Self::SameAccountDistinctAdmin => f.write_str("same-account-admin"),
+                Self::CrossAccountPrincipal => f.write_str("cross-account"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct WriteBucketShape {
+        pub(super) ownership: OwnershipShape,
+        pub(super) block_public_acls: bool,
+        pub(super) ignore_public_acls: bool,
+        pub(super) restrict_public_buckets: bool,
+        pub(super) bucket_public_write: bool,
+    }
+
+    impl WriteBucketShape {
+        pub(super) fn all() -> impl Iterator<Item = Self> {
+            [
+                Self {
+                    ownership: OwnershipShape::ObjectWriter,
+                    block_public_acls: false,
+                    ignore_public_acls: false,
+                    restrict_public_buckets: false,
+                    bucket_public_write: false,
+                },
+                Self {
+                    ownership: OwnershipShape::ObjectWriter,
+                    block_public_acls: false,
+                    ignore_public_acls: false,
+                    restrict_public_buckets: false,
+                    bucket_public_write: true,
+                },
+                Self {
+                    ownership: OwnershipShape::ObjectWriter,
+                    block_public_acls: false,
+                    ignore_public_acls: true,
+                    restrict_public_buckets: false,
+                    bucket_public_write: true,
+                },
+                Self {
+                    ownership: OwnershipShape::ObjectWriter,
+                    block_public_acls: true,
+                    ignore_public_acls: false,
+                    restrict_public_buckets: false,
+                    bucket_public_write: false,
+                },
+                Self {
+                    ownership: OwnershipShape::ObjectWriter,
+                    block_public_acls: true,
+                    ignore_public_acls: false,
+                    restrict_public_buckets: false,
+                    bucket_public_write: true,
+                },
+                Self {
+                    ownership: OwnershipShape::ObjectWriter,
+                    block_public_acls: false,
+                    ignore_public_acls: false,
+                    restrict_public_buckets: true,
+                    bucket_public_write: false,
+                },
+                Self {
+                    ownership: OwnershipShape::BucketOwnerEnforced,
+                    block_public_acls: false,
+                    ignore_public_acls: false,
+                    restrict_public_buckets: false,
+                    bucket_public_write: false,
+                },
+            ]
+            .into_iter()
+        }
+    }
+
+    impl fmt::Display for WriteBucketShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "{}(block_public_acls={}, ignore_public_acls={}, restrict_public_buckets={}, public_write={})",
+                self.ownership,
+                self.block_public_acls,
+                self.ignore_public_acls,
+                self.restrict_public_buckets,
+                self.bucket_public_write
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum RequestedAclShape {
+        None,
+        CannedPrivate,
+        CannedPublicRead,
+        CannedAuthenticatedRead,
+        CannedBucketOwnerFullControl,
+        GrantsOwnerFullControlOnly,
+        GrantsRequesterRead,
+        GrantsAuthenticatedUsersRead,
+    }
+
+    impl RequestedAclShape {
+        const WRITE_ALL: [Self; 8] = [
+            Self::None,
+            Self::CannedPrivate,
+            Self::CannedPublicRead,
+            Self::CannedAuthenticatedRead,
+            Self::CannedBucketOwnerFullControl,
+            Self::GrantsOwnerFullControlOnly,
+            Self::GrantsRequesterRead,
+            Self::GrantsAuthenticatedUsersRead,
+        ];
+
+        const ACL_UPDATE_ALL: [Self; 4] = [
+            Self::CannedPrivate,
+            Self::CannedPublicRead,
+            Self::GrantsRequesterRead,
+            Self::GrantsAuthenticatedUsersRead,
+        ];
+
+        fn is_public_acl(self) -> bool {
+            matches!(
+                self,
+                Self::CannedPublicRead
+                    | Self::CannedAuthenticatedRead
+                    | Self::GrantsAuthenticatedUsersRead
+            )
+        }
+
+        fn is_public_canned_acl(self) -> bool {
+            self == Self::CannedPublicRead
+        }
+
+        fn is_canned(self) -> bool {
+            matches!(
+                self,
+                Self::CannedPrivate
+                    | Self::CannedPublicRead
+                    | Self::CannedAuthenticatedRead
+                    | Self::CannedBucketOwnerFullControl
+            )
+        }
+
+        fn is_supported_under_boe(self) -> bool {
+            matches!(
+                self,
+                Self::None
+                    | Self::CannedPrivate
+                    | Self::CannedBucketOwnerFullControl
+                    | Self::GrantsOwnerFullControlOnly
+            )
+        }
+
+        pub(super) fn policy_condition_value(self) -> Option<&'static str> {
+            match self {
+                Self::None
+                | Self::GrantsOwnerFullControlOnly
+                | Self::GrantsRequesterRead
+                | Self::GrantsAuthenticatedUsersRead => None,
+                Self::CannedPrivate => Some("private"),
+                Self::CannedPublicRead => Some("public-read"),
+                Self::CannedAuthenticatedRead => Some("authenticated-read"),
+                Self::CannedBucketOwnerFullControl => Some("bucket-owner-full-control"),
+            }
+        }
+    }
+
+    impl fmt::Display for RequestedAclShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("none"),
+                Self::CannedPrivate => f.write_str("canned-private"),
+                Self::CannedPublicRead => f.write_str("canned-public-read"),
+                Self::CannedAuthenticatedRead => f.write_str("canned-authenticated-read"),
+                Self::CannedBucketOwnerFullControl => {
+                    f.write_str("canned-bucket-owner-full-control")
+                }
+                Self::GrantsOwnerFullControlOnly => f.write_str("grants-owner-full-control"),
+                Self::GrantsRequesterRead => f.write_str("grants-requester-read"),
+                Self::GrantsAuthenticatedUsersRead => {
+                    f.write_str("grants-authenticated-users-read")
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum WriteOutcome {
+        Allow,
+        Deny,
+        AclNotSupported,
+    }
+
+    impl fmt::Display for WriteOutcome {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Allow => f.write_str("Allow"),
+                Self::Deny => f.write_str("Deny"),
+                Self::AclNotSupported => f.write_str("AclNotSupported"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct WriteScenario {
+        pub(super) action: WriteAction,
+        pub(super) requester: WriteRequesterShape,
+        pub(super) bucket: WriteBucketShape,
+        pub(super) acl: RequestedAclShape,
+        pub(super) policy: PolicyDecisionShape,
+    }
+
+    impl WriteScenario {
+        pub(super) fn scenarios(action: WriteAction) -> Vec<Self> {
+            let mut scenarios = Vec::new();
+            for requester in WriteRequesterShape::ALL {
+                for bucket in WriteBucketShape::all() {
+                    for acl in RequestedAclShape::WRITE_ALL {
+                        for policy in PolicyDecisionShape::ALL {
+                            let scenario = Self {
+                                action,
+                                requester,
+                                bucket,
+                                acl,
+                                policy,
+                            };
+                            if scenario.is_possible() {
+                                scenarios.push(scenario);
+                            }
+                        }
+                    }
+                }
+            }
+            scenarios
+        }
+
+        pub(super) fn expected_outcome(self) -> WriteOutcome {
+            if self.action == WriteAction::CreateMultipartUpload && self.requester.is_anonymous() {
+                return WriteOutcome::Deny;
+            }
+            let fallback = self.requester.is_bucket_owner_account_admin()
+                || (self.bucket.bucket_public_write && !self.bucket.ignore_public_acls);
+            let allowed = match self.policy {
+                PolicyDecisionShape::ExplicitDeny => false,
+                PolicyDecisionShape::ExplicitAllowPrivate => true,
+                PolicyDecisionShape::ExplicitAllowPublic => {
+                    if !self.bucket.restrict_public_buckets
+                        || self.requester.is_bucket_owner_account()
+                    {
+                        true
+                    } else {
+                        fallback
+                    }
+                }
+                PolicyDecisionShape::NoPolicy | PolicyDecisionShape::NoMatch => fallback,
+            };
+            if !allowed {
+                return WriteOutcome::Deny;
+            }
+            if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced
+                && !self.acl.is_supported_under_boe()
+            {
+                return WriteOutcome::AclNotSupported;
+            }
+            if self.bucket.block_public_acls && self.acl.is_public_acl() {
+                return WriteOutcome::Deny;
+            }
+            WriteOutcome::Allow
+        }
+
+        fn is_possible(self) -> bool {
+            if self.requester.is_anonymous()
+                && self.policy == PolicyDecisionShape::ExplicitAllowPrivate
+            {
+                return false;
+            }
+            if self.bucket.restrict_public_buckets
+                && self.policy != PolicyDecisionShape::ExplicitAllowPublic
+            {
+                return false;
+            }
+            if self.bucket.ignore_public_acls && !self.bucket.bucket_public_write {
+                return false;
+            }
+            true
+        }
+    }
+
+    impl fmt::Display for WriteScenario {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "action={} requester={} bucket={} acl={} policy={}",
+                self.action, self.requester, self.bucket, self.acl, self.policy
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum AclUpdateAction {
+        PutObjectAcl,
+        PutObjectVersionAcl,
+    }
+
+    impl fmt::Display for AclUpdateAction {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::PutObjectAcl => f.write_str("PutObjectAcl"),
+                Self::PutObjectVersionAcl => f.write_str("PutObjectVersionAcl"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum AclRequesterShape {
+        Anonymous,
+        BucketOwnerPrincipal,
+        SameAccountOtherPrincipal,
+        SameAccountOtherAdmin,
+        SameAccountDistinctAdmin,
+        CrossAccountPrincipal,
+    }
+
+    impl AclRequesterShape {
+        const ALL: [Self; 6] = [
+            Self::Anonymous,
+            Self::BucketOwnerPrincipal,
+            Self::SameAccountOtherPrincipal,
+            Self::SameAccountOtherAdmin,
+            Self::SameAccountDistinctAdmin,
+            Self::CrossAccountPrincipal,
+        ];
+
+        fn is_anonymous(self) -> bool {
+            self == Self::Anonymous
+        }
+
+        fn is_bucket_owner_account(self) -> bool {
+            matches!(
+                self,
+                Self::BucketOwnerPrincipal
+                    | Self::SameAccountOtherPrincipal
+                    | Self::SameAccountOtherAdmin
+                    | Self::SameAccountDistinctAdmin
+            )
+        }
+
+        fn is_bucket_owner_account_admin(self) -> bool {
+            matches!(
+                self,
+                Self::BucketOwnerPrincipal
+                    | Self::SameAccountOtherAdmin
+                    | Self::SameAccountDistinctAdmin
+            )
+        }
+
+        fn has_owner_account_admin_profile(self) -> bool {
+            matches!(
+                self,
+                Self::SameAccountOtherAdmin | Self::SameAccountDistinctAdmin
+            )
+        }
+    }
+
+    impl fmt::Display for AclRequesterShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Anonymous => f.write_str("anonymous"),
+                Self::BucketOwnerPrincipal => f.write_str("bucket-owner-principal"),
+                Self::SameAccountOtherPrincipal => f.write_str("same-account-other"),
+                Self::SameAccountOtherAdmin => f.write_str("same-account-other-admin"),
+                Self::SameAccountDistinctAdmin => f.write_str("same-account-distinct-admin"),
+                Self::CrossAccountPrincipal => f.write_str("cross-account"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum AclOwnerKind {
+        BucketOwner,
+        SameAccountOther,
+    }
+
+    impl AclOwnerKind {
+        const ALL: [Self; 2] = [Self::BucketOwner, Self::SameAccountOther];
+    }
+
+    impl fmt::Display for AclOwnerKind {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::BucketOwner => f.write_str("bucket-owner"),
+                Self::SameAccountOther => f.write_str("same-account-other"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ExistingAclShape {
+        Private,
+        GrantWriteAcpToRequester,
+    }
+
+    impl ExistingAclShape {
+        const ALL: [Self; 2] = [Self::Private, Self::GrantWriteAcpToRequester];
+    }
+
+    impl fmt::Display for ExistingAclShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Private => f.write_str("private"),
+                Self::GrantWriteAcpToRequester => f.write_str("grant-write-acp-to-requester"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct AclBucketShape {
+        pub(super) ownership: OwnershipShape,
+        pub(super) block_public_acls: bool,
+        pub(super) restrict_public_buckets: bool,
+    }
+
+    impl AclBucketShape {
+        fn all() -> impl Iterator<Item = Self> {
+            [
+                Self {
+                    ownership: OwnershipShape::ObjectWriter,
+                    block_public_acls: false,
+                    restrict_public_buckets: false,
+                },
+                Self {
+                    ownership: OwnershipShape::ObjectWriter,
+                    block_public_acls: true,
+                    restrict_public_buckets: false,
+                },
+                Self {
+                    ownership: OwnershipShape::ObjectWriter,
+                    block_public_acls: false,
+                    restrict_public_buckets: true,
+                },
+                Self {
+                    ownership: OwnershipShape::BucketOwnerEnforced,
+                    block_public_acls: false,
+                    restrict_public_buckets: false,
+                },
+            ]
+            .into_iter()
+        }
+    }
+
+    impl fmt::Display for AclBucketShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "{}(block_public_acls={}, restrict_public_buckets={})",
+                self.ownership, self.block_public_acls, self.restrict_public_buckets
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum AclPolicyShape {
+        NoPolicy,
+        NoMatch,
+        AllowPrivate,
+        AllowPublic,
+        AllowWithPublicCannedDeny,
+        AllowWithGrantReadCondition,
+    }
+
+    impl AclPolicyShape {
+        const ALL: [Self; 6] = [
+            Self::NoPolicy,
+            Self::NoMatch,
+            Self::AllowPrivate,
+            Self::AllowPublic,
+            Self::AllowWithPublicCannedDeny,
+            Self::AllowWithGrantReadCondition,
+        ];
+    }
+
+    impl fmt::Display for AclPolicyShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::NoPolicy => f.write_str("no-policy"),
+                Self::NoMatch => f.write_str("no-match"),
+                Self::AllowPrivate => f.write_str("allow-private"),
+                Self::AllowPublic => f.write_str("allow-public"),
+                Self::AllowWithPublicCannedDeny => f.write_str("allow-with-public-canned-deny"),
+                Self::AllowWithGrantReadCondition => f.write_str("allow-with-grant-read-condition"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum AclContextShape {
+        Exact,
+        CannedAclMismatch,
+        CannedAclWithGrantHeader,
+        GrantReadMismatch,
+        GrantInputWithCannedAcl,
+    }
+
+    impl AclContextShape {
+        const ALL: [Self; 5] = [
+            Self::Exact,
+            Self::CannedAclMismatch,
+            Self::CannedAclWithGrantHeader,
+            Self::GrantReadMismatch,
+            Self::GrantInputWithCannedAcl,
+        ];
+    }
+
+    impl fmt::Display for AclContextShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Exact => f.write_str("exact"),
+                Self::CannedAclMismatch => f.write_str("canned-acl-mismatch"),
+                Self::CannedAclWithGrantHeader => f.write_str("canned-acl-with-grant-header"),
+                Self::GrantReadMismatch => f.write_str("grant-read-mismatch"),
+                Self::GrantInputWithCannedAcl => f.write_str("grant-input-with-canned-acl"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum AclOutcome {
+        Allow,
+        Deny,
+        AclNotSupported,
+        InvalidArgument,
+    }
+
+    impl fmt::Display for AclOutcome {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Allow => f.write_str("Allow"),
+                Self::Deny => f.write_str("Deny"),
+                Self::AclNotSupported => f.write_str("AclNotSupported"),
+                Self::InvalidArgument => f.write_str("InvalidArgument"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct AclUpdateScenario {
+        pub(super) action: AclUpdateAction,
+        pub(super) requester: AclRequesterShape,
+        pub(super) bucket: AclBucketShape,
+        pub(super) owner: AclOwnerKind,
+        pub(super) existing_acl: ExistingAclShape,
+        pub(super) requested_acl: RequestedAclShape,
+        pub(super) policy: AclPolicyShape,
+        pub(super) context: AclContextShape,
+    }
+
+    impl AclUpdateScenario {
+        pub(super) fn scenarios(action: AclUpdateAction) -> Vec<Self> {
+            let mut scenarios = Vec::new();
+            for requester in AclRequesterShape::ALL {
+                for bucket in AclBucketShape::all() {
+                    for owner in AclOwnerKind::ALL {
+                        for existing_acl in ExistingAclShape::ALL {
+                            for requested_acl in RequestedAclShape::ACL_UPDATE_ALL {
+                                for policy in AclPolicyShape::ALL {
+                                    for context in AclContextShape::ALL {
+                                        let scenario = Self {
+                                            action,
+                                            requester,
+                                            bucket,
+                                            owner,
+                                            existing_acl,
+                                            requested_acl,
+                                            policy,
+                                            context,
+                                        };
+                                        if scenario.is_possible() {
+                                            scenarios.push(scenario);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            scenarios
+        }
+
+        pub(super) fn expected_outcome(self) -> AclOutcome {
+            if self.requester.is_anonymous() {
+                return AclOutcome::Deny;
+            }
+            if self.context != AclContextShape::Exact {
+                return AclOutcome::InvalidArgument;
+            }
+            if !self.authorization_allowed() {
+                return AclOutcome::Deny;
+            }
+            if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced {
+                return AclOutcome::AclNotSupported;
+            }
+            if self.bucket.block_public_acls && self.requested_acl.is_public_acl() {
+                return AclOutcome::Deny;
+            }
+            AclOutcome::Allow
+        }
+
+        fn is_possible(self) -> bool {
+            if self.requester.is_anonymous() && self.context != AclContextShape::Exact {
+                return false;
+            }
+            if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced
+                && self.owner != AclOwnerKind::BucketOwner
+            {
+                return false;
+            }
+            if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced
+                && self.existing_acl != ExistingAclShape::Private
+            {
+                return false;
+            }
+            if self.existing_acl == ExistingAclShape::GrantWriteAcpToRequester
+                && (self.requester.is_anonymous() || self.requester_is_exact_owner())
+            {
+                return false;
+            }
+            if self.requested_acl == RequestedAclShape::GrantsRequesterRead
+                && self.requester.is_anonymous()
+            {
+                return false;
+            }
+            if self.bucket.block_public_acls && !self.requested_acl.is_public_acl() {
+                return false;
+            }
+            if self.bucket.restrict_public_buckets && self.policy != AclPolicyShape::AllowPublic {
+                return false;
+            }
+            match self.context {
+                AclContextShape::Exact => {}
+                AclContextShape::CannedAclMismatch | AclContextShape::CannedAclWithGrantHeader => {
+                    if !self.requested_acl.is_canned() {
+                        return false;
+                    }
+                }
+                AclContextShape::GrantReadMismatch => {
+                    if self.requested_acl != RequestedAclShape::GrantsRequesterRead {
+                        return false;
+                    }
+                }
+                AclContextShape::GrantInputWithCannedAcl => {
+                    if self.requested_acl.is_canned() {
+                        return false;
+                    }
+                }
+            }
+            match self.policy {
+                AclPolicyShape::AllowPrivate => !self.requester.is_anonymous(),
+                AclPolicyShape::AllowPublic => true,
+                AclPolicyShape::AllowWithPublicCannedDeny => {
+                    !self.requester.is_anonymous() && self.requested_acl.is_canned()
+                }
+                AclPolicyShape::AllowWithGrantReadCondition => {
+                    !self.requester.is_anonymous()
+                        && self.requested_acl == RequestedAclShape::GrantsRequesterRead
+                }
+                AclPolicyShape::NoPolicy | AclPolicyShape::NoMatch => true,
+            }
+        }
+
+        fn authorization_allowed(self) -> bool {
+            match self.policy {
+                AclPolicyShape::NoPolicy | AclPolicyShape::NoMatch => self.fallback_allowed(),
+                AclPolicyShape::AllowPrivate => true,
+                AclPolicyShape::AllowPublic => {
+                    if !self.bucket.restrict_public_buckets
+                        || self.requester.is_bucket_owner_account()
+                    {
+                        true
+                    } else {
+                        self.fallback_allowed()
+                    }
+                }
+                AclPolicyShape::AllowWithPublicCannedDeny => {
+                    !self.requested_acl.is_public_canned_acl()
+                }
+                AclPolicyShape::AllowWithGrantReadCondition => true,
+            }
+        }
+
+        fn fallback_allowed(self) -> bool {
+            if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced {
+                return self.requester.is_bucket_owner_account_admin();
+            }
+
+            self.requester_is_exact_owner()
+                || self.requester_matches_owner_via_admin_canonical()
+                || self.requester_has_granted_write_acp()
+        }
+
+        fn requester_is_exact_owner(self) -> bool {
+            matches!(
+                (self.requester, self.owner),
+                (
+                    AclRequesterShape::BucketOwnerPrincipal,
+                    AclOwnerKind::BucketOwner
+                ) | (
+                    AclRequesterShape::SameAccountOtherPrincipal,
+                    AclOwnerKind::SameAccountOther,
+                ) | (
+                    AclRequesterShape::SameAccountOtherAdmin,
+                    AclOwnerKind::SameAccountOther,
+                )
+            )
+        }
+
+        fn requester_matches_owner_via_admin_canonical(self) -> bool {
+            self.requester.has_owner_account_admin_profile()
+                && !self.requester_is_exact_owner()
+                && self.requester_canonical_matches_owner()
+        }
+
+        fn requester_has_granted_write_acp(self) -> bool {
+            self.existing_acl == ExistingAclShape::GrantWriteAcpToRequester
+                && !self.requester.is_anonymous()
+                && (!self.requester_canonical_matches_owner()
+                    || self.requester.has_owner_account_admin_profile())
+        }
+
+        fn requester_canonical_matches_owner(self) -> bool {
+            matches!(
+                self.requester,
+                AclRequesterShape::BucketOwnerPrincipal
+                    | AclRequesterShape::SameAccountOtherPrincipal
+                    | AclRequesterShape::SameAccountOtherAdmin
+            )
+        }
+    }
+
+    impl fmt::Display for AclUpdateScenario {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "action={} requester={} bucket={} owner={} existing_acl={} requested_acl={} policy={} context={}",
+                self.action,
+                self.requester,
+                self.bucket,
+                self.owner,
+                self.existing_acl,
+                self.requested_acl,
+                self.policy,
+                self.context
+            )
+        }
+    }
+}
+
+mod phase4_harness {
+    use super::harness::{setup_coordinator, IdentityFixtures};
+    use super::model::{OwnershipShape, PolicyDecisionShape};
+    use super::phase4_model::{
+        AclBucketShape, AclContextShape, AclOutcome, AclOwnerKind, AclPolicyShape,
+        AclRequesterShape, AclUpdateAction, AclUpdateScenario, ExistingAclShape, RequestedAclShape,
+        WriteAction, WriteBucketShape, WriteOutcome, WriteRequesterShape, WriteScenario,
+    };
+    use super::*;
+
+    const PHASE4_KEY: &str = "key";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ClassifiedWriteResult {
+        Allow,
+        Deny,
+        AclNotSupported,
+        InvalidArgument,
+    }
+
+    pub(super) struct Phase4Harness {
+        _tmp: test_util::TempDir,
+        coord: Coordinator,
+        fixtures: IdentityFixtures,
+    }
+
+    impl Phase4Harness {
+        pub(super) fn new() -> Self {
+            let tmp = test_util::tempdir();
+            let coord = setup_coordinator(tmp.path());
+            let fixtures = IdentityFixtures::new();
+            Self {
+                _tmp: tmp,
+                coord,
+                fixtures,
+            }
+        }
+
+        pub(super) fn run_write(
+            &self,
+            bucket: &str,
+            scenario: WriteScenario,
+        ) -> ClassifiedWriteResult {
+            materialize_write_bucket(&self.coord, &self.fixtures, bucket, scenario.bucket)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize phase 4 write bucket for {scenario}: {err:?}");
+                });
+            materialize_write_policy(&self.coord, &self.fixtures, bucket, scenario).unwrap_or_else(
+                |err| {
+                    panic!("failed to materialize phase 4 write policy for {scenario}: {err:?}");
+                },
+            );
+            classify(run_write_action(
+                &self.coord,
+                &self.fixtures,
+                bucket,
+                scenario,
+            ))
+        }
+
+        pub(super) fn run_acl_update(
+            &self,
+            bucket: &str,
+            scenario: AclUpdateScenario,
+        ) -> ClassifiedWriteResult {
+            materialize_acl_bucket(&self.coord, &self.fixtures, bucket, scenario.bucket)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize phase 4 acl bucket for {scenario}: {err:?}");
+                });
+            let version_id = materialize_acl_target(&self.coord, &self.fixtures, bucket, scenario)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize phase 4 acl target for {scenario}: {err:?}");
+                });
+            materialize_acl_policy(&self.coord, &self.fixtures, bucket, scenario).unwrap_or_else(
+                |err| {
+                    panic!("failed to materialize phase 4 acl policy for {scenario}: {err:?}");
+                },
+            );
+            classify(run_acl_update_action(
+                &self.coord,
+                &self.fixtures,
+                bucket,
+                scenario,
+                version_id,
+            ))
+        }
+    }
+
+    pub(super) fn write_bucket_name_for(action: WriteAction, index: usize) -> String {
+        let action_tag = match action {
+            WriteAction::PutObject => "putobj",
+            WriteAction::CreateMultipartUpload => "mpu",
+            WriteAction::BeginStreamPut => "stream",
+        };
+        format!("authz-phase4-{action_tag}-{index:05}")
+    }
+
+    pub(super) fn acl_bucket_name_for(action: AclUpdateAction, index: usize) -> String {
+        let action_tag = match action {
+            AclUpdateAction::PutObjectAcl => "putacl",
+            AclUpdateAction::PutObjectVersionAcl => "putvacl",
+        };
+        format!("authz-phase4-{action_tag}-{index:05}")
+    }
+
+    pub(super) fn to_write_outcome(result: ClassifiedWriteResult) -> WriteOutcome {
+        match result {
+            ClassifiedWriteResult::Allow => WriteOutcome::Allow,
+            ClassifiedWriteResult::Deny => WriteOutcome::Deny,
+            ClassifiedWriteResult::AclNotSupported => WriteOutcome::AclNotSupported,
+            ClassifiedWriteResult::InvalidArgument => {
+                panic!("write-entry matrix produced an unexpected InvalidArgument")
+            }
+        }
+    }
+
+    pub(super) fn to_acl_outcome(result: ClassifiedWriteResult) -> AclOutcome {
+        match result {
+            ClassifiedWriteResult::Allow => AclOutcome::Allow,
+            ClassifiedWriteResult::Deny => AclOutcome::Deny,
+            ClassifiedWriteResult::AclNotSupported => AclOutcome::AclNotSupported,
+            ClassifiedWriteResult::InvalidArgument => AclOutcome::InvalidArgument,
+        }
+    }
+
+    fn materialize_write_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        shape: WriteBucketShape,
+    ) -> Result<(), ServerError> {
+        let owner = OwnerIdentity::new(
+            fixtures.owner_user.principal(),
+            fixtures.owner_user.canonical_user_id().clone(),
+        );
+        let grants =
+            Coordinator::bucket_acl_grants_from_flags(&owner, false, shape.bucket_public_write);
+        coord.create_bucket_with_acl_grants(&owner, bucket, grants, false)?;
+
+        if shape.ownership == OwnershipShape::BucketOwnerEnforced {
+            coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
+                bucket: BucketRequest::new(
+                    bucket,
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                config: BucketOwnershipControls {
+                    object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                },
+            })?;
+        }
+
+        if shape.block_public_acls || shape.ignore_public_acls || shape.restrict_public_buckets {
+            coord.put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
+                bucket: BucketRequest::new(
+                    bucket,
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                config: PublicAccessBlockConfig {
+                    block_public_acls: shape.block_public_acls,
+                    ignore_public_acls: shape.ignore_public_acls,
+                    block_public_policy: false,
+                    restrict_public_buckets: shape.restrict_public_buckets,
+                },
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn materialize_write_policy(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: WriteScenario,
+    ) -> Result<(), ServerError> {
+        let Some(policy) = write_policy_document(fixtures, bucket, scenario) else {
+            return Ok(());
+        };
+        coord.put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: BucketRequest::new(
+                bucket,
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            config: &policy,
+            confirm_remove_self_bucket_access: false,
+        })
+    }
+
+    fn write_policy_document(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: WriteScenario,
+    ) -> Option<String> {
+        let mut statements = Vec::new();
+        let requester_principal = write_requester_principal(fixtures, scenario.requester);
+        let object_resource = format!("arn:aws:s3:::{bucket}/{PHASE4_KEY}");
+        push_policy_statement(
+            &mut statements,
+            requester_principal,
+            "s3:PutObject",
+            &object_resource,
+            scenario.policy,
+        );
+
+        if statements.is_empty() {
+            None
+        } else {
+            Some(format!(
+                r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
+                statements.join(",")
+            ))
+        }
+    }
+
+    fn run_write_action(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: WriteScenario,
+    ) -> Result<(), ServerError> {
+        let requester = write_requester(fixtures, scenario.requester);
+        match scenario.action {
+            WriteAction::PutObject => test_helpers::put_object(
+                coord,
+                &PutObjectRequest {
+                    encryption: WriteEncryptionRequest::none(),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    object: ObjectRequest::new(bucket, PHASE4_KEY, requester, None),
+                    data: b"phase-4-write",
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    cond: NO_WRITE,
+                    acl: put_object_write_acl(fixtures, scenario.acl),
+                },
+            )
+            .map(|_| ()),
+            WriteAction::CreateMultipartUpload => {
+                let upload = coord.create_multipart_upload(&CreateMultipartUploadRequest {
+                    object: ObjectRequest::new(bucket, PHASE4_KEY, requester.clone(), None),
+                    metadata: &MetadataBlob::new(),
+                    system_metadata: &SystemMetadata::EMPTY,
+                    tags: None,
+                    checksum: None,
+                    acl: put_object_write_acl(fixtures, scenario.acl),
+                    policy_context: PutObjectPolicyContext::default(),
+                    object_lock: ObjectLockState::default(),
+                    encryption: WriteEncryptionRequest::none(),
+                })?;
+                coord.abort_multipart_upload(&MultipartObjectRequest::new(
+                    bucket,
+                    PHASE4_KEY,
+                    &upload.upload_id,
+                    requester,
+                    None,
+                ))
+            }
+            WriteAction::BeginStreamPut => {
+                let prepared = coord.begin_stream_put(&AuthorizePutObjectRequest {
+                    object: ObjectRequest::new(bucket, PHASE4_KEY, requester, None),
+                    acl: put_object_write_acl(fixtures, scenario.acl),
+                    policy_context: WriteEncryptionRequest::none().with_policy_context(
+                        PutObjectPolicyContext::default()
+                            .with_default_canned_acl(scenario.acl.policy_condition_value()),
+                    ),
+                    object_lock: ObjectLockState::default(),
+                    tags: None,
+                    encryption: WriteEncryptionRequest::none(),
+                })?;
+                coord.abort_stream_put(bucket, PHASE4_KEY, &prepared.session_id)
+            }
+        }
+    }
+
+    fn materialize_acl_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        shape: AclBucketShape,
+    ) -> Result<(), ServerError> {
+        let owner = OwnerIdentity::new(
+            fixtures.owner_user.principal(),
+            fixtures.owner_user.canonical_user_id().clone(),
+        );
+        let grants = Coordinator::bucket_acl_grants_from_flags(&owner, false, false);
+        coord.create_bucket_with_acl_grants(&owner, bucket, grants, false)?;
+        coord.put_bucket_versioning(&PutBucketVersioningRequest {
+            bucket: BucketRequest::new(
+                bucket,
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            state: BucketVersioningState::Enabled,
+        })?;
+
+        if shape.ownership == OwnershipShape::BucketOwnerEnforced {
+            coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
+                bucket: BucketRequest::new(
+                    bucket,
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                config: BucketOwnershipControls {
+                    object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                },
+            })?;
+        }
+
+        if shape.block_public_acls || shape.restrict_public_buckets {
+            coord.put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
+                bucket: BucketRequest::new(
+                    bucket,
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                config: PublicAccessBlockConfig {
+                    block_public_acls: shape.block_public_acls,
+                    ignore_public_acls: false,
+                    block_public_policy: false,
+                    restrict_public_buckets: shape.restrict_public_buckets,
+                },
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn materialize_acl_target(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: AclUpdateScenario,
+    ) -> Result<VersionId, ServerError> {
+        if scenario.owner == AclOwnerKind::SameAccountOther {
+            let allow_policy = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/{PHASE4_KEY}"}}]}}"#,
+                fixtures.root.principal()
+            );
+            coord.put_bucket_policy(&PutBucketPolicyRequest {
+                bucket: BucketRequest::new(
+                    bucket,
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                config: &allow_policy,
+                confirm_remove_self_bucket_access: false,
+            })?;
+        }
+
+        let writer = acl_owner_requester(fixtures, scenario.owner);
+        let put = test_helpers::put_object(
+            coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: ObjectRequest::new(bucket, PHASE4_KEY, writer, None),
+                data: b"phase-4-acl",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: existing_object_write_acl(fixtures, scenario),
+            },
+        )?;
+        Ok(put.version_id)
+    }
+
+    fn materialize_acl_policy(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: AclUpdateScenario,
+    ) -> Result<(), ServerError> {
+        let Some(policy) = acl_policy_document(fixtures, bucket, scenario) else {
+            if scenario.owner == AclOwnerKind::SameAccountOther {
+                coord.delete_bucket_policy(&BucketRequest::new(
+                    bucket,
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ))?;
+            }
+            return Ok(());
+        };
+        coord.put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: BucketRequest::new(
+                bucket,
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            config: &policy,
+            confirm_remove_self_bucket_access: false,
+        })
+    }
+
+    fn acl_policy_document(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: AclUpdateScenario,
+    ) -> Option<String> {
+        let mut statements = Vec::new();
+        let requester_principal = acl_requester_principal(fixtures, scenario.requester);
+        let action = acl_policy_action_name(scenario.action);
+        let object_resource = format!("arn:aws:s3:::{bucket}/{PHASE4_KEY}");
+        match scenario.policy {
+            AclPolicyShape::NoPolicy => {}
+            AclPolicyShape::NoMatch => statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::999988887777:user/unmatched"}},"Action":"{action}","Resource":"{object_resource}"}}"#
+            )),
+            AclPolicyShape::AllowPrivate => {
+                let principal = requester_principal
+                    .expect("private acl-update allow requires an authenticated requester");
+                statements.push(format!(
+                    r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"{action}","Resource":"{object_resource}"}}"#
+                ));
+            }
+            AclPolicyShape::AllowPublic => statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":"*","Action":"{action}","Resource":"{object_resource}"}}"#
+            )),
+            AclPolicyShape::AllowWithPublicCannedDeny => {
+                let principal = requester_principal.expect(
+                    "conditional canned-acl deny policy requires an authenticated requester",
+                );
+                statements.push(format!(
+                    r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"{action}","Resource":"{object_resource}"}}"#
+                ));
+                statements.push(format!(
+                    r#"{{"Effect":"Deny","Principal":{{"AWS":"{principal}"}},"Action":"{action}","Resource":"{object_resource}","Condition":{{"StringLike":{{"s3:x-amz-acl":"public*"}}}}}}"#
+                ));
+            }
+            AclPolicyShape::AllowWithGrantReadCondition => {
+                let principal = requester_principal.expect(
+                    "grant-read condition policy requires an authenticated requester",
+                );
+                let grant_read_header = acl_requested_grant_read_header(fixtures, scenario)
+                    .expect("grant-read condition policy requires a requester-read ACL shape");
+                let grant_read_json = json_string(grant_read_header);
+                statements.push(format!(
+                    r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"{action}","Resource":"{object_resource}","Condition":{{"StringEquals":{{"s3:x-amz-grant-read":{grant_read_json}}}}}}}"#
+                ));
+            }
+        }
+
+        if statements.is_empty() {
+            None
+        } else {
+            Some(format!(
+                r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
+                statements.join(",")
+            ))
+        }
+    }
+
+    fn run_acl_update_action(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: AclUpdateScenario,
+        version_id: VersionId,
+    ) -> Result<(), ServerError> {
+        let requester = acl_requester(fixtures, scenario.requester);
+        let request_version_id = match scenario.action {
+            AclUpdateAction::PutObjectAcl => None,
+            AclUpdateAction::PutObjectVersionAcl => Some(version_id),
+        };
+        coord
+            .put_object_acl(&PutObjectAclRequest {
+                object: ObjectVersionRequest::new(
+                    bucket,
+                    PHASE4_KEY,
+                    request_version_id,
+                    requester,
+                    None,
+                ),
+                acl: put_object_acl_input(fixtures, scenario),
+                policy_context: acl_policy_context(fixtures, scenario),
+            })
+            .map(|_| ())
+    }
+
+    fn classify(result: Result<(), ServerError>) -> ClassifiedWriteResult {
+        match result {
+            Ok(()) => ClassifiedWriteResult::Allow,
+            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
+                ClassifiedWriteResult::Deny
+            }
+            Err(ServerError::AccessControlListNotSupported) => {
+                ClassifiedWriteResult::AclNotSupported
+            }
+            Err(ServerError::InvalidArgument { .. }) => ClassifiedWriteResult::InvalidArgument,
+            Err(other) => panic!("unexpected phase 4 classified result: {other:?}"),
+        }
+    }
+
+    fn write_requester(fixtures: &IdentityFixtures, shape: WriteRequesterShape) -> Requester {
+        match shape {
+            WriteRequesterShape::Anonymous => Requester::anonymous(),
+            WriteRequesterShape::BucketOwnerPrincipal => {
+                Requester::authenticated(fixtures.owner_user.clone())
+            }
+            WriteRequesterShape::SameAccountOtherPrincipal => {
+                Requester::authenticated(fixtures.root.clone())
+            }
+            WriteRequesterShape::SameAccountDistinctAdmin => {
+                Requester::authenticated_owner_account_admin(fixtures.same_account_distinct.clone())
+            }
+            WriteRequesterShape::CrossAccountPrincipal => {
+                Requester::authenticated(fixtures.cross_account.clone())
+            }
+        }
+    }
+
+    fn write_requester_principal(
+        fixtures: &IdentityFixtures,
+        shape: WriteRequesterShape,
+    ) -> Option<&str> {
+        match shape {
+            WriteRequesterShape::Anonymous => None,
+            WriteRequesterShape::BucketOwnerPrincipal => Some(fixtures.owner_user.principal()),
+            WriteRequesterShape::SameAccountOtherPrincipal => Some(fixtures.root.principal()),
+            WriteRequesterShape::SameAccountDistinctAdmin => {
+                Some(fixtures.same_account_distinct.principal())
+            }
+            WriteRequesterShape::CrossAccountPrincipal => Some(fixtures.cross_account.principal()),
+        }
+    }
+
+    fn put_object_write_acl(
+        fixtures: &IdentityFixtures,
+        acl: RequestedAclShape,
+    ) -> PutObjectWriteAcl<'static> {
+        match acl {
+            RequestedAclShape::None => PutObjectWriteAcl::None,
+            RequestedAclShape::CannedPrivate => PutObjectAcl::Private.into(),
+            RequestedAclShape::CannedPublicRead => PutObjectAcl::PublicRead.into(),
+            RequestedAclShape::CannedAuthenticatedRead => PutObjectAcl::AuthenticatedRead.into(),
+            RequestedAclShape::CannedBucketOwnerFullControl => {
+                PutObjectAcl::BucketOwnerFullControl.into()
+            }
+            RequestedAclShape::GrantsOwnerFullControlOnly => {
+                PutObjectWriteAcl::Grants(AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::CanonicalUser(fixtures.owner_user.canonical_user_id().clone()),
+                    AclPermission::FullControl,
+                )]))
+            }
+            RequestedAclShape::GrantsRequesterRead => {
+                PutObjectWriteAcl::Grants(AclGrants::new(vec![
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(fixtures.owner_user.canonical_user_id().clone()),
+                        AclPermission::FullControl,
+                    ),
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(
+                            fixtures.cross_account.canonical_user_id().clone(),
+                        ),
+                        AclPermission::Read,
+                    ),
+                ]))
+            }
+            RequestedAclShape::GrantsAuthenticatedUsersRead => {
+                PutObjectWriteAcl::Grants(AclGrants::new(vec![
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(fixtures.owner_user.canonical_user_id().clone()),
+                        AclPermission::FullControl,
+                    ),
+                    AclGrant::new(AclGrantee::AuthenticatedUsers, AclPermission::Read),
+                ]))
+            }
+        }
+    }
+
+    fn acl_requester(fixtures: &IdentityFixtures, shape: AclRequesterShape) -> Requester {
+        match shape {
+            AclRequesterShape::Anonymous => Requester::anonymous(),
+            AclRequesterShape::BucketOwnerPrincipal => {
+                Requester::authenticated(fixtures.owner_user.clone())
+            }
+            AclRequesterShape::SameAccountOtherPrincipal => {
+                Requester::authenticated(fixtures.root.clone())
+            }
+            AclRequesterShape::SameAccountOtherAdmin => {
+                Requester::authenticated_owner_account_admin(fixtures.root.clone())
+            }
+            AclRequesterShape::SameAccountDistinctAdmin => {
+                Requester::authenticated_owner_account_admin(fixtures.same_account_distinct.clone())
+            }
+            AclRequesterShape::CrossAccountPrincipal => {
+                Requester::authenticated(fixtures.cross_account.clone())
+            }
+        }
+    }
+
+    fn acl_requester_principal(
+        fixtures: &IdentityFixtures,
+        shape: AclRequesterShape,
+    ) -> Option<&str> {
+        match shape {
+            AclRequesterShape::Anonymous => None,
+            AclRequesterShape::BucketOwnerPrincipal => Some(fixtures.owner_user.principal()),
+            AclRequesterShape::SameAccountOtherPrincipal => Some(fixtures.root.principal()),
+            AclRequesterShape::SameAccountOtherAdmin => Some(fixtures.root.principal()),
+            AclRequesterShape::SameAccountDistinctAdmin => {
+                Some(fixtures.same_account_distinct.principal())
+            }
+            AclRequesterShape::CrossAccountPrincipal => Some(fixtures.cross_account.principal()),
+        }
+    }
+
+    fn acl_requester_account(
+        fixtures: &IdentityFixtures,
+        shape: AclRequesterShape,
+    ) -> Option<&AccountIdentity> {
+        match shape {
+            AclRequesterShape::Anonymous => None,
+            AclRequesterShape::BucketOwnerPrincipal => Some(&fixtures.owner_user),
+            AclRequesterShape::SameAccountOtherPrincipal => Some(&fixtures.root),
+            AclRequesterShape::SameAccountOtherAdmin => Some(&fixtures.root),
+            AclRequesterShape::SameAccountDistinctAdmin => Some(&fixtures.same_account_distinct),
+            AclRequesterShape::CrossAccountPrincipal => Some(&fixtures.cross_account),
+        }
+    }
+
+    fn acl_owner_requester(fixtures: &IdentityFixtures, owner: AclOwnerKind) -> Requester {
+        match owner {
+            AclOwnerKind::BucketOwner => Requester::authenticated(fixtures.owner_user.clone()),
+            AclOwnerKind::SameAccountOther => Requester::authenticated(fixtures.root.clone()),
+        }
+    }
+
+    fn existing_object_write_acl(
+        fixtures: &IdentityFixtures,
+        scenario: AclUpdateScenario,
+    ) -> PutObjectWriteAcl<'static> {
+        match scenario.existing_acl {
+            ExistingAclShape::Private => PutObjectWriteAcl::None,
+            ExistingAclShape::GrantWriteAcpToRequester => {
+                let owner = match scenario.owner {
+                    AclOwnerKind::BucketOwner => &fixtures.owner_user,
+                    AclOwnerKind::SameAccountOther => &fixtures.root,
+                };
+                let requester = acl_requester_account(fixtures, scenario.requester)
+                    .expect("WriteAcp grants require an authenticated requester");
+                PutObjectWriteAcl::Grants(AclGrants::new(vec![
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(owner.canonical_user_id().clone()),
+                        AclPermission::FullControl,
+                    ),
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(requester.canonical_user_id().clone()),
+                        AclPermission::WriteAcp,
+                    ),
+                ]))
+            }
+        }
+    }
+
+    fn put_object_acl_input(
+        fixtures: &IdentityFixtures,
+        scenario: AclUpdateScenario,
+    ) -> PutObjectAclInput<'static> {
+        match scenario.requested_acl {
+            RequestedAclShape::CannedPrivate => PutObjectAclInput::Canned(PutObjectAcl::Private),
+            RequestedAclShape::CannedPublicRead => {
+                PutObjectAclInput::Canned(PutObjectAcl::PublicRead)
+            }
+            RequestedAclShape::GrantsRequesterRead => {
+                let requester = acl_requester_account(fixtures, scenario.requester)
+                    .expect("requester-read grants require an authenticated requester");
+                PutObjectAclInput::Grants(AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::CanonicalUser(requester.canonical_user_id().clone()),
+                    AclPermission::Read,
+                )]))
+            }
+            RequestedAclShape::GrantsAuthenticatedUsersRead => {
+                PutObjectAclInput::Grants(AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::AuthenticatedUsers,
+                    AclPermission::Read,
+                )]))
+            }
+            RequestedAclShape::None
+            | RequestedAclShape::CannedAuthenticatedRead
+            | RequestedAclShape::CannedBucketOwnerFullControl
+            | RequestedAclShape::GrantsOwnerFullControlOnly => {
+                panic!(
+                    "unsupported phase 4 PutObjectAcl request shape: {}",
+                    scenario.requested_acl
+                )
+            }
+        }
+    }
+
+    fn acl_policy_context(
+        fixtures: &IdentityFixtures,
+        scenario: AclUpdateScenario,
+    ) -> PutObjectPolicyContext<'static> {
+        match scenario.context {
+            AclContextShape::Exact => match scenario.requested_acl {
+                RequestedAclShape::CannedPrivate | RequestedAclShape::CannedPublicRead => {
+                    PutObjectPolicyContext::default()
+                        .with_default_canned_acl(scenario.requested_acl.policy_condition_value())
+                }
+                RequestedAclShape::GrantsRequesterRead => PutObjectPolicyContext::default()
+                    .with_acl_grant_headers(
+                        acl_requested_grant_read_header(fixtures, scenario),
+                        None,
+                        None,
+                        None,
+                        None,
+                    ),
+                RequestedAclShape::GrantsAuthenticatedUsersRead => {
+                    PutObjectPolicyContext::default()
+                }
+                RequestedAclShape::None
+                | RequestedAclShape::CannedAuthenticatedRead
+                | RequestedAclShape::CannedBucketOwnerFullControl
+                | RequestedAclShape::GrantsOwnerFullControlOnly => {
+                    panic!(
+                        "unsupported phase 4 PutObjectAcl context shape: {}",
+                        scenario.requested_acl
+                    )
+                }
+            },
+            AclContextShape::CannedAclMismatch => PutObjectPolicyContext::default()
+                .with_default_canned_acl(Some(match scenario.requested_acl {
+                    RequestedAclShape::CannedPrivate => "public-read",
+                    RequestedAclShape::CannedPublicRead => "private",
+                    other => {
+                        panic!("canned ACL mismatch requires canned request shape, got {other}")
+                    }
+                })),
+            AclContextShape::CannedAclWithGrantHeader => PutObjectPolicyContext::default()
+                .with_default_canned_acl(scenario.requested_acl.policy_condition_value())
+                .with_acl_grant_headers(Some(r#"id="different-grantee""#), None, None, None, None),
+            AclContextShape::GrantReadMismatch => PutObjectPolicyContext::default()
+                .with_acl_grant_headers(Some(r#"id="different-grantee""#), None, None, None, None),
+            AclContextShape::GrantInputWithCannedAcl => {
+                PutObjectPolicyContext::default().with_default_canned_acl(Some("public-read"))
+            }
+        }
+    }
+
+    fn acl_requested_grant_read_header(
+        fixtures: &IdentityFixtures,
+        scenario: AclUpdateScenario,
+    ) -> Option<&'static str> {
+        let requester = acl_requester_account(fixtures, scenario.requester)?;
+        let header = format!(r#"id="{}""#, requester.canonical_user_id());
+        Some(Box::leak(header.into_boxed_str()))
+    }
+
+    fn acl_policy_action_name(action: AclUpdateAction) -> &'static str {
+        match action {
+            AclUpdateAction::PutObjectAcl => "s3:PutObjectAcl",
+            AclUpdateAction::PutObjectVersionAcl => "s3:PutObjectVersionAcl",
+        }
+    }
+
+    fn push_policy_statement(
+        statements: &mut Vec<String>,
+        requester_principal: Option<&str>,
+        action: &str,
+        resource: &str,
+        decision: PolicyDecisionShape,
+    ) {
+        match decision {
+            PolicyDecisionShape::NoPolicy => {}
+            PolicyDecisionShape::NoMatch => statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::999988887777:user/unmatched"}},"Action":"{action}","Resource":"{resource}"}}"#
+            )),
+            PolicyDecisionShape::ExplicitAllowPrivate => {
+                let principal = requester_principal
+                    .expect("private allow requires an authenticated requester");
+                statements.push(format!(
+                    r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"{action}","Resource":"{resource}"}}"#
+                ));
+            }
+            PolicyDecisionShape::ExplicitAllowPublic => statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":"*","Action":"{action}","Resource":"{resource}"}}"#
+            )),
+            PolicyDecisionShape::ExplicitDeny => statements.push(format!(
+                r#"{{"Effect":"Deny","Principal":"*","Action":"{action}","Resource":"{resource}"}}"#
+            )),
+        }
+    }
+
+    fn json_string(value: &str) -> String {
+        format!(r#""{}""#, value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+}
+
 use harness::{bucket_name_for, to_existing_outcome, to_missing_outcome, MatrixHarness};
 use model::{Action, MissingScenario, Scenario};
+use phase4_harness::{
+    acl_bucket_name_for, to_acl_outcome, to_write_outcome, write_bucket_name_for, Phase4Harness,
+};
+use phase4_model::{AclUpdateAction, AclUpdateScenario, WriteAction, WriteScenario};
 
 #[test]
 fn authz_model_phase1_get_object_existing_matrix() {
@@ -2015,6 +3633,31 @@ fn authz_model_phase3_delete_object_tagging_missing_matrix() {
     run_missing_matrix("phase 3", Action::DeleteObjectTagging);
 }
 
+#[test]
+fn authz_model_phase4_put_object_write_matrix() {
+    run_phase4_write_matrix(WriteAction::PutObject);
+}
+
+#[test]
+fn authz_model_phase4_create_multipart_upload_write_matrix() {
+    run_phase4_write_matrix(WriteAction::CreateMultipartUpload);
+}
+
+#[test]
+fn authz_model_phase4_begin_stream_put_write_matrix() {
+    run_phase4_write_matrix(WriteAction::BeginStreamPut);
+}
+
+#[test]
+fn authz_model_phase4_put_object_acl_matrix() {
+    run_phase4_acl_matrix(AclUpdateAction::PutObjectAcl);
+}
+
+#[test]
+fn authz_model_phase4_put_object_version_acl_matrix() {
+    run_phase4_acl_matrix(AclUpdateAction::PutObjectVersionAcl);
+}
+
 fn run_existing_matrix(phase: &str, action: Action) {
     let scenarios = Scenario::existing_scenarios(action);
     assert!(
@@ -2049,6 +3692,44 @@ fn run_missing_matrix(phase: &str, action: Action) {
         assert_eq!(
             actual, expected,
             "{phase} authz model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+        );
+    }
+}
+
+fn run_phase4_write_matrix(action: WriteAction) {
+    let scenarios = WriteScenario::scenarios(action);
+    assert!(
+        !scenarios.is_empty(),
+        "phase 4 matrix unexpectedly produced no scenarios for {action}"
+    );
+    let harness = Phase4Harness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = write_bucket_name_for(action, index);
+        let expected = scenario.expected_outcome();
+        let actual = to_write_outcome(harness.run_write(&bucket, scenario));
+        assert_eq!(
+            actual, expected,
+            "phase 4 authz model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+        );
+    }
+}
+
+fn run_phase4_acl_matrix(action: AclUpdateAction) {
+    let scenarios = AclUpdateScenario::scenarios(action);
+    assert!(
+        !scenarios.is_empty(),
+        "phase 4 matrix unexpectedly produced no scenarios for {action}"
+    );
+    let harness = Phase4Harness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = acl_bucket_name_for(action, index);
+        let expected = scenario.expected_outcome();
+        let actual = to_acl_outcome(harness.run_acl_update(&bucket, scenario));
+        assert_eq!(
+            actual, expected,
+            "phase 4 authz model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
         );
     }
 }
