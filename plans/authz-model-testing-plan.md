@@ -17,11 +17,15 @@ In scope:
   - public-access-block interactions
   - narrow bucket-policy allow/deny interactions
   - selected write-authorization and transition semantics
+  - bucket-scoped ACL, versioning, and listing authorization
   - bounded `CopyObject` destination-authorization and request-context behavior
   - delete/object-lock authorization for current, versioned, and missing-version
     deletes
   - request-context exactness for narrow write condition keys such as
     `s3:x-amz-acl`, `s3:x-amz-grant-*`, and copy tagging replacement
+  - bucket-scoped request-context exactness for `PutBucketAcl`
+  - bucket metadata/discovery invariants for `HeadBucket` and
+    `GetBucketLocation`
 
 Out of scope:
 - replacing AWS-backed `s3-tests` as the external compatibility oracle
@@ -85,7 +89,8 @@ contract:
 - `get_object_tags`
 - `put_object_tags`
 - `delete_object_tags`
-- selected write, copy, and delete operations in later phases
+- selected write, copy, delete, and bucket operations in later phases
+- bounded bucket-meta checks in later phases
 
 This avoids encoding the current internal factoring as the expected behavior.
 
@@ -219,6 +224,14 @@ Later phases add:
 - `PutObjectVersionAcl`
 - `DeleteObject`
 - `DeleteObjectVersion`
+- `GetBucketAcl`
+- `PutBucketAcl`
+- `GetBucketVersioning`
+- `PutBucketVersioning`
+- `ListBucketVersions`
+- `ListBucketMultipartUploads`
+- `HeadBucket`
+- `GetBucketLocation`
 
 ### Presence
 
@@ -761,9 +774,96 @@ Acceptance criteria:
 - the recent absent/present `x-amz-acl` and explicit `x-amz-grant-*` baselines
   have corresponding model cases
 
-### Phase 9: Optional Stateful Expansion
+### Phase 9: Bucket Action Matrix
 
-After phases 1-8 are solid, consider a bounded stateful generator using
+Status: planned
+
+Add a bounded bucket-action matrix for:
+
+- `GetBucketAcl`
+- `PutBucketAcl`
+- `GetBucketVersioning`
+- `PutBucketVersioning`
+- `ListBucketVersions`
+- `ListBucketMultipartUploads`
+
+Important rules to encode:
+
+- dedicated bucket-policy actions can grant cross-account access for these
+  APIs where AWS allows
+- `GetBucketAcl` and `PutBucketAcl` preserve the existing owner/bucket-admin/ACL
+  fallback behavior, with dedicated policy allow layered on top
+- `ListBucketVersions` and `ListBucketMultipartUploads` keep their existing
+  bucket-read/public-read fallback; the dedicated policy action is additive,
+  not a replacement
+- explicit deny on the dedicated action must still override the fallback path
+
+Acceptance criteria:
+
+- the recent AWS-backed bucket ACL/versioning/listing regressions are covered
+  by the modeled harness, not only by `s3-tests`
+- the additive fallback behavior for versions and multipart listings is encoded
+  explicitly rather than being left as accidental implementation detail
+
+### Phase 10: Bucket ACL Request-Context Exactness
+
+Status: planned
+
+Add a narrow request-context matrix for:
+
+- `PutBucketAcl`
+
+Cover:
+
+- canned ACL requests
+- grant-header requests
+- XML-body ACL requests
+
+Important rules to encode:
+
+- canned ACL requests expose only `s3:x-amz-acl`
+- grant-header requests expose only the original `s3:x-amz-grant-*` headers
+- XML-body ACLs do not synthesize grant headers into bucket-policy context
+- absent versus present `x-amz-acl` must remain observable to `Null` and
+  `StringNotEquals` bucket-policy conditions
+- each `x-amz-grant-*` header remains independently modeled rather than
+  collapsing to a generic “grants present” flag
+
+Acceptance criteria:
+
+- the recent `PutBucketAcl` conditioned-policy regressions are covered by the
+  modeled harness
+- request provenance mismatches fail locally with a concrete scenario diff
+
+### Phase 11: Bucket Meta and Discovery Slice
+
+Status: planned
+
+Add a small bounded slice for:
+
+- `HeadBucket`
+- `GetBucketLocation`
+
+This slice should stay intentionally small and explicit; it exists to pin
+non-obvious bucket-policy exceptions rather than to turn bucket metadata into a
+large matrix.
+
+Important rules to encode:
+
+- `ListBucket` bucket-policy allow is not sufficient for `HeadBucket`
+- `ListBucket` bucket-policy allow is not sufficient for `GetBucketLocation`
+- dedicated `GetBucketLocation` bucket-policy allow is also not sufficient for
+  cross-account `GetBucketLocation` under the current AWS-backed baseline
+
+Acceptance criteria:
+
+- the `HeadBucket` and `GetBucketLocation` policy non-sufficiency cases are
+  encoded in the same framework rather than only in standalone `s3-tests`
+- failures print the exact negative scenario that regressed
+
+### Phase 12: Optional Stateful Expansion
+
+After phases 1-11 are solid, consider a bounded stateful generator using
 `proptest` for short authz traces.
 
 Possible generated operations:
@@ -774,6 +874,8 @@ Possible generated operations:
 - put object with a constrained ACL shape
 - copy object with constrained destination headers
 - change object ACL
+- update bucket ACL with constrained request context
+- change bucket versioning state
 - delete object or object version with bounded object-lock state
 - read or mutate object tags
 
@@ -871,22 +973,31 @@ Once the first matrices are stable, add:
 - tagging surface
 - missing-object discovery surface
 
-### Step 6: Add write, copy, delete, and transition slices
+### Step 6: Add write, copy, delete, bucket-action, and transition slices
 
 Only after the read/discovery surface is stable, add:
 
 - write auth matrix
 - bounded `CopyObject` destination-auth matrix
 - delete/object-lock matrix
+- bucket-action matrix
 - BOE/public-access-block/policy transition traces
 
 ### Step 7: Add request-context exactness matrices
 
-After the base write/copy/delete slices are stable, add bounded matrices for:
+After the base write/copy/delete/bucket-action slices are stable, add bounded matrices for:
 
 - absent versus present canned ACL headers
 - exact `x-amz-grant-*` header matching
 - tagging replacement plus inline-tag request context
+- `PutBucketAcl` provenance-sensitive canned ACL versus grant-header versus XML context
+
+### Step 8: Add bounded bucket-meta exception slices
+
+Once the bucket-action matrix is stable, add small explicit negative slices for:
+
+- `HeadBucket` bucket-policy non-sufficiency
+- `GetBucketLocation` bucket-policy non-sufficiency
 
 ## Validation
 
@@ -957,9 +1068,14 @@ This plan is complete when:
    covered by matrix-style authz differentials
 3. BOE, public-access-block, and narrow public-policy interactions are encoded
    in the model rather than only as isolated regressions
-4. selected write-auth, `CopyObject`, delete/object-lock, and
-   BOE/public-access transitions are covered by the same framework
-5. narrow request-context exactness for key write condition keys is modeled
-   rather than pinned only by isolated regressions
-6. future authz regressions fail with a small scenario diff rather than only an
+4. selected write-auth, bucket ACL/versioning/listing actions, `CopyObject`,
+   delete/object-lock, and BOE/public-access transitions are covered by the
+   same framework
+5. narrow request-context exactness for key write condition keys and
+   `PutBucketAcl` request provenance is modeled rather than pinned only by
+   isolated regressions
+6. bucket-meta policy exceptions such as `HeadBucket` and
+   `GetBucketLocation` are encoded rather than left only to standalone
+   AWS-backed tests
+7. future authz regressions fail with a small scenario diff rather than only an
    AWS-backed integration failure
