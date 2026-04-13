@@ -17,6 +17,11 @@ In scope:
   - public-access-block interactions
   - narrow bucket-policy allow/deny interactions
   - selected write-authorization and transition semantics
+  - bounded `CopyObject` destination-authorization and request-context behavior
+  - delete/object-lock authorization for current, versioned, and missing-version
+    deletes
+  - request-context exactness for narrow write condition keys such as
+    `s3:x-amz-acl`, `s3:x-amz-grant-*`, and copy tagging replacement
 
 Out of scope:
 - replacing AWS-backed `s3-tests` as the external compatibility oracle
@@ -80,7 +85,7 @@ contract:
 - `get_object_tags`
 - `put_object_tags`
 - `delete_object_tags`
-- selected write operations in later phases
+- selected write, copy, and delete operations in later phases
 
 This avoids encoding the current internal factoring as the expected behavior.
 
@@ -145,8 +150,11 @@ Important AWS-backed anchors:
 - `crates/s3-tests/tests/boe_admin_root.rs`
 - `crates/s3-tests/tests/ownership.rs`
 - `crates/s3-tests/tests/public_access_block.rs`
+- `crates/s3-tests/tests/object_crud.rs`
+- `crates/s3-tests/tests/multipart.rs`
 - `crates/s3-tests/tests/bucket_policy.rs`
 - `crates/s3-tests/tests/bucket_policy_root.rs`
+- `crates/s3-tests/tests/object_lock.rs`
 
 ## File Layout
 
@@ -206,8 +214,11 @@ Later phases add:
 - `PutObject`
 - `CreateMultipartUpload`
 - `BeginStreamPut`
+- `CopyObject`
 - `PutObjectAcl`
 - `PutObjectVersionAcl`
+- `DeleteObject`
+- `DeleteObjectVersion`
 
 ### Presence
 
@@ -644,9 +655,115 @@ Acceptance criteria:
   one place
 - transition failures produce a short trace, not only a final-state mismatch
 
-### Phase 6: Optional Stateful Expansion
+### Phase 6: CopyObject Matrix
 
-After phases 1-5 are solid, consider a bounded stateful generator using
+Status: planned
+
+Add a bounded copy-focused matrix for:
+
+- `CopyObject`
+
+The first pass should hold the source side narrow and stable:
+
+- materialize a readable fixed source object
+- vary the destination-side authorization and request context
+- keep source-read differentials for a later expansion if needed
+
+Important rules to encode:
+
+- `x-amz-tagging-directive=REPLACE` plus inline tags requires
+  `s3:PutObjectTagging`
+- destination canned ACLs and explicit grant headers are evaluated using the
+  copy request context rather than being inferred from `PutObject`
+- `RestrictPublicBuckets`, BOE, and public-access-block still apply to the
+  destination-side write decision
+- exact copy condition keys remain distinct:
+  - `s3:x-amz-acl`
+  - `s3:x-amz-grant-read`
+  - `s3:x-amz-grant-read-acp`
+  - `s3:x-amz-grant-write`
+  - `s3:x-amz-grant-write-acp`
+
+Acceptance criteria:
+
+- recent AWS-backed `CopyObject` authz regressions are covered by the modeled
+  harness, not only by `s3-tests`
+- copy-specific request-context failures print the exact scenario fields that
+  diverged
+
+### Phase 7: Delete and Object-Lock Matrix
+
+Status: planned
+
+Add a bounded delete-focused matrix for:
+
+- `DeleteObject`
+- `DeleteObjectVersion`
+
+Cover:
+
+- current-object versus version-specific delete authorization
+- missing-key versus missing-version targets where the authz result still
+  matters
+- object-lock enabled versus disabled buckets
+- bypass header absent versus present
+- narrow bucket-policy grants for:
+  - `s3:DeleteObject`
+  - `s3:DeleteObjectVersion`
+  - `s3:BypassGovernanceRetention`
+
+Important rules to encode:
+
+- version-specific delete of a missing version with the bypass header on an
+  object-lock-enabled bucket requires `s3:BypassGovernanceRetention`
+- non-version delete with the bypass header does not require bypass permission
+  purely because the header is present
+- missing-version and existing-version versioned deletes should share the same
+  modeled permission structure where AWS does
+
+Acceptance criteria:
+
+- the missing-version bypass-governance rule is encoded in the model, not only
+  in dedicated regressions
+- non-version and version-specific delete behavior cannot be accidentally
+  collapsed together
+
+### Phase 8: Request-Context Exactness Matrix
+
+Status: planned
+
+Add a narrow request-context matrix shared across the write/copy surfaces for:
+
+- `PutObject`
+- `CreateMultipartUpload`
+- `CopyObject`
+- `PutObjectAcl`
+- `PutObjectVersionAcl`
+
+This phase should focus on condition-key exactness rather than the full write
+state-space.
+
+Important rules to encode:
+
+- absent versus present `x-amz-acl` must remain observable to policy conditions
+  such as `Null` and `StringNotEquals`
+- each `x-amz-grant-*` header must remain independently modeled rather than
+  collapsed into a generic “explicit grants present” flag
+- copy tagging replacement plus inline tags is distinct from plain copy and
+  from `PutObject`
+- do not collapse “header omitted” and “default private behavior” into one
+  modeled state
+
+Acceptance criteria:
+
+- condition-key exactness regressions fail the modeled harness before they are
+  rediscovered only through AWS-backed tests
+- the recent absent/present `x-amz-acl` and explicit `x-amz-grant-*` baselines
+  have corresponding model cases
+
+### Phase 9: Optional Stateful Expansion
+
+After phases 1-8 are solid, consider a bounded stateful generator using
 `proptest` for short authz traces.
 
 Possible generated operations:
@@ -655,7 +772,9 @@ Possible generated operations:
 - set public-access-block
 - set or delete narrow bucket policy
 - put object with a constrained ACL shape
+- copy object with constrained destination headers
 - change object ACL
+- delete object or object version with bounded object-lock state
 - read or mutate object tags
 
 This is explicitly follow-up work. Do not start here.
@@ -752,12 +871,22 @@ Once the first matrices are stable, add:
 - tagging surface
 - missing-object discovery surface
 
-### Step 6: Add write and transition slices
+### Step 6: Add write, copy, delete, and transition slices
 
 Only after the read/discovery surface is stable, add:
 
 - write auth matrix
+- bounded `CopyObject` destination-auth matrix
+- delete/object-lock matrix
 - BOE/public-access-block/policy transition traces
+
+### Step 7: Add request-context exactness matrices
+
+After the base write/copy/delete slices are stable, add bounded matrices for:
+
+- absent versus present canned ACL headers
+- exact `x-amz-grant-*` header matching
+- tagging replacement plus inline-tag request context
 
 ## Validation
 
@@ -780,8 +909,11 @@ AWS-backed follow-up runs when a modeled rule is unclear or changes:
 - `cargo test -p s3-tests --test boe_admin_root -- --nocapture`
 - `cargo test -p s3-tests --test ownership -- --nocapture`
 - `cargo test -p s3-tests --test public_access_block -- --nocapture`
+- `cargo test -p s3-tests --test object_crud -- --nocapture`
+- `cargo test -p s3-tests --test multipart -- --nocapture`
 - `cargo test -p s3-tests --test bucket_policy -- --nocapture`
 - `cargo test -p s3-tests --test bucket_policy_root -- --nocapture`
+- `cargo test -p s3-tests --test object_lock -- --nocapture`
 
 ## Risks
 
@@ -825,7 +957,9 @@ This plan is complete when:
    covered by matrix-style authz differentials
 3. BOE, public-access-block, and narrow public-policy interactions are encoded
    in the model rather than only as isolated regressions
-4. selected write-auth and BOE/public-access transitions are covered by the same
-   framework
-5. future authz regressions fail with a small scenario diff rather than only an
+4. selected write-auth, `CopyObject`, delete/object-lock, and
+   BOE/public-access transitions are covered by the same framework
+5. narrow request-context exactness for key write condition keys is modeled
+   rather than pinned only by isolated regressions
+6. future authz regressions fail with a small scenario diff rather than only an
    AWS-backed integration failure
