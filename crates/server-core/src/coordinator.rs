@@ -26532,6 +26532,237 @@ mod tests {
     }
 
     #[test]
+    fn get_object_attributes_bucket_policy_requires_get_object_and_attributes() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectAttributes","Resource":"arn:aws:s3:::bucket/key"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        let err = coord
+            .get_object_attributes(&GetObjectAttributesRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                cond: NO_READ,
+                want_parts: false,
+                part_number_marker: None,
+                max_parts: 0,
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:GetObject","s3:GetObjectAttributes"],"Resource":"arn:aws:s3:::bucket/key"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        coord
+            .get_object_attributes(&GetObjectAttributesRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                cond: NO_READ,
+                want_parts: false,
+                part_number_marker: None,
+                max_parts: 0,
+                sse_customer: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn get_object_attributes_version_bucket_policy_requires_get_object_version_and_attributes() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectVersionAttributes","Resource":"arn:aws:s3:::bucket/key"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        let err = coord
+            .get_object_attributes(&GetObjectAttributesRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(put.version_id),
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                cond: NO_READ,
+                want_parts: false,
+                part_number_marker: None,
+                max_parts: 0,
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:GetObjectVersion","s3:GetObjectVersionAttributes"],"Resource":"arn:aws:s3:::bucket/key"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        coord
+            .get_object_attributes(&GetObjectAttributesRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(put.version_id),
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                cond: NO_READ,
+                want_parts: false,
+                part_number_marker: None,
+                max_parts: 0,
+                sse_customer: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn get_object_attributes_missing_key_uses_bucket_policy_list_bucket_for_masking() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("owner-a", "bucket", false)
+            .unwrap();
+
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:GetObject","s3:GetObjectAttributes"],"Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        let err = coord
+            .get_object_attributes(&GetObjectAttributesRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "missing",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                cond: NO_READ,
+                want_parts: false,
+                part_number_marker: None,
+                max_parts: 0,
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:GetObject","s3:GetObjectAttributes"],"Resource":"arn:aws:s3:::bucket/*"},{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
+        let err = coord
+            .get_object_attributes(&GetObjectAttributesRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "missing",
+                    None,
+                    test_helpers::requester("other-user"),
+                    None,
+                ),
+                cond: NO_READ,
+                want_parts: false,
+                part_number_marker: None,
+                max_parts: 0,
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::ObjectNotFound { .. }));
+    }
+
+    #[test]
     fn put_object_acl_masks_missing_object_for_unauthorized_requester() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -26771,6 +27002,24 @@ mod tests {
         .unwrap_err();
         assert!(matches!(missing_acl, ServerError::ObjectNotFound { .. }));
 
+        let missing_attrs = coord
+            .get_object_attributes(&GetObjectAttributesRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "missing",
+                    None,
+                    same_account_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+                want_parts: false,
+                part_number_marker: None,
+                max_parts: 0,
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(missing_attrs, ServerError::AccessDenied));
+
         let missing_version = coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
@@ -26802,6 +27051,695 @@ mod tests {
             missing_acl_version,
             ServerError::VersionNotFound { .. }
         ));
+    }
+
+    #[test]
+    fn bucket_owner_enforced_same_account_standard_requester_cannot_read_acl_attributes_or_discover(
+    ) {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let bucket_owner = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            CanonicalUserId::from_principal("bucket-owner-standard-canonical"),
+            "Bucket Owner",
+        );
+        let same_account_user = AccountIdentity::new(
+            "arn:aws:iam::111122223333:user/reader",
+            CanonicalUserId::from_principal("same-account-standard-canonical"),
+            "Same Account Reader",
+        );
+        let owner_requester = Requester::authenticated(bucket_owner.clone());
+        let same_account_requester = Requester::authenticated(same_account_user);
+
+        create_bucket_for_owner_with_flags(
+            &coord,
+            bucket_owner.principal(),
+            bucket_owner.canonical_user_id(),
+            "bucket",
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+        put_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+
+        let current = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(
+                    "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>",
+                ),
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let err = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    same_account_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(current.version_id),
+                    same_account_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = coord
+            .get_object_attributes(&GetObjectAttributesRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    same_account_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+                want_parts: false,
+                part_number_marker: None,
+                max_parts: 0,
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = coord
+            .get_object_attributes(&GetObjectAttributesRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(current.version_id),
+                    same_account_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+                want_parts: false,
+                part_number_marker: None,
+                max_parts: 0,
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = get_bucket_acl_test(&coord, "bucket", same_account_requester.clone(), None)
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            same_account_requester.clone(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(current.version_id),
+            same_account_requester.clone(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "missing",
+                    None,
+                    same_account_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = get_object_acl_test(
+            &coord,
+            "bucket",
+            "missing",
+            None,
+            same_account_requester.clone(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = coord
+            .get_object_attributes(&GetObjectAttributesRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "missing",
+                    None,
+                    same_account_requester,
+                    None,
+                ),
+                cond: NO_READ,
+                want_parts: false,
+                part_number_marker: None,
+                max_parts: 0,
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn bucket_owner_enforced_same_account_standard_requester_cannot_manage_object_tags() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let bucket_owner = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            CanonicalUserId::from_principal("bucket-owner-tag-canonical"),
+            "Bucket Owner",
+        );
+        let same_account_user = AccountIdentity::new(
+            "arn:aws:iam::111122223333:user/tagger",
+            CanonicalUserId::from_principal("same-account-tagger-canonical"),
+            "Same Account Tagger",
+        );
+        let owner_requester = Requester::authenticated(bucket_owner.clone());
+        let same_account_requester = Requester::authenticated(same_account_user);
+
+        create_bucket_for_owner_with_flags(
+            &coord,
+            bucket_owner.principal(),
+            bucket_owner.canonical_user_id(),
+            "bucket",
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+        put_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+
+        let current = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(
+                    "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>",
+                ),
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let err = get_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            same_account_requester.clone(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = get_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(current.version_id),
+            same_account_requester.clone(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = put_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>test</Value></Tag></TagSet></Tagging>",
+            same_account_requester.clone(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = put_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(current.version_id),
+            "<Tagging><TagSet><Tag><Key>env</Key><Value>test</Value></Tag></TagSet></Tagging>",
+            same_account_requester.clone(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = coord
+            .delete_object_tags(&object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                same_account_requester.clone(),
+                None,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let err = coord
+            .delete_object_tags(&object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                Some(current.version_id),
+                same_account_requester,
+                None,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn bucket_owner_enforced_shared_canonical_standard_requester_is_not_object_owner() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let shared_canonical_id = CanonicalUserId::from_principal("111122223333");
+        let bucket_owner = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            shared_canonical_id.clone(),
+            "Bucket Owner",
+        );
+        let shared_principal = AccountIdentity::new(
+            "arn:aws:iam::111122223333:user/shared",
+            shared_canonical_id,
+            "Shared Principal",
+        );
+        let owner_requester = Requester::authenticated(bucket_owner.clone());
+        let shared_standard_requester = Requester::authenticated(shared_principal.clone());
+        let shared_admin_requester = Requester::authenticated_owner_account_admin(shared_principal);
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: owner_requester.clone(),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                object_lock_enabled: false,
+            })
+            .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+
+        let current = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(
+                    "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>",
+                ),
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let owner_object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    owner_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(owner_object.body.read_all().unwrap(), b"data");
+        get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(current.version_id),
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+        assert!(get_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(current.version_id),
+            owner_requester,
+            None,
+        )
+        .unwrap()
+        .is_some());
+        coord
+            .get_object_attributes(&GetObjectAttributesRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(current.version_id),
+                    Requester::authenticated(bucket_owner.clone()),
+                    None,
+                ),
+                cond: NO_READ,
+                want_parts: false,
+                part_number_marker: None,
+                max_parts: 0,
+                sse_customer: None,
+            })
+            .unwrap();
+
+        let err = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    shared_standard_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+        let err = get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(current.version_id),
+            shared_standard_requester.clone(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+        let err = get_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(current.version_id),
+            shared_standard_requester.clone(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+        let err = coord
+            .get_object_attributes(&GetObjectAttributesRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(current.version_id),
+                    shared_standard_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+                want_parts: false,
+                part_number_marker: None,
+                max_parts: 0,
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+
+        let shared_admin_object = coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    shared_admin_requester.clone(),
+                    None,
+                ),
+                cond: NO_READ,
+            })
+            .unwrap();
+        assert_eq!(shared_admin_object.body.read_all().unwrap(), b"data");
+        get_object_acl_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(current.version_id),
+            shared_admin_requester.clone(),
+            None,
+        )
+        .unwrap();
+        assert!(get_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(current.version_id),
+            shared_admin_requester.clone(),
+            None,
+        )
+        .unwrap()
+        .is_some());
+        let err = coord
+            .get_object_attributes(&GetObjectAttributesRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    Some(current.version_id),
+                    shared_admin_requester,
+                    None,
+                ),
+                cond: NO_READ,
+                want_parts: false,
+                part_number_marker: None,
+                max_parts: 0,
+                sse_customer: None,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn bucket_owner_enforced_admin_tagging_preserves_delete_marker_and_missing_version_errors() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let bucket_owner = AccountIdentity::new(
+            "arn:aws:iam::111122223333:root",
+            CanonicalUserId::from_principal("bucket-owner-delete-marker-canonical"),
+            "Bucket Owner",
+        );
+        let same_account_user = AccountIdentity::new(
+            "arn:aws:iam::111122223333:user/tag-admin",
+            CanonicalUserId::from_principal("same-account-tag-admin-canonical"),
+            "Same Account Tag Admin",
+        );
+        let owner_requester = Requester::authenticated(bucket_owner.clone());
+        let admin_requester = Requester::authenticated_owner_account_admin(same_account_user);
+
+        create_bucket_for_owner_with_flags(
+            &coord,
+            bucket_owner.principal(),
+            bucket_owner.canonical_user_id(),
+            "bucket",
+            false,
+            false,
+            false,
+        )
+        .unwrap();
+        put_bucket_versioning_test(
+            &coord,
+            "bucket",
+            BucketVersioningState::Enabled,
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+        put_bucket_ownership_controls_test(
+            &coord,
+            "bucket",
+            "<OwnershipControls><Rule><ObjectOwnership>BucketOwnerEnforced</ObjectOwnership></Rule></OwnershipControls>",
+            owner_requester.clone(),
+            None,
+        )
+        .unwrap();
+
+        let current = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester,
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(
+                    "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>",
+                ),
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let delete_marker = coord
+            .delete_object(&DeleteObjectRequest {
+                object: object_version_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    None,
+                    admin_requester.clone(),
+                    None,
+                ),
+                cond: NO_DELETE,
+                bypass_governance: false,
+            })
+            .unwrap();
+        let delete_marker_version = delete_marker.version_id;
+
+        let err = get_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(delete_marker_version),
+            admin_requester.clone(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::MethodNotAllowed));
+
+        let err = coord
+            .delete_object_tags(&object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                Some(delete_marker_version),
+                admin_requester.clone(),
+                None,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::MethodNotAllowed));
+
+        let missing_version = VersionId::from_u64(current.version_id.to_u64() + 1000);
+
+        let err = get_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            Some(missing_version),
+            admin_requester.clone(),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, ServerError::VersionNotFound { .. }));
+
+        let err = coord
+            .delete_object_tags(&object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                Some(missing_version),
+                admin_requester,
+                None,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::VersionNotFound { .. }));
     }
 
     #[test]

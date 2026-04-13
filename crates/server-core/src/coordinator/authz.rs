@@ -21,22 +21,37 @@ enum ObjectBucketPolicyRequirement {
 #[derive(Clone, Copy)]
 enum MissingObjectDiscovery {
     ReadBucket,
+    ReadObjectAttributes,
     BucketAdmin,
     ObjectAcl,
 }
 
 impl MissingObjectDiscovery {
-    fn requester_can_discover_missing(self, requester: &Requester, bucket: &BucketSummary) -> bool {
+    fn requester_can_discover_missing(
+        self,
+        requester: &Requester,
+        bucket: &BucketSummary,
+        key: &str,
+        version_id: Option<VersionId>,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
         match self {
-            Self::ReadBucket => {
-                Coordinator::requester_can_discover_missing_object(requester, bucket)
+            Self::ReadBucket => Ok(Coordinator::requester_can_discover_missing_object(
+                requester, bucket,
+            ) || Coordinator::requester_can_list_bucket_with_bucket_policy(
+                requester, bucket, policy,
+            )),
+            Self::ReadObjectAttributes => {
+                Coordinator::requester_can_discover_missing_object_attrs_with_bucket_policy(
+                    requester, bucket, key, version_id, policy,
+                )
             }
-            Self::BucketAdmin => {
-                Coordinator::requester_can_bucket_owner_account_admin(requester, bucket)
-            }
-            Self::ObjectAcl => {
-                Coordinator::requester_can_discover_missing_object_acl(requester, bucket)
-            }
+            Self::BucketAdmin => Ok(Coordinator::requester_can_bucket_owner_account_admin(
+                requester, bucket,
+            )),
+            Self::ObjectAcl => Ok(Coordinator::requester_can_discover_missing_object_acl(
+                requester, bucket,
+            )),
         }
     }
 }
@@ -177,7 +192,7 @@ impl Coordinator {
         object: &StoredObject,
     ) -> bool {
         if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-            return Self::requester_is_bucket_owner_account(requester, bucket);
+            return Self::requester_can_bucket_owner_account_admin(requester, bucket);
         }
 
         let acl_allows_read = object.acl_grants().is_some_and(|grants| {
@@ -204,13 +219,26 @@ impl Coordinator {
                 && !Self::ignores_public_acls(bucket.public_access_block.as_ref()))
     }
 
+    pub(super) fn requester_can_read_object_attributes(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+    ) -> bool {
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
+            return requester
+                .principal_opt()
+                .is_some_and(|principal| principal == object.owner().principal.as_str());
+        }
+
+        Self::requester_can_read_object(requester, bucket, object)
+    }
+
     pub(super) fn requester_can_read_bucket_acl(
         requester: &Requester,
         bucket: &BucketSummary,
     ) -> bool {
         if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-            return Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
-                || Self::requester_is_bucket_owner_account(requester, bucket);
+            return Self::requester_can_bucket_owner_account_admin(requester, bucket);
         }
 
         Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
@@ -227,8 +255,7 @@ impl Coordinator {
         bucket: &BucketSummary,
     ) -> bool {
         if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-            return Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
-                || Self::requester_is_bucket_owner_account(requester, bucket);
+            return Self::requester_can_bucket_owner_account_admin(requester, bucket);
         }
 
         Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
@@ -246,7 +273,7 @@ impl Coordinator {
         object: &StoredObject,
     ) -> bool {
         (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
-            && Self::requester_is_bucket_owner_account(requester, bucket))
+            && Self::requester_can_bucket_owner_account_admin(requester, bucket))
             || Self::requester_matches_owner_identity(requester, object.owner())
             || object.acl_grants().is_some_and(|grants| {
                 Self::requester_has_acl_permission(
@@ -264,7 +291,7 @@ impl Coordinator {
         object: &StoredObject,
     ) -> bool {
         (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
-            && Self::requester_is_bucket_owner_account(requester, bucket))
+            && Self::requester_can_bucket_owner_account_admin(requester, bucket))
             || requester
                 .account()
                 .is_some_and(|_| Self::requester_matches_owner_identity(requester, object.owner()))
@@ -287,8 +314,10 @@ impl Coordinator {
                 && owner.canonical_id == CanonicalUserId::anonymous_upload();
         }
         requester.account().is_some_and(|account| {
-            account.canonical_user_id() == &owner.canonical_id
-                || account.principal() == owner.principal
+            account.principal() == owner.principal
+                || (account.canonical_user_id() == &owner.canonical_id
+                    && requester.authorization_profile()
+                        == auth::AuthorizationProfile::OwnerAccountAdmin)
         })
     }
 
@@ -345,7 +374,24 @@ impl Coordinator {
             &bucket.acl_grants,
             Self::effective_public_read(bucket),
         ) || (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
-            && Self::requester_is_bucket_owner_account(requester, bucket))
+            && Self::requester_can_bucket_owner_account_admin(requester, bucket))
+    }
+
+    pub(super) fn requester_can_discover_missing_object_attrs(
+        requester: &Requester,
+        bucket: &BucketSummary,
+    ) -> bool {
+        if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
+            return Self::requester_can_bucket_admin(requester, &bucket.owner_principal);
+        }
+
+        Self::requester_can_read_bucket(
+            requester,
+            bucket,
+            &bucket.owner_principal,
+            &bucket.acl_grants,
+            Self::effective_public_read(bucket),
+        )
     }
 
     pub(super) fn requester_can_discover_missing_object_acl(
@@ -354,7 +400,7 @@ impl Coordinator {
     ) -> bool {
         Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
             || (Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref())
-                && Self::requester_is_bucket_owner_account(requester, bucket))
+                && Self::requester_can_bucket_owner_account_admin(requester, bucket))
     }
 
     pub(super) fn requester_can_manage_multipart_upload(
@@ -431,8 +477,7 @@ impl Coordinator {
         bucket: &BucketSummary,
         _object: &StoredObject,
     ) -> bool {
-        Self::requester_can_bucket_admin(requester, &bucket.owner_principal)
-            || Self::requester_is_bucket_owner_account(requester, bucket)
+        Self::requester_can_bucket_owner_account_admin(requester, bucket)
     }
 
     pub(super) fn is_bucket_owner_enforced(config: Option<&BucketOwnershipControls>) -> bool {
@@ -489,6 +534,16 @@ impl Coordinator {
             auth::PolicyAction::GetObjectVersion
         } else {
             auth::PolicyAction::GetObject
+        }
+    }
+
+    pub(super) fn get_object_attributes_policy_action(
+        version_id: Option<VersionId>,
+    ) -> auth::PolicyAction {
+        if version_id.is_some() {
+            auth::PolicyAction::GetObjectVersionAttributes
+        } else {
+            auth::PolicyAction::GetObjectAttributes
         }
     }
 
@@ -849,6 +904,30 @@ impl Coordinator {
         ))
     }
 
+    fn requester_can_missing_object_action_with_bucket_policy<F>(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        key: &str,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+        fallback: F,
+    ) -> Result<bool, ServerError>
+    where
+        F: FnOnce() -> bool,
+    {
+        let decision = Self::object_policy_decision(
+            requester,
+            bucket,
+            ObjectPolicyTarget::MissingKey(key),
+            action,
+            PutObjectPolicyContext::default(),
+            policy,
+        )?;
+        Ok(Self::bucket_policy_allows_with_fallback(
+            requester, bucket, decision, fallback,
+        ))
+    }
+
     fn object_policy_decision(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -888,6 +967,64 @@ impl Coordinator {
             policy,
             || Self::requester_can_read_object(requester, bucket, object),
         )
+    }
+
+    pub(super) fn requester_can_read_object_attributes_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        let read_action = match action {
+            auth::PolicyAction::GetObjectVersionAttributes => auth::PolicyAction::GetObjectVersion,
+            auth::PolicyAction::GetObjectAttributes => auth::PolicyAction::GetObject,
+            _ => action,
+        };
+        Ok(Self::requester_can_read_object_with_bucket_policy(
+            requester,
+            bucket,
+            object,
+            read_action,
+            policy,
+        )? && Self::requester_can_object_action_with_bucket_policy(
+            requester,
+            bucket,
+            object,
+            action,
+            PutObjectPolicyContext::default(),
+            policy,
+            || Self::requester_can_read_object_attributes(requester, bucket, object),
+        )?)
+    }
+
+    pub(super) fn requester_can_discover_missing_object_attrs_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        key: &str,
+        version_id: Option<VersionId>,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        let read_allowed = Self::requester_can_missing_object_action_with_bucket_policy(
+            requester,
+            bucket,
+            key,
+            Self::get_object_policy_action(version_id),
+            policy,
+            || Self::requester_can_discover_missing_object(requester, bucket),
+        )?;
+        let attrs_allowed = Self::requester_can_missing_object_action_with_bucket_policy(
+            requester,
+            bucket,
+            key,
+            Self::get_object_attributes_policy_action(version_id),
+            policy,
+            || Self::requester_can_discover_missing_object_attrs(requester, bucket),
+        )?;
+
+        Ok(read_allowed
+            && attrs_allowed
+            && Self::requester_can_list_bucket_with_bucket_policy(requester, bucket, policy))
     }
 
     pub(super) fn requester_can_manage_object_tags_with_bucket_policy(
@@ -3301,9 +3438,6 @@ impl Coordinator {
     ) -> Result<LoadedObjectState<'a>, ServerError> {
         let bucket_info =
             self.checked_active_bucket_summary(req.bucket, req.expected_bucket_owner)?;
-        let can_discover_missing = req
-            .missing_discovery
-            .requester_can_discover_missing(req.requester, &bucket_info);
         let bucket_policy = if matches!(
             req.policy_requirement,
             ObjectBucketPolicyRequirement::Required
@@ -3312,6 +3446,13 @@ impl Coordinator {
         } else {
             None
         };
+        let can_discover_missing = req.missing_discovery.requester_can_discover_missing(
+            req.requester,
+            &bucket_info,
+            req.key,
+            req.version_id,
+            bucket_policy.as_deref(),
+        )?;
         let locked = match self.lock_object_pgs_for_read(req.bucket, req.key, req.version_id) {
             Ok(locked) => locked,
             Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
@@ -3350,6 +3491,26 @@ impl Coordinator {
                 )?
             }
         };
+        if allowed {
+            Ok(())
+        } else {
+            Err(ServerError::AccessDenied)
+        }
+    }
+
+    fn ensure_loaded_object_attributes_allowed(
+        requester: &Requester,
+        loaded: &LoadedObjectState<'_>,
+        policy_action: auth::PolicyAction,
+    ) -> Result<(), ServerError> {
+        let allowed = Self::requester_can_read_object_attributes_with_bucket_policy(
+            requester,
+            &loaded.bucket_info,
+            &loaded.locked.record,
+            policy_action,
+            loaded.bucket_policy.as_deref(),
+        )?;
+
         if allowed {
             Ok(())
         } else {
@@ -3596,16 +3757,21 @@ impl Coordinator {
         &'a self,
         req: &GetObjectAttributesRequest<'_>,
     ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
-        let locked = self.authorize_object_read(
+        let loaded = self.load_locked_object_state(ObjectStateLoadRequest {
+            requester: req.object.requester(),
+            bucket: req.object.bucket_name(),
+            key: req.object.key(),
+            version_id: req.object.version_id,
+            expected_bucket_owner: req.expected_bucket_owner(),
+            policy_requirement: ObjectBucketPolicyRequirement::Required,
+            missing_discovery: MissingObjectDiscovery::ReadObjectAttributes,
+        })?;
+        Self::ensure_loaded_object_attributes_allowed(
             req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key(),
-            req.object.version_id,
-            req.expected_bucket_owner(),
-            ObjectReadAuthorization::WithBucketPolicy(Self::get_object_policy_action(
-                req.object.version_id,
-            )),
+            &loaded,
+            Self::get_object_attributes_policy_action(req.object.version_id),
         )?;
+        let locked = loaded.locked;
         Ok(AuthorizedObjectRead { locked })
     }
 

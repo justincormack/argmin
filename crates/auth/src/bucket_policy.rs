@@ -124,6 +124,8 @@ pub enum PolicyAction {
     PutBucketObjectLockConfiguration,
     GetObject,
     GetObjectVersion,
+    GetObjectAttributes,
+    GetObjectVersionAttributes,
     GetObjectAcl,
     GetObjectVersionAcl,
     GetObjectTagging,
@@ -169,6 +171,8 @@ impl PolicyAction {
             Self::PutBucketObjectLockConfiguration => "s3:PutBucketObjectLockConfiguration",
             Self::GetObject => "s3:GetObject",
             Self::GetObjectVersion => "s3:GetObjectVersion",
+            Self::GetObjectAttributes => "s3:GetObjectAttributes",
+            Self::GetObjectVersionAttributes => "s3:GetObjectVersionAttributes",
             Self::GetObjectAcl => "s3:GetObjectAcl",
             Self::GetObjectVersionAcl => "s3:GetObjectVersionAcl",
             Self::GetObjectTagging => "s3:GetObjectTagging",
@@ -656,9 +660,11 @@ impl PolicyEffect {
     }
 }
 
-const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 20] = [
+const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 22] = [
     PolicyAction::GetObject,
     PolicyAction::GetObjectVersion,
+    PolicyAction::GetObjectAttributes,
+    PolicyAction::GetObjectVersionAttributes,
     PolicyAction::GetObjectAcl,
     PolicyAction::GetObjectVersionAcl,
     PolicyAction::GetObjectTagging,
@@ -1079,9 +1085,11 @@ const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 19] = [
     PolicyAction::PutBucketObjectLockConfiguration,
 ];
 
-const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 20] = [
+const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 22] = [
     PolicyAction::GetObject,
     PolicyAction::GetObjectVersion,
+    PolicyAction::GetObjectAttributes,
+    PolicyAction::GetObjectVersionAttributes,
     PolicyAction::GetObjectAcl,
     PolicyAction::GetObjectVersionAcl,
     PolicyAction::GetObjectTagging,
