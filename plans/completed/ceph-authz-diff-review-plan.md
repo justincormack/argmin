@@ -1,5 +1,15 @@
 # Ceph Authz Diff Review Plan
 
+Status: complete.
+
+Carry-forward notes:
+- the remaining account-level IAM questions (`CreateBucket`, `ListBuckets`,
+  and any future `DeleteBucket` IAM-policy follow-up) are now tracked under
+  `plans/aws-auth-compat-plan.md`
+- the cross-cutting `s3:ResourceTag/*` investigation is also carried forward
+  there as deferred policy-evaluator follow-up
+- this document should remain historical after move to `plans/completed`
+
 ## Goal
 
 Track an operation-by-operation authz review of `crates/server-core/src/coordinator/authz.rs`

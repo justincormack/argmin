@@ -19,6 +19,14 @@ This still does not cover:
 - full bucket policy evaluation
 - STS AssumeRole API implementation
 
+Carry-forward from the completed Ceph authz diff review:
+- keep the remaining account-level IAM questions visible here:
+  `CreateBucket`, `ListBuckets`, and any future `DeleteBucket` IAM-policy
+  investigation
+- keep the cross-cutting `s3:ResourceTag/*` object-policy investigation visible
+  as deferred policy-evaluator follow-up rather than reopening the completed
+  Ceph review plan
+
 ## Current Status
 
 Completed:
@@ -45,6 +53,8 @@ Completed:
 Still open:
 - Account-level Block Public Access controls
 - Final compatibility/conformance documentation
+- Decision on where to track and validate the remaining `s3:ResourceTag/*`
+  investigation once policy-evaluator expansion resumes
 
 ## Remaining Work
 
@@ -88,6 +98,10 @@ Still missing:
 - a short documented auth/public-access compatibility subset against AWS
 - folding in the remaining auth/header-related Ceph `s3-tests` porting work so
   it is tracked here rather than in the old integration-framework bootstrap plan
+- a documented follow-up decision for account-level IAM coverage on
+  `CreateBucket` / `ListBuckets`, which the Ceph authz review identified as
+  account-policy work rather than bucket-policy work
+- a documented owner for the deferred `s3:ResourceTag/*` investigation
 
 Already covered:
 - wrong-region header auth coverage
@@ -218,6 +232,11 @@ AWS checks:
 - whether `AuthorizationProfile` remains the long-lived compatibility mechanism
   for current credentials, or becomes an implementation detail once durable
   account / credential metadata exists
+
+3. Deferred authz follow-up ownership
+- whether the remaining `s3:ResourceTag/*` compatibility investigation should
+  live under a future policy-evaluator plan or stay tracked here until that
+  work is started
 
 ## Recommended Default Decisions
 
