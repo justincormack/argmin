@@ -1,7 +1,7 @@
 Unbounded multipart field buffering in streaming POST causes DoS
 Link: https://chatgpt.com/codex/security/findings/bda93ebccbb48191b675331742e5e348?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: medium)
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin

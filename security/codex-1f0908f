@@ -1,7 +1,7 @@
 Race in stream segment append can delete committed shards
 Link: https://chatgpt.com/codex/security/findings/23f0220f9ae881918e873ef2b807d1c7?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: ignore)
-Status: new
+Status: fixed
 Criticality notes: race conditions and data loss/corruption are more serious
 
 # Metadata

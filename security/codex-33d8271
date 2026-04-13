@@ -1,7 +1,7 @@
 POST policy expiration parser can panic on invalid month
 Link: https://chatgpt.com/codex/security/findings/65b5b7992fe081918f7e5257493a938b?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: medium)
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin

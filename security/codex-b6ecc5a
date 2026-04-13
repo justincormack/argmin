@@ -1,7 +1,7 @@
 Completed multipart upload tombstones accumulate indefinitely
 Link: https://chatgpt.com/codex/security/findings/efa9bf20ef4c8191ab6567c73920c9e5?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: medium)
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin

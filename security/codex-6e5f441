@@ -1,7 +1,7 @@
 POST object ignores SSE‑C headers, storing data unencrypted
 Link: https://chatgpt.com/codex/security/findings/59c56ea35998819183ccaf1a6e483b60?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: low)
-Status: new
+Status: invalid
 Criticality notes: bypasses encryption that is expected
 
 # Metadata

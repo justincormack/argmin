@@ -1,7 +1,7 @@
 Malformed x-amz-date can panic time-skew parsing
 Link: https://chatgpt.com/codex/security/findings/3362979b05348191b3057567f2ea79c4?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: low)
-Status: new
+Status: fixed
 Criticality notes: this is a crash, the other crashes were also rated as medium
 
 # Metadata

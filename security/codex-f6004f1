@@ -1,7 +1,7 @@
 Streaming PUTs without content hash bypass payload integrity
 Link: https://chatgpt.com/codex/security/findings/eb078011155c8191a02ba79ae00cc909?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: low)
-Status: new
+Status: fixed
 Criticality notes: This bypasses authorization
 
 # Metadata

@@ -1,7 +1,7 @@
 Lifecycle sweep bypasses object-lock retention checks
 Link: https://chatgpt.com/codex/security/findings/14c4b0f438dc819187143b4a5708f9fd?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: medium)
-Status: new
+Status: invalid
 
 # Metadata
 Repo: justincormack/argmin

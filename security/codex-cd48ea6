@@ -1,7 +1,7 @@
 Object Lock headers accept past retention dates
 Link: https://chatgpt.com/codex/security/findings/aa0a3f4c94488191995517c45b1a190f?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: medium)
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin

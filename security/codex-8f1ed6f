@@ -1,7 +1,7 @@
 IgnorePublicAcls bypass via AuthenticatedRead object ACLs
 Link: https://chatgpt.com/codex/security/findings/753675c744f08191b101626ac6d98618?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: medium)
-Status: new
+Status: invalid
 
 # Metadata
 Repo: justincormack/argmin

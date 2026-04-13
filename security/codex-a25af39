@@ -1,7 +1,7 @@
 Constrained same-account users still read/manage data as owners
 Link: https://chatgpt.com/codex/cloud/security/findings/aac3812d7e2c8191a699417215ba12bb?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
 Criticality: medium (attack path: medium)
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin

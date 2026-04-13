@@ -1,7 +1,7 @@
 Delayed PutObject authorization enables extra body read
 Link: https://chatgpt.com/codex/cloud/security/findings/b95b2e22b80c819181ce244149e079ba?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
 Criticality: low (attack path: low)
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin

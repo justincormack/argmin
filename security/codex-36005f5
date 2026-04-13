@@ -1,7 +1,7 @@
 Unvalidated response override headers can panic hyper responses
 Link: https://chatgpt.com/codex/security/findings/0949824c0c608191b2bee67a7c9420d9?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=low
 Criticality: low (attack path: low)
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin

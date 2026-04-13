@@ -1,7 +1,7 @@
 Batch delete skips key validation enabling authenticated DoS
 Link: https://chatgpt.com/codex/security/findings/6d5a9a1513848191a344c092f1947df7?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: medium)
-Status: new
+Status: stale
 
 # Metadata
 Repo: justincormack/argmin

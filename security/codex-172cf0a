@@ -1,7 +1,7 @@
 PutObjectAcl bucket policy ignores ACL/grant conditions
 Link: https://chatgpt.com/codex/cloud/security/findings/2415e98d19fc8191b7020e01d29341b3?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
 Criticality: medium (attack path: medium)
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin

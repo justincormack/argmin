@@ -1,7 +1,7 @@
 Unvalidated response-* overrides can inject response headers
 Link: https://chatgpt.com/codex/security/findings/2aad595ee3c081918023b14b86ba8bee?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=low
 Criticality: low (attack path: low)
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin

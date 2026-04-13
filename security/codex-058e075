@@ -1,7 +1,7 @@
 POST SigV4 auth panics on malformed UTF-8 date input
 Link: https://chatgpt.com/codex/security/findings/9b5cdf05fbb88191ae709b385aa0546d?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=medium
 Criticality: medium (attack path: medium)
-Status: new
+Status: fixed
 
 # Metadata
 Repo: justincormack/argmin
