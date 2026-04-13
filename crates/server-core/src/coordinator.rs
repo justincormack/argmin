@@ -33857,6 +33857,156 @@ mod tests {
     }
 
     #[test]
+    fn delete_object_missing_version_with_bypass_requires_bucket_policy_bypass() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_requester = test_helpers::requester("owner-a");
+        let other_requester = test_helpers::requester("other-user");
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
+            .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                owner_requester.clone(),
+                false,
+                NO_DELETE,
+            ))
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:DeleteObjectVersion","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            owner_requester,
+            None,
+        )
+        .unwrap();
+
+        coord
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                other_requester.clone(),
+                false,
+                NO_DELETE,
+            ))
+            .unwrap();
+
+        let err = coord
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                other_requester,
+                true,
+                NO_DELETE,
+            ))
+            .unwrap_err();
+        assert!(matches!(err, ServerError::AccessDenied));
+    }
+
+    #[test]
+    fn delete_object_missing_version_bucket_policy_allows_cross_account_bypass() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let owner_requester = test_helpers::requester("owner-a");
+        let other_requester = test_helpers::requester("other-user");
+
+        coord
+            .create_bucket(&CreateBucketRequest {
+                name: "bucket",
+                requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
+                namespace: BucketNamespace::Global,
+                acl: CreateBucketAcl::DefaultPrivate,
+                ownership: BucketObjectOwnership::ObjectWriter,
+                object_lock_enabled: true,
+            })
+            .unwrap();
+        let put = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    owner_requester.clone(),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        coord
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                owner_requester.clone(),
+                false,
+                NO_DELETE,
+            ))
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":["s3:DeleteObjectVersion","s3:BypassGovernanceRetention"],"Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            owner_requester,
+            None,
+        )
+        .unwrap();
+
+        coord
+            .delete_object(&delete_object_request(
+                "bucket",
+                "key",
+                Some(put.version_id),
+                other_requester,
+                true,
+                NO_DELETE,
+            ))
+            .unwrap();
+    }
+
+    #[test]
     fn delete_object_allows_same_account_owner_account_bypass() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());

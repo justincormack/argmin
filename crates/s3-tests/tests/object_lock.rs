@@ -1502,6 +1502,139 @@ fn test_object_lock_bucket_policy_bypass_governance_delete_requires_explicit_all
 }
 
 #[test]
+fn test_object_lock_missing_version_delete_with_bypass_header_requires_bypass_allow() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        let missing_version_id = put_object_bytes(&bucket, key, b"abc").await;
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&missing_version_id)
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:DeleteObjectVersion",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                }],
+            }),
+        )
+        .await;
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        let missing_without_bypass = alt_client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&missing_version_id)
+            .send()
+            .await;
+        missing_without_bypass.unwrap();
+
+        let missing_with_bypass = alt_client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&missing_version_id)
+            .bypass_governance_retention(true)
+            .send()
+            .await;
+        assert_eq!(err_status(&missing_with_bypass), 403);
+        assert_s3_err_code(&missing_with_bypass, "AccessDenied");
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_non_version_delete_with_bypass_header_does_not_require_bypass_allow() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        let version_id = put_object_bytes(&bucket, key, b"abc").await;
+
+        client
+            .put_object_retention()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .retention(retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until_later(),
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:DeleteObject",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                }],
+            }),
+        )
+        .await;
+        client
+            .get_bucket_policy()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+
+        let deleted = alt_client
+            .delete_object()
+            .bucket(&bucket)
+            .key(key)
+            .bypass_governance_retention(true)
+            .send()
+            .await;
+        deleted.unwrap();
+
+        let current = client.get_object().bucket(&bucket).key(key).send().await;
+        assert_eq!(err_status(&current), 404);
+        assert_s3_err_code(&current, "NoSuchKey");
+
+        let retained = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            retained.body.collect().await.unwrap().into_bytes().as_ref(),
+            b"abc"
+        );
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
 fn test_object_lock_put_object_headers_persist() {
     s3_tests::run(async {
         let client = CTX.client();

@@ -2766,6 +2766,23 @@ impl Coordinator {
         )
     }
 
+    pub(super) fn requester_can_bypass_governance_retention_for_missing_version_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        key: &str,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        Self::requester_can_put_object_action_with_bucket_policy(
+            requester,
+            bucket,
+            key,
+            auth::PolicyAction::BypassGovernanceRetention,
+            PutObjectPolicyContext::default(),
+            policy,
+            Self::requester_can_bypass_governance_retention(requester, bucket),
+        )
+    }
+
     pub(super) fn authorize_put_object_write(
         &self,
         req: &AuthorizePutObjectRequest<'_>,
@@ -2871,6 +2888,17 @@ impl Coordinator {
                             Self::delete_object_policy_action(Some(version_id)),
                             bucket_policy.as_deref(),
                         )? {
+                            return Err(ServerError::AccessDenied);
+                        }
+                        if bucket_info.object_lock.enabled
+                            && bypass_governance
+                            && !Self::requester_can_bypass_governance_retention_for_missing_version_with_bucket_policy(
+                                requester,
+                                &bucket_info,
+                                key,
+                                bucket_policy.as_deref(),
+                            )?
+                        {
                             return Err(ServerError::AccessDenied);
                         }
                         return Ok(AuthorizedDeleteObject::SpecificVersionMissing { version_id });
