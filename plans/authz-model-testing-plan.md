@@ -468,6 +468,41 @@ Acceptance criteria:
 
 ### Phase 3: Missing-Object Discovery Matrix
 
+Status: completed
+
+Implemented:
+
+- extended `crates/server-core/src/coordinator/authz_model_tests.rs` with a
+  separate missing-object matrix covering:
+  - `GetObject`
+  - `GetObjectAttributes`
+  - `GetObjectAcl`
+  - `GetObjectTagging`
+  - `PutObjectTagging`
+  - `DeleteObjectTagging`
+- added explicit missing-target modeling for both:
+  - missing current keys
+  - missing version IDs on otherwise-existing keys
+- modeled missing discovery outcomes directly as:
+  - `RevealMissing`
+  - `HideMissing`
+- added harness classification for:
+  - `NoSuchKey`
+  - `VersionNotFound`
+  - `AccessDenied`
+- encoded the action-specific discovery rules rather than inferring them from
+  existing-object authorization:
+  - `GetObject` discovery via bucket read and `ListBucket`
+  - `GetObjectAttributes` discovery via the conjunction of read action,
+    attributes action, and `ListBucket`
+  - `GetObjectAcl` discovery via bucket-admin semantics
+  - object-tagging discovery via bucket-owner-account-admin semantics
+- added missing-only bucket-shape coverage for public bucket read and
+  `IgnorePublicAcls`, without expanding the existing-object phase-1/2 matrix
+- kept the phase-1/2 shared-coordinator approach and materialized missing
+  version cases by creating an existing object and probing a non-existent
+  version ID
+
 Add missing-object and missing-version cases for the phase-1/2 actions.
 
 Model outputs:

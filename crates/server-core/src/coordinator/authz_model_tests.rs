@@ -18,6 +18,7 @@ const NO_READ: &ReadCondition = &ReadCondition {
 const NO_WRITE: &WriteCondition = &WriteCondition::None;
 const BUCKET_PREFIX: &str = "authz-phase1";
 const KEY: &str = "key";
+const MISSING_KEY: &str = "missing";
 const TAGS_XML: &str =
     "<Tagging><TagSet><Tag><Key>env</Key><Value>phase2</Value></Tag></TagSet></Tagging>";
 const TEST_SSE_S3_WRAPPING_KEY_B64: &str = "YWJjZGVmMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODk=";
@@ -163,6 +164,10 @@ mod model {
             self.identity == RequesterIdentityShape::Anonymous
         }
 
+        fn is_bucket_owner_principal(self) -> bool {
+            self.identity == RequesterIdentityShape::BucketOwnerPrincipal
+        }
+
         fn is_bucket_owner_account(self) -> bool {
             matches!(
                 self.identity,
@@ -215,7 +220,7 @@ mod model {
     }
 
     impl BucketShape {
-        fn all() -> impl Iterator<Item = Self> {
+        fn all_for_existing() -> impl Iterator<Item = Self> {
             BucketOwnerPrincipalShape::ALL
                 .into_iter()
                 .flat_map(|owner_principal| {
@@ -231,6 +236,60 @@ mod model {
                                 bucket_public_read: false,
                                 bucket_public_write: false,
                             })
+                    })
+                })
+        }
+
+        fn all_for_missing() -> impl Iterator<Item = Self> {
+            // Phase 3 needs public bucket discovery and IgnorePublicAcls coverage without
+            // inflating the existing-object matrix from phases 1/2.
+            BucketOwnerPrincipalShape::ALL
+                .into_iter()
+                .flat_map(|owner_principal| {
+                    OwnershipShape::ALL.into_iter().flat_map(move |ownership| {
+                        let mut shapes = vec![
+                            Self {
+                                owner_principal,
+                                ownership,
+                                ignore_public_acls: false,
+                                block_public_acls: false,
+                                restrict_public_buckets: false,
+                                bucket_public_read: false,
+                                bucket_public_write: false,
+                            },
+                            Self {
+                                owner_principal,
+                                ownership,
+                                ignore_public_acls: false,
+                                block_public_acls: false,
+                                restrict_public_buckets: true,
+                                bucket_public_read: false,
+                                bucket_public_write: false,
+                            },
+                        ];
+                        if ownership == OwnershipShape::ObjectWriter {
+                            shapes.extend([
+                                Self {
+                                    owner_principal,
+                                    ownership,
+                                    ignore_public_acls: false,
+                                    block_public_acls: false,
+                                    restrict_public_buckets: false,
+                                    bucket_public_read: true,
+                                    bucket_public_write: false,
+                                },
+                                Self {
+                                    owner_principal,
+                                    ownership,
+                                    ignore_public_acls: true,
+                                    block_public_acls: false,
+                                    restrict_public_buckets: false,
+                                    bucket_public_read: true,
+                                    bucket_public_write: false,
+                                },
+                            ]);
+                        }
+                        shapes.into_iter()
                     })
                 })
         }
@@ -515,7 +574,7 @@ mod model {
             let mut scenarios = Vec::new();
             for target in ExistingTarget::ALL {
                 for requester in RequesterShape::all() {
-                    for bucket in BucketShape::all() {
+                    for bucket in BucketShape::all_for_existing() {
                         for object in ObjectShape::all_for(action) {
                             for policy in PolicyShape::all_for(action) {
                                 let scenario = Self {
@@ -740,6 +799,295 @@ mod model {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum MissingTarget {
+        Key,
+        Version,
+    }
+
+    impl MissingTarget {
+        const ALL: [Self; 2] = [Self::Key, Self::Version];
+
+        pub(super) fn policy_target(self) -> ExistingTarget {
+            match self {
+                Self::Key => ExistingTarget::Current,
+                Self::Version => ExistingTarget::Versioned,
+            }
+        }
+    }
+
+    impl fmt::Display for MissingTarget {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Key => f.write_str("missing-key"),
+                Self::Version => f.write_str("missing-version"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum MissingOutcome {
+        RevealMissing,
+        HideMissing,
+    }
+
+    impl fmt::Display for MissingOutcome {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::RevealMissing => f.write_str("RevealMissing"),
+                Self::HideMissing => f.write_str("HideMissing"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct MissingPolicyShape {
+        pub(super) read: Option<PolicyDecisionShape>,
+        pub(super) attrs: Option<PolicyDecisionShape>,
+        pub(super) list: Option<PolicyDecisionShape>,
+    }
+
+    impl MissingPolicyShape {
+        fn all_for(action: Action) -> Vec<Self> {
+            match action {
+                Action::GetObject => PolicyDecisionShape::ALL
+                    .into_iter()
+                    .map(|list| Self {
+                        read: None,
+                        attrs: None,
+                        list: Some(list),
+                    })
+                    .collect(),
+                Action::GetObjectAttributes => PolicyShape::all_for(Action::GetObjectAttributes)
+                    .into_iter()
+                    .flat_map(|object_policy| {
+                        PolicyDecisionShape::ALL.into_iter().map(move |list| Self {
+                            read: Some(object_policy.primary),
+                            attrs: object_policy.attrs,
+                            list: Some(list),
+                        })
+                    })
+                    .collect(),
+                Action::GetObjectAcl
+                | Action::GetObjectTagging
+                | Action::PutObjectTagging
+                | Action::DeleteObjectTagging => vec![Self {
+                    read: None,
+                    attrs: None,
+                    list: None,
+                }],
+            }
+        }
+
+        pub(super) fn read_decision(self) -> PolicyDecisionShape {
+            self.read
+                .expect("missing-object read policy decision must be present for this action")
+        }
+
+        pub(super) fn attrs_decision(self) -> PolicyDecisionShape {
+            self.attrs
+                .expect("missing-object attrs policy decision must be present for this action")
+        }
+
+        pub(super) fn list_decision(self) -> PolicyDecisionShape {
+            self.list
+                .expect("missing-object list policy decision must be present for this action")
+        }
+
+        fn has_public_allow(self) -> bool {
+            self.read.is_some_and(PolicyDecisionShape::is_public_allow)
+                || self.attrs.is_some_and(PolicyDecisionShape::is_public_allow)
+                || self.list.is_some_and(PolicyDecisionShape::is_public_allow)
+        }
+
+        fn has_private_allow(self) -> bool {
+            self.read.is_some_and(PolicyDecisionShape::is_private_allow)
+                || self
+                    .attrs
+                    .is_some_and(PolicyDecisionShape::is_private_allow)
+                || self.list.is_some_and(PolicyDecisionShape::is_private_allow)
+        }
+    }
+
+    impl fmt::Display for MissingPolicyShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let mut wrote = false;
+            if let Some(read) = self.read {
+                write!(f, "read={read}")?;
+                wrote = true;
+            }
+            if let Some(attrs) = self.attrs {
+                if wrote {
+                    f.write_str(" ")?;
+                }
+                write!(f, "attrs={attrs}")?;
+                wrote = true;
+            }
+            if let Some(list) = self.list {
+                if wrote {
+                    f.write_str(" ")?;
+                }
+                write!(f, "list={list}")?;
+                wrote = true;
+            }
+            if !wrote {
+                f.write_str("no-policy")
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct MissingScenario {
+        pub(super) action: Action,
+        pub(super) target: MissingTarget,
+        pub(super) requester: RequesterShape,
+        pub(super) bucket: BucketShape,
+        pub(super) policy: MissingPolicyShape,
+    }
+
+    impl MissingScenario {
+        pub(super) fn missing_scenarios(action: Action) -> Vec<Self> {
+            let mut scenarios = Vec::new();
+            for target in MissingTarget::ALL {
+                for requester in RequesterShape::all() {
+                    for bucket in BucketShape::all_for_missing() {
+                        for policy in MissingPolicyShape::all_for(action) {
+                            let scenario = Self {
+                                action,
+                                target,
+                                requester,
+                                bucket,
+                                policy,
+                            };
+                            if scenario.is_possible() {
+                                scenarios.push(scenario);
+                            }
+                        }
+                    }
+                }
+            }
+            scenarios
+        }
+
+        pub(super) fn expected_outcome(self) -> MissingOutcome {
+            let reveal = match self.action {
+                Action::GetObject => {
+                    self.base_get_object_discovery_allowed() || self.list_bucket_allowed()
+                }
+                Action::GetObjectAttributes => {
+                    let read_allowed = self.policy_decision_allows(
+                        self.policy.read_decision(),
+                        self.base_get_object_discovery_allowed(),
+                    );
+                    let attrs_allowed = self.policy_decision_allows(
+                        self.policy.attrs_decision(),
+                        self.base_get_object_attributes_discovery_allowed(),
+                    );
+                    read_allowed && attrs_allowed && self.list_bucket_allowed()
+                }
+                Action::GetObjectAcl => self.base_get_object_acl_discovery_allowed(),
+                Action::GetObjectTagging
+                | Action::PutObjectTagging
+                | Action::DeleteObjectTagging => self.requester.can_bucket_owner_account_admin(),
+            };
+
+            if reveal {
+                MissingOutcome::RevealMissing
+            } else {
+                MissingOutcome::HideMissing
+            }
+        }
+
+        fn is_possible(self) -> bool {
+            if self.requester.is_anonymous() && self.requester.has_admin_profile() {
+                return false;
+            }
+            if self.requester.identity == RequesterIdentityShape::BucketOwnerPrincipal
+                && self.requester.has_admin_profile()
+            {
+                return false;
+            }
+            if self.requester.identity == RequesterIdentityShape::CrossAccountPrincipal
+                && self.requester.has_admin_profile()
+            {
+                return false;
+            }
+            if self.policy.has_private_allow() && self.requester.is_anonymous() {
+                return false;
+            }
+            if self.bucket.restrict_public_buckets && !self.policy.has_public_allow() {
+                return false;
+            }
+
+            true
+        }
+
+        fn base_get_object_discovery_allowed(self) -> bool {
+            self.bucket_read_allowed()
+                || (self.bucket.ownership == OwnershipShape::BucketOwnerEnforced
+                    && self.requester.can_bucket_owner_account_admin())
+        }
+
+        fn base_get_object_attributes_discovery_allowed(self) -> bool {
+            if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced {
+                return self.requester.is_bucket_owner_principal();
+            }
+
+            self.bucket_read_allowed()
+        }
+
+        fn base_get_object_acl_discovery_allowed(self) -> bool {
+            self.requester.is_bucket_owner_principal()
+                || (self.bucket.ownership == OwnershipShape::BucketOwnerEnforced
+                    && self.requester.can_bucket_owner_account_admin())
+        }
+
+        fn bucket_read_allowed(self) -> bool {
+            self.requester.is_bucket_owner_principal()
+                || self.requester_has_bucket_acl_read()
+                || (self.bucket.bucket_public_read && !self.bucket.ignore_public_acls)
+        }
+
+        fn requester_has_bucket_acl_read(self) -> bool {
+            self.requester.identity
+                == RequesterIdentityShape::SameAccountSharedCanonicalOtherPrincipal
+                && self.requester.has_admin_profile()
+        }
+
+        fn list_bucket_allowed(self) -> bool {
+            self.policy_decision_allows(self.policy.list_decision(), self.bucket_read_allowed())
+        }
+
+        fn public_policy_allow_survives(self) -> bool {
+            !self.bucket.restrict_public_buckets || self.requester.is_bucket_owner_account()
+        }
+
+        fn policy_decision_allows(self, decision: PolicyDecisionShape, fallback: bool) -> bool {
+            match decision {
+                PolicyDecisionShape::ExplicitDeny => false,
+                PolicyDecisionShape::ExplicitAllowPrivate => true,
+                PolicyDecisionShape::ExplicitAllowPublic if self.public_policy_allow_survives() => {
+                    true
+                }
+                PolicyDecisionShape::ExplicitAllowPublic
+                | PolicyDecisionShape::NoPolicy
+                | PolicyDecisionShape::NoMatch => fallback,
+            }
+        }
+    }
+
+    impl fmt::Display for MissingScenario {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "action={} target={} requester={} bucket={} policy={}",
+                self.action, self.target, self.requester, self.bucket, self.policy
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum CanonicalGroup {
         Shared,
         Distinct,
@@ -749,9 +1097,9 @@ mod model {
 
 mod harness {
     use super::model::{
-        Action, BucketOwnerPrincipalShape, ExistingTarget, ObjectAclShape, ObjectOwnerKind,
-        Outcome, OwnershipShape, PolicyDecisionShape, RequesterIdentityShape, RequesterShape,
-        Scenario,
+        Action, BucketOwnerPrincipalShape, BucketShape, ExistingTarget, MissingOutcome,
+        MissingScenario, MissingTarget, ObjectAclShape, ObjectOwnerKind, Outcome, OwnershipShape,
+        PolicyDecisionShape, RequesterIdentityShape, RequesterShape, Scenario,
     };
     use super::*;
 
@@ -991,6 +1339,37 @@ mod harness {
                 object_version,
             ))
         }
+
+        pub(super) fn run_missing(
+            &self,
+            bucket: &str,
+            scenario: MissingScenario,
+        ) -> ClassifiedResult {
+            materialize_missing_bucket(&self.coord, &self.fixtures, bucket, scenario)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize bucket for {scenario}: {err:?}");
+                });
+
+            let (key, version_id) =
+                materialize_missing_target(&self.coord, &self.fixtures, bucket, scenario)
+                    .unwrap_or_else(|err| {
+                        panic!("failed to materialize missing target for {scenario}: {err:?}");
+                    });
+
+            materialize_missing_policy(&self.coord, &self.fixtures, bucket, scenario, key)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize policy for {scenario}: {err:?}");
+                });
+
+            classify(run_missing_action(
+                &self.coord,
+                &self.fixtures,
+                bucket,
+                scenario,
+                key,
+                version_id,
+            ))
+        }
     }
 
     pub(super) fn bucket_name_for(action: Action, index: usize) -> String {
@@ -1011,6 +1390,28 @@ mod harness {
             ClassifiedResult::AccessDenied => Outcome::Deny,
             ClassifiedResult::NoSuchKey | ClassifiedResult::VersionNotFound => {
                 panic!("existing-object matrix produced an impossible missing-object result")
+            }
+        }
+    }
+
+    pub(super) fn to_missing_outcome(
+        result: ClassifiedResult,
+        target: MissingTarget,
+    ) -> MissingOutcome {
+        match (result, target) {
+            (ClassifiedResult::AccessDenied, _) => MissingOutcome::HideMissing,
+            (ClassifiedResult::NoSuchKey, MissingTarget::Key) => MissingOutcome::RevealMissing,
+            (ClassifiedResult::VersionNotFound, MissingTarget::Version) => {
+                MissingOutcome::RevealMissing
+            }
+            (ClassifiedResult::Allow, _) => {
+                panic!("missing-object matrix produced an impossible allow result")
+            }
+            (ClassifiedResult::NoSuchKey, MissingTarget::Version) => {
+                panic!("missing-version matrix produced NoSuchKey instead of VersionNotFound")
+            }
+            (ClassifiedResult::VersionNotFound, MissingTarget::Key) => {
+                panic!("missing-key matrix produced VersionNotFound instead of NoSuchKey")
             }
         }
     }
@@ -1040,28 +1441,50 @@ mod harness {
         bucket: &str,
         scenario: Scenario,
     ) -> Result<(), ServerError> {
-        let owner_account = fixtures.bucket_owner_account(scenario.bucket.owner_principal);
+        materialize_bucket_shape(coord, fixtures, bucket, scenario.bucket)
+    }
+
+    fn materialize_missing_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: MissingScenario,
+    ) -> Result<(), ServerError> {
+        materialize_bucket_shape(coord, fixtures, bucket, scenario.bucket)
+    }
+
+    fn materialize_bucket_shape(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        shape: BucketShape,
+    ) -> Result<(), ServerError> {
+        let owner_account = fixtures.bucket_owner_account(shape.owner_principal);
         let owner = OwnerIdentity::new(
             owner_account.principal(),
             owner_account.canonical_user_id().clone(),
         );
-        let grants = Coordinator::bucket_acl_grants_from_flags(&owner, false, false);
+        let grants = Coordinator::bucket_acl_grants_from_flags(
+            &owner,
+            shape.bucket_public_read,
+            shape.bucket_public_write,
+        );
         coord.create_bucket_with_acl_grants(&owner, bucket, grants, false)?;
 
         coord.put_bucket_versioning(&PutBucketVersioningRequest {
             bucket: BucketRequest::new(
                 bucket,
-                fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
+                fixtures.bucket_owner_requester(shape.owner_principal),
                 None,
             ),
             state: BucketVersioningState::Enabled,
         })?;
 
-        if scenario.bucket.ownership == OwnershipShape::BucketOwnerEnforced {
+        if shape.ownership == OwnershipShape::BucketOwnerEnforced {
             coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
                 bucket: BucketRequest::new(
                     bucket,
-                    fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
+                    fixtures.bucket_owner_requester(shape.owner_principal),
                     None,
                 ),
                 config: BucketOwnershipControls {
@@ -1070,18 +1493,18 @@ mod harness {
             })?;
         }
 
-        if scenario.bucket.restrict_public_buckets {
+        if shape.block_public_acls || shape.ignore_public_acls || shape.restrict_public_buckets {
             coord.put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
                 bucket: BucketRequest::new(
                     bucket,
-                    fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
+                    fixtures.bucket_owner_requester(shape.owner_principal),
                     None,
                 ),
                 config: PublicAccessBlockConfig {
-                    block_public_acls: false,
-                    ignore_public_acls: false,
+                    block_public_acls: shape.block_public_acls,
+                    ignore_public_acls: shape.ignore_public_acls,
                     block_public_policy: false,
-                    restrict_public_buckets: true,
+                    restrict_public_buckets: shape.restrict_public_buckets,
                 },
             })?;
         }
@@ -1134,6 +1557,58 @@ mod harness {
         Ok(put.version_id)
     }
 
+    fn materialize_missing_target(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: MissingScenario,
+    ) -> Result<(&'static str, Option<VersionId>), ServerError> {
+        match scenario.target {
+            MissingTarget::Key => Ok((MISSING_KEY, None)),
+            MissingTarget::Version => {
+                let existing_version = materialize_bucket_owner_object(
+                    coord,
+                    fixtures,
+                    bucket,
+                    scenario.bucket.owner_principal,
+                )?;
+                Ok((
+                    KEY,
+                    Some(VersionId::from_u64(existing_version.to_u64() + 1000)),
+                ))
+            }
+        }
+    }
+
+    fn materialize_bucket_owner_object(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        owner_principal: BucketOwnerPrincipalShape,
+    ) -> Result<VersionId, ServerError> {
+        let put = test_helpers::put_object(
+            coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: ObjectRequest::new(
+                    bucket,
+                    KEY,
+                    fixtures.bucket_owner_requester(owner_principal),
+                    None,
+                ),
+                data: b"phase-3-data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: PutObjectWriteAcl::None,
+            },
+        )?;
+        Ok(put.version_id)
+    }
+
     fn materialize_policy(
         coord: &Coordinator,
         fixtures: &IdentityFixtures,
@@ -1162,6 +1637,28 @@ mod harness {
         })
     }
 
+    fn materialize_missing_policy(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: MissingScenario,
+        key: &str,
+    ) -> Result<(), ServerError> {
+        let Some(policy) = missing_policy_document(fixtures, bucket, scenario, key) else {
+            return Ok(());
+        };
+
+        coord.put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: BucketRequest::new(
+                bucket,
+                fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
+                None,
+            ),
+            config: &policy,
+            confirm_remove_self_bucket_access: false,
+        })
+    }
+
     fn run_action(
         coord: &Coordinator,
         fixtures: &IdentityFixtures,
@@ -1176,7 +1673,29 @@ mod harness {
         };
         let object = ObjectVersionRequest::new(bucket, KEY, version_id, requester, None);
 
-        match scenario.action {
+        run_action_for_object(coord, scenario.action, object)
+    }
+
+    fn run_missing_action(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: MissingScenario,
+        key: &str,
+        version_id: Option<VersionId>,
+    ) -> Result<(), ServerError> {
+        let requester = fixtures.requester(scenario.bucket.owner_principal, scenario.requester);
+        let object = ObjectVersionRequest::new(bucket, key, version_id, requester, None);
+
+        run_action_for_object(coord, scenario.action, object)
+    }
+
+    fn run_action_for_object(
+        coord: &Coordinator,
+        action: Action,
+        object: ObjectVersionRequest<'_>,
+    ) -> Result<(), ServerError> {
+        match action {
             Action::GetObject => coord
                 .get_object(&GetObjectRequest {
                     sse_customer: None,
@@ -1261,21 +1780,22 @@ mod harness {
         scenario: Scenario,
     ) -> Option<String> {
         let mut statements = Vec::new();
+        let requester_principal =
+            fixtures.requester_principal(scenario.bucket.owner_principal, scenario.requester);
+        let object_resource = format!("arn:aws:s3:::{bucket}/{KEY}");
         push_policy_statement(
             &mut statements,
-            fixtures,
-            bucket,
-            scenario,
+            requester_principal,
             policy_action_name(scenario.action, scenario.target),
+            &object_resource,
             scenario.policy.primary,
         );
         if scenario.action == Action::GetObjectAttributes {
             push_policy_statement(
                 &mut statements,
-                fixtures,
-                bucket,
-                scenario,
+                requester_principal,
                 get_object_attributes_policy_action_name(scenario.target),
+                &object_resource,
                 scenario.policy.attrs_decision(),
             );
         }
@@ -1290,23 +1810,80 @@ mod harness {
         }
     }
 
-    fn push_policy_statement(
-        statements: &mut Vec<String>,
+    fn missing_policy_document(
         fixtures: &IdentityFixtures,
         bucket: &str,
-        scenario: Scenario,
+        scenario: MissingScenario,
+        key: &str,
+    ) -> Option<String> {
+        let mut statements = Vec::new();
+        let requester_principal =
+            fixtures.requester_principal(scenario.bucket.owner_principal, scenario.requester);
+        let object_resource = format!("arn:aws:s3:::{bucket}/{key}");
+        let bucket_resource = format!("arn:aws:s3:::{bucket}");
+
+        match scenario.action {
+            Action::GetObject => push_policy_statement(
+                &mut statements,
+                requester_principal,
+                "s3:ListBucket",
+                &bucket_resource,
+                scenario.policy.list_decision(),
+            ),
+            Action::GetObjectAttributes => {
+                let target = scenario.target.policy_target();
+                push_policy_statement(
+                    &mut statements,
+                    requester_principal,
+                    get_object_policy_action_name(target),
+                    &object_resource,
+                    scenario.policy.read_decision(),
+                );
+                push_policy_statement(
+                    &mut statements,
+                    requester_principal,
+                    get_object_attributes_policy_action_name(target),
+                    &object_resource,
+                    scenario.policy.attrs_decision(),
+                );
+                push_policy_statement(
+                    &mut statements,
+                    requester_principal,
+                    "s3:ListBucket",
+                    &bucket_resource,
+                    scenario.policy.list_decision(),
+                );
+            }
+            Action::GetObjectAcl
+            | Action::GetObjectTagging
+            | Action::PutObjectTagging
+            | Action::DeleteObjectTagging => {}
+        }
+
+        if statements.is_empty() {
+            None
+        } else {
+            Some(format!(
+                r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
+                statements.join(",")
+            ))
+        }
+    }
+
+    fn push_policy_statement(
+        statements: &mut Vec<String>,
+        requester_principal: Option<&str>,
         action: &str,
+        resource: &str,
         decision: PolicyDecisionShape,
     ) {
-        let resource = format!("arn:aws:s3:::{bucket}/{KEY}");
         match decision {
             PolicyDecisionShape::NoPolicy => {}
             PolicyDecisionShape::NoMatch => statements.push(format!(
                 r#"{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::999988887777:user/unmatched"}},"Action":"{action}","Resource":"{resource}"}}"#
             )),
             PolicyDecisionShape::ExplicitAllowPrivate => {
-                let principal = fixtures
-                    .requester_principal(scenario.bucket.owner_principal, scenario.requester)
+                let principal = requester_principal
                     .expect("private allow requires an authenticated requester");
                 statements.push(format!(
                     r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"{action}","Resource":"{resource}"}}"#
@@ -1375,8 +1952,8 @@ mod harness {
     }
 }
 
-use harness::{bucket_name_for, to_existing_outcome, MatrixHarness};
-use model::{Action, Scenario};
+use harness::{bucket_name_for, to_existing_outcome, to_missing_outcome, MatrixHarness};
+use model::{Action, MissingScenario, Scenario};
 
 #[test]
 fn authz_model_phase1_get_object_existing_matrix() {
@@ -1408,6 +1985,36 @@ fn authz_model_phase2_delete_object_tagging_existing_matrix() {
     run_existing_matrix("phase 2", Action::DeleteObjectTagging);
 }
 
+#[test]
+fn authz_model_phase3_get_object_missing_matrix() {
+    run_missing_matrix("phase 3", Action::GetObject);
+}
+
+#[test]
+fn authz_model_phase3_get_object_attributes_missing_matrix() {
+    run_missing_matrix("phase 3", Action::GetObjectAttributes);
+}
+
+#[test]
+fn authz_model_phase3_get_object_acl_missing_matrix() {
+    run_missing_matrix("phase 3", Action::GetObjectAcl);
+}
+
+#[test]
+fn authz_model_phase3_get_object_tagging_missing_matrix() {
+    run_missing_matrix("phase 3", Action::GetObjectTagging);
+}
+
+#[test]
+fn authz_model_phase3_put_object_tagging_missing_matrix() {
+    run_missing_matrix("phase 3", Action::PutObjectTagging);
+}
+
+#[test]
+fn authz_model_phase3_delete_object_tagging_missing_matrix() {
+    run_missing_matrix("phase 3", Action::DeleteObjectTagging);
+}
+
 fn run_existing_matrix(phase: &str, action: Action) {
     let scenarios = Scenario::existing_scenarios(action);
     assert!(
@@ -1420,6 +2027,25 @@ fn run_existing_matrix(phase: &str, action: Action) {
         let bucket = bucket_name_for(action, index);
         let expected = scenario.expected_existing_outcome();
         let actual = to_existing_outcome(harness.run_existing(&bucket, scenario));
+        assert_eq!(
+            actual, expected,
+            "{phase} authz model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+        );
+    }
+}
+
+fn run_missing_matrix(phase: &str, action: Action) {
+    let scenarios = MissingScenario::missing_scenarios(action);
+    assert!(
+        !scenarios.is_empty(),
+        "{phase} matrix unexpectedly produced no scenarios for {action}"
+    );
+    let harness = MatrixHarness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = bucket_name_for(action, index);
+        let expected = scenario.expected_outcome();
+        let actual = to_missing_outcome(harness.run_missing(&bucket, scenario), scenario.target);
         assert_eq!(
             actual, expected,
             "{phase} authz model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
