@@ -3566,12 +3566,550 @@ mod phase4_harness {
     }
 }
 
+mod phase5_model {
+    use super::model::{Outcome, OwnershipShape};
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum TransitionSeed {
+        PrivateObject,
+        PublicReadAcl,
+        ExplicitGrantReadToCrossAccount,
+    }
+
+    impl fmt::Display for TransitionSeed {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::PrivateObject => f.write_str("private-object"),
+                Self::PublicReadAcl => f.write_str("public-read-acl"),
+                Self::ExplicitGrantReadToCrossAccount => {
+                    f.write_str("explicit-grant-read-cross-account")
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum TransitionPolicyState {
+        None,
+        AllowCrossAccountRead,
+        DenyCrossAccountRead,
+    }
+
+    impl fmt::Display for TransitionPolicyState {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("no-policy"),
+                Self::AllowCrossAccountRead => f.write_str("allow-cross-account-read"),
+                Self::DenyCrossAccountRead => f.write_str("deny-cross-account-read"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum TransitionProbe {
+        AnonymousGetObject,
+        CrossAccountGetObject,
+    }
+
+    impl fmt::Display for TransitionProbe {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::AnonymousGetObject => f.write_str("anonymous-get-object"),
+                Self::CrossAccountGetObject => f.write_str("cross-account-get-object"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum TransitionMutation {
+        EnableBucketOwnerEnforced,
+        DeleteOwnershipControls,
+        EnableIgnorePublicAcls,
+        DeletePublicAccessBlock,
+        SetPolicy(TransitionPolicyState),
+    }
+
+    impl fmt::Display for TransitionMutation {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::EnableBucketOwnerEnforced => f.write_str("enable-boe"),
+                Self::DeleteOwnershipControls => f.write_str("delete-ownership-controls"),
+                Self::EnableIgnorePublicAcls => f.write_str("enable-ignore-public-acls"),
+                Self::DeletePublicAccessBlock => f.write_str("delete-public-access-block"),
+                Self::SetPolicy(policy) => write!(f, "set-policy={policy}"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum TransitionStep {
+        Probe(TransitionProbe),
+        Mutate(TransitionMutation),
+    }
+
+    impl fmt::Display for TransitionStep {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Probe(probe) => write!(f, "probe {probe}"),
+                Self::Mutate(mutation) => write!(f, "mutate {mutation}"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct TransitionState {
+        ownership: OwnershipShape,
+        ignore_public_acls: bool,
+        policy: TransitionPolicyState,
+    }
+
+    impl TransitionState {
+        pub(super) fn new(policy: TransitionPolicyState) -> Self {
+            Self {
+                ownership: OwnershipShape::ObjectWriter,
+                ignore_public_acls: false,
+                policy,
+            }
+        }
+
+        pub(super) fn apply(&mut self, mutation: TransitionMutation) {
+            match mutation {
+                TransitionMutation::EnableBucketOwnerEnforced => {
+                    self.ownership = OwnershipShape::BucketOwnerEnforced;
+                }
+                TransitionMutation::DeleteOwnershipControls => {
+                    self.ownership = OwnershipShape::ObjectWriter;
+                }
+                TransitionMutation::EnableIgnorePublicAcls => {
+                    self.ignore_public_acls = true;
+                }
+                TransitionMutation::DeletePublicAccessBlock => {
+                    self.ignore_public_acls = false;
+                }
+                TransitionMutation::SetPolicy(policy) => {
+                    self.policy = policy;
+                }
+            }
+        }
+
+        pub(super) fn expected_outcome(
+            self,
+            seed: TransitionSeed,
+            probe: TransitionProbe,
+        ) -> Outcome {
+            if probe == TransitionProbe::CrossAccountGetObject {
+                match self.policy {
+                    TransitionPolicyState::AllowCrossAccountRead => return Outcome::Allow,
+                    TransitionPolicyState::DenyCrossAccountRead => return Outcome::Deny,
+                    TransitionPolicyState::None => {}
+                }
+            }
+
+            let legacy_acl_allows = match (seed, probe) {
+                (TransitionSeed::PublicReadAcl, TransitionProbe::AnonymousGetObject)
+                | (TransitionSeed::PublicReadAcl, TransitionProbe::CrossAccountGetObject)
+                | (
+                    TransitionSeed::ExplicitGrantReadToCrossAccount,
+                    TransitionProbe::CrossAccountGetObject,
+                ) => true,
+                (TransitionSeed::PrivateObject, _) => false,
+                (
+                    TransitionSeed::ExplicitGrantReadToCrossAccount,
+                    TransitionProbe::AnonymousGetObject,
+                ) => false,
+            };
+            if !legacy_acl_allows {
+                return Outcome::Deny;
+            }
+            if self.ownership == OwnershipShape::BucketOwnerEnforced {
+                return Outcome::Deny;
+            }
+            if seed == TransitionSeed::PublicReadAcl && self.ignore_public_acls {
+                return Outcome::Deny;
+            }
+            Outcome::Allow
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct TransitionScenario {
+        pub(super) name: &'static str,
+        pub(super) seed: TransitionSeed,
+        pub(super) initial_policy: TransitionPolicyState,
+        pub(super) probe_via_reader: bool,
+        pub(super) steps: &'static [TransitionStep],
+    }
+
+    impl TransitionScenario {
+        pub(super) fn scenarios() -> Vec<Self> {
+            const PUBLIC_READ_BOE_TRACE: [TransitionStep; 5] = [
+                TransitionStep::Probe(TransitionProbe::AnonymousGetObject),
+                TransitionStep::Mutate(TransitionMutation::EnableBucketOwnerEnforced),
+                TransitionStep::Probe(TransitionProbe::AnonymousGetObject),
+                TransitionStep::Mutate(TransitionMutation::DeleteOwnershipControls),
+                TransitionStep::Probe(TransitionProbe::AnonymousGetObject),
+            ];
+            const EXPLICIT_GRANT_BOE_TRACE: [TransitionStep; 5] = [
+                TransitionStep::Probe(TransitionProbe::CrossAccountGetObject),
+                TransitionStep::Mutate(TransitionMutation::EnableBucketOwnerEnforced),
+                TransitionStep::Probe(TransitionProbe::CrossAccountGetObject),
+                TransitionStep::Mutate(TransitionMutation::DeleteOwnershipControls),
+                TransitionStep::Probe(TransitionProbe::CrossAccountGetObject),
+            ];
+            const IGNORE_PUBLIC_ACLS_TRACE: [TransitionStep; 5] = [
+                TransitionStep::Probe(TransitionProbe::AnonymousGetObject),
+                TransitionStep::Mutate(TransitionMutation::EnableIgnorePublicAcls),
+                TransitionStep::Probe(TransitionProbe::AnonymousGetObject),
+                TransitionStep::Mutate(TransitionMutation::DeletePublicAccessBlock),
+                TransitionStep::Probe(TransitionProbe::AnonymousGetObject),
+            ];
+            const POLICY_REPLACE_REMOVE_TRACE: [TransitionStep; 5] = [
+                TransitionStep::Probe(TransitionProbe::CrossAccountGetObject),
+                TransitionStep::Mutate(TransitionMutation::SetPolicy(
+                    TransitionPolicyState::DenyCrossAccountRead,
+                )),
+                TransitionStep::Probe(TransitionProbe::CrossAccountGetObject),
+                TransitionStep::Mutate(TransitionMutation::SetPolicy(TransitionPolicyState::None)),
+                TransitionStep::Probe(TransitionProbe::CrossAccountGetObject),
+            ];
+            const POLICY_BOE_TRACE: [TransitionStep; 5] = [
+                TransitionStep::Probe(TransitionProbe::CrossAccountGetObject),
+                TransitionStep::Mutate(TransitionMutation::EnableBucketOwnerEnforced),
+                TransitionStep::Probe(TransitionProbe::CrossAccountGetObject),
+                TransitionStep::Mutate(TransitionMutation::DeleteOwnershipControls),
+                TransitionStep::Probe(TransitionProbe::CrossAccountGetObject),
+            ];
+
+            vec![
+                Self {
+                    name: "legacy-public-read-acl-boe-transition",
+                    seed: TransitionSeed::PublicReadAcl,
+                    initial_policy: TransitionPolicyState::None,
+                    probe_via_reader: false,
+                    steps: &PUBLIC_READ_BOE_TRACE,
+                },
+                Self {
+                    name: "legacy-explicit-grant-read-boe-transition",
+                    seed: TransitionSeed::ExplicitGrantReadToCrossAccount,
+                    initial_policy: TransitionPolicyState::None,
+                    probe_via_reader: false,
+                    steps: &EXPLICIT_GRANT_BOE_TRACE,
+                },
+                Self {
+                    name: "ignore-public-acls-toggle-restores-legacy-public-read",
+                    seed: TransitionSeed::PublicReadAcl,
+                    initial_policy: TransitionPolicyState::None,
+                    probe_via_reader: false,
+                    steps: &IGNORE_PUBLIC_ACLS_TRACE,
+                },
+                Self {
+                    name: "bucket-policy-replacement-and-removal-transition",
+                    seed: TransitionSeed::PrivateObject,
+                    initial_policy: TransitionPolicyState::AllowCrossAccountRead,
+                    probe_via_reader: false,
+                    steps: &POLICY_REPLACE_REMOVE_TRACE,
+                },
+                Self {
+                    name: "bucket-policy-read-survives-boe-transition",
+                    seed: TransitionSeed::PrivateObject,
+                    initial_policy: TransitionPolicyState::AllowCrossAccountRead,
+                    probe_via_reader: false,
+                    steps: &POLICY_BOE_TRACE,
+                },
+            ]
+        }
+
+        pub(super) fn initial_state(self) -> TransitionState {
+            TransitionState::new(self.initial_policy)
+        }
+    }
+
+    impl fmt::Display for TransitionScenario {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "name={} seed={}", self.name, self.seed)
+        }
+    }
+}
+
+mod phase5_harness {
+    use super::harness::{setup_coordinator, IdentityFixtures};
+    use super::model::Outcome;
+    use super::phase5_model::{
+        TransitionMutation, TransitionPolicyState, TransitionProbe, TransitionScenario,
+        TransitionSeed,
+    };
+    use super::*;
+
+    const PHASE5_KEY: &str = "key";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ClassifiedTransitionResult {
+        Allow,
+        Deny,
+    }
+
+    pub(super) struct Phase5Harness {
+        _tmp: test_util::TempDir,
+        admin: Coordinator,
+        reader: Coordinator,
+        fixtures: IdentityFixtures,
+    }
+
+    impl Phase5Harness {
+        pub(super) fn new() -> Self {
+            let tmp = test_util::tempdir();
+            let admin = setup_coordinator(tmp.path());
+            let reader = setup_coordinator(tmp.path());
+            let fixtures = IdentityFixtures::new();
+            Self {
+                _tmp: tmp,
+                admin,
+                reader,
+                fixtures,
+            }
+        }
+
+        pub(super) fn prepare(&self, bucket: &str, scenario: TransitionScenario) {
+            materialize_transition_bucket(&self.admin, &self.fixtures, bucket).unwrap_or_else(
+                |err| {
+                    panic!("failed to materialize phase 5 bucket for {scenario}: {err:?}");
+                },
+            );
+            materialize_transition_seed(&self.admin, &self.fixtures, bucket, scenario.seed)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize phase 5 seed for {scenario}: {err:?}");
+                });
+            if scenario.initial_policy != TransitionPolicyState::None {
+                apply_transition_mutation(
+                    &self.admin,
+                    &self.fixtures,
+                    bucket,
+                    TransitionMutation::SetPolicy(scenario.initial_policy),
+                )
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize phase 5 initial policy for {scenario}: {err:?}");
+                });
+            }
+        }
+
+        pub(super) fn apply_mutation(
+            &self,
+            bucket: &str,
+            scenario: TransitionScenario,
+            mutation: TransitionMutation,
+        ) {
+            apply_transition_mutation(&self.admin, &self.fixtures, bucket, mutation)
+                .unwrap_or_else(|err| {
+                    panic!("failed to apply phase 5 mutation {mutation} for {scenario}: {err:?}");
+                });
+        }
+
+        pub(super) fn probe(
+            &self,
+            bucket: &str,
+            scenario: TransitionScenario,
+            probe: TransitionProbe,
+        ) -> ClassifiedTransitionResult {
+            let coord = if scenario.probe_via_reader {
+                &self.reader
+            } else {
+                &self.admin
+            };
+            classify(run_transition_probe(coord, &self.fixtures, bucket, probe))
+        }
+    }
+
+    pub(super) fn phase5_bucket_name_for(index: usize) -> String {
+        format!("authz-phase5-{index:05}")
+    }
+
+    pub(super) fn to_transition_outcome(result: ClassifiedTransitionResult) -> Outcome {
+        match result {
+            ClassifiedTransitionResult::Allow => Outcome::Allow,
+            ClassifiedTransitionResult::Deny => Outcome::Deny,
+        }
+    }
+
+    fn materialize_transition_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+    ) -> Result<(), ServerError> {
+        let owner = OwnerIdentity::new(
+            fixtures.owner_user.principal(),
+            fixtures.owner_user.canonical_user_id().clone(),
+        );
+        let grants = Coordinator::bucket_acl_grants_from_flags(&owner, false, false);
+        coord.create_bucket_with_acl_grants(&owner, bucket, grants, false)?;
+        Ok(())
+    }
+
+    fn materialize_transition_seed(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        seed: TransitionSeed,
+    ) -> Result<(), ServerError> {
+        let acl = match seed {
+            TransitionSeed::PrivateObject => PutObjectWriteAcl::None,
+            TransitionSeed::PublicReadAcl => PutObjectAcl::PublicRead.into(),
+            TransitionSeed::ExplicitGrantReadToCrossAccount => {
+                PutObjectWriteAcl::Grants(AclGrants::new(vec![
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(fixtures.owner_user.canonical_user_id().clone()),
+                        AclPermission::FullControl,
+                    ),
+                    AclGrant::new(
+                        AclGrantee::CanonicalUser(
+                            fixtures.cross_account.canonical_user_id().clone(),
+                        ),
+                        AclPermission::Read,
+                    ),
+                ]))
+            }
+        };
+
+        test_helpers::put_object(
+            coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: ObjectRequest::new(
+                    bucket,
+                    PHASE5_KEY,
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                data: b"phase-5-object",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl,
+            },
+        )
+        .map(|_| ())
+    }
+
+    fn apply_transition_mutation(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        mutation: TransitionMutation,
+    ) -> Result<(), ServerError> {
+        let owner_requester = Requester::authenticated(fixtures.owner_user.clone());
+        match mutation {
+            TransitionMutation::EnableBucketOwnerEnforced => {
+                coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
+                    bucket: BucketRequest::new(bucket, owner_requester, None),
+                    config: BucketOwnershipControls {
+                        object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                    },
+                })
+            }
+            TransitionMutation::DeleteOwnershipControls => coord.delete_bucket_ownership_controls(
+                &BucketRequest::new(bucket, owner_requester, None),
+            ),
+            TransitionMutation::EnableIgnorePublicAcls => {
+                coord.put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
+                    bucket: BucketRequest::new(bucket, owner_requester, None),
+                    config: PublicAccessBlockConfig {
+                        block_public_acls: false,
+                        ignore_public_acls: true,
+                        block_public_policy: false,
+                        restrict_public_buckets: false,
+                    },
+                })
+            }
+            TransitionMutation::DeletePublicAccessBlock => coord.delete_bucket_public_access_block(
+                &BucketRequest::new(bucket, owner_requester, None),
+            ),
+            TransitionMutation::SetPolicy(policy) => match policy {
+                TransitionPolicyState::None => {
+                    coord.delete_bucket_policy(&BucketRequest::new(bucket, owner_requester, None))
+                }
+                TransitionPolicyState::AllowCrossAccountRead
+                | TransitionPolicyState::DenyCrossAccountRead => {
+                    let policy_document = transition_policy_document(fixtures, bucket, policy);
+                    coord.put_bucket_policy(&PutBucketPolicyRequest {
+                        bucket: BucketRequest::new(bucket, owner_requester, None),
+                        config: &policy_document,
+                        confirm_remove_self_bucket_access: false,
+                    })
+                }
+            },
+        }
+    }
+
+    fn transition_policy_document(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        policy: TransitionPolicyState,
+    ) -> String {
+        let effect = match policy {
+            TransitionPolicyState::AllowCrossAccountRead => "Allow",
+            TransitionPolicyState::DenyCrossAccountRead => "Deny",
+            TransitionPolicyState::None => panic!("no policy document for no-policy state"),
+        };
+        let principal = fixtures.cross_account.principal();
+        format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"{effect}","Principal":{{"AWS":"{principal}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/{PHASE5_KEY}"}}]}}"#
+        )
+    }
+
+    fn run_transition_probe(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        probe: TransitionProbe,
+    ) -> Result<(), ServerError> {
+        let requester = match probe {
+            TransitionProbe::AnonymousGetObject => Requester::anonymous(),
+            TransitionProbe::CrossAccountGetObject => {
+                Requester::authenticated(fixtures.cross_account.clone())
+            }
+        };
+        coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: ObjectVersionRequest::new(bucket, PHASE5_KEY, None, requester, None),
+                cond: NO_READ,
+            })
+            .and_then(|result| {
+                let _ = read_all_transition_body(result.body)?;
+                Ok(())
+            })
+    }
+
+    fn classify(result: Result<(), ServerError>) -> ClassifiedTransitionResult {
+        match result {
+            Ok(()) => ClassifiedTransitionResult::Allow,
+            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
+                ClassifiedTransitionResult::Deny
+            }
+            Err(other) => panic!("unexpected phase 5 classified result: {other:?}"),
+        }
+    }
+
+    fn read_all_transition_body(mut body: ReadHandle) -> Result<Vec<u8>, ServerError> {
+        let mut out = Vec::new();
+        while let Some(chunk) = body.next_chunk(INTERNAL_SEGMENT_SIZE)? {
+            out.extend_from_slice(&chunk);
+        }
+        Ok(out)
+    }
+}
+
 use harness::{bucket_name_for, to_existing_outcome, to_missing_outcome, MatrixHarness};
 use model::{Action, MissingScenario, Scenario};
 use phase4_harness::{
     acl_bucket_name_for, to_acl_outcome, to_write_outcome, write_bucket_name_for, Phase4Harness,
 };
 use phase4_model::{AclUpdateAction, AclUpdateScenario, WriteAction, WriteScenario};
+use phase5_harness::{phase5_bucket_name_for, to_transition_outcome, Phase5Harness};
+use phase5_model::{TransitionScenario, TransitionStep};
 
 #[test]
 fn authz_model_phase1_get_object_existing_matrix() {
@@ -3656,6 +4194,45 @@ fn authz_model_phase4_put_object_acl_matrix() {
 #[test]
 fn authz_model_phase4_put_object_version_acl_matrix() {
     run_phase4_acl_matrix(AclUpdateAction::PutObjectVersionAcl);
+}
+
+#[test]
+fn authz_model_phase5_transition_matrix() {
+    let scenarios = TransitionScenario::scenarios();
+    assert!(
+        !scenarios.is_empty(),
+        "phase 5 transition matrix unexpectedly produced no scenarios"
+    );
+    let harness = Phase5Harness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = phase5_bucket_name_for(index);
+        harness.prepare(&bucket, scenario);
+
+        let mut state = scenario.initial_state();
+        let mut trace = vec![format!("seed {} {}", bucket, scenario.seed)];
+
+        for step in scenario.steps {
+            match *step {
+                TransitionStep::Mutate(mutation) => {
+                    harness.apply_mutation(&bucket, scenario, mutation);
+                    state.apply(mutation);
+                    trace.push(format!("mutate {mutation}"));
+                }
+                TransitionStep::Probe(probe) => {
+                    let expected = state.expected_outcome(scenario.seed, probe);
+                    let actual = to_transition_outcome(harness.probe(&bucket, scenario, probe));
+                    trace.push(format!("probe {probe} => {actual}"));
+                    assert_eq!(
+                        actual,
+                        expected,
+                        "phase 5 transition mismatch\nscenario: {scenario}\ntrace:\n{}",
+                        trace.join("\n")
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn run_existing_matrix(phase: &str, action: Action) {

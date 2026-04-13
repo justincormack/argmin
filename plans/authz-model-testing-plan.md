@@ -604,6 +604,28 @@ Acceptance criteria:
 
 ### Phase 5: Transition Semantics
 
+Status: completed
+
+Implemented:
+
+- extended `crates/server-core/src/coordinator/authz_model_tests.rs` with a
+  deterministic phase-5 transition model and harness for authz state changes on
+  an unchanged object
+- encoded bounded step traces instead of a randomized state machine so each
+  transition failure reports the exact mutation/probe sequence that regressed
+- covered legacy ACL suppression and restoration across BOE transitions for:
+  - anonymous `public-read` object ACL access
+  - explicit cross-account grantee `READ` access
+- covered `IgnorePublicAcls` toggles after object creation, including restoring
+  the legacy public-read path once the public-access-block config is removed
+- covered bucket-policy transition behavior on an existing private object for:
+  - allow -> deny replacement
+  - deny -> no policy removal
+  - policy-based `GetObject` access surviving BOE enable and later BOE removal
+- kept the policy transition trace focused on same-coordinator authz semantics;
+  the separate cross-coordinator bucket-policy cache invalidation test remains
+  the place that pins replacement invalidation behavior directly
+
 Once the static matrices are stable, add bounded transition scenarios for:
 
 - object created under legacy ACL behavior, then BOE enabled
