@@ -1119,6 +1119,141 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+#[doc(hidden)]
+pub fn fuzz_post_multipart_parser(
+    boundary: &str,
+    body: &[u8],
+    feed_controls: &[u8],
+) -> Result<(), ServerError> {
+    let mut parser = PostMultipartParser::new(boundary);
+    let mut field_budget = StreamingPostFieldBudget::default();
+    let mut seen_file = false;
+    let mut file_ended = false;
+    let mut offset = 0;
+
+    let mut handle_events = |events: Vec<PostMultipartEvent>| -> Result<(), ServerError> {
+        for event in events {
+            match event {
+                PostMultipartEvent::Field { name, value } => {
+                    if seen_file {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "file field must be the final multipart part".to_string(),
+                        });
+                    }
+                    field_budget.record(&name, &value)?;
+                }
+                PostMultipartEvent::FileStart { .. } => {
+                    if seen_file {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "multiple file fields are not supported".to_string(),
+                        });
+                    }
+                    seen_file = true;
+                }
+                PostMultipartEvent::FileChunk(_) => {
+                    if !seen_file || file_ended {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "missing file field in multipart form".to_string(),
+                        });
+                    }
+                }
+                PostMultipartEvent::FileEnd => {
+                    if !seen_file || file_ended {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "missing file field in multipart form".to_string(),
+                        });
+                    }
+                    file_ended = true;
+                }
+            }
+        }
+        Ok(())
+    };
+
+    for &control in feed_controls {
+        if offset >= body.len() {
+            break;
+        }
+        let remaining = body.len() - offset;
+        let len = 1 + usize::from(control) % remaining;
+        let end = offset + len;
+        let events = parser.feed(&body[offset..end])?;
+        handle_events(events)?;
+        offset = end;
+    }
+
+    if offset < body.len() || body.is_empty() {
+        let events = parser.feed(&body[offset..])?;
+        handle_events(events)?;
+    }
+
+    if !parser.is_done() {
+        return Err(ServerError::IncompleteBody);
+    }
+    if !seen_file {
+        return Err(ServerError::InvalidRequest {
+            reason: "missing file field in multipart form".to_string(),
+        });
+    }
+    if !file_ended {
+        return Err(ServerError::IncompleteBody);
+    }
+
+    Ok(())
+}
+
+#[doc(hidden)]
+pub fn fuzz_streaming_request_entrypoints(
+    method: &str,
+    uri: &str,
+    headers: &[(String, String)],
+    transport_security: TransportSecurity,
+) {
+    fn build_parts(
+        method: &str,
+        uri: &str,
+        headers: &[(String, String)],
+    ) -> Option<http::request::Parts> {
+        let method = http::Method::from_bytes(method.as_bytes()).ok()?;
+        let uri = uri.parse::<http::Uri>().ok()?;
+
+        let mut request = http::Request::new(());
+        *request.method_mut() = method;
+        *request.uri_mut() = uri;
+
+        for (name, value) in headers {
+            let Ok(name) = http::header::HeaderName::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+            let Ok(value) = http::HeaderValue::from_str(value) else {
+                continue;
+            };
+            request.headers_mut().append(name, value);
+        }
+
+        Some(request.into_parts().0)
+    }
+
+    if let Some(parts) = build_parts(method, uri, headers) {
+        let _ = is_streaming_write(&parts);
+        let _ = post_object_bucket(&parts);
+    }
+
+    if let Some(parts) = build_parts(method, uri, headers) {
+        let Ok(req) = S3Request::from_hyper_headers(parts, transport_security) else {
+            return;
+        };
+
+        let _ = parse_chunked_mode(&req);
+        let _ = claimed_payload_sha256_from_request(&req);
+        let _ = trailing_hasher_from_request(&req);
+        let _ = inline_checksum_hasher_from_request(&req);
+        let _ = req
+            .header("content-type")
+            .and_then(super::multipart::extract_boundary);
+    }
+}
+
 async fn handle_streaming_post_object(
     state: Arc<ServerState>,
     s3req: S3Request,
@@ -3715,6 +3850,31 @@ mod tests {
             }
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn fuzz_post_multipart_parser_rejects_missing_final_boundary() {
+        let boundary = "BoundaryEOF";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"blob.bin\"\r\nContent-Type: application/octet-stream\r\n\r\nhello world"
+        );
+
+        let err = fuzz_post_multipart_parser(boundary, body.as_bytes(), &[3, 1, 4, 1]).unwrap_err();
+        assert!(matches!(err, ServerError::IncompleteBody));
+    }
+
+    #[test]
+    fn fuzz_post_multipart_parser_rejects_missing_file_field() {
+        let boundary = "BoundaryNoFile";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nobject-key\r\n--{boundary}--"
+        );
+
+        let err = fuzz_post_multipart_parser(boundary, body.as_bytes(), &[2, 7, 1]).unwrap_err();
+        assert!(matches!(
+            err,
+            ServerError::InvalidRequest { reason } if reason == "missing file field in multipart form"
+        ));
     }
 
     #[test]

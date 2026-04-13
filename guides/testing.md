@@ -388,8 +388,8 @@ after targeted local testing has already narrowed down any failures.
 ## Fuzzing
 
 Parser hardening work now has a dedicated `cargo-fuzz` harness under `fuzz/`.
-This is aimed at parser/helper-level targets rather than trying to fuzz the
-entire HTTP server end-to-end.
+This is aimed at parser and request-front-door targets rather than trying to
+fuzz the entire HTTP server end-to-end.
 
 Current targets:
 
@@ -397,6 +397,19 @@ Current targets:
 - `auth_post`
 - `auth_request`
 - `server_http_parsers`
+- `server_http_post_multipart`
+- `server_http_chunked_decoder`
+- `server_http_streaming_frontend`
+
+The `server-http` targets are intentionally focused on the attacker-controlled
+surfaces called out in the threat model:
+
+- `server_http_post_multipart` drives the incremental `POST Object`
+  multipart/form-data parser used by the streaming POST path.
+- `server_http_chunked_decoder` drives `IncrementalChunkedDecoder`, including
+  incremental feeds, signed/unsigned aws-chunked modes, and trailer handling.
+- `server_http_streaming_frontend` drives the streaming PUT/POST request
+  classification and header parsing entry points in `serve.rs`.
 
 Useful commands:
 

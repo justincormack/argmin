@@ -15,6 +15,36 @@ pub fn lossy(data: &[u8]) -> String {
     String::from_utf8_lossy(data).into_owned()
 }
 
+pub fn chunk_by_controls<'a>(data: &'a [u8], controls: &[u8]) -> Vec<&'a [u8]> {
+    if data.is_empty() {
+        return vec![data];
+    }
+
+    let mut chunks = Vec::new();
+    let mut offset = 0;
+
+    for &control in controls {
+        if offset >= data.len() {
+            break;
+        }
+
+        let remaining = data.len() - offset;
+        let len = 1 + usize::from(control) % remaining;
+        chunks.push(&data[offset..offset + len]);
+        offset += len;
+    }
+
+    if offset < data.len() {
+        chunks.push(&data[offset..]);
+    }
+
+    if chunks.is_empty() {
+        chunks.push(data);
+    }
+
+    chunks
+}
+
 pub fn seeded_store() -> CredentialStore {
     let mut store = CredentialStore::new();
     store.add(

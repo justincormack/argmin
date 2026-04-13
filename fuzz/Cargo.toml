@@ -42,5 +42,26 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "server_http_post_multipart"
+path = "fuzz_targets/server_http_post_multipart.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_chunked_decoder"
+path = "fuzz_targets/server_http_chunked_decoder.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_streaming_frontend"
+path = "fuzz_targets/server_http_streaming_frontend.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
