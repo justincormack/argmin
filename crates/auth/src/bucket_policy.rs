@@ -107,6 +107,8 @@ pub enum PolicyAction {
     PutBucketPolicy,
     DeleteBucketPolicy,
     GetBucketCors,
+    GetBucketAcl,
+    GetBucketVersioning,
     GetBucketOwnershipControls,
     GetBucketTagging,
     GetEncryptionConfiguration,
@@ -115,7 +117,11 @@ pub enum PolicyAction {
     GetBucketPublicAccessBlock,
     GetBucketObjectLockConfiguration,
     ListBucket,
+    ListBucketVersions,
+    ListBucketMultipartUploads,
+    PutBucketAcl,
     PutBucketCors,
+    PutBucketVersioning,
     PutBucketOwnershipControls,
     PutBucketTagging,
     PutEncryptionConfiguration,
@@ -154,6 +160,8 @@ impl PolicyAction {
             Self::PutBucketPolicy => "s3:PutBucketPolicy",
             Self::DeleteBucketPolicy => "s3:DeleteBucketPolicy",
             Self::GetBucketCors => "s3:GetBucketCORS",
+            Self::GetBucketAcl => "s3:GetBucketAcl",
+            Self::GetBucketVersioning => "s3:GetBucketVersioning",
             Self::GetBucketOwnershipControls => "s3:GetBucketOwnershipControls",
             Self::GetBucketTagging => "s3:GetBucketTagging",
             Self::GetEncryptionConfiguration => "s3:GetEncryptionConfiguration",
@@ -162,7 +170,11 @@ impl PolicyAction {
             Self::GetBucketPublicAccessBlock => "s3:GetBucketPublicAccessBlock",
             Self::GetBucketObjectLockConfiguration => "s3:GetBucketObjectLockConfiguration",
             Self::ListBucket => "s3:ListBucket",
+            Self::ListBucketVersions => "s3:ListBucketVersions",
+            Self::ListBucketMultipartUploads => "s3:ListBucketMultipartUploads",
+            Self::PutBucketAcl => "s3:PutBucketAcl",
             Self::PutBucketCors => "s3:PutBucketCORS",
+            Self::PutBucketVersioning => "s3:PutBucketVersioning",
             Self::PutBucketOwnershipControls => "s3:PutBucketOwnershipControls",
             Self::PutBucketTagging => "s3:PutBucketTagging",
             Self::PutEncryptionConfiguration => "s3:PutEncryptionConfiguration",
@@ -1063,11 +1075,13 @@ fn validate_resource_applicability(
     Ok(())
 }
 
-const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 19] = [
+const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 25] = [
     PolicyAction::GetBucketPolicy,
     PolicyAction::PutBucketPolicy,
     PolicyAction::DeleteBucketPolicy,
     PolicyAction::GetBucketCors,
+    PolicyAction::GetBucketAcl,
+    PolicyAction::GetBucketVersioning,
     PolicyAction::GetBucketOwnershipControls,
     PolicyAction::GetBucketTagging,
     PolicyAction::GetEncryptionConfiguration,
@@ -1076,7 +1090,11 @@ const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 19] = [
     PolicyAction::GetBucketPublicAccessBlock,
     PolicyAction::GetBucketObjectLockConfiguration,
     PolicyAction::ListBucket,
+    PolicyAction::ListBucketVersions,
+    PolicyAction::ListBucketMultipartUploads,
+    PolicyAction::PutBucketAcl,
     PolicyAction::PutBucketCors,
+    PolicyAction::PutBucketVersioning,
     PolicyAction::PutBucketOwnershipControls,
     PolicyAction::PutBucketTagging,
     PolicyAction::PutEncryptionConfiguration,
@@ -2431,6 +2449,28 @@ mod tests {
     }
 
     #[test]
+    fn get_bucket_acl_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketAcl","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(PolicyAction::GetBucketAcl, "bucket", Some("caller"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn get_bucket_versioning_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketVersioning","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(PolicyAction::GetBucketVersioning, "bucket", Some("caller"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
     fn get_bucket_ownership_controls_matches_bucket_resource() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketOwnershipControls","Resource":"arn:aws:s3:::bucket"}]}"#,
@@ -2508,6 +2548,28 @@ mod tests {
         )
         .unwrap();
         let request = bucket_request(PolicyAction::PutBucketCors, "bucket", Some("caller"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn put_bucket_acl_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutBucketAcl","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(PolicyAction::PutBucketAcl, "bucket", Some("caller"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn put_bucket_versioning_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutBucketVersioning","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(PolicyAction::PutBucketVersioning, "bucket", Some("caller"));
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
     }
@@ -2610,6 +2672,32 @@ mod tests {
     }
 
     #[test]
+    fn list_bucket_versions_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucketVersions","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(PolicyAction::ListBucketVersions, "bucket", Some("caller"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn list_bucket_multipart_uploads_matches_bucket_resource() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucketMultipartUploads","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(
+            PolicyAction::ListBucketMultipartUploads,
+            "bucket",
+            Some("caller"),
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
     fn get_bucket_policy_status_object_only_resource_is_rejected() {
         let err = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketPolicyStatus","Resource":"arn:aws:s3:::bucket/*"}]}"#,
@@ -2673,6 +2761,36 @@ mod tests {
     fn get_bucket_cors_object_only_resource_is_rejected() {
         let err = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketCORS","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_acl_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketAcl","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_versioning_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketVersioning","Resource":"arn:aws:s3:::bucket/*"}]}"#,
         )
         .unwrap_err();
 
@@ -2763,6 +2881,36 @@ mod tests {
     fn put_bucket_cors_object_only_resource_is_rejected() {
         let err = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutBucketCORS","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_acl_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutBucketAcl","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_versioning_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutBucketVersioning","Resource":"arn:aws:s3:::bucket/*"}]}"#,
         )
         .unwrap_err();
 
@@ -2868,6 +3016,36 @@ mod tests {
     fn list_bucket_object_only_resource_is_rejected() {
         let err = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
+    }
+
+    #[test]
+    fn list_bucket_versions_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucketVersions","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Action does not apply to any resource(s) in statement",
+            }
+        );
+    }
+
+    #[test]
+    fn list_bucket_multipart_uploads_object_only_resource_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:ListBucketMultipartUploads","Resource":"arn:aws:s3:::bucket/*"}]}"#,
         )
         .unwrap_err();
 

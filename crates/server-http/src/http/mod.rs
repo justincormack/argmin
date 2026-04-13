@@ -2264,6 +2264,19 @@ impl HttpFrontend {
                         expected_bucket_owner,
                     ),
                     acl,
+                    policy_context: if let Some(canned_acl) = req.header("x-amz-acl") {
+                        crate::coordinator::PutObjectPolicyContext::default()
+                            .with_default_canned_acl(Some(canned_acl))
+                    } else {
+                        crate::coordinator::PutObjectPolicyContext::default()
+                            .with_acl_grant_headers(
+                                req.header("x-amz-grant-read"),
+                                req.header("x-amz-grant-write"),
+                                req.header("x-amz-grant-read-acp"),
+                                req.header("x-amz-grant-write-acp"),
+                                req.header("x-amz-grant-full-control"),
+                            )
+                    },
                 };
                 self.coordinator.validate_put_bucket_acl_request(&acl_req)?;
                 validate_request_checksum_headers(req, true, false)?;

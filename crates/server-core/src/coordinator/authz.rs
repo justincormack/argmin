@@ -751,6 +751,32 @@ impl Coordinator {
         policy.evaluate(&request)
     }
 
+    pub(super) fn bucket_policy_decision_for_bucket_with_context(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        action: auth::PolicyAction,
+        policy_context: PutObjectPolicyContext<'_>,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> auth::PolicyEvaluation {
+        let Some(policy) = policy else {
+            return auth::PolicyEvaluation::NoMatch;
+        };
+
+        let request = auth::PolicyRequest::for_bucket(
+            action,
+            &bucket.name,
+            requester.principal_opt(),
+            requester.canonical_user_id(),
+        )
+        .with_canned_acl(policy_context.canned_acl)
+        .with_grant_read(policy_context.grant_read)
+        .with_grant_write(policy_context.grant_write)
+        .with_grant_read_acp(policy_context.grant_read_acp)
+        .with_grant_write_acp(policy_context.grant_write_acp)
+        .with_grant_full_control(policy_context.grant_full_control);
+        policy.evaluate(&request)
+    }
+
     pub(super) fn bucket_policy_decision_for_put_object_action(
         requester: &Requester,
         bucket: &BucketSummary,
@@ -2500,7 +2526,10 @@ impl Coordinator {
         &self,
         req: &PutBucketVersioningRequest<'_>,
     ) -> Result<AuthorizedPutBucketVersioning, ServerError> {
-        let bucket_info = self.authorize_bucket_owner_account_admin_for(&req.bucket)?;
+        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            &req.bucket,
+            auth::PolicyAction::PutBucketVersioning,
+        )?;
         if bucket_info.object_lock.enabled && req.state != BucketVersioningState::Enabled {
             return Err(ServerError::InvalidBucketState);
         }
@@ -2514,7 +2543,10 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketVersioning, ServerError> {
-        let info = self.authorize_bucket_owner_account_admin_for(req)?;
+        let info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::GetBucketVersioning,
+        )?;
         Ok(AuthorizedGetBucketVersioning {
             state: info.versioning,
         })
@@ -2524,8 +2556,8 @@ impl Coordinator {
         &self,
         req: &ListObjectsV2Request<'_>,
     ) -> Result<AuthorizedListObjectsV2, ServerError> {
-        let bucket_info =
-            self.checked_active_bucket_summary(req.bucket.name, req.expected_bucket_owner())?;
+        let bucket_info = self
+            .checked_active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_list_bucket_with_bucket_policy(
             &req.bucket.requester,
@@ -2553,7 +2585,24 @@ impl Coordinator {
         &self,
         req: &ListObjectVersionsRequest<'_>,
     ) -> Result<AuthorizedListObjectVersions, ServerError> {
-        let bucket_info = self.authorize_bucket_read_for(&req.bucket)?;
+        let bucket_info = self
+            .checked_active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        if !Self::requester_can_bucket_action_with_bucket_policy(
+            &req.bucket.requester,
+            &bucket_info,
+            auth::PolicyAction::ListBucketVersions,
+            bucket_policy.as_deref(),
+            Self::requester_can_read_bucket(
+                &req.bucket.requester,
+                &bucket_info,
+                &bucket_info.owner_principal,
+                &bucket_info.acl_grants,
+                Self::effective_public_read(&bucket_info),
+            ),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
         Ok(AuthorizedListObjectVersions {
             bucket_info: bucket_info.into_inner(),
         })
@@ -2563,7 +2612,24 @@ impl Coordinator {
         &self,
         req: &ListMultipartUploadsRequest<'_>,
     ) -> Result<AuthorizedListMultipartUploads, ServerError> {
-        let _bucket_info = self.authorize_bucket_read_for(&req.bucket)?;
+        let bucket_info = self
+            .checked_active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        if !Self::requester_can_bucket_action_with_bucket_policy(
+            &req.bucket.requester,
+            &bucket_info,
+            auth::PolicyAction::ListBucketMultipartUploads,
+            bucket_policy.as_deref(),
+            Self::requester_can_read_bucket(
+                &req.bucket.requester,
+                &bucket_info,
+                &bucket_info.owner_principal,
+                &bucket_info.acl_grants,
+                Self::effective_public_read(&bucket_info),
+            ),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
         Ok(AuthorizedListMultipartUploads {
             bucket: req.bucket.name.to_string(),
         })
@@ -2678,7 +2744,14 @@ impl Coordinator {
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketAcl, ServerError> {
         let bucket = self.checked_active_bucket_summary(req.name, req.expected_bucket_owner())?;
-        if !Self::requester_can_read_bucket_acl(&req.requester, &bucket) {
+        let bucket_policy = self.cached_bucket_policy(&bucket)?;
+        if !Self::requester_can_bucket_action_with_bucket_policy(
+            &req.requester,
+            &bucket,
+            auth::PolicyAction::GetBucketAcl,
+            bucket_policy.as_deref(),
+            Self::requester_can_read_bucket_acl(&req.requester, &bucket),
+        ) {
             return Err(ServerError::AccessDenied);
         }
         let result = if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
@@ -2708,7 +2781,20 @@ impl Coordinator {
     ) -> Result<AuthorizedPutBucketAcl, ServerError> {
         let bucket_info = self
             .checked_active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
-        if !Self::requester_can_write_bucket_acl(&req.bucket.requester, &bucket_info) {
+        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
+        let policy_decision = Self::bucket_policy_decision_for_bucket_with_context(
+            &req.bucket.requester,
+            &bucket_info,
+            auth::PolicyAction::PutBucketAcl,
+            req.authorization_policy_context()?,
+            bucket_policy.as_deref(),
+        );
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.bucket.requester,
+            &bucket_info,
+            policy_decision,
+            || Self::requester_can_write_bucket_acl(&req.bucket.requester, &bucket_info),
+        ) {
             return Err(ServerError::AccessDenied);
         }
         let owner = Self::bucket_owner_identity(&bucket_info);
