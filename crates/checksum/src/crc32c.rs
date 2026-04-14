@@ -1,8 +1,9 @@
 //! CRC-32C (Castagnoli / iSCSI) checksum with combine support.
 //!
-//! Uses ISA-L when the `isa-l` feature is enabled and a pure-Rust table-based
-//! implementation when the `pure-rust` feature is enabled. Also provides GF(2)
-//! matrix exponentiation for combining independently computed checksums.
+//! Uses the native Rust implementation on all builds. On supported CPUs it
+//! runtime-dispatches to hardware-accelerated backends and otherwise falls
+//! back to a scalar slicing-by-16 implementation. Also provides GF(2) matrix
+//! exponentiation for combining independently computed checksums.
 //!
 //! # Examples
 //!
@@ -25,10 +26,8 @@ use std::sync::OnceLock;
 /// CRC-32C (Castagnoli) reflected polynomial.
 const POLY: u32 = 0x82F63B78;
 
-#[cfg(feature = "pure-rust")]
 const TABLES: [[u32; 256]; 16] = build_tables();
 
-#[cfg(feature = "pure-rust")]
 const fn build_tables() -> [[u32; 256]; 16] {
     let mut tables = [[0u32; 256]; 16];
     let mut i = 0usize;
@@ -61,7 +60,7 @@ const fn build_tables() -> [[u32; 256]; 16] {
     tables
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 #[inline]
 fn read_u16_le(ptr: *const u8) -> u16 {
     // SAFETY: callers only pass pointers proven to be valid for at least
@@ -70,7 +69,6 @@ fn read_u16_le(ptr: *const u8) -> u16 {
     unsafe { u16::from_le(ptr.cast::<u16>().read_unaligned()) }
 }
 
-#[cfg(feature = "pure-rust")]
 #[inline]
 fn read_u32_le(ptr: *const u8) -> u32 {
     // SAFETY: callers only pass pointers proven to be valid for at least
@@ -79,7 +77,6 @@ fn read_u32_le(ptr: *const u8) -> u32 {
     unsafe { u32::from_le(ptr.cast::<u32>().read_unaligned()) }
 }
 
-#[cfg(feature = "pure-rust")]
 #[inline]
 fn read_u64_le(ptr: *const u8) -> u64 {
     // SAFETY: callers only pass pointers proven to be valid for at least
@@ -88,7 +85,6 @@ fn read_u64_le(ptr: *const u8) -> u64 {
     unsafe { u64::from_le(ptr.cast::<u64>().read_unaligned()) }
 }
 
-#[cfg(feature = "pure-rust")]
 #[inline]
 fn update_scalar(mut crc: u32, data: &[u8]) -> u32 {
     let mut remaining = data;
@@ -135,7 +131,6 @@ fn update_scalar(mut crc: u32, data: &[u8]) -> u32 {
     crc
 }
 
-#[cfg(feature = "pure-rust")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PureRustBackend {
     Scalar,
@@ -147,7 +142,6 @@ enum PureRustBackend {
     Sse42X86_64,
 }
 
-#[cfg(feature = "pure-rust")]
 #[inline]
 fn pure_rust_backend() -> PureRustBackend {
     #[cfg(feature = "bench-select")]
@@ -176,7 +170,7 @@ fn pure_rust_backend() -> PureRustBackend {
     PureRustBackend::Scalar
 }
 
-#[cfg(all(feature = "pure-rust", feature = "bench-select"))]
+#[cfg(feature = "bench-select")]
 #[inline]
 fn bench_override_backend() -> Option<PureRustBackend> {
     static OVERRIDE: OnceLock<Option<PureRustBackend>> = OnceLock::new();
@@ -199,19 +193,19 @@ fn bench_override_backend() -> Option<PureRustBackend> {
     })
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 #[inline]
 fn has_crc_pmull_aarch64() -> bool {
     std::arch::is_aarch64_feature_detected!("crc") && std::arch::is_aarch64_feature_detected!("aes")
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn has_sse42_x86_64() -> bool {
     std::arch::is_x86_feature_detected!("sse4.2")
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn has_vpclmul_x86_64() -> bool {
     std::arch::is_x86_feature_detected!("sse4.1")
@@ -222,43 +216,18 @@ fn has_vpclmul_x86_64() -> bool {
 
 #[inline]
 fn update_internal(crc: u32, data: &[u8]) -> u32 {
-    #[cfg(feature = "pure-rust")]
-    {
-        match pure_rust_backend() {
-            PureRustBackend::Scalar => update_scalar(crc, data),
-            #[cfg(target_arch = "aarch64")]
-            PureRustBackend::CrcPmullAarch64 => unsafe { update_crc_pmull_aarch64(crc, data) },
-            #[cfg(target_arch = "x86_64")]
-            PureRustBackend::VpclmulX86_64 => unsafe { update_vpclmul_x86_64(crc, data) },
-            #[cfg(target_arch = "x86_64")]
-            PureRustBackend::Sse42X86_64 => unsafe { update_sse42_x86_64(crc, data) },
-        }
-    }
-
-    #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
-    {
-        let mut crc = crc;
-        // Unlike crc32_gzip_refl, crc32_iscsi does NOT handle
-        // init=0xFFFFFFFF / final XOR internally, so we do it here.
-        //
-        // crc32_iscsi takes len as c_int, so we process in chunks to
-        // avoid truncation for buffers larger than i32::MAX.
-        const CHUNK: usize = std::ffi::c_int::MAX as usize;
-        let mut remaining = data;
-        while !remaining.is_empty() {
-            let n = remaining.len().min(CHUNK);
-            // SAFETY: pointer is valid for n bytes. The cast to *mut is
-            // safe because ISA-L does not mutate the buffer.
-            crc = unsafe {
-                ec_sys::crc32_iscsi(remaining.as_ptr() as *mut _, n as std::ffi::c_int, crc)
-            };
-            remaining = &remaining[n..];
-        }
-        crc
+    match pure_rust_backend() {
+        PureRustBackend::Scalar => update_scalar(crc, data),
+        #[cfg(target_arch = "aarch64")]
+        PureRustBackend::CrcPmullAarch64 => unsafe { update_crc_pmull_aarch64(crc, data) },
+        #[cfg(target_arch = "x86_64")]
+        PureRustBackend::VpclmulX86_64 => unsafe { update_vpclmul_x86_64(crc, data) },
+        #[cfg(target_arch = "x86_64")]
+        PureRustBackend::Sse42X86_64 => unsafe { update_sse42_x86_64(crc, data) },
     }
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse4.2")]
 unsafe fn update_sse42_x86_64(mut crc: u32, data: &[u8]) -> u32 {
     use core::arch::x86_64::{_mm_crc32_u32, _mm_crc32_u64, _mm_crc32_u8};
@@ -282,7 +251,7 @@ unsafe fn update_sse42_x86_64(mut crc: u32, data: &[u8]) -> u32 {
     crc
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 mod x86_64_vpclmul {
     use core::arch::x86_64::{
         __m128i, __m256i, _mm256_castsi256_si128, _mm256_clmulepi64_epi128,
@@ -455,13 +424,13 @@ mod x86_64_vpclmul {
     }
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn update_vpclmul_x86_64(crc: u32, data: &[u8]) -> u32 {
     x86_64_vpclmul::update(crc, data)
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 mod aarch64_crc_pmull {
     use core::arch::aarch64::{
         __crc32cb, __crc32cd, __crc32ch, __crc32cw, vgetq_lane_u64, vmull_p64,
@@ -563,7 +532,7 @@ mod aarch64_crc_pmull {
     }
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn update_crc_pmull_aarch64(crc: u32, data: &[u8]) -> u32 {
     aarch64_crc_pmull::update(crc, data)
@@ -572,22 +541,14 @@ unsafe fn update_crc_pmull_aarch64(crc: u32, data: &[u8]) -> u32 {
 /// Return the active CRC-32C backend name for this build and process.
 #[inline]
 pub fn backend_name() -> &'static str {
-    #[cfg(feature = "pure-rust")]
-    {
-        match pure_rust_backend() {
-            PureRustBackend::Scalar => "scalar",
-            #[cfg(target_arch = "aarch64")]
-            PureRustBackend::CrcPmullAarch64 => "aarch64-3crc-fold",
-            #[cfg(target_arch = "x86_64")]
-            PureRustBackend::VpclmulX86_64 => "x86_64-vpclmulqdq",
-            #[cfg(target_arch = "x86_64")]
-            PureRustBackend::Sse42X86_64 => "x86_64-sse4.2-crc32",
-        }
-    }
-
-    #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
-    {
-        "isa-l"
+    match pure_rust_backend() {
+        PureRustBackend::Scalar => "scalar",
+        #[cfg(target_arch = "aarch64")]
+        PureRustBackend::CrcPmullAarch64 => "aarch64-3crc-fold",
+        #[cfg(target_arch = "x86_64")]
+        PureRustBackend::VpclmulX86_64 => "x86_64-vpclmulqdq",
+        #[cfg(target_arch = "x86_64")]
+        PureRustBackend::Sse42X86_64 => "x86_64-sse4.2-crc32",
     }
 }
 
@@ -725,14 +686,12 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    #[cfg(feature = "pure-rust")]
     #[derive(Clone, Copy, Debug)]
     struct BackendCase {
         backend: PureRustBackend,
         name: &'static str,
     }
 
-    #[cfg(feature = "pure-rust")]
     fn supported_backend_cases() -> Vec<BackendCase> {
         let mut cases = vec![BackendCase {
             backend: PureRustBackend::Scalar,
@@ -769,7 +728,6 @@ mod tests {
         cases
     }
 
-    #[cfg(feature = "pure-rust")]
     fn checksum_with_backend(backend: PureRustBackend, data: &[u8]) -> u32 {
         let mut crc = !0u32;
         crc = match backend {
@@ -784,7 +742,6 @@ mod tests {
         crc ^ !0u32
     }
 
-    #[cfg(feature = "pure-rust")]
     fn checksum_streaming_with_backend(
         backend: PureRustBackend,
         data: &[u8],
@@ -805,7 +762,6 @@ mod tests {
         crc ^ !0u32
     }
 
-    #[cfg(feature = "pure-rust")]
     #[test]
     fn supported_backends_match_scalar_across_boundaries() {
         let lengths = [

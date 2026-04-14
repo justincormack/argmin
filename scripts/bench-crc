@@ -36,17 +36,9 @@ echo "[crc32 native auto]"
 cargo run --offline -p checksum --example crc_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --algorithm crc32 --label crc32-native-auto
 
 echo
-echo "[crc32 isa-l]"
-cargo run --offline -p checksum --example crc_bench --release --no-default-features --features isa-l -- "${common_args[@]}" --algorithm crc32 --label crc32-isa-l
-
-echo
 echo "[crc32c native scalar]"
 ARGMIN_CRC32C_BENCH_BACKEND=scalar cargo run --offline -p checksum --example crc_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --algorithm crc32c --label crc32c-native-scalar
 
 echo
 echo "[crc32c native auto]"
 cargo run --offline -p checksum --example crc_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --algorithm crc32c --label crc32c-native-auto
-
-echo
-echo "[crc32c isa-l]"
-cargo run --offline -p checksum --example crc_bench --release --no-default-features --features isa-l -- "${common_args[@]}" --algorithm crc32c --label crc32c-isa-l
