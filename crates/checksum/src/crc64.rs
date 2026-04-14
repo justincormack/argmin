@@ -79,51 +79,14 @@ fn read_u64_le(ptr: *const u8) -> u64 {
 fn extend(crc: u64, data: &[u8]) -> u64 {
     #[cfg(feature = "pure-rust")]
     {
-        let mut state = !crc;
-        let mut remaining = data;
-
-        while remaining.len() >= 16 {
-            let first = read_u64_le(remaining.as_ptr());
-            let second = read_u64_le(remaining.as_ptr().wrapping_add(8));
-            let mixed = state ^ first;
-            state = TABLES[15][(mixed & 0xFF) as usize]
-                ^ TABLES[14][((mixed >> 8) & 0xFF) as usize]
-                ^ TABLES[13][((mixed >> 16) & 0xFF) as usize]
-                ^ TABLES[12][((mixed >> 24) & 0xFF) as usize]
-                ^ TABLES[11][((mixed >> 32) & 0xFF) as usize]
-                ^ TABLES[10][((mixed >> 40) & 0xFF) as usize]
-                ^ TABLES[9][((mixed >> 48) & 0xFF) as usize]
-                ^ TABLES[8][(mixed >> 56) as usize]
-                ^ TABLES[7][(second & 0xFF) as usize]
-                ^ TABLES[6][((second >> 8) & 0xFF) as usize]
-                ^ TABLES[5][((second >> 16) & 0xFF) as usize]
-                ^ TABLES[4][((second >> 24) & 0xFF) as usize]
-                ^ TABLES[3][((second >> 32) & 0xFF) as usize]
-                ^ TABLES[2][((second >> 40) & 0xFF) as usize]
-                ^ TABLES[1][((second >> 48) & 0xFF) as usize]
-                ^ TABLES[0][(second >> 56) as usize];
-            remaining = &remaining[16..];
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::arch::is_x86_feature_detected!("pclmulqdq") {
+                return unsafe { extend_pclmul_x86_64(crc, data) };
+            }
         }
 
-        while remaining.len() >= 8 {
-            let block = read_u64_le(remaining.as_ptr());
-            let mixed = state ^ block;
-            state = TABLES[7][(mixed & 0xFF) as usize]
-                ^ TABLES[6][((mixed >> 8) & 0xFF) as usize]
-                ^ TABLES[5][((mixed >> 16) & 0xFF) as usize]
-                ^ TABLES[4][((mixed >> 24) & 0xFF) as usize]
-                ^ TABLES[3][((mixed >> 32) & 0xFF) as usize]
-                ^ TABLES[2][((mixed >> 40) & 0xFF) as usize]
-                ^ TABLES[1][((mixed >> 48) & 0xFF) as usize]
-                ^ TABLES[0][(mixed >> 56) as usize];
-            remaining = &remaining[8..];
-        }
-
-        for &byte in remaining {
-            let idx = ((state as u8) ^ byte) as usize;
-            state = TABLES[0][idx] ^ (state >> 8);
-        }
-        !state
+        extend_scalar(crc, data)
     }
 
     #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
@@ -133,6 +96,213 @@ fn extend(crc: u64, data: &[u8]) -> u64 {
         // never dereferenced (len=0).
         unsafe { ec_sys::crc64_rocksoft_refl(crc, data.as_ptr(), data.len() as u64) }
     }
+}
+
+#[cfg(feature = "pure-rust")]
+#[inline]
+fn extend_scalar(crc: u64, data: &[u8]) -> u64 {
+    let mut state = !crc;
+    let mut remaining = data;
+
+    while remaining.len() >= 16 {
+        let first = read_u64_le(remaining.as_ptr());
+        let second = read_u64_le(remaining.as_ptr().wrapping_add(8));
+        let mixed = state ^ first;
+        state = TABLES[15][(mixed & 0xFF) as usize]
+            ^ TABLES[14][((mixed >> 8) & 0xFF) as usize]
+            ^ TABLES[13][((mixed >> 16) & 0xFF) as usize]
+            ^ TABLES[12][((mixed >> 24) & 0xFF) as usize]
+            ^ TABLES[11][((mixed >> 32) & 0xFF) as usize]
+            ^ TABLES[10][((mixed >> 40) & 0xFF) as usize]
+            ^ TABLES[9][((mixed >> 48) & 0xFF) as usize]
+            ^ TABLES[8][(mixed >> 56) as usize]
+            ^ TABLES[7][(second & 0xFF) as usize]
+            ^ TABLES[6][((second >> 8) & 0xFF) as usize]
+            ^ TABLES[5][((second >> 16) & 0xFF) as usize]
+            ^ TABLES[4][((second >> 24) & 0xFF) as usize]
+            ^ TABLES[3][((second >> 32) & 0xFF) as usize]
+            ^ TABLES[2][((second >> 40) & 0xFF) as usize]
+            ^ TABLES[1][((second >> 48) & 0xFF) as usize]
+            ^ TABLES[0][(second >> 56) as usize];
+        remaining = &remaining[16..];
+    }
+
+    while remaining.len() >= 8 {
+        let block = read_u64_le(remaining.as_ptr());
+        let mixed = state ^ block;
+        state = TABLES[7][(mixed & 0xFF) as usize]
+            ^ TABLES[6][((mixed >> 8) & 0xFF) as usize]
+            ^ TABLES[5][((mixed >> 16) & 0xFF) as usize]
+            ^ TABLES[4][((mixed >> 24) & 0xFF) as usize]
+            ^ TABLES[3][((mixed >> 32) & 0xFF) as usize]
+            ^ TABLES[2][((mixed >> 40) & 0xFF) as usize]
+            ^ TABLES[1][((mixed >> 48) & 0xFF) as usize]
+            ^ TABLES[0][(mixed >> 56) as usize];
+        remaining = &remaining[8..];
+    }
+
+    for &byte in remaining {
+        let idx = ((state as u8) ^ byte) as usize;
+        state = TABLES[0][idx] ^ (state >> 8);
+    }
+    !state
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+mod x86_64_pclmul {
+    use core::arch::x86_64::{
+        __m128i, _mm_clmulepi64_si128, _mm_load_si128, _mm_loadu_si128, _mm_set_epi64x,
+        _mm_slli_si128, _mm_srli_si128, _mm_xor_si128,
+    };
+
+    #[repr(align(16))]
+    struct Aligned([u64; 2]);
+
+    const fn aligned(lo: u64, hi: u64) -> Aligned {
+        Aligned([lo, hi])
+    }
+
+    // Constants copied from ISA-L's crc64_rocksoft_refl_const block.
+    static FOLD_1: Aligned = aligned(0x21e9761e252621ac, 0xeadc41fd2ba3d420);
+    static FOLD_8: Aligned = aligned(0x5f852fb61e8d92dc, 0xa1ca681e733f9c40);
+    static FOLD_7: Aligned = aligned(0x946588403d4adcbc, 0xd083dd594d96319d);
+    static FOLD_6: Aligned = aligned(0x34f5a24e22d66e90, 0x3c255f5ebc414423);
+    static FOLD_5: Aligned = aligned(0x03363823e6e791e5, 0x7b0ab10dd0f809fe);
+    static FOLD_4: Aligned = aligned(0x62242240ace5045a, 0x0c32cdb31e18a84a);
+    static FOLD_3: Aligned = aligned(0xa3ffdc1fe8e82a8b, 0xbdd7ac0ee1a4a0f0);
+    static FOLD_2: Aligned = aligned(0xe1e0bb9d45d7a44c, 0xb0bc2e589204f500);
+    static FOLD_128_TO_64: Aligned = aligned(0x21e9761e252621ac, 0x0000000000000000);
+    static BARRETT: Aligned = aligned(0x27ecfa329aef9f77, 0x34d926535897936a);
+
+    #[inline]
+    fn load_aligned(value: &Aligned) -> __m128i {
+        // SAFETY: the wrapper guarantees 16-byte alignment and valid storage.
+        unsafe { _mm_load_si128(value.0.as_ptr().cast()) }
+    }
+
+    #[inline]
+    fn load_block(ptr: *const u8) -> __m128i {
+        // SAFETY: callers only pass pointers valid for 16 readable bytes.
+        unsafe { _mm_loadu_si128(ptr.cast()) }
+    }
+
+    #[inline]
+    fn xor_crc(block: __m128i, crc: u64) -> __m128i {
+        unsafe { _mm_xor_si128(block, _mm_set_epi64x(0, crc as i64)) }
+    }
+
+    #[inline]
+    fn fold_block(x: __m128i, next: __m128i, constant: __m128i) -> __m128i {
+        unsafe {
+            let lo = _mm_clmulepi64_si128::<0x01>(x, constant);
+            let hi = _mm_clmulepi64_si128::<0x10>(x, constant);
+            _mm_xor_si128(_mm_xor_si128(lo, hi), next)
+        }
+    }
+
+    #[inline]
+    fn fold_without_next(x: __m128i, constant: __m128i) -> __m128i {
+        unsafe {
+            let lo = _mm_clmulepi64_si128::<0x01>(x, constant);
+            let hi = _mm_clmulepi64_si128::<0x10>(x, constant);
+            _mm_xor_si128(lo, hi)
+        }
+    }
+
+    #[inline]
+    fn reduce_to_crc(x: __m128i) -> u64 {
+        unsafe {
+            let fold = load_aligned(&FOLD_128_TO_64);
+            let hi = _mm_srli_si128::<8>(x);
+            let folded = _mm_xor_si128(_mm_clmulepi64_si128::<0x00>(x, fold), hi);
+
+            let barrett = load_aligned(&BARRETT);
+            let y = _mm_clmulepi64_si128::<0x00>(folded, barrett);
+            let y_shifted = _mm_slli_si128::<8>(y);
+            let z = _mm_clmulepi64_si128::<0x10>(y, barrett);
+            let reduced = _mm_xor_si128(_mm_xor_si128(z, y_shifted), folded);
+
+            let words: [u64; 2] = core::mem::transmute(reduced);
+            words[1]
+        }
+    }
+
+    #[target_feature(enable = "pclmulqdq")]
+    pub unsafe fn extend(crc: u64, data: &[u8]) -> u64 {
+        let prefix_len = data.len() & !0x0F;
+        if prefix_len < 32 {
+            return super::extend_scalar(crc, data);
+        }
+
+        let (prefix, tail) = data.split_at(prefix_len);
+        let prefix_crc = extend_blocks_only(crc, prefix);
+        super::extend_scalar(prefix_crc, tail)
+    }
+
+    #[target_feature(enable = "pclmulqdq")]
+    unsafe fn extend_blocks_only(crc: u64, data: &[u8]) -> u64 {
+        let fold_1 = load_aligned(&FOLD_1);
+        let mut ptr = data.as_ptr();
+        let end = ptr.add(data.len());
+
+        let mut state = if data.len() >= 128 {
+            let fold_8 = load_aligned(&FOLD_8);
+            let mut x0 = xor_crc(load_block(ptr), !crc);
+            let mut x1 = load_block(ptr.add(16));
+            let mut x2 = load_block(ptr.add(32));
+            let mut x3 = load_block(ptr.add(48));
+            let mut x4 = load_block(ptr.add(64));
+            let mut x5 = load_block(ptr.add(80));
+            let mut x6 = load_block(ptr.add(96));
+            let mut x7 = load_block(ptr.add(112));
+            ptr = ptr.add(128);
+
+            while ptr.add(128) <= end {
+                x0 = fold_block(x0, load_block(ptr), fold_8);
+                x1 = fold_block(x1, load_block(ptr.add(16)), fold_8);
+                x2 = fold_block(x2, load_block(ptr.add(32)), fold_8);
+                x3 = fold_block(x3, load_block(ptr.add(48)), fold_8);
+                x4 = fold_block(x4, load_block(ptr.add(64)), fold_8);
+                x5 = fold_block(x5, load_block(ptr.add(80)), fold_8);
+                x6 = fold_block(x6, load_block(ptr.add(96)), fold_8);
+                x7 = fold_block(x7, load_block(ptr.add(112)), fold_8);
+                ptr = ptr.add(128);
+            }
+
+            let fold_7 = load_aligned(&FOLD_7);
+            let fold_6 = load_aligned(&FOLD_6);
+            let fold_5 = load_aligned(&FOLD_5);
+            let fold_4 = load_aligned(&FOLD_4);
+            let fold_3 = load_aligned(&FOLD_3);
+            let fold_2 = load_aligned(&FOLD_2);
+
+            x7 = _mm_xor_si128(x7, fold_without_next(x0, fold_7));
+            x7 = _mm_xor_si128(x7, fold_without_next(x1, fold_6));
+            x7 = _mm_xor_si128(x7, fold_without_next(x2, fold_5));
+            x7 = _mm_xor_si128(x7, fold_without_next(x3, fold_4));
+            x7 = _mm_xor_si128(x7, fold_without_next(x4, fold_3));
+            x7 = _mm_xor_si128(x7, fold_without_next(x5, fold_2));
+            x7 = _mm_xor_si128(x7, fold_without_next(x6, fold_1));
+            x7
+        } else {
+            let first = xor_crc(load_block(ptr), !crc);
+            ptr = ptr.add(16);
+            first
+        };
+
+        while ptr < end {
+            state = fold_block(state, load_block(ptr), fold_1);
+            ptr = ptr.add(16);
+        }
+
+        !reduce_to_crc(state)
+    }
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[inline]
+unsafe fn extend_pclmul_x86_64(crc: u64, data: &[u8]) -> u64 {
+    x86_64_pclmul::extend(crc, data)
 }
 
 /// Compute CRC-64/NVME over the entire buffer.
