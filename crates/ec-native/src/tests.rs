@@ -33,6 +33,8 @@ fn encode_with_backend(codec: &ErasureCodec, data: &[Vec<u8>], backend: Backend)
 fn backend_name(backend: Backend) -> &'static str {
     match backend {
         Backend::Scalar => "scalar",
+        #[cfg(target_arch = "aarch64")]
+        Backend::NeonAarch64 => "aarch64-neon",
         #[cfg(target_arch = "x86_64")]
         Backend::Avx2X86_64 => "x86_64-avx2",
     }

@@ -135,6 +135,8 @@ pub(crate) fn check_shard_size(size: usize) -> Result<(), EcError> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Backend {
     Scalar,
+    #[cfg(target_arch = "aarch64")]
+    NeonAarch64,
     #[cfg(target_arch = "x86_64")]
     Avx2X86_64,
 }
@@ -152,6 +154,13 @@ pub(crate) fn selected_backend() -> Backend {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        if has_neon_aarch64() {
+            return Backend::NeonAarch64;
+        }
+    }
+
     Backend::Scalar
 }
 
@@ -159,6 +168,12 @@ pub(crate) fn selected_backend() -> Backend {
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn has_avx2_x86_64() -> bool {
     std::arch::is_x86_feature_detected!("avx2")
+}
+
+#[inline]
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn has_neon_aarch64() -> bool {
+    std::arch::is_aarch64_feature_detected!("neon")
 }
 
 #[inline]
@@ -172,6 +187,8 @@ fn bench_override_backend() -> Option<Backend> {
 
         match override_name.as_deref() {
             Some("scalar") => Some(Backend::Scalar),
+            #[cfg(target_arch = "aarch64")]
+            Some("neon") if has_neon_aarch64() => Some(Backend::NeonAarch64),
             #[cfg(target_arch = "x86_64")]
             Some("avx2") if has_avx2_x86_64() => Some(Backend::Avx2X86_64),
             _ => None,
@@ -182,6 +199,10 @@ fn bench_override_backend() -> Option<Backend> {
 #[cfg(test)]
 pub(crate) fn supported_backends() -> Vec<Backend> {
     let mut backends = vec![Backend::Scalar];
+    #[cfg(target_arch = "aarch64")]
+    if has_neon_aarch64() {
+        backends.push(Backend::NeonAarch64);
+    }
     #[cfg(target_arch = "x86_64")]
     if has_avx2_x86_64() {
         backends.push(Backend::Avx2X86_64);
@@ -199,6 +220,9 @@ pub struct ErasureCodec {
     encode_matrix: Vec<u8>,
     /// Per-coefficient multiply tables for parity rows: 256 * k * m bytes.
     encode_tables: Vec<u8>,
+    #[cfg(target_arch = "aarch64")]
+    /// Per-coefficient 32-byte nibble tables for NEON parity rows.
+    encode_tables_neon: Vec<u8>,
     #[cfg(target_arch = "x86_64")]
     /// Per-coefficient 32-byte nibble tables for AVX2 parity rows.
     encode_tables_avx2: Vec<u8>,
@@ -224,6 +248,8 @@ impl ErasureCodec {
         gen_cauchy1_matrix(&mut encode_matrix, total, k);
 
         let encode_tables = build_mul_tables(&encode_matrix[k * k..]);
+        #[cfg(target_arch = "aarch64")]
+        let encode_tables_neon = crate::gf::build_nibble_tables(&encode_matrix[k * k..]);
         #[cfg(target_arch = "x86_64")]
         let encode_tables_avx2 = crate::gf::build_nibble_tables(&encode_matrix[k * k..]);
 
@@ -231,6 +257,8 @@ impl ErasureCodec {
             config,
             encode_matrix,
             encode_tables,
+            #[cfg(target_arch = "aarch64")]
+            encode_tables_neon,
             #[cfg(target_arch = "x86_64")]
             encode_tables_avx2,
         })
@@ -311,6 +339,8 @@ impl ErasureCodec {
             backend,
             k,
             &self.encode_tables,
+            #[cfg(target_arch = "aarch64")]
+            &self.encode_tables_neon,
             #[cfg(target_arch = "x86_64")]
             &self.encode_tables_avx2,
             data,
@@ -411,6 +441,8 @@ impl ErasureCodec {
                     backend,
                     k,
                     &self.encode_tables[table_start..table_end],
+                    #[cfg(target_arch = "aarch64")]
+                    &self.encode_tables_neon[row * k * 32..(row + 1) * k * 32],
                     #[cfg(target_arch = "x86_64")]
                     &self.encode_tables_avx2[table_start_avx2..table_end_avx2],
                     data,

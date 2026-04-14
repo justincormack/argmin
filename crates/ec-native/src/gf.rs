@@ -266,12 +266,15 @@ pub(crate) fn encode_rows(
     backend: Backend,
     k: usize,
     tables: &[u8],
+    #[cfg(target_arch = "aarch64")] neon_tables: &[u8],
     #[cfg(target_arch = "x86_64")] avx2_tables: &[u8],
     data: &[&[u8]],
     outputs: &mut [&mut [u8]],
 ) {
     match backend {
         Backend::Scalar => encode_rows_scalar(k, tables, data, outputs),
+        #[cfg(target_arch = "aarch64")]
+        Backend::NeonAarch64 => unsafe { aarch64_neon::encode_rows(k, neon_tables, data, outputs) },
         #[cfg(target_arch = "x86_64")]
         Backend::Avx2X86_64 => unsafe { x86_64_avx2::encode_rows(k, avx2_tables, data, outputs) },
     }
@@ -315,6 +318,10 @@ pub(crate) fn apply_matrix_rows(
 ) {
     match backend {
         Backend::Scalar => apply_matrix_rows_scalar(k, rows, inputs, outputs),
+        #[cfg(target_arch = "aarch64")]
+        Backend::NeonAarch64 => unsafe {
+            aarch64_neon::apply_matrix_rows(k, rows, inputs, outputs)
+        },
         #[cfg(target_arch = "x86_64")]
         Backend::Avx2X86_64 => unsafe { x86_64_avx2::apply_matrix_rows(k, rows, inputs, outputs) },
     }
@@ -363,6 +370,168 @@ pub(crate) fn invert_matrix(input: &mut [u8], output: &mut [u8], n: usize) -> Re
     }
 
     Ok(())
+}
+
+#[cfg(target_arch = "aarch64")]
+mod aarch64_neon {
+    use super::{build_nibble_table, write_with_coeff, xor_with_coeff, xor_with_slice};
+    use core::arch::aarch64::{
+        uint8x16_t, vandq_u8, vdupq_n_u8, veorq_u8, vld1q_u8, vqtbl1q_u8, vshrq_n_u8, vst1q_u8,
+    };
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn encode_rows(
+        k: usize,
+        tables: &[u8],
+        data: &[&[u8]],
+        outputs: &mut [&mut [u8]],
+    ) {
+        for (row, output) in outputs.iter_mut().enumerate() {
+            let mut first_nonzero_col = None;
+            for col in 0..k {
+                let table_start = (row * k + col) * 32;
+                let coeff = tables[table_start + 1];
+                if coeff != 0 {
+                    first_nonzero_col = Some((col, coeff, &tables[table_start..table_start + 32]));
+                    break;
+                }
+            }
+
+            let Some((first_col, first_coeff, first_table)) = first_nonzero_col else {
+                output.fill(0);
+                continue;
+            };
+
+            if first_coeff == 1 {
+                output.copy_from_slice(data[first_col]);
+            } else {
+                write_with_nibble_table(output, data[first_col], first_table);
+            }
+
+            for (col, source) in data.iter().enumerate().take(k).skip(first_col + 1) {
+                let table_start = (row * k + col) * 32;
+                let coeff = tables[table_start + 1];
+                if coeff == 0 {
+                    continue;
+                }
+                if coeff == 1 {
+                    xor_with_slice(output, source);
+                } else {
+                    xor_with_nibble_table(output, source, &tables[table_start..table_start + 32]);
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    pub(super) unsafe fn apply_matrix_rows(
+        k: usize,
+        rows: &[u8],
+        inputs: &[&[u8]],
+        outputs: &mut [&mut [u8]],
+    ) {
+        for (row_index, output) in outputs.iter_mut().enumerate() {
+            let row = &rows[row_index * k..(row_index + 1) * k];
+            let mut first_nonzero = None;
+            for (index, &coeff) in row.iter().enumerate() {
+                if coeff != 0 {
+                    first_nonzero = Some((index, coeff));
+                    break;
+                }
+            }
+
+            let Some((first_index, first_coeff)) = first_nonzero else {
+                output.fill(0);
+                continue;
+            };
+
+            if first_coeff == 1 {
+                output.copy_from_slice(inputs[first_index]);
+            } else {
+                let table = build_nibble_table(first_coeff);
+                write_with_nibble_table(output, inputs[first_index], &table);
+            }
+
+            for (&coeff, source) in row.iter().zip(inputs.iter().copied()).skip(first_index + 1) {
+                match coeff {
+                    0 => {}
+                    1 => xor_with_slice(output, source),
+                    _ => {
+                        let table = build_nibble_table(coeff);
+                        xor_with_nibble_table(output, source, &table);
+                    }
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn write_with_nibble_table(dest: &mut [u8], src: &[u8], table: &[u8]) {
+        let coeff = table[1];
+        if coeff == 0 || coeff == 1 || dest.len() < 16 {
+            write_with_coeff(dest, src, coeff);
+            return;
+        }
+
+        let len = dest.len();
+        let mut index = 0usize;
+        let mask = vdupq_n_u8(0x0f);
+        let low_table = vld1q_u8(table.as_ptr());
+        let high_table = vld1q_u8(table[16..].as_ptr());
+
+        while index + 16 <= len {
+            let src_chunk = vld1q_u8(src.as_ptr().add(index));
+            let product = mul_chunk(src_chunk, low_table, high_table, mask);
+            vst1q_u8(dest.as_mut_ptr().add(index), product);
+            index += 16;
+        }
+
+        if index < len {
+            write_with_coeff(&mut dest[index..], &src[index..], coeff);
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn xor_with_nibble_table(dest: &mut [u8], src: &[u8], table: &[u8]) {
+        let coeff = table[1];
+        if coeff == 0 || coeff == 1 || dest.len() < 16 {
+            xor_with_coeff(dest, src, coeff);
+            return;
+        }
+
+        let len = dest.len();
+        let mut index = 0usize;
+        let mask = vdupq_n_u8(0x0f);
+        let low_table = vld1q_u8(table.as_ptr());
+        let high_table = vld1q_u8(table[16..].as_ptr());
+
+        while index + 16 <= len {
+            let src_chunk = vld1q_u8(src.as_ptr().add(index));
+            let dest_chunk = vld1q_u8(dest.as_ptr().add(index));
+            let product = mul_chunk(src_chunk, low_table, high_table, mask);
+            let combined = veorq_u8(dest_chunk, product);
+            vst1q_u8(dest.as_mut_ptr().add(index), combined);
+            index += 16;
+        }
+
+        if index < len {
+            xor_with_coeff(&mut dest[index..], &src[index..], coeff);
+        }
+    }
+
+    #[target_feature(enable = "neon")]
+    unsafe fn mul_chunk(
+        src_chunk: uint8x16_t,
+        low_table: uint8x16_t,
+        high_table: uint8x16_t,
+        mask: uint8x16_t,
+    ) -> uint8x16_t {
+        let low = vandq_u8(src_chunk, mask);
+        let high = vandq_u8(vshrq_n_u8::<4>(src_chunk), mask);
+        let low_product = vqtbl1q_u8(low_table, low);
+        let high_product = vqtbl1q_u8(high_table, high);
+        veorq_u8(low_product, high_product)
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
