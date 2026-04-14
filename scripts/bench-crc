@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+SIZE_MIB="${SIZE_MIB:-8}"
+WARMUP_ITERS="${WARMUP_ITERS:-32}"
+SAMPLE_ITERS="${SAMPLE_ITERS:-256}"
+SAMPLES="${SAMPLES:-5}"
+
+common_args=(
+  --size-mib "$SIZE_MIB"
+  --warmup-iters "$WARMUP_ITERS"
+  --sample-iters "$SAMPLE_ITERS"
+  --samples "$SAMPLES"
+)
+
+echo "cpu=$(uname -m)"
+echo "size_mib=$SIZE_MIB warmup_iters=$WARMUP_ITERS sample_iters=$SAMPLE_ITERS samples=$SAMPLES"
+
+echo
+echo "[crc64 native scalar]"
+ARGMIN_CRC64_BENCH_BACKEND=scalar cargo run --offline -p checksum --example crc64_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --label native-scalar
+
+echo
+echo "[crc64 native auto]"
+cargo run --offline -p checksum --example crc64_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --label native-auto
+
+echo
+echo "[crc32 native scalar]"
+ARGMIN_CRC32_BENCH_BACKEND=scalar cargo run --offline -p checksum --example crc_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --algorithm crc32 --label crc32-native-scalar
+
+echo
+echo "[crc32 native auto]"
+cargo run --offline -p checksum --example crc_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --algorithm crc32 --label crc32-native-auto
+
+echo
+echo "[crc32 isa-l]"
+cargo run --offline -p checksum --example crc_bench --release --no-default-features --features isa-l -- "${common_args[@]}" --algorithm crc32 --label crc32-isa-l
+
+echo
+echo "[crc32c native scalar]"
+ARGMIN_CRC32C_BENCH_BACKEND=scalar cargo run --offline -p checksum --example crc_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --algorithm crc32c --label crc32c-native-scalar
+
+echo
+echo "[crc32c native auto]"
+cargo run --offline -p checksum --example crc_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --algorithm crc32c --label crc32c-native-auto
+
+echo
+echo "[crc32c isa-l]"
+cargo run --offline -p checksum --example crc_bench --release --no-default-features --features isa-l -- "${common_args[@]}" --algorithm crc32c --label crc32c-isa-l

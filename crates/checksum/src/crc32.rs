@@ -19,6 +19,9 @@
 //! assert_eq!(combined, checksum::crc32::checksum(b"hello world!"));
 //! ```
 
+#[cfg(feature = "bench-select")]
+use std::sync::OnceLock;
+
 /// CRC-32 reflected polynomial.
 const POLY: u32 = 0xEDB88320;
 
@@ -128,6 +131,11 @@ enum PureRustBackend {
 #[cfg(feature = "pure-rust")]
 #[inline]
 fn pure_rust_backend() -> PureRustBackend {
+    #[cfg(feature = "bench-select")]
+    if let Some(backend) = bench_override_backend() {
+        return backend;
+    }
+
     #[cfg(target_arch = "x86_64")]
     {
         if has_vpclmul_x86_64() {
@@ -140,6 +148,27 @@ fn pure_rust_backend() -> PureRustBackend {
     }
 
     PureRustBackend::Scalar
+}
+
+#[cfg(all(feature = "pure-rust", feature = "bench-select"))]
+#[inline]
+fn bench_override_backend() -> Option<PureRustBackend> {
+    static OVERRIDE: OnceLock<Option<PureRustBackend>> = OnceLock::new();
+
+    *OVERRIDE.get_or_init(|| {
+        let override_name = std::env::var("ARGMIN_CRC32_BENCH_BACKEND")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase());
+
+        match override_name.as_deref() {
+            Some("scalar") => Some(PureRustBackend::Scalar),
+            #[cfg(target_arch = "x86_64")]
+            Some("vpclmul") if has_vpclmul_x86_64() => Some(PureRustBackend::VpclmulX86_64),
+            #[cfg(target_arch = "x86_64")]
+            Some("pclmul") if has_pclmul_x86_64() => Some(PureRustBackend::PclmulX86_64),
+            _ => None,
+        }
+    })
 }
 
 #[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
@@ -411,6 +440,26 @@ unsafe fn extend_pclmul_x86_64(crc: u32, data: &[u8]) -> u32 {
 #[inline]
 unsafe fn extend_vpclmul_x86_64(crc: u32, data: &[u8]) -> u32 {
     x86_64_pclmul::extend_vpclmul(crc, data)
+}
+
+/// Return the active CRC-32 backend name for this build and process.
+#[inline]
+pub fn backend_name() -> &'static str {
+    #[cfg(feature = "pure-rust")]
+    {
+        return match pure_rust_backend() {
+            PureRustBackend::Scalar => "scalar",
+            #[cfg(target_arch = "x86_64")]
+            PureRustBackend::VpclmulX86_64 => "x86_64-vpclmulqdq",
+            #[cfg(target_arch = "x86_64")]
+            PureRustBackend::PclmulX86_64 => "x86_64-pclmulqdq",
+        };
+    }
+
+    #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
+    {
+        "isa-l"
+    }
 }
 
 /// Compute CRC-32 (gzip/IEEE) over the entire buffer.
