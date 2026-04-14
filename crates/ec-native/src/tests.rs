@@ -36,8 +36,6 @@ fn backend_name(backend: Backend) -> &'static str {
         #[cfg(target_arch = "aarch64")]
         Backend::NeonAarch64 => "aarch64-neon",
         #[cfg(target_arch = "x86_64")]
-        Backend::Avx512GfniX86_64 => "x86_64-avx512-gfni",
-        #[cfg(target_arch = "x86_64")]
         Backend::Avx512X86_64 => "x86_64-avx512",
         #[cfg(target_arch = "x86_64")]
         Backend::Avx2X86_64 => "x86_64-avx2",
