@@ -881,6 +881,137 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    #[cfg(feature = "pure-rust")]
+    #[derive(Clone, Copy, Debug)]
+    struct BackendCase {
+        backend: PureRustBackend,
+        name: &'static str,
+    }
+
+    #[cfg(feature = "pure-rust")]
+    fn supported_backend_cases() -> Vec<BackendCase> {
+        let mut cases = vec![BackendCase {
+            backend: PureRustBackend::Scalar,
+            name: "scalar",
+        }];
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if has_pclmul_x86_64() {
+                cases.push(BackendCase {
+                    backend: PureRustBackend::PclmulX86_64,
+                    name: "x86_64-pclmulqdq",
+                });
+            }
+            if has_vpclmul_x86_64() {
+                cases.push(BackendCase {
+                    backend: PureRustBackend::VpclmulX86_64,
+                    name: "x86_64-vpclmulqdq",
+                });
+            }
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("aes") {
+                cases.push(BackendCase {
+                    backend: PureRustBackend::PmullAarch64,
+                    name: "aarch64-pmull",
+                });
+            }
+            if std::arch::is_aarch64_feature_detected!("aes")
+                && std::arch::is_aarch64_feature_detected!("sha3")
+            {
+                cases.push(BackendCase {
+                    backend: PureRustBackend::PmullSha3Aarch64,
+                    name: "aarch64-pmull+sha3",
+                });
+            }
+        }
+
+        cases
+    }
+
+    #[cfg(feature = "pure-rust")]
+    fn checksum_with_backend(backend: PureRustBackend, data: &[u8]) -> u64 {
+        match backend {
+            PureRustBackend::Scalar => extend_scalar(0, data),
+            #[cfg(target_arch = "x86_64")]
+            PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(0, data) },
+            #[cfg(target_arch = "x86_64")]
+            PureRustBackend::VpclmulX86_64 => unsafe { extend_vpclmul_x86_64(0, data) },
+            #[cfg(target_arch = "aarch64")]
+            PureRustBackend::PmullAarch64 => unsafe { extend_pmull_aarch64(0, data) },
+            #[cfg(target_arch = "aarch64")]
+            PureRustBackend::PmullSha3Aarch64 => unsafe { extend_pmull_sha3_aarch64(0, data) },
+        }
+    }
+
+    #[cfg(feature = "pure-rust")]
+    fn checksum_streaming_with_backend(
+        backend: PureRustBackend,
+        data: &[u8],
+        chunk_size: usize,
+    ) -> u64 {
+        let mut crc = 0;
+        for chunk in data.chunks(chunk_size.max(1)) {
+            crc = match backend {
+                PureRustBackend::Scalar => extend_scalar(crc, chunk),
+                #[cfg(target_arch = "x86_64")]
+                PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(crc, chunk) },
+                #[cfg(target_arch = "x86_64")]
+                PureRustBackend::VpclmulX86_64 => unsafe { extend_vpclmul_x86_64(crc, chunk) },
+                #[cfg(target_arch = "aarch64")]
+                PureRustBackend::PmullAarch64 => unsafe { extend_pmull_aarch64(crc, chunk) },
+                #[cfg(target_arch = "aarch64")]
+                PureRustBackend::PmullSha3Aarch64 => unsafe {
+                    extend_pmull_sha3_aarch64(crc, chunk)
+                },
+            };
+        }
+        crc
+    }
+
+    #[cfg(feature = "pure-rust")]
+    #[test]
+    fn supported_backends_match_scalar_across_boundaries() {
+        let lengths = [
+            0usize, 1, 2, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
+            511, 512, 513, 1024, 4096,
+        ];
+        let chunk_sizes = [1usize, 2, 3, 7, 15, 16, 17, 31, 32, 63, 64, 127];
+        let backend_cases = supported_backend_cases();
+
+        for &len in &lengths {
+            let data: Vec<u8> = (0u8..=255)
+                .cycle()
+                .take(len)
+                .enumerate()
+                .map(|(i, byte)| byte ^ ((i as u8).wrapping_mul(17)))
+                .collect();
+            let expected = checksum_with_backend(PureRustBackend::Scalar, &data);
+
+            for case in &backend_cases {
+                let actual = checksum_with_backend(case.backend, &data);
+                assert_eq!(
+                    actual, expected,
+                    "backend {} mismatch at len {}",
+                    case.name, len
+                );
+
+                for &chunk_size in &chunk_sizes {
+                    let streaming =
+                        checksum_streaming_with_backend(case.backend, &data, chunk_size);
+                    assert_eq!(
+                        streaming, expected,
+                        "backend {} streaming mismatch at len {} chunk_size {}",
+                        case.name, len, chunk_size
+                    );
+                }
+            }
+        }
+    }
+
     // ── Standard test vectors ────────────────────────────────────────
 
     #[test]
