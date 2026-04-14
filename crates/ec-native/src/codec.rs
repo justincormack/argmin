@@ -1,3 +1,5 @@
+#[cfg(target_arch = "x86_64")]
+use crate::gf::build_gfni_tables;
 use crate::gf::{build_mul_tables, encode_rows, gen_cauchy1_matrix};
 use crate::reconstruct::reconstruct_shards;
 use std::sync::OnceLock;
@@ -138,6 +140,10 @@ pub(crate) enum Backend {
     #[cfg(target_arch = "aarch64")]
     NeonAarch64,
     #[cfg(target_arch = "x86_64")]
+    Avx512GfniX86_64,
+    #[cfg(target_arch = "x86_64")]
+    Avx512X86_64,
+    #[cfg(target_arch = "x86_64")]
     Avx2X86_64,
 }
 
@@ -149,6 +155,14 @@ pub(crate) fn selected_backend() -> Backend {
 
     #[cfg(target_arch = "x86_64")]
     {
+        if has_avx512_gfni_x86_64() {
+            return Backend::Avx512GfniX86_64;
+        }
+
+        if has_avx512_x86_64() {
+            return Backend::Avx512X86_64;
+        }
+
         if has_avx2_x86_64() {
             return Backend::Avx2X86_64;
         }
@@ -166,8 +180,21 @@ pub(crate) fn selected_backend() -> Backend {
 
 #[inline]
 #[cfg(target_arch = "x86_64")]
+pub(crate) fn has_avx512_gfni_x86_64() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f") && std::arch::is_x86_feature_detected!("gfni")
+}
+
+#[inline]
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn has_avx2_x86_64() -> bool {
     std::arch::is_x86_feature_detected!("avx2")
+}
+
+#[inline]
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn has_avx512_x86_64() -> bool {
+    std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
 }
 
 #[inline]
@@ -190,6 +217,12 @@ fn bench_override_backend() -> Option<Backend> {
             #[cfg(target_arch = "aarch64")]
             Some("neon") if has_neon_aarch64() => Some(Backend::NeonAarch64),
             #[cfg(target_arch = "x86_64")]
+            Some("avx512-gfni" | "avx512_gfni" | "gfni") if has_avx512_gfni_x86_64() => {
+                Some(Backend::Avx512GfniX86_64)
+            }
+            #[cfg(target_arch = "x86_64")]
+            Some("avx512") if has_avx512_x86_64() => Some(Backend::Avx512X86_64),
+            #[cfg(target_arch = "x86_64")]
             Some("avx2") if has_avx2_x86_64() => Some(Backend::Avx2X86_64),
             _ => None,
         }
@@ -202,6 +235,14 @@ pub(crate) fn supported_backends() -> Vec<Backend> {
     #[cfg(target_arch = "aarch64")]
     if has_neon_aarch64() {
         backends.push(Backend::NeonAarch64);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if has_avx512_gfni_x86_64() {
+        backends.push(Backend::Avx512GfniX86_64);
+    }
+    #[cfg(target_arch = "x86_64")]
+    if has_avx512_x86_64() {
+        backends.push(Backend::Avx512X86_64);
     }
     #[cfg(target_arch = "x86_64")]
     if has_avx2_x86_64() {
@@ -224,8 +265,11 @@ pub struct ErasureCodec {
     /// Per-coefficient 32-byte nibble tables for NEON parity rows.
     encode_tables_neon: Vec<u8>,
     #[cfg(target_arch = "x86_64")]
-    /// Per-coefficient 32-byte nibble tables for AVX2 parity rows.
-    encode_tables_avx2: Vec<u8>,
+    /// Per-coefficient 32-byte nibble tables for x86 shuffle backends.
+    encode_tables_x86: Vec<u8>,
+    #[cfg(target_arch = "x86_64")]
+    /// Per-coefficient 64-bit affine matrices for x86 GFNI backends.
+    encode_tables_x86_gfni: Vec<u64>,
 }
 
 impl ErasureCodec {
@@ -251,7 +295,9 @@ impl ErasureCodec {
         #[cfg(target_arch = "aarch64")]
         let encode_tables_neon = crate::gf::build_nibble_tables(&encode_matrix[k * k..]);
         #[cfg(target_arch = "x86_64")]
-        let encode_tables_avx2 = crate::gf::build_nibble_tables(&encode_matrix[k * k..]);
+        let encode_tables_x86 = crate::gf::build_nibble_tables(&encode_matrix[k * k..]);
+        #[cfg(target_arch = "x86_64")]
+        let encode_tables_x86_gfni = build_gfni_tables(&encode_matrix[k * k..]);
 
         Ok(Self {
             config,
@@ -260,7 +306,9 @@ impl ErasureCodec {
             #[cfg(target_arch = "aarch64")]
             encode_tables_neon,
             #[cfg(target_arch = "x86_64")]
-            encode_tables_avx2,
+            encode_tables_x86,
+            #[cfg(target_arch = "x86_64")]
+            encode_tables_x86_gfni,
         })
     }
 
@@ -342,7 +390,9 @@ impl ErasureCodec {
             #[cfg(target_arch = "aarch64")]
             &self.encode_tables_neon,
             #[cfg(target_arch = "x86_64")]
-            &self.encode_tables_avx2,
+            &self.encode_tables_x86,
+            #[cfg(target_arch = "x86_64")]
+            &self.encode_tables_x86_gfni,
             data,
             parity,
         );
@@ -434,9 +484,13 @@ impl ErasureCodec {
                 let table_start = row * k * 256;
                 let table_end = table_start + k * 256;
                 #[cfg(target_arch = "x86_64")]
-                let table_start_avx2 = row * k * 32;
+                let table_start_x86 = row * k * 32;
                 #[cfg(target_arch = "x86_64")]
-                let table_end_avx2 = table_start_avx2 + k * 32;
+                let table_end_x86 = table_start_x86 + k * 32;
+                #[cfg(target_arch = "x86_64")]
+                let table_start_x86_gfni = row * k;
+                #[cfg(target_arch = "x86_64")]
+                let table_end_x86_gfni = table_start_x86_gfni + k;
                 encode_rows(
                     backend,
                     k,
@@ -444,7 +498,9 @@ impl ErasureCodec {
                     #[cfg(target_arch = "aarch64")]
                     &self.encode_tables_neon[row * k * 32..(row + 1) * k * 32],
                     #[cfg(target_arch = "x86_64")]
-                    &self.encode_tables_avx2[table_start_avx2..table_end_avx2],
+                    &self.encode_tables_x86[table_start_x86..table_end_x86],
+                    #[cfg(target_arch = "x86_64")]
+                    &self.encode_tables_x86_gfni[table_start_x86_gfni..table_end_x86_gfni],
                     data,
                     &mut outputs,
                 );

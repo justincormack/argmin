@@ -51,8 +51,61 @@ const fn build_inv_table(mul_table: &[u8; GF_TABLE_SIZE]) -> [u8; 256] {
     table
 }
 
+const fn build_gfni_affine(coeff: u8) -> u64 {
+    let mut rows = [0u8; 8];
+    let mut input_bit = 0usize;
+    while input_bit < 8 {
+        let product = gf_mul_slow(coeff, 1u8 << input_bit);
+        let mut output_bit = 0usize;
+        while output_bit < 8 {
+            if (product >> output_bit) & 1 != 0 {
+                rows[output_bit] |= 1u8 << input_bit;
+            }
+            output_bit += 1;
+        }
+        input_bit += 1;
+    }
+
+    let mut packed = 0u64;
+    let mut row = 0usize;
+    while row < 8 {
+        packed = (packed << 8) | rows[row] as u64;
+        row += 1;
+    }
+    packed
+}
+
+const fn build_gfni_table() -> [u64; 256] {
+    let mut table = [0u64; 256];
+    let mut coeff = 0usize;
+    while coeff < 256 {
+        table[coeff] = build_gfni_affine(coeff as u8);
+        coeff += 1;
+    }
+    table
+}
+
+const fn build_all_nibble_tables() -> [[u8; 32]; 256] {
+    let mut tables = [[0u8; 32]; 256];
+    let mut coeff = 0usize;
+    while coeff < 256 {
+        let mut nibble = 0usize;
+        while nibble < 16 {
+            tables[coeff][nibble] = gf_mul_slow(coeff as u8, nibble as u8);
+            tables[coeff][16 + nibble] = gf_mul_slow(coeff as u8, (nibble << 4) as u8);
+            nibble += 1;
+        }
+        coeff += 1;
+    }
+    tables
+}
+
 static GF_MUL_TABLE: [u8; GF_TABLE_SIZE] = build_mul_table();
 static GF_INV_TABLE: [u8; 256] = build_inv_table(&GF_MUL_TABLE);
+#[cfg(target_arch = "x86_64")]
+static GF_NIBBLE_TABLES: [[u8; 32]; 256] = build_all_nibble_tables();
+#[cfg(target_arch = "x86_64")]
+static GF_AFFINE_TABLE: [u64; 256] = build_gfni_table();
 
 #[inline(always)]
 pub(crate) fn gf_mul(a: u8, b: u8) -> u8 {
@@ -101,6 +154,14 @@ pub(crate) fn build_nibble_tables(coefficients: &[u8]) -> Vec<u8> {
         tables[start..end].copy_from_slice(&build_nibble_table(coefficient));
     }
     tables
+}
+
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn build_gfni_tables(coefficients: &[u8]) -> Vec<u64> {
+    coefficients
+        .iter()
+        .map(|&coefficient| GF_AFFINE_TABLE[coefficient as usize])
+        .collect()
 }
 
 fn build_nibble_table(coeff: u8) -> [u8; 32] {
@@ -267,7 +328,8 @@ pub(crate) fn encode_rows(
     k: usize,
     tables: &[u8],
     #[cfg(target_arch = "aarch64")] neon_tables: &[u8],
-    #[cfg(target_arch = "x86_64")] avx2_tables: &[u8],
+    #[cfg(target_arch = "x86_64")] x86_tables: &[u8],
+    #[cfg(target_arch = "x86_64")] x86_gfni_tables: &[u64],
     data: &[&[u8]],
     outputs: &mut [&mut [u8]],
 ) {
@@ -276,7 +338,15 @@ pub(crate) fn encode_rows(
         #[cfg(target_arch = "aarch64")]
         Backend::NeonAarch64 => unsafe { aarch64_neon::encode_rows(k, neon_tables, data, outputs) },
         #[cfg(target_arch = "x86_64")]
-        Backend::Avx2X86_64 => unsafe { x86_64_avx2::encode_rows(k, avx2_tables, data, outputs) },
+        Backend::Avx512GfniX86_64 => unsafe {
+            x86_64_avx512_gfni::encode_rows(k, tables, x86_gfni_tables, data, outputs)
+        },
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx512X86_64 => unsafe {
+            x86_64_avx512::encode_rows(k, x86_tables, data, outputs)
+        },
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2X86_64 => unsafe { x86_64_avx2::encode_rows(k, x86_tables, data, outputs) },
     }
 }
 
@@ -321,6 +391,14 @@ pub(crate) fn apply_matrix_rows(
         #[cfg(target_arch = "aarch64")]
         Backend::NeonAarch64 => unsafe {
             aarch64_neon::apply_matrix_rows(k, rows, inputs, outputs)
+        },
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx512GfniX86_64 => unsafe {
+            x86_64_avx512_gfni::apply_matrix_rows(k, rows, inputs, outputs)
+        },
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx512X86_64 => unsafe {
+            x86_64_avx512::apply_matrix_rows(k, rows, inputs, outputs)
         },
         #[cfg(target_arch = "x86_64")]
         Backend::Avx2X86_64 => unsafe { x86_64_avx2::apply_matrix_rows(k, rows, inputs, outputs) },
@@ -535,12 +613,416 @@ mod aarch64_neon {
 }
 
 #[cfg(target_arch = "x86_64")]
+mod x86_64_avx512_gfni {
+    use super::{
+        write_with_coeff, xor_with_coeff, xor_with_slice, GF_AFFINE_TABLE, MAX_TOTAL_SHARDS,
+    };
+    use core::arch::x86_64::{
+        __m512i, _mm512_gf2p8affine_epi64_epi8, _mm512_loadu_si512, _mm512_set1_epi64,
+        _mm512_setzero_si512, _mm512_storeu_si512, _mm512_xor_si512,
+    };
+
+    #[target_feature(enable = "gfni,avx512f")]
+    pub(super) unsafe fn encode_rows(
+        k: usize,
+        mul_tables: &[u8],
+        tables: &[u64],
+        data: &[&[u8]],
+        outputs: &mut [&mut [u8]],
+    ) {
+        for (row, output) in outputs.iter_mut().enumerate() {
+            let mut first_nonzero_col = None;
+            for col in 0..k {
+                let coeff = mul_tables[(row * k + col) * 256 + 1];
+                if coeff != 0 {
+                    first_nonzero_col = Some((col, coeff, tables[row * k + col]));
+                    break;
+                }
+            }
+
+            let Some((first_col, first_coeff, first_table)) = first_nonzero_col else {
+                output.fill(0);
+                continue;
+            };
+
+            if first_coeff == 1 {
+                output.copy_from_slice(data[first_col]);
+            } else {
+                write_with_affine_table(output, data[first_col], first_coeff, first_table);
+            }
+
+            for (col, source) in data.iter().enumerate().take(k).skip(first_col + 1) {
+                let table = tables[row * k + col];
+                let coeff = mul_tables[(row * k + col) * 256 + 1];
+                if coeff == 0 {
+                    continue;
+                }
+                if coeff == 1 {
+                    xor_with_slice(output, source);
+                } else {
+                    xor_with_affine_table(output, source, coeff, table);
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "gfni,avx512f")]
+    pub(super) unsafe fn apply_matrix_rows(
+        k: usize,
+        rows: &[u8],
+        inputs: &[&[u8]],
+        outputs: &mut [&mut [u8]],
+    ) {
+        for (row_index, output) in outputs.iter_mut().enumerate() {
+            let row = &rows[row_index * k..(row_index + 1) * k];
+            dot_prod_row(k, row, inputs, output);
+        }
+    }
+
+    #[target_feature(enable = "gfni,avx512f")]
+    unsafe fn dot_prod_row(k: usize, row: &[u8], inputs: &[&[u8]], output: &mut [u8]) {
+        let mut active_coeffs = [0u8; MAX_TOTAL_SHARDS];
+        let mut active_tables = [0u64; MAX_TOTAL_SHARDS];
+        let mut active_inputs = [core::ptr::null::<u8>(); MAX_TOTAL_SHARDS];
+        let mut active_len = 0usize;
+        let mut first_index = None;
+
+        for col in 0..k {
+            let coeff = row[col];
+            if coeff == 0 {
+                continue;
+            }
+            if first_index.is_none() {
+                first_index = Some((col, coeff));
+            }
+            active_coeffs[active_len] = coeff;
+            active_tables[active_len] = GF_AFFINE_TABLE[coeff as usize];
+            active_inputs[active_len] = inputs[col].as_ptr();
+            active_len += 1;
+        }
+
+        if active_len == 0 {
+            output.fill(0);
+            return;
+        }
+
+        let len = output.len();
+        let out_ptr = output.as_mut_ptr();
+        let mut index = 0usize;
+
+        while index + 64 <= len {
+            let mut acc = _mm512_setzero_si512();
+            for slot in 0..active_len {
+                let src_chunk =
+                    _mm512_loadu_si512(active_inputs[slot].add(index) as *const __m512i);
+                let product = if active_coeffs[slot] == 1 {
+                    src_chunk
+                } else {
+                    let affine = _mm512_set1_epi64(active_tables[slot] as i64);
+                    _mm512_gf2p8affine_epi64_epi8::<0>(src_chunk, affine)
+                };
+                acc = _mm512_xor_si512(acc, product);
+            }
+            _mm512_storeu_si512(out_ptr.add(index) as *mut __m512i, acc);
+            index += 64;
+        }
+
+        if index == len {
+            return;
+        }
+
+        let tail = &mut output[index..];
+        let (first_col, first_coeff) = first_index.unwrap();
+        if first_coeff == 1 {
+            tail.copy_from_slice(&inputs[first_col][index..]);
+        } else {
+            write_with_coeff(tail, &inputs[first_col][index..], first_coeff);
+        }
+        let mut used_first = false;
+        for col in 0..k {
+            let coeff = row[col];
+            if coeff == 0 {
+                continue;
+            }
+            if !used_first {
+                used_first = true;
+                continue;
+            }
+            xor_with_coeff(tail, &inputs[col][index..], coeff);
+        }
+    }
+
+    #[target_feature(enable = "gfni,avx512f")]
+    unsafe fn write_with_affine_table(dest: &mut [u8], src: &[u8], coeff: u8, table: u64) {
+        if coeff == 0 || coeff == 1 || dest.len() < 64 {
+            write_with_coeff(dest, src, coeff);
+            return;
+        }
+
+        let len = dest.len();
+        let mut index = 0usize;
+        let affine = _mm512_set1_epi64(table as i64);
+
+        while index + 64 <= len {
+            let src_chunk = _mm512_loadu_si512(src.as_ptr().add(index) as *const __m512i);
+            let product = _mm512_gf2p8affine_epi64_epi8::<0>(src_chunk, affine);
+            _mm512_storeu_si512(dest.as_mut_ptr().add(index) as *mut __m512i, product);
+            index += 64;
+        }
+
+        if index < len {
+            write_with_coeff(&mut dest[index..], &src[index..], coeff);
+        }
+    }
+
+    #[target_feature(enable = "gfni,avx512f")]
+    unsafe fn xor_with_affine_table(dest: &mut [u8], src: &[u8], coeff: u8, table: u64) {
+        if coeff == 0 || coeff == 1 || dest.len() < 64 {
+            xor_with_coeff(dest, src, coeff);
+            return;
+        }
+
+        let len = dest.len();
+        let mut index = 0usize;
+        let affine = _mm512_set1_epi64(table as i64);
+
+        while index + 64 <= len {
+            let src_chunk = _mm512_loadu_si512(src.as_ptr().add(index) as *const __m512i);
+            let dest_chunk = _mm512_loadu_si512(dest.as_ptr().add(index) as *const __m512i);
+            let product = _mm512_gf2p8affine_epi64_epi8::<0>(src_chunk, affine);
+            let combined = _mm512_xor_si512(dest_chunk, product);
+            _mm512_storeu_si512(dest.as_mut_ptr().add(index) as *mut __m512i, combined);
+            index += 64;
+        }
+
+        if index < len {
+            xor_with_coeff(&mut dest[index..], &src[index..], coeff);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+mod x86_64_avx512 {
+    use super::{
+        write_with_coeff, xor_with_coeff, xor_with_slice, GF_NIBBLE_TABLES, MAX_TOTAL_SHARDS,
+    };
+    use core::arch::x86_64::{
+        __m128i, __m512i, _mm512_and_si512, _mm512_broadcast_i32x4, _mm512_loadu_si512,
+        _mm512_set1_epi8, _mm512_setzero_si512, _mm512_shuffle_epi8, _mm512_srli_epi16,
+        _mm512_storeu_si512, _mm512_xor_si512, _mm_loadu_si128,
+    };
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub(super) unsafe fn encode_rows(
+        k: usize,
+        tables: &[u8],
+        data: &[&[u8]],
+        outputs: &mut [&mut [u8]],
+    ) {
+        for (row, output) in outputs.iter_mut().enumerate() {
+            let mut first_nonzero_col = None;
+            for col in 0..k {
+                let table_start = (row * k + col) * 32;
+                let coeff = tables[table_start + 1];
+                if coeff != 0 {
+                    first_nonzero_col = Some((col, coeff, &tables[table_start..table_start + 32]));
+                    break;
+                }
+            }
+
+            let Some((first_col, first_coeff, first_table)) = first_nonzero_col else {
+                output.fill(0);
+                continue;
+            };
+
+            if first_coeff == 1 {
+                output.copy_from_slice(data[first_col]);
+            } else {
+                write_with_nibble_table(output, data[first_col], first_table);
+            }
+
+            for (col, source) in data.iter().enumerate().take(k).skip(first_col + 1) {
+                let table_start = (row * k + col) * 32;
+                let coeff = tables[table_start + 1];
+                if coeff == 0 {
+                    continue;
+                }
+                if coeff == 1 {
+                    xor_with_slice(output, source);
+                } else {
+                    xor_with_nibble_table(output, source, &tables[table_start..table_start + 32]);
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    pub(super) unsafe fn apply_matrix_rows(
+        k: usize,
+        rows: &[u8],
+        inputs: &[&[u8]],
+        outputs: &mut [&mut [u8]],
+    ) {
+        for (row_index, output) in outputs.iter_mut().enumerate() {
+            let row = &rows[row_index * k..(row_index + 1) * k];
+            dot_prod_row(k, row, inputs, output);
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn dot_prod_row(k: usize, row: &[u8], inputs: &[&[u8]], output: &mut [u8]) {
+        let mut active_coeffs = [0u8; MAX_TOTAL_SHARDS];
+        let mut active_inputs = [core::ptr::null::<u8>(); MAX_TOTAL_SHARDS];
+        let mut active_len = 0usize;
+
+        for col in 0..k {
+            let coeff = row[col];
+            if coeff == 0 {
+                continue;
+            }
+            active_coeffs[active_len] = coeff;
+            active_inputs[active_len] = inputs[col].as_ptr();
+            active_len += 1;
+        }
+
+        if active_len == 0 {
+            output.fill(0);
+            return;
+        }
+
+        let len = output.len();
+        let out_ptr = output.as_mut_ptr();
+        let mask = _mm512_set1_epi8(0x0f);
+        let mut index = 0usize;
+
+        while index + 64 <= len {
+            let mut acc = _mm512_setzero_si512();
+            for slot in 0..active_len {
+                let src_chunk =
+                    _mm512_loadu_si512(active_inputs[slot].add(index) as *const __m512i);
+                let product = if active_coeffs[slot] == 1 {
+                    src_chunk
+                } else {
+                    let table = &GF_NIBBLE_TABLES[active_coeffs[slot] as usize];
+                    let low_table =
+                        _mm512_broadcast_i32x4(_mm_loadu_si128(table.as_ptr() as *const __m128i));
+                    let high_table = _mm512_broadcast_i32x4(_mm_loadu_si128(
+                        table[16..].as_ptr() as *const __m128i
+                    ));
+                    mul_chunk(src_chunk, low_table, high_table, mask)
+                };
+                acc = _mm512_xor_si512(acc, product);
+            }
+            _mm512_storeu_si512(out_ptr.add(index) as *mut __m512i, acc);
+            index += 64;
+        }
+
+        if index == len {
+            return;
+        }
+
+        let mut first_index = None;
+        for (col, &coeff) in row.iter().enumerate().take(k) {
+            if coeff != 0 {
+                first_index = Some((col, coeff));
+                break;
+            }
+        }
+        let (first_col, first_coeff) = first_index.unwrap();
+        if first_coeff == 1 {
+            output[index..].copy_from_slice(&inputs[first_col][index..]);
+        } else {
+            write_with_coeff(
+                &mut output[index..],
+                &inputs[first_col][index..],
+                first_coeff,
+            );
+        }
+        for (&coeff, source) in row.iter().zip(inputs.iter().copied()).skip(first_col + 1) {
+            xor_with_coeff(&mut output[index..], &source[index..], coeff);
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn write_with_nibble_table(dest: &mut [u8], src: &[u8], table: &[u8]) {
+        let coeff = table[1];
+        if coeff == 0 || coeff == 1 || dest.len() < 64 {
+            write_with_coeff(dest, src, coeff);
+            return;
+        }
+
+        let len = dest.len();
+        let mut index = 0usize;
+        let mask = _mm512_set1_epi8(0x0f);
+        let low_table = _mm512_broadcast_i32x4(_mm_loadu_si128(table.as_ptr() as *const __m128i));
+        let high_table =
+            _mm512_broadcast_i32x4(_mm_loadu_si128(table[16..].as_ptr() as *const __m128i));
+
+        while index + 64 <= len {
+            let src_chunk = _mm512_loadu_si512(src.as_ptr().add(index) as *const __m512i);
+            let product = mul_chunk(src_chunk, low_table, high_table, mask);
+            _mm512_storeu_si512(dest.as_mut_ptr().add(index) as *mut __m512i, product);
+            index += 64;
+        }
+
+        if index < len {
+            write_with_coeff(&mut dest[index..], &src[index..], coeff);
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn xor_with_nibble_table(dest: &mut [u8], src: &[u8], table: &[u8]) {
+        let coeff = table[1];
+        if coeff == 0 || coeff == 1 || dest.len() < 64 {
+            xor_with_coeff(dest, src, coeff);
+            return;
+        }
+
+        let len = dest.len();
+        let mut index = 0usize;
+        let mask = _mm512_set1_epi8(0x0f);
+        let low_table = _mm512_broadcast_i32x4(_mm_loadu_si128(table.as_ptr() as *const __m128i));
+        let high_table =
+            _mm512_broadcast_i32x4(_mm_loadu_si128(table[16..].as_ptr() as *const __m128i));
+
+        while index + 64 <= len {
+            let src_chunk = _mm512_loadu_si512(src.as_ptr().add(index) as *const __m512i);
+            let dest_chunk = _mm512_loadu_si512(dest.as_ptr().add(index) as *const __m512i);
+            let product = mul_chunk(src_chunk, low_table, high_table, mask);
+            let combined = _mm512_xor_si512(dest_chunk, product);
+            _mm512_storeu_si512(dest.as_mut_ptr().add(index) as *mut __m512i, combined);
+            index += 64;
+        }
+
+        if index < len {
+            xor_with_coeff(&mut dest[index..], &src[index..], coeff);
+        }
+    }
+
+    #[target_feature(enable = "avx512f,avx512bw")]
+    unsafe fn mul_chunk(
+        src_chunk: __m512i,
+        low_table: __m512i,
+        high_table: __m512i,
+        mask: __m512i,
+    ) -> __m512i {
+        let low = _mm512_and_si512(src_chunk, mask);
+        let high = _mm512_and_si512(_mm512_srli_epi16::<4>(src_chunk), mask);
+        let low_product = _mm512_shuffle_epi8(low_table, low);
+        let high_product = _mm512_shuffle_epi8(high_table, high);
+        _mm512_xor_si512(low_product, high_product)
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
 mod x86_64_avx2 {
-    use super::{build_nibble_table, write_with_coeff, xor_with_coeff, xor_with_slice};
+    use super::{
+        write_with_coeff, xor_with_coeff, xor_with_slice, GF_NIBBLE_TABLES, MAX_TOTAL_SHARDS,
+    };
     use core::arch::x86_64::{
         __m128i, __m256i, _mm256_and_si256, _mm256_broadcastsi128_si256, _mm256_loadu_si256,
-        _mm256_set1_epi8, _mm256_shuffle_epi8, _mm256_srli_epi16, _mm256_storeu_si256,
-        _mm256_xor_si256, _mm_loadu_si128,
+        _mm256_set1_epi8, _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_srli_epi16,
+        _mm256_storeu_si256, _mm256_xor_si256, _mm_loadu_si128,
     };
 
     #[target_feature(enable = "avx2")]
@@ -596,36 +1078,82 @@ mod x86_64_avx2 {
     ) {
         for (row_index, output) in outputs.iter_mut().enumerate() {
             let row = &rows[row_index * k..(row_index + 1) * k];
-            let mut first_nonzero = None;
-            for (index, &coeff) in row.iter().enumerate() {
-                if coeff != 0 {
-                    first_nonzero = Some((index, coeff));
-                    break;
-                }
-            }
+            dot_prod_row(k, row, inputs, output);
+        }
+    }
 
-            let Some((first_index, first_coeff)) = first_nonzero else {
-                output.fill(0);
+    #[target_feature(enable = "avx2")]
+    unsafe fn dot_prod_row(k: usize, row: &[u8], inputs: &[&[u8]], output: &mut [u8]) {
+        let mut active_coeffs = [0u8; MAX_TOTAL_SHARDS];
+        let mut active_inputs = [core::ptr::null::<u8>(); MAX_TOTAL_SHARDS];
+        let mut active_len = 0usize;
+
+        for col in 0..k {
+            let coeff = row[col];
+            if coeff == 0 {
                 continue;
-            };
-
-            if first_coeff == 1 {
-                output.copy_from_slice(inputs[first_index]);
-            } else {
-                let table = build_nibble_table(first_coeff);
-                write_with_nibble_table(output, inputs[first_index], &table);
             }
+            active_coeffs[active_len] = coeff;
+            active_inputs[active_len] = inputs[col].as_ptr();
+            active_len += 1;
+        }
 
-            for (&coeff, source) in row.iter().zip(inputs.iter().copied()).skip(first_index + 1) {
-                match coeff {
-                    0 => {}
-                    1 => xor_with_slice(output, source),
-                    _ => {
-                        let table = build_nibble_table(coeff);
-                        xor_with_nibble_table(output, source, &table);
-                    }
-                }
+        if active_len == 0 {
+            output.fill(0);
+            return;
+        }
+
+        let len = output.len();
+        let out_ptr = output.as_mut_ptr();
+        let mask = _mm256_set1_epi8(0x0f);
+        let mut index = 0usize;
+
+        while index + 32 <= len {
+            let mut acc = _mm256_setzero_si256();
+            for slot in 0..active_len {
+                let src_chunk =
+                    _mm256_loadu_si256(active_inputs[slot].add(index) as *const __m256i);
+                let product = if active_coeffs[slot] == 1 {
+                    src_chunk
+                } else {
+                    let table = &GF_NIBBLE_TABLES[active_coeffs[slot] as usize];
+                    let low_table = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                        table.as_ptr() as *const __m128i
+                    ));
+                    let high_table = _mm256_broadcastsi128_si256(_mm_loadu_si128(
+                        table[16..].as_ptr() as *const __m128i,
+                    ));
+                    mul_chunk(src_chunk, low_table, high_table, mask)
+                };
+                acc = _mm256_xor_si256(acc, product);
             }
+            _mm256_storeu_si256(out_ptr.add(index) as *mut __m256i, acc);
+            index += 32;
+        }
+
+        if index == len {
+            return;
+        }
+
+        let mut first_index = None;
+        for (col, &coeff) in row.iter().enumerate().take(k) {
+            if coeff != 0 {
+                first_index = Some((col, coeff));
+                break;
+            }
+        }
+        let (first_col, first_coeff) = first_index.unwrap();
+        if first_coeff == 1 {
+            output[index..].copy_from_slice(&inputs[first_col][index..]);
+        } else {
+            write_with_coeff(
+                &mut output[index..],
+                &inputs[first_col][index..],
+                first_coeff,
+            );
+        }
+        for (&coeff, source) in row.iter().zip(inputs.iter().copied()).skip(first_col + 1) {
+            xor_with_coeff(&mut output[index..], &source[index..], coeff);
         }
     }
 
