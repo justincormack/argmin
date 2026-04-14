@@ -766,13 +766,6 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 name = "ec"
 version = "0.1.0"
 dependencies = [
- "ec-native",
-]
-
-[[package]]
-name = "ec-native"
-version = "0.1.0"
-dependencies = [
  "observability",
  "proptest",
  "thiserror",

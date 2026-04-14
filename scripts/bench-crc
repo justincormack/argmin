@@ -49,4 +49,4 @@ cargo run --offline -p checksum --example crc_bench --release --features bench-s
 
 echo
 echo "[ec reconstruct native]"
-cargo run --offline -p ec --example ec_bench --release -- "${common_args[@]}" --mode reconstruct --data-shards "$EC_DATA_SHARDS" --parity-shards "$EC_PARITY_SHARDS" --recover-index "$EC_RECOVER_INDEX" --label ec-native-reconstruct
+cargo run --offline -p ec --example ec_bench --release -- "${common_args[@]}" --mode reconstruct --data-shards "$EC_DATA_SHARDS" --parity-shards "$EC_PARITY_SHARDS" --recover-index "$EC_RECOVER_INDEX" --label ec-reconstruct

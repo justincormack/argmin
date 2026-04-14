@@ -4,4 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ec-native = { path = "../ec-native" }
+observability = { path = "../observability" }
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"

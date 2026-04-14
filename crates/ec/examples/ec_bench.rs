@@ -51,16 +51,16 @@ trait Backend {
 struct NativeBackend;
 
 impl Backend for NativeBackend {
-    type Codec = ec_native::ErasureCodec;
-    type Config = ec_native::EcConfig;
-    type Error = ec_native::EcError;
+    type Codec = ec::ErasureCodec;
+    type Config = ec::EcConfig;
+    type Error = ec::EcError;
 
     fn config(data_shards: u8, parity_shards: u8) -> Result<Self::Config, Self::Error> {
-        ec_native::EcConfig::new(data_shards, parity_shards)
+        ec::EcConfig::new(data_shards, parity_shards)
     }
 
     fn codec(config: Self::Config) -> Result<Self::Codec, Self::Error> {
-        ec_native::ErasureCodec::new(config)
+        ec::ErasureCodec::new(config)
     }
 
     fn encode(
@@ -83,7 +83,7 @@ impl Backend for NativeBackend {
     ) -> Result<bool, Self::Error> {
         codec
             .verify(data, parity, scratch)
-            .map(|result| matches!(result, ec_native::VerifyResult::Ok))
+            .map(|result| matches!(result, ec::VerifyResult::Ok))
     }
 
     fn reconstruct(
@@ -158,7 +158,7 @@ fn parse_args() -> Result<Config, String> {
         }
     }
 
-    let label = label.unwrap_or_else(|| "ec-native".to_string());
+    let label = label.unwrap_or_else(|| "ec".to_string());
 
     Ok(Config {
         mode,
