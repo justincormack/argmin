@@ -1,3 +1,4 @@
+use crate::codec::{supported_backends, Backend};
 use crate::self_test;
 use crate::{EcConfig, EcError, ErasureCodec, VerifyResult, MAX_TOTAL_SHARDS};
 
@@ -14,13 +15,27 @@ fn make_data(k: usize, shard_size: usize) -> Vec<Vec<u8>> {
 }
 
 fn encode(codec: &ErasureCodec, data: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    encode_with_backend(codec, data, Backend::Scalar)
+}
+
+fn encode_with_backend(codec: &ErasureCodec, data: &[Vec<u8>], backend: Backend) -> Vec<Vec<u8>> {
     let m = codec.config().parity_shards as usize;
     let shard_size = data[0].len();
     let mut parity: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
     let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
     let mut parity_refs: Vec<&mut [u8]> = parity.iter_mut().map(|v| v.as_mut_slice()).collect();
-    codec.encode(&data_refs, &mut parity_refs).unwrap();
+    codec
+        .encode_with_backend_for_test(&data_refs, &mut parity_refs, backend)
+        .unwrap();
     parity
+}
+
+fn backend_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::Scalar => "scalar",
+        #[cfg(target_arch = "x86_64")]
+        Backend::Avx2X86_64 => "x86_64-avx2",
+    }
 }
 
 // Config validation
@@ -68,6 +83,96 @@ fn encode_deterministic() {
     let p1 = encode(&codec, &data);
     let p2 = encode(&codec, &data);
     assert_eq!(p1, p2);
+}
+
+#[test]
+fn supported_backends_match_scalar_encode_and_verify() {
+    let codec = ErasureCodec::new(EcConfig::new(6, 3).unwrap()).unwrap();
+    let shard_sizes = [
+        0usize, 1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1024, 4096,
+    ];
+
+    for &shard_size in &shard_sizes {
+        let data = make_data(6, shard_size);
+        let scalar_parity = encode_with_backend(&codec, &data, Backend::Scalar);
+        let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
+
+        for backend in supported_backends() {
+            let parity = encode_with_backend(&codec, &data, backend);
+            assert_eq!(
+                parity,
+                scalar_parity,
+                "backend={} shard_size={shard_size}",
+                backend_name(backend)
+            );
+
+            let parity_refs: Vec<&[u8]> = parity.iter().map(|v| v.as_slice()).collect();
+            let mut scratch = vec![0u8; codec.verify_scratch_size(shard_size)];
+            assert_eq!(
+                codec
+                    .verify_with_backend_for_test(&data_refs, &parity_refs, &mut scratch, backend)
+                    .unwrap(),
+                VerifyResult::Ok,
+                "backend={} shard_size={shard_size}",
+                backend_name(backend)
+            );
+        }
+    }
+}
+
+#[test]
+fn supported_backends_match_scalar_reconstruct() {
+    let codec = ErasureCodec::new(EcConfig::new(6, 3).unwrap()).unwrap();
+    let shard_sizes = [
+        0usize, 1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 1024, 2048,
+    ];
+    let cases: &[(&[usize], &[usize])] = &[
+        (&[1, 2, 4, 6, 7, 8], &[0, 3, 5]),
+        (&[0, 1, 2, 3, 5, 7], &[4, 6, 8]),
+        (&[2, 3, 4, 5, 7, 8], &[0, 1, 6]),
+    ];
+
+    for &shard_size in &shard_sizes {
+        let data = make_data(6, shard_size);
+        let parity = encode_with_backend(&codec, &data, Backend::Scalar);
+        let all_shards: Vec<Vec<u8>> = data.iter().chain(parity.iter()).cloned().collect();
+
+        for &(present_indices, recover_indices) in cases {
+            let present_data: Vec<&[u8]> = present_indices
+                .iter()
+                .map(|&index| all_shards[index].as_slice())
+                .collect();
+
+            for backend in supported_backends() {
+                let mut recovered: Vec<Vec<u8>> = recover_indices
+                    .iter()
+                    .map(|_| vec![0u8; shard_size])
+                    .collect();
+                let mut outputs: Vec<&mut [u8]> = recovered
+                    .iter_mut()
+                    .map(|value| value.as_mut_slice())
+                    .collect();
+                codec
+                    .reconstruct_with_backend_for_test(
+                        present_indices,
+                        &present_data,
+                        recover_indices,
+                        &mut outputs,
+                        backend,
+                    )
+                    .unwrap();
+
+                for (out_index, &shard_index) in recover_indices.iter().enumerate() {
+                    assert_eq!(
+                        recovered[out_index],
+                        all_shards[shard_index],
+                        "backend={} shard_size={shard_size} shard={shard_index}",
+                        backend_name(backend)
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[test]

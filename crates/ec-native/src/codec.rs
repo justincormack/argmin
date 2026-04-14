@@ -1,5 +1,6 @@
 use crate::gf::{build_mul_tables, encode_rows, gen_cauchy1_matrix};
 use crate::reconstruct::reconstruct_shards;
+use std::sync::OnceLock;
 
 const TRACE_TARGET: &str = "ec";
 
@@ -131,6 +132,63 @@ pub(crate) fn check_shard_size(size: usize) -> Result<(), EcError> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Backend {
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    Avx2X86_64,
+}
+
+#[inline]
+pub(crate) fn selected_backend() -> Backend {
+    if let Some(backend) = bench_override_backend() {
+        return backend;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_avx2_x86_64() {
+            return Backend::Avx2X86_64;
+        }
+    }
+
+    Backend::Scalar
+}
+
+#[inline]
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn has_avx2_x86_64() -> bool {
+    std::arch::is_x86_feature_detected!("avx2")
+}
+
+#[inline]
+fn bench_override_backend() -> Option<Backend> {
+    static OVERRIDE: OnceLock<Option<Backend>> = OnceLock::new();
+
+    *OVERRIDE.get_or_init(|| {
+        let override_name = std::env::var("ARGMIN_EC_BENCH_BACKEND")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase());
+
+        match override_name.as_deref() {
+            Some("scalar") => Some(Backend::Scalar),
+            #[cfg(target_arch = "x86_64")]
+            Some("avx2") if has_avx2_x86_64() => Some(Backend::Avx2X86_64),
+            _ => None,
+        }
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn supported_backends() -> Vec<Backend> {
+    let mut backends = vec![Backend::Scalar];
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2_x86_64() {
+        backends.push(Backend::Avx2X86_64);
+    }
+    backends
+}
+
 /// Pre-computed erasure coding context. Build once; reuse across encode/reconstruct calls.
 ///
 /// Holds the Cauchy encoding matrix and per-coefficient multiply tables for the
@@ -141,6 +199,9 @@ pub struct ErasureCodec {
     encode_matrix: Vec<u8>,
     /// Per-coefficient multiply tables for parity rows: 256 * k * m bytes.
     encode_tables: Vec<u8>,
+    #[cfg(target_arch = "x86_64")]
+    /// Per-coefficient 32-byte nibble tables for AVX2 parity rows.
+    encode_tables_avx2: Vec<u8>,
 }
 
 impl ErasureCodec {
@@ -163,11 +224,15 @@ impl ErasureCodec {
         gen_cauchy1_matrix(&mut encode_matrix, total, k);
 
         let encode_tables = build_mul_tables(&encode_matrix[k * k..]);
+        #[cfg(target_arch = "x86_64")]
+        let encode_tables_avx2 = crate::gf::build_nibble_tables(&encode_matrix[k * k..]);
 
         Ok(Self {
             config,
             encode_matrix,
             encode_tables,
+            #[cfg(target_arch = "x86_64")]
+            encode_tables_avx2,
         })
     }
 
@@ -185,6 +250,15 @@ impl ErasureCodec {
     ///
     /// ZONE_HOT: no heap allocation.
     pub fn encode(&self, data: &[&[u8]], parity: &mut [&mut [u8]]) -> Result<(), EcError> {
+        self.encode_with_backend(data, parity, selected_backend())
+    }
+
+    fn encode_with_backend(
+        &self,
+        data: &[&[u8]],
+        parity: &mut [&mut [u8]],
+        backend: Backend,
+    ) -> Result<(), EcError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "ErasureCodec::encode",
@@ -233,7 +307,15 @@ impl ErasureCodec {
             return Ok(());
         }
 
-        encode_rows(k, &self.encode_tables, data, parity);
+        encode_rows(
+            backend,
+            k,
+            &self.encode_tables,
+            #[cfg(target_arch = "x86_64")]
+            &self.encode_tables_avx2,
+            data,
+            parity,
+        );
         Ok(())
     }
 
@@ -247,6 +329,16 @@ impl ErasureCodec {
         data: &[&[u8]],
         parity: &[&[u8]],
         scratch: &mut [u8],
+    ) -> Result<VerifyResult, EcError> {
+        self.verify_with_backend(data, parity, scratch, selected_backend())
+    }
+
+    fn verify_with_backend(
+        &self,
+        data: &[&[u8]],
+        parity: &[&[u8]],
+        scratch: &mut [u8],
+        backend: Backend,
     ) -> Result<VerifyResult, EcError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -311,9 +403,16 @@ impl ErasureCodec {
                 let mut outputs = [scratch_row];
                 let table_start = row * k * 256;
                 let table_end = table_start + k * 256;
+                #[cfg(target_arch = "x86_64")]
+                let table_start_avx2 = row * k * 32;
+                #[cfg(target_arch = "x86_64")]
+                let table_end_avx2 = table_start_avx2 + k * 32;
                 encode_rows(
+                    backend,
                     k,
                     &self.encode_tables[table_start..table_end],
+                    #[cfg(target_arch = "x86_64")]
+                    &self.encode_tables_avx2[table_start_avx2..table_end_avx2],
                     data,
                     &mut outputs,
                 );
@@ -337,6 +436,23 @@ impl ErasureCodec {
         present_data: &[&[u8]],
         recover_indices: &[usize],
         outputs: &mut [&mut [u8]],
+    ) -> Result<(), EcError> {
+        self.reconstruct_with_backend(
+            present_indices,
+            present_data,
+            recover_indices,
+            outputs,
+            selected_backend(),
+        )
+    }
+
+    fn reconstruct_with_backend(
+        &self,
+        present_indices: &[usize],
+        present_data: &[&[u8]],
+        recover_indices: &[usize],
+        outputs: &mut [&mut [u8]],
+        backend: Backend,
     ) -> Result<(), EcError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -424,12 +540,52 @@ impl ErasureCodec {
         }
 
         reconstruct_shards(
+            backend,
             k,
             &self.encode_matrix,
             present_indices,
             present_data,
             recover_indices,
             outputs,
+        )
+    }
+}
+
+#[cfg(test)]
+impl ErasureCodec {
+    pub(crate) fn encode_with_backend_for_test(
+        &self,
+        data: &[&[u8]],
+        parity: &mut [&mut [u8]],
+        backend: Backend,
+    ) -> Result<(), EcError> {
+        self.encode_with_backend(data, parity, backend)
+    }
+
+    pub(crate) fn verify_with_backend_for_test(
+        &self,
+        data: &[&[u8]],
+        parity: &[&[u8]],
+        scratch: &mut [u8],
+        backend: Backend,
+    ) -> Result<VerifyResult, EcError> {
+        self.verify_with_backend(data, parity, scratch, backend)
+    }
+
+    pub(crate) fn reconstruct_with_backend_for_test(
+        &self,
+        present_indices: &[usize],
+        present_data: &[&[u8]],
+        recover_indices: &[usize],
+        outputs: &mut [&mut [u8]],
+        backend: Backend,
+    ) -> Result<(), EcError> {
+        self.reconstruct_with_backend(
+            present_indices,
+            present_data,
+            recover_indices,
+            outputs,
+            backend,
         )
     }
 }

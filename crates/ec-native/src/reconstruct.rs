@@ -1,8 +1,10 @@
+use crate::codec::Backend;
 use crate::gf::{apply_matrix_rows, gf_mul, invert_matrix};
 use crate::{EcError, MAX_TOTAL_SHARDS};
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reconstruct_shards(
+    backend: Backend,
     k: usize,
     encode_matrix: &[u8],
     present_indices: &[usize],
@@ -38,6 +40,6 @@ pub(crate) fn reconstruct_shards(
         }
     }
 
-    apply_matrix_rows(k, &recovery_matrix, active_data, outputs);
+    apply_matrix_rows(backend, k, &recovery_matrix, active_data, outputs);
     Ok(())
 }
