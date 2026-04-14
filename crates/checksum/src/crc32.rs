@@ -61,6 +61,15 @@ const fn build_tables() -> [[u32; 256]; 16] {
     tables
 }
 
+#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[inline]
+fn read_u16_le(ptr: *const u8) -> u16 {
+    // SAFETY: callers only pass pointers proven to be valid for at least
+    // 2 bytes. We use read_unaligned because the input buffer may not be
+    // naturally aligned.
+    unsafe { u16::from_le(ptr.cast::<u16>().read_unaligned()) }
+}
+
 #[cfg(feature = "pure-rust")]
 #[inline]
 fn read_u32_le(ptr: *const u8) -> u32 {
@@ -68,6 +77,15 @@ fn read_u32_le(ptr: *const u8) -> u32 {
     // 4 bytes. We use read_unaligned because the input buffer may not be
     // naturally aligned.
     unsafe { u32::from_le(ptr.cast::<u32>().read_unaligned()) }
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[inline]
+fn read_u64_le(ptr: *const u8) -> u64 {
+    // SAFETY: callers only pass pointers proven to be valid for at least
+    // 8 bytes. We use read_unaligned because the input buffer may not be
+    // naturally aligned.
+    unsafe { u64::from_le(ptr.cast::<u64>().read_unaligned()) }
 }
 
 #[cfg(feature = "pure-rust")]
@@ -122,6 +140,8 @@ fn extend_scalar(crc: u32, data: &[u8]) -> u32 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PureRustBackend {
     Scalar,
+    #[cfg(target_arch = "aarch64")]
+    CrcPmullAarch64,
     #[cfg(target_arch = "x86_64")]
     VpclmulX86_64,
     #[cfg(target_arch = "x86_64")]
@@ -147,6 +167,13 @@ fn pure_rust_backend() -> PureRustBackend {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
+    {
+        if has_crc_pmull_aarch64() {
+            return PureRustBackend::CrcPmullAarch64;
+        }
+    }
+
     PureRustBackend::Scalar
 }
 
@@ -162,6 +189,8 @@ fn bench_override_backend() -> Option<PureRustBackend> {
 
         match override_name.as_deref() {
             Some("scalar") => Some(PureRustBackend::Scalar),
+            #[cfg(target_arch = "aarch64")]
+            Some("3crc") if has_crc_pmull_aarch64() => Some(PureRustBackend::CrcPmullAarch64),
             #[cfg(target_arch = "x86_64")]
             Some("vpclmul") if has_vpclmul_x86_64() => Some(PureRustBackend::VpclmulX86_64),
             #[cfg(target_arch = "x86_64")]
@@ -169,6 +198,12 @@ fn bench_override_backend() -> Option<PureRustBackend> {
             _ => None,
         }
     })
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[inline]
+fn has_crc_pmull_aarch64() -> bool {
+    std::arch::is_aarch64_feature_detected!("crc") && std::arch::is_aarch64_feature_detected!("aes")
 }
 
 #[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
@@ -193,6 +228,8 @@ fn extend(crc: u32, data: &[u8]) -> u32 {
     {
         match pure_rust_backend() {
             PureRustBackend::Scalar => extend_scalar(crc, data),
+            #[cfg(target_arch = "aarch64")]
+            PureRustBackend::CrcPmullAarch64 => unsafe { extend_crc_pmull_aarch64(crc, data) },
             #[cfg(target_arch = "x86_64")]
             PureRustBackend::VpclmulX86_64 => unsafe { extend_vpclmul_x86_64(crc, data) },
             #[cfg(target_arch = "x86_64")]
@@ -442,18 +479,128 @@ unsafe fn extend_vpclmul_x86_64(crc: u32, data: &[u8]) -> u32 {
     x86_64_pclmul::extend_vpclmul(crc, data)
 }
 
+#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+mod aarch64_crc_pmull {
+    use core::arch::aarch64::{
+        __crc32b, __crc32d, __crc32h, __crc32w, vgetq_lane_u64, vmull_p64, vreinterpretq_u64_p128,
+    };
+
+    const BLOCK_SIZE: usize = 1024;
+    const STRIPE_BYTES: usize = 336;
+    const FOLD_CRC0: u64 = 0x0000_0000_B486_819B;
+    const FOLD_CRC1: u64 = 0x0000_0000_7627_8617;
+
+    #[inline]
+    #[target_feature(enable = "crc,neon,aes")]
+    unsafe fn fold_crc_word(crc: u32, constant: u64) -> u32 {
+        let folded = vmull_p64(crc as u64, constant);
+        let folded_words = vreinterpretq_u64_p128(folded);
+        __crc32d(0, vgetq_lane_u64::<0>(folded_words))
+    }
+
+    #[target_feature(enable = "crc,neon,aes")]
+    #[inline]
+    unsafe fn update_hw(mut crc: u32, data: &[u8]) -> u32 {
+        let mut remaining = data;
+
+        while remaining.len() >= 16 {
+            crc = __crc32d(crc, super::read_u64_le(remaining.as_ptr()));
+            crc = __crc32d(crc, super::read_u64_le(remaining.as_ptr().add(8)));
+            remaining = &remaining[16..];
+        }
+
+        while remaining.len() >= 8 {
+            crc = __crc32d(crc, super::read_u64_le(remaining.as_ptr()));
+            remaining = &remaining[8..];
+        }
+
+        if remaining.len() >= 4 {
+            crc = __crc32w(crc, super::read_u32_le(remaining.as_ptr()));
+            remaining = &remaining[4..];
+        }
+
+        if remaining.len() >= 2 {
+            crc = __crc32h(crc, super::read_u16_le(remaining.as_ptr()));
+            remaining = &remaining[2..];
+        }
+
+        if let Some(&byte) = remaining.first() {
+            crc = __crc32b(crc, byte);
+        }
+
+        crc
+    }
+
+    #[target_feature(enable = "crc,neon,aes")]
+    #[inline]
+    unsafe fn update_blocks_only(mut crc: u32, data: &[u8]) -> u32 {
+        let mut ptr = data.as_ptr();
+        let end = ptr.add(data.len());
+
+        while ptr < end {
+            let mut crc0 = __crc32d(crc, super::read_u64_le(ptr));
+            let mut crc1 = 0u32;
+            let mut crc2 = 0u32;
+            let mut ptr0 = ptr.add(8);
+            let mut ptr1 = ptr0.add(STRIPE_BYTES);
+            let mut ptr2 = ptr1.add(STRIPE_BYTES);
+
+            for _ in 0..(STRIPE_BYTES / 16) {
+                crc0 = __crc32d(crc0, super::read_u64_le(ptr0));
+                crc0 = __crc32d(crc0, super::read_u64_le(ptr0.add(8)));
+                ptr0 = ptr0.add(16);
+
+                crc1 = __crc32d(crc1, super::read_u64_le(ptr1));
+                crc1 = __crc32d(crc1, super::read_u64_le(ptr1.add(8)));
+                ptr1 = ptr1.add(16);
+
+                crc2 = __crc32d(crc2, super::read_u64_le(ptr2));
+                crc2 = __crc32d(crc2, super::read_u64_le(ptr2.add(8)));
+                ptr2 = ptr2.add(16);
+            }
+
+            crc2 = __crc32d(crc2, super::read_u64_le(ptr2));
+            crc = fold_crc_word(crc0, FOLD_CRC0) ^ fold_crc_word(crc1, FOLD_CRC1) ^ crc2;
+            ptr = ptr.add(BLOCK_SIZE);
+        }
+
+        crc
+    }
+
+    #[target_feature(enable = "crc,neon,aes")]
+    pub unsafe fn extend(crc: u32, data: &[u8]) -> u32 {
+        let mut state = !crc;
+        let prefix_len = data.len() & !(BLOCK_SIZE - 1);
+
+        if prefix_len != 0 {
+            state = update_blocks_only(state, &data[..prefix_len]);
+        }
+
+        state = update_hw(state, &data[prefix_len..]);
+        !state
+    }
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[inline]
+unsafe fn extend_crc_pmull_aarch64(crc: u32, data: &[u8]) -> u32 {
+    aarch64_crc_pmull::extend(crc, data)
+}
+
 /// Return the active CRC-32 backend name for this build and process.
 #[inline]
 pub fn backend_name() -> &'static str {
     #[cfg(feature = "pure-rust")]
     {
-        return match pure_rust_backend() {
+        match pure_rust_backend() {
             PureRustBackend::Scalar => "scalar",
+            #[cfg(target_arch = "aarch64")]
+            PureRustBackend::CrcPmullAarch64 => "aarch64-3crc-fold",
             #[cfg(target_arch = "x86_64")]
             PureRustBackend::VpclmulX86_64 => "x86_64-vpclmulqdq",
             #[cfg(target_arch = "x86_64")]
             PureRustBackend::PclmulX86_64 => "x86_64-pclmulqdq",
-        };
+        }
     }
 
     #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
@@ -598,6 +745,16 @@ mod tests {
             name: "scalar",
         }];
 
+        #[cfg(target_arch = "aarch64")]
+        {
+            if has_crc_pmull_aarch64() {
+                cases.push(BackendCase {
+                    backend: PureRustBackend::CrcPmullAarch64,
+                    name: "aarch64-3crc-fold",
+                });
+            }
+        }
+
         #[cfg(target_arch = "x86_64")]
         {
             if has_vpclmul_x86_64() {
@@ -622,6 +779,8 @@ mod tests {
     fn checksum_with_backend(backend: PureRustBackend, data: &[u8]) -> u32 {
         match backend {
             PureRustBackend::Scalar => extend_scalar(0, data),
+            #[cfg(target_arch = "aarch64")]
+            PureRustBackend::CrcPmullAarch64 => unsafe { extend_crc_pmull_aarch64(0, data) },
             #[cfg(target_arch = "x86_64")]
             PureRustBackend::VpclmulX86_64 => unsafe { extend_vpclmul_x86_64(0, data) },
             #[cfg(target_arch = "x86_64")]
@@ -639,6 +798,8 @@ mod tests {
         for chunk in data.chunks(chunk_size.max(1)) {
             crc = match backend {
                 PureRustBackend::Scalar => extend_scalar(crc, chunk),
+                #[cfg(target_arch = "aarch64")]
+                PureRustBackend::CrcPmullAarch64 => unsafe { extend_crc_pmull_aarch64(crc, chunk) },
                 #[cfg(target_arch = "x86_64")]
                 PureRustBackend::VpclmulX86_64 => unsafe { extend_vpclmul_x86_64(crc, chunk) },
                 #[cfg(target_arch = "x86_64")]
