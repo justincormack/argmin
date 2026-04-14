@@ -123,6 +123,7 @@ fn main() -> Result<(), String> {
         "backend_override={}",
         std::env::var("ARGMIN_CRC64_BENCH_BACKEND").unwrap_or_else(|_| "auto".to_string())
     );
+    println!("backend_selected={}", checksum::crc64::backend_name());
     println!("crc=0x{expected:016X}");
     for (idx, elapsed) in samples.iter().enumerate() {
         println!(

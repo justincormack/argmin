@@ -82,26 +82,15 @@ fn read_u64_le(ptr: *const u8) -> u64 {
 fn extend(crc: u64, data: &[u8]) -> u64 {
     #[cfg(feature = "pure-rust")]
     {
-        #[cfg(feature = "bench-select")]
-        if bench_force_scalar() {
-            return extend_scalar(crc, data);
+        match pure_rust_backend() {
+            PureRustBackend::Scalar => extend_scalar(crc, data),
+            #[cfg(target_arch = "x86_64")]
+            PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(crc, data) },
+            #[cfg(target_arch = "aarch64")]
+            PureRustBackend::PmullSha3Aarch64 => unsafe { extend_pmull_sha3_aarch64(crc, data) },
+            #[cfg(target_arch = "aarch64")]
+            PureRustBackend::PmullAarch64 => unsafe { extend_pmull_aarch64(crc, data) },
         }
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            if std::arch::is_x86_feature_detected!("pclmulqdq") {
-                return unsafe { extend_pclmul_x86_64(crc, data) };
-            }
-        }
-
-        #[cfg(target_arch = "aarch64")]
-        {
-            if std::arch::is_aarch64_feature_detected!("aes") {
-                return unsafe { extend_pmull_aarch64(crc, data) };
-            }
-        }
-
-        extend_scalar(crc, data)
     }
 
     #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
@@ -111,6 +100,49 @@ fn extend(crc: u64, data: &[u8]) -> u64 {
         // never dereferenced (len=0).
         unsafe { ec_sys::crc64_rocksoft_refl(crc, data.as_ptr(), data.len() as u64) }
     }
+}
+
+#[cfg(feature = "pure-rust")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PureRustBackend {
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    PclmulX86_64,
+    #[cfg(target_arch = "aarch64")]
+    PmullSha3Aarch64,
+    #[cfg(target_arch = "aarch64")]
+    PmullAarch64,
+}
+
+#[cfg(feature = "pure-rust")]
+#[inline]
+fn pure_rust_backend() -> PureRustBackend {
+    #[cfg(feature = "bench-select")]
+    if bench_force_scalar() {
+        return PureRustBackend::Scalar;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("pclmulqdq") {
+            return PureRustBackend::PclmulX86_64;
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("aes")
+            && std::arch::is_aarch64_feature_detected!("sha3")
+        {
+            return PureRustBackend::PmullSha3Aarch64;
+        }
+
+        if std::arch::is_aarch64_feature_detected!("aes") {
+            return PureRustBackend::PmullAarch64;
+        }
+    }
+
+    PureRustBackend::Scalar
 }
 
 #[cfg(all(feature = "pure-rust", feature = "bench-select"))]
@@ -477,12 +509,80 @@ mod aarch64_pmull {
 
         !reduce_to_crc(x3)
     }
+
+    #[target_feature(enable = "neon,aes,sha3")]
+    pub unsafe fn extend_sha3(crc: u64, data: &[u8]) -> u64 {
+        let prefix_len = data.len() & !0x3F;
+        if prefix_len < 64 {
+            return super::extend_scalar(crc, data);
+        }
+
+        let (prefix, tail) = data.split_at(prefix_len);
+        let prefix_crc = extend_blocks_only_sha3(crc, prefix);
+        super::extend_scalar(prefix_crc, tail)
+    }
+
+    #[target_feature(enable = "neon,aes,sha3")]
+    unsafe fn extend_blocks_only_sha3(crc: u64, data: &[u8]) -> u64 {
+        let p4 = poly64x2(P4_LOW, P4_HIGH);
+        let p1 = poly64x2(P1_LOW, P1_HIGH);
+        let mut ptr = data.as_ptr();
+        let end = ptr.add(data.len());
+
+        let mut x0 = xor_crc(load_block(ptr), !crc);
+        let mut x1 = load_block(ptr.add(16));
+        let mut x2 = load_block(ptr.add(32));
+        let mut x3 = load_block(ptr.add(48));
+        ptr = ptr.add(64);
+
+        while ptr < end {
+            x0 = fold_block(x0, load_block(ptr), p4);
+            x1 = fold_block(x1, load_block(ptr.add(16)), p4);
+            x2 = fold_block(x2, load_block(ptr.add(32)), p4);
+            x3 = fold_block(x3, load_block(ptr.add(48)), p4);
+            ptr = ptr.add(64);
+        }
+
+        x1 = veorq_u8(x1, fold_without_next(x0, p1));
+        x2 = veorq_u8(x2, fold_without_next(x1, p1));
+        x3 = veorq_u8(x3, fold_without_next(x2, p1));
+
+        !reduce_to_crc(x3)
+    }
 }
 
 #[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
 #[inline]
 unsafe fn extend_pmull_aarch64(crc: u64, data: &[u8]) -> u64 {
     aarch64_pmull::extend(crc, data)
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[inline]
+unsafe fn extend_pmull_sha3_aarch64(crc: u64, data: &[u8]) -> u64 {
+    aarch64_pmull::extend_sha3(crc, data)
+}
+
+/// Return the active CRC64 backend name for this build and process.
+#[inline]
+pub fn backend_name() -> &'static str {
+    #[cfg(feature = "pure-rust")]
+    {
+        match pure_rust_backend() {
+            PureRustBackend::Scalar => "scalar",
+            #[cfg(target_arch = "x86_64")]
+            PureRustBackend::PclmulX86_64 => "x86_64-pclmulqdq",
+            #[cfg(target_arch = "aarch64")]
+            PureRustBackend::PmullSha3Aarch64 => "aarch64-pmull+sha3",
+            #[cfg(target_arch = "aarch64")]
+            PureRustBackend::PmullAarch64 => "aarch64-pmull",
+        }
+    }
+
+    #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
+    {
+        "isa-l"
+    }
 }
 
 /// Compute CRC-64/NVME over the entire buffer.
