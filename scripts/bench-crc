@@ -25,32 +25,28 @@ echo "ec_data_shards=$EC_DATA_SHARDS ec_parity_shards=$EC_PARITY_SHARDS ec_recov
 
 echo
 echo "[crc64 native scalar]"
-ARGMIN_CRC64_BENCH_BACKEND=scalar cargo run --offline -p checksum --example crc64_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --label native-scalar
+ARGMIN_CRC64_BENCH_BACKEND=scalar cargo run --offline -p checksum --example crc64_bench --release --features bench-select -- "${common_args[@]}" --label native-scalar
 
 echo
 echo "[crc64 native auto]"
-cargo run --offline -p checksum --example crc64_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --label native-auto
+cargo run --offline -p checksum --example crc64_bench --release --features bench-select -- "${common_args[@]}" --label native-auto
 
 echo
 echo "[crc32 native scalar]"
-ARGMIN_CRC32_BENCH_BACKEND=scalar cargo run --offline -p checksum --example crc_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --algorithm crc32 --label crc32-native-scalar
+ARGMIN_CRC32_BENCH_BACKEND=scalar cargo run --offline -p checksum --example crc_bench --release --features bench-select -- "${common_args[@]}" --algorithm crc32 --label crc32-native-scalar
 
 echo
 echo "[crc32 native auto]"
-cargo run --offline -p checksum --example crc_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --algorithm crc32 --label crc32-native-auto
+cargo run --offline -p checksum --example crc_bench --release --features bench-select -- "${common_args[@]}" --algorithm crc32 --label crc32-native-auto
 
 echo
 echo "[crc32c native scalar]"
-ARGMIN_CRC32C_BENCH_BACKEND=scalar cargo run --offline -p checksum --example crc_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --algorithm crc32c --label crc32c-native-scalar
+ARGMIN_CRC32C_BENCH_BACKEND=scalar cargo run --offline -p checksum --example crc_bench --release --features bench-select -- "${common_args[@]}" --algorithm crc32c --label crc32c-native-scalar
 
 echo
 echo "[crc32c native auto]"
-cargo run --offline -p checksum --example crc_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --algorithm crc32c --label crc32c-native-auto
+cargo run --offline -p checksum --example crc_bench --release --features bench-select -- "${common_args[@]}" --algorithm crc32c --label crc32c-native-auto
 
 echo
 echo "[ec reconstruct native]"
-cargo run --offline -p ec --example ec_bench --release --no-default-features --features native-backend,real-backend -- "${common_args[@]}" --backend native --data-shards "$EC_DATA_SHARDS" --parity-shards "$EC_PARITY_SHARDS" --recover-index "$EC_RECOVER_INDEX" --label ec-native-reconstruct
-
-echo
-echo "[ec reconstruct isa-l]"
-cargo run --offline -p ec --example ec_bench --release --no-default-features --features native-backend,real-backend -- "${common_args[@]}" --backend isa-l --data-shards "$EC_DATA_SHARDS" --parity-shards "$EC_PARITY_SHARDS" --recover-index "$EC_RECOVER_INDEX" --label ec-isa-l-reconstruct
+cargo run --offline -p ec --example ec_bench --release -- "${common_args[@]}" --mode reconstruct --data-shards "$EC_DATA_SHARDS" --parity-shards "$EC_PARITY_SHARDS" --recover-index "$EC_RECOVER_INDEX" --label ec-native-reconstruct

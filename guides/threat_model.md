@@ -4,7 +4,7 @@ Note this will continue to evolve as more features around users, direct TLS
 support, and encryption are added.
 
 ## 1. Overview
-Argmin2 is a single-node, S3-compatible object storage server written in Rust (the `argmin-s3` binary). It exposes an HTTP/1 endpoint implementing a subset of S3 APIs (bucket/object CRUD, multipart uploads, tagging, CORS, ACLs, etc.) using path-style addressing. Requests are parsed in `server-http`, authenticated using AWS Signature Version 4 in the `auth` crate, and dispatched to `server-core`, which enforces bucket/object authorization and orchestrates erasure-coded storage. Object data and metadata are persisted locally: shard files on disk plus per-placement-group SQLite metadata databases (`storage` crate). Data integrity uses CRC64-NVME checksums and verified reads; erasure coding via ISA‑L (`ec`/`ec-sys`) provides redundancy.
+Argmin2 is a single-node, S3-compatible object storage server written in Rust (the `argmin-s3` binary). It exposes an HTTP/1 endpoint implementing a subset of S3 APIs (bucket/object CRUD, multipart uploads, tagging, CORS, ACLs, etc.) using path-style addressing. Requests are parsed in `server-http`, authenticated using AWS Signature Version 4 in the `auth` crate, and dispatched to `server-core`, which enforces bucket/object authorization and orchestrates erasure-coded storage. Object data and metadata are persisted locally: shard files on disk plus per-placement-group SQLite metadata databases (`storage` crate). Data integrity uses CRC64-NVME checksums and verified reads; erasure coding via native Rust backends provides redundancy.
 Typical deployments are local or internal S3-compatible storage for testing or
 lightweight environments, configured by environment variables. Security is
 centered on SigV4 authentication plus optional public bucket ACLs. The server
@@ -24,7 +24,6 @@ assumption is transitional, not the intended end state for `SSE-C`.
 - **Network boundary:** All HTTP request components (method, path, query string, headers, body, XML, multipart form fields, aws-chunked frames) are attacker-controlled.
 - **Authentication boundary:** `auth::authenticate_request` and `auth::authenticate_post_sigv4` are the primary gates; any bug here impacts all operations.
 - **Core/storage boundary:** `server-core` assumes validated bucket/key strings and authenticated `Requester` identity; `storage` assumes internal shard keys and well-formed metadata.
-- **FFI boundary:** `ec-sys` and ISA‑L routines operate on untrusted data; memory safety depends on correct FFI usage and bounds checks.
 - **Configuration boundary:** Environment variables control credentials, listen address, limits, data directory, and tracing output.
 - **Developer boundary:** Test utilities (`crates/s3-tests`, `test-util`) and build scripts are not part of production runtime.
 
@@ -52,7 +51,7 @@ assumption is transitional, not the intended end state for `SSE-C`.
 ### Object data handling, integrity, and streaming
 - **Streaming uploads:** aws-chunked decoding and per-chunk signatures (`chunked.rs`, `serve.rs`) with chunk size validation, trailer checksum verification, and size caps (`MAX_OBJECT_SIZE`).
 - **Integrity:** CRC64-NVME checksums on writes and reads, with shard quarantine on mismatch (`storage/pg_store.rs`, `checksum` crate). ETags use CRC64.
-- **Erasure coding:** ISA‑L via `ec`/`ec-sys` provides redundancy; unsafe FFI boundaries are a potential memory-safety risk if misused.
+- **Erasure coding:** native Rust erasure coding provides redundancy with architecture-specific SIMD paths on supported CPUs.
 - **Multipart uploads:** XML parsing for `CompleteMultipartUpload` and delete/multipart controls (`xml.rs`); risks include orphaned uploads consuming space.
 
 ### Metadata and storage layer
@@ -79,7 +78,7 @@ assumption is transitional, not the intended end state for `SSE-C`.
 - Database migrations are not currently supported or implemented, and older schemas are not supported until a future date when stability will be declared.
 
 ## 4. Criticality calibration (critical, high, medium, low)
-- **Critical:** remote code execution (e.g., unsafe FFI memory corruption), SigV4 auth bypass allowing unauthenticated read/write/delete of private buckets, or leakage of access keys/secrets.
+- **Critical:** remote code execution, SigV4 auth bypass allowing unauthenticated read/write/delete of private buckets, or leakage of access keys/secrets.
 - **High:** authorization bugs that allow public write/read when ACLs forbid it, path traversal allowing writes outside `ARGMIN_DATA_DIR`, or metadata corruption causing permanent data loss.
 - **Medium:** transient denial of service (CPU/memory spikes, excessive multipart uploads) or information disclosure of bucket metadata that does not expose object data.
 - **Low:** minor logging of non-sensitive metadata, incorrect error codes, or edge-case canonicalization mismatches that only affect interoperability.

@@ -2,12 +2,6 @@ use std::hint::black_box;
 use std::time::Instant;
 
 #[derive(Clone, Copy)]
-enum BackendChoice {
-    Native,
-    IsaL,
-}
-
-#[derive(Clone, Copy)]
 enum BenchMode {
     Encode,
     Verify,
@@ -15,7 +9,6 @@ enum BenchMode {
 }
 
 struct Config {
-    backend: BackendChoice,
     mode: BenchMode,
     label: String,
     size_mib: usize,
@@ -55,10 +48,8 @@ trait Backend {
     ) -> Result<(), Self::Error>;
 }
 
-#[cfg(feature = "native-backend")]
 struct NativeBackend;
 
-#[cfg(feature = "native-backend")]
 impl Backend for NativeBackend {
     type Codec = ec_native::ErasureCodec;
     type Config = ec_native::EcConfig;
@@ -106,59 +97,7 @@ impl Backend for NativeBackend {
     }
 }
 
-#[cfg(feature = "real-backend")]
-struct RealBackend;
-
-#[cfg(feature = "real-backend")]
-impl Backend for RealBackend {
-    type Codec = ec_real::ErasureCodec;
-    type Config = ec_real::EcConfig;
-    type Error = ec_real::EcError;
-
-    fn config(data_shards: u8, parity_shards: u8) -> Result<Self::Config, Self::Error> {
-        ec_real::EcConfig::new(data_shards, parity_shards)
-    }
-
-    fn codec(config: Self::Config) -> Result<Self::Codec, Self::Error> {
-        ec_real::ErasureCodec::new(config)
-    }
-
-    fn encode(
-        codec: &Self::Codec,
-        data: &[&[u8]],
-        parity: &mut [&mut [u8]],
-    ) -> Result<(), Self::Error> {
-        codec.encode(data, parity)
-    }
-
-    fn verify_scratch_size(codec: &Self::Codec, shard_size: usize) -> usize {
-        codec.verify_scratch_size(shard_size)
-    }
-
-    fn verify(
-        codec: &Self::Codec,
-        data: &[&[u8]],
-        parity: &[&[u8]],
-        scratch: &mut [u8],
-    ) -> Result<bool, Self::Error> {
-        codec
-            .verify(data, parity, scratch)
-            .map(|result| matches!(result, ec_real::VerifyResult::Ok))
-    }
-
-    fn reconstruct(
-        codec: &Self::Codec,
-        present_indices: &[usize],
-        present_data: &[&[u8]],
-        recover_indices: &[usize],
-        outputs: &mut [&mut [u8]],
-    ) -> Result<(), Self::Error> {
-        codec.reconstruct(present_indices, present_data, recover_indices, outputs)
-    }
-}
-
 fn parse_args() -> Result<Config, String> {
-    let mut backend = None;
     let mut mode = BenchMode::Reconstruct;
     let mut label = None;
     let mut size_mib = 8usize;
@@ -172,16 +111,6 @@ fn parse_args() -> Result<Config, String> {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--backend" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| "missing value for --backend".to_string())?;
-                backend = Some(match value.as_str() {
-                    "native" => BackendChoice::Native,
-                    "isa-l" => BackendChoice::IsaL,
-                    _ => return Err(format!("unsupported backend: {value}")),
-                });
-            }
             "--mode" => {
                 let value = args
                     .next()
@@ -222,21 +151,16 @@ fn parse_args() -> Result<Config, String> {
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: ec_bench --backend native|isa-l [--mode encode|verify|reconstruct] [--label NAME] [--size-mib N] [--warmup-iters N] [--sample-iters N] [--samples N] [--data-shards N] [--parity-shards N] [--recover-index N]".to_string(),
+                    "usage: ec_bench [--mode encode|verify|reconstruct] [--label NAME] [--size-mib N] [--warmup-iters N] [--sample-iters N] [--samples N] [--data-shards N] [--parity-shards N] [--recover-index N]".to_string(),
                 );
             }
             _ => return Err(format!("unknown argument: {arg}")),
         }
     }
 
-    let backend = backend.ok_or_else(|| "missing required --backend".to_string())?;
-    let label = label.unwrap_or_else(|| match backend {
-        BackendChoice::Native => "ec-native".to_string(),
-        BackendChoice::IsaL => "ec-isa-l".to_string(),
-    });
+    let label = label.unwrap_or_else(|| "ec-native".to_string());
 
     Ok(Config {
-        backend,
         mode,
         label,
         size_mib,
@@ -486,27 +410,5 @@ fn run_backend<B: Backend>(config: &Config) -> Result<(), String> {
 
 fn main() -> Result<(), String> {
     let config = parse_args()?;
-
-    match config.backend {
-        BackendChoice::Native => {
-            #[cfg(feature = "native-backend")]
-            {
-                run_backend::<NativeBackend>(&config)
-            }
-            #[cfg(not(feature = "native-backend"))]
-            {
-                Err("native backend not enabled for this build".to_string())
-            }
-        }
-        BackendChoice::IsaL => {
-            #[cfg(feature = "real-backend")]
-            {
-                run_backend::<RealBackend>(&config)
-            }
-            #[cfg(not(feature = "real-backend"))]
-            {
-                Err("isa-l backend not enabled for this build".to_string())
-            }
-        }
-    }
+    run_backend::<NativeBackend>(&config)
 }

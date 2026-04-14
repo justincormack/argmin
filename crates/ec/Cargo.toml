@@ -3,11 +3,5 @@ name = "ec"
 version = "0.1.0"
 edition = "2021"
 
-[features]
-default = ["real-backend"]
-real-backend = ["dep:ec-real"]
-native-backend = ["dep:ec-native"]
-
 [dependencies]
-ec-real = { path = "../ec-real", optional = true }
-ec-native = { path = "../ec-native", optional = true }
+ec-native = { path = "../ec-native" }

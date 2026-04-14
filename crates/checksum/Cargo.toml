@@ -4,13 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = ["isa-l"]
-isa-l = ["dep:ec-sys"]
-pure-rust = []
 bench-select = []
-
-[dependencies]
-ec-sys = { path = "../ec-sys", optional = true }
 
 [dev-dependencies]
 proptest = "1"

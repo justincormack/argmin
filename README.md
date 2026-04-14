@@ -1,7 +1,7 @@
 # argmin
 
 S3-compatible object storage written in Rust. Single-node, synchronous IO,
-erasure-coded with ISA-L.
+erasure-coded with native Rust backends.
 
 This is the v1-minimal implementation: path-style addressing, AWS SigV4
 authentication, per-PG SQLite metadata, and CRC64-NVME integrity checking.
@@ -9,18 +9,6 @@ authentication, per-PG SQLite metadata, and CRC64-NVME integrity checking.
 ## Prerequisites
 
 - **Rust** toolchain (2021 edition)
-- **ISA-L** development library
-- **pkg-config**
-
-Install ISA-L:
-
-```bash
-# Debian/Ubuntu
-apt install libisal-dev
-
-# macOS
-brew install isa-l
-```
 
 ## Build
 
@@ -29,32 +17,6 @@ cargo build --release
 ```
 
 The binary is at `target/release/argmin-s3`.
-
-## Test-Only Build Variants
-
-Two non-default build modes exist for testing and mock-server use:
-
-- `null-ec`
-  - Replaces the ISA-L erasure-coding backend with the minimal null backend.
-  - This backend only supports `parity_shards = 0`.
-- `pure-rust`
-  - Implies `null-ec` and also switches CRC32, CRC32C, and CRC64 to the pure-Rust checksum backend.
-  - This avoids linking against ISA-L entirely.
-
-Examples:
-
-```bash
-# Null EC backend, but still using ISA-L-backed checksums.
-cargo build -p argmin-s3 --release --no-default-features --features null-ec,isa-l-crc
-
-# Fully pure-Rust test build.
-cargo build -p argmin-s3 --release --no-default-features --features pure-rust
-```
-
-These modes are for test harnesses, mock-server usage, and environments where
-linking ISA-L is undesirable. They are not production configurations. Production
-builds should continue using the default ISA-L-backed erasure-coding and
-checksum path.
 
 ## Run
 
@@ -208,7 +170,7 @@ by default for custom endpoints.
 
 ## Architecture
 
-- **Erasure coding**: (4,2) Reed-Solomon via ISA-L
+- **Erasure coding**: (4,2) Reed-Solomon via native Rust backends
 - **Storage**: per-placement-group SQLite metadata + shard files
 - **Integrity**: CRC64-NVME on every read; mismatches quarantine the shard
 - **Auth**: AWS Signature Version 4
@@ -231,19 +193,6 @@ or trailing hyphens, no consecutive periods, and not formatted as an IP address.
 ```bash
 cargo test --workspace
 ```
-
-For local testing there are also non-production build variants:
-
-```bash
-# Run the embedded server tests with the null EC backend.
-cargo test -p s3-tests --no-default-features --features null-ec,isa-l-crc
-
-# Run the embedded server tests with the fully pure-Rust build.
-cargo test -p s3-tests --no-default-features --features pure-rust
-```
-
-These variants exist for testing only. They are not representative of the
-intended production build.
 
 To run `s3-tests` against an external endpoint such as AWS S3:
 
