@@ -6,8 +6,8 @@ edition = "2021"
 [features]
 default = ["real-backend"]
 real-backend = ["dep:ec-real"]
-native-backend = ["dep:ec-null"]
+native-backend = ["dep:ec-native"]
 
 [dependencies]
 ec-real = { path = "../ec-real", optional = true }
-ec-null = { path = "../ec-null", optional = true }
+ec-native = { path = "../ec-native", optional = true }

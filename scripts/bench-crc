@@ -8,6 +8,9 @@ SIZE_MIB="${SIZE_MIB:-8}"
 WARMUP_ITERS="${WARMUP_ITERS:-32}"
 SAMPLE_ITERS="${SAMPLE_ITERS:-256}"
 SAMPLES="${SAMPLES:-5}"
+EC_DATA_SHARDS="${EC_DATA_SHARDS:-6}"
+EC_PARITY_SHARDS="${EC_PARITY_SHARDS:-2}"
+EC_RECOVER_INDEX="${EC_RECOVER_INDEX:-0}"
 
 common_args=(
   --size-mib "$SIZE_MIB"
@@ -18,6 +21,7 @@ common_args=(
 
 echo "cpu=$(uname -m)"
 echo "size_mib=$SIZE_MIB warmup_iters=$WARMUP_ITERS sample_iters=$SAMPLE_ITERS samples=$SAMPLES"
+echo "ec_data_shards=$EC_DATA_SHARDS ec_parity_shards=$EC_PARITY_SHARDS ec_recover_index=$EC_RECOVER_INDEX"
 
 echo
 echo "[crc64 native scalar]"
@@ -42,3 +46,11 @@ ARGMIN_CRC32C_BENCH_BACKEND=scalar cargo run --offline -p checksum --example crc
 echo
 echo "[crc32c native auto]"
 cargo run --offline -p checksum --example crc_bench --release --no-default-features --features pure-rust,bench-select -- "${common_args[@]}" --algorithm crc32c --label crc32c-native-auto
+
+echo
+echo "[ec reconstruct native]"
+cargo run --offline -p ec --example ec_bench --release --no-default-features --features native-backend,real-backend -- "${common_args[@]}" --backend native --data-shards "$EC_DATA_SHARDS" --parity-shards "$EC_PARITY_SHARDS" --recover-index "$EC_RECOVER_INDEX" --label ec-native-reconstruct
+
+echo
+echo "[ec reconstruct isa-l]"
+cargo run --offline -p ec --example ec_bench --release --no-default-features --features native-backend,real-backend -- "${common_args[@]}" --backend isa-l --data-shards "$EC_DATA_SHARDS" --parity-shards "$EC_PARITY_SHARDS" --recover-index "$EC_RECOVER_INDEX" --label ec-isa-l-reconstruct

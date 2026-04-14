@@ -1,5 +1,5 @@
 #[cfg(feature = "native-backend")]
-pub use ec_null::*;
+pub use ec_native::*;
 
 #[cfg(all(not(feature = "native-backend"), feature = "real-backend"))]
 pub use ec_real::*;
