@@ -85,6 +85,8 @@ fn extend(crc: u64, data: &[u8]) -> u64 {
         match pure_rust_backend() {
             PureRustBackend::Scalar => extend_scalar(crc, data),
             #[cfg(target_arch = "x86_64")]
+            PureRustBackend::Avx512X86_64 => unsafe { extend_avx512_x86_64(crc, data) },
+            #[cfg(target_arch = "x86_64")]
             PureRustBackend::VpclmulX86_64 => unsafe { extend_vpclmul_x86_64(crc, data) },
             #[cfg(target_arch = "x86_64")]
             PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(crc, data) },
@@ -109,6 +111,8 @@ fn extend(crc: u64, data: &[u8]) -> u64 {
 enum PureRustBackend {
     Scalar,
     #[cfg(target_arch = "x86_64")]
+    Avx512X86_64,
+    #[cfg(target_arch = "x86_64")]
     VpclmulX86_64,
     #[cfg(target_arch = "x86_64")]
     PclmulX86_64,
@@ -128,6 +132,10 @@ fn pure_rust_backend() -> PureRustBackend {
 
     #[cfg(target_arch = "x86_64")]
     {
+        if has_avx512_x86_64() {
+            return PureRustBackend::Avx512X86_64;
+        }
+
         if has_vpclmul_x86_64() {
             return PureRustBackend::VpclmulX86_64;
         }
@@ -166,6 +174,8 @@ fn bench_override_backend() -> Option<PureRustBackend> {
         match override_name.as_deref() {
             Some("scalar") => Some(PureRustBackend::Scalar),
             #[cfg(target_arch = "x86_64")]
+            Some("avx512") if has_avx512_x86_64() => Some(PureRustBackend::Avx512X86_64),
+            #[cfg(target_arch = "x86_64")]
             Some("vpclmul") if has_vpclmul_x86_64() => Some(PureRustBackend::VpclmulX86_64),
             #[cfg(target_arch = "x86_64")]
             Some("pclmul") if has_pclmul_x86_64() => Some(PureRustBackend::PclmulX86_64),
@@ -197,6 +207,14 @@ fn has_vpclmul_x86_64() -> bool {
     std::arch::is_x86_feature_detected!("pclmulqdq")
         && std::arch::is_x86_feature_detected!("vpclmulqdq")
         && std::arch::is_x86_feature_detected!("avx2")
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[inline]
+fn has_avx512_x86_64() -> bool {
+    std::arch::is_x86_feature_detected!("pclmulqdq")
+        && std::arch::is_x86_feature_detected!("vpclmulqdq")
+        && std::arch::is_x86_feature_detected!("avx512f")
 }
 
 #[cfg(feature = "pure-rust")]
@@ -252,10 +270,12 @@ fn extend_scalar(crc: u64, data: &[u8]) -> u64 {
 #[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
 mod x86_64_pclmul {
     use core::arch::x86_64::{
-        __m128i, __m256i, _mm256_castsi256_si128, _mm256_clmulepi64_epi128,
+        __m128i, __m256i, __m512i, _mm256_castsi256_si128, _mm256_clmulepi64_epi128,
         _mm256_extracti128_si256, _mm256_load_si256, _mm256_loadu_si256, _mm256_set_epi64x,
-        _mm256_xor_si256, _mm_clmulepi64_si128, _mm_load_si128, _mm_loadu_si128, _mm_set_epi64x,
-        _mm_slli_si128, _mm_srli_si128, _mm_xor_si128,
+        _mm256_xor_si256, _mm512_clmulepi64_epi128, _mm512_extracti32x4_epi32, _mm512_loadu_si512,
+        _mm512_set_epi64, _mm512_ternarylogic_epi64, _mm512_xor_si512, _mm_clmulepi64_si128,
+        _mm_load_si128, _mm_loadu_si128, _mm_set_epi64x, _mm_slli_si128, _mm_srli_si128,
+        _mm_xor_si128,
     };
 
     #[repr(align(16))]
@@ -264,12 +284,19 @@ mod x86_64_pclmul {
     #[repr(align(32))]
     struct Aligned256([u64; 4]);
 
+    #[repr(align(64))]
+    struct Aligned512([u64; 8]);
+
     const fn aligned(lo: u64, hi: u64) -> Aligned {
         Aligned([lo, hi])
     }
 
     const fn aligned256(a0: u64, a1: u64, a2: u64, a3: u64) -> Aligned256 {
         Aligned256([a0, a1, a2, a3])
+    }
+
+    const fn aligned512(values: [u64; 8]) -> Aligned512 {
+        Aligned512(values)
     }
 
     // Constants copied from ISA-L's crc64_rocksoft_refl_const block.
@@ -289,6 +316,26 @@ mod x86_64_pclmul {
         0x5f852fb61e8d92dc,
         0xa1ca681e733f9c40,
     );
+    static FOLD_16X4: Aligned512 = aligned512([
+        0xa043808c0f782663,
+        0x37ccd3e14069cabc,
+        0xa043808c0f782663,
+        0x37ccd3e14069cabc,
+        0xa043808c0f782663,
+        0x37ccd3e14069cabc,
+        0xa043808c0f782663,
+        0x37ccd3e14069cabc,
+    ]);
+    static FOLD_8X4: Aligned512 = aligned512([
+        0x5f852fb61e8d92dc,
+        0xa1ca681e733f9c40,
+        0x5f852fb61e8d92dc,
+        0xa1ca681e733f9c40,
+        0x5f852fb61e8d92dc,
+        0xa1ca681e733f9c40,
+        0x5f852fb61e8d92dc,
+        0xa1ca681e733f9c40,
+    ]);
     static FOLD_7_6: Aligned256 = aligned256(
         0x946588403d4adcbc,
         0xd083dd594d96319d,
@@ -333,6 +380,18 @@ mod x86_64_pclmul {
     }
 
     #[inline]
+    fn load_aligned512(value: &Aligned512) -> __m512i {
+        // SAFETY: the wrapper guarantees 64-byte alignment and valid storage.
+        unsafe { _mm512_loadu_si512(value.0.as_ptr().cast()) }
+    }
+
+    #[inline]
+    fn load_block512(ptr: *const u8) -> __m512i {
+        // SAFETY: callers only pass pointers valid for 64 readable bytes.
+        unsafe { _mm512_loadu_si512(ptr.cast()) }
+    }
+
+    #[inline]
     fn xor_crc(block: __m128i, crc: u64) -> __m128i {
         unsafe { _mm_xor_si128(block, _mm_set_epi64x(0, crc as i64)) }
     }
@@ -340,6 +399,11 @@ mod x86_64_pclmul {
     #[inline]
     fn xor_crc256(block: __m256i, crc: u64) -> __m256i {
         unsafe { _mm256_xor_si256(block, _mm256_set_epi64x(0, 0, 0, crc as i64)) }
+    }
+
+    #[inline]
+    fn xor_crc512(block: __m512i, crc: u64) -> __m512i {
+        unsafe { _mm512_xor_si512(block, _mm512_set_epi64(0, 0, 0, 0, 0, 0, 0, crc as i64)) }
     }
 
     #[inline]
@@ -375,6 +439,24 @@ mod x86_64_pclmul {
             let lo = _mm256_clmulepi64_epi128::<0x01>(x, constant);
             let hi = _mm256_clmulepi64_epi128::<0x10>(x, constant);
             _mm256_xor_si256(lo, hi)
+        }
+    }
+
+    #[inline]
+    fn fold_block512(x: __m512i, next: __m512i, constant: __m512i) -> __m512i {
+        unsafe {
+            let lo = _mm512_clmulepi64_epi128::<0x01>(x, constant);
+            let hi = _mm512_clmulepi64_epi128::<0x10>(x, constant);
+            _mm512_ternarylogic_epi64::<0x96>(lo, hi, next)
+        }
+    }
+
+    #[inline]
+    fn fold_without_next512(x: __m512i, constant: __m512i) -> __m512i {
+        unsafe {
+            let lo = _mm512_clmulepi64_epi128::<0x01>(x, constant);
+            let hi = _mm512_clmulepi64_epi128::<0x10>(x, constant);
+            _mm512_xor_si512(lo, hi)
         }
     }
 
@@ -418,6 +500,19 @@ mod x86_64_pclmul {
         let prefix_len = prefix_len & !0x7F;
         let (prefix, tail) = data.split_at(prefix_len);
         let prefix_crc = extend_blocks_only_vpclmul(crc, prefix);
+        super::extend_scalar(prefix_crc, tail)
+    }
+
+    #[target_feature(enable = "pclmulqdq,vpclmulqdq,avx512f")]
+    pub unsafe fn extend_avx512(crc: u64, data: &[u8]) -> u64 {
+        let prefix_len = data.len() & !0x0F;
+        if prefix_len < 256 {
+            return extend_vpclmul(crc, data);
+        }
+
+        let prefix_len = prefix_len & !0xFF;
+        let (prefix, tail) = data.split_at(prefix_len);
+        let prefix_crc = extend_blocks_only_avx512(crc, prefix);
         super::extend_scalar(prefix_crc, tail)
     }
 
@@ -514,6 +609,50 @@ mod x86_64_pclmul {
 
         !reduce_to_crc(state)
     }
+
+    #[target_feature(enable = "pclmulqdq,vpclmulqdq,avx512f")]
+    unsafe fn extend_blocks_only_avx512(crc: u64, data: &[u8]) -> u64 {
+        let fold_16x4 = load_aligned512(&FOLD_16X4);
+        let fold_8x4 = load_aligned512(&FOLD_8X4);
+        let mut ptr = data.as_ptr();
+        let end = ptr.add(data.len());
+
+        let mut x0 = xor_crc512(load_block512(ptr), !crc);
+        let mut x1 = load_block512(ptr.add(64));
+        let mut x2 = load_block512(ptr.add(128));
+        let mut x3 = load_block512(ptr.add(192));
+        ptr = ptr.add(256);
+
+        while ptr < end {
+            x0 = fold_block512(x0, load_block512(ptr), fold_16x4);
+            x1 = fold_block512(x1, load_block512(ptr.add(64)), fold_16x4);
+            x2 = fold_block512(x2, load_block512(ptr.add(128)), fold_16x4);
+            x3 = fold_block512(x3, load_block512(ptr.add(192)), fold_16x4);
+            ptr = ptr.add(256);
+        }
+
+        x2 = _mm512_xor_si512(x2, fold_without_next512(x0, fold_8x4));
+        x3 = _mm512_xor_si512(x3, fold_without_next512(x1, fold_8x4));
+
+        let lane0 = _mm512_extracti32x4_epi32::<0>(x2);
+        let lane1 = _mm512_extracti32x4_epi32::<1>(x2);
+        let lane2 = _mm512_extracti32x4_epi32::<2>(x2);
+        let lane3 = _mm512_extracti32x4_epi32::<3>(x2);
+        let lane4 = _mm512_extracti32x4_epi32::<0>(x3);
+        let lane5 = _mm512_extracti32x4_epi32::<1>(x3);
+        let lane6 = _mm512_extracti32x4_epi32::<2>(x3);
+        let mut state = _mm512_extracti32x4_epi32::<3>(x3);
+
+        state = _mm_xor_si128(state, fold_without_next(lane0, load_aligned(&FOLD_7)));
+        state = _mm_xor_si128(state, fold_without_next(lane1, load_aligned(&FOLD_6)));
+        state = _mm_xor_si128(state, fold_without_next(lane2, load_aligned(&FOLD_5)));
+        state = _mm_xor_si128(state, fold_without_next(lane3, load_aligned(&FOLD_4)));
+        state = _mm_xor_si128(state, fold_without_next(lane4, load_aligned(&FOLD_3)));
+        state = _mm_xor_si128(state, fold_without_next(lane5, load_aligned(&FOLD_2)));
+        state = _mm_xor_si128(state, fold_without_next(lane6, load_aligned(&FOLD_1)));
+
+        !reduce_to_crc(state)
+    }
 }
 
 #[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
@@ -526,6 +665,12 @@ unsafe fn extend_pclmul_x86_64(crc: u64, data: &[u8]) -> u64 {
 #[inline]
 unsafe fn extend_vpclmul_x86_64(crc: u64, data: &[u8]) -> u64 {
     x86_64_pclmul::extend_vpclmul(crc, data)
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[inline]
+unsafe fn extend_avx512_x86_64(crc: u64, data: &[u8]) -> u64 {
+    x86_64_pclmul::extend_avx512(crc, data)
 }
 
 #[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
@@ -729,6 +874,8 @@ pub fn backend_name() -> &'static str {
         match pure_rust_backend() {
             PureRustBackend::Scalar => "scalar",
             #[cfg(target_arch = "x86_64")]
+            PureRustBackend::Avx512X86_64 => "x86_64-avx512-vpclmulqdq",
+            #[cfg(target_arch = "x86_64")]
             PureRustBackend::VpclmulX86_64 => "x86_64-vpclmulqdq",
             #[cfg(target_arch = "x86_64")]
             PureRustBackend::PclmulX86_64 => "x86_64-pclmulqdq",
@@ -897,6 +1044,12 @@ mod tests {
 
         #[cfg(target_arch = "x86_64")]
         {
+            if has_avx512_x86_64() {
+                cases.push(BackendCase {
+                    backend: PureRustBackend::Avx512X86_64,
+                    name: "x86_64-avx512-vpclmulqdq",
+                });
+            }
             if has_pclmul_x86_64() {
                 cases.push(BackendCase {
                     backend: PureRustBackend::PclmulX86_64,
@@ -937,6 +1090,8 @@ mod tests {
         match backend {
             PureRustBackend::Scalar => extend_scalar(0, data),
             #[cfg(target_arch = "x86_64")]
+            PureRustBackend::Avx512X86_64 => unsafe { extend_avx512_x86_64(0, data) },
+            #[cfg(target_arch = "x86_64")]
             PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(0, data) },
             #[cfg(target_arch = "x86_64")]
             PureRustBackend::VpclmulX86_64 => unsafe { extend_vpclmul_x86_64(0, data) },
@@ -957,6 +1112,8 @@ mod tests {
         for chunk in data.chunks(chunk_size.max(1)) {
             crc = match backend {
                 PureRustBackend::Scalar => extend_scalar(crc, chunk),
+                #[cfg(target_arch = "x86_64")]
+                PureRustBackend::Avx512X86_64 => unsafe { extend_avx512_x86_64(crc, chunk) },
                 #[cfg(target_arch = "x86_64")]
                 PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(crc, chunk) },
                 #[cfg(target_arch = "x86_64")]
