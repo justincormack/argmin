@@ -19,6 +19,25 @@ This still does not cover:
 - full bucket policy evaluation
 - STS AssumeRole API implementation
 
+Important current bucket-policy note:
+- AWS-backed testing now shows that `PutBucketPolicy` acceptance is broader
+  than our current runtime evaluator. We should accept the AWS-supported
+  condition keys on the implemented surface even when local request context is
+  still incomplete for some of them.
+- `aws:PrincipalArn` and `aws:SourceVpc` are currently in that acceptance-only
+  category: they are accepted on upload to match AWS, but not yet treated as
+  runtime-evaluable request context.
+- That acceptance-only list should stay explicit; adding more keys later
+  should be a deliberate compatibility decision backed by tests.
+- In particular, request context does not yet carry values for
+  `aws:SourceVpce`, `aws:SourceArn`, `aws:SourceAccount`, `aws:SourceOwner`,
+  `aws:userid`, `aws:PrincipalOrgID`,
+  `s3:DataAccessPointAccount`, or `s3:DataAccessPointArn`.
+- Those other keys also remain outside the current accepted/evaluable
+  object-condition subset; they are future follow-up rather than acceptance-only
+  support today.
+- `s3:ResourceTag/*` remains a separate deferred evaluator gap.
+
 Carry-forward from the completed Ceph authz diff review:
 - keep the remaining account-level IAM questions visible here:
   `CreateBucket`, `ListBuckets`, and any future `DeleteBucket` IAM-policy
@@ -55,6 +74,8 @@ Still open:
 - Final compatibility/conformance documentation
 - Decision on where to track and validate the remaining `s3:ResourceTag/*`
   investigation once policy-evaluator expansion resumes
+- bucket-policy evaluator expansion for AWS-accepted condition keys whose
+  request context is still missing locally
 
 ## Remaining Work
 
@@ -70,6 +91,14 @@ Still missing:
 Explicitly still out of scope for this plan:
 - full bucket policy evaluation
 - full IAM policy language
+
+Still useful follow-up inside the currently implemented bucket-policy surface:
+- align `PutBucketPolicy` acceptance with AWS even when runtime evaluation is
+  still partial
+- add request-context plumbing and evaluator support for AWS-accepted keys such
+  as `aws:PrincipalArn` and `aws:SourceVpc`
+- document which accepted keys are still evaluated with missing/absent local
+  context until that plumbing exists
 
 ### 2. Constrained Same-Account Authorization Shape
 
@@ -113,6 +142,8 @@ Already covered:
 - AWS validation for same-account root/non-root bucket-admin and object-admin
   behavior
 - AWS validation for constrained same-account write denial
+- AWS validation that `PutBucketPolicy` accepts at least some object-policy
+  condition clauses that our current runtime evaluator still cannot fully model
 
 ## Target Behavior
 

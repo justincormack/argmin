@@ -17266,7 +17266,7 @@ mod tests {
     }
 
     #[test]
-    fn put_bucket_policy_rejects_string_not_equals_vpc_for_enforced_object_action() {
+    fn put_bucket_policy_accepts_string_not_equals_vpc_for_enforced_object_action() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
@@ -17280,27 +17280,24 @@ mod tests {
                 object_lock_enabled: false,
             })
             .unwrap();
-        put_bucket_public_access_block_test(&coord,
-                "bucket",
-                "<PublicAccessBlockConfiguration><BlockPublicAcls>false</BlockPublicAcls><IgnorePublicAcls>false</IgnorePublicAcls><BlockPublicPolicy>true</BlockPublicPolicy><RestrictPublicBuckets>false</RestrictPublicBuckets></PublicAccessBlockConfiguration>",
-                test_helpers::requester("owner-a"), None)
-            .unwrap();
-
-        let err = put_bucket_policy_test(&coord,
-                "bucket",
-                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:SourceVpc":"vpc-12345678"}}}]}"#,
-                test_helpers::requester("owner-a"), None)
-            .unwrap_err();
-        assert!(matches!(err, ServerError::MalformedPolicy { .. }));
+        let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:SourceVpc":"vpc-12345678"}}}]}"#;
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            policy,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             get_bucket_policy_test(&coord, "bucket", test_helpers::requester("owner-a"), None)
                 .unwrap(),
-            None
+            Some(auth::parse_bucket_policy(policy).unwrap().normalized_json())
         );
     }
 
     #[test]
-    fn put_bucket_policy_rejects_unsupported_condition_on_enforced_object_action() {
+    fn put_bucket_policy_accepts_principal_arn_condition_on_enforced_object_action() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
@@ -17315,16 +17312,19 @@ mod tests {
             })
             .unwrap();
 
-        let err = put_bucket_policy_test(&coord,
-                "bucket",
-                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/other"}}}]}"#,
-                test_helpers::requester("owner-a"), None)
-            .unwrap_err();
-        assert!(matches!(err, ServerError::MalformedPolicy { .. }));
+        let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/other"}}}]}"#;
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            policy,
+            test_helpers::requester("owner-a"),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             get_bucket_policy_test(&coord, "bucket", test_helpers::requester("owner-a"), None)
                 .unwrap(),
-            None
+            Some(auth::parse_bucket_policy(policy).unwrap().normalized_json())
         );
     }
 

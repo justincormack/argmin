@@ -562,6 +562,7 @@ impl PolicyStatement {
         match self.condition_match_result(request) {
             ConditionMatchResult::Matches => Some(self.effect),
             ConditionMatchResult::NoMatch => None,
+            ConditionMatchResult::AcceptedButNotEvaluable => None,
             ConditionMatchResult::Unsupported => {
                 (self.effect == PolicyEffect::Deny).then_some(PolicyEffect::Deny)
             }
@@ -612,15 +613,21 @@ impl PolicyStatement {
 
     fn condition_match_result(&self, request: &PolicyRequest<'_>) -> ConditionMatchResult {
         let mut saw_unsupported = false;
+        let mut saw_accepted_but_not_evaluable = false;
         for clause in &self.conditions {
             match condition_clause_matches_request(clause, request) {
                 ConditionMatchResult::Matches => {}
                 ConditionMatchResult::NoMatch => return ConditionMatchResult::NoMatch,
+                ConditionMatchResult::AcceptedButNotEvaluable => {
+                    saw_accepted_but_not_evaluable = true;
+                }
                 ConditionMatchResult::Unsupported => saw_unsupported = true,
             }
         }
         if saw_unsupported {
             ConditionMatchResult::Unsupported
+        } else if saw_accepted_but_not_evaluable {
+            ConditionMatchResult::AcceptedButNotEvaluable
         } else {
             ConditionMatchResult::Matches
         }
@@ -701,6 +708,7 @@ const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 22] = [
 enum ConditionMatchResult {
     Matches,
     NoMatch,
+    AcceptedButNotEvaluable,
     Unsupported,
 }
 
@@ -1279,6 +1287,7 @@ fn condition_clause_matches_request(
     }
 
     match clause.key.as_str() {
+        "aws:PrincipalArn" | "aws:SourceVpc" => ConditionMatchResult::AcceptedButNotEvaluable,
         "s3:x-amz-copy-source" => string_condition_matches(clause, request.copy_source()),
         "s3:x-amz-metadata-directive" => {
             string_condition_matches(clause, request.metadata_directive())
@@ -1309,7 +1318,9 @@ fn condition_clause_supported_for_evaluable_object_actions(clause: &PolicyCondit
         || (evaluable_string_condition_operator_supported(clause.operator.as_str())
             && matches!(
                 clause.key.as_str(),
-                "s3:x-amz-copy-source"
+                "aws:PrincipalArn"
+                    | "aws:SourceVpc"
+                    | "s3:x-amz-copy-source"
                     | "s3:x-amz-metadata-directive"
                     | "s3:x-amz-acl"
                     | "s3:x-amz-server-side-encryption"
@@ -1500,7 +1511,6 @@ fn root_account_principal_account_id(value: &str) -> Option<&str> {
 fn is_non_public_condition_clause(clause: &PolicyConditionClause) -> bool {
     match clause.key.as_str() {
         "aws:PrincipalOrgID"
-        | "aws:SourceVpc"
         | "aws:SourceVpce"
         | "aws:SourceOwner"
         | "aws:SourceAccount"
@@ -1669,9 +1679,9 @@ mod tests {
     }
 
     #[test]
-    fn fixed_source_vpc_constrains_wildcard_principal() {
+    fn fixed_source_vpce_constrains_wildcard_principal() {
         let policy = parse_bucket_policy(
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"aws:SourceVpc":"vpc-12345678"}}}]}"#,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"aws:SourceVpce":"vpce-12345678"}}}]}"#,
         )
         .unwrap();
         assert!(!policy.is_public());
@@ -2163,9 +2173,19 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_deny_condition_is_treated_conservatively_at_evaluation_time() {
+    fn principal_arn_condition_is_accepted_for_evaluable_object_actions() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/other"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
+    }
+
+    #[test]
+    fn principal_arn_allow_condition_is_not_runtime_evaluable() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/caller"}}}]}"#,
         )
         .unwrap();
         let tags: [PolicyTag<'_>; 0] = [];
@@ -2173,9 +2193,95 @@ mod tests {
             PolicyAction::GetObject,
             "bucket",
             "key",
-            Some("444455556666"),
+            Some("arn:aws:iam::444455556666:user/caller"),
             &tags,
         );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn principal_arn_deny_condition_is_not_runtime_evaluable() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/caller"}}}]}"#,
+        )
+        .unwrap();
+        let tags: [PolicyTag<'_>; 0] = [];
+        let request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("arn:aws:iam::444455556666:user/caller"),
+            &tags,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn source_vpc_condition_is_accepted_for_evaluable_object_actions() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:SourceVpc":"vpc-12345678"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
+    }
+
+    #[test]
+    fn source_vpc_allow_condition_is_not_runtime_evaluable() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:SourceVpc":"vpc-12345678"}}}]}"#,
+        )
+        .unwrap();
+        let tags: [PolicyTag<'_>; 0] = [];
+        let request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("arn:aws:iam::444455556666:user/caller"),
+            &tags,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn source_vpc_deny_condition_is_not_runtime_evaluable() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:SourceVpc":"vpc-12345678"}}}]}"#,
+        )
+        .unwrap();
+        let tags: [PolicyTag<'_>; 0] = [];
+        let request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("arn:aws:iam::444455556666:user/caller"),
+            &tags,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn unsupported_bucket_condition_still_denies_conservatively() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketAcl","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"aws:SourceVpce":"vpce-12345678"}}}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(PolicyAction::GetBucketAcl, "bucket", Some("caller"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
+    fn mixed_bucket_conditions_preserve_conservative_deny_when_any_clause_is_unsupported() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetBucketAcl","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"aws:SourceVpc":"vpc-12345678","aws:SourceVpce":"vpce-12345678"}}}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(PolicyAction::GetBucketAcl, "bucket", Some("caller"));
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
     }

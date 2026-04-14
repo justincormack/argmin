@@ -185,7 +185,52 @@ Related plan:
 
 - [plans/aws-auth-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/aws-auth-compat-plan.md)
 
-### 11. `AccessDenied` does not yet match AWS principal-specific error text
+### 11. Bucket-policy condition acceptance and runtime context are still partial
+
+Argmin's compatibility target is to accept the same bucket-policy condition
+keys that AWS accepts on the implemented S3 surface, even when the current
+runtime does not yet have enough request context to make every condition
+equally useful.
+
+Today, that means two different compatibility questions have to be kept
+separate:
+
+- policy upload acceptance
+- runtime evaluation of a stored policy against a live request
+
+Policy upload acceptance is being aligned to AWS-backed behavior. Runtime
+evaluation is still narrower.
+
+Current runtime-evaluation limits include:
+
+- `aws:PrincipalArn` and `aws:SourceVpc` are currently accepted at
+  `PutBucketPolicy` time to match AWS upload behavior, but they are not yet
+  treated as runtime-evaluable request context on this server
+- that acceptance-only set is explicit and currently limited to those two keys
+- other network/account condition keys such as `aws:SourceVpce`,
+  `aws:SourceArn`, `aws:SourceAccount`, `aws:SourceOwner`, `aws:userid`,
+  `aws:PrincipalOrgID`, `s3:DataAccessPointAccount`, and
+  `s3:DataAccessPointArn` still remain outside the current accepted/evaluable
+  object-condition subset
+- `s3:ResourceTag/*` object-policy evaluation is still deferred
+
+The current implemented evaluator is strongest on:
+
+- `s3:ExistingObjectTag/*`
+- `s3:RequestObjectTag/*`
+- the supported `s3:x-amz-*` request condition keys already threaded through
+  `PolicyRequest`
+
+So a bucket policy may now be AWS-accepted and storable even if some condition
+clauses are still not runtime-evaluable locally. That is the correct direction
+for upload-time conformance, but it remains a known compatibility gap until
+those request attributes are modeled directly.
+
+Related plan:
+
+- [plans/aws-auth-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/aws-auth-compat-plan.md)
+
+### 12. `AccessDenied` does not yet match AWS principal-specific error text
 
 Argmin now matches the generic XML error shape for several `AccessDenied`
 cases, but it does not yet reproduce AWS's more specific denial messages that

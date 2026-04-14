@@ -18,6 +18,10 @@ use s3_tests::{
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
 
+fn owner_root_client() -> &'static aws_sdk_s3::Client {
+    CTX.require_owner_root_client()
+}
+
 async fn setup_bucket() -> String {
     let client = CTX.client();
     let bucket = unique_bucket();
@@ -215,15 +219,22 @@ async fn do_multipart_upload_with_acl(
 }
 
 async fn complete_single_part_multipart_upload(bucket: &str, key: &str, body: &[u8]) -> String {
-    let client = CTX.client();
-
-    let create = client
-        .create_multipart_upload()
-        .bucket(bucket)
-        .key(key)
-        .send()
+    complete_single_part_multipart_upload_with_client_and_acl(CTX.client(), bucket, key, body, None)
         .await
-        .unwrap();
+}
+
+async fn complete_single_part_multipart_upload_with_client_and_acl(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+    acl: Option<ObjectCannedAcl>,
+) -> String {
+    let mut create_req = client.create_multipart_upload().bucket(bucket).key(key);
+    if let Some(acl) = acl {
+        create_req = create_req.acl(acl);
+    }
+    let create = create_req.send().await.unwrap();
     let upload_id = create.upload_id().unwrap().to_string();
 
     let part = client
@@ -652,6 +663,157 @@ fn test_abort_multipart_upload_after_complete_and_overwrite_succeeds() {
             .unwrap();
         let data = resp.body.collect().await.unwrap().into_bytes();
         assert_eq!(&data[..], b"second");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_abort_completed_multipart_upload_initiator_succeeds_when_owner_is_bucket_owner() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_public_write_bucket(client).await;
+        let key = "multipart-abort-after-complete-initiator-not-owner";
+
+        let bucket_owner_id = client
+            .get_bucket_acl()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap()
+            .owner()
+            .expect("expected bucket owner in GetBucketAcl")
+            .id()
+            .expect("expected bucket owner ID in GetBucketAcl")
+            .to_string();
+        let alt_owner_id = canonical_owner_id(alt_client).await;
+
+        let upload_id = complete_single_part_multipart_upload_with_client_and_acl(
+            alt_client,
+            &bucket,
+            key,
+            b"hello, world!",
+            Some(ObjectCannedAcl::BucketOwnerFullControl),
+        )
+        .await;
+
+        let acl = client
+            .get_object_acl()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let object_owner_id = acl
+            .owner()
+            .expect("expected object owner in GetObjectAcl")
+            .id()
+            .expect("expected object owner ID in GetObjectAcl")
+            .to_string();
+        assert_eq!(object_owner_id, bucket_owner_id);
+        assert_ne!(object_owner_id, alt_owner_id);
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"hello, world!");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_abort_completed_multipart_upload_owner_root_admin_succeeds() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let root_client = owner_root_client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_public_write_bucket(client).await;
+        let key = "multipart-abort-after-complete-owner-root";
+
+        let upload_id = complete_single_part_multipart_upload_with_client_and_acl(
+            alt_client,
+            &bucket,
+            key,
+            b"hello, world!",
+            None,
+        )
+        .await;
+
+        root_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        let resp = alt_client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"hello, world!");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_abort_completed_multipart_upload_rejects_unrelated_cross_account_requester() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_public_write_bucket(client).await;
+        let key = "multipart-abort-after-complete-unrelated-cross-account";
+
+        let upload_id = complete_single_part_multipart_upload_with_client_and_acl(
+            client,
+            &bucket,
+            key,
+            b"hello, world!",
+            None,
+        )
+        .await;
+
+        let result = alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 403);
+        assert_s3_err_code(&result, "AccessDenied");
+
+        let resp = client
+            .get_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"hello, world!");
 
         cleanup(&bucket, &[key]).await;
     });
