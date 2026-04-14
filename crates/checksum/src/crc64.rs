@@ -85,6 +85,8 @@ fn extend(crc: u64, data: &[u8]) -> u64 {
         match pure_rust_backend() {
             PureRustBackend::Scalar => extend_scalar(crc, data),
             #[cfg(target_arch = "x86_64")]
+            PureRustBackend::VpclmulX86_64 => unsafe { extend_vpclmul_x86_64(crc, data) },
+            #[cfg(target_arch = "x86_64")]
             PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(crc, data) },
             #[cfg(target_arch = "aarch64")]
             PureRustBackend::PmullSha3Aarch64 => unsafe { extend_pmull_sha3_aarch64(crc, data) },
@@ -107,6 +109,8 @@ fn extend(crc: u64, data: &[u8]) -> u64 {
 enum PureRustBackend {
     Scalar,
     #[cfg(target_arch = "x86_64")]
+    VpclmulX86_64,
+    #[cfg(target_arch = "x86_64")]
     PclmulX86_64,
     #[cfg(target_arch = "aarch64")]
     PmullSha3Aarch64,
@@ -118,13 +122,17 @@ enum PureRustBackend {
 #[inline]
 fn pure_rust_backend() -> PureRustBackend {
     #[cfg(feature = "bench-select")]
-    if bench_force_scalar() {
-        return PureRustBackend::Scalar;
+    if let Some(backend) = bench_override_backend() {
+        return backend;
     }
 
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("pclmulqdq") {
+        if has_vpclmul_x86_64() {
+            return PureRustBackend::VpclmulX86_64;
+        }
+
+        if has_pclmul_x86_64() {
             return PureRustBackend::PclmulX86_64;
         }
     }
@@ -147,20 +155,48 @@ fn pure_rust_backend() -> PureRustBackend {
 
 #[cfg(all(feature = "pure-rust", feature = "bench-select"))]
 #[inline]
-fn bench_force_scalar() -> bool {
-    static FORCE_SCALAR: OnceLock<bool> = OnceLock::new();
+fn bench_override_backend() -> Option<PureRustBackend> {
+    static OVERRIDE: OnceLock<Option<PureRustBackend>> = OnceLock::new();
 
-    *FORCE_SCALAR.get_or_init(|| {
-        matches!(
-            std::env::var("ARGMIN_CRC64_BENCH_BACKEND")
-                .ok()
-                .as_deref()
-                .map(str::trim)
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("scalar")
-        )
+    *OVERRIDE.get_or_init(|| {
+        let override_name = std::env::var("ARGMIN_CRC64_BENCH_BACKEND")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase());
+
+        match override_name.as_deref() {
+            Some("scalar") => Some(PureRustBackend::Scalar),
+            #[cfg(target_arch = "x86_64")]
+            Some("vpclmul") if has_vpclmul_x86_64() => Some(PureRustBackend::VpclmulX86_64),
+            #[cfg(target_arch = "x86_64")]
+            Some("pclmul") if has_pclmul_x86_64() => Some(PureRustBackend::PclmulX86_64),
+            #[cfg(target_arch = "aarch64")]
+            Some("pmull+sha3")
+                if std::arch::is_aarch64_feature_detected!("aes")
+                    && std::arch::is_aarch64_feature_detected!("sha3") =>
+            {
+                Some(PureRustBackend::PmullSha3Aarch64)
+            }
+            #[cfg(target_arch = "aarch64")]
+            Some("pmull") if std::arch::is_aarch64_feature_detected!("aes") => {
+                Some(PureRustBackend::PmullAarch64)
+            }
+            _ => None,
+        }
     })
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[inline]
+fn has_pclmul_x86_64() -> bool {
+    std::arch::is_x86_feature_detected!("pclmulqdq")
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[inline]
+fn has_vpclmul_x86_64() -> bool {
+    std::arch::is_x86_feature_detected!("pclmulqdq")
+        && std::arch::is_x86_feature_detected!("vpclmulqdq")
+        && std::arch::is_x86_feature_detected!("avx2")
 }
 
 #[cfg(feature = "pure-rust")]
@@ -216,15 +252,24 @@ fn extend_scalar(crc: u64, data: &[u8]) -> u64 {
 #[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
 mod x86_64_pclmul {
     use core::arch::x86_64::{
-        __m128i, _mm_clmulepi64_si128, _mm_load_si128, _mm_loadu_si128, _mm_set_epi64x,
+        __m128i, __m256i, _mm256_castsi256_si128, _mm256_clmulepi64_epi128,
+        _mm256_extracti128_si256, _mm256_load_si256, _mm256_loadu_si256, _mm256_set_epi64x,
+        _mm256_xor_si256, _mm_clmulepi64_si128, _mm_load_si128, _mm_loadu_si128, _mm_set_epi64x,
         _mm_slli_si128, _mm_srli_si128, _mm_xor_si128,
     };
 
     #[repr(align(16))]
     struct Aligned([u64; 2]);
 
+    #[repr(align(32))]
+    struct Aligned256([u64; 4]);
+
     const fn aligned(lo: u64, hi: u64) -> Aligned {
         Aligned([lo, hi])
+    }
+
+    const fn aligned256(a0: u64, a1: u64, a2: u64, a3: u64) -> Aligned256 {
+        Aligned256([a0, a1, a2, a3])
     }
 
     // Constants copied from ISA-L's crc64_rocksoft_refl_const block.
@@ -238,6 +283,30 @@ mod x86_64_pclmul {
     static FOLD_2: Aligned = aligned(0xe1e0bb9d45d7a44c, 0xb0bc2e589204f500);
     static FOLD_128_TO_64: Aligned = aligned(0x21e9761e252621ac, 0x0000000000000000);
     static BARRETT: Aligned = aligned(0x27ecfa329aef9f77, 0x34d926535897936a);
+    static FOLD_8X2: Aligned256 = aligned256(
+        0x5f852fb61e8d92dc,
+        0xa1ca681e733f9c40,
+        0x5f852fb61e8d92dc,
+        0xa1ca681e733f9c40,
+    );
+    static FOLD_7_6: Aligned256 = aligned256(
+        0x946588403d4adcbc,
+        0xd083dd594d96319d,
+        0x34f5a24e22d66e90,
+        0x3c255f5ebc414423,
+    );
+    static FOLD_5_4: Aligned256 = aligned256(
+        0x03363823e6e791e5,
+        0x7b0ab10dd0f809fe,
+        0x62242240ace5045a,
+        0x0c32cdb31e18a84a,
+    );
+    static FOLD_3_2: Aligned256 = aligned256(
+        0xa3ffdc1fe8e82a8b,
+        0xbdd7ac0ee1a4a0f0,
+        0xe1e0bb9d45d7a44c,
+        0xb0bc2e589204f500,
+    );
 
     #[inline]
     fn load_aligned(value: &Aligned) -> __m128i {
@@ -252,8 +321,25 @@ mod x86_64_pclmul {
     }
 
     #[inline]
+    fn load_aligned256(value: &Aligned256) -> __m256i {
+        // SAFETY: the wrapper guarantees 32-byte alignment and valid storage.
+        unsafe { _mm256_load_si256(value.0.as_ptr().cast()) }
+    }
+
+    #[inline]
+    fn load_block256(ptr: *const u8) -> __m256i {
+        // SAFETY: callers only pass pointers valid for 32 readable bytes.
+        unsafe { _mm256_loadu_si256(ptr.cast()) }
+    }
+
+    #[inline]
     fn xor_crc(block: __m128i, crc: u64) -> __m128i {
         unsafe { _mm_xor_si128(block, _mm_set_epi64x(0, crc as i64)) }
+    }
+
+    #[inline]
+    fn xor_crc256(block: __m256i, crc: u64) -> __m256i {
+        unsafe { _mm256_xor_si256(block, _mm256_set_epi64x(0, 0, 0, crc as i64)) }
     }
 
     #[inline]
@@ -271,6 +357,24 @@ mod x86_64_pclmul {
             let lo = _mm_clmulepi64_si128::<0x01>(x, constant);
             let hi = _mm_clmulepi64_si128::<0x10>(x, constant);
             _mm_xor_si128(lo, hi)
+        }
+    }
+
+    #[inline]
+    fn fold_block256(x: __m256i, next: __m256i, constant: __m256i) -> __m256i {
+        unsafe {
+            let lo = _mm256_clmulepi64_epi128::<0x01>(x, constant);
+            let hi = _mm256_clmulepi64_epi128::<0x10>(x, constant);
+            _mm256_xor_si256(_mm256_xor_si256(lo, hi), next)
+        }
+    }
+
+    #[inline]
+    fn fold_without_next256(x: __m256i, constant: __m256i) -> __m256i {
+        unsafe {
+            let lo = _mm256_clmulepi64_epi128::<0x01>(x, constant);
+            let hi = _mm256_clmulepi64_epi128::<0x10>(x, constant);
+            _mm256_xor_si256(lo, hi)
         }
     }
 
@@ -301,6 +405,19 @@ mod x86_64_pclmul {
 
         let (prefix, tail) = data.split_at(prefix_len);
         let prefix_crc = extend_blocks_only(crc, prefix);
+        super::extend_scalar(prefix_crc, tail)
+    }
+
+    #[target_feature(enable = "pclmulqdq,vpclmulqdq,avx2")]
+    pub unsafe fn extend_vpclmul(crc: u64, data: &[u8]) -> u64 {
+        let prefix_len = data.len() & !0x0F;
+        if prefix_len < 128 {
+            return extend(crc, data);
+        }
+
+        let prefix_len = prefix_len & !0x7F;
+        let (prefix, tail) = data.split_at(prefix_len);
+        let prefix_crc = extend_blocks_only_vpclmul(crc, prefix);
         super::extend_scalar(prefix_crc, tail)
     }
 
@@ -362,12 +479,53 @@ mod x86_64_pclmul {
 
         !reduce_to_crc(state)
     }
+
+    #[target_feature(enable = "pclmulqdq,vpclmulqdq,avx2")]
+    unsafe fn extend_blocks_only_vpclmul(crc: u64, data: &[u8]) -> u64 {
+        let fold_8x2 = load_aligned256(&FOLD_8X2);
+        let mut ptr = data.as_ptr();
+        let end = ptr.add(data.len());
+
+        let mut x0 = xor_crc256(load_block256(ptr), !crc);
+        let mut x1 = load_block256(ptr.add(32));
+        let mut x2 = load_block256(ptr.add(64));
+        let mut x3 = load_block256(ptr.add(96));
+        ptr = ptr.add(128);
+
+        while ptr < end {
+            x0 = fold_block256(x0, load_block256(ptr), fold_8x2);
+            x1 = fold_block256(x1, load_block256(ptr.add(32)), fold_8x2);
+            x2 = fold_block256(x2, load_block256(ptr.add(64)), fold_8x2);
+            x3 = fold_block256(x3, load_block256(ptr.add(96)), fold_8x2);
+            ptr = ptr.add(128);
+        }
+
+        let accum_7_6 = fold_without_next256(x0, load_aligned256(&FOLD_7_6));
+        let accum_5_4 = fold_without_next256(x1, load_aligned256(&FOLD_5_4));
+        let accum_3_2 = fold_without_next256(x2, load_aligned256(&FOLD_3_2));
+        let accum = _mm256_xor_si256(_mm256_xor_si256(accum_7_6, accum_5_4), accum_3_2);
+
+        let x3_lo = _mm256_castsi256_si128(x3);
+        let x3_hi = _mm256_extracti128_si256::<1>(x3);
+        let x3_lo_folded = fold_without_next(x3_lo, load_aligned(&FOLD_1));
+        let accum_lo = _mm_xor_si128(_mm256_castsi256_si128(accum), x3_lo_folded);
+        let accum_hi = _mm256_extracti128_si256::<1>(accum);
+        let state = _mm_xor_si128(_mm_xor_si128(x3_hi, accum_lo), accum_hi);
+
+        !reduce_to_crc(state)
+    }
 }
 
 #[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
 #[inline]
 unsafe fn extend_pclmul_x86_64(crc: u64, data: &[u8]) -> u64 {
     x86_64_pclmul::extend(crc, data)
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[inline]
+unsafe fn extend_vpclmul_x86_64(crc: u64, data: &[u8]) -> u64 {
+    x86_64_pclmul::extend_vpclmul(crc, data)
 }
 
 #[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
@@ -570,6 +728,8 @@ pub fn backend_name() -> &'static str {
     {
         match pure_rust_backend() {
             PureRustBackend::Scalar => "scalar",
+            #[cfg(target_arch = "x86_64")]
+            PureRustBackend::VpclmulX86_64 => "x86_64-vpclmulqdq",
             #[cfg(target_arch = "x86_64")]
             PureRustBackend::PclmulX86_64 => "x86_64-pclmulqdq",
             #[cfg(target_arch = "aarch64")]
