@@ -1,4 +1,6 @@
 mod codec;
+mod gf;
+mod reconstruct;
 #[cfg(test)]
 mod tests;
 

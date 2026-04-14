@@ -19,7 +19,7 @@ thiserror = "2"
 [features]
 default = ["real-ec", "isa-l-crc"]
 real-ec = ["ec/real-backend"]
-null-ec = ["ec/null-backend"]
+native-ec = ["ec/native-backend"]
 isa-l-crc = ["checksum/isa-l", "storage/isa-l-crc"]
 pure-rust-crc = ["checksum/pure-rust", "storage/pure-rust-crc"]
 test-utils = []

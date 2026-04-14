@@ -10,10 +10,10 @@ path = "src/lib.rs"
 [features]
 default = ["real-ec", "isa-l-crc"]
 real-ec = ["ec/real-backend", "server-core/real-ec"]
-null-ec = ["ec/null-backend", "server-core/null-ec"]
+native-ec = ["ec/native-backend", "server-core/native-ec"]
 isa-l-crc = ["checksum/isa-l", "server-core/isa-l-crc", "storage/isa-l-crc"]
 pure-rust-crc = ["checksum/pure-rust", "server-core/pure-rust-crc", "storage/pure-rust-crc"]
-pure-rust = ["null-ec", "pure-rust-crc"]
+pure-rust = ["native-ec", "pure-rust-crc"]
 
 [dependencies]
 auth = { path = "../auth" }

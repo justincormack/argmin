@@ -7,10 +7,10 @@ publish = false
 [features]
 default = ["real-ec", "isa-l-crc"]
 real-ec = ["ec/real-backend", "server-core/real-ec", "server_http/real-ec"]
-null-ec = ["ec/null-backend", "server-core/null-ec", "server_http/null-ec"]
+native-ec = ["ec/native-backend", "server-core/native-ec", "server_http/native-ec"]
 isa-l-crc = ["checksum/isa-l", "server-core/isa-l-crc", "server_http/isa-l-crc", "storage/isa-l-crc"]
 pure-rust-crc = ["checksum/pure-rust", "server-core/pure-rust-crc", "server_http/pure-rust-crc", "storage/pure-rust-crc"]
-pure-rust = ["null-ec", "pure-rust-crc"]
+pure-rust = ["native-ec", "pure-rust-crc"]
 
 [dependencies]
 # Server (for local TestServer)

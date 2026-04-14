@@ -1,26 +1,18 @@
+use crate::gf::{build_mul_tables, encode_rows, gen_cauchy1_matrix};
+use crate::reconstruct::reconstruct_shards;
+
 const TRACE_TARGET: &str = "ec";
 
 /// Maximum supported total shards (k + m).
 pub const MAX_TOTAL_SHARDS: usize = 32;
 
-/// Validate that `shard_size` fits in ISA-L's `c_int` (`len`) parameter.
-///
-/// Extracted as a testable helper so tests can verify the boundary without
-/// constructing fake large slices (which would be UB).
-pub(crate) fn check_shard_size(size: usize) -> Result<(), EcError> {
-    if size > i32::MAX as usize {
-        Err(EcError::ShardSizeTooLarge { size })
-    } else {
-        Ok(())
-    }
-}
-
-/// Parameters for the null backend.
+/// Parameters for an erasure coding scheme.
+/// Built once; cheap to copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EcConfig {
     /// k: number of data shards.
     pub data_shards: u8,
-    /// m: number of parity shards. The null backend only supports zero.
+    /// m: number of parity shards.
     pub parity_shards: u8,
 }
 
@@ -37,11 +29,6 @@ impl EcConfig {
         if data_shards == 0 {
             return Err(EcError::InvalidConfig {
                 reason: "data_shards must be >= 1",
-            });
-        }
-        if parity_shards != 0 {
-            return Err(EcError::InvalidConfig {
-                reason: "null backend only supports parity_shards = 0",
             });
         }
         let total = data_shards as usize + parity_shards as usize;
@@ -61,9 +48,9 @@ impl EcConfig {
         self.data_shards as usize + self.parity_shards as usize
     }
 
-    /// Storage overhead multiplier, always 1.0 for the null backend.
+    /// Storage overhead multiplier, e.g. (4,2) → 1.5.
     pub fn overhead(self) -> f64 {
-        1.0
+        self.total_shards() as f64 / self.data_shards as f64
     }
 }
 
@@ -71,7 +58,7 @@ impl Default for EcConfig {
     fn default() -> Self {
         Self {
             data_shards: 4,
-            parity_shards: 0,
+            parity_shards: 2,
         }
     }
 }
@@ -81,7 +68,7 @@ impl Default for EcConfig {
 pub enum VerifyResult {
     /// All parity shards matched.
     Ok,
-    /// Included for API compatibility with the real backend.
+    /// Parity shard at this index (k..k+m) did not match.
     Mismatch(usize),
 }
 
@@ -132,12 +119,34 @@ pub enum EcError {
     SmokeTestFailed { reason: String },
 }
 
-/// Null EC context. It validates inputs but never produces parity.
+/// Validate that `shard_size` fits in ISA-L's `c_int` (`len`) parameter.
+///
+/// Extracted as a testable helper so tests can verify the boundary without
+/// constructing fake large slices (which would be UB).
+pub(crate) fn check_shard_size(size: usize) -> Result<(), EcError> {
+    if size > i32::MAX as usize {
+        Err(EcError::ShardSizeTooLarge { size })
+    } else {
+        Ok(())
+    }
+}
+
+/// Pre-computed erasure coding context. Build once; reuse across encode/reconstruct calls.
+///
+/// Holds the Cauchy encoding matrix and per-coefficient multiply tables for the
+/// parity rows.
 pub struct ErasureCodec {
     config: EcConfig,
+    /// Full (k+m)×k systematic encoding matrix, row-major.
+    encode_matrix: Vec<u8>,
+    /// Per-coefficient multiply tables for parity rows: 256 * k * m bytes.
+    encode_tables: Vec<u8>,
 }
 
 impl ErasureCodec {
+    /// Build a codec for the given config. Pre-computes encoding matrix and multiply tables.
+    ///
+    /// ZONE_INIT: allocates.
     pub fn new(config: EcConfig) -> Result<Self, EcError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -146,18 +155,35 @@ impl ErasureCodec {
             config.data_shards,
             config.parity_shards
         );
-        Ok(Self { config })
+        let k = config.data_shards as usize;
+        let m = config.parity_shards as usize;
+        let total = k + m;
+
+        let mut encode_matrix = vec![0u8; total * k];
+        gen_cauchy1_matrix(&mut encode_matrix, total, k);
+
+        let encode_tables = build_mul_tables(&encode_matrix[k * k..]);
+
+        Ok(Self {
+            config,
+            encode_matrix,
+            encode_tables,
+        })
     }
 
+    /// Returns the config this codec was built for.
     pub fn config(&self) -> EcConfig {
         self.config
     }
 
+    /// Required scratch buffer size (bytes) for `verify` at a given `shard_size`.
     pub fn verify_scratch_size(&self, shard_size: usize) -> usize {
-        let _ = shard_size;
-        0
+        (self.config.parity_shards as usize).saturating_mul(shard_size)
     }
 
+    /// Encode k data shards into m parity shards.
+    ///
+    /// ZONE_HOT: no heap allocation.
     pub fn encode(&self, data: &[&[u8]], parity: &mut [&mut [u8]]) -> Result<(), EcError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -166,9 +192,56 @@ impl ErasureCodec {
             data.len(),
             parity.len()
         );
-        validate_data_and_parity(self.config.data_shards as usize, data, parity)
+        let k = self.config.data_shards as usize;
+        let m = self.config.parity_shards as usize;
+
+        if data.len() != k {
+            return Err(EcError::ShardCount {
+                expected: k,
+                got: data.len(),
+            });
+        }
+        if parity.len() != m {
+            return Err(EcError::ShardCount {
+                expected: m,
+                got: parity.len(),
+            });
+        }
+
+        let shard_size = data[0].len();
+        check_shard_size(shard_size)?;
+        for (i, s) in data.iter().enumerate().skip(1) {
+            if s.len() != shard_size {
+                return Err(EcError::ShardSizeMismatch {
+                    index: i,
+                    expected: shard_size,
+                    got: s.len(),
+                });
+            }
+        }
+        for (i, s) in parity.iter().enumerate() {
+            if s.len() != shard_size {
+                return Err(EcError::ShardSizeMismatch {
+                    index: k + i,
+                    expected: shard_size,
+                    got: s.len(),
+                });
+            }
+        }
+
+        if m == 0 || shard_size == 0 {
+            return Ok(());
+        }
+
+        encode_rows(k, &self.encode_tables, data, parity);
+        Ok(())
     }
 
+    /// Verify that parity shards are consistent with data shards.
+    ///
+    /// Re-encodes `data` into `scratch` and compares against `parity`.
+    ///
+    /// ZONE_HOT: no heap allocation.
     pub fn verify(
         &self,
         data: &[&[u8]],
@@ -183,10 +256,81 @@ impl ErasureCodec {
             parity.len(),
             scratch.len()
         );
-        validate_data_and_parity_const(self.config.data_shards as usize, data, parity)?;
+        let k = self.config.data_shards as usize;
+        let m = self.config.parity_shards as usize;
+
+        if data.len() != k {
+            return Err(EcError::ShardCount {
+                expected: k,
+                got: data.len(),
+            });
+        }
+        if parity.len() != m {
+            return Err(EcError::ShardCount {
+                expected: m,
+                got: parity.len(),
+            });
+        }
+
+        let shard_size = data[0].len();
+        check_shard_size(shard_size)?;
+        for (i, s) in data.iter().enumerate().skip(1) {
+            if s.len() != shard_size {
+                return Err(EcError::ShardSizeMismatch {
+                    index: i,
+                    expected: shard_size,
+                    got: s.len(),
+                });
+            }
+        }
+        for (i, s) in parity.iter().enumerate() {
+            if s.len() != shard_size {
+                return Err(EcError::ShardSizeMismatch {
+                    index: k + i,
+                    expected: shard_size,
+                    got: s.len(),
+                });
+            }
+        }
+
+        let required = m.saturating_mul(shard_size);
+        if scratch.len() < required {
+            return Err(EcError::ScratchTooSmall {
+                required,
+                provided: scratch.len(),
+            });
+        }
+
+        if m == 0 || shard_size == 0 {
+            return Ok(VerifyResult::Ok);
+        }
+
+        for row in 0..m {
+            {
+                let scratch_row = &mut scratch[row * shard_size..(row + 1) * shard_size];
+                let mut outputs = [scratch_row];
+                let table_start = row * k * 256;
+                let table_end = table_start + k * 256;
+                encode_rows(
+                    k,
+                    &self.encode_tables[table_start..table_end],
+                    data,
+                    &mut outputs,
+                );
+            }
+            let scratch_row = &scratch[row * shard_size..(row + 1) * shard_size];
+            if scratch_row != parity[row] {
+                return Ok(VerifyResult::Mismatch(k + row));
+            }
+        }
+
         Ok(VerifyResult::Ok)
     }
 
+    /// Reconstruct missing shards from a subset of available shards.
+    ///
+    /// ZONE_HOT: no heap allocation. All scratch is stack-allocated and bounded
+    /// by MAX_TOTAL_SHARDS.
     pub fn reconstruct(
         &self,
         present_indices: &[usize],
@@ -202,7 +346,8 @@ impl ErasureCodec {
             outputs.len()
         );
         let k = self.config.data_shards as usize;
-        let total = k;
+        let m = self.config.parity_shards as usize;
+        let total = k + m;
 
         if present_indices.len() != present_data.len() {
             return Err(EcError::ShardCount {
@@ -255,116 +400,67 @@ impl ErasureCodec {
 
         let shard_size = present_data[0].len();
         check_shard_size(shard_size)?;
-        for (i, shard) in present_data.iter().enumerate().skip(1) {
-            if shard.len() != shard_size {
+        for (i, s) in present_data.iter().enumerate().skip(1) {
+            if s.len() != shard_size {
                 return Err(EcError::ShardSizeMismatch {
                     index: present_indices[i],
                     expected: shard_size,
-                    got: shard.len(),
+                    got: s.len(),
                 });
             }
         }
-        for (i, shard) in outputs.iter().enumerate() {
-            if shard.len() != shard_size {
+        for (i, s) in outputs.iter().enumerate() {
+            if s.len() != shard_size {
                 return Err(EcError::ShardSizeMismatch {
                     index: recover_indices[i],
                     expected: shard_size,
-                    got: shard.len(),
+                    got: s.len(),
                 });
             }
         }
 
-        if recover_indices.is_empty() {
+        if recover_indices.is_empty() || shard_size == 0 {
             return Ok(());
         }
 
-        Err(EcError::InsufficientShards {
-            need: k,
-            have: present_indices.len(),
-        })
+        reconstruct_shards(
+            k,
+            &self.encode_matrix,
+            present_indices,
+            present_data,
+            recover_indices,
+            outputs,
+        )
     }
 }
 
-fn validate_data_and_parity(
-    k: usize,
-    data: &[&[u8]],
-    parity: &mut [&mut [u8]],
-) -> Result<(), EcError> {
-    if data.len() != k {
-        return Err(EcError::ShardCount {
-            expected: k,
-            got: data.len(),
-        });
-    }
-    if !parity.is_empty() {
-        return Err(EcError::ShardCount {
-            expected: 0,
-            got: parity.len(),
-        });
-    }
-
-    let shard_size = data[0].len();
-    check_shard_size(shard_size)?;
-    for (i, shard) in data.iter().enumerate().skip(1) {
-        if shard.len() != shard_size {
-            return Err(EcError::ShardSizeMismatch {
-                index: i,
-                expected: shard_size,
-                got: shard.len(),
-            });
-        }
-    }
-    Ok(())
-}
-
-fn validate_data_and_parity_const(
-    k: usize,
-    data: &[&[u8]],
-    parity: &[&[u8]],
-) -> Result<(), EcError> {
-    if data.len() != k {
-        return Err(EcError::ShardCount {
-            expected: k,
-            got: data.len(),
-        });
-    }
-    if !parity.is_empty() {
-        return Err(EcError::ShardCount {
-            expected: 0,
-            got: parity.len(),
-        });
-    }
-
-    let shard_size = data[0].len();
-    check_shard_size(shard_size)?;
-    for (i, shard) in data.iter().enumerate().skip(1) {
-        if shard.len() != shard_size {
-            return Err(EcError::ShardSizeMismatch {
-                index: i,
-                expected: shard_size,
-                got: shard.len(),
-            });
-        }
-    }
-    Ok(())
-}
-
+/// Runtime smoke test for erasure coding.
 pub fn self_test() -> Result<(), EcError> {
-    let config = EcConfig::new(4, 0)?;
+    let config = EcConfig::new(4, 2)?;
     let codec = ErasureCodec::new(config)?;
-    let data: Vec<Vec<u8>> = (0..config.data_shards as usize)
+    let k = config.data_shards as usize;
+    let m = config.parity_shards as usize;
+    let shard_size = 256usize;
+
+    let data: Vec<Vec<u8>> = (0..k)
         .map(|i| {
-            (0..256usize)
+            (0..shard_size)
                 .map(|j| ((i * 37 + j * 13 + 7) & 0xFF) as u8)
                 .collect()
         })
         .collect();
+
+    let mut parity: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
     let data_refs: Vec<&[u8]> = data.iter().map(|v| v.as_slice()).collect();
-    let mut parity_refs: Vec<&mut [u8]> = Vec::new();
+    let mut parity_refs: Vec<&mut [u8]> = parity.iter_mut().map(|v| v.as_mut_slice()).collect();
     codec.encode(&data_refs, &mut parity_refs)?;
 
-    let mut scratch = Vec::new();
-    match codec.verify(&data_refs, &[], &mut scratch)? {
+    let mut scratch = vec![0u8; codec.verify_scratch_size(shard_size)];
+    match codec.verify(
+        &data_refs,
+        &parity.iter().map(|v| v.as_slice()).collect::<Vec<_>>(),
+        &mut scratch,
+    )? {
         VerifyResult::Ok => {}
         VerifyResult::Mismatch(idx) => {
             return Err(EcError::SmokeTestFailed {
@@ -373,7 +469,37 @@ pub fn self_test() -> Result<(), EcError> {
         }
     }
 
-    let mut outputs: Vec<&mut [u8]> = Vec::new();
-    codec.reconstruct(&[0, 1, 2, 3], &data_refs, &[], &mut outputs)?;
+    let present_indices: Vec<usize> = vec![0, 2, 3, k];
+    let present_data: Vec<&[u8]> = vec![
+        data[0].as_slice(),
+        data[2].as_slice(),
+        data[3].as_slice(),
+        parity[0].as_slice(),
+    ];
+    let recover_indices: Vec<usize> = vec![1, k + 1];
+    let mut recovered_data = vec![vec![0u8; shard_size]; recover_indices.len()];
+    let mut recovered_refs: Vec<&mut [u8]> = recovered_data
+        .iter_mut()
+        .map(|v| v.as_mut_slice())
+        .collect();
+
+    codec.reconstruct(
+        &present_indices,
+        &present_data,
+        &recover_indices,
+        &mut recovered_refs,
+    )?;
+
+    if recovered_data[0] != data[1] {
+        return Err(EcError::SmokeTestFailed {
+            reason: "reconstruction mismatch for missing data shard".to_string(),
+        });
+    }
+    if recovered_data[1] != parity[1] {
+        return Err(EcError::SmokeTestFailed {
+            reason: "reconstruction mismatch for missing parity shard".to_string(),
+        });
+    }
+
     Ok(())
 }
