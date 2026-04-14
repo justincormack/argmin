@@ -23,11 +23,11 @@
 const POLY: u32 = 0xEDB88320;
 
 #[cfg(feature = "pure-rust")]
-const TABLE: [u32; 256] = build_table();
+const TABLES: [[u32; 256]; 16] = build_tables();
 
 #[cfg(feature = "pure-rust")]
-const fn build_table() -> [u32; 256] {
-    let mut table = [0u32; 256];
+const fn build_tables() -> [[u32; 256]; 16] {
+    let mut tables = [[0u32; 256]; 16];
     let mut i = 0usize;
     while i < 256 {
         let mut crc = i as u32;
@@ -40,10 +40,31 @@ const fn build_table() -> [u32; 256] {
             };
             bit += 1;
         }
-        table[i] = crc;
+        tables[0][i] = crc;
         i += 1;
     }
-    table
+
+    let mut table_idx = 1usize;
+    while table_idx < 16 {
+        let mut byte = 0usize;
+        while byte < 256 {
+            let crc = tables[table_idx - 1][byte];
+            tables[table_idx][byte] = tables[0][(crc & 0xFF) as usize] ^ (crc >> 8);
+            byte += 1;
+        }
+        table_idx += 1;
+    }
+
+    tables
+}
+
+#[cfg(feature = "pure-rust")]
+#[inline]
+fn read_u32_le(ptr: *const u8) -> u32 {
+    // SAFETY: callers only pass pointers proven to be valid for at least
+    // 4 bytes. We use read_unaligned because the input buffer may not be
+    // naturally aligned.
+    unsafe { u32::from_le(ptr.cast::<u32>().read_unaligned()) }
 }
 
 #[inline]
@@ -51,9 +72,45 @@ fn extend(crc: u32, data: &[u8]) -> u32 {
     #[cfg(feature = "pure-rust")]
     {
         let mut state = !crc;
-        for &byte in data {
+        let mut remaining = data;
+
+        while remaining.len() >= 16 {
+            let first = read_u32_le(remaining.as_ptr());
+            let second = read_u32_le(remaining.as_ptr().wrapping_add(4));
+            let third = read_u32_le(remaining.as_ptr().wrapping_add(8));
+            let fourth = read_u32_le(remaining.as_ptr().wrapping_add(12));
+            let mixed = state ^ first;
+            state = TABLES[15][(mixed & 0xFF) as usize]
+                ^ TABLES[14][((mixed >> 8) & 0xFF) as usize]
+                ^ TABLES[13][((mixed >> 16) & 0xFF) as usize]
+                ^ TABLES[12][(mixed >> 24) as usize]
+                ^ TABLES[11][(second & 0xFF) as usize]
+                ^ TABLES[10][((second >> 8) & 0xFF) as usize]
+                ^ TABLES[9][((second >> 16) & 0xFF) as usize]
+                ^ TABLES[8][(second >> 24) as usize]
+                ^ TABLES[7][(third & 0xFF) as usize]
+                ^ TABLES[6][((third >> 8) & 0xFF) as usize]
+                ^ TABLES[5][((third >> 16) & 0xFF) as usize]
+                ^ TABLES[4][(third >> 24) as usize]
+                ^ TABLES[3][(fourth & 0xFF) as usize]
+                ^ TABLES[2][((fourth >> 8) & 0xFF) as usize]
+                ^ TABLES[1][((fourth >> 16) & 0xFF) as usize]
+                ^ TABLES[0][(fourth >> 24) as usize];
+            remaining = &remaining[16..];
+        }
+
+        while remaining.len() >= 4 {
+            let mixed = state ^ read_u32_le(remaining.as_ptr());
+            state = TABLES[3][(mixed & 0xFF) as usize]
+                ^ TABLES[2][((mixed >> 8) & 0xFF) as usize]
+                ^ TABLES[1][((mixed >> 16) & 0xFF) as usize]
+                ^ TABLES[0][(mixed >> 24) as usize];
+            remaining = &remaining[4..];
+        }
+
+        for &byte in remaining {
             let idx = ((state as u8) ^ byte) as usize;
-            state = TABLE[idx] ^ (state >> 8);
+            state = TABLES[0][idx] ^ (state >> 8);
         }
         !state
     }
