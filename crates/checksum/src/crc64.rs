@@ -27,6 +27,9 @@
 //! assert_eq!(combined, checksum::crc64::checksum(b"hello world!"));
 //! ```
 
+#[cfg(all(feature = "pure-rust", feature = "bench-select"))]
+use std::sync::OnceLock;
+
 /// CRC-64/NVME reflected polynomial (bit-reversal of 0xAD93D23594C93659).
 const POLY: u64 = 0x9A6C9329AC4BC9B5;
 
@@ -79,6 +82,11 @@ fn read_u64_le(ptr: *const u8) -> u64 {
 fn extend(crc: u64, data: &[u8]) -> u64 {
     #[cfg(feature = "pure-rust")]
     {
+        #[cfg(feature = "bench-select")]
+        if bench_force_scalar() {
+            return extend_scalar(crc, data);
+        }
+
         #[cfg(target_arch = "x86_64")]
         {
             if std::arch::is_x86_feature_detected!("pclmulqdq") {
@@ -103,6 +111,24 @@ fn extend(crc: u64, data: &[u8]) -> u64 {
         // never dereferenced (len=0).
         unsafe { ec_sys::crc64_rocksoft_refl(crc, data.as_ptr(), data.len() as u64) }
     }
+}
+
+#[cfg(all(feature = "pure-rust", feature = "bench-select"))]
+#[inline]
+fn bench_force_scalar() -> bool {
+    static FORCE_SCALAR: OnceLock<bool> = OnceLock::new();
+
+    *FORCE_SCALAR.get_or_init(|| {
+        matches!(
+            std::env::var("ARGMIN_CRC64_BENCH_BACKEND")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("scalar")
+        )
+    })
 }
 
 #[cfg(feature = "pure-rust")]
