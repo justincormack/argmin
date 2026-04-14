@@ -1,7 +1,8 @@
 //! CRC-64/NVME (= CRC-64/Rocksoft) checksum.
 //!
-//! Uses ISA-L when the `isa-l` feature is enabled and a pure-Rust table-based
-//! implementation when the `pure-rust` feature is enabled.
+//! Uses the native Rust implementation on all builds. On supported CPUs it
+//! runtime-dispatches to hardware-accelerated carryless-multiply backends and
+//! otherwise falls back to a scalar slicing-by-16 implementation.
 //!
 //! # Examples
 //!
@@ -27,16 +28,14 @@
 //! assert_eq!(combined, checksum::crc64::checksum(b"hello world!"));
 //! ```
 
-#[cfg(all(feature = "pure-rust", feature = "bench-select"))]
+#[cfg(feature = "bench-select")]
 use std::sync::OnceLock;
 
 /// CRC-64/NVME reflected polynomial (bit-reversal of 0xAD93D23594C93659).
 const POLY: u64 = 0x9A6C9329AC4BC9B5;
 
-#[cfg(feature = "pure-rust")]
 static TABLES: [[u64; 256]; 16] = build_tables();
 
-#[cfg(feature = "pure-rust")]
 const fn build_tables() -> [[u64; 256]; 16] {
     let mut tables = [[0u64; 256]; 16];
     let mut i = 0usize;
@@ -69,7 +68,6 @@ const fn build_tables() -> [[u64; 256]; 16] {
     tables
 }
 
-#[cfg(feature = "pure-rust")]
 #[inline]
 fn read_u64_le(ptr: *const u8) -> u64 {
     // SAFETY: callers only pass pointers proven to be valid for at least
@@ -80,33 +78,21 @@ fn read_u64_le(ptr: *const u8) -> u64 {
 
 #[inline]
 fn extend(crc: u64, data: &[u8]) -> u64 {
-    #[cfg(feature = "pure-rust")]
-    {
-        match pure_rust_backend() {
-            PureRustBackend::Scalar => extend_scalar(crc, data),
-            #[cfg(target_arch = "x86_64")]
-            PureRustBackend::Avx512X86_64 => unsafe { extend_avx512_x86_64(crc, data) },
-            #[cfg(target_arch = "x86_64")]
-            PureRustBackend::VpclmulX86_64 => unsafe { extend_vpclmul_x86_64(crc, data) },
-            #[cfg(target_arch = "x86_64")]
-            PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(crc, data) },
-            #[cfg(target_arch = "aarch64")]
-            PureRustBackend::PmullSha3Aarch64 => unsafe { extend_pmull_sha3_aarch64(crc, data) },
-            #[cfg(target_arch = "aarch64")]
-            PureRustBackend::PmullAarch64 => unsafe { extend_pmull_aarch64(crc, data) },
-        }
-    }
-
-    #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
-    {
-        // SAFETY: we pass a valid pointer and exact length. ISA-L reads
-        // only within [buf, buf+len). For empty slices the pointer is
-        // never dereferenced (len=0).
-        unsafe { ec_sys::crc64_rocksoft_refl(crc, data.as_ptr(), data.len() as u64) }
+    match pure_rust_backend() {
+        PureRustBackend::Scalar => extend_scalar(crc, data),
+        #[cfg(target_arch = "x86_64")]
+        PureRustBackend::Avx512X86_64 => unsafe { extend_avx512_x86_64(crc, data) },
+        #[cfg(target_arch = "x86_64")]
+        PureRustBackend::VpclmulX86_64 => unsafe { extend_vpclmul_x86_64(crc, data) },
+        #[cfg(target_arch = "x86_64")]
+        PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(crc, data) },
+        #[cfg(target_arch = "aarch64")]
+        PureRustBackend::PmullSha3Aarch64 => unsafe { extend_pmull_sha3_aarch64(crc, data) },
+        #[cfg(target_arch = "aarch64")]
+        PureRustBackend::PmullAarch64 => unsafe { extend_pmull_aarch64(crc, data) },
     }
 }
 
-#[cfg(feature = "pure-rust")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PureRustBackend {
     Scalar,
@@ -122,7 +108,6 @@ enum PureRustBackend {
     PmullAarch64,
 }
 
-#[cfg(feature = "pure-rust")]
 #[inline]
 fn pure_rust_backend() -> PureRustBackend {
     #[cfg(feature = "bench-select")]
@@ -161,7 +146,7 @@ fn pure_rust_backend() -> PureRustBackend {
     PureRustBackend::Scalar
 }
 
-#[cfg(all(feature = "pure-rust", feature = "bench-select"))]
+#[cfg(feature = "bench-select")]
 #[inline]
 fn bench_override_backend() -> Option<PureRustBackend> {
     static OVERRIDE: OnceLock<Option<PureRustBackend>> = OnceLock::new();
@@ -195,13 +180,13 @@ fn bench_override_backend() -> Option<PureRustBackend> {
     })
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn has_pclmul_x86_64() -> bool {
     std::arch::is_x86_feature_detected!("pclmulqdq")
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn has_vpclmul_x86_64() -> bool {
     std::arch::is_x86_feature_detected!("pclmulqdq")
@@ -209,7 +194,7 @@ fn has_vpclmul_x86_64() -> bool {
         && std::arch::is_x86_feature_detected!("avx2")
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 fn has_avx512_x86_64() -> bool {
     std::arch::is_x86_feature_detected!("pclmulqdq")
@@ -217,7 +202,6 @@ fn has_avx512_x86_64() -> bool {
         && std::arch::is_x86_feature_detected!("avx512f")
 }
 
-#[cfg(feature = "pure-rust")]
 #[inline]
 fn extend_scalar(crc: u64, data: &[u8]) -> u64 {
     let mut state = !crc;
@@ -267,7 +251,7 @@ fn extend_scalar(crc: u64, data: &[u8]) -> u64 {
     !state
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 mod x86_64_pclmul {
     use core::arch::x86_64::{
         __m128i, __m256i, __m512i, _mm256_castsi256_si128, _mm256_clmulepi64_epi128,
@@ -655,25 +639,25 @@ mod x86_64_pclmul {
     }
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn extend_pclmul_x86_64(crc: u64, data: &[u8]) -> u64 {
     x86_64_pclmul::extend(crc, data)
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn extend_vpclmul_x86_64(crc: u64, data: &[u8]) -> u64 {
     x86_64_pclmul::extend_vpclmul(crc, data)
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn extend_avx512_x86_64(crc: u64, data: &[u8]) -> u64 {
     x86_64_pclmul::extend_avx512(crc, data)
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 mod aarch64_pmull {
     use core::arch::aarch64::{
         poly64x2_t, uint64x2_t, uint8x16_t, vdupq_n_u64, veorq_u8, vget_lane_p64, vget_low_p64,
@@ -854,13 +838,13 @@ mod aarch64_pmull {
     }
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn extend_pmull_aarch64(crc: u64, data: &[u8]) -> u64 {
     aarch64_pmull::extend(crc, data)
 }
 
-#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 #[inline]
 unsafe fn extend_pmull_sha3_aarch64(crc: u64, data: &[u8]) -> u64 {
     aarch64_pmull::extend_sha3(crc, data)
@@ -869,26 +853,18 @@ unsafe fn extend_pmull_sha3_aarch64(crc: u64, data: &[u8]) -> u64 {
 /// Return the active CRC64 backend name for this build and process.
 #[inline]
 pub fn backend_name() -> &'static str {
-    #[cfg(feature = "pure-rust")]
-    {
-        match pure_rust_backend() {
-            PureRustBackend::Scalar => "scalar",
-            #[cfg(target_arch = "x86_64")]
-            PureRustBackend::Avx512X86_64 => "x86_64-avx512-vpclmulqdq",
-            #[cfg(target_arch = "x86_64")]
-            PureRustBackend::VpclmulX86_64 => "x86_64-vpclmulqdq",
-            #[cfg(target_arch = "x86_64")]
-            PureRustBackend::PclmulX86_64 => "x86_64-pclmulqdq",
-            #[cfg(target_arch = "aarch64")]
-            PureRustBackend::PmullSha3Aarch64 => "aarch64-pmull+sha3",
-            #[cfg(target_arch = "aarch64")]
-            PureRustBackend::PmullAarch64 => "aarch64-pmull",
-        }
-    }
-
-    #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
-    {
-        "isa-l"
+    match pure_rust_backend() {
+        PureRustBackend::Scalar => "scalar",
+        #[cfg(target_arch = "x86_64")]
+        PureRustBackend::Avx512X86_64 => "x86_64-avx512-vpclmulqdq",
+        #[cfg(target_arch = "x86_64")]
+        PureRustBackend::VpclmulX86_64 => "x86_64-vpclmulqdq",
+        #[cfg(target_arch = "x86_64")]
+        PureRustBackend::PclmulX86_64 => "x86_64-pclmulqdq",
+        #[cfg(target_arch = "aarch64")]
+        PureRustBackend::PmullSha3Aarch64 => "aarch64-pmull+sha3",
+        #[cfg(target_arch = "aarch64")]
+        PureRustBackend::PmullAarch64 => "aarch64-pmull",
     }
 }
 
@@ -1028,14 +1004,12 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    #[cfg(feature = "pure-rust")]
     #[derive(Clone, Copy, Debug)]
     struct BackendCase {
         backend: PureRustBackend,
         name: &'static str,
     }
 
-    #[cfg(feature = "pure-rust")]
     fn supported_backend_cases() -> Vec<BackendCase> {
         let mut cases = vec![BackendCase {
             backend: PureRustBackend::Scalar,
@@ -1085,7 +1059,6 @@ mod tests {
         cases
     }
 
-    #[cfg(feature = "pure-rust")]
     fn checksum_with_backend(backend: PureRustBackend, data: &[u8]) -> u64 {
         match backend {
             PureRustBackend::Scalar => extend_scalar(0, data),
@@ -1102,7 +1075,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "pure-rust")]
     fn checksum_streaming_with_backend(
         backend: PureRustBackend,
         data: &[u8],
@@ -1129,7 +1101,6 @@ mod tests {
         crc
     }
 
-    #[cfg(feature = "pure-rust")]
     #[test]
     fn supported_backends_match_scalar_across_boundaries() {
         let lengths = [
