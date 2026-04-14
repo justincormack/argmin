@@ -7,8 +7,16 @@ enum BackendChoice {
     IsaL,
 }
 
+#[derive(Clone, Copy)]
+enum BenchMode {
+    Encode,
+    Verify,
+    Reconstruct,
+}
+
 struct Config {
     backend: BackendChoice,
+    mode: BenchMode,
     label: String,
     size_mib: usize,
     warmup_iters: usize,
@@ -31,6 +39,13 @@ trait Backend {
         data: &[&[u8]],
         parity: &mut [&mut [u8]],
     ) -> Result<(), Self::Error>;
+    fn verify_scratch_size(codec: &Self::Codec, shard_size: usize) -> usize;
+    fn verify(
+        codec: &Self::Codec,
+        data: &[&[u8]],
+        parity: &[&[u8]],
+        scratch: &mut [u8],
+    ) -> Result<bool, Self::Error>;
     fn reconstruct(
         codec: &Self::Codec,
         present_indices: &[usize],
@@ -63,6 +78,21 @@ impl Backend for NativeBackend {
         parity: &mut [&mut [u8]],
     ) -> Result<(), Self::Error> {
         codec.encode(data, parity)
+    }
+
+    fn verify_scratch_size(codec: &Self::Codec, shard_size: usize) -> usize {
+        codec.verify_scratch_size(shard_size)
+    }
+
+    fn verify(
+        codec: &Self::Codec,
+        data: &[&[u8]],
+        parity: &[&[u8]],
+        scratch: &mut [u8],
+    ) -> Result<bool, Self::Error> {
+        codec
+            .verify(data, parity, scratch)
+            .map(|result| matches!(result, ec_native::VerifyResult::Ok))
     }
 
     fn reconstruct(
@@ -101,6 +131,21 @@ impl Backend for RealBackend {
         codec.encode(data, parity)
     }
 
+    fn verify_scratch_size(codec: &Self::Codec, shard_size: usize) -> usize {
+        codec.verify_scratch_size(shard_size)
+    }
+
+    fn verify(
+        codec: &Self::Codec,
+        data: &[&[u8]],
+        parity: &[&[u8]],
+        scratch: &mut [u8],
+    ) -> Result<bool, Self::Error> {
+        codec
+            .verify(data, parity, scratch)
+            .map(|result| matches!(result, ec_real::VerifyResult::Ok))
+    }
+
     fn reconstruct(
         codec: &Self::Codec,
         present_indices: &[usize],
@@ -114,6 +159,7 @@ impl Backend for RealBackend {
 
 fn parse_args() -> Result<Config, String> {
     let mut backend = None;
+    let mut mode = BenchMode::Reconstruct;
     let mut label = None;
     let mut size_mib = 8usize;
     let mut warmup_iters = 32usize;
@@ -135,6 +181,17 @@ fn parse_args() -> Result<Config, String> {
                     "isa-l" => BackendChoice::IsaL,
                     _ => return Err(format!("unsupported backend: {value}")),
                 });
+            }
+            "--mode" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "missing value for --mode".to_string())?;
+                mode = match value.as_str() {
+                    "encode" => BenchMode::Encode,
+                    "verify" => BenchMode::Verify,
+                    "reconstruct" => BenchMode::Reconstruct,
+                    _ => return Err(format!("unsupported mode: {value}")),
+                };
             }
             "--label" => {
                 label = Some(
@@ -165,7 +222,7 @@ fn parse_args() -> Result<Config, String> {
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: ec_bench --backend native|isa-l [--label NAME] [--size-mib N] [--warmup-iters N] [--sample-iters N] [--samples N] [--data-shards N] [--parity-shards N] [--recover-index N]".to_string(),
+                    "usage: ec_bench --backend native|isa-l [--mode encode|verify|reconstruct] [--label NAME] [--size-mib N] [--warmup-iters N] [--sample-iters N] [--samples N] [--data-shards N] [--parity-shards N] [--recover-index N]".to_string(),
                 );
             }
             _ => return Err(format!("unknown argument: {arg}")),
@@ -180,6 +237,7 @@ fn parse_args() -> Result<Config, String> {
 
     Ok(Config {
         backend,
+        mode,
         label,
         size_mib,
         warmup_iters,
@@ -228,20 +286,38 @@ fn present_indices(total: usize, k: usize, recover_index: usize) -> Result<Vec<u
     Ok(indices)
 }
 
+fn mode_name(mode: BenchMode) -> &'static str {
+    match mode {
+        BenchMode::Encode => "encode",
+        BenchMode::Verify => "verify",
+        BenchMode::Reconstruct => "reconstruct",
+    }
+}
+
+fn black_box_first_byte(bytes: &[u8]) {
+    if let Some(&byte) = bytes.first() {
+        black_box(byte);
+    } else {
+        black_box(bytes.len());
+    }
+}
+
 fn run_backend<B: Backend>(config: &Config) -> Result<(), String> {
     let k = config.data_shards as usize;
     let m = config.parity_shards as usize;
     let total = k + m;
     let shard_size = config.size_mib * 1024 * 1024;
 
-    if config.parity_shards == 0 {
-        return Err("parity_shards must be >= 1 for reconstruction benchmark".to_string());
-    }
-    if config.recover_index >= total {
-        return Err(format!(
-            "recover index {} out of range for total shards {}",
-            config.recover_index, total
-        ));
+    if matches!(config.mode, BenchMode::Reconstruct) {
+        if config.parity_shards == 0 {
+            return Err("parity_shards must be >= 1 for reconstruction benchmark".to_string());
+        }
+        if config.recover_index >= total {
+            return Err(format!(
+                "recover index {} out of range for total shards {}",
+                config.recover_index, total
+            ));
+        }
     }
 
     let codec_config =
@@ -253,9 +329,14 @@ fn run_backend<B: Backend>(config: &Config) -> Result<(), String> {
     let mut parity: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
     let mut parity_refs: Vec<&mut [u8]> = parity.iter_mut().map(Vec::as_mut_slice).collect();
     B::encode(&codec, &data_refs, &mut parity_refs).map_err(|err| err.to_string())?;
+    let parity_read_refs: Vec<&[u8]> = parity.iter().map(Vec::as_slice).collect();
 
     let recover_indices = [config.recover_index];
-    let present_indices = present_indices(total, k, config.recover_index)?;
+    let present_indices = if matches!(config.mode, BenchMode::Reconstruct) {
+        present_indices(total, k, config.recover_index)?
+    } else {
+        Vec::new()
+    };
     let present_data: Vec<&[u8]> = present_indices
         .iter()
         .map(|&index| {
@@ -267,50 +348,107 @@ fn run_backend<B: Backend>(config: &Config) -> Result<(), String> {
         })
         .collect();
 
-    let expected = if config.recover_index < k {
-        data[config.recover_index].as_slice()
+    let expected = if matches!(config.mode, BenchMode::Reconstruct) {
+        Some(if config.recover_index < k {
+            data[config.recover_index].as_slice()
+        } else {
+            parity[config.recover_index - k].as_slice()
+        })
     } else {
-        parity[config.recover_index - k].as_slice()
+        None
     };
 
     let mut output = vec![0u8; shard_size];
-    let bytes_per_sample = config.sample_iters as f64 * shard_size as f64;
+    let mut _encode_buffers: Vec<Vec<u8>> = (0..m).map(|_| vec![0u8; shard_size]).collect();
+    let mut encode_output_refs: Vec<&mut [u8]> =
+        _encode_buffers.iter_mut().map(Vec::as_mut_slice).collect();
+    let mut verify_scratch = vec![0u8; B::verify_scratch_size(&codec, shard_size)];
+    let bytes_per_iter = match config.mode {
+        BenchMode::Encode | BenchMode::Verify => shard_size as f64 * k as f64,
+        BenchMode::Reconstruct => shard_size as f64,
+    };
+    let bytes_per_sample = config.sample_iters as f64 * bytes_per_iter;
 
     println!("label={}", config.label);
+    println!("mode={}", mode_name(config.mode));
     println!("shard_size_bytes={shard_size}");
     println!("data_shards={}", config.data_shards);
     println!("parity_shards={}", config.parity_shards);
-    println!("recover_index={}", config.recover_index);
+    if matches!(config.mode, BenchMode::Reconstruct) {
+        println!("recover_index={}", config.recover_index);
+    }
     println!("sample_iters={}", config.sample_iters);
     println!("samples={}", config.samples);
 
     for _ in 0..config.warmup_iters {
-        let mut outputs = [output.as_mut_slice()];
-        B::reconstruct(
-            &codec,
-            &present_indices,
-            &present_data,
-            &recover_indices,
-            &mut outputs,
-        )
-        .map_err(|err| err.to_string())?;
-        black_box(output[0]);
+        match config.mode {
+            BenchMode::Encode => {
+                B::encode(&codec, &data_refs, &mut encode_output_refs)
+                    .map_err(|err| err.to_string())?;
+                if let Some(first) = encode_output_refs.first() {
+                    black_box_first_byte(first);
+                } else {
+                    black_box(encode_output_refs.len());
+                }
+            }
+            BenchMode::Verify => {
+                let ok = B::verify(&codec, &data_refs, &parity_read_refs, &mut verify_scratch)
+                    .map_err(|err| err.to_string())?;
+                if !ok {
+                    return Err("verify reported mismatch".to_string());
+                }
+                black_box_first_byte(&verify_scratch);
+            }
+            BenchMode::Reconstruct => {
+                let mut outputs = [output.as_mut_slice()];
+                B::reconstruct(
+                    &codec,
+                    &present_indices,
+                    &present_data,
+                    &recover_indices,
+                    &mut outputs,
+                )
+                .map_err(|err| err.to_string())?;
+                black_box_first_byte(&output);
+            }
+        }
     }
 
     let mut throughputs = Vec::with_capacity(config.samples);
     for sample in 0..config.samples {
         let started = Instant::now();
         for _ in 0..config.sample_iters {
-            let mut outputs = [output.as_mut_slice()];
-            B::reconstruct(
-                &codec,
-                &present_indices,
-                &present_data,
-                &recover_indices,
-                &mut outputs,
-            )
-            .map_err(|err| err.to_string())?;
-            black_box(output[0]);
+            match config.mode {
+                BenchMode::Encode => {
+                    B::encode(&codec, &data_refs, &mut encode_output_refs)
+                        .map_err(|err| err.to_string())?;
+                    if let Some(first) = encode_output_refs.first() {
+                        black_box_first_byte(first);
+                    } else {
+                        black_box(encode_output_refs.len());
+                    }
+                }
+                BenchMode::Verify => {
+                    let ok = B::verify(&codec, &data_refs, &parity_read_refs, &mut verify_scratch)
+                        .map_err(|err| err.to_string())?;
+                    if !ok {
+                        return Err("verify reported mismatch".to_string());
+                    }
+                    black_box_first_byte(&verify_scratch);
+                }
+                BenchMode::Reconstruct => {
+                    let mut outputs = [output.as_mut_slice()];
+                    B::reconstruct(
+                        &codec,
+                        &present_indices,
+                        &present_data,
+                        &recover_indices,
+                        &mut outputs,
+                    )
+                    .map_err(|err| err.to_string())?;
+                    black_box_first_byte(&output);
+                }
+            }
         }
 
         let elapsed = started.elapsed();
@@ -325,8 +463,10 @@ fn run_backend<B: Backend>(config: &Config) -> Result<(), String> {
         );
     }
 
-    if output.as_slice() != expected {
-        return Err("reconstructed shard did not match expected contents".to_string());
+    if let Some(expected) = expected {
+        if output.as_slice() != expected {
+            return Err("reconstructed shard did not match expected contents".to_string());
+        }
     }
 
     let mut sorted = throughputs.clone();

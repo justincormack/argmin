@@ -68,7 +68,7 @@ const fn build_all_nibble_tables() -> [[u8; 32]; 256] {
 
 static GF_MUL_TABLE: [u8; GF_TABLE_SIZE] = build_mul_table();
 static GF_INV_TABLE: [u8; 256] = build_inv_table(&GF_MUL_TABLE);
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 static GF_NIBBLE_TABLES: [[u8; 32]; 256] = build_all_nibble_tables();
 
 #[inline(always)]
@@ -399,7 +399,7 @@ pub(crate) fn invert_matrix(input: &mut [u8], output: &mut [u8], n: usize) -> Re
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64_neon {
-    use super::{build_nibble_table, write_with_coeff, xor_with_coeff, xor_with_slice};
+    use super::{write_with_coeff, xor_with_coeff, GF_NIBBLE_TABLES, MAX_TOTAL_SHARDS};
     use core::arch::aarch64::{
         uint8x16_t, vandq_u8, vdupq_n_u8, veorq_u8, vld1q_u8, vqtbl1q_u8, vshrq_n_u8, vst1q_u8,
     };
@@ -412,39 +412,128 @@ mod aarch64_neon {
         outputs: &mut [&mut [u8]],
     ) {
         for (row, output) in outputs.iter_mut().enumerate() {
-            let mut first_nonzero_col = None;
-            for col in 0..k {
-                let table_start = (row * k + col) * 32;
-                let coeff = tables[table_start + 1];
-                if coeff != 0 {
-                    first_nonzero_col = Some((col, coeff, &tables[table_start..table_start + 32]));
-                    break;
-                }
-            }
+            dot_prod_table_row(k, row, tables, data, output);
+        }
+    }
 
-            let Some((first_col, first_coeff, first_table)) = first_nonzero_col else {
-                output.fill(0);
+    #[target_feature(enable = "neon")]
+    unsafe fn dot_prod_table_row(
+        k: usize,
+        row_index: usize,
+        tables: &[u8],
+        data: &[&[u8]],
+        output: &mut [u8],
+    ) {
+        let zero = vdupq_n_u8(0);
+        let mut active_coeffs = [0u8; MAX_TOTAL_SHARDS];
+        let mut active_inputs = [core::ptr::null::<u8>(); MAX_TOTAL_SHARDS];
+        let mut low_tables = [zero; MAX_TOTAL_SHARDS];
+        let mut high_tables = [zero; MAX_TOTAL_SHARDS];
+        let mut active_len = 0usize;
+
+        for (col, source) in data.iter().enumerate().take(k) {
+            let table_start = (row_index * k + col) * 32;
+            let coeff = tables[table_start + 1];
+            if coeff == 0 {
                 continue;
-            };
-
-            if first_coeff == 1 {
-                output.copy_from_slice(data[first_col]);
-            } else {
-                write_with_nibble_table(output, data[first_col], first_table);
             }
+            active_coeffs[active_len] = coeff;
+            active_inputs[active_len] = source.as_ptr();
+            if coeff != 1 {
+                low_tables[active_len] = vld1q_u8(tables[table_start..].as_ptr());
+                high_tables[active_len] = vld1q_u8(tables[table_start + 16..].as_ptr());
+            }
+            active_len += 1;
+        }
 
-            for (col, source) in data.iter().enumerate().take(k).skip(first_col + 1) {
-                let table_start = (row * k + col) * 32;
-                let coeff = tables[table_start + 1];
-                if coeff == 0 {
+        if active_len == 0 {
+            output.fill(0);
+            return;
+        }
+
+        let len = output.len();
+        let out_ptr = output.as_mut_ptr();
+        let mask = vdupq_n_u8(0x0f);
+        let mut index = 0usize;
+
+        while index + 64 <= len {
+            let mut acc0 = zero;
+            let mut acc1 = zero;
+            let mut acc2 = zero;
+            let mut acc3 = zero;
+
+            for slot in 0..active_len {
+                let src_ptr = active_inputs[slot].add(index);
+                let src0 = vld1q_u8(src_ptr);
+                let src1 = vld1q_u8(src_ptr.add(16));
+                let src2 = vld1q_u8(src_ptr.add(32));
+                let src3 = vld1q_u8(src_ptr.add(48));
+                if active_coeffs[slot] == 1 {
+                    acc0 = veorq_u8(acc0, src0);
+                    acc1 = veorq_u8(acc1, src1);
+                    acc2 = veorq_u8(acc2, src2);
+                    acc3 = veorq_u8(acc3, src3);
                     continue;
                 }
-                if coeff == 1 {
-                    xor_with_slice(output, source);
-                } else {
-                    xor_with_nibble_table(output, source, &tables[table_start..table_start + 32]);
-                }
+
+                let low_table = low_tables[slot];
+                let high_table = high_tables[slot];
+                acc0 = veorq_u8(acc0, mul_chunk(src0, low_table, high_table, mask));
+                acc1 = veorq_u8(acc1, mul_chunk(src1, low_table, high_table, mask));
+                acc2 = veorq_u8(acc2, mul_chunk(src2, low_table, high_table, mask));
+                acc3 = veorq_u8(acc3, mul_chunk(src3, low_table, high_table, mask));
             }
+
+            vst1q_u8(out_ptr.add(index), acc0);
+            vst1q_u8(out_ptr.add(index + 16), acc1);
+            vst1q_u8(out_ptr.add(index + 32), acc2);
+            vst1q_u8(out_ptr.add(index + 48), acc3);
+            index += 64;
+        }
+
+        while index + 16 <= len {
+            let mut acc = zero;
+            for slot in 0..active_len {
+                let src = vld1q_u8(active_inputs[slot].add(index));
+                let product = if active_coeffs[slot] == 1 {
+                    src
+                } else {
+                    mul_chunk(src, low_tables[slot], high_tables[slot], mask)
+                };
+                acc = veorq_u8(acc, product);
+            }
+            vst1q_u8(out_ptr.add(index), acc);
+            index += 16;
+        }
+
+        if index == len {
+            return;
+        }
+
+        let mut first_index = None;
+        for (col, source) in data.iter().enumerate().take(k) {
+            let table_start = (row_index * k + col) * 32;
+            let coeff = tables[table_start + 1];
+            if coeff != 0 {
+                first_index = Some((col, coeff, source));
+                break;
+            }
+        }
+
+        let (first_col, first_coeff, first_source) = first_index.unwrap();
+        if first_coeff == 1 {
+            output[index..].copy_from_slice(&first_source[index..]);
+        } else {
+            write_with_coeff(&mut output[index..], &first_source[index..], first_coeff);
+        }
+
+        for (col, source) in data.iter().enumerate().take(k) {
+            let table_start = (row_index * k + col) * 32;
+            let coeff = tables[table_start + 1];
+            if coeff == 0 || col == first_col {
+                continue;
+            }
+            xor_with_coeff(&mut output[index..], &source[index..], coeff);
         }
     }
 
@@ -457,90 +546,113 @@ mod aarch64_neon {
     ) {
         for (row_index, output) in outputs.iter_mut().enumerate() {
             let row = &rows[row_index * k..(row_index + 1) * k];
-            let mut first_nonzero = None;
-            for (index, &coeff) in row.iter().enumerate() {
-                if coeff != 0 {
-                    first_nonzero = Some((index, coeff));
-                    break;
-                }
-            }
+            dot_prod_row(k, row, inputs, output);
+        }
+    }
 
-            let Some((first_index, first_coeff)) = first_nonzero else {
-                output.fill(0);
+    #[target_feature(enable = "neon")]
+    unsafe fn dot_prod_row(k: usize, row: &[u8], inputs: &[&[u8]], output: &mut [u8]) {
+        let mut active_coeffs = [0u8; MAX_TOTAL_SHARDS];
+        let mut active_inputs = [core::ptr::null::<u8>(); MAX_TOTAL_SHARDS];
+        let mut active_len = 0usize;
+
+        for col in 0..k {
+            let coeff = row[col];
+            if coeff == 0 {
                 continue;
-            };
-
-            if first_coeff == 1 {
-                output.copy_from_slice(inputs[first_index]);
-            } else {
-                let table = build_nibble_table(first_coeff);
-                write_with_nibble_table(output, inputs[first_index], &table);
             }
+            active_coeffs[active_len] = coeff;
+            active_inputs[active_len] = inputs[col].as_ptr();
+            active_len += 1;
+        }
 
-            for (&coeff, source) in row.iter().zip(inputs.iter().copied()).skip(first_index + 1) {
-                match coeff {
-                    0 => {}
-                    1 => xor_with_slice(output, source),
-                    _ => {
-                        let table = build_nibble_table(coeff);
-                        xor_with_nibble_table(output, source, &table);
-                    }
+        if active_len == 0 {
+            output.fill(0);
+            return;
+        }
+
+        let len = output.len();
+        let out_ptr = output.as_mut_ptr();
+        let mask = vdupq_n_u8(0x0f);
+        let mut index = 0usize;
+
+        while index + 64 <= len {
+            let mut acc0 = vdupq_n_u8(0);
+            let mut acc1 = vdupq_n_u8(0);
+            let mut acc2 = vdupq_n_u8(0);
+            let mut acc3 = vdupq_n_u8(0);
+
+            for slot in 0..active_len {
+                let src_ptr = active_inputs[slot].add(index);
+                let src0 = vld1q_u8(src_ptr);
+                let src1 = vld1q_u8(src_ptr.add(16));
+                let src2 = vld1q_u8(src_ptr.add(32));
+                let src3 = vld1q_u8(src_ptr.add(48));
+                if active_coeffs[slot] == 1 {
+                    acc0 = veorq_u8(acc0, src0);
+                    acc1 = veorq_u8(acc1, src1);
+                    acc2 = veorq_u8(acc2, src2);
+                    acc3 = veorq_u8(acc3, src3);
+                    continue;
                 }
+
+                let table = &GF_NIBBLE_TABLES[active_coeffs[slot] as usize];
+                let low_table = vld1q_u8(table.as_ptr());
+                let high_table = vld1q_u8(table[16..].as_ptr());
+                acc0 = veorq_u8(acc0, mul_chunk(src0, low_table, high_table, mask));
+                acc1 = veorq_u8(acc1, mul_chunk(src1, low_table, high_table, mask));
+                acc2 = veorq_u8(acc2, mul_chunk(src2, low_table, high_table, mask));
+                acc3 = veorq_u8(acc3, mul_chunk(src3, low_table, high_table, mask));
+            }
+
+            vst1q_u8(out_ptr.add(index), acc0);
+            vst1q_u8(out_ptr.add(index + 16), acc1);
+            vst1q_u8(out_ptr.add(index + 32), acc2);
+            vst1q_u8(out_ptr.add(index + 48), acc3);
+            index += 64;
+        }
+
+        while index + 16 <= len {
+            let mut acc = vdupq_n_u8(0);
+            for slot in 0..active_len {
+                let src = vld1q_u8(active_inputs[slot].add(index));
+                let product = if active_coeffs[slot] == 1 {
+                    src
+                } else {
+                    let table = &GF_NIBBLE_TABLES[active_coeffs[slot] as usize];
+                    let low_table = vld1q_u8(table.as_ptr());
+                    let high_table = vld1q_u8(table[16..].as_ptr());
+                    mul_chunk(src, low_table, high_table, mask)
+                };
+                acc = veorq_u8(acc, product);
+            }
+            vst1q_u8(out_ptr.add(index), acc);
+            index += 16;
+        }
+
+        if index == len {
+            return;
+        }
+
+        let mut first_index = None;
+        for (col, &coeff) in row.iter().enumerate().take(k) {
+            if coeff != 0 {
+                first_index = Some((col, coeff));
+                break;
             }
         }
-    }
-
-    #[target_feature(enable = "neon")]
-    unsafe fn write_with_nibble_table(dest: &mut [u8], src: &[u8], table: &[u8]) {
-        let coeff = table[1];
-        if coeff == 0 || coeff == 1 || dest.len() < 16 {
-            write_with_coeff(dest, src, coeff);
-            return;
+        let (first_col, first_coeff) = first_index.unwrap();
+        if first_coeff == 1 {
+            output[index..].copy_from_slice(&inputs[first_col][index..]);
+        } else {
+            write_with_coeff(
+                &mut output[index..],
+                &inputs[first_col][index..],
+                first_coeff,
+            );
         }
-
-        let len = dest.len();
-        let mut index = 0usize;
-        let mask = vdupq_n_u8(0x0f);
-        let low_table = vld1q_u8(table.as_ptr());
-        let high_table = vld1q_u8(table[16..].as_ptr());
-
-        while index + 16 <= len {
-            let src_chunk = vld1q_u8(src.as_ptr().add(index));
-            let product = mul_chunk(src_chunk, low_table, high_table, mask);
-            vst1q_u8(dest.as_mut_ptr().add(index), product);
-            index += 16;
-        }
-
-        if index < len {
-            write_with_coeff(&mut dest[index..], &src[index..], coeff);
-        }
-    }
-
-    #[target_feature(enable = "neon")]
-    unsafe fn xor_with_nibble_table(dest: &mut [u8], src: &[u8], table: &[u8]) {
-        let coeff = table[1];
-        if coeff == 0 || coeff == 1 || dest.len() < 16 {
-            xor_with_coeff(dest, src, coeff);
-            return;
-        }
-
-        let len = dest.len();
-        let mut index = 0usize;
-        let mask = vdupq_n_u8(0x0f);
-        let low_table = vld1q_u8(table.as_ptr());
-        let high_table = vld1q_u8(table[16..].as_ptr());
-
-        while index + 16 <= len {
-            let src_chunk = vld1q_u8(src.as_ptr().add(index));
-            let dest_chunk = vld1q_u8(dest.as_ptr().add(index));
-            let product = mul_chunk(src_chunk, low_table, high_table, mask);
-            let combined = veorq_u8(dest_chunk, product);
-            vst1q_u8(dest.as_mut_ptr().add(index), combined);
-            index += 16;
-        }
-
-        if index < len {
-            xor_with_coeff(&mut dest[index..], &src[index..], coeff);
+        for (&coeff, source) in row.iter().zip(inputs.iter().copied()).skip(first_col + 1) {
+            xor_with_coeff(&mut output[index..], &source[index..], coeff);
         }
     }
 
@@ -559,6 +671,7 @@ mod aarch64_neon {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 mod x86_64_avx512 {
     use super::{
         write_with_coeff, xor_with_coeff, xor_with_slice, GF_NIBBLE_TABLES, MAX_TOTAL_SHARDS,
@@ -771,6 +884,7 @@ mod x86_64_avx512 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[cfg(target_arch = "x86_64")]
 mod x86_64_avx2 {
     use super::{
