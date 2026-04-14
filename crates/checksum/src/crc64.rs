@@ -86,6 +86,13 @@ fn extend(crc: u64, data: &[u8]) -> u64 {
             }
         }
 
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("aes") {
+                return unsafe { extend_pmull_aarch64(crc, data) };
+            }
+        }
+
         extend_scalar(crc, data)
     }
 
@@ -303,6 +310,153 @@ mod x86_64_pclmul {
 #[inline]
 unsafe fn extend_pclmul_x86_64(crc: u64, data: &[u8]) -> u64 {
     x86_64_pclmul::extend(crc, data)
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+mod aarch64_pmull {
+    use core::arch::aarch64::{
+        poly64x2_t, uint64x2_t, uint8x16_t, vdupq_n_u64, veorq_u8, vget_lane_p64, vget_low_p64,
+        vgetq_lane_u64, vld1q_u8, vmull_high_p64, vmull_p64, vreinterpretq_p64_u64,
+        vreinterpretq_p64_u8, vreinterpretq_u64_p128, vreinterpretq_u64_u8, vreinterpretq_u8_p128,
+        vreinterpretq_u8_u64, vsetq_lane_u64,
+    };
+
+    const P4_LOW: u64 = 0x0C32_CDB3_1E18_A84A;
+    const P4_HIGH: u64 = 0x6224_2240_ACE5_045A;
+    const P1_LOW: u64 = 0xEADC_41FD_2BA3_D420;
+    const P1_HIGH: u64 = 0x21E9_761E_2526_21AC;
+    const P0_LOW: u64 = 0x21E9_761E_2526_21AC;
+    const BR_LOW: u64 = 0x27EC_FA32_9AEF_9F77;
+    const BR_HIGH: u64 = 0x34D9_2653_5897_936B;
+
+    #[inline]
+    unsafe fn u64x2(lo: u64, hi: u64) -> uint64x2_t {
+        let value = vdupq_n_u64(0);
+        let value = vsetq_lane_u64::<0>(lo, value);
+        vsetq_lane_u64::<1>(hi, value)
+    }
+
+    #[inline]
+    unsafe fn poly64x2(lo: u64, hi: u64) -> poly64x2_t {
+        vreinterpretq_p64_u64(u64x2(lo, hi))
+    }
+
+    #[inline]
+    unsafe fn low64_as_u8x16(value: u64) -> uint8x16_t {
+        vreinterpretq_u8_u64(u64x2(value, 0))
+    }
+
+    #[inline]
+    fn load_block(ptr: *const u8) -> uint8x16_t {
+        unsafe { vld1q_u8(ptr) }
+    }
+
+    #[inline]
+    fn xor_crc(block: uint8x16_t, crc: u64) -> uint8x16_t {
+        unsafe { veorq_u8(block, low64_as_u8x16(crc)) }
+    }
+
+    #[inline]
+    fn low_p64(x: poly64x2_t) -> u64 {
+        unsafe { vget_lane_p64::<0>(vget_low_p64(x)) }
+    }
+
+    #[inline]
+    fn clmul_low(x: poly64x2_t, y: poly64x2_t) -> uint8x16_t {
+        unsafe { vreinterpretq_u8_p128(vmull_p64(low_p64(x), low_p64(y))) }
+    }
+
+    #[inline]
+    fn clmul_high(x: poly64x2_t, y: poly64x2_t) -> uint8x16_t {
+        unsafe { vreinterpretq_u8_p128(vmull_high_p64(x, y)) }
+    }
+
+    #[inline]
+    fn fold_block(x: uint8x16_t, next: uint8x16_t, constant: poly64x2_t) -> uint8x16_t {
+        unsafe {
+            let poly = vreinterpretq_p64_u8(x);
+            veorq_u8(
+                veorq_u8(clmul_low(poly, constant), clmul_high(poly, constant)),
+                next,
+            )
+        }
+    }
+
+    #[inline]
+    fn fold_without_next(x: uint8x16_t, constant: poly64x2_t) -> uint8x16_t {
+        unsafe {
+            let poly = vreinterpretq_p64_u8(x);
+            veorq_u8(clmul_low(poly, constant), clmul_high(poly, constant))
+        }
+    }
+
+    #[inline]
+    fn reduce_to_crc(x: uint8x16_t) -> u64 {
+        unsafe {
+            let folded = {
+                let x_poly = vreinterpretq_p64_u8(x);
+                let tmp_low = vreinterpretq_u8_p128(vmull_p64(low_p64(x_poly), P0_LOW));
+                let x_words = vreinterpretq_u64_u8(x);
+                let tmp_high = low64_as_u8x16(vgetq_lane_u64::<1>(x_words));
+                veorq_u8(tmp_low, tmp_high)
+            };
+
+            let folded_poly = vreinterpretq_p64_u8(folded);
+            let y = vmull_p64(low_p64(folded_poly), BR_LOW);
+            let y_words = vreinterpretq_u64_p128(y);
+            let y_low = vgetq_lane_u64::<0>(y_words);
+            let y_shifted = vreinterpretq_u8_u64(u64x2(0, y_low));
+            let z = vreinterpretq_u8_p128(vmull_p64(y_low, BR_HIGH));
+            let reduced = veorq_u8(veorq_u8(z, y_shifted), folded);
+            vgetq_lane_u64::<1>(vreinterpretq_u64_u8(reduced))
+        }
+    }
+
+    #[target_feature(enable = "neon,aes")]
+    pub unsafe fn extend(crc: u64, data: &[u8]) -> u64 {
+        let prefix_len = data.len() & !0x3F;
+        if prefix_len < 64 {
+            return super::extend_scalar(crc, data);
+        }
+
+        let (prefix, tail) = data.split_at(prefix_len);
+        let prefix_crc = extend_blocks_only(crc, prefix);
+        super::extend_scalar(prefix_crc, tail)
+    }
+
+    #[target_feature(enable = "neon,aes")]
+    unsafe fn extend_blocks_only(crc: u64, data: &[u8]) -> u64 {
+        let p4 = poly64x2(P4_LOW, P4_HIGH);
+        let p1 = poly64x2(P1_LOW, P1_HIGH);
+        let mut ptr = data.as_ptr();
+        let end = ptr.add(data.len());
+
+        let mut x0 = xor_crc(load_block(ptr), !crc);
+        let mut x1 = load_block(ptr.add(16));
+        let mut x2 = load_block(ptr.add(32));
+        let mut x3 = load_block(ptr.add(48));
+        ptr = ptr.add(64);
+
+        while ptr < end {
+            x0 = fold_block(x0, load_block(ptr), p4);
+            x1 = fold_block(x1, load_block(ptr.add(16)), p4);
+            x2 = fold_block(x2, load_block(ptr.add(32)), p4);
+            x3 = fold_block(x3, load_block(ptr.add(48)), p4);
+            ptr = ptr.add(64);
+        }
+
+        x1 = veorq_u8(x1, fold_without_next(x0, p1));
+        x2 = veorq_u8(x2, fold_without_next(x1, p1));
+        x3 = veorq_u8(x3, fold_without_next(x2, p1));
+
+        !reduce_to_crc(x3)
+    }
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[inline]
+unsafe fn extend_pmull_aarch64(crc: u64, data: &[u8]) -> u64 {
+    aarch64_pmull::extend(crc, data)
 }
 
 /// Compute CRC-64/NVME over the entire buffer.
