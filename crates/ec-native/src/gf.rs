@@ -97,31 +97,142 @@ fn xor_with_coeff(dest: &mut [u8], src: &[u8], coeff: u8) {
     match coeff {
         0 => {}
         1 => {
-            for (out, &value) in dest.iter_mut().zip(src.iter()) {
-                *out ^= value;
-            }
+            xor_with_slice(dest, src);
         }
         _ => {
-            let table = gf_mul_table(coeff);
-            for (out, &value) in dest.iter_mut().zip(src.iter()) {
-                *out ^= table[value as usize];
-            }
+            xor_with_table(dest, src, gf_mul_table(coeff));
+        }
+    }
+}
+
+#[inline(always)]
+fn write_with_coeff(dest: &mut [u8], src: &[u8], coeff: u8) {
+    match coeff {
+        0 => dest.fill(0),
+        1 => dest.copy_from_slice(src),
+        _ => write_with_table(dest, src, gf_mul_table(coeff)),
+    }
+}
+
+#[inline(always)]
+fn xor_with_slice(dest: &mut [u8], src: &[u8]) {
+    debug_assert_eq!(dest.len(), src.len());
+
+    let len = dest.len();
+    let dest_ptr = dest.as_mut_ptr();
+    let src_ptr = src.as_ptr();
+    let mut index = 0usize;
+
+    // SAFETY: `dest` and `src` have the same length, and every indexed access
+    // stays within bounds of those slices.
+    unsafe {
+        while index + 8 <= len {
+            *dest_ptr.add(index) ^= *src_ptr.add(index);
+            *dest_ptr.add(index + 1) ^= *src_ptr.add(index + 1);
+            *dest_ptr.add(index + 2) ^= *src_ptr.add(index + 2);
+            *dest_ptr.add(index + 3) ^= *src_ptr.add(index + 3);
+            *dest_ptr.add(index + 4) ^= *src_ptr.add(index + 4);
+            *dest_ptr.add(index + 5) ^= *src_ptr.add(index + 5);
+            *dest_ptr.add(index + 6) ^= *src_ptr.add(index + 6);
+            *dest_ptr.add(index + 7) ^= *src_ptr.add(index + 7);
+            index += 8;
+        }
+        while index < len {
+            *dest_ptr.add(index) ^= *src_ptr.add(index);
+            index += 1;
         }
     }
 }
 
 #[inline(always)]
 fn xor_with_table(dest: &mut [u8], src: &[u8], table: &[u8]) {
-    for (out, &value) in dest.iter_mut().zip(src.iter()) {
-        *out ^= table[value as usize];
+    debug_assert_eq!(dest.len(), src.len());
+    debug_assert_eq!(table.len(), 256);
+
+    let len = dest.len();
+    let dest_ptr = dest.as_mut_ptr();
+    let src_ptr = src.as_ptr();
+    let table_ptr = table.as_ptr();
+    let mut index = 0usize;
+
+    // SAFETY: `dest` and `src` have the same length, every table lookup stays
+    // within the fixed 256-byte multiplication table, and every slice access is
+    // within bounds.
+    unsafe {
+        while index + 8 <= len {
+            *dest_ptr.add(index) ^= *table_ptr.add(*src_ptr.add(index) as usize);
+            *dest_ptr.add(index + 1) ^= *table_ptr.add(*src_ptr.add(index + 1) as usize);
+            *dest_ptr.add(index + 2) ^= *table_ptr.add(*src_ptr.add(index + 2) as usize);
+            *dest_ptr.add(index + 3) ^= *table_ptr.add(*src_ptr.add(index + 3) as usize);
+            *dest_ptr.add(index + 4) ^= *table_ptr.add(*src_ptr.add(index + 4) as usize);
+            *dest_ptr.add(index + 5) ^= *table_ptr.add(*src_ptr.add(index + 5) as usize);
+            *dest_ptr.add(index + 6) ^= *table_ptr.add(*src_ptr.add(index + 6) as usize);
+            *dest_ptr.add(index + 7) ^= *table_ptr.add(*src_ptr.add(index + 7) as usize);
+            index += 8;
+        }
+        while index < len {
+            *dest_ptr.add(index) ^= *table_ptr.add(*src_ptr.add(index) as usize);
+            index += 1;
+        }
+    }
+}
+
+#[inline(always)]
+fn write_with_table(dest: &mut [u8], src: &[u8], table: &[u8]) {
+    debug_assert_eq!(dest.len(), src.len());
+    debug_assert_eq!(table.len(), 256);
+
+    let len = dest.len();
+    let dest_ptr = dest.as_mut_ptr();
+    let src_ptr = src.as_ptr();
+    let table_ptr = table.as_ptr();
+    let mut index = 0usize;
+
+    // SAFETY: `dest` and `src` have the same length, every table lookup stays
+    // within the fixed 256-byte multiplication table, and every slice access is
+    // within bounds.
+    unsafe {
+        while index + 8 <= len {
+            *dest_ptr.add(index) = *table_ptr.add(*src_ptr.add(index) as usize);
+            *dest_ptr.add(index + 1) = *table_ptr.add(*src_ptr.add(index + 1) as usize);
+            *dest_ptr.add(index + 2) = *table_ptr.add(*src_ptr.add(index + 2) as usize);
+            *dest_ptr.add(index + 3) = *table_ptr.add(*src_ptr.add(index + 3) as usize);
+            *dest_ptr.add(index + 4) = *table_ptr.add(*src_ptr.add(index + 4) as usize);
+            *dest_ptr.add(index + 5) = *table_ptr.add(*src_ptr.add(index + 5) as usize);
+            *dest_ptr.add(index + 6) = *table_ptr.add(*src_ptr.add(index + 6) as usize);
+            *dest_ptr.add(index + 7) = *table_ptr.add(*src_ptr.add(index + 7) as usize);
+            index += 8;
+        }
+        while index < len {
+            *dest_ptr.add(index) = *table_ptr.add(*src_ptr.add(index) as usize);
+            index += 1;
+        }
     }
 }
 
 pub(crate) fn encode_rows(k: usize, tables: &[u8], data: &[&[u8]], outputs: &mut [&mut [u8]]) {
     for (row, output) in outputs.iter_mut().enumerate() {
-        output.fill(0);
-        for (col, source) in data.iter().enumerate().take(k) {
+        let mut first_nonzero_col = None;
+        for col in 0..k {
             let table_start = (row * k + col) * 256;
+            let table_end = table_start + 256;
+            if tables[table_start + 1] != 0 {
+                first_nonzero_col = Some((col, &tables[table_start..table_end]));
+                break;
+            }
+        }
+
+        let Some((first_col, first_table)) = first_nonzero_col else {
+            output.fill(0);
+            continue;
+        };
+
+        write_with_table(output, data[first_col], first_table);
+        for (col, source) in data.iter().enumerate().take(k).skip(first_col + 1) {
+            let table_start = (row * k + col) * 256;
+            if tables[table_start + 1] == 0 {
+                continue;
+            }
             let table_end = table_start + 256;
             xor_with_table(output, source, &tables[table_start..table_end]);
         }
@@ -136,9 +247,27 @@ pub(crate) fn apply_matrix_rows(
 ) {
     debug_assert!(k <= MAX_TOTAL_SHARDS);
     for (row_index, output) in outputs.iter_mut().enumerate() {
-        output.fill(0);
         let row = &rows[row_index * k..(row_index + 1) * k];
-        for (coeff, source) in row.iter().copied().zip(inputs.iter().copied()) {
+        let mut first_nonzero = None;
+        for (index, &coeff) in row.iter().enumerate() {
+            if coeff != 0 {
+                first_nonzero = Some((index, coeff));
+                break;
+            }
+        }
+
+        let Some((first_index, first_coeff)) = first_nonzero else {
+            output.fill(0);
+            continue;
+        };
+
+        write_with_coeff(output, inputs[first_index], first_coeff);
+        for (coeff, source) in row
+            .iter()
+            .copied()
+            .zip(inputs.iter().copied())
+            .skip(first_index + 1)
+        {
             xor_with_coeff(output, source, coeff);
         }
     }
