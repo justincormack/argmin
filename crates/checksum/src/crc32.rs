@@ -67,52 +67,91 @@ fn read_u32_le(ptr: *const u8) -> u32 {
     unsafe { u32::from_le(ptr.cast::<u32>().read_unaligned()) }
 }
 
+#[cfg(feature = "pure-rust")]
+#[inline]
+fn extend_scalar(crc: u32, data: &[u8]) -> u32 {
+    let mut state = !crc;
+    let mut remaining = data;
+
+    while remaining.len() >= 16 {
+        let first = read_u32_le(remaining.as_ptr());
+        let second = read_u32_le(remaining.as_ptr().wrapping_add(4));
+        let third = read_u32_le(remaining.as_ptr().wrapping_add(8));
+        let fourth = read_u32_le(remaining.as_ptr().wrapping_add(12));
+        let mixed = state ^ first;
+        state = TABLES[15][(mixed & 0xFF) as usize]
+            ^ TABLES[14][((mixed >> 8) & 0xFF) as usize]
+            ^ TABLES[13][((mixed >> 16) & 0xFF) as usize]
+            ^ TABLES[12][(mixed >> 24) as usize]
+            ^ TABLES[11][(second & 0xFF) as usize]
+            ^ TABLES[10][((second >> 8) & 0xFF) as usize]
+            ^ TABLES[9][((second >> 16) & 0xFF) as usize]
+            ^ TABLES[8][(second >> 24) as usize]
+            ^ TABLES[7][(third & 0xFF) as usize]
+            ^ TABLES[6][((third >> 8) & 0xFF) as usize]
+            ^ TABLES[5][((third >> 16) & 0xFF) as usize]
+            ^ TABLES[4][(third >> 24) as usize]
+            ^ TABLES[3][(fourth & 0xFF) as usize]
+            ^ TABLES[2][((fourth >> 8) & 0xFF) as usize]
+            ^ TABLES[1][((fourth >> 16) & 0xFF) as usize]
+            ^ TABLES[0][(fourth >> 24) as usize];
+        remaining = &remaining[16..];
+    }
+
+    while remaining.len() >= 4 {
+        let mixed = state ^ read_u32_le(remaining.as_ptr());
+        state = TABLES[3][(mixed & 0xFF) as usize]
+            ^ TABLES[2][((mixed >> 8) & 0xFF) as usize]
+            ^ TABLES[1][((mixed >> 16) & 0xFF) as usize]
+            ^ TABLES[0][(mixed >> 24) as usize];
+        remaining = &remaining[4..];
+    }
+
+    for &byte in remaining {
+        let idx = ((state as u8) ^ byte) as usize;
+        state = TABLES[0][idx] ^ (state >> 8);
+    }
+
+    !state
+}
+
+#[cfg(feature = "pure-rust")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PureRustBackend {
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    PclmulX86_64,
+}
+
+#[cfg(feature = "pure-rust")]
+#[inline]
+fn pure_rust_backend() -> PureRustBackend {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_pclmul_x86_64() {
+            return PureRustBackend::PclmulX86_64;
+        }
+    }
+
+    PureRustBackend::Scalar
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[inline]
+fn has_pclmul_x86_64() -> bool {
+    std::arch::is_x86_feature_detected!("sse4.1")
+        && std::arch::is_x86_feature_detected!("pclmulqdq")
+}
+
 #[inline]
 fn extend(crc: u32, data: &[u8]) -> u32 {
     #[cfg(feature = "pure-rust")]
     {
-        let mut state = !crc;
-        let mut remaining = data;
-
-        while remaining.len() >= 16 {
-            let first = read_u32_le(remaining.as_ptr());
-            let second = read_u32_le(remaining.as_ptr().wrapping_add(4));
-            let third = read_u32_le(remaining.as_ptr().wrapping_add(8));
-            let fourth = read_u32_le(remaining.as_ptr().wrapping_add(12));
-            let mixed = state ^ first;
-            state = TABLES[15][(mixed & 0xFF) as usize]
-                ^ TABLES[14][((mixed >> 8) & 0xFF) as usize]
-                ^ TABLES[13][((mixed >> 16) & 0xFF) as usize]
-                ^ TABLES[12][(mixed >> 24) as usize]
-                ^ TABLES[11][(second & 0xFF) as usize]
-                ^ TABLES[10][((second >> 8) & 0xFF) as usize]
-                ^ TABLES[9][((second >> 16) & 0xFF) as usize]
-                ^ TABLES[8][(second >> 24) as usize]
-                ^ TABLES[7][(third & 0xFF) as usize]
-                ^ TABLES[6][((third >> 8) & 0xFF) as usize]
-                ^ TABLES[5][((third >> 16) & 0xFF) as usize]
-                ^ TABLES[4][(third >> 24) as usize]
-                ^ TABLES[3][(fourth & 0xFF) as usize]
-                ^ TABLES[2][((fourth >> 8) & 0xFF) as usize]
-                ^ TABLES[1][((fourth >> 16) & 0xFF) as usize]
-                ^ TABLES[0][(fourth >> 24) as usize];
-            remaining = &remaining[16..];
+        match pure_rust_backend() {
+            PureRustBackend::Scalar => extend_scalar(crc, data),
+            #[cfg(target_arch = "x86_64")]
+            PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(crc, data) },
         }
-
-        while remaining.len() >= 4 {
-            let mixed = state ^ read_u32_le(remaining.as_ptr());
-            state = TABLES[3][(mixed & 0xFF) as usize]
-                ^ TABLES[2][((mixed >> 8) & 0xFF) as usize]
-                ^ TABLES[1][((mixed >> 16) & 0xFF) as usize]
-                ^ TABLES[0][(mixed >> 24) as usize];
-            remaining = &remaining[4..];
-        }
-
-        for &byte in remaining {
-            let idx = ((state as u8) ^ byte) as usize;
-            state = TABLES[0][idx] ^ (state >> 8);
-        }
-        !state
     }
 
     #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
@@ -122,6 +161,109 @@ fn extend(crc: u32, data: &[u8]) -> u32 {
         // never dereferenced (len=0).
         unsafe { ec_sys::crc32_gzip_refl(crc, data.as_ptr(), data.len() as u64) }
     }
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+mod x86_64_pclmul {
+    use core::arch::x86_64::{
+        __m128i, _mm_and_si128, _mm_clmulepi64_si128, _mm_cvtsi128_si32, _mm_cvtsi32_si128,
+        _mm_load_si128, _mm_loadu_si128, _mm_slli_si128, _mm_srli_si128, _mm_xor_si128,
+    };
+
+    #[repr(align(16))]
+    struct Aligned([u64; 2]);
+
+    const fn aligned(lo: u64, hi: u64) -> Aligned {
+        Aligned([lo, hi])
+    }
+
+    static FOLD_1: Aligned = aligned(0x00000000ccaa009e, 0x00000001751997d0);
+    static FOLD_128_TO_64: Aligned = aligned(0x00000000ccaa009e, 0x0000000163cd6124);
+    static BARRETT: Aligned = aligned(0x00000001f7011640, 0x00000001db710640);
+    static LO32_CLR_MASK: Aligned = aligned(0xFFFFFFFF00000000, 0xFFFFFFFFFFFFFFFF);
+    static HI64_MASK: Aligned = aligned(0xFFFFFFFFFFFFFFFF, 0x0000000000000000);
+
+    #[inline]
+    fn load_aligned(value: &Aligned) -> __m128i {
+        unsafe { _mm_load_si128(value.0.as_ptr().cast::<__m128i>()) }
+    }
+
+    #[inline]
+    fn load_block(ptr: *const u8) -> __m128i {
+        unsafe { _mm_loadu_si128(ptr.cast::<__m128i>()) }
+    }
+
+    #[inline]
+    fn xor_crc(block: __m128i, crc: u32) -> __m128i {
+        unsafe { _mm_xor_si128(block, _mm_cvtsi32_si128(crc as i32)) }
+    }
+
+    #[inline]
+    fn fold_block(x: __m128i, next: __m128i, constant: __m128i) -> __m128i {
+        unsafe {
+            let lo = _mm_clmulepi64_si128::<0x01>(x, constant);
+            let hi = _mm_clmulepi64_si128::<0x10>(x, constant);
+            _mm_xor_si128(_mm_xor_si128(lo, hi), next)
+        }
+    }
+
+    #[inline]
+    fn reduce_to_crc(x: __m128i) -> u32 {
+        unsafe {
+            let fold = load_aligned(&FOLD_128_TO_64);
+            let hi = _mm_srli_si128::<8>(x);
+            let folded = _mm_xor_si128(_mm_clmulepi64_si128::<0x00>(x, fold), hi);
+
+            let tmp = _mm_slli_si128::<4>(folded);
+            let folded32 = _mm_xor_si128(_mm_clmulepi64_si128::<0x10>(tmp, fold), folded);
+
+            let masked = _mm_and_si128(folded32, load_aligned(&LO32_CLR_MASK));
+            let y = _mm_xor_si128(
+                _mm_clmulepi64_si128::<0x00>(masked, load_aligned(&BARRETT)),
+                masked,
+            );
+            let y = _mm_and_si128(y, load_aligned(&HI64_MASK));
+            let z = _mm_xor_si128(_mm_clmulepi64_si128::<0x10>(y, load_aligned(&BARRETT)), y);
+            let reduced = _mm_xor_si128(z, masked);
+
+            _mm_cvtsi128_si32(_mm_srli_si128::<8>(reduced)) as u32
+        }
+    }
+
+    #[target_feature(enable = "sse4.1,pclmulqdq")]
+    pub unsafe fn extend(crc: u32, data: &[u8]) -> u32 {
+        let prefix_len = data.len() & !0x0F;
+        if prefix_len < 16 {
+            return super::extend_scalar(crc, data);
+        }
+
+        let (prefix, tail) = data.split_at(prefix_len);
+        let prefix_crc = extend_blocks_only(crc, prefix);
+        super::extend_scalar(prefix_crc, tail)
+    }
+
+    #[target_feature(enable = "sse4.1,pclmulqdq")]
+    unsafe fn extend_blocks_only(crc: u32, data: &[u8]) -> u32 {
+        let mut ptr = data.as_ptr();
+        let end = ptr.add(data.len());
+        let fold_1 = load_aligned(&FOLD_1);
+
+        let mut state = xor_crc(load_block(ptr), !crc);
+        ptr = ptr.add(16);
+
+        while ptr < end {
+            state = fold_block(state, load_block(ptr), fold_1);
+            ptr = ptr.add(16);
+        }
+
+        !reduce_to_crc(state)
+    }
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[inline]
+unsafe fn extend_pclmul_x86_64(crc: u32, data: &[u8]) -> u32 {
+    x86_64_pclmul::extend(crc, data)
 }
 
 /// Compute CRC-32 (gzip/IEEE) over the entire buffer.
@@ -245,6 +387,99 @@ fn gf2_matrix_square(square: &mut [u32; 32], mat: &[u32; 32]) {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[cfg(feature = "pure-rust")]
+    #[derive(Clone, Copy, Debug)]
+    struct BackendCase {
+        backend: PureRustBackend,
+        name: &'static str,
+    }
+
+    #[cfg(feature = "pure-rust")]
+    fn supported_backend_cases() -> Vec<BackendCase> {
+        let mut cases = vec![BackendCase {
+            backend: PureRustBackend::Scalar,
+            name: "scalar",
+        }];
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if has_pclmul_x86_64() {
+                cases.push(BackendCase {
+                    backend: PureRustBackend::PclmulX86_64,
+                    name: "x86_64-pclmulqdq",
+                });
+            }
+        }
+
+        cases
+    }
+
+    #[cfg(feature = "pure-rust")]
+    fn checksum_with_backend(backend: PureRustBackend, data: &[u8]) -> u32 {
+        match backend {
+            PureRustBackend::Scalar => extend_scalar(0, data),
+            #[cfg(target_arch = "x86_64")]
+            PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(0, data) },
+        }
+    }
+
+    #[cfg(feature = "pure-rust")]
+    fn checksum_streaming_with_backend(
+        backend: PureRustBackend,
+        data: &[u8],
+        chunk_size: usize,
+    ) -> u32 {
+        let mut crc = 0;
+        for chunk in data.chunks(chunk_size.max(1)) {
+            crc = match backend {
+                PureRustBackend::Scalar => extend_scalar(crc, chunk),
+                #[cfg(target_arch = "x86_64")]
+                PureRustBackend::PclmulX86_64 => unsafe { extend_pclmul_x86_64(crc, chunk) },
+            };
+        }
+        crc
+    }
+
+    #[cfg(feature = "pure-rust")]
+    #[test]
+    fn supported_backends_match_scalar_across_boundaries() {
+        let lengths = [
+            0usize, 1, 2, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
+            511, 512, 513, 1024, 4096,
+        ];
+        let chunk_sizes = [1usize, 2, 3, 7, 15, 16, 17, 31, 32, 63, 64, 127];
+        let backend_cases = supported_backend_cases();
+
+        for &len in &lengths {
+            let data: Vec<u8> = (0u8..=255)
+                .cycle()
+                .take(len)
+                .enumerate()
+                .map(|(i, byte)| byte ^ ((i as u8).wrapping_mul(17)))
+                .collect();
+            let expected = checksum_with_backend(PureRustBackend::Scalar, &data);
+
+            for case in &backend_cases {
+                let actual = checksum_with_backend(case.backend, &data);
+                assert_eq!(
+                    actual, expected,
+                    "backend {} mismatch at len {}",
+                    case.name, len
+                );
+
+                for &chunk_size in &chunk_sizes {
+                    let streaming =
+                        checksum_streaming_with_backend(case.backend, &data, chunk_size);
+                    assert_eq!(
+                        streaming, expected,
+                        "backend {} streaming mismatch at len {} chunk_size {}",
+                        case.name, len, chunk_size
+                    );
+                }
+            }
+        }
+    }
 
     // ── Standard test vectors ────────────────────────────────────────
 

@@ -67,55 +67,103 @@ fn read_u32_le(ptr: *const u8) -> u32 {
     unsafe { u32::from_le(ptr.cast::<u32>().read_unaligned()) }
 }
 
+#[cfg(feature = "pure-rust")]
 #[inline]
-fn update_internal(mut crc: u32, data: &[u8]) -> u32 {
+fn read_u64_le(ptr: *const u8) -> u64 {
+    // SAFETY: callers only pass pointers proven to be valid for at least
+    // 8 bytes. We use read_unaligned because the input buffer may not be
+    // naturally aligned.
+    unsafe { u64::from_le(ptr.cast::<u64>().read_unaligned()) }
+}
+
+#[cfg(feature = "pure-rust")]
+#[inline]
+fn update_scalar(mut crc: u32, data: &[u8]) -> u32 {
+    let mut remaining = data;
+
+    while remaining.len() >= 16 {
+        let first = read_u32_le(remaining.as_ptr());
+        let second = read_u32_le(remaining.as_ptr().wrapping_add(4));
+        let third = read_u32_le(remaining.as_ptr().wrapping_add(8));
+        let fourth = read_u32_le(remaining.as_ptr().wrapping_add(12));
+        let mixed = crc ^ first;
+        crc = TABLES[15][(mixed & 0xFF) as usize]
+            ^ TABLES[14][((mixed >> 8) & 0xFF) as usize]
+            ^ TABLES[13][((mixed >> 16) & 0xFF) as usize]
+            ^ TABLES[12][(mixed >> 24) as usize]
+            ^ TABLES[11][(second & 0xFF) as usize]
+            ^ TABLES[10][((second >> 8) & 0xFF) as usize]
+            ^ TABLES[9][((second >> 16) & 0xFF) as usize]
+            ^ TABLES[8][(second >> 24) as usize]
+            ^ TABLES[7][(third & 0xFF) as usize]
+            ^ TABLES[6][((third >> 8) & 0xFF) as usize]
+            ^ TABLES[5][((third >> 16) & 0xFF) as usize]
+            ^ TABLES[4][(third >> 24) as usize]
+            ^ TABLES[3][(fourth & 0xFF) as usize]
+            ^ TABLES[2][((fourth >> 8) & 0xFF) as usize]
+            ^ TABLES[1][((fourth >> 16) & 0xFF) as usize]
+            ^ TABLES[0][(fourth >> 24) as usize];
+        remaining = &remaining[16..];
+    }
+
+    while remaining.len() >= 4 {
+        let mixed = crc ^ read_u32_le(remaining.as_ptr());
+        crc = TABLES[3][(mixed & 0xFF) as usize]
+            ^ TABLES[2][((mixed >> 8) & 0xFF) as usize]
+            ^ TABLES[1][((mixed >> 16) & 0xFF) as usize]
+            ^ TABLES[0][(mixed >> 24) as usize];
+        remaining = &remaining[4..];
+    }
+
+    for &byte in remaining {
+        let idx = ((crc as u8) ^ byte) as usize;
+        crc = TABLES[0][idx] ^ (crc >> 8);
+    }
+
+    crc
+}
+
+#[cfg(feature = "pure-rust")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PureRustBackend {
+    Scalar,
+    #[cfg(target_arch = "x86_64")]
+    Sse42X86_64,
+}
+
+#[cfg(feature = "pure-rust")]
+#[inline]
+fn pure_rust_backend() -> PureRustBackend {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if has_sse42_x86_64() {
+            return PureRustBackend::Sse42X86_64;
+        }
+    }
+
+    PureRustBackend::Scalar
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[inline]
+fn has_sse42_x86_64() -> bool {
+    std::arch::is_x86_feature_detected!("sse4.2")
+}
+
+#[inline]
+fn update_internal(crc: u32, data: &[u8]) -> u32 {
     #[cfg(feature = "pure-rust")]
     {
-        let mut remaining = data;
-
-        while remaining.len() >= 16 {
-            let first = read_u32_le(remaining.as_ptr());
-            let second = read_u32_le(remaining.as_ptr().wrapping_add(4));
-            let third = read_u32_le(remaining.as_ptr().wrapping_add(8));
-            let fourth = read_u32_le(remaining.as_ptr().wrapping_add(12));
-            let mixed = crc ^ first;
-            crc = TABLES[15][(mixed & 0xFF) as usize]
-                ^ TABLES[14][((mixed >> 8) & 0xFF) as usize]
-                ^ TABLES[13][((mixed >> 16) & 0xFF) as usize]
-                ^ TABLES[12][(mixed >> 24) as usize]
-                ^ TABLES[11][(second & 0xFF) as usize]
-                ^ TABLES[10][((second >> 8) & 0xFF) as usize]
-                ^ TABLES[9][((second >> 16) & 0xFF) as usize]
-                ^ TABLES[8][(second >> 24) as usize]
-                ^ TABLES[7][(third & 0xFF) as usize]
-                ^ TABLES[6][((third >> 8) & 0xFF) as usize]
-                ^ TABLES[5][((third >> 16) & 0xFF) as usize]
-                ^ TABLES[4][(third >> 24) as usize]
-                ^ TABLES[3][(fourth & 0xFF) as usize]
-                ^ TABLES[2][((fourth >> 8) & 0xFF) as usize]
-                ^ TABLES[1][((fourth >> 16) & 0xFF) as usize]
-                ^ TABLES[0][(fourth >> 24) as usize];
-            remaining = &remaining[16..];
+        match pure_rust_backend() {
+            PureRustBackend::Scalar => update_scalar(crc, data),
+            #[cfg(target_arch = "x86_64")]
+            PureRustBackend::Sse42X86_64 => unsafe { update_sse42_x86_64(crc, data) },
         }
-
-        while remaining.len() >= 4 {
-            let mixed = crc ^ read_u32_le(remaining.as_ptr());
-            crc = TABLES[3][(mixed & 0xFF) as usize]
-                ^ TABLES[2][((mixed >> 8) & 0xFF) as usize]
-                ^ TABLES[1][((mixed >> 16) & 0xFF) as usize]
-                ^ TABLES[0][(mixed >> 24) as usize];
-            remaining = &remaining[4..];
-        }
-
-        for &byte in remaining {
-            let idx = ((crc as u8) ^ byte) as usize;
-            crc = TABLES[0][idx] ^ (crc >> 8);
-        }
-        crc
     }
 
     #[cfg(all(not(feature = "pure-rust"), feature = "isa-l"))]
     {
+        let mut crc = crc;
         // Unlike crc32_gzip_refl, crc32_iscsi does NOT handle
         // init=0xFFFFFFFF / final XOR internally, so we do it here.
         //
@@ -134,6 +182,30 @@ fn update_internal(mut crc: u32, data: &[u8]) -> u32 {
         }
         crc
     }
+}
+
+#[cfg(all(feature = "pure-rust", target_arch = "x86_64"))]
+#[target_feature(enable = "sse4.2")]
+unsafe fn update_sse42_x86_64(mut crc: u32, data: &[u8]) -> u32 {
+    use core::arch::x86_64::{_mm_crc32_u32, _mm_crc32_u64, _mm_crc32_u8};
+
+    let mut remaining = data;
+
+    while remaining.len() >= 8 {
+        crc = _mm_crc32_u64(crc as u64, read_u64_le(remaining.as_ptr())) as u32;
+        remaining = &remaining[8..];
+    }
+
+    while remaining.len() >= 4 {
+        crc = _mm_crc32_u32(crc, read_u32_le(remaining.as_ptr()));
+        remaining = &remaining[4..];
+    }
+
+    for &byte in remaining {
+        crc = _mm_crc32_u8(crc, byte);
+    }
+
+    crc
 }
 
 /// Compute CRC-32C over the entire buffer.
@@ -269,6 +341,101 @@ impl Default for Hasher {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[cfg(feature = "pure-rust")]
+    #[derive(Clone, Copy, Debug)]
+    struct BackendCase {
+        backend: PureRustBackend,
+        name: &'static str,
+    }
+
+    #[cfg(feature = "pure-rust")]
+    fn supported_backend_cases() -> Vec<BackendCase> {
+        let mut cases = vec![BackendCase {
+            backend: PureRustBackend::Scalar,
+            name: "scalar",
+        }];
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            if has_sse42_x86_64() {
+                cases.push(BackendCase {
+                    backend: PureRustBackend::Sse42X86_64,
+                    name: "x86_64-sse4.2-crc32",
+                });
+            }
+        }
+
+        cases
+    }
+
+    #[cfg(feature = "pure-rust")]
+    fn checksum_with_backend(backend: PureRustBackend, data: &[u8]) -> u32 {
+        let mut crc = !0u32;
+        crc = match backend {
+            PureRustBackend::Scalar => update_scalar(crc, data),
+            #[cfg(target_arch = "x86_64")]
+            PureRustBackend::Sse42X86_64 => unsafe { update_sse42_x86_64(crc, data) },
+        };
+        crc ^ !0u32
+    }
+
+    #[cfg(feature = "pure-rust")]
+    fn checksum_streaming_with_backend(
+        backend: PureRustBackend,
+        data: &[u8],
+        chunk_size: usize,
+    ) -> u32 {
+        let mut crc = !0u32;
+        for chunk in data.chunks(chunk_size.max(1)) {
+            crc = match backend {
+                PureRustBackend::Scalar => update_scalar(crc, chunk),
+                #[cfg(target_arch = "x86_64")]
+                PureRustBackend::Sse42X86_64 => unsafe { update_sse42_x86_64(crc, chunk) },
+            };
+        }
+        crc ^ !0u32
+    }
+
+    #[cfg(feature = "pure-rust")]
+    #[test]
+    fn supported_backends_match_scalar_across_boundaries() {
+        let lengths = [
+            0usize, 1, 2, 7, 8, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257,
+            511, 512, 513, 1024, 4096,
+        ];
+        let chunk_sizes = [1usize, 2, 3, 7, 15, 16, 17, 31, 32, 63, 64, 127];
+        let backend_cases = supported_backend_cases();
+
+        for &len in &lengths {
+            let data: Vec<u8> = (0u8..=255)
+                .cycle()
+                .take(len)
+                .enumerate()
+                .map(|(i, byte)| byte ^ ((i as u8).wrapping_mul(17)))
+                .collect();
+            let expected = checksum_with_backend(PureRustBackend::Scalar, &data);
+
+            for case in &backend_cases {
+                let actual = checksum_with_backend(case.backend, &data);
+                assert_eq!(
+                    actual, expected,
+                    "backend {} mismatch at len {}",
+                    case.name, len
+                );
+
+                for &chunk_size in &chunk_sizes {
+                    let streaming =
+                        checksum_streaming_with_backend(case.backend, &data, chunk_size);
+                    assert_eq!(
+                        streaming, expected,
+                        "backend {} streaming mismatch at len {} chunk_size {}",
+                        case.name, len, chunk_size
+                    );
+                }
+            }
+        }
+    }
 
     // ── Standard test vectors ────────────────────────────────────────
 
