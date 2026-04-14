@@ -3471,6 +3471,77 @@ impl<'a> ObjectPgGuards<'a> {
     }
 }
 
+/// Ordered bucket/object PG guards for mixed metadata loads.
+///
+/// The underlying storage helper acquires the physical PG mutexes in ascending
+/// PG ID order, but returns them in logical bucket/object order so call sites
+/// cannot accidentally swap roles.
+struct BucketObjectPgGuards<'a> {
+    bucket: MutexGuard<'a, storage::PgStore>,
+    object: Option<MutexGuard<'a, storage::PgStore>>,
+}
+
+impl<'a> BucketObjectPgGuards<'a> {
+    fn new(
+        bucket: MutexGuard<'a, storage::PgStore>,
+        object: Option<MutexGuard<'a, storage::PgStore>>,
+    ) -> Self {
+        Self { bucket, object }
+    }
+
+    fn bucket(&self) -> &storage::PgStore {
+        &self.bucket
+    }
+
+    fn object(&self) -> &storage::PgStore {
+        match self.object.as_ref() {
+            Some(object) => object,
+            None => &self.bucket,
+        }
+    }
+
+    fn into_object_guards(self) -> ObjectPgGuards<'a> {
+        let Self { bucket, object } = self;
+        match object {
+            Some(object) => ObjectPgGuards::new(object),
+            None => ObjectPgGuards::new(bucket),
+        }
+    }
+}
+
+/// Ordered metadata/shard PG guards for object write publication.
+///
+/// The helper keeps logical meta/shard roles explicit even when both roles map
+/// to the same physical PG.
+struct TwoPgGuards<'a> {
+    meta: MutexGuard<'a, storage::PgStore>,
+    shard: Option<MutexGuard<'a, storage::PgStore>>,
+}
+
+impl<'a> TwoPgGuards<'a> {
+    fn new(
+        meta: MutexGuard<'a, storage::PgStore>,
+        shard: Option<MutexGuard<'a, storage::PgStore>>,
+    ) -> Self {
+        Self { meta, shard }
+    }
+
+    fn same_pg(&self) -> bool {
+        self.shard.is_none()
+    }
+
+    fn meta(&self) -> &storage::PgStore {
+        &self.meta
+    }
+
+    fn shard(&self) -> &storage::PgStore {
+        match self.shard.as_ref() {
+            Some(shard) => shard,
+            None => &self.meta,
+        }
+    }
+}
+
 struct LockedReadObject<'a> {
     record: StoredObject,
     pgs: ObjectPgGuards<'a>,
@@ -5844,14 +5915,7 @@ impl Coordinator {
         }
 
         let bucket_pg = self.get_bucket_pg(name)?;
-        let info = bucket_pg.head_bucket(name).map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        self.storage_node.upsert_bucket_fast_path((&info).into());
-        Ok(Self::bucket_summary(info))
+        self.load_active_bucket_summary_from_pg(&bucket_pg, name)
     }
 
     fn checked_active_bucket_summary(
@@ -6046,6 +6110,45 @@ impl Coordinator {
     fn get_bucket_pg(&self, bucket: &str) -> Result<MutexGuard<'_, storage::PgStore>, ServerError> {
         let pg_id = self.bucket_pg_id(bucket);
         Ok(self.storage_node.get_pg(pg_id)?)
+    }
+
+    fn lock_bucket_and_object_pgs(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<BucketObjectPgGuards<'_>, ServerError> {
+        let (bucket_guard, object_guard) = self
+            .storage_node
+            .lock_two_pgs(self.bucket_pg_id(bucket), self.object_pg_id(bucket, key))
+            .map_err(ServerError::Store)?;
+        Ok(BucketObjectPgGuards::new(bucket_guard, object_guard))
+    }
+
+    fn lock_object_pgs_for_write_ids(
+        &self,
+        meta_pg_id: u32,
+        shard_pg_id: u32,
+    ) -> Result<TwoPgGuards<'_>, ServerError> {
+        let (meta_guard, shard_guard) = self
+            .storage_node
+            .lock_two_pgs(meta_pg_id, shard_pg_id)
+            .map_err(ServerError::Store)?;
+        Ok(TwoPgGuards::new(meta_guard, shard_guard))
+    }
+
+    fn load_active_bucket_summary_from_pg(
+        &self,
+        bucket_pg: &storage::PgStore,
+        name: &str,
+    ) -> Result<BucketSummary, ServerError> {
+        let info = bucket_pg.head_bucket(name).map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
+        self.storage_node.upsert_bucket_fast_path((&info).into());
+        Ok(Self::bucket_summary(info))
     }
 
     // ── Bucket operations ─────────────────────────────────────────────
@@ -7030,15 +7133,7 @@ impl Coordinator {
         authorized: &AuthorizedBucketSubresourceGet,
     ) -> Result<Option<String>, ServerError> {
         let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
-        bucket_pg
-            .get_bucket_subresource(&authorized.bucket, authorized.kind)
-            .map(|stored| stored.map(|stored| stored.body))
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+        Self::load_bucket_subresource_from_pg(&bucket_pg, &authorized.bucket, authorized.kind)
     }
 
     fn remove_authorized_bucket_subresource(
@@ -7048,6 +7143,22 @@ impl Coordinator {
         let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
         bucket_pg
             .delete_bucket_subresource(&authorized.bucket, authorized.kind)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
+    }
+
+    fn load_bucket_subresource_from_pg(
+        bucket_pg: &storage::PgStore,
+        bucket: &str,
+        kind: storage::BucketSubresourceKind,
+    ) -> Result<Option<String>, ServerError> {
+        bucket_pg
+            .get_bucket_subresource(bucket, kind)
+            .map(|stored| stored.map(|stored| stored.body))
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -8057,18 +8168,15 @@ impl Coordinator {
                 self.write_segment_shards(shard_pg_id, &segment_okh, segment_vid, &storage_bytes)?;
 
             let meta_pg_id = self.object_pg_id(authorized.bucket(), authorized.key());
-            let (meta_pg, shard_pg_opt) =
-                match self.storage_node.lock_two_pgs(meta_pg_id, shard_pg_id) {
-                    Ok(guards) => guards,
-                    Err(err) => {
-                        self.best_effort_delete_written_shards(shard_pg_id, &written_shards);
-                        return Err(ServerError::Store(err));
-                    }
-                };
-            let shard_pg: &storage::PgStore = match shard_pg_opt.as_ref() {
-                Some(pg) => pg,
-                None => &meta_pg,
+            let pgs = match self.lock_object_pgs_for_write_ids(meta_pg_id, shard_pg_id) {
+                Ok(pgs) => pgs,
+                Err(err) => {
+                    self.best_effort_delete_written_shards(shard_pg_id, &written_shards);
+                    return Err(err);
+                }
             };
+            let meta_pg = pgs.meta();
+            let shard_pg = pgs.shard();
             let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
                 .iter()
                 .map(|written| (&written.key, written.ack))
@@ -8080,7 +8188,7 @@ impl Coordinator {
             );
 
             let prepared = match self.prepare_put_commit_locked(
-                &meta_pg,
+                meta_pg,
                 &bucket_info,
                 &PutCommitRequest {
                     bucket: authorized.bucket(),
@@ -8146,7 +8254,7 @@ impl Coordinator {
                 return Err(ServerError::Metadata(err));
             }
             Self::finalize_put_commit_metadata_locked(
-                &meta_pg,
+                meta_pg,
                 authorized.bucket(),
                 authorized.key(),
                 prepared.version_id,
@@ -8166,8 +8274,7 @@ impl Coordinator {
             let lifecycle_size = live_record.size;
             let lifecycle_last_modified = live_record.last_modified;
 
-            drop(shard_pg_opt);
-            drop(meta_pg);
+            drop(pgs);
             let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
                 &bucket_info,
                 authorized.key(),
@@ -8620,20 +8727,15 @@ impl Coordinator {
             data,
         )?;
 
-        let (meta_guard, shard_guard_opt) = match self
-            .storage_node
-            .lock_two_pgs(meta_pg_id, segment_record.shard_pg_id)
-        {
-            Ok(guards) => guards,
+        let pgs = match self.lock_object_pgs_for_write_ids(meta_pg_id, segment_record.shard_pg_id) {
+            Ok(pgs) => pgs,
             Err(err) => {
                 self.best_effort_delete_written_shards(segment_record.shard_pg_id, &written_shards);
-                return Err(ServerError::Store(err));
+                return Err(err);
             }
         };
-        let shard_guard: &storage::PgStore = match shard_guard_opt.as_ref() {
-            Some(pg) => pg,
-            None => &meta_guard,
-        };
+        let meta_guard = pgs.meta();
+        let shard_guard = pgs.shard();
         let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
             .iter()
             .map(|written| (&written.key, written.ack))
@@ -8651,13 +8753,13 @@ impl Coordinator {
             return Err(err);
         }
         if let Err(err) =
-            Self::reject_duplicate_stream_segment_index(&meta_guard, session_id, segment_index)
+            Self::reject_duplicate_stream_segment_index(meta_guard, session_id, segment_index)
         {
             Self::cleanup_written_shards_locked(shard_guard, &written_shards);
             return Err(err);
         }
 
-        if shard_guard_opt.is_none() {
+        if pgs.same_pg() {
             if let Err(err) = meta_guard
                 .register_written_shards_and_append_stream_segment(&shard_batch, &segment_record)
             {
@@ -20504,6 +20606,7 @@ mod tests {
             None,
         )
         .unwrap();
+        admin.clear_bucket_policy_cache("bucket");
 
         let bucket_pg_id = admin.bucket_pg_id("bucket");
         let key = (0..1024)
@@ -26796,6 +26899,7 @@ mod tests {
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
                 test_helpers::requester("owner-a"), None)
             .unwrap();
+        admin.clear_bucket_policy_cache("bucket");
         test_helpers::put_object(
             &admin,
             &PutObjectRequest {
@@ -26853,6 +26957,7 @@ mod tests {
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectTagging","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
                 test_helpers::requester("owner-a"), None)
             .unwrap();
+        admin.clear_bucket_policy_cache("bucket");
         let tags_xml =
             "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
         test_helpers::put_object(
@@ -26957,6 +27062,7 @@ mod tests {
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 owner_requester.clone(), None)
             .unwrap();
+        admin.clear_bucket_policy_cache("bucket");
 
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {

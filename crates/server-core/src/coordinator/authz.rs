@@ -600,17 +600,46 @@ impl Coordinator {
             return Ok(None);
         }
 
-        if let Some(cached) = read_rwlock_unpoisoned(&self.bucket_policy_cache)
-            .get(&bucket.name)
-            .cloned()
-        {
-            if cached.generation == bucket.bucket_policy_generation {
-                return Ok(Some(cached.policy));
-            }
+        if let Some(cached) = self.cached_bucket_policy_if_fresh(bucket) {
+            return Ok(Some(cached));
         }
 
-        let authorized = self.authorize_load_bucket_policy(&bucket.name);
-        let raw_policy = self.load_authorized_bucket_subresource(&authorized)?;
+        let bucket_pg = self.get_bucket_pg(&bucket.name)?;
+        self.cached_bucket_policy_with_locked_bucket_pg(bucket, &bucket_pg)
+    }
+
+    pub(super) fn cached_bucket_policy_if_fresh(
+        &self,
+        bucket: &BucketSummary,
+    ) -> Option<Arc<auth::BucketPolicy>> {
+        if !bucket.bucket_policy_present {
+            return None;
+        }
+
+        let cached = read_rwlock_unpoisoned(&self.bucket_policy_cache)
+            .get(&bucket.name)
+            .cloned()?;
+        (cached.generation == bucket.bucket_policy_generation).then_some(cached.policy)
+    }
+
+    pub(super) fn cached_bucket_policy_with_locked_bucket_pg(
+        &self,
+        bucket: &BucketSummary,
+        bucket_pg: &storage::PgStore,
+    ) -> Result<Option<Arc<auth::BucketPolicy>>, ServerError> {
+        if !bucket.bucket_policy_present {
+            return Ok(None);
+        }
+
+        if let Some(cached) = self.cached_bucket_policy_if_fresh(bucket) {
+            return Ok(Some(cached));
+        }
+
+        let raw_policy = Self::load_bucket_subresource_from_pg(
+            bucket_pg,
+            &bucket.name,
+            storage::BucketSubresourceKind::Policy,
+        )?;
         let parsed_policy = match raw_policy {
             Some(policy) => Arc::new(auth::parse_bucket_policy(&policy).map_err(|e| {
                 ServerError::InternalError {
@@ -2303,20 +2332,6 @@ impl Coordinator {
         })
     }
 
-    /// Creates an internal authorization token for bucket policy cache fills.
-    ///
-    /// This intentionally bypasses request auth because the coordinator is
-    /// loading already-authoritative stored state for cache population.
-    pub(super) fn authorize_load_bucket_policy(
-        &self,
-        name: &str,
-    ) -> AuthorizedBucketSubresourceGet {
-        AuthorizedBucketSubresourceGet {
-            bucket: name.to_string(),
-            kind: storage::BucketSubresourceKind::Policy,
-        }
-    }
-
     pub(super) fn authorize_delete_bucket_policy(
         &self,
         req: &BucketRequest<'_>,
@@ -3526,10 +3541,82 @@ impl Coordinator {
         &'a self,
         req: ObjectStateLoadRequest<'_>,
     ) -> Result<LoadedObjectState<'a>, ServerError> {
-        let bucket_info =
-            self.checked_active_bucket_summary(req.bucket, req.expected_bucket_owner)?;
+        let fast_bucket_info = match self.storage_node.get_bucket_fast_path(req.bucket) {
+            Some(info) if info.state == BucketState::Active => {
+                Some(Self::validate_expected_bucket_owner(
+                    Self::bucket_summary_fast(info),
+                    req.expected_bucket_owner,
+                )?)
+            }
+            Some(_) => {
+                return Err(ServerError::BucketNotFound {
+                    name: req.bucket.to_string(),
+                });
+            }
+            None => None,
+        };
+        let fresh_bucket_policy = match req.policy_requirement {
+            ObjectBucketPolicyRequirement::Required => fast_bucket_info
+                .as_ref()
+                .and_then(|bucket_info| self.cached_bucket_policy_if_fresh(bucket_info)),
+        };
+        let need_ordered_bucket_load = fast_bucket_info.is_none()
+            || matches!(
+                req.policy_requirement,
+                ObjectBucketPolicyRequirement::Required
+            ) && fast_bucket_info.as_ref().is_some_and(|bucket_info| {
+                bucket_info.bucket_policy_present && fresh_bucket_policy.is_none()
+            });
+
+        if need_ordered_bucket_load {
+            let guards = self.lock_bucket_and_object_pgs(req.bucket, req.key)?;
+            let bucket_info = match fast_bucket_info {
+                Some(bucket_info) => bucket_info,
+                None => Self::validate_expected_bucket_owner(
+                    self.load_active_bucket_summary_from_pg(guards.bucket(), req.bucket)?,
+                    req.expected_bucket_owner,
+                )?,
+            };
+            let bucket_policy = match req.policy_requirement {
+                ObjectBucketPolicyRequirement::Required => {
+                    self.cached_bucket_policy_with_locked_bucket_pg(&bucket_info, guards.bucket())?
+                }
+            };
+            let can_discover_missing = req.missing_discovery.requester_can_discover_missing(
+                req.requester,
+                &bucket_info,
+                req.key,
+                req.version_id,
+                bucket_policy.as_deref(),
+            )?;
+            let record = match Self::lookup_object_record(
+                guards.object(),
+                req.bucket,
+                req.key,
+                req.version_id,
+            ) {
+                Ok(record) => record,
+                Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
+                    if !can_discover_missing =>
+                {
+                    return Err(ServerError::AccessDenied);
+                }
+                Err(other) => return Err(other),
+            };
+
+            return Ok(LoadedObjectState {
+                bucket_info,
+                bucket_policy,
+                locked: LockedReadObject {
+                    record,
+                    pgs: guards.into_object_guards(),
+                },
+            });
+        }
+
+        let bucket_info = fast_bucket_info.expect("ordered load handles missing bucket fast path");
         let bucket_policy = match req.policy_requirement {
-            ObjectBucketPolicyRequirement::Required => self.cached_bucket_policy(&bucket_info)?,
+            ObjectBucketPolicyRequirement::Required => fresh_bucket_policy,
         };
         let can_discover_missing = req.missing_discovery.requester_can_discover_missing(
             req.requester,
