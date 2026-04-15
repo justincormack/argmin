@@ -18,9 +18,16 @@ In scope:
   - narrow bucket-policy allow/deny interactions
   - selected write-authorization and transition semantics
   - bucket-scoped ACL, versioning, and listing authorization
-  - bounded `CopyObject` destination-authorization and request-context behavior
-  - delete/object-lock authorization for current, versioned, and missing-version
-    deletes
+  - bounded `CopyObject` and `UploadPartCopy` authorization and
+    request-context behavior
+  - object-lock read/update authorization plus governance-bypass profile
+    boundaries
+  - delete authorization for current, versioned, and missing-version deletes
+  - object-scoped multipart upload authorization for:
+    - `BeginStreamPart`
+    - `CompleteMultipartUpload`
+    - `AbortMultipartUpload`
+    - `ListParts`
   - request-context exactness for narrow write condition keys such as
     `s3:x-amz-acl`, `s3:x-amz-grant-*`, and copy tagging replacement
   - bucket-scoped request-context exactness for `PutBucketAcl`
@@ -89,7 +96,8 @@ contract:
 - `get_object_tags`
 - `put_object_tags`
 - `delete_object_tags`
-- selected write, copy, delete, and bucket operations in later phases
+- selected write, copy, delete/object-lock, multipart, and bucket operations
+  in later phases
 - bounded bucket-meta checks in later phases
 
 This avoids encoding the current internal factoring as the expected behavior.
@@ -154,6 +162,7 @@ Important AWS-backed anchors:
 - `crates/s3-tests/tests/boe_constrained.rs`
 - `crates/s3-tests/tests/boe_admin_root.rs`
 - `crates/s3-tests/tests/ownership.rs`
+- `crates/s3-tests/tests/object_admin_root.rs`
 - `crates/s3-tests/tests/public_access_block.rs`
 - `crates/s3-tests/tests/object_crud.rs`
 - `crates/s3-tests/tests/multipart.rs`
@@ -219,9 +228,18 @@ Later phases add:
 - `PutObject`
 - `CreateMultipartUpload`
 - `BeginStreamPut`
+- `BeginStreamPart`
 - `CopyObject`
+- `UploadPartCopy`
+- `CompleteMultipartUpload`
+- `AbortMultipartUpload`
+- `ListParts`
 - `PutObjectAcl`
 - `PutObjectVersionAcl`
+- `PutObjectRetention`
+- `GetObjectRetention`
+- `PutObjectLegalHold`
+- `GetObjectLegalHold`
 - `DeleteObject`
 - `DeleteObjectVersion`
 - `GetBucketAcl`
@@ -668,19 +686,21 @@ Acceptance criteria:
   one place
 - transition failures produce a short trace, not only a final-state mismatch
 
-### Phase 6: CopyObject Matrix
+### Phase 6: Copy and Multipart Copy Matrix
 
 Status: planned
 
 Add a bounded copy-focused matrix for:
 
 - `CopyObject`
+- `UploadPartCopy`
 
 The first pass should hold the source side narrow and stable:
 
 - materialize a readable fixed source object
 - vary the destination-side authorization and request context
-- keep source-read differentials for a later expansion if needed
+- vary the multipart-upload target state for `UploadPartCopy`
+- keep broader source-read differentials for a later expansion if needed
 
 Important rules to encode:
 
@@ -696,11 +716,15 @@ Important rules to encode:
   - `s3:x-amz-grant-read-acp`
   - `s3:x-amz-grant-write`
   - `s3:x-amz-grant-write-acp`
+- `UploadPartCopy` destination authorization is evaluated against the target
+  multipart upload state and write context, not as a generic object-copy write
+- copy-to-object and copy-to-upload request contexts must stay distinct even
+  when they share the same readable source object
 
 Acceptance criteria:
 
-- recent AWS-backed `CopyObject` authz regressions are covered by the modeled
-  harness, not only by `s3-tests`
+- recent AWS-backed `CopyObject` and `UploadPartCopy` authz regressions are
+  covered by the modeled harness, not only by `s3-tests`
 - copy-specific request-context failures print the exact scenario fields that
   diverged
 
@@ -708,25 +732,44 @@ Acceptance criteria:
 
 Status: planned
 
-Add a bounded delete-focused matrix for:
+Add a bounded delete/object-lock matrix for:
 
+- `PutObjectRetention`
+- `GetObjectRetention`
+- `PutObjectLegalHold`
+- `GetObjectLegalHold`
 - `DeleteObject`
 - `DeleteObjectVersion`
 
 Cover:
 
+- object-lock read/update authorization separately from delete authorization
 - current-object versus version-specific delete authorization
 - missing-key versus missing-version targets where the authz result still
   matters
 - object-lock enabled versus disabled buckets
 - bypass header absent versus present
+- same-account `Standard` versus `OwnerAccountAdmin` requesters on
+  object-lock-enabled buckets
 - narrow bucket-policy grants for:
+  - `s3:PutObjectRetention`
+  - `s3:GetObjectRetention`
+  - `s3:PutObjectLegalHold`
+  - `s3:GetObjectLegalHold`
   - `s3:DeleteObject`
   - `s3:DeleteObjectVersion`
   - `s3:BypassGovernanceRetention`
 
 Important rules to encode:
 
+- same-account `Standard` requesters must not inherit implicit owner-account
+  object-lock management or governance-bypass rights that belong only to
+  `OwnerAccountAdmin`
+- same-account `OwnerAccountAdmin` requesters can exercise the implicit
+  owner-account object-lock and governance-bypass paths, subject to explicit
+  bucket-policy deny
+- object-lock read/update APIs and delete-with-bypass must not be collapsed
+  into one generic "object-lock allowed" rule
 - version-specific delete of a missing version with the bypass header on an
   object-lock-enabled bucket requires `s3:BypassGovernanceRetention`
 - non-version delete with the bypass header does not require bypass permission
@@ -736,10 +779,49 @@ Important rules to encode:
 
 Acceptance criteria:
 
+- same-account constrained-versus-admin governance-bypass behavior is encoded
+  in the model, not left only to targeted regressions or AWS-backed tests
 - the missing-version bypass-governance rule is encoded in the model, not only
   in dedicated regressions
 - non-version and version-specific delete behavior cannot be accidentally
   collapsed together
+
+### Phase 7A: Object-Scoped Multipart Management Matrix
+
+Status: planned
+
+Add a bounded multipart-management matrix for:
+
+- `BeginStreamPart`
+- `CompleteMultipartUpload`
+- `AbortMultipartUpload`
+- `ListParts`
+
+Cover:
+
+- initiator versus upload owner versus bucket-owner exact principal
+- same-account `Standard` versus `OwnerAccountAdmin`
+- in-progress versus completed upload records where the API distinguishes them
+- narrow bucket-policy allow on multipart write paths that reuse `PutObject`
+  semantics
+- absence of a bucket-policy fallback on management-only paths unless an
+  AWS-backed baseline later proves otherwise
+
+Important rules to encode:
+
+- `BeginStreamPart` and `CompleteMultipartUpload` reuse multipart write
+  authorization with the upload's stored context, rather than generic
+  bucket-admin-only management
+- `AbortMultipartUpload` and `ListParts` are initiator/owner/admin management
+  paths and must not accidentally inherit `PutObject` bucket-policy allows
+- completed-upload abort follows `requester_can_manage_completed_multipart_upload`
+  rather than the in-progress upload management path
+
+Acceptance criteria:
+
+- object-scoped multipart authorization no longer lives only in one-off tests
+- the distinction between multipart write paths and multipart management paths
+  is encoded explicitly and cannot collapse accidentally
 
 ### Phase 8: Request-Context Exactness Matrix
 
@@ -978,8 +1060,9 @@ Once the first matrices are stable, add:
 Only after the read/discovery surface is stable, add:
 
 - write auth matrix
-- bounded `CopyObject` destination-auth matrix
+- bounded `CopyObject` and `UploadPartCopy` matrix
 - delete/object-lock matrix
+- object-scoped multipart-management matrix
 - bucket-action matrix
 - BOE/public-access-block/policy transition traces
 
@@ -1068,9 +1151,9 @@ This plan is complete when:
    covered by matrix-style authz differentials
 3. BOE, public-access-block, and narrow public-policy interactions are encoded
    in the model rather than only as isolated regressions
-4. selected write-auth, bucket ACL/versioning/listing actions, `CopyObject`,
-   delete/object-lock, and BOE/public-access transitions are covered by the
-   same framework
+4. selected write-auth, bucket ACL/versioning/listing actions, copy,
+   delete/object-lock, object-scoped multipart authorization, and
+   BOE/public-access transitions are covered by the same framework
 5. narrow request-context exactness for key write condition keys and
    `PutBucketAcl` request provenance is modeled rather than pinned only by
    isolated regressions
