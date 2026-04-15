@@ -27,7 +27,7 @@ async fn setup_sse_c_bucket() -> String {
 }
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
-fn agent() -> ureq::Agent {
+fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 
@@ -293,7 +293,7 @@ fn post_object_with_headers(
 
 fn post_object_to_endpoint(
     endpoint: &str,
-    agent: &ureq::Agent,
+    agent: &s3_tests::Agent,
     bucket: &str,
     fields: &[(&str, &str)],
     file_data: &[u8],
@@ -2636,9 +2636,6 @@ fn test_post_object_success_redirect_action() {
         let (content_type, body) = build_multipart(&field_refs, b"bar", "test.txt");
         let mut resp = agent()
             .post(&url)
-            .config()
-            .max_redirects(0)
-            .build()
             .header("Content-Type", &content_type)
             .send(&body[..])
             .expect("HTTP transport error");
@@ -2656,7 +2653,7 @@ fn test_post_object_success_redirect_action() {
         let etag = head.e_tag().unwrap().trim_matches('"');
         let location = resp
             .headers()
-            .get("Location")
+            .get(hyper::header::LOCATION)
             .and_then(|value| value.to_str().ok())
             .expect("missing Location header");
         let expected_location =

@@ -2553,7 +2553,7 @@ fn test_bucket_list_return_data() {
 
 // ── Anonymous access ────────────────────────────────────────────────
 
-fn anon_agent() -> ureq::Agent {
+fn anon_agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 

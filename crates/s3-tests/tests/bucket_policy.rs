@@ -18,7 +18,7 @@ use s3_tests::{
 use serde_json::json;
 use std::future::Future;
 
-fn agent() -> ureq::Agent {
+fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 

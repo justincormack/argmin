@@ -7,7 +7,7 @@ use s3_tests::{build_client_with_ca, build_test_agent, unique_bucket, TestServer
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn agent() -> ureq::Agent {
+fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 

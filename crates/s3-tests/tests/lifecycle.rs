@@ -14,7 +14,7 @@ use s3_tests::{
     put_bucket_lifecycle_with_md5, send_signed_request, unique_bucket, CTX,
 };
 
-fn agent() -> ureq::Agent {
+fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 

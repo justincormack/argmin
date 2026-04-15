@@ -135,7 +135,7 @@ async fn cleanup_multipart(bucket: &str, key: &str, upload_id: &str) {
     cleanup(bucket, key).await;
 }
 
-fn agent() -> ureq::Agent {
+fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 

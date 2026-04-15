@@ -157,7 +157,7 @@ fn query_encode_value(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
-fn anon_agent() -> ureq::Agent {
+fn anon_agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 

@@ -86,7 +86,7 @@ async fn cleanup_object_if_present(bucket: &str, key: &str) {
     let _ = client.delete_object().bucket(bucket).key(key).send().await;
 }
 
-async fn anonymous_get(url: &str) -> ureq::http::Response<ureq::Body> {
+async fn anonymous_get(url: &str) -> s3_tests::Response {
     let url = url.to_string();
     tokio::task::spawn_blocking(move || s3_tests::test_agent().get(&url).call())
         .await

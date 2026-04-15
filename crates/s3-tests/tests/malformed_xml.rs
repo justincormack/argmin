@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
-fn agent() -> ureq::Agent {
+fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 

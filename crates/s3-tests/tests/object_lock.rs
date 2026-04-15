@@ -26,7 +26,7 @@ const GOVERNANCE_RETENTION_SECS: u64 = 24 * 60 * 60;
 const GOVERNANCE_RETENTION_LATER_SECS: u64 = 2 * 24 * 60 * 60;
 const COMPLIANCE_RETENTION_SECS: u64 = 3;
 
-fn agent() -> ureq::Agent {
+fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 

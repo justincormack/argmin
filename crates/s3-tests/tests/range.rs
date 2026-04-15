@@ -17,7 +17,7 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     client.delete_bucket().bucket(bucket).send().await.unwrap();
 }
 
-fn agent() -> ureq::Agent {
+fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 

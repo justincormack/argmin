@@ -26,7 +26,7 @@ async fn setup_sse_c_bucket() -> String {
 }
 
 /// Build an agent that returns all HTTP responses (including 4xx/5xx) as Ok.
-fn agent() -> ureq::Agent {
+fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 

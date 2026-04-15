@@ -1,6 +1,7 @@
 pub mod helpers;
 mod hyper_client;
 mod post_form;
+mod raw_http_client;
 pub mod server;
 
 pub use aws_sdk_s3;
@@ -19,6 +20,7 @@ pub use post_form::{
     post_object_to_test_endpoint_with_headers, sigv4_post_fields_for_credentials,
     sigv4_post_sse_c_fields_for_credentials,
 };
+pub use raw_http_client::{Agent, Response};
 pub use server::TestServer;
 
 use std::sync::LazyLock;
@@ -28,8 +30,6 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use aws_sdk_s3::Client;
 use s3_types::is_legacy_create_bucket_region;
-use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
-
 /// Shared tokio runtime for all tests in a binary.
 ///
 /// All tests must use `RT.block_on(async { ... })` rather than `#[tokio::test]`
@@ -579,11 +579,11 @@ fn is_retryable_bucket_reuse_error(
     )
 }
 
-pub fn test_agent() -> ureq::Agent {
+pub fn test_agent() -> Agent {
     test_agent_with_timeout(configured_test_timeout())
 }
 
-pub fn test_agent_with_timeout(timeout: std::time::Duration) -> ureq::Agent {
+pub fn test_agent_with_timeout(timeout: std::time::Duration) -> Agent {
     build_test_agent(CTX.endpoint(), CTX.tls_ca_pem(), timeout)
 }
 
@@ -591,18 +591,6 @@ pub fn build_test_agent(
     endpoint: &str,
     tls_ca_pem: Option<&[u8]>,
     timeout: std::time::Duration,
-) -> ureq::Agent {
-    let mut builder = ureq::config::Config::builder()
-        .http_status_as_error(false)
-        .timeout_global(Some(timeout));
-    if let Some(tls_ca_pem) = tls_ca_pem.filter(|_| endpoint.starts_with("https://")) {
-        let cert = Certificate::from_pem(tls_ca_pem).expect("valid test TLS PEM");
-        builder = builder.tls_config(
-            TlsConfig::builder()
-                .provider(TlsProvider::Rustls)
-                .root_certs(RootCerts::from([cert]))
-                .build(),
-        );
-    }
-    builder.build().new_agent()
+) -> Agent {
+    Agent::new(endpoint, tls_ca_pem, timeout)
 }

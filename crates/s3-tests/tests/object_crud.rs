@@ -470,7 +470,7 @@ async fn run_object_acl_canonical_user_permission_case(
     delete_all_and_bucket(client, &bucket, &["foo".to_string()]).await;
 }
 
-fn agent() -> ureq::Agent {
+fn agent() -> s3_tests::Agent {
     s3_tests::test_agent()
 }
 
