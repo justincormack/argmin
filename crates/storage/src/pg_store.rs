@@ -56,6 +56,12 @@ fn bucket_not_found(name: &str) -> MetadataError {
     }
 }
 
+fn validated_bucket_name(name: &str) -> Result<BucketName, MetadataError> {
+    BucketName::try_from(name).map_err(|error| MetadataError::InvalidBucketName {
+        reason: error.to_string(),
+    })
+}
+
 #[cfg(test)]
 fn trusted_object_key(key: impl Into<String>) -> ObjectKey {
     ObjectKey::try_from(key.into())
@@ -2178,10 +2184,8 @@ impl PgStore {
                 source: e,
             })
     }
-}
 
-impl PgMetadataStore for PgStore {
-    fn create_bucket(
+    pub fn create_bucket(
         &self,
         name: &str,
         owner_principal: &str,
@@ -2190,8 +2194,212 @@ impl PgMetadataStore for PgStore {
         public_read: bool,
         public_write: bool,
     ) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::create_bucket(
+            self,
+            &validated_bucket_name(name)?,
+            owner_principal,
+            owner_canonical_id,
+            acl_grants,
+            public_read,
+            public_write,
+        )
+    }
+
+    pub fn delete_bucket(&self, name: &str) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::delete_bucket(self, &validated_bucket_name(name)?)
+    }
+
+    pub fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError> {
+        <Self as PgMetadataStore>::head_bucket(self, &validated_bucket_name(name)?)
+    }
+
+    pub fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError> {
+        <Self as PgMetadataStore>::head_bucket_raw(self, &validated_bucket_name(name)?)
+    }
+
+    pub fn mark_bucket_deleting(&self, name: &str) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::mark_bucket_deleting(self, &validated_bucket_name(name)?)
+    }
+
+    pub fn acquire_bucket_write_reservation(
+        &self,
+        name: &str,
+    ) -> Result<BucketInfo, MetadataError> {
+        <Self as PgMetadataStore>::acquire_bucket_write_reservation(
+            self,
+            &validated_bucket_name(name)?,
+        )
+    }
+
+    pub fn release_bucket_write_reservation(&self, name: &str) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::release_bucket_write_reservation(
+            self,
+            &validated_bucket_name(name)?,
+        )
+    }
+
+    pub fn begin_bucket_write_drain(&self, name: &str) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::begin_bucket_write_drain(self, &validated_bucket_name(name)?)
+    }
+
+    pub fn end_bucket_write_drain(&self, name: &str) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::end_bucket_write_drain(self, &validated_bucket_name(name)?)
+    }
+
+    pub fn put_bucket_versioning(
+        &self,
+        name: &str,
+        state: BucketVersioningState,
+    ) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::put_bucket_versioning(self, &validated_bucket_name(name)?, state)
+    }
+
+    pub fn put_bucket_object_lock(
+        &self,
+        name: &str,
+        config: BucketObjectLockConfig,
+    ) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::put_bucket_object_lock(
+            self,
+            &validated_bucket_name(name)?,
+            config,
+        )
+    }
+
+    pub fn put_bucket_acl(
+        &self,
+        name: &str,
+        acl_grants: &AclGrants,
+        public_read: bool,
+        public_write: bool,
+    ) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::put_bucket_acl(
+            self,
+            &validated_bucket_name(name)?,
+            acl_grants,
+            public_read,
+            public_write,
+        )
+    }
+
+    pub fn put_bucket_subresource(
+        &self,
+        name: &str,
+        req: PutBucketSubresource<'_>,
+    ) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::put_bucket_subresource(self, &validated_bucket_name(name)?, req)
+    }
+
+    pub fn get_bucket_subresource(
+        &self,
+        name: &str,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<StoredBucketSubresource>, MetadataError> {
+        <Self as PgMetadataStore>::get_bucket_subresource(self, &validated_bucket_name(name)?, kind)
+    }
+
+    pub fn delete_bucket_subresource(
+        &self,
+        name: &str,
+        kind: BucketSubresourceKind,
+    ) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::delete_bucket_subresource(
+            self,
+            &validated_bucket_name(name)?,
+            kind,
+        )
+    }
+
+    pub fn put_bucket_public_access_block(
+        &self,
+        name: &str,
+        config: PublicAccessBlockConfig,
+    ) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::put_bucket_public_access_block(
+            self,
+            &validated_bucket_name(name)?,
+            config,
+        )
+    }
+
+    pub fn get_bucket_public_access_block(
+        &self,
+        name: &str,
+    ) -> Result<Option<PublicAccessBlockConfig>, MetadataError> {
+        <Self as PgMetadataStore>::get_bucket_public_access_block(
+            self,
+            &validated_bucket_name(name)?,
+        )
+    }
+
+    pub fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::delete_bucket_public_access_block(
+            self,
+            &validated_bucket_name(name)?,
+        )
+    }
+
+    pub fn put_bucket_ownership_controls(
+        &self,
+        name: &str,
+        config: BucketOwnershipControls,
+    ) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::put_bucket_ownership_controls(
+            self,
+            &validated_bucket_name(name)?,
+            config,
+        )
+    }
+
+    pub fn get_bucket_ownership_controls(
+        &self,
+        name: &str,
+    ) -> Result<Option<BucketOwnershipControls>, MetadataError> {
+        <Self as PgMetadataStore>::get_bucket_ownership_controls(
+            self,
+            &validated_bucket_name(name)?,
+        )
+    }
+
+    pub fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::delete_bucket_ownership_controls(
+            self,
+            &validated_bucket_name(name)?,
+        )
+    }
+
+    pub fn put_bucket_encryption(
+        &self,
+        name: &str,
+        config: BucketEncryptionConfig,
+    ) -> Result<(), MetadataError> {
+        <Self as PgMetadataStore>::put_bucket_encryption(
+            self,
+            &validated_bucket_name(name)?,
+            config,
+        )
+    }
+
+    pub fn get_bucket_encryption(
+        &self,
+        name: &str,
+    ) -> Result<BucketEncryptionConfig, MetadataError> {
+        <Self as PgMetadataStore>::get_bucket_encryption(self, &validated_bucket_name(name)?)
+    }
+}
+
+impl PgMetadataStore for PgStore {
+    fn create_bucket(
+        &self,
+        name: &BucketName,
+        owner_principal: &str,
+        owner_canonical_id: &CanonicalUserId,
+        acl_grants: &AclGrants,
+        public_read: bool,
+        public_write: bool,
+    ) -> Result<(), MetadataError> {
         self.create_bucket_with_config(&CreateBucketConfig {
-            name,
+            name: name.as_str(),
             owner_principal,
             owner_canonical_id,
             acl_grants,
@@ -2202,7 +2410,7 @@ impl PgMetadataStore for PgStore {
         })
     }
 
-    fn delete_bucket(&self, name: &str) -> Result<(), MetadataError> {
+    fn delete_bucket(&self, name: &BucketName) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::delete_bucket",
@@ -2217,13 +2425,14 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         let result = (|| -> Result<usize, rusqlite::Error> {
-            let deleted = self
-                .conn
-                .execute("DELETE FROM buckets WHERE name = ?1", params![name])?;
+            let deleted = self.conn.execute(
+                "DELETE FROM buckets WHERE name = ?1",
+                params![name.as_str()],
+            )?;
             if deleted != 0 {
                 self.conn.execute(
                     "DELETE FROM completed_multipart_uploads WHERE bucket = ?1",
-                    params![name],
+                    params![name.as_str()],
                 )?;
             }
             Ok(deleted)
@@ -2247,12 +2456,12 @@ impl PgMetadataStore for PgStore {
             }
         };
         if deleted == 0 {
-            return Err(bucket_not_found(name));
+            return Err(bucket_not_found(name.as_str()));
         }
         Ok(())
     }
 
-    fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError> {
+    fn head_bucket(&self, name: &BucketName) -> Result<BucketInfo, MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::head_bucket",
@@ -2262,16 +2471,16 @@ impl PgMetadataStore for PgStore {
         );
         let info = self.head_bucket_raw(name)?;
         if info.state != BucketState::Active {
-            return Err(bucket_not_found(name));
+            return Err(bucket_not_found(name.as_str()));
         }
         Ok(info)
     }
 
-    fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError> {
+    fn head_bucket_raw(&self, name: &BucketName) -> Result<BucketInfo, MetadataError> {
         self.conn
             .query_row(
                 &format!("{BUCKET_INFO_SELECT} WHERE name = ?1"),
-                params![name],
+                params![name.as_str()],
                 Self::row_to_bucket_info,
             )
             .optional()
@@ -2279,7 +2488,7 @@ impl PgMetadataStore for PgStore {
                 context: "head bucket raw",
                 source: e,
             })?
-            .ok_or_else(|| bucket_not_found(name))
+            .ok_or_else(|| bucket_not_found(name.as_str()))
     }
 
     fn list_buckets(&self, owner_canonical_id: &str) -> Result<Vec<BucketInfo>, MetadataError> {
@@ -2393,7 +2602,7 @@ impl PgMetadataStore for PgStore {
         Ok(buckets)
     }
 
-    fn mark_bucket_deleting(&self, name: &str) -> Result<(), MetadataError> {
+    fn mark_bucket_deleting(&self, name: &BucketName) -> Result<(), MetadataError> {
         let updated = self
             .conn
             .execute(
@@ -2403,26 +2612,33 @@ impl PgMetadataStore for PgStore {
                    AND state = ?3 \
                    AND write_reservations_blocked = 1 \
                    AND active_write_reservations = 0",
-                params![BucketState::Deleting as u8, name, BucketState::Active as u8],
+                params![
+                    BucketState::Deleting as u8,
+                    name.as_str(),
+                    BucketState::Active as u8
+                ],
             )
             .map_err(|e| MetadataError::Db {
                 context: "mark bucket deleting",
                 source: e,
             })?;
         if updated == 0 {
-            return Err(bucket_not_found(name));
+            return Err(bucket_not_found(name.as_str()));
         }
         Ok(())
     }
 
-    fn acquire_bucket_write_reservation(&self, name: &str) -> Result<BucketInfo, MetadataError> {
+    fn acquire_bucket_write_reservation(
+        &self,
+        name: &BucketName,
+    ) -> Result<BucketInfo, MetadataError> {
         let updated = self
             .conn
             .execute(
                 "UPDATE buckets \
                  SET active_write_reservations = active_write_reservations + 1 \
                  WHERE name = ?1 AND state = ?2 AND write_reservations_blocked = 0",
-                params![name, BucketState::Active as u8],
+                params![name.as_str(), BucketState::Active as u8],
             )
             .map_err(|e| MetadataError::Db {
                 context: "acquire bucket write reservation",
@@ -2435,36 +2651,36 @@ impl PgMetadataStore for PgStore {
         if info.state == BucketState::Active && info.write_reservations_blocked {
             return Err(MetadataError::BucketWriteDraining);
         }
-        Err(bucket_not_found(name))
+        Err(bucket_not_found(name.as_str()))
     }
 
-    fn release_bucket_write_reservation(&self, name: &str) -> Result<(), MetadataError> {
+    fn release_bucket_write_reservation(&self, name: &BucketName) -> Result<(), MetadataError> {
         let updated = self
             .conn
             .execute(
                 "UPDATE buckets \
                  SET active_write_reservations = active_write_reservations - 1 \
                  WHERE name = ?1 AND active_write_reservations > 0",
-                params![name],
+                params![name.as_str()],
             )
             .map_err(|e| MetadataError::Db {
                 context: "release bucket write reservation",
                 source: e,
             })?;
         if updated == 0 {
-            return Err(bucket_not_found(name));
+            return Err(bucket_not_found(name.as_str()));
         }
         Ok(())
     }
 
-    fn begin_bucket_write_drain(&self, name: &str) -> Result<(), MetadataError> {
+    fn begin_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError> {
         let updated = self
             .conn
             .execute(
                 "UPDATE buckets \
                  SET write_reservations_blocked = 1 \
                  WHERE name = ?1 AND state = ?2 AND write_reservations_blocked = 0",
-                params![name, BucketState::Active as u8],
+                params![name.as_str(), BucketState::Active as u8],
             )
             .map_err(|e| MetadataError::Db {
                 context: "begin bucket write drain",
@@ -2475,40 +2691,40 @@ impl PgMetadataStore for PgStore {
             if info.state == BucketState::Active && info.write_reservations_blocked {
                 return Err(MetadataError::BucketWriteDraining);
             }
-            return Err(bucket_not_found(name));
+            return Err(bucket_not_found(name.as_str()));
         }
         Ok(())
     }
 
-    fn end_bucket_write_drain(&self, name: &str) -> Result<(), MetadataError> {
+    fn end_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError> {
         let updated = self
             .conn
             .execute(
                 "UPDATE buckets \
                  SET write_reservations_blocked = 0 \
                  WHERE name = ?1 AND state = ?2 AND write_reservations_blocked = 1",
-                params![name, BucketState::Active as u8],
+                params![name.as_str(), BucketState::Active as u8],
             )
             .map_err(|e| MetadataError::Db {
                 context: "end bucket write drain",
                 source: e,
             })?;
         if updated == 0 {
-            return Err(bucket_not_found(name));
+            return Err(bucket_not_found(name.as_str()));
         }
         Ok(())
     }
 
     fn put_bucket_versioning(
         &self,
-        name: &str,
+        name: &BucketName,
         state: BucketVersioningState,
     ) -> Result<(), MetadataError> {
         let current: BucketVersioningState = self
             .conn
             .query_row(
                 "SELECT versioning FROM buckets WHERE name = ?1",
-                params![name],
+                params![name.as_str()],
                 |row| row.get::<_, u8>(0),
             )
             .optional()
@@ -2516,7 +2732,7 @@ impl PgMetadataStore for PgStore {
                 context: "get bucket versioning",
                 source: e,
             })?
-            .ok_or_else(|| bucket_not_found(name))
+            .ok_or_else(|| bucket_not_found(name.as_str()))
             .and_then(|raw| {
                 BucketVersioningState::from_u8(raw).ok_or_else(|| MetadataError::Db {
                     context: "invalid versioning state in database",
@@ -2537,7 +2753,7 @@ impl PgMetadataStore for PgStore {
         self.conn
             .execute(
                 "UPDATE buckets SET versioning = ?1 WHERE name = ?2",
-                params![state as u8 as i64, name],
+                params![state as u8 as i64, name.as_str()],
             )
             .map_err(|e| MetadataError::Db {
                 context: "put bucket versioning",
@@ -2548,7 +2764,7 @@ impl PgMetadataStore for PgStore {
 
     fn put_bucket_object_lock(
         &self,
-        name: &str,
+        name: &BucketName,
         config: BucketObjectLockConfig,
     ) -> Result<(), MetadataError> {
         let (enabled, default_mode, default_days, default_years) =
@@ -2565,21 +2781,27 @@ impl PgMetadataStore for PgStore {
                      object_lock_default_days = ?3, \
                      object_lock_default_years = ?4 \
                  WHERE name = ?5",
-                params![enabled, default_mode, default_days, default_years, name],
+                params![
+                    enabled,
+                    default_mode,
+                    default_days,
+                    default_years,
+                    name.as_str()
+                ],
             )
             .map_err(|e| MetadataError::Db {
                 context: "put bucket object lock",
                 source: e,
             })?;
         if updated == 0 {
-            return Err(bucket_not_found(name));
+            return Err(bucket_not_found(name.as_str()));
         }
         Ok(())
     }
 
     fn put_bucket_acl(
         &self,
-        name: &str,
+        name: &BucketName,
         acl_grants: &AclGrants,
         public_read: bool,
         public_write: bool,
@@ -2592,7 +2814,7 @@ impl PgMetadataStore for PgStore {
                     acl_grants.serialized(),
                     i32::from(public_read),
                     i32::from(public_write),
-                    name
+                    name.as_str()
                 ],
             )
             .map_err(|e| MetadataError::Db {
@@ -2600,38 +2822,38 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(bucket_not_found(name));
+            return Err(bucket_not_found(name.as_str()));
         }
         Ok(())
     }
 
     fn put_bucket_subresource(
         &self,
-        name: &str,
+        name: &BucketName,
         req: PutBucketSubresource<'_>,
     ) -> Result<(), MetadataError> {
-        self.put_bucket_subresource_internal(name, req.kind, req.body, req.aux)
+        self.put_bucket_subresource_internal(name.as_str(), req.kind, req.body, req.aux)
     }
 
     fn get_bucket_subresource(
         &self,
-        name: &str,
+        name: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<StoredBucketSubresource>, MetadataError> {
-        self.get_bucket_subresource_internal(name, kind)
+        self.get_bucket_subresource_internal(name.as_str(), kind)
     }
 
     fn delete_bucket_subresource(
         &self,
-        name: &str,
+        name: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<(), MetadataError> {
-        self.delete_bucket_subresource_internal(name, kind)
+        self.delete_bucket_subresource_internal(name.as_str(), kind)
     }
 
     fn put_bucket_public_access_block(
         &self,
-        name: &str,
+        name: &BucketName,
         config: PublicAccessBlockConfig,
     ) -> Result<(), MetadataError> {
         let (
@@ -2657,7 +2879,7 @@ impl PgMetadataStore for PgStore {
                     ignore_public_acls,
                     block_public_policy,
                     restrict_public_buckets,
-                    name,
+                    name.as_str(),
                 ],
             )
             .map_err(|e| MetadataError::Db {
@@ -2665,14 +2887,14 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(bucket_not_found(name));
+            return Err(bucket_not_found(name.as_str()));
         }
         Ok(())
     }
 
     fn get_bucket_public_access_block(
         &self,
-        name: &str,
+        name: &BucketName,
     ) -> Result<Option<PublicAccessBlockConfig>, MetadataError> {
         self.conn
             .query_row(
@@ -2683,7 +2905,7 @@ impl PgMetadataStore for PgStore {
                      public_access_block_block_public_policy, \
                      public_access_block_restrict_public_buckets \
                  FROM buckets WHERE name = ?1",
-                params![name],
+                params![name.as_str()],
                 |row| {
                     Self::parse_public_access_block(
                         (
@@ -2702,10 +2924,10 @@ impl PgMetadataStore for PgStore {
                 context: "get bucket public access block",
                 source: e,
             })?
-            .ok_or_else(|| bucket_not_found(name))
+            .ok_or_else(|| bucket_not_found(name.as_str()))
     }
 
-    fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError> {
+    fn delete_bucket_public_access_block(&self, name: &BucketName) -> Result<(), MetadataError> {
         let (
             present,
             block_public_acls,
@@ -2729,7 +2951,7 @@ impl PgMetadataStore for PgStore {
                     ignore_public_acls,
                     block_public_policy,
                     restrict_public_buckets,
-                    name,
+                    name.as_str(),
                 ],
             )
             .map_err(|e| MetadataError::Db {
@@ -2737,40 +2959,43 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(bucket_not_found(name));
+            return Err(bucket_not_found(name.as_str()));
         }
         Ok(())
     }
 
     fn put_bucket_ownership_controls(
         &self,
-        name: &str,
+        name: &BucketName,
         config: BucketOwnershipControls,
     ) -> Result<(), MetadataError> {
         let updated = self
             .conn
             .execute(
                 "UPDATE buckets SET ownership_controls_mode = ?1 WHERE name = ?2",
-                params![Self::ownership_controls_sql_value(Some(config)), name],
+                params![
+                    Self::ownership_controls_sql_value(Some(config)),
+                    name.as_str()
+                ],
             )
             .map_err(|e| MetadataError::Db {
                 context: "put bucket ownership controls",
                 source: e,
             })?;
         if updated == 0 {
-            return Err(bucket_not_found(name));
+            return Err(bucket_not_found(name.as_str()));
         }
         Ok(())
     }
 
     fn get_bucket_ownership_controls(
         &self,
-        name: &str,
+        name: &BucketName,
     ) -> Result<Option<BucketOwnershipControls>, MetadataError> {
         self.conn
             .query_row(
                 "SELECT ownership_controls_mode FROM buckets WHERE name = ?1",
-                params![name],
+                params![name.as_str()],
                 |row| Self::parse_ownership_controls(row.get(0)?, 0),
             )
             .optional()
@@ -2778,29 +3003,29 @@ impl PgMetadataStore for PgStore {
                 context: "get bucket ownership controls",
                 source: e,
             })?
-            .ok_or_else(|| bucket_not_found(name))
+            .ok_or_else(|| bucket_not_found(name.as_str()))
     }
 
-    fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError> {
+    fn delete_bucket_ownership_controls(&self, name: &BucketName) -> Result<(), MetadataError> {
         let updated = self
             .conn
             .execute(
                 "UPDATE buckets SET ownership_controls_mode = ?1 WHERE name = ?2",
-                params![Self::ownership_controls_sql_value(None), name],
+                params![Self::ownership_controls_sql_value(None), name.as_str()],
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete bucket ownership controls",
                 source: e,
             })?;
         if updated == 0 {
-            return Err(bucket_not_found(name));
+            return Err(bucket_not_found(name.as_str()));
         }
         Ok(())
     }
 
     fn put_bucket_encryption(
         &self,
-        name: &str,
+        name: &BucketName,
         config: BucketEncryptionConfig,
     ) -> Result<(), MetadataError> {
         let updated = self
@@ -2810,7 +3035,7 @@ impl PgMetadataStore for PgStore {
                 params![
                     config.default_encryption.map(|value| value as u8),
                     i32::from(config.sse_c_blocked),
-                    name
+                    name.as_str()
                 ],
             )
             .map_err(|e| MetadataError::Db {
@@ -2818,16 +3043,19 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(bucket_not_found(name));
+            return Err(bucket_not_found(name.as_str()));
         }
         Ok(())
     }
 
-    fn get_bucket_encryption(&self, name: &str) -> Result<BucketEncryptionConfig, MetadataError> {
+    fn get_bucket_encryption(
+        &self,
+        name: &BucketName,
+    ) -> Result<BucketEncryptionConfig, MetadataError> {
         self.conn
             .query_row(
                 "SELECT default_encryption_type, sse_c_blocked FROM buckets WHERE name = ?1",
-                params![name],
+                params![name.as_str()],
                 |row| {
                     Ok(BucketEncryptionConfig {
                         default_encryption: row
@@ -2853,7 +3081,7 @@ impl PgMetadataStore for PgStore {
                 context: "get bucket encryption",
                 source: e,
             })?
-            .ok_or_else(|| bucket_not_found(name))
+            .ok_or_else(|| bucket_not_found(name.as_str()))
     }
 
     fn put_object_meta(&self, req: &PutObjectReq) -> Result<(), MetadataError> {

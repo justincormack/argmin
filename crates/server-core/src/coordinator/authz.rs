@@ -637,7 +637,7 @@ impl Coordinator {
 
         let raw_policy = Self::load_bucket_subresource_from_pg(
             bucket_pg,
-            &bucket.name,
+            &trusted_bucket_name(&bucket.name),
             storage::BucketSubresourceKind::Policy,
         )?;
         let parsed_policy = match raw_policy {
@@ -2153,7 +2153,7 @@ impl Coordinator {
     ) -> Result<AuthorizedDeleteBucket, ServerError> {
         let _bucket_info = self.authorize_bucket_owner_account_admin_for(req)?;
         Ok(AuthorizedDeleteBucket {
-            name: req.name.to_string(),
+            name: req.name_typed().clone(),
         })
     }
 
@@ -2166,7 +2166,7 @@ impl Coordinator {
             auth::PolicyAction::PutBucketCors,
         )?;
         Ok(AuthorizedBucketSubresourcePut {
-            bucket: req.bucket.name.to_string(),
+            bucket: req.bucket.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Cors,
             body: req.config.to_string(),
         })
@@ -2181,7 +2181,7 @@ impl Coordinator {
             auth::PolicyAction::GetBucketCors,
         )?;
         Ok(AuthorizedBucketSubresourceGet {
-            bucket: req.name.to_string(),
+            bucket: req.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Cors,
         })
     }
@@ -2197,7 +2197,7 @@ impl Coordinator {
         name: &str,
     ) -> AuthorizedBucketSubresourceGet {
         AuthorizedBucketSubresourceGet {
-            bucket: name.to_string(),
+            bucket: trusted_bucket_name(name),
             kind: storage::BucketSubresourceKind::Cors,
         }
     }
@@ -2211,7 +2211,7 @@ impl Coordinator {
             auth::PolicyAction::PutBucketCors,
         )?;
         Ok(AuthorizedBucketSubresourceDelete {
-            bucket: req.name.to_string(),
+            bucket: req.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Cors,
         })
     }
@@ -2225,7 +2225,7 @@ impl Coordinator {
             auth::PolicyAction::PutBucketTagging,
         )?;
         Ok(AuthorizedBucketSubresourcePut {
-            bucket: req.bucket.name.to_string(),
+            bucket: req.bucket.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Tagging,
             body: req.config.to_string(),
         })
@@ -2240,7 +2240,7 @@ impl Coordinator {
             auth::PolicyAction::GetBucketTagging,
         )?;
         Ok(AuthorizedBucketSubresourceGet {
-            bucket: req.name.to_string(),
+            bucket: req.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Tagging,
         })
     }
@@ -2254,7 +2254,7 @@ impl Coordinator {
             auth::PolicyAction::PutBucketTagging,
         )?;
         Ok(AuthorizedBucketSubresourceDelete {
-            bucket: req.name.to_string(),
+            bucket: req.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Tagging,
         })
     }
@@ -2305,7 +2305,7 @@ impl Coordinator {
             });
         }
         Ok(AuthorizedPutBucketPolicy {
-            bucket: req.bucket.name.to_string(),
+            bucket: req.bucket.name_typed().clone(),
             body: normalized_policy,
             parsed_policy: Arc::new(parsed_policy),
             policy_is_public,
@@ -2329,7 +2329,7 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedBucketSubresourceGet {
-            bucket: req.name.to_string(),
+            bucket: req.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Policy,
         })
     }
@@ -2351,7 +2351,7 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedBucketSubresourceDelete {
-            bucket: req.name.to_string(),
+            bucket: req.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Policy,
         })
     }
@@ -2365,7 +2365,7 @@ impl Coordinator {
             auth::PolicyAction::PutBucketPublicAccessBlock,
         )?;
         Ok(AuthorizedPutBucketPublicAccessBlock {
-            bucket: req.bucket.name.to_string(),
+            bucket: req.bucket.name_typed().clone(),
             config: req.config,
         })
     }
@@ -2384,7 +2384,7 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedBucketConfigAccess {
-            bucket: req.name.to_string(),
+            bucket: req.name_typed().clone(),
         })
     }
 
@@ -2397,7 +2397,7 @@ impl Coordinator {
             auth::PolicyAction::PutBucketPublicAccessBlock,
         )?;
         Ok(AuthorizedBucketConfigAccess {
-            bucket: req.name.to_string(),
+            bucket: req.name_typed().clone(),
         })
     }
 
@@ -2418,7 +2418,7 @@ impl Coordinator {
             return Err(ServerError::InvalidBucketAclWithObjectOwnership);
         }
         Ok(AuthorizedPutBucketOwnershipControls {
-            bucket: req.bucket.name.to_string(),
+            bucket: req.bucket.name_typed().clone(),
             config: req.config,
         })
     }
@@ -2432,7 +2432,7 @@ impl Coordinator {
             auth::PolicyAction::GetBucketOwnershipControls,
         )?;
         Ok(AuthorizedBucketConfigAccess {
-            bucket: req.name.to_string(),
+            bucket: req.name_typed().clone(),
         })
     }
 
@@ -2445,7 +2445,7 @@ impl Coordinator {
             auth::PolicyAction::PutBucketOwnershipControls,
         )?;
         Ok(AuthorizedBucketConfigAccess {
-            bucket: req.name.to_string(),
+            bucket: req.name_typed().clone(),
         })
     }
 
@@ -2476,7 +2476,7 @@ impl Coordinator {
             })?,
         );
         Ok(AuthorizedPutBucketLifecycle {
-            bucket: req.bucket.name.to_string(),
+            bucket: req.bucket.name_typed().clone(),
             body: req.config.to_string(),
             parsed_config,
         })
@@ -2491,7 +2491,7 @@ impl Coordinator {
             auth::PolicyAction::GetLifecycleConfiguration,
         )?;
         Ok(AuthorizedBucketSubresourceGet {
-            bucket: req.name.to_string(),
+            bucket: req.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Lifecycle,
         })
     }
@@ -2505,7 +2505,7 @@ impl Coordinator {
         name: &str,
     ) -> AuthorizedBucketSubresourceGet {
         AuthorizedBucketSubresourceGet {
-            bucket: name.to_string(),
+            bucket: trusted_bucket_name(name),
             kind: storage::BucketSubresourceKind::Lifecycle,
         }
     }
@@ -2519,7 +2519,7 @@ impl Coordinator {
             auth::PolicyAction::PutLifecycleConfiguration,
         )?;
         Ok(AuthorizedBucketSubresourceDelete {
-            bucket: req.name.to_string(),
+            bucket: req.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Lifecycle,
         })
     }
@@ -2533,7 +2533,7 @@ impl Coordinator {
             auth::PolicyAction::PutEncryptionConfiguration,
         )?;
         Ok(AuthorizedPutBucketEncryption {
-            bucket: req.bucket.name.to_string(),
+            bucket: req.bucket.name_typed().clone(),
             config: req.config,
             effective_config: req.config.effective(),
         })
@@ -2551,7 +2551,7 @@ impl Coordinator {
             return Err(ServerError::InvalidBucketState);
         }
         Ok(AuthorizedPutBucketVersioning {
-            bucket: req.bucket.name.to_string(),
+            bucket: req.bucket.name_typed().clone(),
             state: req.state,
         })
     }
@@ -2679,7 +2679,7 @@ impl Coordinator {
         }
 
         Ok(AuthorizedPutBucketObjectLockConfiguration {
-            bucket: req.bucket.name.to_string(),
+            bucket: req.bucket.name_typed().clone(),
             config: BucketObjectLockConfig {
                 enabled: true,
                 default_retention: req.config.default_retention,
@@ -2709,7 +2709,7 @@ impl Coordinator {
             auth::PolicyAction::PutEncryptionConfiguration,
         )?;
         Ok(AuthorizedDeleteBucketEncryption {
-            bucket: req.name.to_string(),
+            bucket: req.name_typed().clone(),
         })
     }
 
@@ -2846,7 +2846,7 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedPutBucketAcl {
-            bucket: req.bucket.name.to_string(),
+            bucket: req.bucket.name_typed().clone(),
             acl_grants,
             public_read,
             public_write,

@@ -31,6 +31,11 @@ What has landed so far:
 8. Object delete, object read/authz state loading, and multipart authz entry
    points now use typed bucket/object PG routing and typed bucket-summary
    helpers instead of the older raw-string coordinator helpers.
+9. The bucket-only `PgMetadataStore` boundary is now partly migrated to typed
+   `BucketName` parameters, and the main coordinator bucket operations now use
+   those typed storage calls rather than a string-only storage trait surface.
+   `PgStore` still keeps narrow raw wrappers for tests and compatibility during
+   migration, but the trait-level boundary moved.
 
 What is still open before Phase 3 can be marked complete:
 
@@ -289,9 +294,9 @@ Current status:
    Typed PG entry points exist for validated S3 names, but raw helper entry
    points still remain for internal namespaces and older call paths.
 6. Still open:
-   `crates/storage/src/traits.rs` and `crates/storage/src/pg_store.rs` remain
-   predominantly raw-string bucket/key interfaces, so coordinator-to-storage
-   dispatch still has a large mixed typed/raw boundary.
+   the storage boundary is still mixed overall: bucket-only trait methods are
+   partly typed now, but object-key/object-version/storage-dispatch APIs still
+   largely accept raw `&str` bucket/key values.
 
 Exit criteria:
 

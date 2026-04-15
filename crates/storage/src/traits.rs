@@ -39,7 +39,7 @@ pub trait PgMetadataStore {
     /// Create a new bucket.
     fn create_bucket(
         &self,
-        name: &str,
+        name: &BucketName,
         owner_principal: &str,
         owner_canonical_id: &CanonicalUserId,
         acl_grants: &AclGrants,
@@ -50,13 +50,13 @@ pub trait PgMetadataStore {
     /// Delete a bucket row.
     ///
     /// Emptiness checks are handled at coordinator level.
-    fn delete_bucket(&self, name: &str) -> Result<(), MetadataError>;
+    fn delete_bucket(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Get bucket metadata.
-    fn head_bucket(&self, name: &str) -> Result<BucketInfo, MetadataError>;
+    fn head_bucket(&self, name: &BucketName) -> Result<BucketInfo, MetadataError>;
 
     /// Get bucket metadata including non-active lifecycle states.
-    fn head_bucket_raw(&self, name: &str) -> Result<BucketInfo, MetadataError>;
+    fn head_bucket_raw(&self, name: &BucketName) -> Result<BucketInfo, MetadataError>;
 
     /// List all buckets owned by the given owner within this PG.
     fn list_buckets(&self, owner_canonical_id: &str) -> Result<Vec<BucketInfo>, MetadataError>;
@@ -72,23 +72,26 @@ pub trait PgMetadataStore {
 
     /// Mark a bucket as deleting so it is hidden from normal operations while
     /// background cleanup drains outstanding reclaim work.
-    fn mark_bucket_deleting(&self, name: &str) -> Result<(), MetadataError>;
+    fn mark_bucket_deleting(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Acquire a short-lived bucket write reservation.
     ///
     /// Reservations fence bucket deletion while cross-PG write publication is
     /// in progress. Returns the current bucket metadata on success.
-    fn acquire_bucket_write_reservation(&self, name: &str) -> Result<BucketInfo, MetadataError>;
+    fn acquire_bucket_write_reservation(
+        &self,
+        name: &BucketName,
+    ) -> Result<BucketInfo, MetadataError>;
 
     /// Release a previously acquired bucket write reservation.
-    fn release_bucket_write_reservation(&self, name: &str) -> Result<(), MetadataError>;
+    fn release_bucket_write_reservation(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Block new bucket write reservations while deletion drains in-flight
     /// writers and verifies emptiness.
-    fn begin_bucket_write_drain(&self, name: &str) -> Result<(), MetadataError>;
+    fn begin_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Re-open the bucket for new write reservations after a failed delete.
-    fn end_bucket_write_drain(&self, name: &str) -> Result<(), MetadataError>;
+    fn end_bucket_write_drain(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Set bucket versioning state.
     ///
@@ -96,21 +99,21 @@ pub trait PgMetadataStore {
     /// Enabled→Disabled is rejected.
     fn put_bucket_versioning(
         &self,
-        name: &str,
+        name: &BucketName,
         state: BucketVersioningState,
     ) -> Result<(), MetadataError>;
 
     /// Store bucket-level Object Lock configuration.
     fn put_bucket_object_lock(
         &self,
-        name: &str,
+        name: &BucketName,
         config: BucketObjectLockConfig,
     ) -> Result<(), MetadataError>;
 
     /// Update a bucket's public ACL flags.
     fn put_bucket_acl(
         &self,
-        name: &str,
+        name: &BucketName,
         acl_grants: &AclGrants,
         public_read: bool,
         public_write: bool,
@@ -122,65 +125,68 @@ pub trait PgMetadataStore {
     /// payloads whose primary stored form is an opaque string.
     fn put_bucket_subresource(
         &self,
-        name: &str,
+        name: &BucketName,
         req: PutBucketSubresource<'_>,
     ) -> Result<(), MetadataError>;
 
     /// Retrieve an opaque bucket subresource and its typed summary data.
     fn get_bucket_subresource(
         &self,
-        name: &str,
+        name: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<Option<StoredBucketSubresource>, MetadataError>;
 
     /// Delete an opaque bucket subresource. Idempotent.
     fn delete_bucket_subresource(
         &self,
-        name: &str,
+        name: &BucketName,
         kind: BucketSubresourceKind,
     ) -> Result<(), MetadataError>;
 
     /// Store the bucket public access block configuration.
     fn put_bucket_public_access_block(
         &self,
-        name: &str,
+        name: &BucketName,
         config: PublicAccessBlockConfig,
     ) -> Result<(), MetadataError>;
 
     /// Retrieve the bucket public access block configuration.
     fn get_bucket_public_access_block(
         &self,
-        name: &str,
+        name: &BucketName,
     ) -> Result<Option<PublicAccessBlockConfig>, MetadataError>;
 
     /// Delete the bucket public access block configuration. Idempotent.
-    fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError>;
+    fn delete_bucket_public_access_block(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Store the bucket ownership controls configuration.
     fn put_bucket_ownership_controls(
         &self,
-        name: &str,
+        name: &BucketName,
         config: BucketOwnershipControls,
     ) -> Result<(), MetadataError>;
 
     /// Retrieve the bucket ownership controls configuration.
     fn get_bucket_ownership_controls(
         &self,
-        name: &str,
+        name: &BucketName,
     ) -> Result<Option<BucketOwnershipControls>, MetadataError>;
 
     /// Delete the bucket ownership controls configuration. Idempotent.
-    fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError>;
+    fn delete_bucket_ownership_controls(&self, name: &BucketName) -> Result<(), MetadataError>;
 
     /// Store the currently supported bucket encryption configuration subset.
     fn put_bucket_encryption(
         &self,
-        name: &str,
+        name: &BucketName,
         config: BucketEncryptionConfig,
     ) -> Result<(), MetadataError>;
 
     /// Retrieve the currently supported bucket encryption configuration subset.
-    fn get_bucket_encryption(&self, name: &str) -> Result<BucketEncryptionConfig, MetadataError>;
+    fn get_bucket_encryption(
+        &self,
+        name: &BucketName,
+    ) -> Result<BucketEncryptionConfig, MetadataError>;
 
     /// Insert or replace an object record.
     ///

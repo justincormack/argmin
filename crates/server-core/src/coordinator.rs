@@ -227,43 +227,43 @@ pub struct AuthorizedPutObjectWrite {
 
 #[derive(Debug)]
 struct AuthorizedBucketSubresourcePut {
-    bucket: String,
+    bucket: BucketName,
     kind: storage::BucketSubresourceKind,
     body: String,
 }
 
 #[derive(Debug)]
 struct AuthorizedBucketSubresourceGet {
-    bucket: String,
+    bucket: BucketName,
     kind: storage::BucketSubresourceKind,
 }
 
 #[derive(Debug)]
 struct AuthorizedBucketSubresourceDelete {
-    bucket: String,
+    bucket: BucketName,
     kind: storage::BucketSubresourceKind,
 }
 
 #[derive(Debug)]
 struct AuthorizedBucketConfigAccess {
-    bucket: String,
+    bucket: BucketName,
 }
 
 #[derive(Debug)]
 struct AuthorizedPutBucketPublicAccessBlock {
-    bucket: String,
+    bucket: BucketName,
     config: PublicAccessBlockConfig,
 }
 
 #[derive(Debug)]
 struct AuthorizedPutBucketOwnershipControls {
-    bucket: String,
+    bucket: BucketName,
     config: BucketOwnershipControls,
 }
 
 #[derive(Debug)]
 struct AuthorizedPutBucketPolicy {
-    bucket: String,
+    bucket: BucketName,
     body: String,
     parsed_policy: Arc<auth::BucketPolicy>,
     policy_is_public: bool,
@@ -271,21 +271,21 @@ struct AuthorizedPutBucketPolicy {
 
 #[derive(Debug)]
 struct AuthorizedPutBucketLifecycle {
-    bucket: String,
+    bucket: BucketName,
     body: String,
     parsed_config: Arc<BucketLifecycleConfiguration>,
 }
 
 #[derive(Debug)]
 struct AuthorizedPutBucketEncryption {
-    bucket: String,
+    bucket: BucketName,
     config: BucketEncryptionConfig,
     effective_config: EffectiveBucketEncryptionConfig,
 }
 
 #[derive(Debug)]
 struct AuthorizedPutBucketVersioning {
-    bucket: String,
+    bucket: BucketName,
     state: BucketVersioningState,
 }
 
@@ -296,7 +296,7 @@ struct AuthorizedGetBucketVersioning {
 
 #[derive(Debug)]
 struct AuthorizedPutBucketObjectLockConfiguration {
-    bucket: String,
+    bucket: BucketName,
     config: BucketObjectLockConfig,
 }
 
@@ -307,7 +307,7 @@ struct AuthorizedGetBucketEncryption {
 
 #[derive(Debug)]
 struct AuthorizedDeleteBucketEncryption {
-    bucket: String,
+    bucket: BucketName,
 }
 
 #[derive(Debug)]
@@ -329,7 +329,7 @@ struct AuthorizedHeadBucket {
 
 #[derive(Debug)]
 struct AuthorizedDeleteBucket {
-    name: String,
+    name: BucketName,
 }
 
 #[derive(Debug)]
@@ -349,7 +349,7 @@ struct AuthorizedGetBucketAcl {
 
 #[derive(Debug)]
 struct AuthorizedPutBucketAcl {
-    bucket: String,
+    bucket: BucketName,
     acl_grants: AclGrants,
     public_read: bool,
     public_write: bool,
@@ -6206,6 +6206,14 @@ impl Coordinator {
         Ok(self.storage_node.get_pg(pg_id)?)
     }
 
+    fn get_bucket_pg_for(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<MutexGuard<'_, storage::PgStore>, ServerError> {
+        let pg_id = self.bucket_pg_id_for(bucket);
+        Ok(self.storage_node.get_pg(pg_id)?)
+    }
+
     fn lock_bucket_and_object_pgs_for(
         &self,
         bucket: &BucketName,
@@ -6459,7 +6467,7 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedPutBucketAcl {
-            bucket: bucket.name.clone(),
+            bucket: trusted_bucket_name(bucket.name.clone()),
             acl_grants,
             public_read,
             public_write,
@@ -6474,19 +6482,18 @@ impl Coordinator {
             req.name
         );
         let AuthorizedDeleteBucket { name } = self.authorize_delete_bucket(req)?;
-        let name = name.as_str();
-        self.begin_bucket_write_drain(name)?;
+        self.begin_bucket_write_drain(name.as_str())?;
 
         let mut marked_deleting = false;
         let result = (|| {
-            self.wait_for_bucket_write_reservations_to_drain(name)?;
+            self.wait_for_bucket_write_reservations_to_drain(name.as_str())?;
 
             // Check emptiness: list all object versions (including delete markers),
             // multipart uploads, and in-progress stream sessions across all PGs.
             self.pg_topology.for_each_pg(|pg_id| {
                 let pg = self.storage_node.get_pg(pg_id)?;
                 let resp = pg.list_object_versions(&ListObjectVersionsReq {
-                    bucket: trusted_bucket_name(name),
+                    bucket: name.clone(),
                     prefix: None,
                     key_marker: None,
                     version_id_marker: None,
@@ -6496,7 +6503,7 @@ impl Coordinator {
                     return Err(ServerError::BucketNotEmpty);
                 }
                 let mpu_resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                    bucket: trusted_bucket_name(name),
+                    bucket: name.clone(),
                     prefix: None,
                     key_marker: None,
                     upload_id_marker: None,
@@ -6508,30 +6515,38 @@ impl Coordinator {
                 let sessions = pg
                     .list_all_stream_uploads()
                     .map_err(ServerError::Metadata)?;
-                if sessions.iter().any(|session| session.bucket == name) {
+                if sessions
+                    .iter()
+                    .any(|session| session.bucket == name.as_str())
+                {
                     return Err(ServerError::BucketNotEmpty);
                 }
                 Ok::<(), ServerError>(())
             })?;
 
-            let bucket_pg = self.get_bucket_pg(name)?;
-            bucket_pg.mark_bucket_deleting(name).map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
+            let bucket_pg = self.get_bucket_pg_for(&name)?;
+            storage::PgMetadataStore::mark_bucket_deleting(&*bucket_pg, &name).map_err(
+                |e| match e {
+                    storage::MetadataError::BucketNotFound { name } => {
+                        ServerError::BucketNotFound {
+                            name: name.to_string(),
+                        }
+                    }
+                    other => ServerError::Metadata(other),
                 },
-                other => ServerError::Metadata(other),
-            })?;
-            self.storage_node.remove_bucket_fast_path(name);
-            self.clear_bucket_policy_cache(name);
-            self.clear_bucket_lifecycle_cache(name);
+            )?;
+            self.storage_node.remove_bucket_fast_path(name.as_str());
+            self.clear_bucket_policy_cache(name.as_str());
+            self.clear_bucket_lifecycle_cache(name.as_str());
             marked_deleting = true;
-            self.read_runtime().enqueue_bucket_delete_finalize(name);
+            self.read_runtime()
+                .enqueue_bucket_delete_finalize(name.as_str());
             Ok(())
         })();
 
         if !marked_deleting {
-            let bucket_pg = self.get_bucket_pg(name)?;
-            let _ = bucket_pg.end_bucket_write_drain(name);
+            let bucket_pg = self.get_bucket_pg_for(&name)?;
+            let _ = storage::PgMetadataStore::end_bucket_write_drain(&*bucket_pg, &name);
         }
 
         result
@@ -6591,7 +6606,7 @@ impl Coordinator {
             req.state
         );
         let authorized = self.authorize_put_bucket_versioning(req)?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         bucket_pg
             .put_bucket_versioning(&authorized.bucket, authorized.state)
             .map_err(|e| match e {
@@ -6639,7 +6654,7 @@ impl Coordinator {
             req.config.default_retention.is_some()
         );
         let authorized = self.authorize_put_bucket_object_lock_configuration(req)?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         bucket_pg
             .put_bucket_object_lock(&authorized.bucket, authorized.config)
             .map_err(|e| match e {
@@ -6681,7 +6696,7 @@ impl Coordinator {
             req.config.sse_c_blocked
         );
         let authorized = self.authorize_put_bucket_encryption(req)?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         bucket_pg
             .put_bucket_encryption(&authorized.bucket, authorized.config)
             .map_err(|e| match e {
@@ -6719,7 +6734,7 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_delete_bucket_encryption(req)?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         bucket_pg
             .put_bucket_encryption(&authorized.bucket, BucketEncryptionConfig::default())
             .map_err(|e| match e {
@@ -6837,9 +6852,9 @@ impl Coordinator {
                 aux: storage::BucketSubresourceAux::policy(authorized.policy_is_public),
             },
         )?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         let info = bucket_pg
-            .head_bucket_raw(req.bucket.name())
+            .head_bucket_raw(&authorized.bucket)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -6889,7 +6904,7 @@ impl Coordinator {
         );
         let authorized = self.authorize_delete_bucket_policy(req)?;
         self.remove_authorized_bucket_subresource(&authorized)?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         let info = bucket_pg
             .head_bucket_raw(&authorized.bucket)
             .map_err(|e| match e {
@@ -6923,7 +6938,7 @@ impl Coordinator {
                 aux: storage::BucketSubresourceAux::None,
             },
         )?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         let info = bucket_pg
             .head_bucket_raw(&authorized.bucket)
             .map_err(|e| match e {
@@ -6964,7 +6979,7 @@ impl Coordinator {
         );
         let authorized = self.authorize_delete_bucket_lifecycle(req)?;
         self.remove_authorized_bucket_subresource(&authorized)?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         let info = bucket_pg
             .head_bucket_raw(&authorized.bucket)
             .map_err(|e| match e {
@@ -6990,7 +7005,7 @@ impl Coordinator {
             req.config
         );
         let authorized = self.authorize_put_bucket_public_access_block(req)?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         bucket_pg
             .put_bucket_public_access_block(&authorized.bucket, authorized.config)
             .map_err(|e| match e {
@@ -7017,7 +7032,7 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_get_bucket_public_access_block(req)?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         bucket_pg
             .get_bucket_public_access_block(&authorized.bucket)
             .map_err(|e| match e {
@@ -7039,7 +7054,7 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_delete_bucket_public_access_block(req)?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         bucket_pg
             .delete_bucket_public_access_block(&authorized.bucket)
             .map_err(|e| match e {
@@ -7067,7 +7082,7 @@ impl Coordinator {
             req.config
         );
         let authorized = self.authorize_put_bucket_ownership_controls(req)?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         bucket_pg
             .put_bucket_ownership_controls(&authorized.bucket, authorized.config)
             .map_err(|e| match e {
@@ -7094,7 +7109,7 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_get_bucket_ownership_controls(req)?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         bucket_pg
             .get_bucket_ownership_controls(&authorized.bucket)
             .map_err(|e| match e {
@@ -7116,7 +7131,7 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_delete_bucket_ownership_controls(req)?;
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         bucket_pg
             .delete_bucket_ownership_controls(&authorized.bucket)
             .map_err(|e| match e {
@@ -7172,7 +7187,7 @@ impl Coordinator {
         &self,
         authorized: &AuthorizedPutBucketAcl,
     ) -> Result<(), ServerError> {
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         bucket_pg
             .put_bucket_acl(
                 &authorized.bucket,
@@ -7211,10 +7226,10 @@ impl Coordinator {
 
     fn store_bucket_subresource(
         &self,
-        name: &str,
+        name: &BucketName,
         req: storage::PutBucketSubresource<'_>,
     ) -> Result<(), ServerError> {
-        let bucket_pg = self.get_bucket_pg(name)?;
+        let bucket_pg = self.get_bucket_pg_for(name)?;
         bucket_pg
             .put_bucket_subresource(name, req)
             .map_err(|e| match e {
@@ -7229,7 +7244,7 @@ impl Coordinator {
         &self,
         authorized: &AuthorizedBucketSubresourceGet,
     ) -> Result<Option<String>, ServerError> {
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         Self::load_bucket_subresource_from_pg(&bucket_pg, &authorized.bucket, authorized.kind)
     }
 
@@ -7237,7 +7252,7 @@ impl Coordinator {
         &self,
         authorized: &AuthorizedBucketSubresourceDelete,
     ) -> Result<(), ServerError> {
-        let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
         bucket_pg
             .delete_bucket_subresource(&authorized.bucket, authorized.kind)
             .map_err(|e| match e {
@@ -7250,7 +7265,7 @@ impl Coordinator {
 
     fn load_bucket_subresource_from_pg(
         bucket_pg: &storage::PgStore,
-        bucket: &str,
+        bucket: &BucketName,
         kind: storage::BucketSubresourceKind,
     ) -> Result<Option<String>, ServerError> {
         bucket_pg
