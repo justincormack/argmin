@@ -1770,8 +1770,8 @@ impl Coordinator {
             return Err(ServerError::MethodNotAllowed);
         }
         Ok(AuthorizedObjectTagsAccess {
-            bucket: req.object.bucket_name().to_string(),
-            key: req.object.key().to_string(),
+            bucket: req.object.bucket_name_typed().clone(),
+            key: req.object.key_typed().clone(),
             version_id: stored.version_id(),
             pgs,
         })
@@ -1793,8 +1793,8 @@ impl Coordinator {
             return Err(ServerError::MethodNotAllowed);
         }
         Ok(AuthorizedObjectTagsAccess {
-            bucket: req.object.bucket_name().to_string(),
-            key: req.object.key.to_string(),
+            bucket: req.object.bucket_name_typed().clone(),
+            key: req.object.key_typed().clone(),
             version_id: stored.version_id(),
             pgs,
         })
@@ -1816,8 +1816,8 @@ impl Coordinator {
             return Err(ServerError::MethodNotAllowed);
         }
         Ok(AuthorizedObjectTagsAccess {
-            bucket: req.object.bucket_name().to_string(),
-            key: req.object.key.to_string(),
+            bucket: req.object.bucket_name_typed().clone(),
+            key: req.object.key_typed().clone(),
             version_id: stored.version_id(),
             pgs,
         })
@@ -1913,8 +1913,8 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedPutObjectAclUpdate {
-            bucket: req.object.bucket_name().to_string(),
-            key: req.object.key().to_string(),
+            bucket: req.object.bucket_name_typed().clone(),
+            key: req.object.key_typed().clone(),
             version_id: stored.version_id(),
             acl_grants,
             public_read,
@@ -1957,8 +1957,8 @@ impl Coordinator {
             can_bypass_governance,
         )?;
         Ok(AuthorizedPutObjectRetention {
-            bucket: req.object.bucket_name().to_string(),
-            key: req.object.key().to_string(),
+            bucket: req.object.bucket_name_typed().clone(),
+            key: req.object.key_typed().clone(),
             version_id: live.version_id,
             retention: req.retention,
             pgs,
@@ -2007,8 +2007,8 @@ impl Coordinator {
         )?;
         let live = stored.as_live().ok_or(ServerError::MethodNotAllowed)?;
         Ok(AuthorizedPutObjectLegalHold {
-            bucket: req.object.bucket_name().to_string(),
-            key: req.object.key().to_string(),
+            bucket: req.object.bucket_name_typed().clone(),
+            key: req.object.key_typed().clone(),
             version_id: live.version_id,
             legal_hold: StoredLegalHoldStatus::from_legal_hold_status(Some(req.legal_hold)),
             pgs,

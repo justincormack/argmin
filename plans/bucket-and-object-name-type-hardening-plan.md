@@ -286,6 +286,9 @@ Current status:
    Bucket-scoped coordinator helper traits now expose typed bucket access, and
    the raw read-lock and bucket-write-reservation helper variants that were
    only serving older request shapes have been removed from the touched paths.
+   Object-tagging/object-lock/object-ACL authorization tokens now also carry
+   typed bucket/key values, and the main PutObject / streaming PutObject commit
+   helpers reuse those typed values instead of reconstructing trusted names.
 4. Still open:
    storage-dispatch and many coordinator-internal helper APIs still accept raw
    `&str` bucket/key parameters.

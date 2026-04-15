@@ -356,15 +356,15 @@ struct AuthorizedPutBucketAcl {
 }
 
 struct AuthorizedObjectTagsAccess<'a> {
-    bucket: String,
-    key: String,
+    bucket: BucketName,
+    key: ObjectKey,
     version_id: VersionId,
     pgs: ObjectPgGuards<'a>,
 }
 
 struct AuthorizedPutObjectRetention<'a> {
-    bucket: String,
-    key: String,
+    bucket: BucketName,
+    key: ObjectKey,
     version_id: VersionId,
     retention: ObjectRetention,
     pgs: ObjectPgGuards<'a>,
@@ -375,8 +375,8 @@ struct AuthorizedGetObjectRetention {
 }
 
 struct AuthorizedPutObjectLegalHold<'a> {
-    bucket: String,
-    key: String,
+    bucket: BucketName,
+    key: ObjectKey,
     version_id: VersionId,
     legal_hold: StoredLegalHoldStatus,
     pgs: ObjectPgGuards<'a>,
@@ -387,8 +387,8 @@ struct AuthorizedGetObjectLegalHold {
 }
 
 struct AuthorizedPutObjectAclUpdate<'a> {
-    bucket: String,
-    key: String,
+    bucket: BucketName,
+    key: ObjectKey,
     version_id: VersionId,
     acl_grants: AclGrants,
     public_read: bool,
@@ -2114,8 +2114,8 @@ struct PreparedPutCommit {
 }
 
 struct PutCommitRequest<'a> {
-    bucket: &'a str,
-    key: &'a str,
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
     metadata_blob: &'a MetadataBlob,
     system_metadata: &'a SystemMetadata,
     write_encryption: &'a ActiveWriteEncryption,
@@ -7281,15 +7281,21 @@ impl Coordinator {
 
     // ── Bucket tagging ────────────────────────────────────────────────
     fn persist_locked_object_acl(
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         meta_pg: &storage::PgStore,
         version_id: VersionId,
         acl_grants: AclGrants,
         public_read: bool,
     ) -> Result<VersionId, ServerError> {
         meta_pg
-            .put_object_acl(bucket, key, version_id, &acl_grants, public_read)
+            .put_object_acl(
+                bucket.as_str(),
+                key.as_str(),
+                version_id,
+                &acl_grants,
+                public_read,
+            )
             .map_err(|e| match e {
                 storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
                     bucket: bucket.to_string(),
@@ -7549,8 +7555,8 @@ impl Coordinator {
             .pgs
             .meta()
             .put_object_tags(
-                &authorized.bucket,
-                &authorized.key,
+                authorized.bucket.as_str(),
+                authorized.key.as_str(),
                 authorized.version_id,
                 req.tags,
             )
@@ -7576,8 +7582,8 @@ impl Coordinator {
             .pgs
             .meta()
             .put_object_retention(
-                &authorized.bucket,
-                &authorized.key,
+                authorized.bucket.as_str(),
+                authorized.key.as_str(),
                 authorized.version_id,
                 authorized.retention,
             )
@@ -7623,8 +7629,8 @@ impl Coordinator {
             .pgs
             .meta()
             .put_object_legal_hold(
-                &authorized.bucket,
-                &authorized.key,
+                authorized.bucket.as_str(),
+                authorized.key.as_str(),
                 authorized.version_id,
                 authorized.legal_hold,
             )
@@ -7667,7 +7673,11 @@ impl Coordinator {
         authorized
             .pgs
             .meta()
-            .get_object_tags(&authorized.bucket, &authorized.key, authorized.version_id)
+            .get_object_tags(
+                authorized.bucket.as_str(),
+                authorized.key.as_str(),
+                authorized.version_id,
+            )
             .map_err(ServerError::Metadata)
     }
 
@@ -7683,7 +7693,11 @@ impl Coordinator {
         authorized
             .pgs
             .meta()
-            .delete_object_tags(&authorized.bucket, &authorized.key, authorized.version_id)
+            .delete_object_tags(
+                authorized.bucket.as_str(),
+                authorized.key.as_str(),
+                authorized.version_id,
+            )
             .map_err(ServerError::Metadata)
     }
 
@@ -7734,7 +7748,8 @@ impl Coordinator {
             Self::prepare_stored_system_metadata(req.system_metadata, req.write_encryption)?;
 
         if !req.cond.is_empty() {
-            let existing_etag = match meta_pg.get_object_meta(req.bucket, req.key) {
+            let existing_etag = match meta_pg.get_object_meta(req.bucket.as_str(), req.key.as_str())
+            {
                 Ok(stored) => stored.as_live().map(|record| record.etag.format()),
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
@@ -7749,13 +7764,17 @@ impl Coordinator {
         }
 
         let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
-            meta_pg.next_version_id(req.bucket, req.key)?
+            meta_pg.next_version_id(req.bucket.as_str(), req.key.as_str())?
         } else {
             VersionId::Null
         };
-        let generation_id = meta_pg.next_generation_id(req.bucket, req.key)?;
+        let generation_id = meta_pg.next_generation_id(req.bucket.as_str(), req.key.as_str())?;
         let stale_payload = if version_id.is_null() {
-            Self::snapshot_overwritten_null_version_payload(meta_pg, req.bucket, req.key)?
+            Self::snapshot_overwritten_null_version_payload(
+                meta_pg,
+                req.bucket.as_str(),
+                req.key.as_str(),
+            )?
         } else {
             None
         };
@@ -8313,8 +8332,8 @@ impl Coordinator {
                 meta_pg,
                 &bucket_info,
                 &PutCommitRequest {
-                    bucket: authorized.bucket(),
-                    key: authorized.key(),
+                    bucket: authorized.bucket_typed(),
+                    key: authorized.key_typed(),
                     metadata_blob: req.metadata,
                     system_metadata: &system_metadata,
                     write_encryption,
@@ -8333,8 +8352,8 @@ impl Coordinator {
             let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &acl);
 
             let segment_record = ObjectSegmentRecord {
-                bucket: trusted_bucket_name(authorized.bucket()),
-                key: trusted_object_key(authorized.key()),
+                bucket: authorized.bucket_typed().clone(),
+                key: authorized.key_typed().clone(),
                 version_id: prepared.version_id,
                 segment_index,
                 size: req.data.len() as u64,
@@ -8346,8 +8365,8 @@ impl Coordinator {
                 ec_m: self.ec_config.parity_shards,
             };
             let live_req = PutLiveObjectReq {
-                bucket: trusted_bucket_name(authorized.bucket()),
-                key: trusted_object_key(authorized.key()),
+                bucket: authorized.bucket_typed().clone(),
+                key: authorized.key_typed().clone(),
                 version_id: prepared.version_id,
                 owner,
                 acl_grants: acl_grants.clone(),
@@ -8967,8 +8986,8 @@ impl Coordinator {
         };
         self.finalize_stream_put(&FinalizeStreamPutRequest {
             object: ObjectRequest::new(
-                trusted_bucket_name(authorized.bucket()),
-                trusted_object_key(authorized.key()),
+                authorized.bucket_typed().clone(),
+                authorized.key_typed().clone(),
                 authorized.requester().clone(),
                 authorized.expected_bucket_owner(),
             ),
@@ -9043,8 +9062,8 @@ impl Coordinator {
                 &meta_guard,
                 &bucket_info,
                 &PutCommitRequest {
-                    bucket,
-                    key,
+                    bucket: req.object.bucket_name_typed(),
+                    key: req.object.key_typed(),
                     metadata_blob,
                     system_metadata: &system_metadata,
                     write_encryption: &write_encryption,
@@ -9070,8 +9089,8 @@ impl Coordinator {
             let committed_segments: Vec<ObjectSegmentRecord> = staging_segments
                 .iter()
                 .map(|segment| ObjectSegmentRecord {
-                    bucket: trusted_bucket_name(bucket),
-                    key: trusted_object_key(key),
+                    bucket: req.object.bucket_name_typed().clone(),
+                    key: req.object.key_typed().clone(),
                     version_id: prepared.version_id,
                     segment_index: segment.segment_index,
                     size: segment.size,
@@ -9088,8 +9107,8 @@ impl Coordinator {
                 .commit_stream_put(
                     session_id,
                     &CommitStreamPutReq {
-                        bucket: trusted_bucket_name(bucket),
-                        key: trusted_object_key(key),
+                        bucket: req.object.bucket_name_typed().clone(),
+                        key: req.object.key_typed().clone(),
                         version_id: prepared.version_id,
                         owner,
                         acl_grants: acl_grants.clone(),
