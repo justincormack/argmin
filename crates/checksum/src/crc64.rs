@@ -505,6 +505,7 @@ mod x86_64_pclmul {
         let fold_1 = load_aligned(&FOLD_1);
         let mut ptr = data.as_ptr();
         let end = ptr.add(data.len());
+        let mut remaining = data.len();
 
         let mut state = if data.len() >= 128 {
             let fold_8 = load_aligned(&FOLD_8);
@@ -517,8 +518,9 @@ mod x86_64_pclmul {
             let mut x6 = load_block(ptr.add(96));
             let mut x7 = load_block(ptr.add(112));
             ptr = ptr.add(128);
+            remaining -= 128;
 
-            while ptr.add(128) <= end {
+            while remaining >= 128 {
                 x0 = fold_block(x0, load_block(ptr), fold_8);
                 x1 = fold_block(x1, load_block(ptr.add(16)), fold_8);
                 x2 = fold_block(x2, load_block(ptr.add(32)), fold_8);
@@ -528,6 +530,7 @@ mod x86_64_pclmul {
                 x6 = fold_block(x6, load_block(ptr.add(96)), fold_8);
                 x7 = fold_block(x7, load_block(ptr.add(112)), fold_8);
                 ptr = ptr.add(128);
+                remaining -= 128;
             }
 
             let fold_7 = load_aligned(&FOLD_7);
@@ -548,13 +551,17 @@ mod x86_64_pclmul {
         } else {
             let first = xor_crc(load_block(ptr), !crc);
             ptr = ptr.add(16);
+            remaining -= 16;
             first
         };
 
-        while ptr < end {
+        while remaining >= 16 {
             state = fold_block(state, load_block(ptr), fold_1);
             ptr = ptr.add(16);
+            remaining -= 16;
         }
+
+        debug_assert_eq!(ptr, end);
 
         !reduce_to_crc(state)
     }
