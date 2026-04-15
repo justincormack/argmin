@@ -1,6 +1,6 @@
 /// Core types for the storage layer.
 use crate::error::StoreError;
-use std::num::NonZeroU64;
+use std::{num::NonZeroU64, str::FromStr};
 
 pub use checksum::{
     ChecksumAlgorithm, ChecksumBytes, ChecksumType, InvalidChecksumConfig, MultipartChecksumConfig,
@@ -41,6 +41,218 @@ impl std::fmt::Display for GenerationId {
 }
 
 // ── String newtypes ───────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BucketNameError {
+    #[error("bucket name must be 3-63 characters, got {length}")]
+    InvalidLength { length: usize },
+    #[error("bucket name must start with a lowercase letter or digit")]
+    InvalidStartCharacter,
+    #[error("bucket name must end with a lowercase letter or digit")]
+    InvalidEndCharacter,
+    #[error("bucket name must contain only lowercase letters, digits, hyphens, and periods")]
+    InvalidCharacterSet,
+    #[error("bucket name must not contain consecutive periods")]
+    ConsecutivePeriods,
+    #[error("bucket name must not contain dot-dash or dash-dot")]
+    DotDashOrDashDot,
+    #[error("bucket name must not start with xn-- (reserved for IDN)")]
+    ReservedPrefix,
+    #[error("bucket name must not be formatted as an IP address")]
+    IpAddressFormat,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ObjectKeyError {
+    #[error("object key must be 1-1024 bytes, got {length}")]
+    InvalidLength { length: usize },
+    #[error("object key must not contain null bytes")]
+    ContainsNullByte,
+}
+
+fn validate_bucket_name(name: &str) -> Result<(), BucketNameError> {
+    if name.len() < 3 || name.len() > 63 {
+        return Err(BucketNameError::InvalidLength { length: name.len() });
+    }
+
+    let first = name.as_bytes()[0];
+    let last = name.as_bytes()[name.len() - 1];
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return Err(BucketNameError::InvalidStartCharacter);
+    }
+    if !(last.is_ascii_lowercase() || last.is_ascii_digit()) {
+        return Err(BucketNameError::InvalidEndCharacter);
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+    {
+        return Err(BucketNameError::InvalidCharacterSet);
+    }
+    if name.contains("..") {
+        return Err(BucketNameError::ConsecutivePeriods);
+    }
+    if name.contains(".-") || name.contains("-.") {
+        return Err(BucketNameError::DotDashOrDashDot);
+    }
+    if name.starts_with("xn--") {
+        return Err(BucketNameError::ReservedPrefix);
+    }
+
+    let mut parts = name.split('.');
+    if let (Some(a), Some(b), Some(c), Some(d), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) {
+        if [a, b, c, d]
+            .into_iter()
+            .all(|part| part.parse::<u8>().is_ok())
+        {
+            return Err(BucketNameError::IpAddressFormat);
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_object_key(key: &str) -> Result<(), ObjectKeyError> {
+    if key.is_empty() || key.len() > 1024 {
+        return Err(ObjectKeyError::InvalidLength { length: key.len() });
+    }
+    if key.as_bytes().contains(&0) {
+        return Err(ObjectKeyError::ContainsNullByte);
+    }
+    Ok(())
+}
+
+macro_rules! validated_string_newtype {
+    ($(#[$meta:meta])* $name:ident, $error:ident, $validate:ident) => {
+        $(#[$meta])*
+        #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(s: impl Into<String>) -> Result<Self, $error> {
+                let s = s.into();
+                $validate(&s)?;
+                Ok(Self(s))
+            }
+
+            pub fn into_string(self) -> String {
+                self.0
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl AsRef<str> for $name {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+
+        impl std::ops::Deref for $name {
+            type Target = str;
+            fn deref(&self) -> &str {
+                self.as_str()
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                std::fmt::Debug::fmt(&observability::escaped(&self.0), f)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = $error;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = $error;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl FromStr for $name {
+            type Err = $error;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::try_from(s)
+            }
+        }
+
+        impl PartialEq<str> for $name {
+            fn eq(&self, other: &str) -> bool {
+                self.0 == other
+            }
+        }
+
+        impl PartialEq<&str> for $name {
+            fn eq(&self, other: &&str) -> bool {
+                self.as_str() == *other
+            }
+        }
+
+        impl PartialEq<$name> for str {
+            fn eq(&self, other: &$name) -> bool {
+                self == other.as_str()
+            }
+        }
+
+        impl PartialEq<$name> for &str {
+            fn eq(&self, other: &$name) -> bool {
+                *self == other.as_str()
+            }
+        }
+
+        impl PartialEq<String> for $name {
+            fn eq(&self, other: &String) -> bool {
+                self.0 == *other
+            }
+        }
+
+        impl PartialEq<$name> for String {
+            fn eq(&self, other: &$name) -> bool {
+                *self == other.0
+            }
+        }
+
+        impl rusqlite::types::ToSql for $name {
+            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+                self.0.to_sql()
+            }
+        }
+
+        impl rusqlite::types::FromSql for $name {
+            fn column_result(
+                value: rusqlite::types::ValueRef<'_>,
+            ) -> rusqlite::types::FromSqlResult<Self> {
+                let value = String::column_result(value)?;
+                Self::try_from(value).map_err(|error| {
+                    rusqlite::types::FromSqlError::Other(Box::new(error))
+                })
+            }
+        }
+    };
+}
 
 macro_rules! string_newtype {
     ($(#[$meta:meta])* $name:ident) => {
@@ -136,21 +348,27 @@ macro_rules! string_newtype {
         }
 
         impl rusqlite::types::FromSql for $name {
-            fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+            fn column_result(
+                value: rusqlite::types::ValueRef<'_>,
+            ) -> rusqlite::types::FromSqlResult<Self> {
                 String::column_result(value).map(Self)
             }
         }
     };
 }
 
-string_newtype!(
+validated_string_newtype!(
     /// S3 bucket name.
-    BucketName
+    BucketName,
+    BucketNameError,
+    validate_bucket_name
 );
 
-string_newtype!(
+validated_string_newtype!(
     /// S3 object key.
-    ObjectKey
+    ObjectKey,
+    ObjectKeyError,
+    validate_object_key
 );
 
 /// Return the smallest valid UTF-8 string that sorts after every key beginning
@@ -2437,7 +2655,7 @@ mod tests {
     #[test]
     fn bucket_info_debug_summarizes_raw_configs() {
         let info = BucketInfo {
-            name: BucketName::from("buck\r\net"),
+            name: BucketName::try_from("bucket-1").unwrap(),
             owner_principal: "own\ner".to_string(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
             created_at: 1,
@@ -2518,15 +2736,81 @@ mod tests {
 
     #[test]
     fn string_newtype_debug_escapes_control_characters() {
-        let bucket = BucketName::from("buck\r\net");
-        let key = ObjectKey::from("obj\t\u{1b}[31m");
+        let bucket = BucketName::try_from("bucket-1").unwrap();
+        let key = ObjectKey::try_from("obj\t\u{1b}[31m").unwrap();
         let upload = UploadId::from("up\nload");
         let session = SessionId::from("sess\rion");
 
-        assert_eq!(format!("{bucket:?}"), r#""buck\r\net""#);
+        assert_eq!(format!("{bucket:?}"), r#""bucket-1""#);
         assert_eq!(format!("{key:?}"), r#""obj\t\u{1b}[31m""#);
         assert_eq!(format!("{upload:?}"), r#""up\nload""#);
         assert_eq!(format!("{session:?}"), r#""sess\rion""#);
+    }
+
+    #[test]
+    fn bucket_name_try_from_rejects_invalid_inputs() {
+        assert_eq!(
+            BucketName::try_from("ab").unwrap_err(),
+            BucketNameError::InvalidLength { length: 2 }
+        );
+        assert_eq!(
+            BucketName::try_from("xn--bucket").unwrap_err(),
+            BucketNameError::ReservedPrefix
+        );
+        assert_eq!(
+            BucketName::try_from("192.168.0.1").unwrap_err(),
+            BucketNameError::IpAddressFormat
+        );
+    }
+
+    #[test]
+    fn object_key_try_from_rejects_invalid_inputs() {
+        assert_eq!(
+            ObjectKey::try_from("").unwrap_err(),
+            ObjectKeyError::InvalidLength { length: 0 }
+        );
+        assert_eq!(
+            ObjectKey::try_from("nul\0key").unwrap_err(),
+            ObjectKeyError::ContainsNullByte
+        );
+        assert_eq!(
+            ObjectKey::try_from("x".repeat(1025)).unwrap_err(),
+            ObjectKeyError::InvalidLength { length: 1025 }
+        );
+    }
+
+    #[test]
+    fn bucket_name_from_sql_rejects_invalid_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (name TEXT NOT NULL)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t (name) VALUES (?1)", ["BadBucket"])
+            .unwrap();
+
+        let err = conn
+            .query_row("SELECT name FROM t", [], |row| row.get::<_, BucketName>(0))
+            .unwrap_err();
+        match err {
+            rusqlite::Error::FromSqlConversionFailure(_, rusqlite::types::Type::Text, _) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_key_from_sql_rejects_invalid_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (key TEXT NOT NULL)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t (key) VALUES (?1)", [String::new()])
+            .unwrap();
+
+        let err = conn
+            .query_row("SELECT key FROM t", [], |row| row.get::<_, ObjectKey>(0))
+            .unwrap_err();
+        match err {
+            rusqlite::Error::FromSqlConversionFailure(_, rusqlite::types::Type::Text, _) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     // ── Property-based tests ────────────────────────────────────────

@@ -41,6 +41,27 @@ type PublicAccessBlockSqlValues = (i64, i64, i64, i64, i64);
 type BucketObjectLockSqlValues = (i64, Option<u8>, Option<i64>, Option<i64>);
 type ObjectLockSqlValues = (Option<u8>, Option<i64>, u8);
 
+#[cfg(test)]
+fn trusted_bucket_name(name: impl Into<String>) -> BucketName {
+    BucketName::try_from(name.into())
+        .expect("pg_store must only construct BucketName from validated values")
+}
+
+fn bucket_not_found(name: &str) -> MetadataError {
+    match BucketName::try_from(name) {
+        Ok(name) => MetadataError::BucketNotFound { name },
+        Err(error) => MetadataError::InvalidBucketName {
+            reason: error.to_string(),
+        },
+    }
+}
+
+#[cfg(test)]
+fn trusted_object_key(key: impl Into<String>) -> ObjectKey {
+    ObjectKey::try_from(key.into())
+        .expect("pg_store must only construct ObjectKey from validated values")
+}
+
 struct PreparedShardFile {
     key: ShardKey,
     ack: WriteAck,
@@ -1064,9 +1085,7 @@ impl PgStore {
             )
             .optional()
             .map_err(|source| MetadataError::Db { context, source })?
-            .ok_or_else(|| MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            })
+            .ok_or_else(|| bucket_not_found(name))
     }
 
     fn bucket_subresource_invalid_aux(
@@ -1407,9 +1426,7 @@ impl PgStore {
                 context: "get bucket subresource",
                 source: e,
             })?
-            .ok_or(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            })
+            .ok_or_else(|| bucket_not_found(name))
     }
 
     /// Map a row with columns (bucket, key, version_id, generation_id, size,
@@ -2082,9 +2099,7 @@ impl PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(bucket),
-            });
+            return Err(bucket_not_found(bucket));
         }
         self.conn
             .query_row(
@@ -2232,9 +2247,7 @@ impl PgMetadataStore for PgStore {
             }
         };
         if deleted == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
+            return Err(bucket_not_found(name));
         }
         Ok(())
     }
@@ -2249,9 +2262,7 @@ impl PgMetadataStore for PgStore {
         );
         let info = self.head_bucket_raw(name)?;
         if info.state != BucketState::Active {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
+            return Err(bucket_not_found(name));
         }
         Ok(info)
     }
@@ -2268,9 +2279,7 @@ impl PgMetadataStore for PgStore {
                 context: "head bucket raw",
                 source: e,
             })?
-            .ok_or(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            })
+            .ok_or_else(|| bucket_not_found(name))
     }
 
     fn list_buckets(&self, owner_canonical_id: &str) -> Result<Vec<BucketInfo>, MetadataError> {
@@ -2401,9 +2410,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
+            return Err(bucket_not_found(name));
         }
         Ok(())
     }
@@ -2428,9 +2435,7 @@ impl PgMetadataStore for PgStore {
         if info.state == BucketState::Active && info.write_reservations_blocked {
             return Err(MetadataError::BucketWriteDraining);
         }
-        Err(MetadataError::BucketNotFound {
-            name: BucketName::from(name),
-        })
+        Err(bucket_not_found(name))
     }
 
     fn release_bucket_write_reservation(&self, name: &str) -> Result<(), MetadataError> {
@@ -2447,9 +2452,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
+            return Err(bucket_not_found(name));
         }
         Ok(())
     }
@@ -2472,9 +2475,7 @@ impl PgMetadataStore for PgStore {
             if info.state == BucketState::Active && info.write_reservations_blocked {
                 return Err(MetadataError::BucketWriteDraining);
             }
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
+            return Err(bucket_not_found(name));
         }
         Ok(())
     }
@@ -2493,9 +2494,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
+            return Err(bucket_not_found(name));
         }
         Ok(())
     }
@@ -2517,9 +2516,7 @@ impl PgMetadataStore for PgStore {
                 context: "get bucket versioning",
                 source: e,
             })?
-            .ok_or(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            })
+            .ok_or_else(|| bucket_not_found(name))
             .and_then(|raw| {
                 BucketVersioningState::from_u8(raw).ok_or_else(|| MetadataError::Db {
                     context: "invalid versioning state in database",
@@ -2575,9 +2572,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
+            return Err(bucket_not_found(name));
         }
         Ok(())
     }
@@ -2605,9 +2600,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
+            return Err(bucket_not_found(name));
         }
         Ok(())
     }
@@ -2672,9 +2665,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
+            return Err(bucket_not_found(name));
         }
         Ok(())
     }
@@ -2711,9 +2702,7 @@ impl PgMetadataStore for PgStore {
                 context: "get bucket public access block",
                 source: e,
             })?
-            .ok_or(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            })
+            .ok_or_else(|| bucket_not_found(name))
     }
 
     fn delete_bucket_public_access_block(&self, name: &str) -> Result<(), MetadataError> {
@@ -2748,9 +2737,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
+            return Err(bucket_not_found(name));
         }
         Ok(())
     }
@@ -2771,9 +2758,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
+            return Err(bucket_not_found(name));
         }
         Ok(())
     }
@@ -2793,9 +2778,7 @@ impl PgMetadataStore for PgStore {
                 context: "get bucket ownership controls",
                 source: e,
             })?
-            .ok_or(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            })
+            .ok_or_else(|| bucket_not_found(name))
     }
 
     fn delete_bucket_ownership_controls(&self, name: &str) -> Result<(), MetadataError> {
@@ -2810,9 +2793,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
+            return Err(bucket_not_found(name));
         }
         Ok(())
     }
@@ -2837,9 +2818,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         if updated == 0 {
-            return Err(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            });
+            return Err(bucket_not_found(name));
         }
         Ok(())
     }
@@ -2874,9 +2853,7 @@ impl PgMetadataStore for PgStore {
                 context: "get bucket encryption",
                 source: e,
             })?
-            .ok_or(MetadataError::BucketNotFound {
-                name: BucketName::from(name),
-            })
+            .ok_or_else(|| bucket_not_found(name))
     }
 
     fn put_object_meta(&self, req: &PutObjectReq) -> Result<(), MetadataError> {
@@ -7163,8 +7140,8 @@ mod tests {
         for key in &["photos/a.jpg", "photos/b.jpg", "photos/c.jpg", "docs/x"] {
             store
                 .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-                    bucket: "bucket".into(),
-                    key: ObjectKey::from(*key),
+                    bucket: trusted_bucket_name("bucket"),
+                    key: trusted_object_key(*key),
                     version_id: VersionId::Null,
                     owner: test_owner(),
                     acl_grants: AclGrants::default(),
@@ -7186,9 +7163,9 @@ mod tests {
         // List with prefix=photos/ and start_after=photos/a.jpg
         let resp = store
             .list_objects(&ListObjectsReq {
-                bucket: "bucket".into(),
-                prefix: Some("photos/".into()),
-                start_after: Some("photos/a.jpg".into()),
+                bucket: trusted_bucket_name("bucket"),
+                prefix: Some(trusted_object_key("photos/")),
+                start_after: Some(trusted_object_key("photos/a.jpg")),
                 start_at: None,
                 max_keys: 10,
             })
@@ -7256,7 +7233,7 @@ mod tests {
             .connection()
             .query_row(
                 "SELECT \
-                    'b' AS bucket, \
+                    'bucket' AS bucket, \
                     'k' AS key, \
                     0 AS version_id, \
                     1 AS generation_id, \
@@ -7348,8 +7325,8 @@ mod tests {
         for i in 0..5 {
             store
                 .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-                    bucket: "b".into(),
-                    key: ObjectKey::from(format!("key-{:02}", i)),
+                    bucket: trusted_bucket_name("bucket"),
+                    key: trusted_object_key(format!("key-{:02}", i)),
                     version_id: VersionId::Null,
                     owner: test_owner(),
                     acl_grants: AclGrants::default(),
@@ -7371,7 +7348,7 @@ mod tests {
         // First page
         let resp = store
             .list_objects(&ListObjectsReq {
-                bucket: "b".into(),
+                bucket: trusted_bucket_name("bucket"),
                 prefix: None,
                 start_after: None,
                 start_at: None,
@@ -7386,7 +7363,7 @@ mod tests {
         // Second page
         let resp2 = store
             .list_objects(&ListObjectsReq {
-                bucket: "b".into(),
+                bucket: trusted_bucket_name("bucket"),
                 prefix: None,
                 start_after: resp.next_start_after,
                 start_at: None,
@@ -7406,8 +7383,8 @@ mod tests {
         for key in ["alpha", "beta", "gamma"] {
             store
                 .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-                    bucket: "b".into(),
-                    key: key.into(),
+                    bucket: trusted_bucket_name("bucket"),
+                    key: trusted_object_key(key),
                     version_id: VersionId::Null,
                     owner: test_owner(),
                     acl_grants: AclGrants::default(),
@@ -7428,10 +7405,10 @@ mod tests {
 
         let resp = store
             .list_objects(&ListObjectsReq {
-                bucket: "b".into(),
+                bucket: trusted_bucket_name("bucket"),
                 prefix: None,
                 start_after: None,
-                start_at: Some("beta".into()),
+                start_at: Some(trusted_object_key("beta")),
                 max_keys: 10,
             })
             .unwrap();

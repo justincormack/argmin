@@ -1138,8 +1138,8 @@ impl HttpFrontend {
                     );
                     let result = self.coordinator.copy_object(&CopyObjectRequest {
                         source: CopySource::new(
-                            &src_bucket,
-                            &src_key,
+                            src_bucket,
+                            src_key,
                             src_version_id,
                             &src_cond,
                             expected_source_bucket_owner(req),
@@ -2404,8 +2404,8 @@ impl HttpFrontend {
                     };
                 let result = self.coordinator.upload_part_copy(&UploadPartCopyRequest {
                     source: CopySource::new(
-                        &src_bucket,
-                        &src_key,
+                        src_bucket,
+                        src_key,
                         src_version_id,
                         &src_cond,
                         expected_source_bucket_owner(req),

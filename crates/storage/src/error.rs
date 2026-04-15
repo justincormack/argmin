@@ -35,6 +35,9 @@ pub enum MetadataError {
     #[error("bucket not found: {name}")]
     BucketNotFound { name: crate::types::BucketName },
 
+    #[error("invalid bucket name: {reason}")]
+    InvalidBucketName { reason: String },
+
     #[error("bucket already exists")]
     BucketAlreadyExists,
 

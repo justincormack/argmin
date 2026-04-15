@@ -77,8 +77,7 @@ fn alt_credentials() -> SignedRequestCredentials<'static> {
 fn presign_object_with_credentials<K, V, I>(
     credentials: SignedRequestCredentials<'_>,
     method: &str,
-    bucket: &str,
-    key: &str,
+    object: (&str, &str),
     query: Option<&str>,
     expires: Duration,
     extra_headers: I,
@@ -91,7 +90,7 @@ where
 {
     presign_url_with_credentials(
         method,
-        &object_url(CTX.endpoint(), bucket, key, query),
+        &object_url(CTX.endpoint(), object.0, object.1, query),
         expires,
         extra_headers,
         payload_hash,
@@ -116,8 +115,7 @@ where
     presign_object_with_credentials(
         primary_credentials(),
         method,
-        bucket,
-        key,
+        (bucket, key),
         query,
         expires,
         extra_headers,
@@ -275,8 +273,7 @@ async fn assert_presigned_put_object_with_acl(
     let presigned = presign_object_with_credentials(
         credentials,
         "PUT",
-        &bucket,
-        "foo",
+        (&bucket, "foo"),
         None,
         Duration::from_secs(900),
         [("x-amz-acl", "private")],
@@ -297,8 +294,7 @@ async fn assert_presigned_put_object_with_acl(
     let get_presigned = presign_object_with_credentials(
         credentials,
         "GET",
-        &bucket,
-        "foo",
+        (&bucket, "foo"),
         None,
         Duration::from_secs(900),
         NO_HEADERS,
@@ -444,7 +440,7 @@ fn test_presigned_put_object_signed_payload_mismatch() {
         let wrong_body = b"different body content";
         let mut resp = agent()
             .put(presigned.uri())
-            .header("x-amz-content-sha256", &sha256_hex(wrong_body))
+            .header("x-amz-content-sha256", sha256_hex(wrong_body))
             .send(&wrong_body[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -1249,8 +1245,7 @@ async fn assert_object_raw_get_x_amz_expires_not_expired(
     let presigned = presign_object_with_credentials(
         credentials,
         "GET",
-        &bucket,
-        "obj",
+        (&bucket, "obj"),
         None,
         Duration::from_secs(600),
         NO_HEADERS,

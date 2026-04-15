@@ -1,3 +1,4 @@
+use super::{bucket_name, object_key};
 use crate::types::*;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
@@ -358,7 +359,7 @@ impl VersionStateModel {
 pub(super) fn key_strategy() -> BoxedStrategy<ObjectKey> {
     proptest::string::string_regex(r"[A-Za-z0-9._/-]{1,16}")
         .expect("static key regex should compile")
-        .prop_map(ObjectKey::from)
+        .prop_map(object_key)
         .boxed()
 }
 
@@ -577,8 +578,8 @@ mod tests {
 
     fn live_object(key: &str, version_id: VersionId, size: u64) -> StoredObject {
         StoredObject::Live(LiveObjectRecord {
-            bucket: PROP_TEST_BUCKET.into(),
-            key: key.into(),
+            bucket: bucket_name(PROP_TEST_BUCKET),
+            key: object_key(key),
             version_id,
             owner: OwnerIdentity::from_principal("owner"),
             acl_grants: AclGrants::default(),
@@ -601,8 +602,8 @@ mod tests {
 
     fn delete_marker(key: &str, version_id: VersionId) -> StoredObject {
         StoredObject::DeleteMarker(DeleteMarkerRecord {
-            bucket: PROP_TEST_BUCKET.into(),
-            key: key.into(),
+            bucket: bucket_name(PROP_TEST_BUCKET),
+            key: object_key(key),
             version_id,
             owner: OwnerIdentity::from_principal("owner"),
             last_modified: version_id.to_u64(),
@@ -635,7 +636,7 @@ mod tests {
 
     #[test]
     fn model_null_live_version_becomes_current_over_older_numbered_version() {
-        let key = ObjectKey::from("k");
+        let key = object_key("k");
         let numbered = numbered_version_id(1);
         let mut model = VersionStateModel::new();
 
@@ -691,7 +692,7 @@ mod tests {
 
     #[test]
     fn deleting_current_version_restores_revealed_live_version_to_current() {
-        let key = ObjectKey::from("k");
+        let key = object_key("k");
         let older = numbered_version_id(1);
         let current = numbered_version_id(2);
         let mut model = VersionStateModel::with_versioning(BucketVersioningState::Enabled);
@@ -746,19 +747,19 @@ mod tests {
             object_snapshots_from_store(&objects),
             vec![
                 ObjectSnapshot {
-                    key: ObjectKey::from("a"),
+                    key: object_key("a"),
                     version_id: numbered_version_id(2),
                     kind: ModelObjectKind::Live,
                     size: Some(20),
                 },
                 ObjectSnapshot {
-                    key: ObjectKey::from("a"),
+                    key: object_key("a"),
                     version_id: numbered_version_id(1),
                     kind: ModelObjectKind::Live,
                     size: Some(10),
                 },
                 ObjectSnapshot {
-                    key: ObjectKey::from("b"),
+                    key: object_key("b"),
                     version_id: VersionId::Null,
                     kind: ModelObjectKind::DeleteMarker,
                     size: None,

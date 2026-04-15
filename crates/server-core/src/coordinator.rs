@@ -49,6 +49,29 @@ fn lock_mutex_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
 
+fn trusted_bucket_name(name: impl Into<String>) -> BucketName {
+    BucketName::try_from(name.into())
+        .expect("coordinator must only construct BucketName from validated values")
+}
+
+fn trusted_object_key(key: impl Into<String>) -> ObjectKey {
+    ObjectKey::try_from(key.into())
+        .expect("coordinator must only construct ObjectKey from validated values")
+}
+
+fn parse_list_object_key(value: &str) -> Result<ObjectKey, ServerError> {
+    ObjectKey::try_from(value).map_err(|error| ServerError::InvalidArgument {
+        reason: error.to_string(),
+    })
+}
+
+fn optional_list_object_key(value: Option<&str>) -> Result<Option<ObjectKey>, ServerError> {
+    value
+        .filter(|value| !value.is_empty())
+        .map(parse_list_object_key)
+        .transpose()
+}
+
 fn read_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|err| err.into_inner())
 }
@@ -1917,8 +1940,8 @@ impl<'a> PutObjectPolicyContext<'a> {
 /// Parsed copy-source reference, shared by CopyObject and UploadPartCopy.
 #[derive(Debug)]
 pub struct CopySource<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
     pub version_id: Option<VersionId>,
     pub condition: &'a ReadCondition,
     expected_bucket_owner: Option<&'a str>,
@@ -1952,8 +1975,8 @@ pub struct UploadPartCopyRequest<'a> {
 
 impl<'a> CopySource<'a> {
     pub fn new(
-        bucket: &'a str,
-        key: &'a str,
+        bucket: BucketName,
+        key: ObjectKey,
         version_id: Option<VersionId>,
         condition: &'a ReadCondition,
         expected_bucket_owner: Option<&'a str>,
@@ -4033,7 +4056,7 @@ impl ReadRuntime {
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: BucketName::from(bucket),
+                bucket: trusted_bucket_name(bucket),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
@@ -4778,7 +4801,7 @@ impl ReadRuntime {
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let versions = pg.list_object_versions(&ListObjectVersionsReq {
-                bucket: BucketName::from(bucket),
+                bucket: trusted_bucket_name(bucket),
                 prefix: None,
                 key_marker: None,
                 version_id_marker: None,
@@ -4789,7 +4812,7 @@ impl ReadRuntime {
                 return Ok(());
             }
             let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: BucketName::from(bucket),
+                bucket: trusted_bucket_name(bucket),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
@@ -5686,8 +5709,8 @@ impl Coordinator {
         let pg = self.storage_node.get_pg(meta_pg_id)?;
         pg.create_stream_upload(&CreateStreamUploadReq {
             session_id: SessionId::from(session_id.as_str()),
-            bucket: BucketName::from(bucket),
-            key: ObjectKey::from(key),
+            bucket: trusted_bucket_name(bucket),
+            key: trusted_object_key(key),
             target: StreamUploadTarget::PutObject,
             encryption: stored_encryption,
         })?;
@@ -6389,7 +6412,7 @@ impl Coordinator {
             self.pg_topology.for_each_pg(|pg_id| {
                 let pg = self.storage_node.get_pg(pg_id)?;
                 let resp = pg.list_object_versions(&ListObjectVersionsReq {
-                    bucket: BucketName::from(name),
+                    bucket: trusted_bucket_name(name),
                     prefix: None,
                     key_marker: None,
                     version_id_marker: None,
@@ -6399,7 +6422,7 @@ impl Coordinator {
                     return Err(ServerError::BucketNotEmpty);
                 }
                 let mpu_resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                    bucket: BucketName::from(name),
+                    bucket: trusted_bucket_name(name),
                     prefix: None,
                     key_marker: None,
                     upload_id_marker: None,
@@ -8211,8 +8234,8 @@ impl Coordinator {
             let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &acl);
 
             let segment_record = ObjectSegmentRecord {
-                bucket: BucketName::from(authorized.bucket()),
-                key: ObjectKey::from(authorized.key()),
+                bucket: trusted_bucket_name(authorized.bucket()),
+                key: trusted_object_key(authorized.key()),
                 version_id: prepared.version_id,
                 segment_index,
                 size: req.data.len() as u64,
@@ -8224,8 +8247,8 @@ impl Coordinator {
                 ec_m: self.ec_config.parity_shards,
             };
             let live_req = PutLiveObjectReq {
-                bucket: BucketName::from(authorized.bucket()),
-                key: ObjectKey::from(authorized.key()),
+                bucket: trusted_bucket_name(authorized.bucket()),
+                key: trusted_object_key(authorized.key()),
                 version_id: prepared.version_id,
                 owner,
                 acl_grants: acl_grants.clone(),
@@ -8432,8 +8455,8 @@ impl Coordinator {
 
         pg.create_stream_upload(&CreateStreamUploadReq {
             session_id: SessionId::from(session_id.as_str()),
-            bucket: BucketName::from(bucket),
-            key: ObjectKey::from(key),
+            bucket: trusted_bucket_name(bucket),
+            key: trusted_object_key(key),
             target: StreamUploadTarget::UploadPart {
                 upload_id: UploadId::from(upload_id),
                 part_number,
@@ -8942,8 +8965,8 @@ impl Coordinator {
             let committed_segments: Vec<ObjectSegmentRecord> = staging_segments
                 .iter()
                 .map(|segment| ObjectSegmentRecord {
-                    bucket: BucketName::from(bucket),
-                    key: ObjectKey::from(key),
+                    bucket: trusted_bucket_name(bucket),
+                    key: trusted_object_key(key),
                     version_id: prepared.version_id,
                     segment_index: segment.segment_index,
                     size: segment.size,
@@ -8960,8 +8983,8 @@ impl Coordinator {
                 .commit_stream_put(
                     session_id,
                     &CommitStreamPutReq {
-                        bucket: BucketName::from(bucket),
-                        key: ObjectKey::from(key),
+                        bucket: trusted_bucket_name(bucket),
+                        key: trusted_object_key(key),
                         version_id: prepared.version_id,
                         owner,
                         acl_grants: acl_grants.clone(),
@@ -9180,8 +9203,8 @@ impl Coordinator {
         let committed_segments: Vec<MultipartPartSegmentRecord> = staging_segments
             .iter()
             .map(|segment| MultipartPartSegmentRecord {
-                bucket: BucketName::from(bucket),
-                key: ObjectKey::from(key),
+                bucket: trusted_bucket_name(bucket),
+                key: trusted_object_key(key),
                 upload_id: UploadId::from(upload_id),
                 version_id: u64::MAX, // staging sentinel — reparented at CompleteMultipartUpload time
                 part_number,
@@ -9390,8 +9413,8 @@ impl Coordinator {
             req.destination.bucket.name,
             req.destination.key
         );
-        let src_bucket = req.source.bucket;
-        let src_key = req.source.key;
+        let src_bucket = req.source.bucket.as_str();
+        let src_key = req.source.key.as_str();
         let src_version_id = req.source.version_id;
         let dst_bucket = req.destination.bucket.name;
         let dst_key = req.destination.key;
@@ -10155,8 +10178,8 @@ impl Coordinator {
     ) -> Result<(), ServerError> {
         meta_pg
             .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-                bucket: BucketName::from(bucket),
-                key: ObjectKey::from(key),
+                bucket: trusted_bucket_name(bucket),
+                key: trusted_object_key(key),
                 version_id,
                 owner,
             }))
@@ -10214,8 +10237,8 @@ impl Coordinator {
     ) -> Result<(), ServerError> {
         meta_pg
             .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
-                bucket: BucketName::from(bucket),
-                key: ObjectKey::from(key),
+                bucket: trusted_bucket_name(bucket),
+                key: trusted_object_key(key),
                 generation_id,
                 created_at: Self::now_millis(),
                 segments: segments
@@ -10291,8 +10314,8 @@ impl Coordinator {
 
         meta_pg
             .put_multipart_reclaim(&MultipartReclaimRecord {
-                bucket: BucketName::from(bucket),
-                key: ObjectKey::from(key),
+                bucket: trusted_bucket_name(bucket),
+                key: trusted_object_key(key),
                 generation_id,
                 created_at: Self::now_millis(),
                 parts,
@@ -11594,9 +11617,9 @@ impl Coordinator {
                 }
                 let pg = self.storage_node.get_pg(pg_id)?;
                 let resp = pg.list_objects(&ListObjectsReq {
-                    bucket: BucketName::from(bucket),
-                    prefix: prefix.map(ObjectKey::from),
-                    start_after: continuation_token.map(ObjectKey::from),
+                    bucket: trusted_bucket_name(bucket),
+                    prefix: optional_list_object_key(prefix)?,
+                    start_after: optional_list_object_key(continuation_token)?,
                     start_at: None,
                     max_keys: fetch_limit,
                 })?;
@@ -11653,16 +11676,26 @@ impl Coordinator {
 
         let prefix_str = prefix.unwrap_or("");
         let delimiter = delimiter.expect("checked above");
-        let initial_start = continuation_token.map(|token| {
-            if let Some(after_prefix) = token.strip_prefix(prefix_str) {
-                if after_prefix.ends_with(delimiter) {
-                    if let Some(upper_bound) = key_prefix_upper_bound(token) {
-                        return ListObjectsPageStart::At(ObjectKey::from(upper_bound));
+        let initial_start = match continuation_token.filter(|token| !token.is_empty()) {
+            Some(token) => {
+                let token = parse_list_object_key(token)?;
+                let token_str = token.as_str();
+                if let Some(after_prefix) = token_str.strip_prefix(prefix_str) {
+                    if after_prefix.ends_with(delimiter) {
+                        if let Some(upper_bound) = key_prefix_upper_bound(token_str) {
+                            Some(ListObjectsPageStart::At(trusted_object_key(upper_bound)))
+                        } else {
+                            Some(ListObjectsPageStart::After(token))
+                        }
+                    } else {
+                        Some(ListObjectsPageStart::After(token))
                     }
+                } else {
+                    Some(ListObjectsPageStart::After(token))
                 }
             }
-            ListObjectsPageStart::After(ObjectKey::from(token))
-        });
+            None => None,
+        };
 
         let fetch_objects_page = |cursor: &mut ObjectCursor,
                                   start: Option<ListObjectsPageStart>|
@@ -11674,8 +11707,8 @@ impl Coordinator {
             };
             let pg = self.storage_node.get_pg(cursor.pg_id)?;
             let resp = pg.list_objects(&ListObjectsReq {
-                bucket: BucketName::from(bucket),
-                prefix: prefix.map(ObjectKey::from),
+                bucket: trusted_bucket_name(bucket),
+                prefix: optional_list_object_key(prefix)?,
                 start_after,
                 start_at,
                 max_keys: fetch_limit,
@@ -11781,7 +11814,7 @@ impl Coordinator {
             if let Some(pos) = after_prefix.find(delimiter) {
                 let common_prefix =
                     format!("{}{}", prefix_str, &after_prefix[..pos + delimiter.len()]);
-                let upper_bound = key_prefix_upper_bound(&common_prefix).map(ObjectKey::from);
+                let upper_bound = key_prefix_upper_bound(&common_prefix).map(trusted_object_key);
                 active_common_prefix = Some((common_prefix.clone(), upper_bound));
                 if objects.len() + common_prefixes.len() >= max {
                     is_truncated = true;
@@ -11885,9 +11918,9 @@ impl Coordinator {
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_object_versions(&ListObjectVersionsReq {
-                bucket: BucketName::from(bucket),
-                prefix: prefix.map(ObjectKey::from),
-                key_marker: key_marker.map(ObjectKey::from),
+                bucket: trusted_bucket_name(bucket),
+                prefix: optional_list_object_key(prefix)?,
+                key_marker: optional_list_object_key(key_marker)?,
                 version_id_marker,
                 max_keys: fetch_limit,
             })?;
@@ -12079,8 +12112,8 @@ impl Coordinator {
         let pg = self.storage_node.get_pg(meta_pg_id)?;
         pg.create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: UploadId::from(upload_id.as_str()),
-            bucket: BucketName::from(bucket.as_str()),
-            key: ObjectKey::from(key.as_str()),
+            bucket: trusted_bucket_name(bucket.as_str()),
+            key: trusted_object_key(key.as_str()),
             tags: tags.as_deref().map(SerializedTagSet::from),
             metadata_blob: SerializedMetadataBlob::from(metadata_blob),
             system_metadata_blob: SerializedSystemMetadataBlob::from(system_metadata_blob),
@@ -12122,8 +12155,8 @@ impl Coordinator {
             req.part_number
         );
         Self::validate_upload_part_number(req.part_number)?;
-        let src_bucket = req.source.bucket;
-        let src_key = req.source.key;
+        let src_bucket = req.source.bucket.as_str();
+        let src_key = req.source.key.as_str();
         let src_version_id = req.source.version_id;
         let src_cond = req.source.condition;
         let copy_source_range = req.copy_source_range;
@@ -12734,8 +12767,8 @@ impl Coordinator {
         let managed_encryption = final_encryption.managed_encryption_algorithm();
 
         let obj_req = CommitMultipartReq {
-            bucket: BucketName::from(bucket.as_str()),
-            key: ObjectKey::from(key.as_str()),
+            bucket: trusted_bucket_name(bucket.as_str()),
+            key: trusted_object_key(key.as_str()),
             version_id,
             owner: upload.owner.clone(),
             acl_grants: upload.acl_grants.clone(),
@@ -12760,8 +12793,8 @@ impl Coordinator {
                     p.part_vid.get(),
                 );
                 ObjectPartRecord {
-                    bucket: BucketName::from(bucket.as_str()),
-                    key: ObjectKey::from(key.as_str()),
+                    bucket: trusted_bucket_name(bucket.as_str()),
+                    key: trusted_object_key(key.as_str()),
                     version_id,
                     part_number: p.part_number,
                     size: p.size,
@@ -12993,9 +13026,9 @@ impl Coordinator {
             }
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: BucketName::from(bucket.as_str()),
-                prefix: prefix.map(ObjectKey::from),
-                key_marker: key_marker.map(ObjectKey::from),
+                bucket: trusted_bucket_name(bucket.as_str()),
+                prefix: optional_list_object_key(prefix)?,
+                key_marker: optional_list_object_key(key_marker)?,
                 upload_id_marker: upload_id_marker.map(UploadId::from),
                 max_uploads: max_uploads.saturating_add(1),
             })?;
@@ -13569,20 +13602,21 @@ mod tests {
         key: &'a str,
         version_id: Option<VersionId>,
     ) -> CopySource<'a> {
-        copy_source_with_expected_owner(bucket, key, version_id, None)
+        copy_source_with_condition_and_expected_owner(bucket, key, version_id, NO_READ, None)
     }
 
-    fn copy_source_with_expected_owner<'a>(
+    fn copy_source_with_condition_and_expected_owner<'a>(
         bucket: &'a str,
         key: &'a str,
         version_id: Option<VersionId>,
+        condition: &'a ReadCondition,
         expected_bucket_owner: Option<&'a str>,
     ) -> CopySource<'a> {
         CopySource {
-            bucket,
-            key,
+            bucket: trusted_bucket_name(bucket),
+            key: trusted_object_key(key),
             version_id,
-            condition: NO_READ,
+            condition,
             expected_bucket_owner,
         }
     }
@@ -30822,14 +30856,7 @@ mod tests {
 
         let err = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source("bucket", "src", None),
                 destination: object_request_with_expected_owner(
                     "bucket",
                     "dst",
@@ -31276,14 +31303,7 @@ mod tests {
         let new_system_metadata = SystemMetadata::from_headers(&new_headers).unwrap();
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "key",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source("bucket", "key", None),
                 destination: object_request_with_expected_owner(
                     "bucket",
                     "key",
@@ -31353,14 +31373,7 @@ mod tests {
 
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source("bucket", "src", None),
                 destination: object_request_with_expected_owner(
                     "bucket",
                     "dst",
@@ -31424,13 +31437,7 @@ mod tests {
 
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-                    expected_bucket_owner: None,
-                },
+                source: copy_source("bucket", "src", None),
                 destination: object_request_with_expected_owner(
                     "bucket",
                     "dst",
@@ -31497,14 +31504,7 @@ mod tests {
 
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source("bucket", "src", None),
                 destination: object_request_with_expected_owner(
                     "bucket",
                     "dst",
@@ -31575,14 +31575,7 @@ mod tests {
         let new_system_metadata = SystemMetadata::from_headers(&new_headers).unwrap();
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source("bucket", "src", None),
                 destination: object_request_with_expected_owner(
                     "bucket",
                     "dst",
@@ -31664,14 +31657,7 @@ mod tests {
         let new_system_metadata = SystemMetadata::from_headers(&new_headers).unwrap();
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source("bucket", "src", None),
                 destination: object_request_with_expected_owner(
                     "bucket",
                     "dst",
@@ -31740,14 +31726,7 @@ mod tests {
 
         let err = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "no-such-key",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source("bucket", "no-such-key", None),
                 destination: object_request_with_expected_owner(
                     "bucket",
                     "dst",
@@ -31795,14 +31774,7 @@ mod tests {
 
         let err = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source("bucket", "src", None),
                 destination: object_request_with_expected_owner(
                     "no-bucket",
                     "dst",
@@ -31854,14 +31826,9 @@ mod tests {
         };
         let err = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: &src_cond,
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source_with_condition_and_expected_owner(
+                    "bucket", "src", None, &src_cond, None,
+                ),
                 destination: object_request_with_expected_owner(
                     "bucket",
                     "dst",
@@ -31928,14 +31895,7 @@ mod tests {
         let dst_cond = WriteCondition::IfNoneMatchStar;
         let err = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source("bucket", "src", None),
                 destination: object_request_with_expected_owner(
                     "bucket",
                     "dst",
@@ -32002,14 +31962,7 @@ mod tests {
         let dst_cond = WriteCondition::IfMatch(SpecificEtag::new(existing.etag).unwrap());
         let result = coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "bucket",
-                    key: "src",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source("bucket", "src", None),
                 destination: object_request_with_expected_owner(
                     "bucket",
                     "dst",
@@ -32084,14 +32037,7 @@ mod tests {
 
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "src-bucket",
-                    key: "key",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source("src-bucket", "key", None),
                 destination: object_request_with_expected_owner(
                     "dst-bucket",
                     "key",
@@ -36197,14 +36143,7 @@ mod tests {
 
         let t_copy = thread::spawn(move || {
             copier.copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "src-bucket",
-                    key: "race-key-copy",
-                    version_id: None,
-                    condition: NO_READ,
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source("src-bucket", "race-key-copy", None),
                 destination: object_request_with_expected_owner(
                     "dst-bucket",
                     "copied",
@@ -37528,8 +37467,8 @@ mod tests {
         {
             let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             pg.put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-                bucket: "bucket".into(),
-                key: "ghost".into(),
+                bucket: trusted_bucket_name("bucket"),
+                key: trusted_object_key("ghost"),
                 generation_id,
                 ec: EcShape { k: 4, m: 2 },
                 created_at: 1,
@@ -39185,6 +39124,60 @@ mod tests {
             matches!(err, ServerError::NoSuchUpload { .. }),
             "expected NoSuchUpload, got {err:?}"
         );
+    }
+
+    #[test]
+    fn list_requests_reject_oversized_user_supplied_keys() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+        let oversized = "x".repeat(1025);
+
+        let err = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: Some(oversized.as_str()),
+                delimiter: None,
+                continuation_token: None,
+                max_keys: 100,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
+
+        let err = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                delimiter: Some("/"),
+                continuation_token: Some(oversized.as_str()),
+                max_keys: 100,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
+
+        let err = coord
+            .list_object_versions(&ListObjectVersionsRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                key_marker: Some(oversized.as_str()),
+                version_id_marker: None,
+                max_keys: 100,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
+
+        let err = coord
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: Some(oversized.as_str()),
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 100,
+            })
+            .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
 
     #[test]
@@ -40866,14 +40859,13 @@ mod tests {
 
         coord
             .copy_object(&CopyObjectRequest {
-                source: CopySource {
-                    bucket: "src",
-                    key: "key",
-                    version_id: None,
-                    condition: &ReadCondition::default(),
-
-                    expected_bucket_owner: None,
-                },
+                source: copy_source_with_condition_and_expected_owner(
+                    "src",
+                    "key",
+                    None,
+                    &ReadCondition::default(),
+                    None,
+                ),
                 destination: object_request_with_expected_owner(
                     "dst",
                     "key",
@@ -43093,8 +43085,8 @@ mod tests {
                 .unwrap();
             meta_pg
                 .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-                    bucket: "bucket".into(),
-                    key: "key".into(),
+                    bucket: trusted_bucket_name("bucket"),
+                    key: trusted_object_key("key"),
                     generation_id,
                     ec: EcShape { k: 4, m: 2 },
                     created_at: 1,
@@ -44516,8 +44508,8 @@ mod tests {
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         pg.create_stream_upload(&CreateStreamUploadReq {
             session_id: SessionId::from("upload-part-session"),
-            bucket: BucketName::from("bucket"),
-            key: ObjectKey::from("key"),
+            bucket: trusted_bucket_name("bucket"),
+            key: trusted_object_key("key"),
             target: StreamUploadTarget::UploadPart {
                 upload_id: UploadId::from("mpu-123"),
                 part_number: 1,

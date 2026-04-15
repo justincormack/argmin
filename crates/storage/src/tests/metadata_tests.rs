@@ -1,3 +1,4 @@
+use super::{bucket_name, object_key};
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::*;
 use std::num::NonZeroU64;
@@ -33,8 +34,8 @@ fn sample_object_lock_state() -> ObjectLockState {
 /// Run the common metadata test suite against any PgMetadataStore implementation.
 fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
     let req = PutObjectReq::Live(PutLiveObjectReq {
-        bucket: "test-bucket".into(),
-        key: "test-key".into(),
+        bucket: bucket_name("test-bucket"),
+        key: object_key("test-key"),
         version_id: VersionId::Null,
         owner: test_owner(),
         acl_grants: AclGrants::default(),
@@ -83,8 +84,8 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
 
 fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
     let req1 = PutObjectReq::Live(PutLiveObjectReq {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         version_id: VersionId::Null,
         owner: test_owner(),
         acl_grants: AclGrants::default(),
@@ -103,8 +104,8 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
     store.put_object_meta(&req1).unwrap();
 
     let req2 = PutObjectReq::Live(PutLiveObjectReq {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         version_id: VersionId::Null,
         owner: test_owner(),
         acl_grants: AclGrants::default(),
@@ -122,7 +123,7 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
     });
     store.put_object_meta(&req2).unwrap();
 
-    let obj = store.get_object_meta("b", "k").unwrap();
+    let obj = store.get_object_meta("bucket", "k").unwrap();
     let live = obj.as_live().unwrap();
     assert_eq!(live.size, 200);
     assert_eq!(live.etag, ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0]));
@@ -136,8 +137,8 @@ fn metadata_get_nonexistent(store: &dyn PgMetadataStore) {
 fn metadata_list_basic(store: &dyn PgMetadataStore) {
     for i in 0..5 {
         let req = PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "list-bucket".into(),
-            key: format!("obj-{i:02}").into(),
+            bucket: bucket_name("list-bucket"),
+            key: object_key(format!("obj-{i:02}")),
             version_id: VersionId::Null,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -158,7 +159,7 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
 
     let resp = store
         .list_objects(&ListObjectsReq {
-            bucket: "list-bucket".into(),
+            bucket: bucket_name("list-bucket"),
             prefix: None,
             start_after: None,
             start_at: None,
@@ -177,8 +178,8 @@ fn metadata_list_basic(store: &dyn PgMetadataStore) {
 fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
     for key in &["photos/a.jpg", "photos/b.jpg", "docs/c.txt", "photos/d.jpg"] {
         let req = PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "prefix-bucket".into(),
-            key: (*key).into(),
+            bucket: bucket_name("prefix-bucket"),
+            key: object_key(*key),
             version_id: VersionId::Null,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -199,8 +200,8 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
 
     let resp = store
         .list_objects(&ListObjectsReq {
-            bucket: "prefix-bucket".into(),
-            prefix: Some("photos/".into()),
+            bucket: bucket_name("prefix-bucket"),
+            prefix: Some(object_key("photos/")),
             start_after: None,
             start_at: None,
             max_keys: 100,
@@ -214,8 +215,8 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
 fn metadata_list_pagination(store: &dyn PgMetadataStore) {
     for i in 0..10 {
         let req = PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "page-bucket".into(),
-            key: format!("item-{i:02}").into(),
+            bucket: bucket_name("page-bucket"),
+            key: object_key(format!("item-{i:02}")),
             version_id: VersionId::Null,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -237,7 +238,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
     // First page: 3 items.
     let resp1 = store
         .list_objects(&ListObjectsReq {
-            bucket: "page-bucket".into(),
+            bucket: bucket_name("page-bucket"),
             prefix: None,
             start_after: None,
             start_at: None,
@@ -249,12 +250,12 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
     assert!(resp1.is_truncated);
     assert_eq!(resp1.objects[0].key(), "item-00");
     assert_eq!(resp1.objects[2].key(), "item-02");
-    assert_eq!(resp1.next_start_after, Some("item-02".into()));
+    assert_eq!(resp1.next_start_after, Some(object_key("item-02")));
 
     // Second page.
     let resp2 = store
         .list_objects(&ListObjectsReq {
-            bucket: "page-bucket".into(),
+            bucket: bucket_name("page-bucket"),
             prefix: None,
             start_after: resp1.next_start_after,
             start_at: None,
@@ -275,7 +276,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
     loop {
         let resp = store
             .list_objects(&ListObjectsReq {
-                bucket: "page-bucket".into(),
+                bucket: bucket_name("page-bucket"),
                 prefix: None,
                 start_after: start_after.clone(),
                 start_at: None,
@@ -299,7 +300,7 @@ fn metadata_list_pagination(store: &dyn PgMetadataStore) {
 fn metadata_list_empty_bucket(store: &dyn PgMetadataStore) {
     let resp = store
         .list_objects(&ListObjectsReq {
-            bucket: "empty-bucket".into(),
+            bucket: bucket_name("empty-bucket"),
             prefix: None,
             start_after: None,
             start_at: None,
@@ -312,38 +313,17 @@ fn metadata_list_empty_bucket(store: &dyn PgMetadataStore) {
     assert!(resp.next_start_after.is_none());
 }
 
-fn metadata_empty_key(store: &dyn PgMetadataStore) {
-    // S3 allows empty keys (though unusual).
-    let req = PutObjectReq::Live(PutLiveObjectReq {
-        bucket: "b".into(),
-        key: "".into(),
-        version_id: VersionId::Null,
-        owner: test_owner(),
-        acl_grants: AclGrants::default(),
-        public_read: false,
-        generation_id: GenerationId::MIN,
-        ec: EcShape { k: 4, m: 2 },
-        size: 0,
-        etag: ObjectEtag::SinglePart([0; 8]),
-        layout: ObjectLayout::Standard,
-        tags: None,
-        metadata_blob: None,
-        system_metadata_blob: None,
-        object_lock: ObjectLockState::default(),
-        encryption: ObjectEncryption::None,
-    });
-    store.put_object_meta(&req).unwrap();
-
-    let obj = store.get_object_meta("b", "").unwrap();
-    assert_eq!(*obj.key(), "");
+fn metadata_empty_key(_store: &dyn PgMetadataStore) {
+    let err = ObjectKey::try_from("").unwrap_err();
+    assert!(matches!(err, ObjectKeyError::InvalidLength { length: 0 }));
 }
 
 fn metadata_long_key(store: &dyn PgMetadataStore) {
     // S3 allows keys up to 1024 bytes.
     let long_key = "x".repeat(1024);
     let req = PutObjectReq::Live(PutLiveObjectReq {
-        bucket: "b".into(),
-        key: long_key.clone().into(),
+        bucket: bucket_name("bucket"),
+        key: object_key(long_key.clone()),
         version_id: VersionId::Null,
         owner: test_owner(),
         acl_grants: AclGrants::default(),
@@ -361,14 +341,14 @@ fn metadata_long_key(store: &dyn PgMetadataStore) {
     });
     store.put_object_meta(&req).unwrap();
 
-    let obj = store.get_object_meta("b", &long_key).unwrap();
+    let obj = store.get_object_meta("bucket", &long_key).unwrap();
     assert_eq!(*obj.key(), long_key);
 }
 
 fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
     let req = PutObjectReq::Live(PutLiveObjectReq {
-        bucket: "b".into(),
-        key: "empty-obj".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("empty-obj"),
         version_id: VersionId::Null,
         owner: test_owner(),
         acl_grants: AclGrants::default(),
@@ -386,7 +366,7 @@ fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
     });
     store.put_object_meta(&req).unwrap();
 
-    let obj = store.get_object_meta("b", "empty-obj").unwrap();
+    let obj = store.get_object_meta("bucket", "empty-obj").unwrap();
     assert_eq!(obj.as_live().unwrap().size, 0);
 }
 
@@ -559,8 +539,8 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "completed-upload".into(),
-            bucket: "bucket".into(),
-            key: "key".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("key"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -575,8 +555,8 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
         .unwrap();
 
     let obj = CommitMultipartReq {
-        bucket: "bucket".into(),
-        key: "key".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("key"),
         version_id: VersionId::Null,
         owner: test_owner(),
         acl_grants: AclGrants::default(),
@@ -592,8 +572,8 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
         encryption: ObjectEncryption::None,
     };
     let parts = vec![ObjectPartRecord {
-        bucket: "bucket".into(),
-        key: "key".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("key"),
         version_id: VersionId::Null,
         part_number: 1,
         size: 1024,
@@ -1301,8 +1281,8 @@ fn list_buckets_with_aborting_multipart_uploads_returns_distinct_bucket_names() 
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
                 upload_id: upload_id.into(),
-                bucket: bucket.into(),
-                key: key.into(),
+                bucket: bucket_name(bucket),
+                key: object_key(key),
                 owner: test_owner(),
                 initiator: None,
                 tags: None,
@@ -1329,7 +1309,7 @@ fn list_buckets_with_aborting_multipart_uploads_returns_distinct_bucket_names() 
     let buckets = store
         .list_buckets_with_aborting_multipart_uploads()
         .unwrap();
-    assert_eq!(buckets, vec![BucketName::from("alpha")]);
+    assert_eq!(buckets, vec![bucket_name("alpha")]);
 }
 
 #[test]
@@ -1403,8 +1383,8 @@ fn file_metadata_object_has_inline_legacy_layout() {
     let (_dir, store) = make_pg_store();
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::Null,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -1422,7 +1402,7 @@ fn file_metadata_object_has_inline_legacy_layout() {
         }))
         .unwrap();
 
-    let obj = store.get_object_meta("b", "k").unwrap();
+    let obj = store.get_object_meta("bucket", "k").unwrap();
     let live = obj.as_live().unwrap();
     assert_eq!(live.layout, ObjectLayout::Standard);
     assert_eq!(live.metadata_blob, None);
@@ -1435,8 +1415,8 @@ fn file_metadata_invalid_data_layout_returns_error() {
     // Insert a valid object first
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::Null,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -1458,7 +1438,7 @@ fn file_metadata_invalid_data_layout_returns_error() {
     let err = store
         .connection()
         .execute(
-            "UPDATE objects SET data_layout = 99 WHERE bucket = 'b' AND key = 'k'",
+            "UPDATE objects SET data_layout = 99 WHERE bucket = 'bucket' AND key = 'k'",
             [],
         )
         .unwrap_err();
@@ -1468,7 +1448,7 @@ fn file_metadata_invalid_data_layout_returns_error() {
     );
 
     // Record remains readable and unchanged.
-    let obj = store.get_object_meta("b", "k").unwrap();
+    let obj = store.get_object_meta("bucket", "k").unwrap();
     assert_eq!(obj.as_live().unwrap().layout, ObjectLayout::Standard);
 }
 
@@ -1481,8 +1461,8 @@ fn mpu_create_and_get_upload() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "uid-1".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: Some(tags.into()),
             metadata_blob: vec![1, 2, 3].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -1499,7 +1479,7 @@ fn mpu_create_and_get_upload() {
 
     let rec = store.get_multipart_upload("uid-1").unwrap();
     assert_eq!(rec.upload_id, "uid-1");
-    assert_eq!(rec.bucket, "b");
+    assert_eq!(rec.bucket, "bucket");
     assert_eq!(rec.key, "k");
     assert_eq!(rec.state, UploadState::InProgress);
     assert_eq!(rec.tags.as_deref(), Some(tags));
@@ -1515,8 +1495,8 @@ fn mpu_create_upload_with_checksum_fields() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "uid-cksum".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -1551,8 +1531,8 @@ fn mpu_create_upload_with_checksum_fields() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "uid-no-cksum".into(),
-            bucket: "b".into(),
-            key: "k2".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k2"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -1576,8 +1556,8 @@ fn mpu_part_checksum_round_trip() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "uid-pc".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -1649,8 +1629,8 @@ fn mpu_object_part_checksum_round_trip() {
     store
         .commit_object_parts(&[
             ObjectPartRecord {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::from_u64(1),
                 part_number: 1,
                 size: 5 * 1024 * 1024,
@@ -1664,8 +1644,8 @@ fn mpu_object_part_checksum_round_trip() {
                 checksum: Some(checksum_bytes.clone()),
             },
             ObjectPartRecord {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::from_u64(1),
                 part_number: 2,
                 size: 1024,
@@ -1682,7 +1662,7 @@ fn mpu_object_part_checksum_round_trip() {
         .unwrap();
 
     let committed = store
-        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .get_object_parts("bucket", "k", VersionId::from_u64(1))
         .unwrap();
     assert_eq!(committed.len(), 2);
     assert_eq!(committed[0].checksum, Some(checksum_bytes));
@@ -1698,8 +1678,8 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "uid-cmc".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: Some(tags.into()),
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -1721,8 +1701,8 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         .unwrap();
 
     let obj = CommitMultipartReq {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         version_id: VersionId::Null,
         owner: test_owner(),
         acl_grants: AclGrants::default(),
@@ -1741,8 +1721,8 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
     let cksum = ChecksumBytes::new([0xDE, 0xAD]).unwrap();
     let parts = vec![
         ObjectPartRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::Null,
             part_number: 1,
             size: 5 * 1024 * 1024,
@@ -1756,8 +1736,8 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
             checksum: Some(cksum.clone()),
         },
         ObjectPartRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::Null,
             part_number: 2,
             size: 1024 * 1024,
@@ -1776,12 +1756,14 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         .complete_multipart_commit("uid-cmc", 1, &obj, &parts)
         .unwrap();
 
-    let committed = store.get_object_parts("b", "k", VersionId::Null).unwrap();
+    let committed = store
+        .get_object_parts("bucket", "k", VersionId::Null)
+        .unwrap();
     assert_eq!(committed.len(), 2);
     assert_eq!(committed[0].checksum, Some(cksum));
     assert_eq!(committed[1].checksum, None);
     let live = store
-        .get_object_meta("b", "k")
+        .get_object_meta("bucket", "k")
         .unwrap()
         .into_live()
         .unwrap();
@@ -1791,7 +1773,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         .get_completed_multipart_upload("uid-cmc")
         .unwrap()
         .expect("completed upload record");
-    assert_eq!(completed.bucket.as_str(), "b");
+    assert_eq!(completed.bucket.as_str(), "bucket");
     assert_eq!(completed.key.as_str(), "k");
     assert_eq!(completed.owner.principal, "owner");
 }
@@ -1812,8 +1794,8 @@ fn completed_multipart_tombstone_survives_null_version_overwrite() {
 
     let upload = CreateMultipartUploadReq {
         upload_id: "upload-1".into(),
-        bucket: "bucket".into(),
-        key: "key".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("key"),
         tags: None,
         metadata_blob: vec![].into(),
         system_metadata_blob: vec![].into(),
@@ -1828,8 +1810,8 @@ fn completed_multipart_tombstone_survives_null_version_overwrite() {
     store.create_multipart_upload(&upload).unwrap();
 
     let obj = CommitMultipartReq {
-        bucket: "bucket".into(),
-        key: "key".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("key"),
         version_id: VersionId::Null,
         owner: test_owner(),
         acl_grants: AclGrants::default(),
@@ -1845,8 +1827,8 @@ fn completed_multipart_tombstone_survives_null_version_overwrite() {
         encryption: ObjectEncryption::None,
     };
     let parts = vec![ObjectPartRecord {
-        bucket: "bucket".into(),
-        key: "key".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("key"),
         version_id: VersionId::Null,
         part_number: 1,
         size: 32,
@@ -1870,8 +1852,8 @@ fn completed_multipart_tombstone_survives_null_version_overwrite() {
 
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "bucket".into(),
-            key: "key".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("key"),
             version_id: VersionId::Null,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -1912,8 +1894,8 @@ fn completed_multipart_tombstone_survives_object_version_delete() {
     let version_id = VersionId::Versioned(NonZeroU64::new(1).unwrap());
     let upload = CreateMultipartUploadReq {
         upload_id: "upload-versioned".into(),
-        bucket: "bucket".into(),
-        key: "key".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("key"),
         tags: None,
         metadata_blob: vec![].into(),
         system_metadata_blob: vec![].into(),
@@ -1928,8 +1910,8 @@ fn completed_multipart_tombstone_survives_object_version_delete() {
     store.create_multipart_upload(&upload).unwrap();
 
     let obj = CommitMultipartReq {
-        bucket: "bucket".into(),
-        key: "key".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("key"),
         version_id,
         owner: test_owner(),
         acl_grants: AclGrants::default(),
@@ -1945,8 +1927,8 @@ fn completed_multipart_tombstone_survives_object_version_delete() {
         encryption: ObjectEncryption::None,
     };
     let parts = vec![ObjectPartRecord {
-        bucket: "bucket".into(),
-        key: "key".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("key"),
         version_id,
         part_number: 1,
         size: 64,
@@ -1998,8 +1980,8 @@ fn completed_multipart_upload_list_reports_global_completion_orders() {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
                 upload_id: upload_id.into(),
-                bucket: "bucket".into(),
-                key: key.into(),
+                bucket: bucket_name("bucket"),
+                key: object_key(key),
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: vec![].into(),
@@ -2017,8 +1999,8 @@ fn completed_multipart_upload_list_reports_global_completion_orders() {
                 upload_id,
                 if upload_id == "z-first" { 1 } else { 2 },
                 &CommitMultipartReq {
-                    bucket: "bucket".into(),
-                    key: key.into(),
+                    bucket: bucket_name("bucket"),
+                    key: object_key(key),
                     version_id: VersionId::Null,
                     owner: test_owner(),
                     acl_grants: AclGrants::default(),
@@ -2034,8 +2016,8 @@ fn completed_multipart_upload_list_reports_global_completion_orders() {
                     encryption: ObjectEncryption::None,
                 },
                 &[ObjectPartRecord {
-                    bucket: "bucket".into(),
-                    key: key.into(),
+                    bucket: bucket_name("bucket"),
+                    key: object_key(key),
                     version_id: VersionId::Null,
                     part_number: 1,
                     size: 8,
@@ -2080,8 +2062,8 @@ fn mpu_set_upload_state_transition() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "uid-2".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -2131,8 +2113,8 @@ fn mpu_delete_upload_cascades_parts() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "uid-3".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -2190,8 +2172,8 @@ fn mpu_upsert_part_and_get() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "uid-4".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -2263,8 +2245,8 @@ fn mpu_list_parts_pagination() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "uid-5".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -2348,8 +2330,8 @@ fn mpu_list_uploads_pagination() {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
                 upload_id: uid.into(),
-                bucket: "bkt".into(),
-                key: key.into(),
+                bucket: bucket_name("bkt"),
+                key: object_key(key),
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -2368,7 +2350,7 @@ fn mpu_list_uploads_pagination() {
     // List first page (max 2)
     let resp = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: "bkt".into(),
+            bucket: bucket_name("bkt"),
             prefix: None,
             key_marker: None,
             upload_id_marker: None,
@@ -2383,7 +2365,7 @@ fn mpu_list_uploads_pagination() {
     // List second page using markers
     let resp = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: "bkt".into(),
+            bucket: bucket_name("bkt"),
             prefix: None,
             key_marker: resp.next_key_marker,
             upload_id_marker: resp.next_upload_id_marker,
@@ -2407,8 +2389,8 @@ fn mpu_list_uploads_with_prefix() {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
                 upload_id: uid.into(),
-                bucket: "bkt".into(),
-                key: key.into(),
+                bucket: bucket_name("bkt"),
+                key: object_key(key),
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -2426,8 +2408,8 @@ fn mpu_list_uploads_with_prefix() {
 
     let resp = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: "bkt".into(),
-            prefix: Some("photos/".into()),
+            bucket: bucket_name("bkt"),
+            prefix: Some(object_key("photos/")),
             key_marker: None,
             upload_id_marker: None,
             max_uploads: 100,
@@ -2446,8 +2428,8 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
                 upload_id: uid.into(),
-                bucket: "bkt".into(),
-                key: "same-key".into(),
+                bucket: bucket_name("bkt"),
+                key: object_key("same-key"),
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -2466,7 +2448,7 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
     // Page 1: max_uploads=2
     let resp = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: "bkt".into(),
+            bucket: bucket_name("bkt"),
             prefix: None,
             key_marker: None,
             upload_id_marker: None,
@@ -2482,7 +2464,7 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
     // Page 2: resume with markers
     let resp2 = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: "bkt".into(),
+            bucket: bucket_name("bkt"),
             prefix: None,
             key_marker: resp.next_key_marker,
             upload_id_marker: resp.next_upload_id_marker,
@@ -2503,8 +2485,8 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
                 upload_id: uid.into(),
-                bucket: "bkt".into(),
-                key: "key".into(),
+                bucket: bucket_name("bkt"),
+                key: object_key("key"),
                 tags: None,
                 metadata_blob: vec![].into(),
                 system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -2527,9 +2509,9 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
     // COALESCE to 0 means all remaining uploads for "key" are returned.
     let resp = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: "bkt".into(),
+            bucket: bucket_name("bkt"),
             prefix: None,
-            key_marker: Some("key".into()),
+            key_marker: Some(object_key("key")),
             upload_id_marker: Some("u-y".into()),
             max_uploads: 10,
         })
@@ -2550,8 +2532,8 @@ fn mpu_corrupted_part_okh_returns_error() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "uid-okh".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -2608,8 +2590,8 @@ fn mpu_corrupted_object_part_okh_returns_error() {
 
     store
         .commit_object_parts(&[ObjectPartRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::from_u64(1),
             part_number: 1,
             size: 1024,
@@ -2629,13 +2611,13 @@ fn mpu_corrupted_object_part_okh_returns_error() {
         .connection()
         .execute(
             "UPDATE object_parts SET part_okh = X'AABB' \
-             WHERE bucket = 'b' AND key = 'k' AND version_id = 1",
+             WHERE bucket = 'bucket' AND key = 'k' AND version_id = 1",
             [],
         )
         .unwrap();
 
     let err = store
-        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .get_object_parts("bucket", "k", VersionId::from_u64(1))
         .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::Db { .. }),
@@ -2649,8 +2631,8 @@ fn mpu_get_missing_part_returns_part_not_found() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "uid-pnf".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -2684,8 +2666,8 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "uid-ip".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -2790,8 +2772,8 @@ fn mpu_commit_object_parts_rollback_on_duplicate() {
     let (_dir, store) = make_pg_store();
 
     let part = ObjectPartRecord {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         version_id: VersionId::from_u64(1),
         part_number: 1,
         size: 1024,
@@ -2819,7 +2801,7 @@ fn mpu_commit_object_parts_rollback_on_duplicate() {
 
     // The connection should still be usable (no poisoned transaction)
     let parts = store
-        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .get_object_parts("bucket", "k", VersionId::from_u64(1))
         .unwrap();
     assert_eq!(parts.len(), 1, "original commit should still be intact");
 }
@@ -2830,8 +2812,8 @@ fn mpu_commit_and_get_object_parts() {
 
     let parts = vec![
         ObjectPartRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::from_u64(1),
             part_number: 1,
             size: 5 * 1024 * 1024,
@@ -2845,8 +2827,8 @@ fn mpu_commit_and_get_object_parts() {
             checksum: None,
         },
         ObjectPartRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::from_u64(1),
             part_number: 2,
             size: 3 * 1024 * 1024,
@@ -2864,7 +2846,7 @@ fn mpu_commit_and_get_object_parts() {
     store.commit_object_parts(&parts).unwrap();
 
     let committed = store
-        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .get_object_parts("bucket", "k", VersionId::from_u64(1))
         .unwrap();
     assert_eq!(committed.len(), 2);
     assert_eq!(committed[0].part_number, 1);
@@ -2875,7 +2857,7 @@ fn mpu_commit_and_get_object_parts() {
 
     // Get for non-existent version returns empty
     let empty = store
-        .get_object_parts("b", "k", VersionId::from_u64(999))
+        .get_object_parts("bucket", "k", VersionId::from_u64(999))
         .unwrap();
     assert!(empty.is_empty());
 }
@@ -2887,8 +2869,8 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
     let mib = 1024 * 1024;
     let parts = vec![
         ObjectPartRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::from_u64(1),
             part_number: 1,
             size: 5 * mib,
@@ -2902,8 +2884,8 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             checksum: None,
         },
         ObjectPartRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::from_u64(1),
             part_number: 2,
             size: 3 * mib,
@@ -2917,8 +2899,8 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
             checksum: None,
         },
         ObjectPartRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::from_u64(1),
             part_number: 3,
             size: 2 * mib,
@@ -2936,7 +2918,13 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
     store.commit_object_parts(&parts).unwrap();
 
     let middle = store
-        .get_object_parts_overlapping_range("b", "k", VersionId::from_u64(1), 5 * mib, 5 * mib + 1)
+        .get_object_parts_overlapping_range(
+            "bucket",
+            "k",
+            VersionId::from_u64(1),
+            5 * mib,
+            5 * mib + 1,
+        )
         .unwrap();
     assert_eq!(middle.len(), 1);
     assert_eq!(middle[0].part.part_number, 2);
@@ -2944,7 +2932,7 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
 
     let boundary = store
         .get_object_parts_overlapping_range(
-            "b",
+            "bucket",
             "k",
             VersionId::from_u64(1),
             5 * mib - 1,
@@ -2964,8 +2952,8 @@ fn mpu_delete_object_parts() {
 
     store
         .commit_object_parts(&[ObjectPartRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::from_u64(1),
             part_number: 1,
             size: 1024,
@@ -2981,16 +2969,16 @@ fn mpu_delete_object_parts() {
         .unwrap();
 
     store
-        .delete_object_parts("b", "k", VersionId::from_u64(1))
+        .delete_object_parts("bucket", "k", VersionId::from_u64(1))
         .unwrap();
     let parts = store
-        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .get_object_parts("bucket", "k", VersionId::from_u64(1))
         .unwrap();
     assert!(parts.is_empty());
 
     // Delete again is idempotent (no error)
     store
-        .delete_object_parts("b", "k", VersionId::from_u64(1))
+        .delete_object_parts("bucket", "k", VersionId::from_u64(1))
         .unwrap();
 }
 
@@ -3001,8 +2989,8 @@ fn create_upload(store: &dyn PgMetadataStore, upload_id: &str) {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: upload_id.into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -3086,8 +3074,8 @@ fn mpu_commit_partial_batch_failure_rolls_back_all() {
 
     // Commit part 1 for version 1.
     let part1 = ObjectPartRecord {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         version_id: VersionId::from_u64(1),
         part_number: 1,
         size: 1024,
@@ -3128,7 +3116,7 @@ fn mpu_commit_partial_batch_failure_rolls_back_all() {
 
     // Only part 1 from the original commit should exist — parts 2 and 3 were rolled back.
     let parts = store
-        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .get_object_parts("bucket", "k", VersionId::from_u64(1))
         .unwrap();
     assert_eq!(parts.len(), 1, "batch should have been fully rolled back");
     assert_eq!(parts[0].part_number, 1);
@@ -3267,8 +3255,8 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
     let (_dir, store) = make_pg_store();
 
     let part = ObjectPartRecord {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         version_id: VersionId::from_u64(1),
         part_number: 1,
         size: 1024,
@@ -3296,7 +3284,7 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
 
     // Connection should still work fine after repeated failures.
     let parts = store
-        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .get_object_parts("bucket", "k", VersionId::from_u64(1))
         .unwrap();
     assert_eq!(parts.len(), 1);
 
@@ -3309,7 +3297,7 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
         .commit_object_parts(std::slice::from_ref(&part2))
         .unwrap();
     let parts = store
-        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .get_object_parts("bucket", "k", VersionId::from_u64(1))
         .unwrap();
     assert_eq!(parts.len(), 2);
 }
@@ -3430,8 +3418,8 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
     // commit_object_parts: BEGIN IMMEDIATE gets RESERVED (OK), INSERT succeeds,
     // COMMIT fails with SQLITE_BUSY (can't upgrade to EXCLUSIVE).
     let part = ObjectPartRecord {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         version_id: VersionId::from_u64(1),
         part_number: 1,
         size: 1024,
@@ -3463,7 +3451,7 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
 
     // Rolled-back parts should not be visible.
     let parts = store
-        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .get_object_parts("bucket", "k", VersionId::from_u64(1))
         .unwrap();
     assert!(parts.is_empty(), "rolled-back parts should not be visible");
 
@@ -3472,7 +3460,7 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
         .commit_object_parts(std::slice::from_ref(&part))
         .unwrap();
     let parts = store
-        .get_object_parts("b", "k", VersionId::from_u64(1))
+        .get_object_parts("bucket", "k", VersionId::from_u64(1))
         .unwrap();
     assert_eq!(parts.len(), 1);
 }
@@ -3672,7 +3660,7 @@ mod prop_tests {
     fn insert_keys(store: &dyn PgMetadataStore, bucket: &str, keys: &[ObjectKey]) {
         for key in keys {
             let req = PutObjectReq::Live(PutLiveObjectReq {
-                bucket: bucket.into(),
+                bucket: bucket_name(bucket),
                 key: key.clone(),
                 version_id: VersionId::Null,
                 owner: test_owner(),
@@ -3704,7 +3692,7 @@ mod prop_tests {
         for _ in 0..1000 {
             let resp = store
                 .list_objects(&ListObjectsReq {
-                    bucket: bucket.into(),
+                    bucket: bucket_name(bucket),
                     prefix: prefix.clone(),
                     start_after: start_after.clone(),
                     start_at: None,
@@ -3743,7 +3731,7 @@ mod prop_tests {
 
     fn live_put_req(key: &ObjectKey, version_id: VersionId, size: u64) -> PutObjectReq {
         PutObjectReq::Live(PutLiveObjectReq {
-            bucket: PROP_TEST_BUCKET.into(),
+            bucket: bucket_name(PROP_TEST_BUCKET),
             key: key.clone(),
             version_id,
             owner: test_owner(),
@@ -3764,7 +3752,7 @@ mod prop_tests {
 
     fn delete_marker_req(key: &ObjectKey, version_id: VersionId) -> PutObjectReq {
         PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-            bucket: PROP_TEST_BUCKET.into(),
+            bucket: bucket_name(PROP_TEST_BUCKET),
             key: key.clone(),
             version_id,
             owner: test_owner(),
@@ -3815,7 +3803,7 @@ mod prop_tests {
 
     fn list_live_snapshots(store: &crate::PgStore) -> Result<Vec<ObjectSnapshot>, TestCaseError> {
         match store.list_objects(&ListObjectsReq {
-            bucket: PROP_TEST_BUCKET.into(),
+            bucket: bucket_name(PROP_TEST_BUCKET),
             prefix: None,
             start_after: None,
             start_at: None,
@@ -3838,7 +3826,7 @@ mod prop_tests {
         store: &crate::PgStore,
     ) -> Result<Vec<VersionSnapshot>, TestCaseError> {
         match store.list_object_versions(&ListObjectVersionsReq {
-            bucket: PROP_TEST_BUCKET.into(),
+            bucket: bucket_name(PROP_TEST_BUCKET),
             prefix: None,
             key_marker: None,
             version_id_marker: None,
@@ -3865,7 +3853,7 @@ mod prop_tests {
         max_keys: u32,
     ) -> Result<LivePage, TestCaseError> {
         match store.list_objects(&ListObjectsReq {
-            bucket: PROP_TEST_BUCKET.into(),
+            bucket: bucket_name(PROP_TEST_BUCKET),
             prefix: None,
             start_after,
             start_at: None,
@@ -3889,7 +3877,7 @@ mod prop_tests {
         max_keys: u32,
     ) -> Result<VersionPage, TestCaseError> {
         match store.list_object_versions(&ListObjectVersionsReq {
-            bucket: PROP_TEST_BUCKET.into(),
+            bucket: bucket_name(PROP_TEST_BUCKET),
             prefix: None,
             key_marker,
             version_id_marker,
@@ -4300,10 +4288,10 @@ mod prop_tests {
     #[test]
     fn regression_empty_prefix_matches_all() {
         let (_dir, store) = super::make_pg_store();
-        insert_keys(&store, "bucket", &[ObjectKey::from("O")]);
+        insert_keys(&store, "bucket", &[object_key("O")]);
 
-        let got = list_all_keys(&store, "bucket", Some(ObjectKey::from("")), 1);
-        assert_eq!(got, vec![ObjectKey::from("O")]);
+        let got = list_all_keys(&store, "bucket", None, 1);
+        assert_eq!(got, vec![object_key("O")]);
     }
 
     proptest! {
@@ -4339,7 +4327,13 @@ mod prop_tests {
             expected.sort();
             expected.dedup();
 
-            let got = list_all_keys(&store, "bucket", Some(ObjectKey::from(prefix)), max_keys);
+            let prefix = if prefix.is_empty() {
+                None
+            } else {
+                Some(object_key(prefix.clone()))
+            };
+
+            let got = list_all_keys(&store, "bucket", prefix, max_keys);
             prop_assert_eq!(got, expected);
         }
 
@@ -4436,8 +4430,8 @@ fn stream_upload_create_get_delete() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sess-1".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -4445,7 +4439,7 @@ fn stream_upload_create_get_delete() {
 
     let rec = store.get_stream_upload("sess-1").unwrap();
     assert_eq!(rec.session_id, "sess-1");
-    assert_eq!(rec.bucket, "b");
+    assert_eq!(rec.bucket, "bucket");
     assert_eq!(rec.key, "k");
     assert_eq!(rec.target, StreamUploadTarget::PutObject);
     assert_eq!(rec.state, StreamUploadState::InProgress);
@@ -4466,8 +4460,8 @@ fn stream_upload_state_transitions() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sess-2".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -4517,8 +4511,8 @@ fn stream_upload_upload_part_kind() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sess-part".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
                 upload_id: "mpu-123".into(),
                 part_number: 3,
@@ -4544,8 +4538,8 @@ fn stream_upload_segment_vid_allocation_is_monotonic() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sess-vid".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -4572,8 +4566,8 @@ fn stream_upload_segment_vid_allocation_requires_in_progress_session() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sess-vid-state".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -4598,8 +4592,8 @@ fn stream_segment_append_and_list() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sess-segments".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -4642,8 +4636,8 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sess-publish".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -4693,8 +4687,8 @@ fn stream_segment_cascade_delete() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sess-cascade".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -4729,8 +4723,8 @@ fn commit_stream_put_atomic() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sess-commit".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -4766,8 +4760,8 @@ fn commit_stream_put_atomic() {
 
     // Commit
     let obj = CommitStreamPutReq {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         version_id: VersionId::Null,
         owner: test_owner(),
         acl_grants: AclGrants::default(),
@@ -4785,8 +4779,8 @@ fn commit_stream_put_atomic() {
 
     let committed_segments = vec![
         ObjectSegmentRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::Null,
             segment_index: 0,
             size: 4_000_000,
@@ -4798,8 +4792,8 @@ fn commit_stream_put_atomic() {
             ec_m: 2,
         },
         ObjectSegmentRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::Null,
             segment_index: 1,
             size: 2_000_000,
@@ -4817,14 +4811,14 @@ fn commit_stream_put_atomic() {
         .unwrap();
 
     // Object metadata is committed
-    let record = store.get_object_meta("b", "k").unwrap();
+    let record = store.get_object_meta("bucket", "k").unwrap();
     let live = record.as_live().unwrap();
     assert_eq!(live.size, 6_000_000);
     assert_eq!(live.layout, ObjectLayout::Standard);
 
     // Committed segments are readable
     let segments = store
-        .get_object_segments("b", "k", VersionId::Null)
+        .get_object_segments("bucket", "k", VersionId::Null)
         .unwrap();
     assert_eq!(segments.len(), 2);
     assert_eq!(segments[0].segment_index, 0);
@@ -4855,8 +4849,8 @@ fn commit_stream_put_overwrite_unversioned() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "s1".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -4865,8 +4859,8 @@ fn commit_stream_put_overwrite_unversioned() {
         .commit_stream_put(
             "s1",
             &CommitStreamPutReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -4882,8 +4876,8 @@ fn commit_stream_put_overwrite_unversioned() {
                 encryption: ObjectEncryption::None,
             },
             &[ObjectSegmentRecord {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 100,
@@ -4901,8 +4895,8 @@ fn commit_stream_put_overwrite_unversioned() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "s2".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -4911,8 +4905,8 @@ fn commit_stream_put_overwrite_unversioned() {
         .commit_stream_put(
             "s2",
             &CommitStreamPutReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -4928,8 +4922,8 @@ fn commit_stream_put_overwrite_unversioned() {
                 encryption: ObjectEncryption::None,
             },
             &[ObjectSegmentRecord {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 200,
@@ -4944,12 +4938,12 @@ fn commit_stream_put_overwrite_unversioned() {
         .unwrap();
 
     // Verify overwrite: new data
-    let record = store.get_object_meta("b", "k").unwrap();
+    let record = store.get_object_meta("bucket", "k").unwrap();
     assert_eq!(record.as_live().unwrap().size, 200);
 
     // Segments replaced
     let segments = store
-        .get_object_segments("b", "k", VersionId::Null)
+        .get_object_segments("bucket", "k", VersionId::Null)
         .unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].size, 200);
@@ -4963,8 +4957,8 @@ fn put_object_with_segments_persists_manifest() {
     store
         .put_object_with_segments(
             &PutLiveObjectReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -4982,8 +4976,8 @@ fn put_object_with_segments_persists_manifest() {
             },
             &[
                 ObjectSegmentRecord {
-                    bucket: "b".into(),
-                    key: "k".into(),
+                    bucket: bucket_name("bucket"),
+                    key: object_key("k"),
                     version_id: VersionId::Null,
                     segment_index: 0,
                     size: 4_000_000,
@@ -4995,8 +4989,8 @@ fn put_object_with_segments_persists_manifest() {
                     ec_m: 2,
                 },
                 ObjectSegmentRecord {
-                    bucket: "b".into(),
-                    key: "k".into(),
+                    bucket: bucket_name("bucket"),
+                    key: object_key("k"),
                     version_id: VersionId::Null,
                     segment_index: 1,
                     size: 2_000_000,
@@ -5011,13 +5005,13 @@ fn put_object_with_segments_persists_manifest() {
         )
         .unwrap();
 
-    let record = store.get_object_meta("b", "k").unwrap();
+    let record = store.get_object_meta("bucket", "k").unwrap();
     let live = record.as_live().unwrap();
     assert_eq!(live.size, 6_000_000);
     assert_eq!(live.layout, ObjectLayout::Standard);
 
     let segments = store
-        .get_object_segments("b", "k", VersionId::Null)
+        .get_object_segments("bucket", "k", VersionId::Null)
         .unwrap();
     assert_eq!(segments.len(), 2);
     assert_eq!(segments[0].segment_okh, [0x11; 16]);
@@ -5031,8 +5025,8 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
     store
         .put_object_with_segments(
             &PutLiveObjectReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -5049,8 +5043,8 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 encryption: ObjectEncryption::None,
             },
             &[ObjectSegmentRecord {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 100,
@@ -5067,8 +5061,8 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
     store
         .put_object_with_segments(
             &PutLiveObjectReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -5085,8 +5079,8 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
                 encryption: ObjectEncryption::None,
             },
             &[ObjectSegmentRecord {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 200,
@@ -5100,11 +5094,11 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
         )
         .unwrap();
 
-    let record = store.get_object_meta("b", "k").unwrap();
+    let record = store.get_object_meta("bucket", "k").unwrap();
     assert_eq!(record.as_live().unwrap().size, 200);
 
     let segments = store
-        .get_object_segments("b", "k", VersionId::Null)
+        .get_object_segments("bucket", "k", VersionId::Null)
         .unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].size, 200);
@@ -5118,8 +5112,8 @@ fn delete_object_segments_cleanup() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "s-del".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -5128,8 +5122,8 @@ fn delete_object_segments_cleanup() {
         .commit_stream_put(
             "s-del",
             &CommitStreamPutReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -5145,8 +5139,8 @@ fn delete_object_segments_cleanup() {
                 encryption: ObjectEncryption::None,
             },
             &[ObjectSegmentRecord {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 100,
@@ -5162,16 +5156,16 @@ fn delete_object_segments_cleanup() {
 
     // Delete committed segments
     store
-        .delete_object_segments("b", "k", VersionId::Null)
+        .delete_object_segments("bucket", "k", VersionId::Null)
         .unwrap();
     let segments = store
-        .get_object_segments("b", "k", VersionId::Null)
+        .get_object_segments("bucket", "k", VersionId::Null)
         .unwrap();
     assert!(segments.is_empty());
 
     // Idempotent
     store
-        .delete_object_segments("b", "k", VersionId::Null)
+        .delete_object_segments("bucket", "k", VersionId::Null)
         .unwrap();
 }
 
@@ -5182,8 +5176,8 @@ fn commit_stream_put_rejects_non_in_progress() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sess-bad".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -5199,8 +5193,8 @@ fn commit_stream_put_rejects_non_in_progress() {
         .commit_stream_put(
             "sess-bad",
             &CommitStreamPutReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -5237,7 +5231,7 @@ fn multipart_part_segments_crud() {
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
           segment_vid, shard_pg_id, ec_k, ec_m) \
-         VALUES ('b', 'k', 'uid-1', 1, 1, 0, 4000000, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 4, 2)",
+         VALUES ('bucket', 'k', 'uid-1', 1, 1, 0, 4000000, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 4, 2)",
         [],
     )
     .unwrap();
@@ -5245,14 +5239,14 @@ fn multipart_part_segments_crud() {
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
           segment_vid, shard_pg_id, ec_k, ec_m) \
-         VALUES ('b', 'k', 'uid-1', 1, 1, 1, 2000000, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 4, 2)",
+         VALUES ('bucket', 'k', 'uid-1', 1, 1, 1, 2000000, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 4, 2)",
         [],
     )
     .unwrap();
 
     // Read back
     let segments = store
-        .get_multipart_part_segments("b", "k", VersionId::from_u64(1), 1)
+        .get_multipart_part_segments("bucket", "k", VersionId::from_u64(1), 1)
         .unwrap();
     assert_eq!(segments.len(), 2);
     assert_eq!(segments[0].segment_index, 0);
@@ -5262,10 +5256,10 @@ fn multipart_part_segments_crud() {
 
     // Delete
     store
-        .delete_multipart_part_segments("b", "k", VersionId::from_u64(1))
+        .delete_multipart_part_segments("bucket", "k", VersionId::from_u64(1))
         .unwrap();
     let segments = store
-        .get_multipart_part_segments("b", "k", VersionId::from_u64(1), 1)
+        .get_multipart_part_segments("bucket", "k", VersionId::from_u64(1), 1)
         .unwrap();
     assert!(segments.is_empty());
 }
@@ -5277,8 +5271,8 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "mpu-1".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -5308,8 +5302,8 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         checksum: None,
     };
     let make_segment = |segment_index, size, fill| MultipartPartSegmentRecord {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         upload_id: "mpu-1".into(),
         version_id: MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
         part_number: 1,
@@ -5362,8 +5356,8 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "mpu-1".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -5397,8 +5391,8 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sp-1".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
                 upload_id: "mpu-1".into(),
                 part_number: 1,
@@ -5409,8 +5403,8 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
 
     let segments_v1: Vec<MultipartPartSegmentRecord> = (0..3)
         .map(|i| MultipartPartSegmentRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             upload_id: "mpu-1".into(),
             version_id: u64::MAX,
             part_number: 1,
@@ -5434,7 +5428,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
     );
 
     let segments = store
-        .get_multipart_part_segments("b", "k", VersionId::from_u64(u64::MAX), 1)
+        .get_multipart_part_segments("bucket", "k", VersionId::from_u64(u64::MAX), 1)
         .unwrap();
     assert_eq!(segments.len(), 3);
 
@@ -5442,8 +5436,8 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sp-2".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
                 upload_id: "mpu-1".into(),
                 part_number: 1,
@@ -5453,8 +5447,8 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         .unwrap();
 
     let segments_v2 = vec![MultipartPartSegmentRecord {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         upload_id: "mpu-1".into(),
         version_id: u64::MAX,
         part_number: 1,
@@ -5482,7 +5476,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
 
     // Verify: only 1 segment (stale rows deleted)
     let segments = store
-        .get_multipart_part_segments("b", "k", VersionId::from_u64(u64::MAX), 1)
+        .get_multipart_part_segments("bucket", "k", VersionId::from_u64(u64::MAX), 1)
         .unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].size, 5000);
@@ -5497,8 +5491,8 @@ fn commit_stream_put_rejects_wrong_kind() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sess-wrong-kind".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
                 upload_id: "mpu-x".into(),
                 part_number: 1,
@@ -5512,8 +5506,8 @@ fn commit_stream_put_rejects_wrong_kind() {
         .commit_stream_put(
             "sess-wrong-kind",
             &CommitStreamPutReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -5547,8 +5541,8 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sess-mismatch".into(),
-            bucket: "b1".into(),
-            key: "k1".into(),
+            bucket: bucket_name("bucket-one"),
+            key: object_key("k1"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -5559,8 +5553,8 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
         .commit_stream_put(
             "sess-mismatch",
             &CommitStreamPutReq {
-                bucket: "b2".into(),
-                key: "k2".into(),
+                bucket: bucket_name("bucket-two"),
+                key: object_key("k2"),
                 version_id: VersionId::Null,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -5594,8 +5588,8 @@ fn commit_stream_part_rejects_wrong_upload_id() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "mpu-correct".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -5613,8 +5607,8 @@ fn commit_stream_part_rejects_wrong_upload_id() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sp-mismatch".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
                 upload_id: "mpu-correct".into(),
                 part_number: 1,
@@ -5660,8 +5654,8 @@ fn commit_stream_part_zero_segments_clears_prior() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "mpu-zc".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -5680,8 +5674,8 @@ fn commit_stream_part_zero_segments_clears_prior() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sp-zc1".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
                 upload_id: "mpu-zc".into(),
                 part_number: 1,
@@ -5708,8 +5702,8 @@ fn commit_stream_part_zero_segments_clears_prior() {
             },
             &[
                 MultipartPartSegmentRecord {
-                    bucket: "b".into(),
-                    key: "k".into(),
+                    bucket: bucket_name("bucket"),
+                    key: object_key("k"),
                     upload_id: "mpu-zc".into(),
                     version_id: u64::MAX,
                     part_number: 1,
@@ -5723,8 +5717,8 @@ fn commit_stream_part_zero_segments_clears_prior() {
                     ec_m: 2,
                 },
                 MultipartPartSegmentRecord {
-                    bucket: "b".into(),
-                    key: "k".into(),
+                    bucket: bucket_name("bucket"),
+                    key: object_key("k"),
                     upload_id: "mpu-zc".into(),
                     version_id: u64::MAX,
                     part_number: 1,
@@ -5743,7 +5737,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
 
     assert_eq!(
         store
-            .get_multipart_part_segments("b", "k", VersionId::from_u64(u64::MAX), 1)
+            .get_multipart_part_segments("bucket", "k", VersionId::from_u64(u64::MAX), 1)
             .unwrap()
             .len(),
         2
@@ -5753,8 +5747,8 @@ fn commit_stream_part_zero_segments_clears_prior() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sp-zc2".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
                 upload_id: "mpu-zc".into(),
                 part_number: 1,
@@ -5784,7 +5778,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
         .unwrap();
 
     let segments = store
-        .get_multipart_part_segments("b", "k", VersionId::from_u64(u64::MAX), 1)
+        .get_multipart_part_segments("bucket", "k", VersionId::from_u64(u64::MAX), 1)
         .unwrap();
     assert!(
         segments.is_empty(),
@@ -5799,8 +5793,8 @@ fn commit_stream_put_rejects_mismatched_segment_target() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sp-ct".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -5811,8 +5805,8 @@ fn commit_stream_put_rejects_mismatched_segment_target() {
         .commit_stream_put(
             "sp-ct",
             &CommitStreamPutReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -5828,8 +5822,8 @@ fn commit_stream_put_rejects_mismatched_segment_target() {
                 encryption: ObjectEncryption::None,
             },
             &[ObjectSegmentRecord {
-                bucket: "WRONG".into(),
-                key: "k".into(),
+                bucket: bucket_name("wrong-bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Null,
                 segment_index: 0,
                 size: 100,
@@ -5857,8 +5851,8 @@ fn object_segments_reclaim_round_trip() {
 
     let generation_id = GenerationId::new(7).unwrap();
     let reclaim = ObjectSegmentsReclaimRecord {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         generation_id,
         created_at: 1234,
         segments: vec![
@@ -5882,16 +5876,16 @@ fn object_segments_reclaim_round_trip() {
     store.put_object_segments_reclaim(&reclaim).unwrap();
 
     let got = store
-        .get_object_segments_reclaim("b", "k", generation_id)
+        .get_object_segments_reclaim("bucket", "k", generation_id)
         .unwrap()
         .expect("object segments reclaim should exist");
     assert_eq!(got, reclaim);
 
     store
-        .delete_object_segments_reclaim("b", "k", generation_id)
+        .delete_object_segments_reclaim("bucket", "k", generation_id)
         .unwrap();
     assert!(store
-        .get_object_segments_reclaim("b", "k", generation_id)
+        .get_object_segments_reclaim("bucket", "k", generation_id)
         .unwrap()
         .is_none());
 }
@@ -5902,8 +5896,8 @@ fn next_generation_id_skips_object_segments_reclaim_generation() {
 
     store
         .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             generation_id: GenerationId::new(7).unwrap(),
             created_at: 1,
             segments: vec![ObjectSegmentsReclaimSegmentRecord {
@@ -5917,7 +5911,7 @@ fn next_generation_id_skips_object_segments_reclaim_generation() {
         .unwrap();
 
     assert_eq!(
-        store.next_generation_id("b", "k").unwrap(),
+        store.next_generation_id("bucket", "k").unwrap(),
         GenerationId::new(8).unwrap()
     );
 }
@@ -5928,8 +5922,8 @@ fn multipart_reclaim_round_trip() {
 
     let generation_id = GenerationId::new(9).unwrap();
     let reclaim = MultipartReclaimRecord {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         generation_id,
         created_at: 4321,
         parts: vec![
@@ -5967,16 +5961,16 @@ fn multipart_reclaim_round_trip() {
     store.put_multipart_reclaim(&reclaim).unwrap();
 
     let got = store
-        .get_multipart_reclaim("b", "k", generation_id)
+        .get_multipart_reclaim("bucket", "k", generation_id)
         .unwrap()
         .expect("multipart reclaim should exist");
     assert_eq!(got, reclaim);
 
     store
-        .delete_multipart_reclaim("b", "k", generation_id)
+        .delete_multipart_reclaim("bucket", "k", generation_id)
         .unwrap();
     assert!(store
-        .get_multipart_reclaim("b", "k", generation_id)
+        .get_multipart_reclaim("bucket", "k", generation_id)
         .unwrap()
         .is_none());
 }
@@ -5987,8 +5981,8 @@ fn next_generation_id_skips_multipart_reclaim_generation() {
 
     store
         .put_multipart_reclaim(&MultipartReclaimRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             generation_id: GenerationId::new(11).unwrap(),
             created_at: 1,
             parts: vec![MultipartReclaimPartRecord::ShardSet {
@@ -6002,7 +5996,7 @@ fn next_generation_id_skips_multipart_reclaim_generation() {
         .unwrap();
 
     assert_eq!(
-        store.next_generation_id("b", "k").unwrap(),
+        store.next_generation_id("bucket", "k").unwrap(),
         GenerationId::new(12).unwrap()
     );
 }
@@ -6013,8 +6007,8 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
 
     store
         .put_multipart_reclaim(&MultipartReclaimRecord {
-            bucket: "b".into(),
-            key: "z".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("z"),
             generation_id: GenerationId::new(9).unwrap(),
             created_at: 1,
             parts: vec![MultipartReclaimPartRecord::ShardSet {
@@ -6028,8 +6022,8 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
         .unwrap();
     store
         .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-            bucket: "b".into(),
-            key: "a".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("a"),
             generation_id: GenerationId::new(3).unwrap(),
             ec: EcShape { k: 4, m: 2 },
             created_at: 1,
@@ -6037,10 +6031,10 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
         .unwrap();
 
     let root = store
-        .get_bucket_payload_reclaim_root("b")
+        .get_bucket_payload_reclaim_root("bucket")
         .unwrap()
         .expect("bucket reclaim root should exist");
-    assert_eq!(root.bucket, "b");
+    assert_eq!(root.bucket, "bucket");
     assert_eq!(root.key, "a");
     assert_eq!(root.generation_id, GenerationId::new(3).unwrap());
 }
@@ -6054,29 +6048,29 @@ fn payload_reclaim_exists_checks_all_reclaim_tables() {
     let multipart_generation = GenerationId::new(11).unwrap();
 
     assert!(!store
-        .payload_reclaim_exists("b", "k", simple_generation)
+        .payload_reclaim_exists("bucket", "k", simple_generation)
         .unwrap());
 
     store
         .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             generation_id: simple_generation,
             ec: EcShape { k: 4, m: 2 },
             created_at: 1,
         })
         .unwrap();
     assert!(store
-        .payload_reclaim_exists("b", "k", simple_generation)
+        .payload_reclaim_exists("bucket", "k", simple_generation)
         .unwrap());
     store
-        .delete_simple_payload_reclaim("b", "k", simple_generation)
+        .delete_simple_payload_reclaim("bucket", "k", simple_generation)
         .unwrap();
 
     store
         .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             generation_id: segments_generation,
             created_at: 1,
             segments: vec![ObjectSegmentsReclaimSegmentRecord {
@@ -6089,16 +6083,16 @@ fn payload_reclaim_exists_checks_all_reclaim_tables() {
         })
         .unwrap();
     assert!(store
-        .payload_reclaim_exists("b", "k", segments_generation)
+        .payload_reclaim_exists("bucket", "k", segments_generation)
         .unwrap());
     store
-        .delete_object_segments_reclaim("b", "k", segments_generation)
+        .delete_object_segments_reclaim("bucket", "k", segments_generation)
         .unwrap();
 
     store
         .put_multipart_reclaim(&MultipartReclaimRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             generation_id: multipart_generation,
             created_at: 1,
             parts: vec![MultipartReclaimPartRecord::ShardSet {
@@ -6111,14 +6105,14 @@ fn payload_reclaim_exists_checks_all_reclaim_tables() {
         })
         .unwrap();
     assert!(store
-        .payload_reclaim_exists("b", "k", multipart_generation)
+        .payload_reclaim_exists("bucket", "k", multipart_generation)
         .unwrap());
     store
-        .delete_multipart_reclaim("b", "k", multipart_generation)
+        .delete_multipart_reclaim("bucket", "k", multipart_generation)
         .unwrap();
 
     assert!(!store
-        .payload_reclaim_exists("b", "k", multipart_generation)
+        .payload_reclaim_exists("bucket", "k", multipart_generation)
         .unwrap());
 }
 
@@ -6129,8 +6123,8 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "mpu-cpc".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -6148,8 +6142,8 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sp-cpc".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
                 upload_id: "mpu-cpc".into(),
                 part_number: 1,
@@ -6177,8 +6171,8 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
                 checksum: None,
             },
             &[MultipartPartSegmentRecord {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 upload_id: "mpu-cpc".into(),
                 version_id: u64::MAX,
                 part_number: 99, // wrong!
@@ -6209,8 +6203,8 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "mpu-vid".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -6228,8 +6222,8 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "sp-vid".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
                 upload_id: "mpu-vid".into(),
                 part_number: 1,
@@ -6257,8 +6251,8 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
                 checksum: None,
             },
             &[MultipartPartSegmentRecord {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 upload_id: "mpu-vid".into(),
                 version_id: 42, // wrong — must be u64::MAX (staging sentinel)
                 part_number: 1,
@@ -6292,13 +6286,13 @@ fn malformed_segment_okh_returns_db_error() {
         "INSERT INTO object_segments \
          (bucket, key, version_id, segment_index, size, segment_okh, segment_vid, \
           shard_pg_id, ec_k, ec_m) \
-         VALUES ('b', 'k', 0, 0, 100, X'AABB', 1, 0, 4, 2)",
+         VALUES ('bucket', 'k', 0, 0, 100, X'AABB', 1, 0, 4, 2)",
         [],
     )
     .unwrap();
 
     let err = store
-        .get_object_segments("b", "k", VersionId::Null)
+        .get_object_segments("bucket", "k", VersionId::Null)
         .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::Db { .. }),
@@ -6316,7 +6310,7 @@ fn malformed_multipart_segment_okh_returns_db_error() {
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
           segment_vid, shard_pg_id, ec_k, ec_m) \
-         VALUES ('b', 'k', 'mpu-bad', 0, 1, 0, 100, X'AABB', 1, 0, 4, 2)",
+         VALUES ('bucket', 'k', 'mpu-bad', 0, 1, 0, 100, X'AABB', 1, 0, 4, 2)",
         [],
     )
     .unwrap();
@@ -6337,8 +6331,8 @@ fn get_object_version_null() {
     let (_dir, store) = make_pg_store();
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::Null,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -6356,7 +6350,9 @@ fn get_object_version_null() {
         }))
         .unwrap();
 
-    let obj = store.get_object_version("b", "k", VersionId::Null).unwrap();
+    let obj = store
+        .get_object_version("bucket", "k", VersionId::Null)
+        .unwrap();
     let live = obj.as_live().unwrap();
     assert_eq!(live.size, 100);
 }
@@ -6367,8 +6363,8 @@ fn get_object_version_versioned() {
     let vid = VersionId::Versioned(NonZeroU64::new(1).unwrap());
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: vid,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -6386,7 +6382,7 @@ fn get_object_version_versioned() {
         }))
         .unwrap();
 
-    let obj = store.get_object_version("b", "k", vid).unwrap();
+    let obj = store.get_object_version("bucket", "k", vid).unwrap();
     let live = obj.as_live().unwrap();
     assert_eq!(live.size, 200);
     assert_eq!(live.version_id, vid);
@@ -6396,7 +6392,7 @@ fn get_object_version_versioned() {
 fn get_object_version_not_found() {
     let (_dir, store) = make_pg_store();
     let err = store
-        .get_object_version("b", "k", VersionId::Null)
+        .get_object_version("bucket", "k", VersionId::Null)
         .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::ObjectNotFound));
 }
@@ -6406,8 +6402,8 @@ fn delete_object_version_null() {
     let (_dir, store) = make_pg_store();
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::Null,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -6426,10 +6422,10 @@ fn delete_object_version_null() {
         .unwrap();
 
     store
-        .delete_object_version("b", "k", VersionId::Null)
+        .delete_object_version("bucket", "k", VersionId::Null)
         .unwrap();
     let err = store
-        .get_object_version("b", "k", VersionId::Null)
+        .get_object_version("bucket", "k", VersionId::Null)
         .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::ObjectNotFound));
 }
@@ -6443,8 +6439,8 @@ fn delete_object_version_specific_leaves_others() {
     for (vid, size) in [(vid1, 100u64), (vid2, 200u64)] {
         store
             .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: vid,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -6463,13 +6459,13 @@ fn delete_object_version_specific_leaves_others() {
             .unwrap();
     }
 
-    store.delete_object_version("b", "k", vid1).unwrap();
+    store.delete_object_version("bucket", "k", vid1).unwrap();
 
     // vid1 gone
-    let err = store.get_object_version("b", "k", vid1).unwrap_err();
+    let err = store.get_object_version("bucket", "k", vid1).unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::ObjectNotFound));
     // vid2 still exists
-    let obj = store.get_object_version("b", "k", vid2).unwrap();
+    let obj = store.get_object_version("bucket", "k", vid2).unwrap();
     assert_eq!(obj.as_live().unwrap().size, 200);
 }
 
@@ -6484,8 +6480,8 @@ fn list_object_versions_basic() {
     for (vid, size) in [(vid1, 100u64), (vid2, 200)] {
         store
             .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: vid,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -6506,7 +6502,7 @@ fn list_object_versions_basic() {
 
     let resp = store
         .list_object_versions(&ListObjectVersionsReq {
-            bucket: "b".into(),
+            bucket: bucket_name("bucket"),
             prefix: None,
             key_marker: None,
             version_id_marker: None,
@@ -6526,8 +6522,8 @@ fn list_object_versions_pagination() {
     for i in 1..=3u64 {
         store
             .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id: VersionId::Versioned(NonZeroU64::new(i).unwrap()),
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -6549,7 +6545,7 @@ fn list_object_versions_pagination() {
     // Page 1: max_keys=2
     let resp = store
         .list_object_versions(&ListObjectVersionsReq {
-            bucket: "b".into(),
+            bucket: bucket_name("bucket"),
             prefix: None,
             key_marker: None,
             version_id_marker: None,
@@ -6564,7 +6560,7 @@ fn list_object_versions_pagination() {
     // Page 2: use markers from page 1
     let resp2 = store
         .list_object_versions(&ListObjectVersionsReq {
-            bucket: "b".into(),
+            bucket: bucket_name("bucket"),
             prefix: None,
             key_marker: resp.next_key_marker,
             version_id_marker: resp.next_version_id_marker,
@@ -6582,8 +6578,8 @@ fn list_object_versions_with_prefix() {
     for key in ["photos/a.jpg", "photos/b.jpg", "docs/c.txt"] {
         store
             .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-                bucket: "b".into(),
-                key: key.into(),
+                bucket: bucket_name("bucket"),
+                key: object_key(key),
                 version_id: VersionId::Null,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -6604,8 +6600,8 @@ fn list_object_versions_with_prefix() {
 
     let resp = store
         .list_object_versions(&ListObjectVersionsReq {
-            bucket: "b".into(),
-            prefix: Some("photos/".into()),
+            bucket: bucket_name("bucket"),
+            prefix: Some(object_key("photos/")),
             key_marker: None,
             version_id_marker: None,
             max_keys: 100,
@@ -6622,8 +6618,8 @@ fn list_object_versions_includes_delete_markers() {
 
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: vid1,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -6643,8 +6639,8 @@ fn list_object_versions_includes_delete_markers() {
 
     store
         .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: vid2,
             owner: test_owner(),
         }))
@@ -6652,7 +6648,7 @@ fn list_object_versions_includes_delete_markers() {
 
     let resp = store
         .list_object_versions(&ListObjectVersionsReq {
-            bucket: "b".into(),
+            bucket: bucket_name("bucket"),
             prefix: None,
             key_marker: None,
             version_id_marker: None,
@@ -6674,7 +6670,7 @@ fn suspended_null_live_version_stays_current_when_last_modified_ties() {
 
     store
         .create_bucket(
-            "b",
+            "bucket",
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -6683,13 +6679,13 @@ fn suspended_null_live_version_stays_current_when_last_modified_ties() {
         )
         .unwrap();
     store
-        .put_bucket_versioning("b", BucketVersioningState::Suspended)
+        .put_bucket_versioning("bucket", BucketVersioningState::Suspended)
         .unwrap();
 
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: numbered,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -6708,8 +6704,8 @@ fn suspended_null_live_version_stays_current_when_last_modified_ties() {
         .unwrap();
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::Null,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -6730,17 +6726,17 @@ fn suspended_null_live_version_stays_current_when_last_modified_ties() {
         .connection()
         .execute(
             "UPDATE objects SET last_modified = ?1 WHERE bucket = ?2 AND key = ?3",
-            rusqlite::params![1_i64, "b", "k"],
+            rusqlite::params![1_i64, "bucket", "k"],
         )
         .unwrap();
 
-    let current = store.get_object_meta("b", "k").unwrap();
+    let current = store.get_object_meta("bucket", "k").unwrap();
     assert_eq!(current.version_id(), VersionId::Null);
     assert_eq!(current.as_live().unwrap().size, 200);
 
     let listed = store
         .list_objects(&ListObjectsReq {
-            bucket: "b".into(),
+            bucket: bucket_name("bucket"),
             prefix: None,
             start_after: None,
             start_at: None,
@@ -6753,7 +6749,7 @@ fn suspended_null_live_version_stays_current_when_last_modified_ties() {
 
     let versions = store
         .list_object_versions(&ListObjectVersionsReq {
-            bucket: "b".into(),
+            bucket: bucket_name("bucket"),
             prefix: None,
             key_marker: None,
             version_id_marker: None,
@@ -6772,7 +6768,7 @@ fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
 
     store
         .create_bucket(
-            "b",
+            "bucket",
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -6781,13 +6777,13 @@ fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
         )
         .unwrap();
     store
-        .put_bucket_versioning("b", BucketVersioningState::Suspended)
+        .put_bucket_versioning("bucket", BucketVersioningState::Suspended)
         .unwrap();
 
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: numbered,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -6806,8 +6802,8 @@ fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
         .unwrap();
     store
         .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::Null,
             owner: test_owner(),
         }))
@@ -6816,17 +6812,17 @@ fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
         .connection()
         .execute(
             "UPDATE objects SET last_modified = ?1 WHERE bucket = ?2 AND key = ?3",
-            rusqlite::params![1_i64, "b", "k"],
+            rusqlite::params![1_i64, "bucket", "k"],
         )
         .unwrap();
 
-    let current = store.get_object_meta("b", "k").unwrap();
+    let current = store.get_object_meta("bucket", "k").unwrap();
     assert_eq!(current.version_id(), VersionId::Null);
     assert!(current.is_delete_marker());
 
     let listed = store
         .list_objects(&ListObjectsReq {
-            bucket: "b".into(),
+            bucket: bucket_name("bucket"),
             prefix: None,
             start_after: None,
             start_at: None,
@@ -6837,7 +6833,7 @@ fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
 
     let versions = store
         .list_object_versions(&ListObjectVersionsReq {
-            bucket: "b".into(),
+            bucket: bucket_name("bucket"),
             prefix: None,
             key_marker: None,
             version_id_marker: None,
@@ -6860,8 +6856,8 @@ fn put_object_meta_marks_displaced_live_version_noncurrent() {
     for version_id in [older, current] {
         store
             .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -6880,9 +6876,9 @@ fn put_object_meta_marks_displaced_live_version_noncurrent() {
             .unwrap();
     }
 
-    let current_record = store.get_object_version("b", "k", current).unwrap();
+    let current_record = store.get_object_version("bucket", "k", current).unwrap();
     let current_live = current_record.as_live().unwrap();
-    let older_record = store.get_object_version("b", "k", older).unwrap();
+    let older_record = store.get_object_version("bucket", "k", older).unwrap();
     let older_live = older_record.as_live().unwrap();
 
     assert_eq!(current_live.became_noncurrent_at, None);
@@ -6900,8 +6896,8 @@ fn put_delete_marker_marks_displaced_live_version_noncurrent() {
 
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: live_version,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -6920,17 +6916,19 @@ fn put_delete_marker_marks_displaced_live_version_noncurrent() {
         .unwrap();
     store
         .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: delete_marker,
             owner: test_owner(),
         }))
         .unwrap();
 
-    let current = store.get_object_meta("b", "k").unwrap();
+    let current = store.get_object_meta("bucket", "k").unwrap();
     assert!(current.is_delete_marker());
 
-    let older_record = store.get_object_version("b", "k", live_version).unwrap();
+    let older_record = store
+        .get_object_version("bucket", "k", live_version)
+        .unwrap();
     let older_live = older_record.as_live().unwrap();
     assert_eq!(
         older_live.became_noncurrent_at,
@@ -6945,8 +6943,8 @@ fn null_live_write_marks_displaced_numbered_version_noncurrent() {
 
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: numbered,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -6965,8 +6963,8 @@ fn null_live_write_marks_displaced_numbered_version_noncurrent() {
         .unwrap();
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::Null,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -6984,10 +6982,10 @@ fn null_live_write_marks_displaced_numbered_version_noncurrent() {
         }))
         .unwrap();
 
-    let current = store.get_object_meta("b", "k").unwrap();
+    let current = store.get_object_meta("bucket", "k").unwrap();
     assert_eq!(current.version_id(), VersionId::Null);
 
-    let older_record = store.get_object_version("b", "k", numbered).unwrap();
+    let older_record = store.get_object_version("bucket", "k", numbered).unwrap();
     let older_live = older_record.as_live().unwrap();
     assert_eq!(
         older_live.became_noncurrent_at,
@@ -7004,8 +7002,8 @@ fn deleting_current_live_version_clears_revealed_live_noncurrent_timestamp() {
     for version_id in [older, current] {
         store
             .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-                bucket: "b".into(),
-                key: "k".into(),
+                bucket: bucket_name("bucket"),
+                key: object_key("k"),
                 version_id,
                 owner: test_owner(),
                 acl_grants: AclGrants::default(),
@@ -7024,16 +7022,16 @@ fn deleting_current_live_version_clears_revealed_live_noncurrent_timestamp() {
             .unwrap();
     }
 
-    let older_record = store.get_object_version("b", "k", older).unwrap();
+    let older_record = store.get_object_version("bucket", "k", older).unwrap();
     assert!(older_record
         .as_live()
         .unwrap()
         .became_noncurrent_at
         .is_some());
 
-    store.delete_object_version("b", "k", current).unwrap();
+    store.delete_object_version("bucket", "k", current).unwrap();
 
-    let revealed = store.get_object_meta("b", "k").unwrap();
+    let revealed = store.get_object_meta("bucket", "k").unwrap();
     assert_eq!(revealed.version_id(), older);
     assert_eq!(revealed.as_live().unwrap().became_noncurrent_at, None);
 }
@@ -7046,8 +7044,8 @@ fn deleting_current_delete_marker_clears_revealed_live_noncurrent_timestamp() {
 
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: live_version,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -7066,14 +7064,16 @@ fn deleting_current_delete_marker_clears_revealed_live_noncurrent_timestamp() {
         .unwrap();
     store
         .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: delete_marker,
             owner: test_owner(),
         }))
         .unwrap();
 
-    let live_record = store.get_object_version("b", "k", live_version).unwrap();
+    let live_record = store
+        .get_object_version("bucket", "k", live_version)
+        .unwrap();
     assert!(live_record
         .as_live()
         .unwrap()
@@ -7081,10 +7081,10 @@ fn deleting_current_delete_marker_clears_revealed_live_noncurrent_timestamp() {
         .is_some());
 
     store
-        .delete_object_version("b", "k", delete_marker)
+        .delete_object_version("bucket", "k", delete_marker)
         .unwrap();
 
-    let revealed = store.get_object_meta("b", "k").unwrap();
+    let revealed = store.get_object_meta("bucket", "k").unwrap();
     assert_eq!(revealed.version_id(), live_version);
     assert_eq!(revealed.as_live().unwrap().became_noncurrent_at, None);
 }
@@ -7096,14 +7096,14 @@ fn next_version_id_increments() {
     let (_dir, store) = make_pg_store();
 
     // First call with no prior versions starts at 1.
-    let v1 = store.next_version_id("b", "k").unwrap();
+    let v1 = store.next_version_id("bucket", "k").unwrap();
     assert!(matches!(v1, VersionId::Versioned(_)));
 
     // Write an object at v1 so the counter advances.
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: v1,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -7121,7 +7121,7 @@ fn next_version_id_increments() {
         }))
         .unwrap();
 
-    let v2 = store.next_version_id("b", "k").unwrap();
+    let v2 = store.next_version_id("bucket", "k").unwrap();
     assert!(matches!(v2, VersionId::Versioned(_)));
     assert_ne!(v1, v2);
 }
@@ -7130,8 +7130,8 @@ fn next_version_id_increments() {
 fn next_version_id_independent_per_key() {
     let (_dir, store) = make_pg_store();
 
-    let v1 = store.next_version_id("b", "k1").unwrap();
-    let v2 = store.next_version_id("b", "k2").unwrap();
+    let v1 = store.next_version_id("bucket", "k1").unwrap();
+    let v2 = store.next_version_id("bucket", "k2").unwrap();
     // Different keys should each get the first version ID
     assert_eq!(v1, v2);
 }
@@ -7143,8 +7143,8 @@ fn object_tags_round_trip() {
     let (_dir, store) = make_pg_store();
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: VersionId::Null,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -7163,26 +7163,36 @@ fn object_tags_round_trip() {
         .unwrap();
 
     // Initially no tags
-    let tags = store.get_object_tags("b", "k", VersionId::Null).unwrap();
+    let tags = store
+        .get_object_tags("bucket", "k", VersionId::Null)
+        .unwrap();
     assert!(tags.is_none());
 
     // Put tags
     store
-        .put_object_tags("b", "k", VersionId::Null, "<tags>env=prod</tags>")
+        .put_object_tags("bucket", "k", VersionId::Null, "<tags>env=prod</tags>")
         .unwrap();
-    let tags = store.get_object_tags("b", "k", VersionId::Null).unwrap();
+    let tags = store
+        .get_object_tags("bucket", "k", VersionId::Null)
+        .unwrap();
     assert_eq!(tags.as_deref(), Some("<tags>env=prod</tags>"));
 
     // Overwrite tags
     store
-        .put_object_tags("b", "k", VersionId::Null, "<tags>env=staging</tags>")
+        .put_object_tags("bucket", "k", VersionId::Null, "<tags>env=staging</tags>")
         .unwrap();
-    let tags = store.get_object_tags("b", "k", VersionId::Null).unwrap();
+    let tags = store
+        .get_object_tags("bucket", "k", VersionId::Null)
+        .unwrap();
     assert_eq!(tags.as_deref(), Some("<tags>env=staging</tags>"));
 
     // Delete tags
-    store.delete_object_tags("b", "k", VersionId::Null).unwrap();
-    let tags = store.get_object_tags("b", "k", VersionId::Null).unwrap();
+    store
+        .delete_object_tags("bucket", "k", VersionId::Null)
+        .unwrap();
+    let tags = store
+        .get_object_tags("bucket", "k", VersionId::Null)
+        .unwrap();
     assert!(tags.is_none());
 }
 
@@ -7190,7 +7200,7 @@ fn object_tags_round_trip() {
 fn object_tags_on_nonexistent_object() {
     let (_dir, store) = make_pg_store();
     let err = store
-        .get_object_tags("b", "k", VersionId::Null)
+        .get_object_tags("bucket", "k", VersionId::Null)
         .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::ObjectNotFound));
 }
@@ -7201,14 +7211,16 @@ fn object_tags_on_delete_marker() {
     let vid = VersionId::Versioned(NonZeroU64::new(1).unwrap());
     store
         .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             version_id: vid,
             owner: test_owner(),
         }))
         .unwrap();
 
-    let err = store.put_object_tags("b", "k", vid, "<tags/>").unwrap_err();
+    let err = store
+        .put_object_tags("bucket", "k", vid, "<tags/>")
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -7217,7 +7229,7 @@ fn object_tags_on_delete_marker() {
         "expected MethodNotAllowedOnDeleteMarker, got {err:?}"
     );
 
-    let err = store.get_object_tags("b", "k", vid).unwrap_err();
+    let err = store.get_object_tags("bucket", "k", vid).unwrap_err();
     assert!(
         matches!(
             err,
@@ -7226,7 +7238,7 @@ fn object_tags_on_delete_marker() {
         "expected MethodNotAllowedOnDeleteMarker, got {err:?}"
     );
 
-    let err = store.delete_object_tags("b", "k", vid).unwrap_err();
+    let err = store.delete_object_tags("bucket", "k", vid).unwrap_err();
     assert!(
         matches!(
             err,
@@ -7245,25 +7257,31 @@ fn simple_payload_reclaim_round_trip() {
 
     store
         .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             generation_id: gen,
             ec: EcShape { k: 4, m: 2 },
             created_at: 12345,
         })
         .unwrap();
 
-    let rec = store.get_simple_payload_reclaim("b", "k", gen).unwrap();
+    let rec = store
+        .get_simple_payload_reclaim("bucket", "k", gen)
+        .unwrap();
     assert!(rec.is_some());
     let rec = rec.unwrap();
-    assert_eq!(rec.bucket.as_str(), "b");
+    assert_eq!(rec.bucket.as_str(), "bucket");
     assert_eq!(rec.key.as_str(), "k");
     assert_eq!(rec.generation_id, gen);
     assert_eq!(rec.ec.k, 4);
     assert_eq!(rec.ec.m, 2);
 
-    store.delete_simple_payload_reclaim("b", "k", gen).unwrap();
-    let rec = store.get_simple_payload_reclaim("b", "k", gen).unwrap();
+    store
+        .delete_simple_payload_reclaim("bucket", "k", gen)
+        .unwrap();
+    let rec = store
+        .get_simple_payload_reclaim("bucket", "k", gen)
+        .unwrap();
     assert!(rec.is_none());
 }
 
@@ -7272,7 +7290,7 @@ fn simple_payload_reclaim_delete_idempotent() {
     let (_dir, store) = make_pg_store();
     // Deleting a nonexistent reclaim should not error
     store
-        .delete_simple_payload_reclaim("b", "k", GenerationId::MIN)
+        .delete_simple_payload_reclaim("bucket", "k", GenerationId::MIN)
         .unwrap();
 }
 
@@ -7292,8 +7310,8 @@ fn list_all_stream_uploads_returns_sessions() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "s1".into(),
-            bucket: "b".into(),
-            key: "k1".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k1"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -7301,8 +7319,8 @@ fn list_all_stream_uploads_returns_sessions() {
     store
         .create_stream_upload(&CreateStreamUploadReq {
             session_id: "s2".into(),
-            bucket: "b".into(),
-            key: "k2".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k2"),
             target: StreamUploadTarget::PutObject,
             encryption: ObjectEncryption::None,
         })
@@ -7325,8 +7343,8 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "mpu-seg".into(),
-            bucket: "b".into(),
-            key: "k".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("k"),
             tags: None,
             metadata_blob: vec![].into(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -7369,7 +7387,7 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, \
           segment_okh, segment_vid, shard_pg_id, ec_k, ec_m) \
-         VALUES ('b', 'k', 'mpu-seg', 0, 1, 0, 100, X'00112233445566778899AABBCCDDEEFF', 1, 0, 4, 2)",
+         VALUES ('bucket', 'k', 'mpu-seg', 0, 1, 0, 100, X'00112233445566778899AABBCCDDEEFF', 1, 0, 4, 2)",
         [],
     ).unwrap();
 
@@ -7463,6 +7481,29 @@ fn head_bucket_raw_nonexistent() {
         matches!(err, crate::error::MetadataError::BucketNotFound { .. }),
         "expected BucketNotFound, got {err:?}"
     );
+}
+
+#[test]
+fn raw_bucket_methods_reject_invalid_bucket_names_without_panicking() {
+    let (_dir, store) = make_pg_store();
+
+    let err = store.head_bucket_raw("BadBucket").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvalidBucketName { .. }
+    ));
+
+    let err = store.mark_bucket_deleting("b").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvalidBucketName { .. }
+    ));
+
+    let err = store.delete_bucket("b").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvalidBucketName { .. }
+    ));
 }
 
 #[test]
@@ -7569,8 +7610,8 @@ fn put_bucket_versioning_nonexistent_bucket() {
 fn complete_multipart_commit_no_such_upload() {
     let (_dir, store) = make_pg_store();
     let obj = CommitMultipartReq {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         version_id: VersionId::Null,
         owner: test_owner(),
         acl_grants: AclGrants::default(),
@@ -7586,8 +7627,8 @@ fn complete_multipart_commit_no_such_upload() {
         encryption: ObjectEncryption::None,
     };
     let parts = vec![ObjectPartRecord {
-        bucket: "b".into(),
-        key: "k".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("k"),
         version_id: VersionId::Null,
         part_number: 1,
         size: 1024,
@@ -7731,8 +7772,8 @@ fn live_object_object_lock_round_trip() {
 
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "bucket".into(),
-            key: "key".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("key"),
             version_id: VersionId::Versioned(NonZeroU64::new(1).unwrap()),
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -7766,8 +7807,8 @@ fn put_object_retention_and_legal_hold_round_trip() {
     let version_id = VersionId::Versioned(NonZeroU64::new(1).unwrap());
     store
         .put_object_meta(&PutObjectReq::Live(PutLiveObjectReq {
-            bucket: "bucket".into(),
-            key: "key".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("key"),
             version_id,
             owner: test_owner(),
             acl_grants: AclGrants::default(),
@@ -7810,8 +7851,8 @@ fn put_object_retention_and_legal_hold_reject_delete_marker() {
     let version_id = VersionId::Versioned(NonZeroU64::new(1).unwrap());
     store
         .put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
-            bucket: "bucket".into(),
-            key: "key".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("key"),
             version_id,
             owner: test_owner(),
         }))
@@ -7850,8 +7891,8 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: "upload-1".into(),
-            bucket: "bucket".into(),
-            key: "key".into(),
+            bucket: bucket_name("bucket"),
+            key: object_key("key"),
             tags: None,
             metadata_blob: SerializedMetadataBlob::default(),
             system_metadata_blob: SerializedSystemMetadataBlob::default(),
@@ -7869,7 +7910,7 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
     assert_eq!(upload.object_lock, object_lock);
     let uploads = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
-            bucket: "bucket".into(),
+            bucket: bucket_name("bucket"),
             prefix: None,
             key_marker: None,
             upload_id_marker: None,
@@ -7879,8 +7920,8 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
     assert_eq!(uploads.uploads[0].object_lock, object_lock);
 
     let obj = CommitMultipartReq {
-        bucket: "bucket".into(),
-        key: "key".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("key"),
         version_id: VersionId::Versioned(NonZeroU64::new(1).unwrap()),
         owner: test_owner(),
         acl_grants: AclGrants::default(),
@@ -7896,8 +7937,8 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
         encryption: ObjectEncryption::None,
     };
     let parts = vec![ObjectPartRecord {
-        bucket: "bucket".into(),
-        key: "key".into(),
+        bucket: bucket_name("bucket"),
+        key: object_key("key"),
         version_id: VersionId::Versioned(NonZeroU64::new(1).unwrap()),
         part_number: 1,
         size: 32,

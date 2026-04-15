@@ -1,6 +1,7 @@
 /// S3 operation routing from HTTP method + path + query.
 use crate::error::ServerError;
 use crate::http::request::{query_has_key, query_has_param};
+use storage::{BucketName, ObjectKey};
 
 /// Recognized S3 operations.
 #[derive(Debug, PartialEq, Eq)]
@@ -143,73 +144,21 @@ impl S3Operation {
 /// - Not formatted as an IP address
 /// - Must not start with `xn--` (reserved for IDN/Punycode)
 fn validate_bucket_name(name: &str) -> Result<(), ServerError> {
-    if name.len() < 3 || name.len() > 63 {
-        return Err(ServerError::InvalidBucketName {
-            reason: format!("bucket name must be 3-63 characters, got {}", name.len()),
-        });
-    }
-    // Must start and end with a lowercase letter or digit
-    let first = name.as_bytes()[0];
-    let last = name.as_bytes()[name.len() - 1];
-    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
-        return Err(ServerError::InvalidBucketName {
-            reason: "bucket name must start with a lowercase letter or digit".to_string(),
-        });
-    }
-    if !(last.is_ascii_lowercase() || last.is_ascii_digit()) {
-        return Err(ServerError::InvalidBucketName {
-            reason: "bucket name must end with a lowercase letter or digit".to_string(),
-        });
-    }
-    if !name
-        .bytes()
-        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
-    {
-        return Err(ServerError::InvalidBucketName {
-            reason: "bucket name must contain only lowercase letters, digits, hyphens, and periods"
-                .to_string(),
-        });
-    }
-    if name.contains("..") {
-        return Err(ServerError::InvalidBucketName {
-            reason: "bucket name must not contain consecutive periods".to_string(),
-        });
-    }
-    if name.contains(".-") || name.contains("-.") {
-        return Err(ServerError::InvalidBucketName {
-            reason: "bucket name must not contain dot-dash or dash-dot".to_string(),
-        });
-    }
-    // Reject xn-- prefix (reserved for Internationalized Domain Names)
-    if name.starts_with("xn--") {
-        return Err(ServerError::InvalidBucketName {
-            reason: "bucket name must not start with xn-- (reserved for IDN)".to_string(),
-        });
-    }
-    // Reject IP-address-formatted names (4 groups of digits separated by periods)
-    let parts: Vec<&str> = name.split('.').collect();
-    if parts.len() == 4 && parts.iter().all(|p| p.parse::<u8>().is_ok()) {
-        return Err(ServerError::InvalidBucketName {
-            reason: "bucket name must not be formatted as an IP address".to_string(),
-        });
-    }
-    Ok(())
+    BucketName::try_from(name)
+        .map(|_| ())
+        .map_err(|error| ServerError::InvalidBucketName {
+            reason: error.to_string(),
+        })
 }
 
 /// Validate an S3 object key.
 /// 1-1024 bytes, no null bytes.
 pub(crate) fn validate_object_key(key: &str) -> Result<(), ServerError> {
-    if key.is_empty() || key.len() > 1024 {
-        return Err(ServerError::InvalidRequest {
-            reason: format!("object key must be 1-1024 bytes, got {}", key.len()),
-        });
-    }
-    if key.as_bytes().contains(&0) {
-        return Err(ServerError::InvalidRequest {
-            reason: "object key must not contain null bytes".to_string(),
-        });
-    }
-    Ok(())
+    ObjectKey::try_from(key)
+        .map(|_| ())
+        .map_err(|error| ServerError::InvalidRequest {
+            reason: error.to_string(),
+        })
 }
 
 /// Route an HTTP request to an S3 operation.

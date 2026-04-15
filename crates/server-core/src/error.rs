@@ -426,6 +426,9 @@ impl From<MetadataError> for ServerError {
             MetadataError::NoSuchUpload { upload_id } => ServerError::NoSuchUpload {
                 upload_id: upload_id.into_string(),
             },
+            MetadataError::InvalidBucketName { reason } => {
+                ServerError::InvalidBucketName { reason }
+            }
             other => ServerError::Metadata(other),
         }
     }

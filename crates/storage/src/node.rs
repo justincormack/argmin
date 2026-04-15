@@ -716,7 +716,7 @@ mod tests {
         }));
 
         let info = BucketFastPathInfo {
-            name: crate::types::BucketName::from("bucket"),
+            name: crate::types::BucketName::try_from("bucket").unwrap(),
             owner_principal: "owner".to_string(),
             owner_canonical_id: s3_types::CanonicalUserId::from_principal("owner"),
             created_at: 0,

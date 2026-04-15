@@ -3120,8 +3120,8 @@ impl Coordinator {
         &'a self,
         req: &CopyObjectRequest<'_>,
     ) -> Result<AuthorizedCopyObject<'a>, ServerError> {
-        let src_bucket = req.source.bucket;
-        let src_key = req.source.key;
+        let src_bucket = req.source.bucket.as_str();
+        let src_key = req.source.key.as_str();
         let src_version_id = req.source.version_id;
         let dst_bucket = req.destination.bucket.name;
         let dst_key = req.destination.key;
@@ -3243,8 +3243,8 @@ impl Coordinator {
         &'a self,
         req: &UploadPartCopyRequest<'_>,
     ) -> Result<AuthorizedUploadPartCopy<'a>, ServerError> {
-        let src_bucket = req.source.bucket;
-        let src_key = req.source.key;
+        let src_bucket = req.source.bucket.as_str();
+        let src_key = req.source.key.as_str();
         let src_version_id = req.source.version_id;
         let dst_bucket = req.upload.bucket_name();
         let dst_key = req.upload.key();
