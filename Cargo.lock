@@ -1344,7 +1344,7 @@ version = "0.1.0"
 dependencies = [
  "libm",
  "proptest",
- "rapidhash 4.4.1",
+ "rapidhash",
  "smallvec",
  "thiserror",
 ]
@@ -1493,12 +1493,6 @@ checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
 dependencies = [
  "rand_core 0.9.5",
 ]
-
-[[package]]
-name = "rapidhash"
-version = "1.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9813f789f95ee4fe6b4d01834404d7cccacbc3f6c029343af910b3c2835eb9f1"
 
 [[package]]
 name = "rapidhash"
@@ -1823,7 +1817,7 @@ dependencies = [
  "ec",
  "observability",
  "proptest",
- "rapidhash 1.4.0",
+ "rapidhash",
  "ring",
  "s3-types",
  "storage",
@@ -1940,7 +1934,7 @@ dependencies = [
  "checksum",
  "observability",
  "proptest",
- "rapidhash 1.4.0",
+ "rapidhash",
  "rusqlite",
  "s3-types",
  "test-util",

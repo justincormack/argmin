@@ -1536,7 +1536,7 @@ fn test_put_missing_credential() {
             .put(&url)
             .header("Authorization", auth)
             .header("x-amz-date", &amz_date)
-            .header("x-amz-content-sha256", &sha256_hex(b"data"))
+            .header("x-amz-content-sha256", sha256_hex(b"data"))
             .send(b"data" as &[u8])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -1575,7 +1575,7 @@ fn test_put_missing_signature() {
             .put(&url)
             .header("Authorization", &auth)
             .header("x-amz-date", &amz_date)
-            .header("x-amz-content-sha256", &sha256_hex(b"data"))
+            .header("x-amz-content-sha256", sha256_hex(b"data"))
             .send(b"data" as &[u8])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -1610,7 +1610,7 @@ fn test_put_bad_credential_scope() {
             .put(&url)
             .header("Authorization", &auth)
             .header("x-amz-date", &amz_date)
-            .header("x-amz-content-sha256", &sha256_hex(b"data"))
+            .header("x-amz-content-sha256", sha256_hex(b"data"))
             .send(b"data" as &[u8])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -1755,7 +1755,7 @@ fn test_sigv2_rejected_in_region_that_requires_sigv4() {
         let date = current_http_date();
         let mut resp = agent()
             .get(&url)
-            .header("Authorization", &sigv2_authorization(&bucket, &date))
+            .header("Authorization", sigv2_authorization(&bucket, &date))
             .header("Date", &date)
             .call()
             .expect("transport error");

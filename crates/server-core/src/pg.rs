@@ -1,3 +1,45 @@
+use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
+
+const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
+const PG_HASH_STACK_LIMIT: usize = 63 + 1 + 1024 + 1 + 20;
+
+#[inline]
+fn hash_bytes(data: &[u8]) -> u64 {
+    rapidhash_v3_micro_inline::<true, false>(data, &RAPIDHASH_SECRETS)
+}
+
+#[inline]
+fn hash_parts(parts: &[&[u8]]) -> u64 {
+    let total_len = parts.iter().map(|part| part.len()).sum::<usize>();
+    assert!(
+        total_len <= PG_HASH_STACK_LIMIT,
+        "PG hash input exceeded validated bound: {total_len} > {PG_HASH_STACK_LIMIT}"
+    );
+
+    let mut data = [0u8; PG_HASH_STACK_LIMIT];
+    let mut offset = 0;
+    for part in parts {
+        let end = offset + part.len();
+        data[offset..end].copy_from_slice(part);
+        offset = end;
+    }
+    hash_bytes(&data[..total_len])
+}
+
+#[inline]
+fn decimal_u64_bytes(value: u64, out: &mut [u8; 20]) -> &[u8] {
+    let mut value = value;
+    let mut idx = out.len();
+    loop {
+        idx -= 1;
+        out[idx] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            return &out[idx..];
+        }
+    }
+}
+
 /// PG derivation: maps keys to placement group IDs.
 ///
 /// `PgTopology` is the coordinator-facing API and should be preferred over
@@ -31,22 +73,21 @@ impl PgTopology {
 
     /// Derive the PG ID for a given bucket and key.
     pub fn object_pg(&self, bucket: &str, key: &str) -> u32 {
-        let full_key = format!("{bucket}/{key}");
-        let hash = rapidhash::rapidhash(full_key.as_bytes());
+        let hash = hash_parts(&[bucket.as_bytes(), b"/", key.as_bytes()]);
         pick_pg(&self.pg_ids, hash)
     }
 
     /// Derive the PG ID for bucket metadata placement.
     pub fn bucket_pg(&self, bucket: &str) -> u32 {
-        let full_key = format!("bucket/{bucket}");
-        let hash = rapidhash::rapidhash(full_key.as_bytes());
+        let hash = hash_parts(&[b"bucket/", bucket.as_bytes()]);
         pick_pg(&self.pg_ids, hash)
     }
 
     /// Derive the shard PG ID.
     pub fn shard_pg(&self, bucket: &str, key: &str, version_id: u64) -> u32 {
-        let full_key = format!("{bucket}/{key}/{version_id}");
-        let hash = rapidhash::rapidhash(full_key.as_bytes());
+        let mut version_buf = [0u8; 20];
+        let version_bytes = decimal_u64_bytes(version_id, &mut version_buf);
+        let hash = hash_parts(&[bucket.as_bytes(), b"/", key.as_bytes(), b"/", version_bytes]);
         pick_pg(&self.pg_ids, hash)
     }
 
@@ -69,8 +110,7 @@ fn pick_pg(pg_ids: &[u32], hash: u64) -> u32 {
 /// pg_id = rapidhash(bucket + "/" + key) % pg_count
 #[cfg(test)]
 pub(crate) fn derive_pg(bucket: &str, key: &str, pg_count: u32) -> u32 {
-    let full_key = format!("{bucket}/{key}");
-    let hash = rapidhash::rapidhash(full_key.as_bytes());
+    let hash = hash_parts(&[bucket.as_bytes(), b"/", key.as_bytes()]);
     (hash % u64::from(pg_count)) as u32
 }
 
@@ -79,8 +119,7 @@ pub(crate) fn derive_pg(bucket: &str, key: &str, pg_count: u32) -> u32 {
 /// pg_id = rapidhash("bucket/" + bucket_name) % pg_count
 #[cfg(test)]
 pub(crate) fn derive_bucket_pg(bucket: &str, pg_count: u32) -> u32 {
-    let full_key = format!("bucket/{bucket}");
-    let hash = rapidhash::rapidhash(full_key.as_bytes());
+    let hash = hash_parts(&[b"bucket/", bucket.as_bytes()]);
     (hash % u64::from(pg_count)) as u32
 }
 
@@ -92,8 +131,9 @@ pub(crate) fn derive_bucket_pg(bucket: &str, pg_count: u32) -> u32 {
 /// pg_id = rapidhash(bucket + "/" + key + "/" + version_id) % pg_count
 #[cfg(test)]
 pub(crate) fn derive_pg_shards(bucket: &str, key: &str, version_id: u64, pg_count: u32) -> u32 {
-    let full_key = format!("{bucket}/{key}/{version_id}");
-    let hash = rapidhash::rapidhash(full_key.as_bytes());
+    let mut version_buf = [0u8; 20];
+    let version_bytes = decimal_u64_bytes(version_id, &mut version_buf);
+    let hash = hash_parts(&[bucket.as_bytes(), b"/", key.as_bytes(), b"/", version_bytes]);
     (hash % u64::from(pg_count)) as u32
 }
 
@@ -292,6 +332,40 @@ mod tests {
             pg_v0 != pg_v1 || pg_v1 != pg_v2,
             "all versions mapped to same PG"
         );
+    }
+
+    #[test]
+    fn hash_parts_matches_bulk_hash_for_object_pg() {
+        let bucket = "bucket";
+        let key = "key";
+        let expected = hash_bytes(format!("{bucket}/{key}").as_bytes());
+        let actual = hash_parts(&[bucket.as_bytes(), b"/", key.as_bytes()]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn hash_parts_matches_bulk_hash_for_bucket_pg() {
+        let bucket = "bucket";
+        let expected = hash_bytes(format!("bucket/{bucket}").as_bytes());
+        let actual = hash_parts(&[b"bucket/", bucket.as_bytes()]);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn hash_parts_matches_bulk_hash_for_shard_pg() {
+        let bucket = "bucket";
+        let key = "x".repeat(1024);
+        let version_id = u64::MAX;
+        let expected = hash_bytes(format!("{bucket}/{key}/{version_id}").as_bytes());
+        let mut version_buf = [0u8; 20];
+        let actual = hash_parts(&[
+            bucket.as_bytes(),
+            b"/",
+            key.as_bytes(),
+            b"/",
+            decimal_u64_bytes(version_id, &mut version_buf),
+        ]);
+        assert_eq!(actual, expected);
     }
 
     #[test]

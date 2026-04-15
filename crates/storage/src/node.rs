@@ -7,12 +7,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Instant;
 
+use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
+
 use crate::error::StoreError;
 use crate::pg_store::PgStore;
 use crate::traits::{ShardStore, StorageNode};
 use crate::types::{BucketFastPathInfo, GenerationId, ShardKey, WriteAck};
 
 const TRACE_TARGET: &str = "storage";
+const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
 
 fn read_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|err| err.into_inner())
@@ -226,7 +229,8 @@ impl SharedStorageNode {
     }
 
     fn bucket_lock_index(&self, bucket: &str) -> usize {
-        (rapidhash::rapidhash(bucket.as_bytes()) as usize) % self.bucket_locks.len()
+        (rapidhash_v3_micro_inline::<true, false>(bucket.as_bytes(), &RAPIDHASH_SECRETS) as usize)
+            % self.bucket_locks.len()
     }
 
     /// Return the cached active-bucket fast-path metadata for `bucket`.

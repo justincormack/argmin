@@ -683,8 +683,8 @@ fn test_unsigned_chunked_put() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -726,8 +726,8 @@ fn test_unsigned_chunked_legacy_token_rejected() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -757,8 +757,8 @@ fn test_signed_chunked_put() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -821,8 +821,8 @@ fn test_signed_chunked_put_with_gzip_content_encoding() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "gzip")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -894,8 +894,8 @@ fn test_signed_chunked_bad_signature() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -937,8 +937,8 @@ fn test_unsigned_chunked_trailing_checksum() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -992,8 +992,8 @@ fn test_chunked_decoded_content_length_mismatch() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &wrong_length.to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", wrong_length.to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -1033,8 +1033,8 @@ fn test_chunked_content_encoding_stripped() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -1089,7 +1089,7 @@ fn test_non_numeric_decoded_content_length() {
             .header("content-encoding", "aws-chunked")
             // Override the signed numeric value with a non-numeric one.
             .header("x-amz-decoded-content-length", "not-a-number")
-            .header("content-length", &wire.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -1143,8 +1143,8 @@ fn test_signed_streaming_missing_context_rejected() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -1179,8 +1179,8 @@ fn test_signed_chunked_multi_chunk() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &total_len.to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", total_len.to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -1244,8 +1244,8 @@ fn test_unsigned_chunked_multi_chunk() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &total_len.to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", total_len.to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -1314,8 +1314,8 @@ fn test_signed_chunked_trailing_checksum() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -1387,8 +1387,8 @@ fn test_signed_chunked_trailing_checksum_bad_trailer_sig() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -1430,8 +1430,8 @@ fn test_unsigned_trailing_checksum_verified() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -1501,8 +1501,8 @@ fn test_unsigned_trailing_checksum_bad_value() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -1543,7 +1543,7 @@ fn test_signed_chunked_empty_object() {
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
             .header("x-amz-decoded-content-length", "0")
-            .header("content-length", &wire.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -1605,7 +1605,7 @@ fn test_unsigned_chunked_empty_object() {
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
             .header("x-amz-decoded-content-length", "0")
-            .header("content-length", &wire.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -1653,8 +1653,8 @@ fn test_signed_chunked_small_non_final_chunk_rejected() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &total_len.to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", total_len.to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -1715,8 +1715,8 @@ fn test_signed_multi_chunk_bad_middle_signature() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &total_len.to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", total_len.to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -1841,8 +1841,8 @@ fn test_signed_multi_chunk_with_trailing_checksum() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &total_len.to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", total_len.to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -1910,9 +1910,9 @@ fn test_streaming_missing_content_encoding() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             // Deliberately NOT sending content-encoding header
-            .header("x-amz-decoded-content-length", &data.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
-            .header("content-length", &wire.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -1951,9 +1951,9 @@ fn test_streaming_wrong_content_encoding() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "gzip") // wrong value
-            .header("x-amz-decoded-content-length", &data.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
-            .header("content-length", &wire.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -1994,7 +1994,7 @@ fn test_streaming_missing_decoded_content_length() {
             .header("content-encoding", "aws-chunked")
             // Deliberately NOT sending x-amz-decoded-content-length
             .header("x-amz-trailer", "x-amz-checksum-crc32")
-            .header("content-length", &wire.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -2033,8 +2033,8 @@ fn test_streaming_unsupported_token() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -2072,8 +2072,8 @@ fn test_trailer_present_without_declaration() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             // Deliberately NOT sending x-amz-trailer header
             .send(&wire[..])
             .expect("transport error");
@@ -2111,8 +2111,8 @@ fn test_declared_trailer_missing_from_body() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -2155,8 +2155,8 @@ fn test_undeclared_trailer_in_body() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-sha256")
             .send(&wire[..])
             .expect("transport error");
@@ -2212,8 +2212,8 @@ fn test_non_trailer_mode_with_trailers() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -2259,8 +2259,8 @@ fn test_malformed_trailer_line_rejected() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .send(&wire[..])
             .expect("transport error");
@@ -2509,8 +2509,8 @@ fn test_inline_plus_trailing_checksum_rejected() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
             .header("x-amz-checksum-sha256", &bogus_sha256)
             .send(&wire[..])
@@ -2564,8 +2564,8 @@ fn test_inline_plus_trailing_checksum_rejected_mixed_case() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
-            .header("content-length", &wire.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
+            .header("content-length", wire.len().to_string())
             .header("x-amz-trailer", "X-Amz-Checksum-CRC32")
             .header("x-amz-checksum-sha256", &bogus_sha256)
             .send(&wire[..])
@@ -2691,7 +2691,7 @@ fn test_chunked_malformed_invalid_hex_chunk_size() {
             .header("content-encoding", "aws-chunked")
             .header("x-amz-decoded-content-length", "5")
             .header("x-amz-trailer", "x-amz-checksum-crc32")
-            .header("content-length", &wire.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -2734,7 +2734,7 @@ fn test_chunked_malformed_non_utf8_chunk_header() {
             .header("content-encoding", "aws-chunked")
             .header("x-amz-decoded-content-length", "5")
             .header("x-amz-trailer", "x-amz-checksum-crc32")
-            .header("content-length", &wire.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -2798,9 +2798,9 @@ fn test_signed_chunked_missing_trailer_signature() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
-            .header("content-length", &wire.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -2872,9 +2872,9 @@ fn test_signed_chunked_bad_trailer_signature() {
             .header("x-amz-date", &sign.amz_date)
             .header("x-amz-content-sha256", content_sha256)
             .header("content-encoding", "aws-chunked")
-            .header("x-amz-decoded-content-length", &data.len().to_string())
+            .header("x-amz-decoded-content-length", data.len().to_string())
             .header("x-amz-trailer", "x-amz-checksum-crc32")
-            .header("content-length", &wire.len().to_string())
+            .header("content-length", wire.len().to_string())
             .send(&wire[..])
             .expect("transport error");
         let status = resp.status().as_u16();
