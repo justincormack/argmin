@@ -4830,11 +4830,15 @@ impl ReadRuntime {
     }
 
     fn try_finalize_bucket_delete(&self, bucket: &str) -> Result<(), ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(bucket);
-        let bucket_pg_id = self.pg_topology.bucket_pg(bucket);
+        self.try_finalize_bucket_delete_for(&trusted_bucket_name(bucket))
+    }
+
+    fn try_finalize_bucket_delete_for(&self, bucket: &BucketName) -> Result<(), ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(bucket.as_str());
+        let bucket_pg_id = self.pg_topology.bucket_pg_for(bucket);
         {
             let bucket_pg = self.storage_node.get_pg(bucket_pg_id)?;
-            let info = match bucket_pg.head_bucket_raw(bucket) {
+            let info = match bucket_pg.head_bucket(bucket.as_str()) {
                 Ok(info) => info,
                 Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(()),
                 Err(other) => return Err(ServerError::Metadata(other)),
@@ -4850,7 +4854,7 @@ impl ReadRuntime {
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let versions = pg.list_object_versions(&ListObjectVersionsReq {
-                bucket: trusted_bucket_name(bucket),
+                bucket: bucket.clone(),
                 prefix: None,
                 key_marker: None,
                 version_id_marker: None,
@@ -4861,7 +4865,7 @@ impl ReadRuntime {
                 return Ok(());
             }
             let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: trusted_bucket_name(bucket),
+                bucket: bucket.clone(),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
@@ -4871,7 +4875,7 @@ impl ReadRuntime {
                 found_visible_data = true;
                 return Ok(());
             }
-            if let Some(root) = pg.get_bucket_payload_reclaim_root(bucket)? {
+            if let Some(root) = pg.get_bucket_payload_reclaim_root(bucket.as_str())? {
                 found_reclaim_root = true;
                 reclaim_roots.push(root);
             }
@@ -4895,18 +4899,23 @@ impl ReadRuntime {
                 );
             }
         }
-        if found_reclaim_root || self.storage_node.bucket_object_payload_lease_count(bucket) != 0 {
+        if found_reclaim_root
+            || self
+                .storage_node
+                .bucket_object_payload_lease_count(bucket.as_str())
+                != 0
+        {
             return Ok(());
         }
 
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
-            pg.delete_completed_multipart_uploads_for_bucket(bucket)
+            pg.delete_completed_multipart_uploads_for_bucket(bucket.as_str())
                 .map_err(ServerError::Metadata)
         })?;
 
         let bucket_pg = self.storage_node.get_pg(bucket_pg_id)?;
-        match bucket_pg.delete_bucket(bucket) {
+        match bucket_pg.delete_bucket(bucket.as_str()) {
             Ok(()) => Ok(()),
             Err(storage::MetadataError::BucketNotFound { .. }) => Ok(()),
             Err(other) => Err(ServerError::Metadata(other)),
@@ -5981,6 +5990,7 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
     fn unchecked_active_bucket_summary(&self, name: &str) -> Result<BucketSummary, ServerError> {
         if let Some(info) = self.storage_node.get_bucket_fast_path(name) {
             if info.state == BucketState::Active {
@@ -6192,6 +6202,7 @@ impl Coordinator {
         self.pg_topology.object_pg_for(bucket, key)
     }
 
+    #[cfg(test)]
     fn bucket_pg_id(&self, bucket: &str) -> u32 {
         self.bucket_pg_id_for(&trusted_bucket_name(bucket))
     }
@@ -6210,6 +6221,7 @@ impl Coordinator {
         self.shard_pg_id_raw(bucket, key, generation_id.get())
     }
 
+    #[cfg(test)]
     fn get_bucket_pg(&self, bucket: &str) -> Result<MutexGuard<'_, storage::PgStore>, ServerError> {
         let pg_id = self.bucket_pg_id(bucket);
         Ok(self.storage_node.get_pg(pg_id)?)
@@ -6276,10 +6288,11 @@ impl Coordinator {
             req.object_lock_enabled
         );
         let authorized = self.authorize_create_bucket(req)?;
+        let authorized_name = trusted_bucket_name(&authorized.name);
 
-        let create_outcome = self.create_bucket_with_acl_grants(
+        let create_outcome = self.create_bucket_with_acl_grants_for(
             &authorized.owner,
-            &authorized.name,
+            &authorized_name,
             authorized.acl_grants,
             authorized.object_lock_enabled,
         )?;
@@ -6287,7 +6300,7 @@ impl Coordinator {
             BucketCreateOutcome::Created => {
                 self.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
                     bucket: BucketRequest {
-                        name: trusted_bucket_name(&authorized.name),
+                        name: authorized_name,
                         requester: authorized.requester.clone(),
                         expected_bucket_owner: None,
                     },
@@ -6302,8 +6315,7 @@ impl Coordinator {
                 {
                     return Err(ServerError::BucketAlreadyOwnedByYou);
                 }
-                let existing = self
-                    .unchecked_active_bucket_summary_for(&trusted_bucket_name(&authorized.name))?;
+                let existing = self.unchecked_active_bucket_summary_for(&authorized_name)?;
                 let authorized_acl = self.resolve_create_bucket_recreate_acl_update(
                     &existing,
                     &authorized.owner,
@@ -6384,6 +6396,7 @@ impl Coordinator {
         Ok(())
     }
 
+    #[cfg(test)]
     fn create_bucket_with_acl_grants(
         &self,
         owner: &OwnerIdentity,
@@ -6391,8 +6404,23 @@ impl Coordinator {
         acl_grants: AclGrants,
         object_lock_enabled: bool,
     ) -> Result<BucketCreateOutcome, ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(name);
-        let bucket_pg = self.get_bucket_pg(name)?;
+        self.create_bucket_with_acl_grants_for(
+            owner,
+            &trusted_bucket_name(name),
+            acl_grants,
+            object_lock_enabled,
+        )
+    }
+
+    fn create_bucket_with_acl_grants_for(
+        &self,
+        owner: &OwnerIdentity,
+        name: &BucketName,
+        acl_grants: AclGrants,
+        object_lock_enabled: bool,
+    ) -> Result<BucketCreateOutcome, ServerError> {
+        let _bucket_guard = self.storage_node.lock_bucket(name.as_str());
+        let bucket_pg = self.get_bucket_pg_for(name)?;
         let public_read = Self::acl_grants_public_read(&acl_grants);
         let public_write = Self::acl_grants_public_write(&acl_grants);
         let initial_versioning = if object_lock_enabled {
@@ -6405,7 +6433,7 @@ impl Coordinator {
             default_retention: None,
         };
         match bucket_pg.create_bucket_with_config(&storage::CreateBucketConfig {
-            name,
+            name: name.as_str(),
             owner_principal: owner.principal.as_str(),
             owner_canonical_id: &owner.canonical_id,
             acl_grants: &acl_grants,
@@ -6415,7 +6443,7 @@ impl Coordinator {
             object_lock: initial_object_lock,
         }) {
             Ok(()) => {
-                let info = bucket_pg.head_bucket_raw(name).map_err(|e| match e {
+                let info = bucket_pg.head_bucket(name.as_str()).map_err(|e| match e {
                     storage::MetadataError::BucketNotFound { name } => {
                         ServerError::BucketNotFound {
                             name: name.to_string(),
@@ -6427,7 +6455,7 @@ impl Coordinator {
                 Ok(BucketCreateOutcome::Created)
             }
             Err(storage::MetadataError::BucketAlreadyExists) => {
-                let existing = bucket_pg.head_bucket_raw(name).map_err(|e| match e {
+                let existing = bucket_pg.head_bucket(name.as_str()).map_err(|e| match e {
                     storage::MetadataError::BucketNotFound { name } => {
                         ServerError::BucketNotFound {
                             name: name.to_string(),
