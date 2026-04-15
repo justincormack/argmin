@@ -4115,7 +4115,7 @@ mod tests {
     #[test]
     fn list_buckets_xml_format() {
         let buckets = vec![BucketSummary {
-            name: "test-bucket".to_string(),
+            name: storage::BucketName::try_from("test-bucket").unwrap(),
             owner_principal: "owner".to_string(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
             created_at: 1685000000000,

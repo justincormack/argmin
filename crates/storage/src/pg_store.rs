@@ -68,6 +68,16 @@ fn trusted_object_key(key: impl Into<String>) -> ObjectKey {
         .expect("pg_store must only construct ObjectKey from validated values")
 }
 
+fn validated_object_key(key: &str) -> Result<ObjectKey, MetadataError> {
+    ObjectKey::try_from(key).map_err(|error| MetadataError::InvalidObjectKey {
+        reason: error.to_string(),
+    })
+}
+
+fn validated_bucket_key(bucket: &str, key: &str) -> Result<(BucketName, ObjectKey), MetadataError> {
+    Ok((validated_bucket_name(bucket)?, validated_object_key(key)?))
+}
+
 struct PreparedShardFile {
     key: ShardKey,
     ack: WriteAck,
@@ -1944,6 +1954,279 @@ impl PgStore {
         }
     }
 
+    pub fn get_object_meta(&self, bucket: &str, key: &str) -> Result<StoredObject, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::get_object_meta(self, &bucket, &key)
+    }
+
+    pub fn get_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+    ) -> Result<StoredObject, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::get_object_version(self, &bucket, &key, version_id)
+    }
+
+    pub fn delete_object_meta(&self, bucket: &str, key: &str) -> Result<(), MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::delete_object_meta(self, &bucket, &key)
+    }
+
+    pub fn delete_object_version(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+    ) -> Result<(), MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::delete_object_version(self, &bucket, &key, version_id)
+    }
+
+    pub fn next_version_id(&self, bucket: &str, key: &str) -> Result<VersionId, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::next_version_id(self, &bucket, &key)
+    }
+
+    pub fn next_generation_id(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<GenerationId, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::next_generation_id(self, &bucket, &key)
+    }
+
+    pub fn get_simple_payload_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<Option<SimplePayloadReclaimRecord>, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::get_simple_payload_reclaim(self, &bucket, &key, generation_id)
+    }
+
+    pub fn delete_simple_payload_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<(), MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::delete_simple_payload_reclaim(self, &bucket, &key, generation_id)
+    }
+
+    pub fn get_object_segments_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<Option<ObjectSegmentsReclaimRecord>, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::get_object_segments_reclaim(self, &bucket, &key, generation_id)
+    }
+
+    pub fn delete_object_segments_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<(), MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::delete_object_segments_reclaim(self, &bucket, &key, generation_id)
+    }
+
+    pub fn get_multipart_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<Option<MultipartReclaimRecord>, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::get_multipart_reclaim(self, &bucket, &key, generation_id)
+    }
+
+    pub fn delete_multipart_reclaim(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<(), MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::delete_multipart_reclaim(self, &bucket, &key, generation_id)
+    }
+
+    pub fn payload_reclaim_exists(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<bool, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::payload_reclaim_exists(self, &bucket, &key, generation_id)
+    }
+
+    pub fn get_bucket_payload_reclaim_root(
+        &self,
+        bucket: &str,
+    ) -> Result<Option<PayloadReclaimRoot>, MetadataError> {
+        PgMetadataStore::get_bucket_payload_reclaim_root(self, &validated_bucket_name(bucket)?)
+    }
+
+    pub fn put_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        tags: &str,
+    ) -> Result<(), MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::put_object_tags(self, &bucket, &key, version_id, tags)
+    }
+
+    pub fn get_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+    ) -> Result<Option<String>, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::get_object_tags(self, &bucket, &key, version_id)
+    }
+
+    pub fn delete_object_tags(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+    ) -> Result<(), MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::delete_object_tags(self, &bucket, &key, version_id)
+    }
+
+    pub fn delete_completed_multipart_uploads_for_bucket(
+        &self,
+        bucket: &str,
+    ) -> Result<(), MetadataError> {
+        PgMetadataStore::delete_completed_multipart_uploads_for_bucket(
+            self,
+            &validated_bucket_name(bucket)?,
+        )
+    }
+
+    pub fn get_object_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+    ) -> Result<Vec<ObjectPartRecord>, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::get_object_parts(self, &bucket, &key, version_id)
+    }
+
+    pub fn get_object_parts_overlapping_range(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        start: u64,
+        end_exclusive: u64,
+    ) -> Result<Vec<ObjectPartRangeRecord>, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::get_object_parts_overlapping_range(
+            self,
+            &bucket,
+            &key,
+            version_id,
+            start,
+            end_exclusive,
+        )
+    }
+
+    pub fn delete_object_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+    ) -> Result<(), MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::delete_object_parts(self, &bucket, &key, version_id)
+    }
+
+    pub fn get_object_segments(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+    ) -> Result<Vec<ObjectSegmentRecord>, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::get_object_segments(self, &bucket, &key, version_id)
+    }
+
+    pub fn delete_object_segments(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+    ) -> Result<(), MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::delete_object_segments(self, &bucket, &key, version_id)
+    }
+
+    pub fn get_multipart_part_segments(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        part_number: u32,
+    ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::get_multipart_part_segments(self, &bucket, &key, version_id, part_number)
+    }
+
+    pub fn delete_multipart_part_segments(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+    ) -> Result<(), MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::delete_multipart_part_segments(self, &bucket, &key, version_id)
+    }
+
+    pub fn list_object_versions_for_key(
+        &self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Vec<StoredObject>, MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::list_object_versions_for_key(self, &bucket, &key)
+    }
+
+    pub fn put_object_retention(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        retention: ObjectRetention,
+    ) -> Result<(), MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::put_object_retention(self, &bucket, &key, version_id, retention)
+    }
+
+    pub fn put_object_legal_hold(
+        &self,
+        bucket: &str,
+        key: &str,
+        version_id: VersionId,
+        legal_hold: StoredLegalHoldStatus,
+    ) -> Result<(), MetadataError> {
+        let (bucket, key) = validated_bucket_key(bucket, key)?;
+        PgMetadataStore::put_object_legal_hold(self, &bucket, &key, version_id, legal_hold)
+    }
+
     fn next_object_write_sequence(&self, bucket: &str, key: &str) -> Result<u64, MetadataError> {
         let max: Option<i64> = self
             .conn
@@ -3256,7 +3539,11 @@ impl PgMetadataStore for PgStore {
         }
     }
 
-    fn get_object_meta(&self, bucket: &str, key: &str) -> Result<StoredObject, MetadataError> {
+    fn get_object_meta(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<StoredObject, MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::get_object_meta",
@@ -3286,8 +3573,8 @@ impl PgMetadataStore for PgStore {
 
     fn get_object_version(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<StoredObject, MetadataError> {
         observability::trace_scope!(
@@ -3319,8 +3606,8 @@ impl PgMetadataStore for PgStore {
 
     fn put_object_acl(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         acl_grants: &AclGrants,
         public_read: bool,
@@ -3368,8 +3655,8 @@ impl PgMetadataStore for PgStore {
 
     fn put_object_retention(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         retention: ObjectRetention,
     ) -> Result<(), MetadataError> {
@@ -3425,8 +3712,8 @@ impl PgMetadataStore for PgStore {
 
     fn put_object_legal_hold(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         legal_hold: StoredLegalHoldStatus,
     ) -> Result<(), MetadataError> {
@@ -3470,7 +3757,11 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
-    fn delete_object_meta(&self, bucket: &str, key: &str) -> Result<(), MetadataError> {
+    fn delete_object_meta(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<(), MetadataError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "PgStore::delete_object_meta",
@@ -3493,8 +3784,8 @@ impl PgMetadataStore for PgStore {
 
     fn delete_object_version(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError> {
         observability::trace_scope!(
@@ -3781,8 +4072,8 @@ impl PgMetadataStore for PgStore {
 
     fn list_object_versions_for_key(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
     ) -> Result<Vec<StoredObject>, MetadataError> {
         let mut stmt = self
             .conn
@@ -3816,7 +4107,11 @@ impl PgMetadataStore for PgStore {
         Ok(versions)
     }
 
-    fn next_version_id(&self, bucket: &str, key: &str) -> Result<VersionId, MetadataError> {
+    fn next_version_id(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<VersionId, MetadataError> {
         let max: Option<i64> = self
             .conn
             .query_row(
@@ -3855,7 +4150,11 @@ impl PgMetadataStore for PgStore {
         Ok(VersionId::from_u64(next))
     }
 
-    fn next_generation_id(&self, bucket: &str, key: &str) -> Result<GenerationId, MetadataError> {
+    fn next_generation_id(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<GenerationId, MetadataError> {
         let max: Option<i64> = self
             .conn
             .query_row(
@@ -3936,8 +4235,8 @@ impl PgMetadataStore for PgStore {
 
     fn get_simple_payload_reclaim(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<Option<SimplePayloadReclaimRecord>, MetadataError> {
         self.conn
@@ -3972,8 +4271,8 @@ impl PgMetadataStore for PgStore {
 
     fn delete_simple_payload_reclaim(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<(), MetadataError> {
         self.conn
@@ -4064,8 +4363,8 @@ impl PgMetadataStore for PgStore {
 
     fn get_object_segments_reclaim(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<Option<ObjectSegmentsReclaimRecord>, MetadataError> {
         let root = self
@@ -4151,8 +4450,8 @@ impl PgMetadataStore for PgStore {
 
     fn delete_object_segments_reclaim(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<(), MetadataError> {
         self.conn
@@ -4300,8 +4599,8 @@ impl PgMetadataStore for PgStore {
 
     fn get_multipart_reclaim(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<Option<MultipartReclaimRecord>, MetadataError> {
         let root = self
@@ -4497,8 +4796,8 @@ impl PgMetadataStore for PgStore {
 
     fn delete_multipart_reclaim(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<(), MetadataError> {
         self.conn
@@ -4516,8 +4815,8 @@ impl PgMetadataStore for PgStore {
 
     fn payload_reclaim_exists(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, MetadataError> {
         self.conn
@@ -4546,7 +4845,7 @@ impl PgMetadataStore for PgStore {
 
     fn get_bucket_payload_reclaim_root(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
     ) -> Result<Option<PayloadReclaimRoot>, MetadataError> {
         self.conn
             .query_row(
@@ -4581,8 +4880,8 @@ impl PgMetadataStore for PgStore {
 
     fn put_object_tags(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         tags: &str,
     ) -> Result<(), MetadataError> {
@@ -4619,8 +4918,8 @@ impl PgMetadataStore for PgStore {
 
     fn get_object_tags(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<Option<String>, MetadataError> {
         let result = self.conn
@@ -4658,8 +4957,8 @@ impl PgMetadataStore for PgStore {
 
     fn delete_object_tags(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError> {
         let updated = self
@@ -4992,7 +5291,7 @@ impl PgMetadataStore for PgStore {
 
     fn delete_completed_multipart_uploads_for_bucket(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
     ) -> Result<(), MetadataError> {
         self.conn
             .execute(
@@ -5622,8 +5921,8 @@ impl PgMetadataStore for PgStore {
 
     fn get_object_parts(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<Vec<ObjectPartRecord>, MetadataError> {
         let mut stmt = self
@@ -5662,8 +5961,8 @@ impl PgMetadataStore for PgStore {
 
     fn get_object_parts_overlapping_range(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         start: u64,
         end_exclusive: u64,
@@ -5755,8 +6054,8 @@ impl PgMetadataStore for PgStore {
 
     fn delete_object_parts(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError> {
         self.conn
@@ -7075,8 +7374,8 @@ impl PgMetadataStore for PgStore {
 
     fn get_object_segments(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<Vec<ObjectSegmentRecord>, MetadataError> {
         let mut stmt = self
@@ -7131,8 +7430,8 @@ impl PgMetadataStore for PgStore {
 
     fn delete_object_segments(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError> {
         self.conn
@@ -7150,8 +7449,8 @@ impl PgMetadataStore for PgStore {
 
     fn get_multipart_part_segments(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         part_number: u32,
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError> {
@@ -7212,8 +7511,8 @@ impl PgMetadataStore for PgStore {
 
     fn delete_multipart_part_segments(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError> {
         self.conn

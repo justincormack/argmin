@@ -56,7 +56,9 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
     store.put_object_meta(&req).unwrap();
 
     // Get
-    let obj = store.get_object_meta("test-bucket", "test-key").unwrap();
+    let obj = store
+        .get_object_meta(&bucket_name("test-bucket"), &object_key("test-key"))
+        .unwrap();
     assert_eq!(*obj.bucket(), "test-bucket");
     assert_eq!(*obj.key(), "test-key");
     assert_eq!(obj.version_id(), VersionId::Null);
@@ -74,10 +76,12 @@ fn metadata_put_get_delete(store: &dyn PgMetadataStore) {
     assert!(obj.last_modified() > 0);
 
     // Delete
-    store.delete_object_meta("test-bucket", "test-key").unwrap();
+    store
+        .delete_object_meta(&bucket_name("test-bucket"), &object_key("test-key"))
+        .unwrap();
 
     let err = store
-        .get_object_meta("test-bucket", "test-key")
+        .get_object_meta(&bucket_name("test-bucket"), &object_key("test-key"))
         .unwrap_err();
     assert!(matches!(err, crate::MetadataError::ObjectNotFound));
 }
@@ -123,14 +127,18 @@ fn metadata_put_overwrites(store: &dyn PgMetadataStore) {
     });
     store.put_object_meta(&req2).unwrap();
 
-    let obj = store.get_object_meta("bucket", "k").unwrap();
+    let obj = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     let live = obj.as_live().unwrap();
     assert_eq!(live.size, 200);
     assert_eq!(live.etag, ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0]));
 }
 
 fn metadata_get_nonexistent(store: &dyn PgMetadataStore) {
-    let err = store.get_object_meta("no-bucket", "no-key").unwrap_err();
+    let err = store
+        .get_object_meta(&bucket_name("no-bucket"), &object_key("no-key"))
+        .unwrap_err();
     assert!(matches!(err, crate::MetadataError::ObjectNotFound));
 }
 
@@ -341,7 +349,9 @@ fn metadata_long_key(store: &dyn PgMetadataStore) {
     });
     store.put_object_meta(&req).unwrap();
 
-    let obj = store.get_object_meta("bucket", &long_key).unwrap();
+    let obj = store
+        .get_object_meta(&bucket_name("bucket"), &object_key(&long_key))
+        .unwrap();
     assert_eq!(*obj.key(), long_key);
 }
 
@@ -366,7 +376,9 @@ fn metadata_zero_size_object(store: &dyn PgMetadataStore) {
     });
     store.put_object_meta(&req).unwrap();
 
-    let obj = store.get_object_meta("bucket", "empty-obj").unwrap();
+    let obj = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("empty-obj"))
+        .unwrap();
     assert_eq!(obj.as_live().unwrap().size, 0);
 }
 
@@ -2919,8 +2931,8 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
 
     let middle = store
         .get_object_parts_overlapping_range(
-            "bucket",
-            "k",
+            &bucket_name("bucket"),
+            &object_key("k"),
             VersionId::from_u64(1),
             5 * mib,
             5 * mib + 1,
@@ -2932,8 +2944,8 @@ fn get_object_parts_overlapping_range_returns_only_overlapping_parts() {
 
     let boundary = store
         .get_object_parts_overlapping_range(
-            "bucket",
-            "k",
+            &bucket_name("bucket"),
+            &object_key("k"),
             VersionId::from_u64(1),
             5 * mib - 1,
             5 * mib + 1,
@@ -2969,16 +2981,28 @@ fn mpu_delete_object_parts() {
         .unwrap();
 
     store
-        .delete_object_parts("bucket", "k", VersionId::from_u64(1))
+        .delete_object_parts(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+        )
         .unwrap();
     let parts = store
-        .get_object_parts("bucket", "k", VersionId::from_u64(1))
+        .get_object_parts(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+        )
         .unwrap();
     assert!(parts.is_empty());
 
     // Delete again is idempotent (no error)
     store
-        .delete_object_parts("bucket", "k", VersionId::from_u64(1))
+        .delete_object_parts(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+        )
         .unwrap();
 }
 
@@ -4066,14 +4090,15 @@ mod prop_tests {
         prop_assert_eq!(&actual, &expected, "{}", context);
 
         for key in keys {
-            let per_key = match store.list_object_versions_for_key(PROP_TEST_BUCKET, key.as_str()) {
-                Ok(versions) => version_snapshots_from_store(&versions),
-                Err(err) => {
-                    return Err(TestCaseError::fail(format!(
-                        "{context}\nlist_object_versions_for_key failed for key {key}: {err:?}"
-                    )))
-                }
-            };
+            let per_key =
+                match store.list_object_versions_for_key(&bucket_name(PROP_TEST_BUCKET), key) {
+                    Ok(versions) => version_snapshots_from_store(&versions),
+                    Err(err) => {
+                        return Err(TestCaseError::fail(format!(
+                            "{context}\nlist_object_versions_for_key failed for key {key}: {err:?}"
+                        )))
+                    }
+                };
             let expected_per_key = model_version_snapshots_for_key(model, key);
             prop_assert_eq!(per_key, expected_per_key, "{}", context);
         }
@@ -5156,16 +5181,16 @@ fn delete_object_segments_cleanup() {
 
     // Delete committed segments
     store
-        .delete_object_segments("bucket", "k", VersionId::Null)
+        .delete_object_segments(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     let segments = store
-        .get_object_segments("bucket", "k", VersionId::Null)
+        .get_object_segments(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert!(segments.is_empty());
 
     // Idempotent
     store
-        .delete_object_segments("bucket", "k", VersionId::Null)
+        .delete_object_segments(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
 }
 
@@ -5246,7 +5271,12 @@ fn multipart_part_segments_crud() {
 
     // Read back
     let segments = store
-        .get_multipart_part_segments("bucket", "k", VersionId::from_u64(1), 1)
+        .get_multipart_part_segments(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+            1,
+        )
         .unwrap();
     assert_eq!(segments.len(), 2);
     assert_eq!(segments[0].segment_index, 0);
@@ -5256,10 +5286,19 @@ fn multipart_part_segments_crud() {
 
     // Delete
     store
-        .delete_multipart_part_segments("bucket", "k", VersionId::from_u64(1))
+        .delete_multipart_part_segments(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+        )
         .unwrap();
     let segments = store
-        .get_multipart_part_segments("bucket", "k", VersionId::from_u64(1), 1)
+        .get_multipart_part_segments(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+            1,
+        )
         .unwrap();
     assert!(segments.is_empty());
 }
@@ -5428,7 +5467,12 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
     );
 
     let segments = store
-        .get_multipart_part_segments("bucket", "k", VersionId::from_u64(u64::MAX), 1)
+        .get_multipart_part_segments(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(u64::MAX),
+            1,
+        )
         .unwrap();
     assert_eq!(segments.len(), 3);
 
@@ -5476,7 +5520,12 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
 
     // Verify: only 1 segment (stale rows deleted)
     let segments = store
-        .get_multipart_part_segments("bucket", "k", VersionId::from_u64(u64::MAX), 1)
+        .get_multipart_part_segments(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(u64::MAX),
+            1,
+        )
         .unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].size, 5000);
@@ -5737,7 +5786,12 @@ fn commit_stream_part_zero_segments_clears_prior() {
 
     assert_eq!(
         store
-            .get_multipart_part_segments("bucket", "k", VersionId::from_u64(u64::MAX), 1)
+            .get_multipart_part_segments(
+                &bucket_name("bucket"),
+                &object_key("k"),
+                VersionId::from_u64(u64::MAX),
+                1,
+            )
             .unwrap()
             .len(),
         2
@@ -5778,7 +5832,12 @@ fn commit_stream_part_zero_segments_clears_prior() {
         .unwrap();
 
     let segments = store
-        .get_multipart_part_segments("bucket", "k", VersionId::from_u64(u64::MAX), 1)
+        .get_multipart_part_segments(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(u64::MAX),
+            1,
+        )
         .unwrap();
     assert!(
         segments.is_empty(),
@@ -7507,6 +7566,29 @@ fn raw_bucket_methods_reject_invalid_bucket_names_without_panicking() {
 }
 
 #[test]
+fn raw_object_methods_reject_invalid_names_without_panicking() {
+    let (_dir, store) = make_pg_store();
+
+    let err = store.get_object_meta("BadBucket", "key").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvalidBucketName { .. }
+    ));
+
+    let err = store.get_object_meta("bucket", "").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvalidObjectKey { .. }
+    ));
+
+    let err = store.next_generation_id("bucket", "\0").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::MetadataError::InvalidObjectKey { .. }
+    ));
+}
+
+#[test]
 fn bucket_write_reservations_and_drain_round_trip() {
     let (_dir, store) = make_pg_store();
     store
@@ -7831,14 +7913,24 @@ fn put_object_retention_and_legal_hold_round_trip() {
         retain_until_unix_seconds: 5_364_662_400,
     };
     store
-        .put_object_retention("bucket", "key", version_id, retention)
+        .put_object_retention(
+            &bucket_name("bucket"),
+            &object_key("key"),
+            version_id,
+            retention,
+        )
         .unwrap();
     store
-        .put_object_legal_hold("bucket", "key", version_id, StoredLegalHoldStatus::On)
+        .put_object_legal_hold(
+            &bucket_name("bucket"),
+            &object_key("key"),
+            version_id,
+            StoredLegalHoldStatus::On,
+        )
         .unwrap();
 
     let record = store
-        .get_object_version("bucket", "key", version_id)
+        .get_object_version(&bucket_name("bucket"), &object_key("key"), version_id)
         .unwrap();
     let live = record.as_live().unwrap();
     assert_eq!(live.object_lock.retention, Some(retention));
@@ -7860,8 +7952,8 @@ fn put_object_retention_and_legal_hold_reject_delete_marker() {
 
     let err = store
         .put_object_retention(
-            "bucket",
-            "key",
+            &bucket_name("bucket"),
+            &object_key("key"),
             version_id,
             ObjectRetention {
                 mode: ObjectLockMode::Governance,
@@ -7875,7 +7967,12 @@ fn put_object_retention_and_legal_hold_reject_delete_marker() {
     ));
 
     let err = store
-        .put_object_legal_hold("bucket", "key", version_id, StoredLegalHoldStatus::Off)
+        .put_object_legal_hold(
+            &bucket_name("bucket"),
+            &object_key("key"),
+            version_id,
+            StoredLegalHoldStatus::Off,
+        )
         .unwrap_err();
     assert!(matches!(
         err,

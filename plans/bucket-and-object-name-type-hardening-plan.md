@@ -31,21 +31,25 @@ What has landed so far:
 8. Object delete, object read/authz state loading, and multipart authz entry
    points now use typed bucket/object PG routing and typed bucket-summary
    helpers instead of the older raw-string coordinator helpers.
-9. The bucket-only `PgMetadataStore` boundary is now partly migrated to typed
-   `BucketName` parameters, and the main coordinator bucket operations now use
-   those typed storage calls rather than a string-only storage trait surface.
-   `PgStore` still keeps narrow raw wrappers for tests and compatibility during
-   migration, but the trait-level boundary moved.
+9. The `PgMetadataStore` boundary is now substantially migrated to typed
+   `BucketName` / `ObjectKey` parameters on both bucket and object paths, and
+   the main coordinator object/multipart/read/reclaim flows now use those
+   typed storage calls instead of a raw-string storage-dispatch surface.
+10. `BucketSummary`, the coordinator bucket policy/lifecycle caches, and the
+    `SharedStorageNode` bucket fast-path / bucket-lock / multipart-completion
+    lock helpers now also carry `BucketName` directly instead of degrading
+    hot-path bucket state back to `String`.
 
 What is still open before Phase 3 can be marked complete:
 
-1. `server-core` still has many internal helper and storage-dispatch APIs that
-   take raw `&str` bucket/key values.
-2. `crates/storage/src/traits.rs` still exposes raw-string bucket/key methods,
-   so the typed invariant is not yet carried through the storage trait boundary.
-3. There is still a mixed model of typed request ingress plus downstream
-   trusted reconstruction in parts of coordinator/storage interaction, which is
-   exactly what the rest of Phase 3 needs to remove or narrow.
+1. `server-core` still has a small number of compatibility and convenience
+   helpers that accept raw `&str` bucket/key values, mostly around external
+   probes, cache keys, older raw PG helpers, and test-only entry points.
+2. The final Phase 3 answer on raw internal PG/cache helper variants versus
+   typed-only access is not complete yet.
+3. The PG hashing failure-model cleanup is still only partly done: typed S3
+   entry points now cover the main request path, but some older raw helper
+   variants remain for internal namespaces and compatibility-shaped paths.
 
 `security/codex-23ffb1b` remains open until the early migration phases in this
 plan land. This plan is the intended fix path; it is not documenting work that
@@ -307,22 +311,32 @@ Current status:
    coordinator cleanup entry points for those sessions now take typed names on
    their production path. The non-test `bucket_exists` region-probe path and
    authz bucket-policy PG lookup also now route through typed bucket parsing /
-   typed PG accessors rather than leaning on test-only raw helpers. This
-   pushes the remaining raw-string boundary outward toward the true ingress
-   points.
+   typed PG accessors rather than leaning on test-only raw helpers. The
+   reclaim queue, bucket-delete finalize queue, payload-lease bookkeeping, and
+   `PayloadLease` drop path now also carry typed bucket/key values instead of
+   raw strings, and the reclaim worker consumes those typed queue items
+   directly on its production path. The read-path `ReadObjectContext`,
+   multipart/segment `ReadHandle` constructors, stale-payload cleanup path, and
+   multipart-abort path now also reuse typed bucket/key values instead of
+   reconstructing trusted strings. The object-side `PgMetadataStore` boundary
+   now likewise takes typed bucket/object parameters for the main metadata,
+   version, reclaim, tags, and parts/segments APIs, so the production
+   coordinator/storage dispatch path is substantially typed end to end.
+   `BucketSummary`, the bucket policy/lifecycle caches, and the
+   `SharedStorageNode` bucket fast-path / bucket-lock / multipart-completion
+   lock helpers now also keep typed bucket names on the production path
+   instead of downgrading those hot-path coordinator internals back to
+   `String`. This pushes the remaining raw-string boundary outward toward the
+   true ingress points and a shrinking set of compatibility helpers.
 4. Still open:
-   storage-dispatch and some older coordinator-internal helper APIs still
-   accept raw `&str` bucket/key parameters, now mostly around internal reclaim
-   / lease bookkeeping and a few compatibility wrappers that still sit above
-   typed PG entry points.
+   some older coordinator-internal helper APIs still accept raw `&str`
+   bucket/key parameters, now mostly around external convenience probes, older
+   raw PG helper variants, and a few compatibility wrappers that still sit
+   above typed PG entry points.
 5. Still open:
    the final Phase 3 answer on the failure model is only partly in place today.
    Typed PG entry points exist for validated S3 names, but raw helper entry
    points still remain for internal namespaces and older call paths.
-6. Still open:
-   the storage boundary is still mixed overall: bucket-only trait methods are
-   partly typed now, but object-key/object-version/storage-dispatch APIs still
-   largely accept raw `&str` bucket/key values.
 
 Exit criteria:
 

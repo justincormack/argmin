@@ -429,6 +429,7 @@ impl From<MetadataError> for ServerError {
             MetadataError::InvalidBucketName { reason } => {
                 ServerError::InvalidBucketName { reason }
             }
+            MetadataError::InvalidObjectKey { reason } => ServerError::InvalidArgument { reason },
             other => ServerError::Metadata(other),
         }
     }
@@ -845,6 +846,12 @@ mod tests {
     fn from_metadata_error() {
         let err: ServerError = MetadataError::ObjectNotFound.into();
         assert!(matches!(err, ServerError::Metadata(_)));
+    }
+
+    #[test]
+    fn from_invalid_object_key_metadata_error() {
+        let err: ServerError = MetadataError::InvalidObjectKey { reason: "x".into() }.into();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
     }
 
     #[test]

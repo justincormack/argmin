@@ -198,21 +198,25 @@ pub trait PgMetadataStore {
     ///
     /// Returns the latest version whether live or delete marker.
     /// The coordinator decides what to do with delete markers.
-    fn get_object_meta(&self, bucket: &str, key: &str) -> Result<StoredObject, MetadataError>;
+    fn get_object_meta(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<StoredObject, MetadataError>;
 
     /// Get a specific version of an object.
     fn get_object_version(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<StoredObject, MetadataError>;
 
     /// Update the ACL grants for a specific live object version.
     fn put_object_acl(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         acl_grants: &AclGrants,
         public_read: bool,
@@ -221,8 +225,8 @@ pub trait PgMetadataStore {
     /// Update retention metadata for a specific live object version.
     fn put_object_retention(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         retention: ObjectRetention,
     ) -> Result<(), MetadataError>;
@@ -230,20 +234,21 @@ pub trait PgMetadataStore {
     /// Update legal hold metadata for a specific live object version.
     fn put_object_legal_hold(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         legal_hold: StoredLegalHoldStatus,
     ) -> Result<(), MetadataError>;
 
     /// Delete all versions of an object's metadata.
-    fn delete_object_meta(&self, bucket: &str, key: &str) -> Result<(), MetadataError>;
+    fn delete_object_meta(&self, bucket: &BucketName, key: &ObjectKey)
+        -> Result<(), MetadataError>;
 
     /// Delete a specific version of an object's metadata.
     fn delete_object_version(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError>;
 
@@ -264,19 +269,27 @@ pub trait PgMetadataStore {
     /// List all versions for a single key, newest write first.
     fn list_object_versions_for_key(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
     ) -> Result<Vec<StoredObject>, MetadataError>;
 
     /// Get the next version_id for a key (MAX(version_id) + 1).
     ///
     /// Returns 1 if no versions exist.
-    fn next_version_id(&self, bucket: &str, key: &str) -> Result<VersionId, MetadataError>;
+    fn next_version_id(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<VersionId, MetadataError>;
 
     /// Get the next internal payload generation_id for a key.
     ///
     /// Returns 1 if no live object generations exist.
-    fn next_generation_id(&self, bucket: &str, key: &str) -> Result<GenerationId, MetadataError>;
+    fn next_generation_id(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<GenerationId, MetadataError>;
 
     /// Insert a durable reclaim record for a simple single-shard-set payload.
     fn put_simple_payload_reclaim(
@@ -287,16 +300,16 @@ pub trait PgMetadataStore {
     /// Look up a durable reclaim record for a simple payload generation.
     fn get_simple_payload_reclaim(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<Option<SimplePayloadReclaimRecord>, MetadataError>;
 
     /// Delete a durable reclaim record for a simple payload generation.
     fn delete_simple_payload_reclaim(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<(), MetadataError>;
 
@@ -309,16 +322,16 @@ pub trait PgMetadataStore {
     /// Look up a durable reclaim record for a standard segmented payload generation.
     fn get_object_segments_reclaim(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<Option<ObjectSegmentsReclaimRecord>, MetadataError>;
 
     /// Delete a durable reclaim record for a standard segmented payload generation.
     fn delete_object_segments_reclaim(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<(), MetadataError>;
 
@@ -328,24 +341,24 @@ pub trait PgMetadataStore {
     /// Look up a durable reclaim record for a multipart payload generation.
     fn get_multipart_reclaim(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<Option<MultipartReclaimRecord>, MetadataError>;
 
     /// Delete a durable reclaim record for a multipart payload generation.
     fn delete_multipart_reclaim(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<(), MetadataError>;
 
     /// Return whether any durable reclaim record exists for this exact generation.
     fn payload_reclaim_exists(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, MetadataError>;
 
@@ -354,14 +367,14 @@ pub trait PgMetadataStore {
     /// Used by synchronous bucket deletion to drain deferred reclaim work.
     fn get_bucket_payload_reclaim_root(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
     ) -> Result<Option<PayloadReclaimRoot>, MetadataError>;
 
     /// Store tags for an object version (serialized XML string).
     fn put_object_tags(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         tags: &str,
     ) -> Result<(), MetadataError>;
@@ -369,16 +382,16 @@ pub trait PgMetadataStore {
     /// Retrieve tags for an object version. Returns None if not set.
     fn get_object_tags(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<Option<String>, MetadataError>;
 
     /// Delete tags for an object version. Idempotent.
     fn delete_object_tags(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError>;
 
@@ -411,7 +424,7 @@ pub trait PgMetadataStore {
     /// Delete all completed multipart upload records for a bucket.
     fn delete_completed_multipart_uploads_for_bucket(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
     ) -> Result<(), MetadataError>;
 
     /// List multipart uploads for a bucket with pagination.
@@ -453,8 +466,8 @@ pub trait PgMetadataStore {
     /// Read committed manifest parts for a multipart object.
     fn get_object_parts(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<Vec<ObjectPartRecord>, MetadataError>;
 
@@ -463,8 +476,8 @@ pub trait PgMetadataStore {
     /// `start` is inclusive and `end_exclusive` is exclusive.
     fn get_object_parts_overlapping_range(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         start: u64,
         end_exclusive: u64,
@@ -473,8 +486,8 @@ pub trait PgMetadataStore {
     /// Delete committed manifest parts for an object version.
     fn delete_object_parts(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError>;
 
@@ -580,24 +593,24 @@ pub trait PgMetadataStore {
     /// Read committed segments for a StandardInternal object.
     fn get_object_segments(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<Vec<ObjectSegmentRecord>, MetadataError>;
 
     /// Delete committed segments for an object version.
     fn delete_object_segments(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError>;
 
     /// Read committed segments for a multipart part.
     fn get_multipart_part_segments(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         part_number: u32,
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError>;
@@ -605,8 +618,8 @@ pub trait PgMetadataStore {
     /// Delete all committed part segments for an object version.
     fn delete_multipart_part_segments(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
     ) -> Result<(), MetadataError>;
 

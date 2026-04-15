@@ -146,7 +146,7 @@ struct DeleteMarkerLifecycleExpiration {
 /// Core-owned bucket summary exposed above the storage layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketSummary {
-    pub name: String,
+    pub name: BucketName,
     pub owner_principal: String,
     pub owner_canonical_id: CanonicalUserId,
     pub created_at: u64,
@@ -1302,8 +1302,8 @@ struct MultipartReader {
 
 struct ReadObjectContext<'a> {
     runtime: ReadRuntime,
-    bucket: &'a str,
-    key: &'a str,
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
     generation_id: GenerationId,
     sse_customer_request: Option<SseCustomerRequest>,
 }
@@ -1318,8 +1318,8 @@ enum ReadHandleInner {
 
 struct PayloadLease {
     runtime: ReadRuntime,
-    bucket: String,
-    key: String,
+    bucket: BucketName,
+    key: ObjectKey,
     generation_id: GenerationId,
 }
 
@@ -1331,12 +1331,12 @@ impl Drop for PayloadLease {
             self.generation_id,
         ) == 0
         {
-            match self.runtime.object_payload_reclaim_exists(
+            match self.runtime.object_payload_reclaim_exists_for(
                 &self.bucket,
                 &self.key,
                 self.generation_id,
             ) {
-                Ok(true) | Err(_) => self.runtime.enqueue_object_payload_reclaim(
+                Ok(true) | Err(_) => self.runtime.enqueue_object_payload_reclaim_for(
                     &self.bucket,
                     &self.key,
                     self.generation_id,
@@ -1471,12 +1471,12 @@ impl ReadHandle {
             generation_id,
             sse_customer_request,
         } = ctx;
-        let bucket_owned = bucket.to_string();
-        let key_owned = key.to_string();
+        let bucket_owned = bucket.as_str().to_string();
+        let key_owned = key.as_str().to_string();
         Self {
             bucket: bucket_owned.clone(),
             key: key_owned.clone(),
-            lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
+            lease: Some(runtime.acquire_object_payload_lease_for(bucket, key, generation_id)),
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -1514,12 +1514,12 @@ impl ReadHandle {
             sse_customer_request,
         } = ctx;
         let expected_size = end - start + 1;
-        let bucket_owned = bucket.to_string();
-        let key_owned = key.to_string();
+        let bucket_owned = bucket.as_str().to_string();
+        let key_owned = key.as_str().to_string();
         Self {
             bucket: bucket_owned.clone(),
             key: key_owned.clone(),
-            lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
+            lease: Some(runtime.acquire_object_payload_lease_for(bucket, key, generation_id)),
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -1539,17 +1539,17 @@ impl ReadHandle {
 
     fn from_multipart(
         runtime: ReadRuntime,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
         parts: Vec<SnapshottedMultipartPart>,
         expected_size: usize,
         sse_customer_request: Option<SseCustomerRequest>,
     ) -> Self {
         Self {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
+            bucket: bucket.as_str().to_string(),
+            key: key.as_str().to_string(),
+            lease: Some(runtime.acquire_object_payload_lease_for(bucket, key, generation_id)),
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -1557,8 +1557,8 @@ impl ReadHandle {
             crc64: checksum::crc64::Hasher::new(),
             inner: ReadHandleInner::Multipart(Box::new(MultipartReader {
                 runtime,
-                bucket: bucket.to_string(),
-                key: key.to_string(),
+                bucket: bucket.as_str().to_string(),
+                key: key.as_str().to_string(),
                 parts: Self::multipart_ranges_for_range(parts, 0, expected_size.saturating_sub(1)),
                 next_part_index: 0,
                 current_part: None,
@@ -1569,8 +1569,8 @@ impl ReadHandle {
 
     fn from_multipart_range(
         runtime: ReadRuntime,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
         parts: Vec<SnapshottedMultipartPart>,
         range: (usize, usize),
@@ -1579,9 +1579,9 @@ impl ReadHandle {
         let (start, end) = range;
         let expected_size = end - start + 1;
         Self {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            lease: Some(runtime.acquire_object_payload_lease(bucket, key, generation_id)),
+            bucket: bucket.as_str().to_string(),
+            key: key.as_str().to_string(),
+            lease: Some(runtime.acquire_object_payload_lease_for(bucket, key, generation_id)),
             trace: observability::current_context(),
             expected_size,
             bytes_emitted: 0,
@@ -1589,8 +1589,8 @@ impl ReadHandle {
             crc64: checksum::crc64::Hasher::new(),
             inner: ReadHandleInner::Multipart(Box::new(MultipartReader {
                 runtime,
-                bucket: bucket.to_string(),
-                key: key.to_string(),
+                bucket: bucket.as_str().to_string(),
+                key: key.as_str().to_string(),
                 parts: Self::multipart_ranges_for_range(parts, start, end),
                 next_part_index: 0,
                 current_part: None,
@@ -3805,8 +3805,8 @@ impl LifecycleSweeper {
 
 pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
-    bucket_policy_cache: RwLock<HashMap<String, CachedBucketPolicy>>,
-    bucket_lifecycle_cache: RwLock<HashMap<String, CachedBucketLifecycle>>,
+    bucket_policy_cache: RwLock<HashMap<BucketName, CachedBucketPolicy>>,
+    bucket_lifecycle_cache: RwLock<HashMap<BucketName, CachedBucketLifecycle>>,
     pg_topology: PgTopology,
     ec_codec: Arc<ErasureCodec>,
     ec_config: EcConfig,
@@ -3925,26 +3925,40 @@ fn maybe_run_object_segments_delete_metadata_hook(bucket: &str, key: &str) {
 }
 
 impl ReadRuntime {
-    fn object_payload_reclaim_exists(
+    fn object_payload_reclaim_exists_for(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<bool, ServerError> {
         let meta_pg = self
             .storage_node
-            .get_pg(self.pg_topology.object_pg(bucket, key))?;
+            .get_pg(self.pg_topology.object_pg(bucket.as_str(), key.as_str()))?;
         meta_pg
             .payload_reclaim_exists(bucket, key, generation_id)
             .map_err(ServerError::Metadata)
     }
 
-    fn enqueue_object_payload_reclaim(&self, bucket: &str, key: &str, generation_id: GenerationId) {
+    fn enqueue_object_payload_reclaim_for(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+    ) {
         self.storage_node
             .enqueue_object_payload_reclaim(bucket, key, generation_id);
     }
 
-    fn enqueue_bucket_delete_finalize(&self, bucket: &str) {
+    #[cfg(test)]
+    fn enqueue_object_payload_reclaim(&self, bucket: &str, key: &str, generation_id: GenerationId) {
+        self.enqueue_object_payload_reclaim_for(
+            &trusted_bucket_name(bucket),
+            &trusted_object_key(key),
+            generation_id,
+        );
+    }
+
+    fn enqueue_bucket_delete_finalize_for(&self, bucket: &BucketName) {
         self.storage_node.enqueue_bucket_delete_finalize(bucket);
     }
 
@@ -4175,7 +4189,7 @@ impl ReadRuntime {
         expected_version_id: VersionId,
         now_millis: u64,
     ) -> Result<bool, ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(bucket.as_str());
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
         let bucket_pg = self
             .storage_node
             .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
@@ -4193,7 +4207,7 @@ impl ReadRuntime {
         let meta_pg = self
             .storage_node
             .get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let stored = match meta_pg.get_object_meta(bucket.as_str(), key.as_str()) {
+        let stored = match meta_pg.get_object_meta(bucket, key) {
             Ok(stored) => stored,
             Err(storage::MetadataError::ObjectNotFound) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4232,7 +4246,7 @@ impl ReadRuntime {
                 Coordinator::permanently_delete_live_object_locked(&meta_pg, bucket, key, &record)?
             }
             BucketVersioningState::Enabled => {
-                let marker_vid = meta_pg.next_version_id(bucket.as_str(), key.as_str())?;
+                let marker_vid = meta_pg.next_version_id(bucket, key)?;
                 Coordinator::put_delete_marker_locked(&meta_pg, bucket, key, marker_vid, owner)?;
                 None
             }
@@ -4243,11 +4257,7 @@ impl ReadRuntime {
 
         drop(meta_pg);
         if let Some(reclaim) = reclaim {
-            self.enqueue_object_payload_reclaim(
-                bucket.as_str(),
-                key.as_str(),
-                reclaim.generation_id,
-            );
+            self.enqueue_object_payload_reclaim_for(bucket, key, reclaim.generation_id);
         }
         Ok(true)
     }
@@ -4258,7 +4268,7 @@ impl ReadRuntime {
         key: &ObjectKey,
         now_millis: u64,
     ) -> Result<u64, ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(bucket.as_str());
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
         let bucket_pg = self
             .storage_node
             .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
@@ -4276,7 +4286,7 @@ impl ReadRuntime {
         let meta_pg = self
             .storage_node
             .get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let versions = meta_pg.list_object_versions_for_key(bucket.as_str(), key.as_str())?;
+        let versions = meta_pg.list_object_versions_for_key(bucket, key)?;
         let due_versions = Coordinator::evaluate_due_noncurrent_version_expirations(
             &config, &versions, now_millis,
         )?;
@@ -4320,11 +4330,7 @@ impl ReadRuntime {
 
         drop(meta_pg);
         for reclaim in reclaims {
-            self.enqueue_object_payload_reclaim(
-                bucket.as_str(),
-                key.as_str(),
-                reclaim.generation_id,
-            );
+            self.enqueue_object_payload_reclaim_for(bucket, key, reclaim.generation_id);
         }
 
         Ok(deleted)
@@ -4354,10 +4360,10 @@ impl ReadRuntime {
 
             let mut group_start = 0usize;
             while group_start < versions.versions.len() {
-                let key = versions.versions[group_start].key().to_string();
+                let key = versions.versions[group_start].key().clone();
                 let mut group_end = group_start + 1;
                 while group_end < versions.versions.len()
-                    && versions.versions[group_end].key().as_str() == key
+                    && versions.versions[group_end].key() == &key
                 {
                     group_end += 1;
                 }
@@ -4376,12 +4382,7 @@ impl ReadRuntime {
         })?;
 
         for (key, version_id) in candidates {
-            if self.expire_delete_marker_if_due(
-                bucket_info.name.as_str(),
-                &key,
-                version_id,
-                now_millis,
-            )? {
+            if self.expire_delete_marker_if_due(&bucket_info.name, &key, version_id, now_millis)? {
                 stats.expired_delete_markers += 1;
             }
         }
@@ -4391,16 +4392,16 @@ impl ReadRuntime {
 
     fn expire_delete_marker_if_due(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         expected_version_id: VersionId,
         now_millis: u64,
     ) -> Result<bool, ServerError> {
         let _bucket_guard = self.storage_node.lock_bucket(bucket);
         let bucket_pg = self
             .storage_node
-            .get_pg(self.pg_topology.bucket_pg(bucket))?;
-        let bucket_info = match bucket_pg.head_bucket(bucket) {
+            .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
+        let bucket_info = match bucket_pg.head_bucket(bucket.as_str()) {
             Ok(info) => info,
             Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4413,7 +4414,7 @@ impl ReadRuntime {
 
         let meta_pg = self
             .storage_node
-            .get_pg(self.pg_topology.object_pg(bucket, key))?;
+            .get_pg(self.pg_topology.object_pg_for(bucket, key))?;
         let versions = match meta_pg.list_object_versions_for_key(bucket, key) {
             Ok(versions) => versions,
             Err(storage::MetadataError::ObjectNotFound) => return Ok(false),
@@ -4495,7 +4496,7 @@ impl ReadRuntime {
         upload_id: &str,
         now_millis: u64,
     ) -> Result<bool, ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(bucket.as_str());
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
         let bucket_pg = self
             .storage_node
             .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
@@ -4542,19 +4543,6 @@ impl ReadRuntime {
 
         drop(meta_pg);
         self.abort_multipart_upload_internal_for(bucket, key, upload_id)
-    }
-
-    fn abort_multipart_upload_internal(
-        &self,
-        bucket: &str,
-        key: &str,
-        upload_id: &str,
-    ) -> Result<bool, ServerError> {
-        self.abort_multipart_upload_internal_for(
-            &trusted_bucket_name(bucket),
-            &trusted_object_key(key),
-            upload_id,
-        )
     }
 
     fn abort_multipart_upload_internal_for(
@@ -4658,26 +4646,40 @@ impl ReadRuntime {
         Ok(())
     }
 
-    fn acquire_object_payload_lease(
+    fn acquire_object_payload_lease_for(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> PayloadLease {
         self.storage_node
             .acquire_object_payload_lease(bucket, key, generation_id);
         PayloadLease {
             runtime: self.clone(),
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            bucket: bucket.clone(),
+            key: key.clone(),
             generation_id,
         }
     }
 
-    fn try_reclaim_object_payload(
+    #[cfg(test)]
+    fn acquire_object_payload_lease(
         &self,
         bucket: &str,
         key: &str,
+        generation_id: GenerationId,
+    ) -> PayloadLease {
+        self.acquire_object_payload_lease_for(
+            &trusted_bucket_name(bucket),
+            &trusted_object_key(key),
+            generation_id,
+        )
+    }
+
+    fn try_reclaim_object_payload_for(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> Result<(), ServerError> {
         enum ReclaimPayload {
@@ -4709,7 +4711,7 @@ impl ReadRuntime {
             return Ok(());
         }
 
-        let meta_pg_id = self.pg_topology.object_pg(bucket, key);
+        let meta_pg_id = self.pg_topology.object_pg(bucket.as_str(), key.as_str());
         let reclaim = {
             let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
             let meta_pg: &storage::PgStore = &meta_guard;
@@ -4749,8 +4751,10 @@ impl ReadRuntime {
 
         match &reclaim {
             ReclaimPayload::Simple(reclaim) => {
-                let shard_pg_id = self.pg_topology.shard_pg(bucket, key, generation_id.get());
-                let okh = object_key_hash(bucket, key);
+                let shard_pg_id =
+                    self.pg_topology
+                        .shard_pg(bucket.as_str(), key.as_str(), generation_id.get());
+                let okh = object_key_hash(bucket.as_str(), key.as_str());
                 delete_ec_shards(
                     &self.storage_node,
                     shard_pg_id,
@@ -4825,16 +4829,26 @@ impl ReadRuntime {
                 meta_pg.delete_multipart_reclaim(bucket, key, generation_id)?;
             }
         }
-        self.enqueue_bucket_delete_finalize(bucket);
+        self.enqueue_bucket_delete_finalize_for(bucket);
         Ok(())
     }
 
-    fn try_finalize_bucket_delete(&self, bucket: &str) -> Result<(), ServerError> {
-        self.try_finalize_bucket_delete_for(&trusted_bucket_name(bucket))
+    #[cfg(test)]
+    fn try_reclaim_object_payload(
+        &self,
+        bucket: &str,
+        key: &str,
+        generation_id: GenerationId,
+    ) -> Result<(), ServerError> {
+        self.try_reclaim_object_payload_for(
+            &trusted_bucket_name(bucket),
+            &trusted_object_key(key),
+            generation_id,
+        )
     }
 
     fn try_finalize_bucket_delete_for(&self, bucket: &BucketName) -> Result<(), ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(bucket.as_str());
+        let _bucket_guard = self.storage_node.lock_bucket(bucket);
         let bucket_pg_id = self.pg_topology.bucket_pg_for(bucket);
         {
             let bucket_pg = self.storage_node.get_pg(bucket_pg_id)?;
@@ -4875,7 +4889,7 @@ impl ReadRuntime {
                 found_visible_data = true;
                 return Ok(());
             }
-            if let Some(root) = pg.get_bucket_payload_reclaim_root(bucket.as_str())? {
+            if let Some(root) = pg.get_bucket_payload_reclaim_root(bucket)? {
                 found_reclaim_root = true;
                 reclaim_roots.push(root);
             }
@@ -4887,30 +4901,25 @@ impl ReadRuntime {
         }
         for root in &reclaim_roots {
             if self.storage_node.object_payload_lease_count(
-                root.bucket.as_str(),
-                root.key.as_str(),
+                &root.bucket,
+                &root.key,
                 root.generation_id,
             ) == 0
             {
-                self.enqueue_object_payload_reclaim(
-                    root.bucket.as_str(),
-                    root.key.as_str(),
+                self.enqueue_object_payload_reclaim_for(
+                    &root.bucket,
+                    &root.key,
                     root.generation_id,
                 );
             }
         }
-        if found_reclaim_root
-            || self
-                .storage_node
-                .bucket_object_payload_lease_count(bucket.as_str())
-                != 0
-        {
+        if found_reclaim_root || self.storage_node.bucket_object_payload_lease_count(bucket) != 0 {
             return Ok(());
         }
 
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
-            pg.delete_completed_multipart_uploads_for_bucket(bucket.as_str())
+            pg.delete_completed_multipart_uploads_for_bucket(bucket)
                 .map_err(ServerError::Metadata)
         })?;
 
@@ -5368,7 +5377,7 @@ impl Coordinator {
             }
         }
 
-        let authorized = self.authorize_load_bucket_lifecycle(&bucket.name);
+        let authorized = self.authorize_load_bucket_lifecycle(bucket.name.as_str());
         let raw_config = self.load_authorized_bucket_subresource(&authorized)?;
         let parsed_config = match raw_config {
             Some(config_xml) => Arc::new(
@@ -5397,17 +5406,15 @@ impl Coordinator {
 
     fn cache_bucket_lifecycle(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
         generation: u64,
         config: Arc<BucketLifecycleConfiguration>,
     ) {
-        write_rwlock_unpoisoned(&self.bucket_lifecycle_cache).insert(
-            bucket.to_string(),
-            CachedBucketLifecycle { generation, config },
-        );
+        write_rwlock_unpoisoned(&self.bucket_lifecycle_cache)
+            .insert(bucket.clone(), CachedBucketLifecycle { generation, config });
     }
 
-    fn clear_bucket_lifecycle_cache(&self, bucket: &str) {
+    fn clear_bucket_lifecycle_cache(&self, bucket: &BucketName) {
         write_rwlock_unpoisoned(&self.bucket_lifecycle_cache).remove(bucket);
     }
 
@@ -5948,7 +5955,7 @@ impl Coordinator {
 
     fn bucket_summary_ref(info: &BucketInfo) -> BucketSummary {
         BucketSummary {
-            name: info.name.to_string(),
+            name: info.name.clone(),
             owner_principal: info.owner_principal.clone(),
             owner_canonical_id: info.owner_canonical_id.clone(),
             created_at: info.created_at,
@@ -5970,7 +5977,7 @@ impl Coordinator {
 
     fn bucket_summary_fast(info: BucketFastPathInfo) -> BucketSummary {
         BucketSummary {
-            name: info.name.into_string(),
+            name: info.name,
             owner_principal: info.owner_principal,
             owner_canonical_id: info.owner_canonical_id,
             created_at: info.created_at,
@@ -5992,7 +5999,10 @@ impl Coordinator {
 
     #[cfg(test)]
     fn unchecked_active_bucket_summary(&self, name: &str) -> Result<BucketSummary, ServerError> {
-        if let Some(info) = self.storage_node.get_bucket_fast_path(name) {
+        if let Some(info) = self
+            .storage_node
+            .get_bucket_fast_path(&trusted_bucket_name(name))
+        {
             if info.state == BucketState::Active {
                 return Ok(Self::bucket_summary_fast(info));
             }
@@ -6009,7 +6019,7 @@ impl Coordinator {
         &self,
         name: &BucketName,
     ) -> Result<BucketSummary, ServerError> {
-        if let Some(info) = self.storage_node.get_bucket_fast_path(name.as_str()) {
+        if let Some(info) = self.storage_node.get_bucket_fast_path(name) {
             if info.state == BucketState::Active {
                 return Ok(Self::bucket_summary_fast(info));
             }
@@ -6123,14 +6133,14 @@ impl Coordinator {
                 while let Some(work) = worker_node.wait_for_reclaim_work(&worker_stop) {
                     match work {
                         ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)) => {
-                            let _ = reclaim_runtime.try_reclaim_object_payload(
+                            let _ = reclaim_runtime.try_reclaim_object_payload_for(
                                 &bucket,
                                 &key,
                                 generation_id,
                             );
                         }
                         ReclaimWorkItem::BucketDelete(bucket) => {
-                            let _ = reclaim_runtime.try_finalize_bucket_delete(&bucket);
+                            let _ = reclaim_runtime.try_finalize_bucket_delete_for(&bucket);
                         }
                     }
                 }
@@ -6419,7 +6429,7 @@ impl Coordinator {
         acl_grants: AclGrants,
         object_lock_enabled: bool,
     ) -> Result<BucketCreateOutcome, ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(name.as_str());
+        let _bucket_guard = self.storage_node.lock_bucket(name);
         let bucket_pg = self.get_bucket_pg_for(name)?;
         let public_read = Self::acl_grants_public_read(&acl_grants);
         let public_write = Self::acl_grants_public_write(&acl_grants);
@@ -6510,7 +6520,7 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedPutBucketAcl {
-            bucket: trusted_bucket_name(bucket.name.clone()),
+            bucket: bucket.name.clone(),
             acl_grants,
             public_read,
             public_write,
@@ -6578,12 +6588,12 @@ impl Coordinator {
                     other => ServerError::Metadata(other),
                 },
             )?;
-            self.storage_node.remove_bucket_fast_path(name.as_str());
-            self.clear_bucket_policy_cache(name.as_str());
-            self.clear_bucket_lifecycle_cache(name.as_str());
+            self.storage_node.remove_bucket_fast_path(&name);
+            self.clear_bucket_policy_cache(&name);
+            self.clear_bucket_lifecycle_cache(&name);
             marked_deleting = true;
             self.read_runtime()
-                .enqueue_bucket_delete_finalize(name.as_str());
+                .enqueue_bucket_delete_finalize_for(&name);
             Ok(())
         })();
 
@@ -7335,13 +7345,7 @@ impl Coordinator {
         public_read: bool,
     ) -> Result<VersionId, ServerError> {
         meta_pg
-            .put_object_acl(
-                bucket.as_str(),
-                key.as_str(),
-                version_id,
-                &acl_grants,
-                public_read,
-            )
+            .put_object_acl(bucket, key, version_id, &acl_grants, public_read)
             .map_err(|e| match e {
                 storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
                     bucket: bucket.to_string(),
@@ -7601,8 +7605,8 @@ impl Coordinator {
             .pgs
             .meta()
             .put_object_tags(
-                authorized.bucket.as_str(),
-                authorized.key.as_str(),
+                &authorized.bucket,
+                &authorized.key,
                 authorized.version_id,
                 req.tags,
             )
@@ -7628,8 +7632,8 @@ impl Coordinator {
             .pgs
             .meta()
             .put_object_retention(
-                authorized.bucket.as_str(),
-                authorized.key.as_str(),
+                &authorized.bucket,
+                &authorized.key,
                 authorized.version_id,
                 authorized.retention,
             )
@@ -7675,8 +7679,8 @@ impl Coordinator {
             .pgs
             .meta()
             .put_object_legal_hold(
-                authorized.bucket.as_str(),
-                authorized.key.as_str(),
+                &authorized.bucket,
+                &authorized.key,
                 authorized.version_id,
                 authorized.legal_hold,
             )
@@ -7719,11 +7723,7 @@ impl Coordinator {
         authorized
             .pgs
             .meta()
-            .get_object_tags(
-                authorized.bucket.as_str(),
-                authorized.key.as_str(),
-                authorized.version_id,
-            )
+            .get_object_tags(&authorized.bucket, &authorized.key, authorized.version_id)
             .map_err(ServerError::Metadata)
     }
 
@@ -7739,11 +7739,7 @@ impl Coordinator {
         authorized
             .pgs
             .meta()
-            .delete_object_tags(
-                authorized.bucket.as_str(),
-                authorized.key.as_str(),
-                authorized.version_id,
-            )
+            .delete_object_tags(&authorized.bucket, &authorized.key, authorized.version_id)
             .map_err(ServerError::Metadata)
     }
 
@@ -7794,8 +7790,7 @@ impl Coordinator {
             Self::prepare_stored_system_metadata(req.system_metadata, req.write_encryption)?;
 
         if !req.cond.is_empty() {
-            let existing_etag = match meta_pg.get_object_meta(req.bucket.as_str(), req.key.as_str())
-            {
+            let existing_etag = match meta_pg.get_object_meta(req.bucket, req.key) {
                 Ok(stored) => stored.as_live().map(|record| record.etag.format()),
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
@@ -7810,11 +7805,11 @@ impl Coordinator {
         }
 
         let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
-            meta_pg.next_version_id(req.bucket.as_str(), req.key.as_str())?
+            meta_pg.next_version_id(req.bucket, req.key)?
         } else {
             VersionId::Null
         };
-        let generation_id = meta_pg.next_generation_id(req.bucket.as_str(), req.key.as_str())?;
+        let generation_id = meta_pg.next_generation_id(req.bucket, req.key)?;
         let stale_payload = if version_id.is_null() {
             Self::snapshot_overwritten_null_version_payload(meta_pg, req.bucket, req.key)?
         } else {
@@ -8227,7 +8222,7 @@ impl Coordinator {
     ) -> Result<Option<StoredObject>, ServerError> {
         let meta_pg_id = self.object_pg_id_for(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-        match meta_pg.get_object_meta(bucket.as_str(), key.as_str()) {
+        match meta_pg.get_object_meta(bucket, key) {
             Ok(object @ StoredObject::Live(_)) => Ok(Some(object)),
             Ok(StoredObject::DeleteMarker(_)) | Err(storage::MetadataError::ObjectNotFound) => {
                 Ok(None)
@@ -8455,7 +8450,7 @@ impl Coordinator {
                 prepared.stale_payload.as_ref(),
             )?;
             let stored = meta_pg
-                .get_object_meta(authorized.bucket(), authorized.key())
+                .get_object_meta(authorized.bucket_typed(), authorized.key_typed())
                 .map_err(ServerError::Metadata)?;
             let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
                 reason: format!(
@@ -8477,7 +8472,11 @@ impl Coordinator {
                 lifecycle_last_modified,
             )?;
             if let Some(ref payload) = prepared.stale_payload {
-                self.delete_stale_object_payload(authorized.bucket(), authorized.key(), payload);
+                self.delete_stale_object_payload(
+                    authorized.bucket_typed(),
+                    authorized.key_typed(),
+                    payload,
+                );
             }
 
             Ok(PutObjectResult {
@@ -9204,9 +9203,9 @@ impl Coordinator {
                 prepared.version_id,
                 prepared.stale_payload.as_ref(),
             )?;
-            let stored = meta_guard
-                .get_object_meta(bucket, key)
-                .map_err(ServerError::Metadata)?;
+        let stored = meta_guard
+            .get_object_meta(req.object.bucket_name_typed(), req.object.key_typed())
+            .map_err(ServerError::Metadata)?;
             let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
                 reason: format!(
                     "stored object {} / {} is not live immediately after streaming PutObject",
@@ -9226,7 +9225,11 @@ impl Coordinator {
                 lifecycle_last_modified,
             )?;
             if let Some(ref payload) = prepared.stale_payload {
-                self.delete_stale_object_payload(bucket, key, payload);
+                self.delete_stale_object_payload(
+                    req.object.bucket_name_typed(),
+                    req.object.key_typed(),
+                    payload,
+                );
             }
 
             Ok(PutObjectResult {
@@ -9713,8 +9716,8 @@ impl Coordinator {
                 let meta_pg = pgs.meta();
                 let obj_parts = Self::snapshot_multipart_parts(
                     meta_pg,
-                    src_bucket,
-                    src_key,
+                    &req.source.bucket,
+                    &req.source.key,
                     src_record.version_id,
                     &src_record.encryption,
                 )?;
@@ -9726,8 +9729,8 @@ impl Coordinator {
                 } else {
                     let body = ReadHandle::from_multipart(
                         self.read_runtime(),
-                        src_bucket,
-                        src_key,
+                        &req.source.bucket,
+                        &req.source.key,
                         src_record.generation_id,
                         obj_parts,
                         src_record.size as usize,
@@ -9754,7 +9757,7 @@ impl Coordinator {
                 // Non-multipart payloads now read through committed object segments.
                 let meta_pg = pgs.meta();
                 let segments = meta_pg
-                    .get_object_segments(src_bucket, src_key, src_record.version_id)
+                    .get_object_segments(&req.source.bucket, &req.source.key, src_record.version_id)
                     .map_err(ServerError::Metadata)?;
 
                 let body = if src_record.size == 0 {
@@ -9764,8 +9767,8 @@ impl Coordinator {
                     let body = ReadHandle::from_segments(
                         ReadObjectContext {
                             runtime: self.read_runtime(),
-                            bucket: src_bucket,
-                            key: src_key,
+                            bucket: &req.source.bucket,
+                            key: &req.source.key,
                             generation_id: src_record.generation_id,
                             sse_customer_request: source_sse_customer.cloned(),
                         },
@@ -9894,7 +9897,10 @@ impl Coordinator {
                 req.destination.key_typed(),
             ))?;
             let dst_stored = dst_meta_pg
-                .get_object_meta(dst_bucket, dst_key)
+                .get_object_meta(
+                    req.destination.bucket.name_typed(),
+                    req.destination.key_typed(),
+                )
                 .map_err(ServerError::Metadata)?;
             let dst_live = dst_stored
                 .as_live()
@@ -9943,8 +9949,8 @@ impl Coordinator {
 
     fn lookup_object_record(
         meta_pg: &storage::PgStore,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: Option<VersionId>,
     ) -> Result<StoredObject, ServerError> {
         match version_id {
@@ -10097,8 +10103,7 @@ impl Coordinator {
     ) -> Result<LockedReadObject<'a>, ServerError> {
         let meta_pg_id = self.object_pg_id_for(bucket, key);
         let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-        let record =
-            Self::lookup_object_record(&meta_guard, bucket.as_str(), key.as_str(), version_id)?;
+        let record = Self::lookup_object_record(&meta_guard, bucket, key, version_id)?;
         Ok(LockedReadObject {
             record,
             pgs: ObjectPgGuards::new(meta_guard),
@@ -10107,8 +10112,8 @@ impl Coordinator {
 
     fn multipart_part_payloads(
         meta_pg: &storage::PgStore,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         part: &ObjectPartRecord,
         encryption: &ObjectEncryption,
@@ -10150,8 +10155,8 @@ impl Coordinator {
 
     fn snapshot_multipart_parts(
         meta_pg: &storage::PgStore,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         encryption: &ObjectEncryption,
     ) -> Result<Vec<SnapshottedMultipartPart>, ServerError> {
@@ -10176,8 +10181,8 @@ impl Coordinator {
 
     fn snapshot_multipart_parts_overlapping_range(
         meta_pg: &storage::PgStore,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: VersionId,
         encryption: &ObjectEncryption,
         start: u64,
@@ -10205,12 +10210,11 @@ impl Coordinator {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Option<StaleObjectPayload>, ServerError> {
-        let stored =
-            match meta_pg.get_object_version(bucket.as_str(), key.as_str(), VersionId::Null) {
-                Ok(stored) => stored,
-                Err(storage::MetadataError::ObjectNotFound) => return Ok(None),
-                Err(e) => return Err(ServerError::Metadata(e)),
-            };
+        let stored = match meta_pg.get_object_version(bucket, key, VersionId::Null) {
+            Ok(stored) => stored,
+            Err(storage::MetadataError::ObjectNotFound) => return Ok(None),
+            Err(e) => return Err(ServerError::Metadata(e)),
+        };
         let record = match stored {
             StoredObject::Live(record) => record,
             StoredObject::DeleteMarker(_) => return Ok(None),
@@ -10219,15 +10223,15 @@ impl Coordinator {
         match record.layout {
             ObjectLayout::MultipartManifest { .. } => {
                 let parts = meta_pg
-                    .get_object_parts(bucket.as_str(), key.as_str(), VersionId::Null)
+                    .get_object_parts(bucket, key, VersionId::Null)
                     .map_err(ServerError::Metadata)?;
                 let mut streaming_segments = Vec::new();
                 for part in &parts {
                     if part.part_okh == [0u8; 16] {
                         let segments = meta_pg
                             .get_multipart_part_segments(
-                                bucket.as_str(),
-                                key.as_str(),
+                                bucket,
+                                key,
                                 VersionId::Null,
                                 part.part_number,
                             )
@@ -10243,7 +10247,7 @@ impl Coordinator {
             }
             ObjectLayout::Standard => {
                 let segments = meta_pg
-                    .get_object_segments(bucket.as_str(), key.as_str(), VersionId::Null)
+                    .get_object_segments(bucket, key, VersionId::Null)
                     .map_err(ServerError::Metadata)?;
                 Ok(Some(StaleObjectPayload::Segments {
                     generation_id: record.generation_id,
@@ -10273,7 +10277,7 @@ impl Coordinator {
                     segments,
                 )?;
                 meta_pg
-                    .delete_object_segments(bucket.as_str(), key.as_str(), version_id)
+                    .delete_object_segments(bucket, key, version_id)
                     .map_err(ServerError::Metadata)
             }
             StaleObjectPayload::Multipart {
@@ -10291,11 +10295,11 @@ impl Coordinator {
                 )?;
                 if !streaming_segments.is_empty() {
                     meta_pg
-                        .delete_multipart_part_segments(bucket.as_str(), key.as_str(), version_id)
+                        .delete_multipart_part_segments(bucket, key, version_id)
                         .map_err(ServerError::Metadata)?;
                 }
                 meta_pg
-                    .delete_object_parts(bucket.as_str(), key.as_str(), version_id)
+                    .delete_object_parts(bucket, key, version_id)
                     .map_err(ServerError::Metadata)
             }
         }
@@ -10322,15 +10326,15 @@ impl Coordinator {
     ) -> Result<Option<DeletedLiveObjectReclaim>, ServerError> {
         let reclaim = if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             let obj_parts = meta_pg
-                .get_object_parts(bucket.as_str(), key.as_str(), record.version_id)
+                .get_object_parts(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
             let mut streaming_segments: Vec<MultipartPartSegmentRecord> = Vec::new();
             for part in &obj_parts {
                 if part.part_okh == [0u8; 16] {
                     let segments = meta_pg
                         .get_multipart_part_segments(
-                            bucket.as_str(),
-                            key.as_str(),
+                            bucket,
+                            key,
                             record.version_id,
                             part.part_number,
                         )
@@ -10348,21 +10352,17 @@ impl Coordinator {
             )?;
             if !streaming_segments.is_empty() {
                 meta_pg
-                    .delete_multipart_part_segments(
-                        bucket.as_str(),
-                        key.as_str(),
-                        record.version_id,
-                    )
+                    .delete_multipart_part_segments(bucket, key, record.version_id)
                     .map_err(ServerError::Metadata)?;
             }
-            meta_pg.delete_object_parts(bucket.as_str(), key.as_str(), record.version_id)?;
+            meta_pg.delete_object_parts(bucket, key, record.version_id)?;
             Some(DeletedLiveObjectReclaim {
                 generation_id: record.generation_id,
                 kind: DeletedLiveObjectKind::Multipart,
             })
         } else {
             let segments = meta_pg
-                .get_object_segments(bucket.as_str(), key.as_str(), record.version_id)
+                .get_object_segments(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
             Self::enqueue_object_segments_reclaim(
                 meta_pg,
@@ -10372,7 +10372,7 @@ impl Coordinator {
                 &segments,
             )?;
             meta_pg
-                .delete_object_segments(bucket.as_str(), key.as_str(), record.version_id)
+                .delete_object_segments(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
             Some(DeletedLiveObjectReclaim {
                 generation_id: record.generation_id,
@@ -10381,10 +10381,10 @@ impl Coordinator {
         };
 
         if record.version_id.is_null() {
-            meta_pg.delete_object_meta(bucket.as_str(), key.as_str())?;
+            meta_pg.delete_object_meta(bucket, key)?;
         } else {
             meta_pg
-                .delete_object_version(bucket.as_str(), key.as_str(), record.version_id)
+                .delete_object_version(bucket, key, record.version_id)
                 .map_err(ServerError::Metadata)?;
         }
 
@@ -10439,14 +10439,19 @@ impl Coordinator {
         Ok(reclaim)
     }
 
-    fn delete_stale_object_payload(&self, bucket: &str, key: &str, payload: &StaleObjectPayload) {
+    fn delete_stale_object_payload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        payload: &StaleObjectPayload,
+    ) {
         match payload {
             StaleObjectPayload::Segments { generation_id, .. } => self
                 .read_runtime()
-                .enqueue_object_payload_reclaim(bucket, key, *generation_id),
+                .enqueue_object_payload_reclaim_for(bucket, key, *generation_id),
             StaleObjectPayload::Multipart { generation_id, .. } => self
                 .read_runtime()
-                .enqueue_object_payload_reclaim(bucket, key, *generation_id),
+                .enqueue_object_payload_reclaim_for(bucket, key, *generation_id),
         }
     }
 
@@ -10628,8 +10633,8 @@ impl Coordinator {
             let meta_pg = pgs.meta();
             let obj_parts = Self::snapshot_multipart_parts(
                 meta_pg,
-                bucket,
-                key,
+                req.object.bucket_name_typed(),
+                req.object.key_typed(),
                 record.version_id,
                 &record.encryption,
             )?;
@@ -10643,8 +10648,8 @@ impl Coordinator {
 
             let body = ReadHandle::from_multipart(
                 self.read_runtime(),
-                bucket,
-                key,
+                req.object.bucket_name_typed(),
+                req.object.key_typed(),
                 record.generation_id,
                 obj_parts,
                 record.size as usize,
@@ -10691,7 +10696,11 @@ impl Coordinator {
             // Non-multipart payloads now read through committed object segments.
             let meta_pg = pgs.meta();
             let segments = meta_pg
-                .get_object_segments(bucket, key, record.version_id)
+                .get_object_segments(
+                    req.object.bucket_name_typed(),
+                    req.object.key_typed(),
+                    record.version_id,
+                )
                 .map_err(ServerError::Metadata)?;
 
             let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
@@ -10708,8 +10717,8 @@ impl Coordinator {
                 let body = ReadHandle::from_segments(
                     ReadObjectContext {
                         runtime: self.read_runtime(),
-                        bucket,
-                        key,
+                        bucket: req.object.bucket_name_typed(),
+                        key: req.object.key_typed(),
                         generation_id: record.generation_id,
                         sse_customer_request: req.sse_customer.cloned(),
                     },
@@ -10820,8 +10829,8 @@ impl Coordinator {
             let meta_pg = pgs.meta();
             let obj_parts = Self::snapshot_multipart_parts(
                 meta_pg,
-                bucket,
-                key,
+                req.object.bucket_name_typed(),
+                req.object.key_typed(),
                 record.version_id,
                 &record.encryption,
             )?;
@@ -10866,8 +10875,8 @@ impl Coordinator {
             part_body.object_offset_start = 0;
             let body = ReadHandle::from_multipart(
                 self.read_runtime(),
-                bucket,
-                key,
+                req.object.bucket_name_typed(),
+                req.object.key_typed(),
                 record.generation_id,
                 vec![part_body],
                 part.record.size as usize,
@@ -10923,7 +10932,11 @@ impl Coordinator {
             // Non-multipart payloads now read through committed object segments.
             let meta_pg = pgs.meta();
             let segments = meta_pg
-                .get_object_segments(bucket, key, record.version_id)
+                .get_object_segments(
+                    req.object.bucket_name_typed(),
+                    req.object.key_typed(),
+                    record.version_id,
+                )
                 .map_err(ServerError::Metadata)?;
 
             let body = if user_size == 0 {
@@ -10933,8 +10946,8 @@ impl Coordinator {
                 let body = ReadHandle::from_segments(
                     ReadObjectContext {
                         runtime: self.read_runtime(),
-                        bucket,
-                        key,
+                        bucket: req.object.bucket_name_typed(),
+                        key: req.object.key_typed(),
                         generation_id: record.generation_id,
                         sse_customer_request: req.sse_customer.cloned(),
                     },
@@ -11052,7 +11065,11 @@ impl Coordinator {
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             let meta_pg = pgs.meta();
             let obj_parts = meta_pg
-                .get_object_parts(bucket, key, record.version_id)
+                .get_object_parts(
+                    req.object.bucket_name_typed(),
+                    req.object.key_typed(),
+                    record.version_id,
+                )
                 .map_err(ServerError::Metadata)?;
             drop(pgs);
             let lifecycle_expiration = if emit_lifecycle_expiration {
@@ -11324,7 +11341,11 @@ impl Coordinator {
                 if has_checksum {
                     // Checksummed multipart: full detail with parts, pagination
                     let meta_pg = pgs.meta();
-                    let all_parts = meta_pg.get_object_parts(bucket, key, record.version_id)?;
+                    let all_parts = meta_pg.get_object_parts(
+                        req.object.bucket_name_typed(),
+                        req.object.key_typed(),
+                        record.version_id,
+                    )?;
                     let total_parts_count = all_parts.len() as u32;
                     let marker = part_number_marker.unwrap_or(0);
 
@@ -11369,7 +11390,11 @@ impl Coordinator {
                 } else {
                     // Non-checksummed multipart: only PartsCount
                     let meta_pg = pgs.meta();
-                    let all_parts = meta_pg.get_object_parts(bucket, key, record.version_id)?;
+                    let all_parts = meta_pg.get_object_parts(
+                        req.object.bucket_name_typed(),
+                        req.object.key_typed(),
+                        record.version_id,
+                    )?;
                     let total_parts_count = all_parts.len() as u32;
 
                     Some(ObjectPartsInfo {
@@ -11508,8 +11533,8 @@ impl Coordinator {
             let meta_pg = pgs.meta();
             let obj_parts = Self::snapshot_multipart_parts_overlapping_range(
                 meta_pg,
-                bucket,
-                key,
+                req.object.bucket_name_typed(),
+                req.object.key_typed(),
                 record.version_id,
                 &record.encryption,
                 user_start,
@@ -11532,8 +11557,8 @@ impl Coordinator {
 
             let body = ReadHandle::from_multipart_range(
                 self.read_runtime(),
-                bucket,
-                key,
+                req.object.bucket_name_typed(),
+                req.object.key_typed(),
                 record.generation_id,
                 obj_parts,
                 (user_start as usize, user_end as usize),
@@ -11555,14 +11580,18 @@ impl Coordinator {
             // Non-multipart payloads now read through committed object segments.
             let meta_pg = pgs.meta();
             let segments = meta_pg
-                .get_object_segments(bucket, key, record.version_id)
+                .get_object_segments(
+                    req.object.bucket_name_typed(),
+                    req.object.key_typed(),
+                    record.version_id,
+                )
                 .map_err(ServerError::Metadata)?;
 
             let body = ReadHandle::from_segments_range(
                 ReadObjectContext {
                     runtime: self.read_runtime(),
-                    bucket,
-                    key,
+                    bucket: req.object.bucket_name_typed(),
+                    key: req.object.key_typed(),
                     generation_id: record.generation_id,
                     sse_customer_request: req.sse_customer.cloned(),
                 },
@@ -11655,7 +11684,7 @@ impl Coordinator {
                     }
                 }
                 if let Some(reclaim) = reclaim {
-                    self.read_runtime().enqueue_object_payload_reclaim(
+                    self.read_runtime().enqueue_object_payload_reclaim_for(
                         &bucket,
                         &key,
                         reclaim.generation_id,
@@ -11703,7 +11732,7 @@ impl Coordinator {
                             }
                         }
                         if let Some(reclaim) = reclaim {
-                            self.read_runtime().enqueue_object_payload_reclaim(
+                            self.read_runtime().enqueue_object_payload_reclaim_for(
                                 &bucket,
                                 &key,
                                 reclaim.generation_id,
@@ -12481,15 +12510,15 @@ impl Coordinator {
                 let meta_pg = pgs.meta();
                 let obj_parts = Self::snapshot_multipart_parts(
                     meta_pg,
-                    src_bucket,
-                    src_key,
+                    &req.source.bucket,
+                    &req.source.key,
                     src_record.version_id,
                     &src_record.encryption,
                 )?;
                 let body = ReadHandle::from_multipart_range(
                     self.read_runtime(),
-                    src_bucket,
-                    src_key,
+                    &req.source.bucket,
+                    &req.source.key,
                     src_record.generation_id,
                     obj_parts,
                     (read_start as usize, read_end as usize),
@@ -12503,14 +12532,14 @@ impl Coordinator {
                 // Non-multipart source: check for object segments first.
                 let meta_pg = pgs.meta();
                 let segments = meta_pg
-                    .get_object_segments(src_bucket, src_key, src_record.version_id)
+                    .get_object_segments(&req.source.bucket, &req.source.key, src_record.version_id)
                     .map_err(ServerError::Metadata)?;
 
                 let body = ReadHandle::from_segments_range(
                     ReadObjectContext {
                         runtime: self.read_runtime(),
-                        bucket: src_bucket,
-                        key: src_key,
+                        bucket: &req.source.bucket,
+                        key: &req.source.key,
                         generation_id: src_record.generation_id,
                         sse_customer_request: source_sse_customer.cloned(),
                     },
@@ -12677,9 +12706,7 @@ impl Coordinator {
         let parts = req.parts;
         let claimed_checksum = req.claimed_checksum;
         let expected_object_size = req.expected_object_size;
-        let _completion_guard = self
-            .storage_node
-            .lock_multipart_completion_bucket(bucket.as_str());
+        let _completion_guard = self.storage_node.lock_multipart_completion_bucket(&bucket);
         let completion_order =
             self.next_completed_multipart_upload_order_for_bucket_name(&bucket)?;
         let meta_pg_id = self.object_pg_id_for(&bucket, &key);
@@ -12697,7 +12724,7 @@ impl Coordinator {
         }
 
         if !req.cond.is_empty() {
-            let existing_etag = match meta_pg.get_object_meta(bucket.as_str(), key.as_str()) {
+            let existing_etag = match meta_pg.get_object_meta(&bucket, &key) {
                 Ok(stored) => stored.as_live().map(|record| record.etag.format()),
                 Err(storage::MetadataError::ObjectNotFound) => None,
                 Err(e) => return Err(ServerError::Metadata(e)),
@@ -12808,11 +12835,11 @@ impl Coordinator {
         }
 
         let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
-            meta_pg.next_version_id(bucket.as_str(), key.as_str())?
+            meta_pg.next_version_id(&bucket, &key)?
         } else {
             VersionId::Null
         };
-        let generation_id = meta_pg.next_generation_id(bucket.as_str(), key.as_str())?;
+        let generation_id = meta_pg.next_generation_id(&bucket, &key)?;
         let stale_payload = if version_id.is_null() {
             Self::snapshot_overwritten_null_version_payload(&meta_pg, &bucket, &key)?
         } else {
@@ -13063,7 +13090,7 @@ impl Coordinator {
             )
             .map_err(ServerError::Metadata)?;
         let stored = meta_pg
-            .get_object_meta(bucket.as_str(), key.as_str())
+            .get_object_meta(&bucket, &key)
             .map_err(ServerError::Metadata)?;
         let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
             reason: format!(
@@ -13112,7 +13139,7 @@ impl Coordinator {
             lifecycle_last_modified,
         )?;
         if let Some(ref payload) = stale_payload {
-            self.delete_stale_object_payload(bucket.as_str(), key.as_str(), payload);
+            self.delete_stale_object_payload(&bucket, &key, payload);
         }
 
         Ok(CompleteMultipartUploadResult {
@@ -13146,11 +13173,10 @@ impl Coordinator {
                 key,
                 upload_id,
             } => {
-                if self.read_runtime().abort_multipart_upload_internal(
-                    bucket.as_str(),
-                    key.as_str(),
-                    &upload_id,
-                )? {
+                if self
+                    .read_runtime()
+                    .abort_multipart_upload_internal_for(&bucket, &key, &upload_id)?
+                {
                     Ok(())
                 } else {
                     Err(ServerError::NoSuchUpload { upload_id })
@@ -15253,7 +15279,7 @@ mod tests {
             })
             .unwrap()
             .into_iter()
-            .map(|bucket| bucket.name)
+            .map(|bucket| bucket.name.into_string())
             .collect();
         assert_eq!(root_names, vec!["bucket-root", "bucket-user"]);
 
@@ -15263,7 +15289,7 @@ mod tests {
             })
             .unwrap()
             .into_iter()
-            .map(|bucket| bucket.name)
+            .map(|bucket| bucket.name.into_string())
             .collect();
         assert_eq!(user_names, vec!["bucket-root", "bucket-user"]);
     }
@@ -15291,7 +15317,7 @@ mod tests {
             })
             .unwrap()
             .into_iter()
-            .map(|b| b.name.clone())
+            .map(|b| b.name.into_string())
             .collect();
         assert_eq!(names, vec!["alpha", "beta", "mango", "zz-top"]);
     }
@@ -20012,7 +20038,7 @@ mod tests {
             })
             .unwrap()
             .into_iter()
-            .map(|b| b.name.clone())
+            .map(|b| b.name.into_string())
             .collect();
         assert_eq!(names, vec![bucket]);
     }
@@ -20474,7 +20500,7 @@ mod tests {
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
 
-        let guard = storage_node.lock_bucket("bucket");
+        let guard = storage_node.lock_bucket(&trusted_bucket_name("bucket"));
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let res = test_helpers::put_object(
@@ -20521,7 +20547,7 @@ mod tests {
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
 
-        let guard = storage_node.lock_bucket("bucket");
+        let guard = storage_node.lock_bucket(&trusted_bucket_name("bucket"));
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let metadata = MetadataBlob::new();
@@ -20560,7 +20586,7 @@ mod tests {
             .create_bucket_for_owner("default-owner", "bucket", false)
             .unwrap();
 
-        let guard = storage_node.lock_bucket("bucket");
+        let guard = storage_node.lock_bucket(&trusted_bucket_name("bucket"));
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let res = delete_bucket_test(&deleter, "bucket");
@@ -20602,8 +20628,13 @@ mod tests {
         )
         .unwrap();
 
-        coord.storage_node.remove_bucket_fast_path("bucket");
-        assert!(coord.storage_node.get_bucket_fast_path("bucket").is_none());
+        coord
+            .storage_node
+            .remove_bucket_fast_path(&trusted_bucket_name("bucket"));
+        assert!(coord
+            .storage_node
+            .get_bucket_fast_path(&trusted_bucket_name("bucket"))
+            .is_none());
 
         let head = coord
             .head_object(&GetObjectRequest {
@@ -20622,7 +20653,7 @@ mod tests {
 
         let cached = coord
             .storage_node
-            .get_bucket_fast_path("bucket")
+            .get_bucket_fast_path(&trusted_bucket_name("bucket"))
             .expect("head_object should repopulate bucket fast path");
         assert_eq!(cached.name.as_str(), "bucket");
         assert_eq!(cached.state, BucketState::Active);
@@ -20658,7 +20689,7 @@ mod tests {
         )
         .unwrap();
 
-        storage_node.remove_bucket_fast_path("bucket");
+        storage_node.remove_bucket_fast_path(&trusted_bucket_name("bucket"));
         reader
             .head_object(&GetObjectRequest {
                 sse_customer: None,
@@ -20729,7 +20760,7 @@ mod tests {
         )
         .unwrap();
 
-        storage_node.remove_bucket_fast_path("bucket");
+        storage_node.remove_bucket_fast_path(&trusted_bucket_name("bucket"));
         admin
             .head_object(&GetObjectRequest {
                 sse_customer: None,
@@ -20795,7 +20826,7 @@ mod tests {
 
         let (upload_id, parts) = create_upload_with_parts(&admin, "bucket", "key", &[(1, b"part")]);
 
-        let guard = storage_node.lock_bucket("bucket");
+        let guard = storage_node.lock_bucket(&trusted_bucket_name("bucket"));
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let res = completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
@@ -20840,7 +20871,7 @@ mod tests {
 
         let (upload_id, parts) = create_upload_with_parts(&admin, "bucket", "key", &[(1, b"part")]);
 
-        let guard = storage_node.lock_multipart_completion_bucket("bucket");
+        let guard = storage_node.lock_multipart_completion_bucket(&trusted_bucket_name("bucket"));
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {
             let res = completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
@@ -20895,7 +20926,7 @@ mod tests {
             None,
         )
         .unwrap();
-        admin.clear_bucket_policy_cache("bucket");
+        admin.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
 
         let bucket_pg_id = admin.bucket_pg_id("bucket");
         let key = (0..1024)
@@ -27188,7 +27219,7 @@ mod tests {
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
                 test_helpers::requester("owner-a"), None)
             .unwrap();
-        admin.clear_bucket_policy_cache("bucket");
+        admin.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
         test_helpers::put_object(
             &admin,
             &PutObjectRequest {
@@ -27246,7 +27277,7 @@ mod tests {
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectTagging","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
                 test_helpers::requester("owner-a"), None)
             .unwrap();
-        admin.clear_bucket_policy_cache("bucket");
+        admin.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
         let tags_xml =
             "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
         test_helpers::put_object(
@@ -27351,7 +27382,7 @@ mod tests {
                 r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
                 owner_requester.clone(), None)
             .unwrap();
-        admin.clear_bucket_policy_cache("bucket");
+        admin.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
 
         let (tx, rx) = mpsc::channel();
         let handle = thread::spawn(move || {

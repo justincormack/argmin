@@ -2396,7 +2396,7 @@ mod tests {
     #[test]
     fn head_bucket_response() {
         let info = BucketSummary {
-            name: "b".into(),
+            name: storage::BucketName::try_from("bbb").unwrap(),
             owner_principal: "owner".into(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
             created_at: 0,
@@ -2423,7 +2423,7 @@ mod tests {
         );
         assert_eq!(
             find_header(&resp, "x-amz-bucket-arn"),
-            Some("arn:aws:s3:::b")
+            Some("arn:aws:s3:::bbb")
         );
         assert_eq!(find_header(&resp, "x-amz-bucket-region"), Some("us-west-2"));
         assert_eq!(find_header(&resp, "Content-Length"), None);
@@ -2501,7 +2501,7 @@ mod tests {
     #[test]
     fn list_buckets_response() {
         let buckets = vec![BucketSummary {
-            name: "test-bucket".into(),
+            name: storage::BucketName::try_from("test-bucket").unwrap(),
             owner_principal: "owner".into(),
             owner_canonical_id: CanonicalUserId::from_principal("owner"),
             created_at: 1000,

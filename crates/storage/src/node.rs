@@ -12,7 +12,7 @@ use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 use crate::error::StoreError;
 use crate::pg_store::PgStore;
 use crate::traits::{ShardStore, StorageNode};
-use crate::types::{BucketFastPathInfo, GenerationId, ShardKey, WriteAck};
+use crate::types::{BucketFastPathInfo, BucketName, GenerationId, ObjectKey, ShardKey, WriteAck};
 
 const TRACE_TARGET: &str = "storage";
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
@@ -32,7 +32,7 @@ struct PgDataPaths {
 
 pub struct BucketLockGuard<'a> {
     guard: MutexGuard<'a, ()>,
-    bucket: String,
+    bucket: BucketName,
     stripe: usize,
     acquired_at: Instant,
     trace: Option<observability::TraceContext>,
@@ -137,23 +137,23 @@ pub struct SharedStorageNode {
     data_dir: PathBuf,
     bucket_locks: Vec<Mutex<()>>,
     multipart_completion_locks: Vec<Mutex<()>>,
-    bucket_fast_path: RwLock<HashMap<String, BucketFastPathInfo>>,
-    object_payload_leases: Mutex<HashMap<(String, String, GenerationId), usize>>,
+    bucket_fast_path: RwLock<HashMap<BucketName, BucketFastPathInfo>>,
+    object_payload_leases: Mutex<HashMap<(BucketName, ObjectKey, GenerationId), usize>>,
     reclaim_queue: (Mutex<ReclaimQueueState>, Condvar),
 }
 
-type ReclaimRoot = (String, String, GenerationId);
+type ReclaimRoot = (BucketName, ObjectKey, GenerationId);
 
 pub enum ReclaimWorkItem {
     ObjectPayload(ReclaimRoot),
-    BucketDelete(String),
+    BucketDelete(BucketName),
 }
 
 struct ReclaimQueueState {
     object_queue: VecDeque<ReclaimRoot>,
     queued_objects: HashSet<ReclaimRoot>,
-    bucket_delete_queue: VecDeque<String>,
-    queued_bucket_deletes: HashSet<String>,
+    bucket_delete_queue: VecDeque<BucketName>,
+    queued_bucket_deletes: HashSet<BucketName>,
 }
 
 const BUCKET_LOCK_STRIPES: usize = 256;
@@ -228,13 +228,13 @@ impl SharedStorageNode {
         &self.pg_id_list
     }
 
-    fn bucket_lock_index(&self, bucket: &str) -> usize {
+    fn bucket_lock_index(&self, bucket: &BucketName) -> usize {
         (rapidhash_v3_micro_inline::<true, false>(bucket.as_bytes(), &RAPIDHASH_SECRETS) as usize)
             % self.bucket_locks.len()
     }
 
     /// Return the cached active-bucket fast-path metadata for `bucket`.
-    pub fn get_bucket_fast_path(&self, bucket: &str) -> Option<BucketFastPathInfo> {
+    pub fn get_bucket_fast_path(&self, bucket: &BucketName) -> Option<BucketFastPathInfo> {
         read_rwlock_unpoisoned(&self.bucket_fast_path)
             .get(bucket)
             .cloned()
@@ -242,13 +242,13 @@ impl SharedStorageNode {
 
     /// Insert or replace the cached active-bucket fast-path metadata.
     pub fn upsert_bucket_fast_path(&self, info: BucketFastPathInfo) {
-        write_rwlock_unpoisoned(&self.bucket_fast_path).insert(info.name.to_string(), info);
+        write_rwlock_unpoisoned(&self.bucket_fast_path).insert(info.name.clone(), info);
     }
 
     /// Mutate the cached fast-path metadata if present.
     pub fn update_bucket_fast_path_if_present(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
         update: impl FnOnce(&mut BucketFastPathInfo),
     ) {
         if let Some(info) = write_rwlock_unpoisoned(&self.bucket_fast_path).get_mut(bucket) {
@@ -257,7 +257,7 @@ impl SharedStorageNode {
     }
 
     /// Remove cached fast-path metadata for `bucket`.
-    pub fn remove_bucket_fast_path(&self, bucket: &str) {
+    pub fn remove_bucket_fast_path(&self, bucket: &BucketName) {
         write_rwlock_unpoisoned(&self.bucket_fast_path).remove(bucket);
     }
 
@@ -267,7 +267,7 @@ impl SharedStorageNode {
     /// gate so multi-step flows (for example, delete-bucket emptiness check
     /// followed by delete) cannot interleave with concurrent writes that would
     /// make the bucket non-empty.
-    pub fn lock_bucket(&self, bucket: &str) -> BucketLockGuard<'_> {
+    pub fn lock_bucket(&self, bucket: &BucketName) -> BucketLockGuard<'_> {
         observability::trace_scope!(
             TRACE_TARGET,
             "SharedStorageNode::lock_bucket",
@@ -295,7 +295,7 @@ impl SharedStorageNode {
         }
         BucketLockGuard {
             guard,
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
             stripe: idx,
             acquired_at,
             trace,
@@ -304,7 +304,7 @@ impl SharedStorageNode {
 
     /// Lock a bucket-scoped stripe mutex used to serialize multipart
     /// completion publication order across coordinators.
-    pub fn lock_multipart_completion_bucket(&self, bucket: &str) -> BucketLockGuard<'_> {
+    pub fn lock_multipart_completion_bucket(&self, bucket: &BucketName) -> BucketLockGuard<'_> {
         observability::trace_scope!(
             TRACE_TARGET,
             "SharedStorageNode::lock_multipart_completion_bucket",
@@ -332,7 +332,7 @@ impl SharedStorageNode {
         }
         BucketLockGuard {
             guard,
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
             stripe: idx,
             acquired_at,
             trace,
@@ -485,8 +485,8 @@ impl SharedStorageNode {
     /// Acquire an in-memory lease on an object payload generation.
     pub fn acquire_object_payload_lease(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) {
         let mut leases = self
@@ -494,7 +494,7 @@ impl SharedStorageNode {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         *leases
-            .entry((bucket.to_string(), key.to_string(), generation_id))
+            .entry((bucket.clone(), key.clone(), generation_id))
             .or_insert(0) += 1;
     }
 
@@ -503,8 +503,8 @@ impl SharedStorageNode {
     /// Returns the remaining active lease count after release.
     pub fn release_object_payload_lease(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> usize {
         let mut leases = self
@@ -512,12 +512,12 @@ impl SharedStorageNode {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let entry = leases
-            .get_mut(&(bucket.to_string(), key.to_string(), generation_id))
+            .get_mut(&(bucket.clone(), key.clone(), generation_id))
             .expect("object payload lease release without acquire");
         *entry -= 1;
         let remaining = *entry;
         if remaining == 0 {
-            leases.remove(&(bucket.to_string(), key.to_string(), generation_id));
+            leases.remove(&(bucket.clone(), key.clone(), generation_id));
         }
         remaining
     }
@@ -525,8 +525,8 @@ impl SharedStorageNode {
     /// Return the number of active object-payload leases for a generation.
     pub fn object_payload_lease_count(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) -> usize {
         let leases = self
@@ -534,13 +534,13 @@ impl SharedStorageNode {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         leases
-            .get(&(bucket.to_string(), key.to_string(), generation_id))
+            .get(&(bucket.clone(), key.clone(), generation_id))
             .copied()
             .unwrap_or(0)
     }
 
     /// Return the number of active object-payload leases for a bucket.
-    pub fn bucket_object_payload_lease_count(&self, bucket: &str) -> usize {
+    pub fn bucket_object_payload_lease_count(&self, bucket: &BucketName) -> usize {
         let leases = self
             .object_payload_leases
             .lock()
@@ -555,11 +555,11 @@ impl SharedStorageNode {
     /// Queue a payload generation for background reclaim.
     pub fn enqueue_object_payload_reclaim(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         generation_id: GenerationId,
     ) {
-        let root = (bucket.to_string(), key.to_string(), generation_id);
+        let root = (bucket.clone(), key.clone(), generation_id);
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
         if state.queued_objects.insert(root.clone()) {
@@ -569,10 +569,10 @@ impl SharedStorageNode {
     }
 
     /// Queue a bucket for deferred final deletion once reclaim is drained.
-    pub fn enqueue_bucket_delete_finalize(&self, bucket: &str) {
+    pub fn enqueue_bucket_delete_finalize(&self, bucket: &BucketName) {
         let (state_lock, cv) = &self.reclaim_queue;
         let mut state = state_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let bucket = bucket.to_string();
+        let bucket = bucket.clone();
         if state.queued_bucket_deletes.insert(bucket.clone()) {
             state.bucket_delete_queue.push_back(bucket);
             cv.notify_one();
@@ -647,6 +647,10 @@ impl SharedStorageNode {
 mod tests {
     use super::*;
     use std::panic::AssertUnwindSafe;
+
+    fn bucket_name(name: &str) -> BucketName {
+        BucketName::try_from(name).unwrap()
+    }
 
     #[test]
     fn data_dir_accessor() {
@@ -740,13 +744,13 @@ mod tests {
         };
         node.upsert_bucket_fast_path(info);
         assert_eq!(
-            node.get_bucket_fast_path("bucket")
+            node.get_bucket_fast_path(&bucket_name("bucket"))
                 .as_ref()
                 .map(|entry| entry.name.as_str()),
             Some("bucket")
         );
-        node.remove_bucket_fast_path("bucket");
-        assert!(node.get_bucket_fast_path("bucket").is_none());
+        node.remove_bucket_fast_path(&bucket_name("bucket"));
+        assert!(node.get_bucket_fast_path(&bucket_name("bucket")).is_none());
     }
 
     #[test]
@@ -894,9 +898,9 @@ mod tests {
 
         let (tx, rx) = channel();
         std::thread::scope(|s| {
-            let guard = node.lock_bucket("bucket-a");
+            let guard = node.lock_bucket(&bucket_name("bucket-a"));
             s.spawn(|| {
-                let _g2 = node.lock_bucket("bucket-a");
+                let _g2 = node.lock_bucket(&bucket_name("bucket-a"));
                 tx.send(()).unwrap();
             });
 
@@ -911,10 +915,10 @@ mod tests {
     fn shared_node_bucket_lock_different_buckets_do_not_deadlock() {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();
-        let a_guard = node.lock_bucket("bucket-a");
+        let a_guard = node.lock_bucket(&bucket_name("bucket-a"));
         // Different bucket may map to the same stripe, but this must never deadlock.
         // We only assert that taking locks in sequence is safe.
         drop(a_guard);
-        let _b_guard = node.lock_bucket("bucket-b");
+        let _b_guard = node.lock_bucket(&bucket_name("bucket-b"));
     }
 }

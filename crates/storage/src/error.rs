@@ -38,6 +38,9 @@ pub enum MetadataError {
     #[error("invalid bucket name: {reason}")]
     InvalidBucketName { reason: String },
 
+    #[error("invalid object key: {reason}")]
+    InvalidObjectKey { reason: String },
+
     #[error("bucket already exists")]
     BucketAlreadyExists,
 

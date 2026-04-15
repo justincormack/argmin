@@ -604,7 +604,7 @@ impl Coordinator {
             return Ok(Some(cached));
         }
 
-        let bucket_pg = self.get_bucket_pg_for(&trusted_bucket_name(&bucket.name))?;
+        let bucket_pg = self.get_bucket_pg_for(&bucket.name)?;
         self.cached_bucket_policy_with_locked_bucket_pg(bucket, &bucket_pg)
     }
 
@@ -637,7 +637,7 @@ impl Coordinator {
 
         let raw_policy = Self::load_bucket_subresource_from_pg(
             bucket_pg,
-            &trusted_bucket_name(&bucket.name),
+            &bucket.name,
             storage::BucketSubresourceKind::Policy,
         )?;
         let parsed_policy = match raw_policy {
@@ -666,17 +666,15 @@ impl Coordinator {
 
     pub(super) fn cache_bucket_policy(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
         generation: u64,
         policy: Arc<auth::BucketPolicy>,
     ) {
-        write_rwlock_unpoisoned(&self.bucket_policy_cache).insert(
-            bucket.to_string(),
-            CachedBucketPolicy { generation, policy },
-        );
+        write_rwlock_unpoisoned(&self.bucket_policy_cache)
+            .insert(bucket.clone(), CachedBucketPolicy { generation, policy });
     }
 
-    pub(super) fn clear_bucket_policy_cache(&self, bucket: &str) {
+    pub(super) fn clear_bucket_policy_cache(&self, bucket: &BucketName) {
         write_rwlock_unpoisoned(&self.bucket_policy_cache).remove(bucket);
     }
 
@@ -3563,7 +3561,7 @@ impl Coordinator {
         &'a self,
         req: ObjectStateLoadRequest<'_>,
     ) -> Result<LoadedObjectState<'a>, ServerError> {
-        let fast_bucket_info = match self.storage_node.get_bucket_fast_path(req.bucket.as_str()) {
+        let fast_bucket_info = match self.storage_node.get_bucket_fast_path(req.bucket) {
             Some(info) if info.state == BucketState::Active => {
                 Some(Self::validate_expected_bucket_owner(
                     Self::bucket_summary_fast(info),
@@ -3613,8 +3611,8 @@ impl Coordinator {
             )?;
             let record = match Self::lookup_object_record(
                 guards.object(),
-                req.bucket.as_str(),
-                req.key.as_str(),
+                req.bucket,
+                req.key,
                 req.version_id,
             ) {
                 Ok(record) => record,
