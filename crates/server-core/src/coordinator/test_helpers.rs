@@ -85,8 +85,11 @@ pub fn upload_part(
         })
     })();
     if result.is_err() {
-        let _ =
-            coord.abort_stream_part_session(req.upload.bucket_name(), req.upload.key(), session_id);
+        let _ = coord.abort_stream_part_session(
+            req.upload.bucket_name_typed(),
+            req.upload.key_typed(),
+            session_id,
+        );
     }
     result
 }

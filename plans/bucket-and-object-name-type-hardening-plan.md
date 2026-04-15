@@ -301,12 +301,19 @@ Current status:
    through raw-string wrappers. The lifecycle sweep now also carries typed
    bucket/object names from stored metadata through current-object expiration,
    noncurrent-version expiration, and aborting-upload completion instead of
-   reconstructing trusted names at each operation. This pushes the remaining
-   raw-string boundary outward toward the true ingress points.
+   reconstructing trusted names at each operation. The `server-http` streaming
+   POST / PUT / UploadPart contexts now also store typed bucket/key values
+   across their async lifetime instead of degrading them back to `String`, and
+   coordinator cleanup entry points for those sessions now take typed names on
+   their production path. The non-test `bucket_exists` region-probe path and
+   authz bucket-policy PG lookup also now route through typed bucket parsing /
+   typed PG accessors rather than leaning on test-only raw helpers. This
+   pushes the remaining raw-string boundary outward toward the true ingress
+   points.
 4. Still open:
    storage-dispatch and some older coordinator-internal helper APIs still
-   accept raw `&str` bucket/key parameters, especially around bucket creation /
-   existence helpers and a few compatibility wrappers that still sit above
+   accept raw `&str` bucket/key parameters, now mostly around internal reclaim
+   / lease bookkeeping and a few compatibility wrappers that still sit above
    typed PG entry points.
 5. Still open:
    the final Phase 3 answer on the failure model is only partly in place today.

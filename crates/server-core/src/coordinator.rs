@@ -4838,7 +4838,7 @@ impl ReadRuntime {
         let bucket_pg_id = self.pg_topology.bucket_pg_for(bucket);
         {
             let bucket_pg = self.storage_node.get_pg(bucket_pg_id)?;
-            let info = match bucket_pg.head_bucket(bucket.as_str()) {
+            let info = match bucket_pg.head_bucket_raw(bucket.as_str()) {
                 Ok(info) => info,
                 Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(()),
                 Err(other) => return Err(ServerError::Metadata(other)),
@@ -6455,21 +6455,26 @@ impl Coordinator {
                 Ok(BucketCreateOutcome::Created)
             }
             Err(storage::MetadataError::BucketAlreadyExists) => {
-                let existing = bucket_pg.head_bucket(name.as_str()).map_err(|e| match e {
-                    storage::MetadataError::BucketNotFound { name } => {
-                        ServerError::BucketNotFound {
-                            name: name.to_string(),
+                let existing = bucket_pg
+                    .head_bucket_raw(name.as_str())
+                    .map_err(|e| match e {
+                        storage::MetadataError::BucketNotFound { name } => {
+                            ServerError::BucketNotFound {
+                                name: name.to_string(),
+                            }
                         }
+                        other => ServerError::Metadata(other),
+                    })?;
+                match existing.state {
+                    BucketState::Active
+                        if existing.owner_principal == owner.principal
+                            && existing.owner_canonical_id == owner.canonical_id =>
+                    {
+                        Ok(BucketCreateOutcome::AlreadyOwned)
                     }
-                    other => ServerError::Metadata(other),
-                })?;
-                if existing.state == BucketState::Active
-                    && existing.owner_principal == owner.principal
-                    && existing.owner_canonical_id == owner.canonical_id
-                {
-                    Ok(BucketCreateOutcome::AlreadyOwned)
-                } else {
-                    Err(ServerError::BucketAlreadyExists)
+                    BucketState::Active | BucketState::Deleting => {
+                        Err(ServerError::BucketAlreadyExists)
+                    }
                 }
             }
             Err(other) => Err(ServerError::Metadata(other)),
@@ -6608,7 +6613,10 @@ impl Coordinator {
             "bucket={:?}",
             name
         );
-        match self.unchecked_active_bucket_summary(name) {
+        let Ok(name) = BucketName::try_from(name) else {
+            return Ok(false);
+        };
+        match self.unchecked_active_bucket_summary_for(&name) {
             Ok(_) => Ok(true),
             Err(ServerError::BucketNotFound { .. }) => Ok(false),
             Err(err) => Err(err),
@@ -8967,6 +8975,7 @@ impl Coordinator {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn append_stream_segment(
         &self,
         bucket: &str,
@@ -9521,6 +9530,7 @@ impl Coordinator {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn abort_stream_put(
         &self,
         bucket: &str,
@@ -9536,20 +9546,20 @@ impl Coordinator {
 
     pub fn abort_stream_put_session(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         session_id: &str,
     ) -> Result<(), ServerError> {
-        self.abort_stream_put(bucket, key, session_id)
+        self.abort_stream_put_for(bucket, key, session_id)
     }
 
     pub fn abort_stream_part_session(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         session_id: &str,
     ) -> Result<(), ServerError> {
-        self.abort_stream_put(bucket, key, session_id)
+        self.abort_stream_put_for(bucket, key, session_id)
     }
 
     /// Scavenge abandoned streaming upload sessions across all PGs.
@@ -9585,7 +9595,7 @@ impl Coordinator {
             for session in sessions {
                 if session.created_at < cutoff
                     && self
-                        .abort_stream_put(&session.bucket, &session.key, &session.session_id)
+                        .abort_stream_put_for(&session.bucket, &session.key, &session.session_id)
                         .is_ok()
                 {
                     count += 1;

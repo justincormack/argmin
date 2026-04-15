@@ -604,7 +604,7 @@ impl Coordinator {
             return Ok(Some(cached));
         }
 
-        let bucket_pg = self.get_bucket_pg(&bucket.name)?;
+        let bucket_pg = self.get_bucket_pg_for(&trusted_bucket_name(&bucket.name))?;
         self.cached_bucket_policy_with_locked_bucket_pg(bucket, &bucket_pg)
     }
 

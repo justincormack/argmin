@@ -3057,11 +3057,12 @@ impl HttpFrontend {
             sse_customer_request.as_ref(),
             managed_encryption,
         );
+        let bucket_name = parse_bucket_name(bucket)?;
         let prepared_put = self
             .coordinator
             .begin_stream_put(&AuthorizePutObjectRequest {
                 object: ObjectRequest::new(
-                    parse_bucket_name(bucket)?,
+                    bucket_name.clone(),
                     key.clone(),
                     requester.clone(),
                     None,
@@ -3097,7 +3098,7 @@ impl HttpFrontend {
             };
             format!(
                 "{scheme}://{host}/{}/{}",
-                percent_encode_location_path_segment(bucket),
+                percent_encode_location_path_segment(bucket_name.as_str()),
                 percent_encode_location_key(key.as_str())
             )
         });
@@ -3106,8 +3107,8 @@ impl HttpFrontend {
             trace: current_trace_context(),
             binding: StreamObjectBinding {
                 session_id: prepared_put.session_id,
-                bucket: bucket.to_string(),
-                key: key.into_string(),
+                bucket: bucket_name,
+                key,
             },
             requester,
             acl_header: field("acl").map(std::string::ToString::to_string),
@@ -3168,7 +3169,7 @@ impl HttpFrontend {
                 policy_b64,
                 &field_pairs,
                 file_size,
-                &ctx.binding.bucket,
+                ctx.binding.bucket.as_str(),
                 now,
             )
             .map_err(|e| match &e {
@@ -3214,8 +3215,8 @@ impl HttpFrontend {
 
         let mut resp = S3Response::post_object(
             &result,
-            &ctx.binding.bucket,
-            &ctx.binding.key,
+            ctx.binding.bucket.as_str(),
+            ctx.binding.key.as_str(),
             ctx.success_status,
             ctx.success_redirect.as_deref(),
             ctx.response_location.as_deref(),
@@ -3457,8 +3458,8 @@ impl HttpFrontend {
 
         Ok(StreamingPutContext {
             trace: current_trace_context(),
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            bucket: authorized_write.bucket_typed().clone(),
+            key: authorized_write.key_typed().clone(),
             requester,
             expected_bucket_owner: expected_bucket_owner(req).map(str::to_string),
             acl_header: req.header("x-amz-acl").map(str::to_string),
@@ -3661,16 +3662,19 @@ impl HttpFrontend {
             }
         }
 
+        let upload = multipart_object_request(
+            bucket,
+            key,
+            upload_id,
+            requester.clone(),
+            expected_bucket_owner.as_deref(),
+        )?;
+        let binding_bucket = upload.object.bucket.name.clone();
+        let binding_key = upload.object.key.clone();
         let begin = self
             .coordinator
             .begin_stream_part(&BeginStreamPartRequest {
-                upload: multipart_object_request(
-                    bucket,
-                    key,
-                    upload_id,
-                    requester.clone(),
-                    expected_bucket_owner.as_deref(),
-                )?,
+                upload,
                 part_number,
                 policy_context: crate::coordinator::PutObjectPolicyContext::default()
                     .with_sse_customer_algorithm(
@@ -3686,8 +3690,8 @@ impl HttpFrontend {
             binding: StreamPartBinding {
                 object: StreamObjectBinding {
                     session_id: begin.session_id,
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
+                    bucket: binding_bucket,
+                    key: binding_key,
                 },
                 upload_id: upload_id.to_string(),
                 part_number,
@@ -3862,8 +3866,8 @@ impl HttpFrontend {
 /// Session binding for a streaming object-scoped upload.
 pub struct StreamObjectBinding {
     pub session_id: String,
-    pub bucket: String,
-    pub key: String,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
 }
 
 /// Session binding for a streaming multipart-part upload.
@@ -3895,8 +3899,8 @@ pub struct StreamingPartChecksumContract {
 /// Created by `prepare_streaming_put`, used across async/blocking boundaries.
 pub struct StreamingPutContext {
     pub trace: observability::TraceContext,
-    pub bucket: String,
-    pub key: String,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
     pub requester: crate::coordinator::Requester,
     pub expected_bucket_owner: Option<String>,
     pub acl_header: Option<String>,
@@ -9158,9 +9162,11 @@ mod tests {
                 })
         })();
         if result.is_err() {
-            let _ = fe
-                .coordinator
-                .abort_stream_part_session(bucket, key, &session.session_id);
+            let _ = fe.coordinator.abort_stream_part_session(
+                &parse_bucket_name(bucket).unwrap(),
+                &parse_object_key(key).unwrap(),
+                &session.session_id,
+            );
         }
         result.unwrap()
     }
