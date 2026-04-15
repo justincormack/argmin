@@ -1588,7 +1588,7 @@ impl HttpFrontend {
                     let has_unsupported_versioned_etag = version_id.is_some() && e.etag.is_some();
                     if has_unsupported_form_fields || has_unsupported_versioned_etag {
                         validation_errors.push(crate::coordinator::DeleteError {
-                            key: e.key.clone(),
+                            key: e.key.to_string(),
                             version_id,
                             code: "NotImplemented".to_string(),
                             message:
@@ -1605,7 +1605,7 @@ impl HttpFrontend {
                         None => crate::conditional::DeleteCondition::None,
                     };
                     entries.push(crate::coordinator::DeleteEntry {
-                        key: &e.key,
+                        key: e.key.as_str(),
                         version_id,
                         cond,
                     });
@@ -3067,7 +3067,7 @@ impl HttpFrontend {
         let prepared_put = self
             .coordinator
             .begin_stream_put(&AuthorizePutObjectRequest {
-                object: ObjectRequest::new(bucket, &key, requester.clone(), None),
+                object: ObjectRequest::new(bucket, key.as_str(), requester.clone(), None),
                 acl: acl.into(),
                 policy_context: crate::coordinator::PutObjectPolicyContext::new(
                     None,
@@ -3100,7 +3100,7 @@ impl HttpFrontend {
             format!(
                 "{scheme}://{host}/{}/{}",
                 percent_encode_location_path_segment(bucket),
-                percent_encode_location_key(&key)
+                percent_encode_location_key(key.as_str())
             )
         });
 
@@ -3109,7 +3109,7 @@ impl HttpFrontend {
             binding: StreamObjectBinding {
                 session_id: prepared_put.session_id,
                 bucket: bucket.to_string(),
-                key,
+                key: key.into_string(),
             },
             requester,
             acl_header: field("acl").map(std::string::ToString::to_string),

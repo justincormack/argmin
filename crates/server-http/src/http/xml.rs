@@ -18,11 +18,10 @@ use server_core::system_metadata::SystemMetadata;
 use storage::{
     BucketEncryptionConfig, BucketLifecycleConfiguration, BucketObjectOwnership,
     BucketOwnershipControls, EffectiveBucketEncryptionConfig, ManagedEncryptionAlgorithm,
-    PublicAccessBlockConfig,
+    ObjectKey, PublicAccessBlockConfig,
 };
 
 use super::response::format_version_id;
-use super::router::validate_object_key;
 
 fn ensure_xml_body_size(data: &[u8], max_message_length_bytes: usize) -> Result<(), ServerError> {
     if data.len() > max_message_length_bytes {
@@ -768,7 +767,7 @@ pub fn list_objects_v1_xml(
 /// An entry in a `DeleteObjects` request.
 #[derive(Debug)]
 pub struct DeleteObjectEntry {
-    pub key: String,
+    pub key: ObjectKey,
     pub version_id: Option<String>,
     pub etag: Option<String>,
     pub last_modified_time: Option<String>,
@@ -894,7 +893,20 @@ pub fn parse_delete_objects_xml(
                             max_size_allowed: 1024,
                         });
                     }
-                    validate_object_key(&key)?;
+                    let key = ObjectKey::try_from(key).map_err(|error| match error {
+                        storage::ObjectKeyError::InvalidLength { length } if length > 1024 => {
+                            ServerError::KeyTooLongError {
+                                size: length,
+                                max_size_allowed: 1024,
+                            }
+                        }
+                        storage::ObjectKeyError::InvalidLength { .. }
+                        | storage::ObjectKeyError::ContainsNullByte => {
+                            ServerError::InvalidRequest {
+                                reason: error.to_string(),
+                            }
+                        }
+                    })?;
                     entries.push(DeleteObjectEntry {
                         etag: current_etag.take(),
                         key,
@@ -4611,6 +4623,17 @@ mod tests {
     }
 
     #[test]
+    fn parse_delete_objects_empty_key_rejected() {
+        let xml = b"<Delete><Object><Key></Key></Object></Delete>";
+        match parse_delete_objects_xml(xml) {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(reason, "object key must be 1-1024 bytes, got 0");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_delete_objects_control_character_key_allowed() {
         let xml = b"<Delete><Object><Key>bad\x7fkey</Key></Object></Delete>";
         let (entries, quiet) = parse_delete_objects_xml(xml).unwrap();
@@ -6777,7 +6800,7 @@ mod tests {
         let entries: Vec<DeleteEntry> = xml_entries
             .iter()
             .map(|e| DeleteEntry {
-                key: &e.key,
+                key: e.key.as_str(),
                 version_id: None,
                 cond: DeleteCondition::None,
             })
@@ -6896,7 +6919,7 @@ mod tests {
         let entries: Vec<DeleteEntry> = xml_entries
             .iter()
             .map(|e| DeleteEntry {
-                key: &e.key,
+                key: e.key.as_str(),
                 version_id: None,
                 cond: DeleteCondition::None,
             })

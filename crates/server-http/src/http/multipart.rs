@@ -1,5 +1,6 @@
 /// Multipart form-data parser for S3 POST Object.
 use crate::error::ServerError;
+use storage::ObjectKey;
 
 /// Parsed multipart form data from a POST Object request.
 pub struct PostFormData {
@@ -85,14 +86,14 @@ impl PostFormData {
     }
 
     /// Resolve the object key, performing ${filename} substitution.
-    pub fn resolve_key(&self) -> Result<String, ServerError> {
+    pub fn resolve_key(&self) -> Result<ObjectKey, ServerError> {
         let key = self
             .field("key")
             .ok_or_else(|| ServerError::InvalidRequest {
                 reason: "POST form missing 'key' field".to_string(),
             })?;
 
-        if key.contains("${filename}") {
+        let resolved = if key.contains("${filename}") {
             let fname = self.file_name.as_deref().unwrap_or("");
             // Use only the filename portion (strip directory components)
             let basename = fname
@@ -100,10 +101,23 @@ impl PostFormData {
                 .map(|(_, f)| f)
                 .or_else(|| fname.rsplit_once('\\').map(|(_, f)| f))
                 .unwrap_or(fname);
-            Ok(key.replace("${filename}", basename))
+            key.replace("${filename}", basename)
         } else {
-            Ok(key.to_string())
-        }
+            key.to_string()
+        };
+
+        ObjectKey::try_from(resolved).map_err(|error| match error {
+            storage::ObjectKeyError::InvalidLength { length } if length > 1024 => {
+                ServerError::KeyTooLongError {
+                    size: length,
+                    max_size_allowed: 1024,
+                }
+            }
+            storage::ObjectKeyError::InvalidLength { .. }
+            | storage::ObjectKeyError::ContainsNullByte => ServerError::InvalidRequest {
+                reason: error.to_string(),
+            },
+        })
     }
 }
 
@@ -152,7 +166,7 @@ mod tests {
             file_data: vec![],
             file_name: Some("photo.jpg".to_string()),
         };
-        assert_eq!(data.resolve_key().unwrap(), "uploads/photo.jpg");
+        assert_eq!(data.resolve_key().unwrap().as_str(), "uploads/photo.jpg");
     }
 
     #[test]
@@ -162,7 +176,7 @@ mod tests {
             file_data: vec![],
             file_name: None,
         };
-        assert_eq!(data.resolve_key().unwrap(), "mykey.txt");
+        assert_eq!(data.resolve_key().unwrap().as_str(), "mykey.txt");
     }
 
     #[test]
@@ -172,6 +186,55 @@ mod tests {
             file_data: vec![],
             file_name: Some("C:\\Users\\alice\\photo.jpg".to_string()),
         };
-        assert_eq!(data.resolve_key().unwrap(), "photo.jpg");
+        assert_eq!(data.resolve_key().unwrap().as_str(), "photo.jpg");
+    }
+
+    #[test]
+    fn resolve_key_empty_filename_is_rejected() {
+        let data = PostFormData {
+            fields: vec![("key".to_string(), "${filename}".to_string())],
+            file_data: vec![],
+            file_name: None,
+        };
+        match data.resolve_key() {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(reason, "object key must be 1-1024 bytes, got 0");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_key_rejects_oversized_key() {
+        let data = PostFormData {
+            fields: vec![("key".to_string(), "x".repeat(1025))],
+            file_data: vec![],
+            file_name: None,
+        };
+        match data.resolve_key() {
+            Err(ServerError::KeyTooLongError {
+                size,
+                max_size_allowed,
+            }) => {
+                assert_eq!(size, 1025);
+                assert_eq!(max_size_allowed, 1024);
+            }
+            other => panic!("expected KeyTooLongError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_key_rejects_nul() {
+        let data = PostFormData {
+            fields: vec![("key".to_string(), "bad\0key".to_string())],
+            file_data: vec![],
+            file_name: None,
+        };
+        match data.resolve_key() {
+            Err(ServerError::InvalidRequest { reason }) => {
+                assert_eq!(reason, "object key must not contain null bytes");
+            }
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
     }
 }
