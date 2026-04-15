@@ -21,21 +21,16 @@ This still does not cover:
 
 Important current bucket-policy note:
 - AWS-backed testing now shows that `PutBucketPolicy` acceptance is broader
-  than our current runtime evaluator. We should accept the AWS-supported
-  condition keys on the implemented surface even when local request context is
-  still incomplete for some of them.
-- `aws:PrincipalArn` and `aws:SourceVpc` are currently in that acceptance-only
-  category: they are accepted on upload to match AWS, but not yet treated as
-  runtime-evaluable request context.
-- That acceptance-only list should stay explicit; adding more keys later
-  should be a deliberate compatibility decision backed by tests.
+  than our current runtime evaluator. We are not keeping an acceptance-only
+  subset for unsupported object-condition keys because that creates a stored
+  policy state the evaluator cannot use correctly.
 - In particular, request context does not yet carry values for
-  `aws:SourceVpce`, `aws:SourceArn`, `aws:SourceAccount`, `aws:SourceOwner`,
-  `aws:userid`, `aws:PrincipalOrgID`,
+  `aws:PrincipalArn`, `aws:SourceVpc`, `aws:SourceVpce`, `aws:SourceArn`,
+  `aws:SourceAccount`, `aws:SourceOwner`, `aws:userid`, `aws:PrincipalOrgID`,
   `s3:DataAccessPointAccount`, or `s3:DataAccessPointArn`.
-- Those other keys also remain outside the current accepted/evaluable
-  object-condition subset; they are future follow-up rather than acceptance-only
-  support today.
+- Those keys remain outside the current accepted/evaluable object-condition
+  subset; they are future follow-up rather than partially accepted support
+  today.
 - `s3:ResourceTag/*` remains a separate deferred evaluator gap.
 
 Carry-forward from the completed Ceph authz diff review:
@@ -93,12 +88,10 @@ Explicitly still out of scope for this plan:
 - full IAM policy language
 
 Still useful follow-up inside the currently implemented bucket-policy surface:
-- align `PutBucketPolicy` acceptance with AWS even when runtime evaluation is
-  still partial
-- add request-context plumbing and evaluator support for AWS-accepted keys such
-  as `aws:PrincipalArn` and `aws:SourceVpc`
-- document which accepted keys are still evaluated with missing/absent local
-  context until that plumbing exists
+- add request-context plumbing and evaluator support for currently unsupported
+  keys such as `aws:PrincipalArn` and `aws:SourceVpc`
+- decide, with AWS-backed evidence, whether any future upload-time acceptance
+  mismatch is worth taking on without matching request-time semantics
 
 ### 2. Constrained Same-Account Authorization Shape
 

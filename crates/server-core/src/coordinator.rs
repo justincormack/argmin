@@ -17368,7 +17368,7 @@ mod tests {
     }
 
     #[test]
-    fn put_bucket_policy_accepts_string_not_equals_vpc_for_enforced_object_action() {
+    fn put_bucket_policy_rejects_source_vpc_condition_on_enforced_object_action() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
@@ -17383,23 +17383,19 @@ mod tests {
             })
             .unwrap();
         let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:SourceVpc":"vpc-12345678"}}}]}"#;
-        put_bucket_policy_test(
+        let err = put_bucket_policy_test(
             &coord,
             "bucket",
             policy,
             test_helpers::requester("owner-a"),
             None,
         )
-        .unwrap();
-        assert_eq!(
-            get_bucket_policy_test(&coord, "bucket", test_helpers::requester("owner-a"), None)
-                .unwrap(),
-            Some(auth::parse_bucket_policy(policy).unwrap().normalized_json())
-        );
+        .unwrap_err();
+        assert!(matches!(err, ServerError::MalformedPolicy { .. }));
     }
 
     #[test]
-    fn put_bucket_policy_accepts_principal_arn_condition_on_enforced_object_action() {
+    fn put_bucket_policy_rejects_principal_arn_condition_on_enforced_object_action() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
 
@@ -17415,19 +17411,15 @@ mod tests {
             .unwrap();
 
         let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"owner-a"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/other"}}}]}"#;
-        put_bucket_policy_test(
+        let err = put_bucket_policy_test(
             &coord,
             "bucket",
             policy,
             test_helpers::requester("owner-a"),
             None,
         )
-        .unwrap();
-        assert_eq!(
-            get_bucket_policy_test(&coord, "bucket", test_helpers::requester("owner-a"), None)
-                .unwrap(),
-            Some(auth::parse_bucket_policy(policy).unwrap().normalized_json())
-        );
+        .unwrap_err();
+        assert!(matches!(err, ServerError::MalformedPolicy { .. }));
     }
 
     #[test]

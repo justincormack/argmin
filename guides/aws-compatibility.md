@@ -225,11 +225,8 @@ evaluation is still narrower.
 
 Current runtime-evaluation limits include:
 
-- `aws:PrincipalArn` and `aws:SourceVpc` are currently accepted at
-  `PutBucketPolicy` time to match AWS upload behavior, but they are not yet
-  treated as runtime-evaluable request context on this server
-- that acceptance-only set is explicit and currently limited to those two keys
-- other network/account condition keys such as `aws:SourceVpce`,
+- network/account condition keys such as `aws:PrincipalArn`, `aws:SourceVpc`,
+  `aws:SourceVpce`,
   `aws:SourceArn`, `aws:SourceAccount`, `aws:SourceOwner`, `aws:userid`,
   `aws:PrincipalOrgID`, `s3:DataAccessPointAccount`, and
   `s3:DataAccessPointArn` still remain outside the current accepted/evaluable

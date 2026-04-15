@@ -1287,7 +1287,6 @@ fn condition_clause_matches_request(
     }
 
     match clause.key.as_str() {
-        "aws:PrincipalArn" | "aws:SourceVpc" => ConditionMatchResult::AcceptedButNotEvaluable,
         "s3:x-amz-copy-source" => string_condition_matches(clause, request.copy_source()),
         "s3:x-amz-metadata-directive" => {
             string_condition_matches(clause, request.metadata_directive())
@@ -1318,9 +1317,7 @@ fn condition_clause_supported_for_evaluable_object_actions(clause: &PolicyCondit
         || (evaluable_string_condition_operator_supported(clause.operator.as_str())
             && matches!(
                 clause.key.as_str(),
-                "aws:PrincipalArn"
-                    | "aws:SourceVpc"
-                    | "s3:x-amz-copy-source"
+                "s3:x-amz-copy-source"
                     | "s3:x-amz-metadata-directive"
                     | "s3:x-amz-acl"
                     | "s3:x-amz-server-side-encryption"
@@ -2173,95 +2170,33 @@ mod tests {
     }
 
     #[test]
-    fn principal_arn_condition_is_accepted_for_evaluable_object_actions() {
+    fn principal_arn_condition_is_rejected_for_evaluable_object_actions() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/other"}}}]}"#,
         )
         .unwrap();
 
-        assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
-    }
-
-    #[test]
-    fn principal_arn_allow_condition_is_not_runtime_evaluable() {
-        let policy = parse_bucket_policy(
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/caller"}}}]}"#,
-        )
-        .unwrap();
-        let tags: [PolicyTag<'_>; 0] = [];
-        let request = request(
-            PolicyAction::GetObject,
-            "bucket",
-            "key",
-            Some("arn:aws:iam::444455556666:user/caller"),
-            &tags,
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
         );
-
-        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
     }
 
     #[test]
-    fn principal_arn_deny_condition_is_not_runtime_evaluable() {
-        let policy = parse_bucket_policy(
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"aws:PrincipalArn":"arn:aws:iam::444455556666:user/caller"}}}]}"#,
-        )
-        .unwrap();
-        let tags: [PolicyTag<'_>; 0] = [];
-        let request = request(
-            PolicyAction::GetObject,
-            "bucket",
-            "key",
-            Some("arn:aws:iam::444455556666:user/caller"),
-            &tags,
-        );
-
-        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
-    }
-
-    #[test]
-    fn source_vpc_condition_is_accepted_for_evaluable_object_actions() {
+    fn source_vpc_condition_is_rejected_for_evaluable_object_actions() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:SourceVpc":"vpc-12345678"}}}]}"#,
         )
         .unwrap();
 
-        assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
-    }
-
-    #[test]
-    fn source_vpc_allow_condition_is_not_runtime_evaluable() {
-        let policy = parse_bucket_policy(
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:SourceVpc":"vpc-12345678"}}}]}"#,
-        )
-        .unwrap();
-        let tags: [PolicyTag<'_>; 0] = [];
-        let request = request(
-            PolicyAction::GetObject,
-            "bucket",
-            "key",
-            Some("arn:aws:iam::444455556666:user/caller"),
-            &tags,
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
         );
-
-        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
-    }
-
-    #[test]
-    fn source_vpc_deny_condition_is_not_runtime_evaluable() {
-        let policy = parse_bucket_policy(
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"aws:SourceVpc":"vpc-12345678"}}}]}"#,
-        )
-        .unwrap();
-        let tags: [PolicyTag<'_>; 0] = [];
-        let request = request(
-            PolicyAction::GetObject,
-            "bucket",
-            "key",
-            Some("arn:aws:iam::444455556666:user/caller"),
-            &tags,
-        );
-
-        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
     }
 
     #[test]
