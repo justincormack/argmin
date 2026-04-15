@@ -1,0 +1,147 @@
+Bucket policy denies skipped for PrincipalArn/SourceVpc clauses
+Link: https://chatgpt.com/codex/cloud/security/findings/65a3f2748c5881918d5f908716152939?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 154e45d
+Author: justin@specialbusservice.com
+Created: 14/04/2026, 11:46:10
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced an authorization bypass for bucket policies using aws:PrincipalArn or aws:SourceVpc conditions: deny statements with these clauses are ignored rather than enforced.
+The commit introduces a new AcceptedButNotEvaluable state for aws:PrincipalArn and aws:SourceVpc conditions. These clauses are now treated as valid for policy validation, but evaluation returns None for them, meaning the entire statement is skipped. This changes prior conservative behavior where unsupported deny conditions resulted in an explicit deny. As a result, bucket policies that rely on these conditions to restrict access (for example, deny when not from a specific VPC or deny unless principal ARN matches) are silently ignored at runtime, allowing fallback ACLs or other allow statements to grant access that should be denied.
+
+# Validation
+## Rubric
+- [x] Confirm aws:PrincipalArn/aws:SourceVpc conditions are mapped to AcceptedButNotEvaluable (bucket_policy.rs:1278-1291).
+- [x] Confirm AcceptedButNotEvaluable causes request_effect to skip statements even when Effect=Deny (bucket_policy.rs:549-566).
+- [x] Demonstrate with a runtime PoC that a Deny + Allow policy yields ExplicitAllow for a matching principal (policy_bypass test output).
+- [ ] Verify behavior against real runtime request context including SourceVpc (not possible here; request lacks SourceVpc fields).
+## Report
+Rubric-guided validation with dynamic repro. Crash attempt: ran `cargo test -p auth --test policy_bypass -- --nocapture` (debug build); no crash since issue is logic. Valgrind attempt: `valgrind --version` not available. Debugger attempt: `gdb --version` not available.
+
+Code evidence: In `crates/auth/src/bucket_policy.rs`, `condition_clause_matches_request` maps `aws:PrincipalArn` and `aws:SourceVpc` to `ConditionMatchResult::AcceptedButNotEvaluable` (lines 1278-1291). In `PolicyStatement::request_effect`, `AcceptedButNotEvaluable` returns `None`, meaning the statement is ignored even for Deny (lines 549-566). This skips deny statements that rely on these conditions, allowing other allow statements/ACLs to grant access.
+
+Dynamic PoC: added integration test `crates/auth/tests/policy_bypass.rs` that builds a policy with a Deny on `aws:PrincipalArn` plus a blanket Allow. Running `cargo test -p auth --test policy_bypass -- --nocapture` prints `evaluation: ExplicitAllow`, confirming the Deny is ignored and Allow wins. Output captured in `/workspace/validation_artifacts/policy_bypass/policy_bypass_output.txt` (also inside the tarball).
+
+# Evidence
+/workspace/argmin/crates/auth/src/bucket_policy.rs (L1278 to 1310)
+  Note: aws:PrincipalArn and aws:SourceVpc clauses are explicitly mapped to AcceptedButNotEvaluable, preventing any runtime enforcement.
+```
+fn condition_clause_matches_request(
+    clause: &PolicyConditionClause,
+    request: &PolicyRequest<'_>,
+) -> ConditionMatchResult {
+    if let Some(tag_key) = clause.key.strip_prefix("s3:ExistingObjectTag/") {
+        return string_equals_condition_matches(clause, request.existing_object_tag_value(tag_key));
+    }
+    if let Some(tag_key) = clause.key.strip_prefix("s3:RequestObjectTag/") {
+        return string_condition_matches(clause, request.request_object_tag_value(tag_key));
+    }
+
+    match clause.key.as_str() {
+        "aws:PrincipalArn" | "aws:SourceVpc" => ConditionMatchResult::AcceptedButNotEvaluable,
+        "s3:x-amz-copy-source" => string_condition_matches(clause, request.copy_source()),
+        "s3:x-amz-metadata-directive" => {
+            string_condition_matches(clause, request.metadata_directive())
+        }
+        "s3:x-amz-acl" => string_condition_matches(clause, request.canned_acl()),
+        "s3:x-amz-server-side-encryption" => {
+            string_condition_matches(clause, request.server_side_encryption())
+        }
+        "s3:x-amz-server-side-encryption-customer-algorithm" => {
+            string_condition_matches(clause, request.sse_customer_algorithm())
+        }
+        "s3:x-amz-grant-read" => string_condition_matches(clause, request.grant_read()),
+        "s3:x-amz-grant-write" => string_condition_matches(clause, request.grant_write()),
+        "s3:x-amz-grant-read-acp" => string_condition_matches(clause, request.grant_read_acp()),
+        "s3:x-amz-grant-write-acp" => string_condition_matches(clause, request.grant_write_acp()),
+        "s3:x-amz-grant-full-control" => {
+            string_condition_matches(clause, request.grant_full_control())
+        }
+        _ => ConditionMatchResult::Unsupported,
+    }
+```
+
+/workspace/argmin/crates/auth/src/bucket_policy.rs (L549 to 569)
+  Note: AcceptedButNotEvaluable now causes policy statements (including Deny) to be ignored during evaluation.
+```
+    fn request_effect(
+        &self,
+        request: &PolicyRequest<'_>,
+        action: &str,
+        resource: &str,
+    ) -> Option<PolicyEffect> {
+        if !self.matches_principal(request)
+            || !self.matches_action(action)
+            || !self.matches_resource(resource)
+        {
+            return None;
+        }
+
+        match self.condition_match_result(request) {
+            ConditionMatchResult::Matches => Some(self.effect),
+            ConditionMatchResult::NoMatch => None,
+            ConditionMatchResult::AcceptedButNotEvaluable => None,
+            ConditionMatchResult::Unsupported => {
+                (self.effect == PolicyEffect::Deny).then_some(PolicyEffect::Deny)
+            }
+        }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Downgraded from high because exploitation requires a specific bucket policy pattern (Deny with aws:PrincipalArn or aws:SourceVpc plus a separate Allow/ACL) and non-localhost exposure; the default config binds to 127.0.0.1:9000. While the authz bug is real and can lead to unauthorized data access in those configurations, it is not universally exploitable across typical deployments.
+## Likelihood
+high - Requires specific policy configuration and network exposure; default listen is localhost, but deployments can expose the service and use these conditions. | Remote network vector
+## Impact
+medium - Deny statements using aws:PrincipalArn/aws:SourceVpc are ignored, so access can be granted outside intended principal/VPC restrictions when other Allow/ACL rules exist.
+## Assumptions
+- The argmin-s3 server is bound to a non-localhost address and reachable by the attacker (ARGMIN_LISTEN_ADDR not left at 127.0.0.1:9000).
+- A bucket policy includes a Deny statement with aws:PrincipalArn or aws:SourceVpc and an Allow (or ACL) that would otherwise permit access.
+- The attacker can send S3 API requests (with any required credentials if the Allow is not public).
+- Bucket policy Deny uses aws:PrincipalArn or aws:SourceVpc
+- Another Allow statement or ACL grants access absent the Deny
+- Service reachable over network
+## Path
+Remote client -> S3 HTTP API -> BucketPolicy.evaluate -> AcceptedButNotEvaluable -> Deny skipped/Allow applies
+## Path evidence
+- `crates/auth/src/bucket_policy.rs:549-568` - request_effect returns None for AcceptedButNotEvaluable, so Deny statements are skipped.
+- `crates/auth/src/bucket_policy.rs:1278-1291` - aws:PrincipalArn and aws:SourceVpc map to AcceptedButNotEvaluable.
+- `crates/server-core/src/coordinator/authz.rs:687-712` - Authorization builds a PolicyRequest and calls policy.evaluate for object actions.
+- `crates/argmin-s3/src/config.rs:27-62` - ARGMIN_LISTEN_ADDR default is 127.0.0.1:9000 and can be overridden, affecting exposure.
+## Narrative
+Bucket policy evaluation returns AcceptedButNotEvaluable for aws:PrincipalArn/aws:SourceVpc and then skips the statement entirely, even when the statement effect is Deny. Since coordinator authz uses BucketPolicy.evaluate for runtime decisions, Deny rules relying on these conditions are ignored and other Allow/ACL rules can grant access that operators expected to be blocked. The service listens on a configurable address (default 127.0.0.1:9000), so exploitability depends on deployment exposure and policy usage.
+## Controls
+- SigV4 authentication
+- Bucket policy evaluation
+- ACL/public access block checks
+## Blindspots
+- No deployment manifests were found to confirm actual network exposure or use of these policy conditions in real environments.
+- Static review only; no runtime verification in this assessment.
+
+# Resolution
+The acceptance-only behavior for `aws:PrincipalArn` and `aws:SourceVpc` was reverted.
+
+Fixed by: `2bd8e74` (`Remove acceptance-only bucket policy keys`)
+
+These keys are no longer accepted for object-policy `Condition` clauses on the
+implemented bucket-policy surface, so the intermediate "accepted but not
+runtime-evaluable" state described above no longer exists in the codebase.
+
+This closes the finding regardless of whether the original security impact was
+ultimately the right interpretation of that temporary behavior. The confusing
+state was removed rather than retained.
+
+Follow-up:
+- `crates/auth/src/bucket_policy.rs` now rejects these keys as unsupported for
+  evaluable object actions.
+- The corresponding local coordinator tests were updated to expect rejection.
+- The AWS-backed round-trip acceptance tests for these keys were removed.
+- `plans/aws-auth-compat-plan.md` and `guides/aws-compatibility.md` were
+  updated to stop describing an acceptance-only subset for them.
