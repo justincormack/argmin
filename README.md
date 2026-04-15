@@ -13,10 +13,11 @@ authentication, per-PG SQLite metadata, and CRC64-NVME integrity checking.
 ## Build
 
 ```bash
-cargo build --release
+cargo build -p argmin-s3 --release
 ```
 
-The binary is at `target/release/argmin-s3`.
+This builds the production server binary without pulling in the full workspace
+test harness dependency set. The binary is at `target/release/argmin-s3`.
 
 ## Run
 
