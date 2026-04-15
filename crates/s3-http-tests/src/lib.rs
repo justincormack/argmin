@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 
+use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use aws_sdk_s3::Client;
 use s3_tests::{build_client_with_ca, build_test_agent, server, TestServer, RT};
 
@@ -87,6 +88,22 @@ impl HttpTestContext {
 
 pub fn test_agent() -> ureq::Agent {
     build_test_agent(CTX.endpoint(), None, std::time::Duration::from_secs(30))
+}
+
+pub async fn create_bucket(
+    client: &Client,
+    bucket: &str,
+) -> Result<(), aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>>
+{
+    let mut request = client.create_bucket().bucket(bucket);
+    if CTX.region() != "us-east-1" {
+        request = request.create_bucket_configuration(
+            CreateBucketConfiguration::builder()
+                .location_constraint(BucketLocationConstraint::from(CTX.region()))
+                .build(),
+        );
+    }
+    request.send().await.map(|_| ())
 }
 
 pub fn unique_bucket() -> String {

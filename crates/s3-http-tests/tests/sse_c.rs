@@ -1,5 +1,5 @@
 use aws_sdk_s3::primitives::ByteStream;
-use s3_http_tests::{run, unique_bucket, CTX};
+use s3_http_tests::{create_bucket, run, unique_bucket, CTX};
 use s3_tests::{assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key};
 
 #[test]
@@ -7,7 +7,7 @@ fn test_sse_c_put_requires_https() {
     run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        create_bucket(client, &bucket).await.unwrap();
 
         let key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&key);
@@ -33,7 +33,7 @@ fn test_sse_c_get_and_head_require_https() {
     run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)
@@ -84,7 +84,7 @@ fn test_plain_http_without_sse_c_still_works() {
     run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        create_bucket(client, &bucket).await.unwrap();
         client
             .put_object()
             .bucket(&bucket)

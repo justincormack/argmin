@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use s3_http_tests::{run, test_agent, unique_bucket, CTX};
+use s3_http_tests::{create_bucket, run, test_agent, unique_bucket, CTX};
 use s3_tests::{
     object_url, presign_url_with_credentials, sse_c_header_values, test_sse_c_key,
     SignedRequestCredentials,
@@ -21,7 +21,7 @@ fn test_presigned_sse_c_put_requires_https() {
     run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        create_bucket(client, &bucket).await.unwrap();
 
         let body = b"presigned insecure sse-c put";
         let customer_key = test_sse_c_key();

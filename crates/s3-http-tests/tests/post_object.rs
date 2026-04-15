@@ -1,4 +1,4 @@
-use s3_http_tests::{run, unique_bucket, CTX};
+use s3_http_tests::{create_bucket, run, unique_bucket, CTX};
 use s3_tests::{
     post_object_to_test_endpoint, sigv4_post_sse_c_fields_for_credentials, test_sse_c_key,
 };
@@ -16,7 +16,7 @@ fn test_post_object_sse_c_requires_https() {
     run(async {
         let client = CTX.client();
         let bucket = unique_bucket();
-        client.create_bucket().bucket(&bucket).send().await.unwrap();
+        create_bucket(client, &bucket).await.unwrap();
 
         let key = "post-sse-c-http";
         let file_data = b"insecure post sse-c";
