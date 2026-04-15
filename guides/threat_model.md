@@ -4,7 +4,7 @@ Note this will continue to evolve as more features around users and encryption
 are added.
 
 ## 1. Overview
-Argmin2 is a single-node, S3-compatible object storage server written in Rust
+Argmin is a single-node, S3-compatible object storage server written in Rust
 (the `argmin-s3` binary). It exposes an HTTP/1 endpoint implementing a subset
 of S3 APIs (bucket/object CRUD, multipart uploads, tagging, CORS, ACLs, bucket
 policy, object lock, etc.) using path-style addressing. Requests are parsed in
