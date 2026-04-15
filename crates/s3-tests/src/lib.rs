@@ -22,7 +22,9 @@ pub use post_form::{
 pub use server::TestServer;
 
 use std::sync::LazyLock;
+use std::time::Duration;
 
+use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use aws_sdk_s3::Client;
 use s3_types::is_legacy_create_bucket_region;
@@ -507,6 +509,33 @@ pub async fn create_bucket(
         .map(|_| ())
 }
 
+/// Create a bucket, retrying transient same-name reuse conflicts after `DeleteBucket`.
+///
+/// AWS does not guarantee that deleting a bucket immediately makes the name
+/// reusable. Local tests use this helper for delete-then-recreate flows so they
+/// model the same bounded retry behavior instead of assuming synchronous
+/// namespace release.
+pub async fn create_bucket_retrying_reuse(
+    client: &Client,
+    bucket: &str,
+) -> Result<(), aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>>
+{
+    const MAX_ATTEMPTS: usize = 20;
+    const RETRY_DELAY: Duration = Duration::from_millis(200);
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match create_bucket(client, bucket).await {
+            Ok(()) => return Ok(()),
+            Err(err) if is_retryable_bucket_reuse_error(&err) && attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    unreachable!("bucket recreate retry loop must return before exhausting attempts")
+}
+
 pub fn create_bucket_request(
     client: &Client,
     bucket: &str,
@@ -539,6 +568,15 @@ fn create_bucket_request_in_region(
         request = request.create_bucket_configuration(config);
     }
     request
+}
+
+fn is_retryable_bucket_reuse_error(
+    err: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::create_bucket::CreateBucketError>,
+) -> bool {
+    matches!(
+        err.as_service_error().and_then(ProvideErrorMetadata::code),
+        Some("BucketAlreadyExists" | "BucketAlreadyOwnedByYou" | "OperationAborted")
+    )
 }
 
 pub fn test_agent() -> ureq::Agent {

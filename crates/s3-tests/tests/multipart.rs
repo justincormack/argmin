@@ -836,7 +836,9 @@ fn test_abort_multipart_upload_after_bucket_delete_and_recreate_fails() {
             .await
             .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
-        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        s3_tests::create_bucket_retrying_reuse(client, &bucket)
+            .await
+            .unwrap();
 
         let result = client
             .abort_multipart_upload()

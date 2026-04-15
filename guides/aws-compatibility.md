@@ -28,6 +28,28 @@ including cases where AWS ignores a directory-bucket-specific query and cases
 where AWS rejects a directory-bucket-specific header or parameter with the
 corresponding error.
 
+## Behavior notes
+
+### Delete-then-recreate bucket name reuse may require retry
+
+`DeleteBucket` should not be treated as proof that the same bucket name is
+immediately reusable.
+
+AWS appears to have a name-reuse window here as well: a client that deletes a
+bucket and immediately issues `CreateBucket` for the same name can observe a
+transient `409` such as `BucketAlreadyExists`, `BucketAlreadyOwnedByYou`, or
+`OperationAborted` before the namespace is fully reusable.
+
+This is not tracked as a compatibility gap. It is a behavior note for tests and
+clients:
+
+- prefer retrying the exact `CreateBucket` operation when reusing a just-deleted
+  bucket name
+- do not assume that a successful `DeleteBucket` implies synchronous namespace
+  release
+- in `crates/s3-tests`, use the bounded recreate helper rather than a fixed
+  sleep for delete-then-recreate flows
+
 ## Current known gaps
 
 ### 1. Single-part `ETag` is not AWS MD5
