@@ -127,9 +127,12 @@ impl TestContext {
                 std::env::var("S3_TEST_SECOND_ACCESS_KEY"),
                 std::env::var("S3_TEST_SECOND_SECRET_KEY"),
             ) {
-                (Ok(second_access_key), Ok(second_secret_key)) => Some(
-                    build_client(&endpoint, &second_access_key, &second_secret_key, &region).await,
-                ),
+                (Ok(second_access_key), Ok(second_secret_key)) => Some(build_client(
+                    &endpoint,
+                    &second_access_key,
+                    &second_secret_key,
+                    &region,
+                )),
                 (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
                 (Err(std::env::VarError::NotPresent), Ok(_)) => {
                     panic!("S3_TEST_SECOND_ACCESS_KEY required with S3_TEST_SECOND_SECRET_KEY");
@@ -145,15 +148,12 @@ impl TestContext {
                 std::env::var("S3_TEST_OWNER_ROOT_ACCESS_KEY"),
                 std::env::var("S3_TEST_OWNER_ROOT_SECRET_KEY"),
             ) {
-                (Ok(owner_root_access_key), Ok(owner_root_secret_key)) => Some(
-                    build_client(
-                        &endpoint,
-                        &owner_root_access_key,
-                        &owner_root_secret_key,
-                        &region,
-                    )
-                    .await,
-                ),
+                (Ok(owner_root_access_key), Ok(owner_root_secret_key)) => Some(build_client(
+                    &endpoint,
+                    &owner_root_access_key,
+                    &owner_root_secret_key,
+                    &region,
+                )),
                 (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
                 (Err(std::env::VarError::NotPresent), Ok(_)) => {
                     panic!(
@@ -173,9 +173,8 @@ impl TestContext {
                 "S3_TEST_BUCKET_PREFIX required with S3_TEST_ENDPOINT; use a dedicated prefix such as claude-s3- that matches the test IAM policy",
             );
 
-            let client = build_client(&endpoint, &access_key, &secret_key, &region).await;
-            let alt_client =
-                build_client(&endpoint, &alt_access_key, &alt_secret_key, &region).await;
+            let client = build_client(&endpoint, &access_key, &secret_key, &region);
+            let alt_client = build_client(&endpoint, &alt_access_key, &alt_secret_key, &region);
             assert_distinct_external_s3_owners(
                 &client,
                 owner_root_client.as_ref(),
@@ -208,36 +207,28 @@ impl TestContext {
                 server::TEST_SECRET_KEY,
                 server::TEST_REGION,
                 server.tls_ca_pem(),
-            )
-            .await;
+            );
             let alt_client = build_client_with_ca(
                 &endpoint,
                 server::ALT_ACCESS_KEY,
                 server::ALT_SECRET_KEY,
                 server::TEST_REGION,
                 server.tls_ca_pem(),
-            )
-            .await;
-            let second_client = Some(
-                build_client_with_ca(
-                    &endpoint,
-                    server::TEST_SECOND_ACCESS_KEY,
-                    server::TEST_SECOND_SECRET_KEY,
-                    server::TEST_REGION,
-                    server.tls_ca_pem(),
-                )
-                .await,
             );
-            let owner_root_client = Some(
-                build_client_with_ca(
-                    &endpoint,
-                    server::TEST_OWNER_ROOT_ACCESS_KEY,
-                    server::TEST_OWNER_ROOT_SECRET_KEY,
-                    server::TEST_REGION,
-                    server.tls_ca_pem(),
-                )
-                .await,
-            );
+            let second_client = Some(build_client_with_ca(
+                &endpoint,
+                server::TEST_SECOND_ACCESS_KEY,
+                server::TEST_SECOND_SECRET_KEY,
+                server::TEST_REGION,
+                server.tls_ca_pem(),
+            ));
+            let owner_root_client = Some(build_client_with_ca(
+                &endpoint,
+                server::TEST_OWNER_ROOT_ACCESS_KEY,
+                server::TEST_OWNER_ROOT_SECRET_KEY,
+                server::TEST_REGION,
+                server.tls_ca_pem(),
+            ));
             TestContext {
                 client,
                 second_client,
@@ -328,8 +319,8 @@ impl TestContext {
     }
 }
 
-async fn build_client(endpoint: &str, access_key: &str, secret_key: &str, region: &str) -> Client {
-    build_client_with_ca(endpoint, access_key, secret_key, region, None).await
+fn build_client(endpoint: &str, access_key: &str, secret_key: &str, region: &str) -> Client {
+    build_client_with_ca(endpoint, access_key, secret_key, region, None)
 }
 
 fn external_test_mode() -> bool {
@@ -344,7 +335,7 @@ fn configured_test_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(timeout_secs)
 }
 
-pub async fn build_client_with_ca(
+pub fn build_client_with_ca(
     endpoint: &str,
     access_key: &str,
     secret_key: &str,
@@ -378,16 +369,14 @@ pub async fn build_client_with_ca(
         aws_smithy_http_client::Builder::new().build_http()
     };
 
-    let loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+    let mut s3_config = aws_sdk_s3::config::Builder::new()
+        .behavior_version_latest()
         .credentials_provider(creds)
-        .region(aws_config::Region::new(region.to_string()))
+        .region(aws_sdk_s3::config::Region::new(region.to_string()))
         .endpoint_url(endpoint)
         .timeout_config(timeout_config)
-        .http_client(http_client);
-    let config = loader.load().await;
-
-    let mut s3_config = aws_sdk_s3::config::Builder::from(&config);
-    s3_config.set_force_path_style(Some(true));
+        .http_client(http_client)
+        .force_path_style(true);
     if external_test_mode() {
         s3_config.set_stalled_stream_protection(Some(
             aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),

@@ -34,8 +34,7 @@ impl HttpTestContext {
                 .expect("S3_TEST_SECRET_KEY required for external s3-http-tests runs");
             let region =
                 std::env::var("S3_TEST_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-            let client =
-                build_client_with_ca(&endpoint, &access_key, &secret_key, &region, None).await;
+            let client = build_client_with_ca(&endpoint, &access_key, &secret_key, &region, None);
             Self {
                 client,
                 endpoint,
@@ -53,8 +52,7 @@ impl HttpTestContext {
                 server::TEST_SECRET_KEY,
                 server::TEST_REGION,
                 None,
-            )
-            .await;
+            );
             Self {
                 client,
                 endpoint,

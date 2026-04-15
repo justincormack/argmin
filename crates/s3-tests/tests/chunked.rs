@@ -260,8 +260,7 @@ async fn chunked_put_context_for_content_encoding_case() -> ChunkedPutContext {
             s3_tests::server::TEST_SECRET_KEY,
             s3_tests::server::TEST_REGION,
             server.tls_ca_pem(),
-        )
-        .await;
+        );
         ChunkedPutContext {
             client,
             endpoint,

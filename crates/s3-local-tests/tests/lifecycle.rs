@@ -26,7 +26,6 @@ async fn test_client(server: &TestServer) -> aws_sdk_s3::Client {
         TEST_REGION,
         server.tls_ca_pem(),
     )
-    .await
 }
 
 async fn create_bucket(client: &aws_sdk_s3::Client, bucket: &str) {

@@ -17,8 +17,7 @@ async fn local_client() -> (TestServer, aws_sdk_s3::Client) {
         s3_tests::server::TEST_SECRET_KEY,
         s3_tests::server::TEST_REGION,
         server.tls_ca_pem(),
-    )
-    .await;
+    );
     (server, client)
 }
 

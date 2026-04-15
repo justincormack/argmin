@@ -55,8 +55,7 @@ impl ComparisonEnv {
             s3_tests::server::TEST_SECRET_KEY,
             &external_region,
             local_server.tls_ca_pem(),
-        )
-        .await;
+        );
 
         Some(Self {
             external_client: CTX.client().clone(),

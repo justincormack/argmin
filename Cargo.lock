@@ -61,31 +61,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
-name = "aws-config"
-version = "1.8.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11493b0bad143270fb8ad284a096dd529ba91924c5409adeac856cc1bf047dbc"
-dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-sdk-sts",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-types",
- "bytes",
- "fastrand",
- "http 1.4.0",
- "time",
- "tokio",
- "tracing",
- "url",
-]
-
-[[package]]
 name = "aws-credential-types"
 version = "1.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -180,31 +155,6 @@ dependencies = [
  "sha2",
  "tracing",
  "url",
-]
-
-[[package]]
-name = "aws-sdk-sts"
-version = "1.101.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab41ad64e4051ecabeea802d6a17845a91e83287e1dd249e6963ea1ba78c428a"
-dependencies = [
- "aws-credential-types",
- "aws-runtime",
- "aws-smithy-async",
- "aws-smithy-http",
- "aws-smithy-json",
- "aws-smithy-observability",
- "aws-smithy-query",
- "aws-smithy-runtime",
- "aws-smithy-runtime-api",
- "aws-smithy-types",
- "aws-smithy-xml",
- "aws-types",
- "fastrand",
- "http 0.2.12",
- "http 1.4.0",
- "regex-lite",
- "tracing",
 ]
 
 [[package]]
@@ -346,16 +296,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a06c2315d173edbf1920da8ba3a7189695827002e4c0fc961973ab1c54abca9c"
 dependencies = [
  "aws-smithy-runtime-api",
-]
-
-[[package]]
-name = "aws-smithy-query"
-version = "0.60.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a56d79744fb3edb5d722ef79d86081e121d3b9422cb209eb03aea6aa4f21ebd"
-dependencies = [
- "aws-smithy-types",
- "urlencoding",
 ]
 
 [[package]]
@@ -1916,7 +1856,6 @@ name = "s3-tests"
 version = "0.1.0"
 dependencies = [
  "auth",
- "aws-config",
  "aws-credential-types",
  "aws-sdk-s3",
  "aws-smithy-http-client",
@@ -2505,12 +2444,6 @@ dependencies = [
  "percent-encoding",
  "serde",
 ]
-
-[[package]]
-name = "urlencoding"
-version = "2.1.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "daf8dba3b7eb870caf1ddeed7bc9d2a049f3cfdfae7cb521b087cc33ae4c49da"
 
 [[package]]
 name = "utf8-zero"
