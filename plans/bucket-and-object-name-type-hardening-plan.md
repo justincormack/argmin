@@ -289,6 +289,13 @@ Current status:
    Object-tagging/object-lock/object-ACL authorization tokens now also carry
    typed bucket/key values, and the main PutObject / streaming PutObject commit
    helpers reuse those typed values instead of reconstructing trusted names.
+   The stale-payload snapshot/delete-marker/reclaim helper path and upload-part
+   stream-session helper path now also take typed bucket/key values internally.
+   The list fan-out paths now reuse typed buckets and parsed typed
+   prefix/marker keys instead of rebuilding trusted names inside each PG query,
+   and the streaming append/abort helper path now keeps typed bucket/key values
+   through PG routing and session binding as well. This pushes the remaining
+   raw-string boundary outward toward the true ingress points.
 4. Still open:
    storage-dispatch and many coordinator-internal helper APIs still accept raw
    `&str` bucket/key parameters.
