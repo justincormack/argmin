@@ -1,8 +1,10 @@
 use std::time::Duration;
 
-use aws_sdk_s3::presigning::PresigningConfig;
 use s3_http_tests::{run, test_agent, unique_bucket, CTX};
-use s3_tests::{sse_c_header_values, test_sse_c_key};
+use s3_tests::{
+    object_url, presign_url_with_credentials, sse_c_header_values, test_sse_c_key,
+    SignedRequestCredentials,
+};
 
 macro_rules! with_presigned_headers {
     ($req:expr, $presigned:expr) => {{
@@ -25,17 +27,29 @@ fn test_presigned_sse_c_put_requires_https() {
         let customer_key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .put_object()
-            .bucket(&bucket)
-            .key("uploaded-sse-c-http")
-            .sse_customer_algorithm("AES256")
-            .sse_customer_key(key_b64)
-            .sse_customer_key_md5(key_md5_b64)
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_url_with_credentials(
+            "PUT",
+            &object_url(CTX.endpoint(), &bucket, "uploaded-sse-c-http", None),
+            Duration::from_secs(900),
+            [
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                (
+                    "x-amz-server-side-encryption-customer-key",
+                    key_b64.as_str(),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.as_str(),
+                ),
+            ],
+            None,
+            SignedRequestCredentials {
+                access_key: CTX.access_key(),
+                secret_key: CTX.secret_key(),
+                region: CTX.region(),
+                tls_ca_pem: None,
+            },
+        );
 
         let mut resp = with_presigned_headers!(test_agent().put(presigned.uri()), presigned)
             .send(&body[..])

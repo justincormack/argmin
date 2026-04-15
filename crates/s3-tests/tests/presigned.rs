@@ -1,9 +1,12 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
-use ring::{digest, hmac};
-use s3_tests::{create_public_bucket, sse_c_header_values, test_sse_c_key, unique_bucket, CTX};
+use s3_tests::{
+    create_public_bucket, object_url, presign_url_with_credentials, sse_c_header_values,
+    test_sse_c_key, unique_bucket, PresignedRequest, SignedRequestCredentials, CTX,
+};
+
+const NO_HEADERS: [(&str, &str); 0] = [];
 
 /// Create a bucket, returning its name.
 async fn setup_bucket() -> String {
@@ -49,135 +52,77 @@ macro_rules! with_presigned_headers {
     }};
 }
 
-// ── Manual presigned-URL helpers (for signed-payload tests) ─────────────
-
 fn sha256_hex(data: &[u8]) -> String {
-    let d = digest::digest(&digest::SHA256, data);
-    d.as_ref().iter().map(|b| format!("{:02x}", b)).collect()
+    auth::canonical::sha256_hex(data)
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> hmac::Tag {
-    hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data)
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> hmac::Tag {
-    let k_secret = format!("AWS4{}", secret);
-    let k_date = hmac_sha256(k_secret.as_bytes(), date.as_bytes());
-    let k_region = hmac_sha256(k_date.as_ref(), region.as_bytes());
-    let k_service = hmac_sha256(k_region.as_ref(), service.as_bytes());
-    hmac_sha256(k_service.as_ref(), b"aws4_request")
-}
-
-/// URI-encode a value per AWS SigV4 rules (encode everything except unreserved chars).
-fn uri_encode(value: &str) -> String {
-    let mut out = String::new();
-    for b in value.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push_str(&format!("%{:02X}", b));
-            }
-        }
+fn primary_credentials() -> SignedRequestCredentials<'static> {
+    SignedRequestCredentials {
+        access_key: CTX.access_key(),
+        secret_key: CTX.secret_key(),
+        region: CTX.region(),
+        tls_ca_pem: CTX.tls_ca_pem(),
     }
-    out
 }
 
-/// Build a manually-signed presigned PUT URL with the given body hash.
-fn presigned_put_url(
-    endpoint: &str,
+fn alt_credentials() -> SignedRequestCredentials<'static> {
+    SignedRequestCredentials {
+        access_key: CTX.alt_access_key(),
+        secret_key: CTX.alt_secret_key(),
+        region: CTX.region(),
+        tls_ca_pem: CTX.tls_ca_pem(),
+    }
+}
+
+fn presign_object_with_credentials<K, V, I>(
+    credentials: SignedRequestCredentials<'_>,
+    method: &str,
     bucket: &str,
     key: &str,
-    body_hash: &str,
-    access_key: &str,
-    secret_key: &str,
-    region: &str,
-) -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    let days = secs / 86400;
-    let (year, month, day) = days_to_ymd(days);
-    let time_of_day = secs % 86400;
-    let hour = time_of_day / 3600;
-    let minute = (time_of_day % 3600) / 60;
-    let second = time_of_day % 60;
-    let date_long = format!(
-        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
-        year, month, day, hour, minute, second
-    );
-    let date_short = &date_long[..8];
-
-    let path = format!("/{}/{}", bucket, key);
-    let credential = format!("{}/{}/{}/s3/aws4_request", access_key, date_short, region);
-
-    // Signed headers: host is always required; include x-amz-content-sha256
-    // only when the payload is signed (not UNSIGNED-PAYLOAD).
-    let host = endpoint
-        .trim_start_matches("http://")
-        .trim_start_matches("https://");
-    let (signed_headers, canonical_headers_str) = if body_hash == "UNSIGNED-PAYLOAD" {
-        ("host".to_string(), format!("host:{}\n", host))
-    } else {
-        (
-            "host;x-amz-content-sha256".to_string(),
-            format!("host:{}\nx-amz-content-sha256:{}\n", host, body_hash),
-        )
-    };
-
-    // Build canonical query string (sorted)
-    let mut qs_parts = [
-        format!("X-Amz-Algorithm={}", uri_encode("AWS4-HMAC-SHA256")),
-        format!("X-Amz-Credential={}", uri_encode(&credential)),
-        format!("X-Amz-Date={}", uri_encode(&date_long)),
-        "X-Amz-Expires=900".to_string(),
-        format!("X-Amz-SignedHeaders={}", uri_encode(&signed_headers)),
-    ];
-    qs_parts.sort();
-    let canonical_qs = qs_parts.join("&");
-
-    let canonical_request = format!(
-        "PUT\n{}\n{}\n{}\n{}\n{}",
-        path, canonical_qs, canonical_headers_str, signed_headers, body_hash
-    );
-
-    let canonical_hash = sha256_hex(canonical_request.as_bytes());
-    let scope = format!("{}/{}/s3/aws4_request", date_short, region);
-    let string_to_sign = format!(
-        "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        date_long, scope, canonical_hash
-    );
-
-    let signing_key = derive_signing_key(secret_key, date_short, region, "s3");
-    let signature = hmac_sha256(signing_key.as_ref(), string_to_sign.as_bytes());
-    let sig_hex = hex_encode(signature.as_ref());
-
-    format!(
-        "{}{}?{}&X-Amz-Signature={}",
-        endpoint, path, canonical_qs, sig_hex
+    query: Option<&str>,
+    expires: Duration,
+    extra_headers: I,
+    payload_hash: Option<&str>,
+) -> PresignedRequest
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    presign_url_with_credentials(
+        method,
+        &object_url(CTX.endpoint(), bucket, key, query),
+        expires,
+        extra_headers,
+        payload_hash,
+        credentials,
     )
 }
 
-/// Convert days since Unix epoch to (year, month, day).
-fn days_to_ymd(days: u64) -> (u64, u64, u64) {
-    // Algorithm from http://howardhinnant.github.io/date_algorithms.html
-    let z = days + 719468;
-    let era = z / 146097;
-    let doe = z - era * 146097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d)
+fn presign_object<K, V, I>(
+    method: &str,
+    bucket: &str,
+    key: &str,
+    query: Option<&str>,
+    expires: Duration,
+    extra_headers: I,
+    payload_hash: Option<&str>,
+) -> PresignedRequest
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    presign_object_with_credentials(
+        primary_credentials(),
+        method,
+        bucket,
+        key,
+        query,
+        expires,
+        extra_headers,
+        payload_hash,
+    )
 }
 
 /// Cleanup helper.
@@ -210,14 +155,15 @@ fn test_presigned_get_object() {
             .await
             .unwrap();
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "obj",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
 
         let mut resp = agent()
             .get(presigned.uri())
@@ -234,17 +180,17 @@ fn test_presigned_get_object() {
 #[test]
 fn test_presigned_get_object_nonexistent() {
     s3_tests::run(async {
-        let client = CTX.client();
         let bucket = setup_bucket().await;
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("no-such-key")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "no-such-key",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
 
         let mut resp = agent()
             .get(presigned.uri())
@@ -267,14 +213,15 @@ fn test_presigned_put_object() {
         let bucket = setup_bucket().await;
         let body = b"presigned put content";
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .put_object()
-            .bucket(&bucket)
-            .key("uploaded")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "PUT",
+            &bucket,
+            "uploaded",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
 
         let mut resp = agent()
             .put(presigned.uri())
@@ -299,7 +246,10 @@ fn test_presigned_put_object() {
     });
 }
 
-async fn assert_presigned_put_object_with_acl(client: &aws_sdk_s3::Client) {
+async fn assert_presigned_put_object_with_acl(
+    client: &aws_sdk_s3::Client,
+    credentials: SignedRequestCredentials<'_>,
+) {
     use aws_sdk_s3::types::{ObjectOwnership, OwnershipControls, OwnershipControlsRule};
 
     let bucket = unique_bucket();
@@ -322,15 +272,16 @@ async fn assert_presigned_put_object_with_acl(client: &aws_sdk_s3::Client) {
         .unwrap();
     let body = b"hello world";
 
-    let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-    let presigned = client
-        .put_object()
-        .bucket(&bucket)
-        .key("foo")
-        .acl(aws_sdk_s3::types::ObjectCannedAcl::Private)
-        .presigned(presign_config.clone())
-        .await
-        .unwrap();
+    let presigned = presign_object_with_credentials(
+        credentials,
+        "PUT",
+        &bucket,
+        "foo",
+        None,
+        Duration::from_secs(900),
+        [("x-amz-acl", "private")],
+        None,
+    );
 
     let mut resp = with_presigned_headers!(agent().put(presigned.uri()), presigned)
         .send(&body[..])
@@ -343,13 +294,16 @@ async fn assert_presigned_put_object_with_acl(client: &aws_sdk_s3::Client) {
         status, response_body
     );
 
-    let get_presigned = client
-        .get_object()
-        .bucket(&bucket)
-        .key("foo")
-        .presigned(presign_config)
-        .await
-        .unwrap();
+    let get_presigned = presign_object_with_credentials(
+        credentials,
+        "GET",
+        &bucket,
+        "foo",
+        None,
+        Duration::from_secs(900),
+        NO_HEADERS,
+        None,
+    );
     let mut get_resp = agent()
         .get(get_presigned.uri())
         .call()
@@ -371,17 +325,25 @@ fn test_presigned_sse_c_put_object() {
         let customer_key = test_sse_c_key();
         let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .put_object()
-            .bucket(&bucket)
-            .key("uploaded-sse-c")
-            .sse_customer_algorithm("AES256")
-            .sse_customer_key(key_b64.clone())
-            .sse_customer_key_md5(key_md5_b64.clone())
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "PUT",
+            &bucket,
+            "uploaded-sse-c",
+            None,
+            Duration::from_secs(900),
+            [
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                (
+                    "x-amz-server-side-encryption-customer-key",
+                    key_b64.as_str(),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.as_str(),
+                ),
+            ],
+            None,
+        );
 
         let mut resp = with_presigned_headers!(agent().put(presigned.uri()), presigned)
             .send(&body[..])
@@ -424,19 +386,17 @@ fn test_presigned_put_object_signed_payload() {
         let body = b"presigned put with signed payload";
         let body_hash = sha256_hex(body);
 
-        let url = presigned_put_url(
-            CTX.endpoint(),
+        let presigned = presign_object(
+            "PUT",
             &bucket,
             "signed-body",
-            &body_hash,
-            CTX.access_key(),
-            CTX.secret_key(),
-            CTX.region(),
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            Some(&body_hash),
         );
 
-        let mut resp = agent()
-            .put(&url)
-            .header("x-amz-content-sha256", &body_hash)
+        let mut resp = with_presigned_headers!(agent().put(presigned.uri()), presigned)
             .send(&body[..])
             .expect("transport error");
         let status = resp.status().as_u16();
@@ -470,20 +430,20 @@ fn test_presigned_put_object_signed_payload_mismatch() {
         let body_hash = sha256_hex(body);
 
         // Sign the URL for this specific body
-        let url = presigned_put_url(
-            CTX.endpoint(),
+        let presigned = presign_object(
+            "PUT",
             &bucket,
             "signed-body",
-            &body_hash,
-            CTX.access_key(),
-            CTX.secret_key(),
-            CTX.region(),
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            Some(&body_hash),
         );
 
         // Send a different body — signature was for the original body
         let wrong_body = b"different body content";
         let mut resp = agent()
-            .put(&url)
+            .put(presigned.uri())
             .header("x-amz-content-sha256", &sha256_hex(wrong_body))
             .send(&wrong_body[..])
             .expect("transport error");
@@ -516,14 +476,15 @@ fn test_presigned_delete_object() {
             .await
             .unwrap();
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .delete_object()
-            .bucket(&bucket)
-            .key("todelete")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "DELETE",
+            &bucket,
+            "todelete",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
 
         let mut resp = agent()
             .delete(presigned.uri())
@@ -564,14 +525,15 @@ fn test_presigned_head_object() {
             .await
             .unwrap();
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .head_object()
-            .bucket(&bucket)
-            .key("obj")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "HEAD",
+            &bucket,
+            "obj",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
 
         let mut resp = agent()
             .head(presigned.uri())
@@ -607,17 +569,25 @@ fn test_presigned_sse_c_get_object() {
             .await
             .unwrap();
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj-sse-c")
-            .sse_customer_algorithm("AES256")
-            .sse_customer_key(key_b64.clone())
-            .sse_customer_key_md5(key_md5_b64.clone())
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "obj-sse-c",
+            None,
+            Duration::from_secs(900),
+            [
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                (
+                    "x-amz-server-side-encryption-customer-key",
+                    key_b64.as_str(),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.as_str(),
+                ),
+            ],
+            None,
+        );
 
         let mut resp = with_presigned_headers!(agent().get(presigned.uri()), presigned)
             .call()
@@ -661,17 +631,25 @@ fn test_presigned_sse_c_get_requires_signed_headers() {
             .await
             .unwrap();
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj-sse-c-missing-headers")
-            .sse_customer_algorithm("AES256")
-            .sse_customer_key(key_b64.clone())
-            .sse_customer_key_md5(key_md5_b64.clone())
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "obj-sse-c-missing-headers",
+            None,
+            Duration::from_secs(900),
+            [
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                (
+                    "x-amz-server-side-encryption-customer-key",
+                    key_b64.as_str(),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.as_str(),
+                ),
+            ],
+            None,
+        );
 
         let mut resp = agent()
             .get(presigned.uri())
@@ -706,17 +684,25 @@ fn test_presigned_sse_c_head_object() {
             .await
             .unwrap();
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .head_object()
-            .bucket(&bucket)
-            .key("obj-head-sse-c")
-            .sse_customer_algorithm("AES256")
-            .sse_customer_key(key_b64.clone())
-            .sse_customer_key_md5(key_md5_b64.clone())
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "HEAD",
+            &bucket,
+            "obj-head-sse-c",
+            None,
+            Duration::from_secs(900),
+            [
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                (
+                    "x-amz-server-side-encryption-customer-key",
+                    key_b64.as_str(),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.as_str(),
+                ),
+            ],
+            None,
+        );
 
         let mut resp = with_presigned_headers!(agent().head(presigned.uri()), presigned)
             .call()
@@ -756,14 +742,15 @@ fn test_presigned_get_expired() {
             .unwrap();
 
         // Generate a URL that expires in 1 second
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(1)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "obj",
+            None,
+            Duration::from_secs(1),
+            NO_HEADERS,
+            None,
+        );
 
         // Wait for it to expire
         std::thread::sleep(Duration::from_secs(2));
@@ -797,14 +784,15 @@ fn test_presigned_get_bad_signature() {
             .await
             .unwrap();
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "obj",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
 
         // Tamper with the signature
         let url = presigned.uri().to_string();
@@ -840,14 +828,15 @@ fn test_presigned_get_tampered_key() {
             .await
             .unwrap();
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("original")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "original",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
 
         // Change the key in the URL path from "original" to "different"
         let url = presigned.uri().to_string();
@@ -881,14 +870,15 @@ fn test_presigned_wrong_method() {
             .unwrap();
 
         // Generate a presigned GET URL
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "obj",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
 
         // Use it with PUT instead of GET — signature was computed for GET
         let mut resp = agent()
@@ -931,14 +921,15 @@ fn test_presigned_missing_signature() {
             .await
             .unwrap();
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "obj",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
 
         // Remove the X-Amz-Signature parameter
         let url = presigned.uri().to_string();
@@ -966,19 +957,19 @@ fn test_presigned_missing_signature() {
 #[test]
 fn test_presigned_put_get_round_trip() {
     s3_tests::run(async {
-        let client = CTX.client();
         let bucket = setup_bucket().await;
         let body = b"round-trip content via presigned URLs";
 
         // Presigned PUT
-        let put_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let put_presigned = client
-            .put_object()
-            .bucket(&bucket)
-            .key("roundtrip")
-            .presigned(put_config)
-            .await
-            .unwrap();
+        let put_presigned = presign_object(
+            "PUT",
+            &bucket,
+            "roundtrip",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
 
         let mut put_resp = agent()
             .put(put_presigned.uri())
@@ -988,14 +979,15 @@ fn test_presigned_put_get_round_trip() {
         let _ = put_resp.body_mut().read_to_string();
 
         // Presigned GET
-        let get_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let get_presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("roundtrip")
-            .presigned(get_config)
-            .await
-            .unwrap();
+        let get_presigned = presign_object(
+            "GET",
+            &bucket,
+            "roundtrip",
+            None,
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
 
         let mut get_resp = agent()
             .get(get_presigned.uri())
@@ -1026,15 +1018,15 @@ fn test_presigned_get_response_content_type() {
             .await
             .unwrap();
 
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(900)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .response_content_type("application/pdf")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "obj",
+            Some("response-content-type=application/pdf"),
+            Duration::from_secs(900),
+            NO_HEADERS,
+            None,
+        );
 
         let mut resp = agent()
             .get(presigned.uri())
@@ -1057,7 +1049,7 @@ fn test_presigned_get_response_content_type() {
 #[test]
 fn test_object_raw_get_x_amz_expires_not_expired() {
     s3_tests::run(async {
-        assert_object_raw_get_x_amz_expires_not_expired(CTX.client()).await;
+        assert_object_raw_get_x_amz_expires_not_expired(CTX.client(), primary_credentials()).await;
     });
 }
 
@@ -1077,16 +1069,16 @@ fn test_object_raw_get_x_amz_expires_out_max_range() {
             .unwrap();
 
         // Generate a valid presigned URL, then tamper X-Amz-Expires to exceed the
-        // 604800-second (7-day) maximum. The SDK rejects >604800 client-side, so
-        // we create a legal URL and replace the value.
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(600)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        // 604800-second (7-day) maximum.
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "obj",
+            None,
+            Duration::from_secs(600),
+            NO_HEADERS,
+            None,
+        );
 
         let tampered_url = presigned
             .uri()
@@ -1122,14 +1114,15 @@ fn test_object_raw_get_x_amz_expires_out_positive_range() {
             .unwrap();
 
         // Manually construct a URL with a negative X-Amz-Expires
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(600)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "obj",
+            None,
+            Duration::from_secs(600),
+            NO_HEADERS,
+            None,
+        );
 
         // Replace the X-Amz-Expires value with a negative number
         let tampered_url = presigned
@@ -1166,14 +1159,15 @@ fn test_object_raw_get_x_amz_expires_out_range_zero() {
             .unwrap();
 
         // Construct a URL with X-Amz-Expires=0
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(600)).unwrap();
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "GET",
+            &bucket,
+            "obj",
+            None,
+            Duration::from_secs(600),
+            NO_HEADERS,
+            None,
+        );
 
         let tampered_url = presigned
             .uri()
@@ -1192,18 +1186,18 @@ fn test_object_raw_get_x_amz_expires_out_range_zero() {
 #[test]
 fn test_object_raw_put_authenticated_expired() {
     s3_tests::run(async {
-        let client = CTX.client();
         let bucket = setup_bucket().await;
 
         // Generate a presigned PUT URL that's already expired
-        let presign_config = PresigningConfig::expires_in(Duration::from_secs(1)).unwrap();
-        let presigned = client
-            .put_object()
-            .bucket(&bucket)
-            .key("obj")
-            .presigned(presign_config)
-            .await
-            .unwrap();
+        let presigned = presign_object(
+            "PUT",
+            &bucket,
+            "obj",
+            None,
+            Duration::from_secs(1),
+            NO_HEADERS,
+            None,
+        );
 
         // Wait for expiry
         std::thread::sleep(Duration::from_secs(2));
@@ -1226,18 +1220,21 @@ fn test_object_raw_put_authenticated_expired() {
 #[test]
 fn test_object_presigned_put_object_with_acl() {
     s3_tests::run(async {
-        assert_presigned_put_object_with_acl(CTX.client()).await;
+        assert_presigned_put_object_with_acl(CTX.client(), primary_credentials()).await;
     });
 }
 
 #[test]
 fn test_object_presigned_put_object_with_acl_tenant() {
     s3_tests::run(async {
-        assert_presigned_put_object_with_acl(CTX.alt_client()).await;
+        assert_presigned_put_object_with_acl(CTX.alt_client(), alt_credentials()).await;
     });
 }
 
-async fn assert_object_raw_get_x_amz_expires_not_expired(client: &aws_sdk_s3::Client) {
+async fn assert_object_raw_get_x_amz_expires_not_expired(
+    client: &aws_sdk_s3::Client,
+    credentials: SignedRequestCredentials<'_>,
+) {
     let bucket = create_public_bucket(client).await;
     client
         .put_object()
@@ -1249,14 +1246,16 @@ async fn assert_object_raw_get_x_amz_expires_not_expired(client: &aws_sdk_s3::Cl
         .await
         .unwrap();
 
-    let presign_config = PresigningConfig::expires_in(Duration::from_secs(600)).unwrap();
-    let presigned = client
-        .get_object()
-        .bucket(&bucket)
-        .key("obj")
-        .presigned(presign_config)
-        .await
-        .unwrap();
+    let presigned = presign_object_with_credentials(
+        credentials,
+        "GET",
+        &bucket,
+        "obj",
+        None,
+        Duration::from_secs(600),
+        NO_HEADERS,
+        None,
+    );
 
     let mut options_resp = agent()
         .options(presigned.uri())
@@ -1280,6 +1279,6 @@ async fn assert_object_raw_get_x_amz_expires_not_expired(client: &aws_sdk_s3::Cl
 #[test]
 fn test_object_raw_get_x_amz_expires_not_expired_tenant() {
     s3_tests::run(async {
-        assert_object_raw_get_x_amz_expires_not_expired(CTX.alt_client()).await;
+        assert_object_raw_get_x_amz_expires_not_expired(CTX.alt_client(), alt_credentials()).await;
     });
 }

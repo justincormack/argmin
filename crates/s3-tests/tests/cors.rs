@@ -1,7 +1,8 @@
-use aws_sdk_s3::presigning::PresigningConfig;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CorsConfiguration, CorsRule, ObjectCannedAcl};
-use s3_tests::{content_md5_header, send_signed_request, unique_bucket, CTX};
+use s3_tests::{
+    content_md5_header, object_url, presign_url, send_signed_request, unique_bucket, CTX,
+};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -1242,13 +1243,13 @@ fn test_cors_presigned_get_object_preflight() {
             .await
             .unwrap();
 
-        let presigned = client
-            .get_object()
-            .bucket(&bucket)
-            .key("obj")
-            .presigned(PresigningConfig::expires_in(Duration::from_secs(600)).unwrap())
-            .await
-            .unwrap();
+        let presigned = presign_url(
+            "GET",
+            &object_url(CTX.endpoint(), &bucket, "obj", None),
+            Duration::from_secs(600),
+            [] as [(&str, &str); 0],
+            None,
+        );
 
         let mut resp = agent()
             .options(presigned.uri())
@@ -1286,15 +1287,13 @@ fn test_cors_presigned_put_object_preflight() {
             .build()
             .unwrap()])
         .await;
-        let client = CTX.client();
-
-        let presigned = client
-            .put_object()
-            .bucket(&bucket)
-            .key("upload")
-            .presigned(PresigningConfig::expires_in(Duration::from_secs(600)).unwrap())
-            .await
-            .unwrap();
+        let presigned = presign_url(
+            "PUT",
+            &object_url(CTX.endpoint(), &bucket, "upload", None),
+            Duration::from_secs(600),
+            [] as [(&str, &str); 0],
+            None,
+        );
 
         let mut resp = agent()
             .options(presigned.uri())

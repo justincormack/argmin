@@ -428,6 +428,24 @@ pub struct SignedRequestCredentials<'a> {
     pub tls_ca_pem: Option<&'a [u8]>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PresignedRequest {
+    uri: String,
+    headers: Vec<(String, String)>,
+}
+
+impl PresignedRequest {
+    pub fn uri(&self) -> &str {
+        &self.uri
+    }
+
+    pub fn headers(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+}
+
 /// Build a `Content-MD5` header pair for the request body.
 pub fn content_md5_header(body: &[u8]) -> (String, String) {
     ("Content-MD5".to_string(), md5_b64(body))
@@ -439,6 +457,134 @@ pub fn sdk_checksum_headers(body: &[u8]) -> Vec<(String, String)> {
         ("x-amz-checksum-algorithm".to_string(), "CRC32".to_string()),
         ("x-amz-checksum-crc32".to_string(), crc32_b64(body)),
     ]
+}
+
+pub fn object_url(endpoint: &str, bucket: &str, key: &str, query: Option<&str>) -> String {
+    let encoded_key = auth::canonical::uri_encode_path(key);
+    match query {
+        Some(query) => format!("{endpoint}/{bucket}/{encoded_key}?{query}"),
+        None => format!("{endpoint}/{bucket}/{encoded_key}"),
+    }
+}
+
+pub fn presign_url<K, V, I>(
+    method: &str,
+    url_str: &str,
+    expires: Duration,
+    extra_headers: I,
+    payload_hash: Option<&str>,
+) -> PresignedRequest
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    presign_url_with_credentials(
+        method,
+        url_str,
+        expires,
+        extra_headers,
+        payload_hash,
+        SignedRequestCredentials {
+            access_key: CTX.access_key(),
+            secret_key: CTX.secret_key(),
+            region: CTX.region(),
+            tls_ca_pem: CTX._server.as_ref().and_then(TestServer::tls_ca_pem),
+        },
+    )
+}
+
+pub fn presign_url_with_credentials<K, V, I>(
+    method: &str,
+    url_str: &str,
+    expires: Duration,
+    extra_headers: I,
+    payload_hash: Option<&str>,
+    credentials: SignedRequestCredentials<'_>,
+) -> PresignedRequest
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    let parsed = url::Url::parse(url_str).expect("parse URL");
+    let path = parsed.path();
+    let base_query = parsed.query().unwrap_or("");
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let amz_date = format_amz_date(secs);
+    let date_stamp = &amz_date[..8];
+    let host = parsed
+        .host_str()
+        .map(|host| {
+            if let Some(port) = parsed.port() {
+                format!("{host}:{port}")
+            } else {
+                host.to_string()
+            }
+        })
+        .expect("URL host");
+
+    let payload_hash = payload_hash.unwrap_or("UNSIGNED-PAYLOAD").to_string();
+    let mut request_headers = vec![("host".to_string(), host)];
+    if payload_hash != "UNSIGNED-PAYLOAD" {
+        request_headers.push(("x-amz-content-sha256".to_string(), payload_hash.clone()));
+    }
+    for (name, value) in extra_headers {
+        request_headers.push((name.as_ref().to_lowercase(), value.as_ref().to_string()));
+    }
+    request_headers.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let signed_headers = request_headers
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_headers: String = request_headers
+        .iter()
+        .map(|(name, value)| format!("{name}:{value}\n"))
+        .collect();
+    let credential = format!(
+        "{}/{}/{}/s3/aws4_request",
+        credentials.access_key, date_stamp, credentials.region
+    );
+    let mut raw_query_parts = Vec::new();
+    if !base_query.is_empty() {
+        raw_query_parts.push(base_query.to_string());
+    }
+    raw_query_parts.push("X-Amz-Algorithm=AWS4-HMAC-SHA256".to_string());
+    raw_query_parts.push(format!("X-Amz-Credential={credential}"));
+    raw_query_parts.push(format!("X-Amz-Date={amz_date}"));
+    raw_query_parts.push(format!("X-Amz-Expires={}", expires.as_secs()));
+    raw_query_parts.push(format!("X-Amz-SignedHeaders={signed_headers}"));
+    let canonical_query = normalize_query(&raw_query_parts.join("&"));
+    let canonical_request = format!(
+        "{method}\n{path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    );
+    let scope = format!("{date_stamp}/{}/s3/aws4_request", credentials.region);
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let signing_key = derive_signing_key(credentials.secret_key, date_stamp, credentials.region);
+    let signature = hmac_sha256(&signing_key, string_to_sign.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let uri = format!(
+        "{}{}?{}&X-Amz-Signature={signature}",
+        parsed.origin().ascii_serialization(),
+        path,
+        canonical_query
+    );
+    let headers = request_headers
+        .into_iter()
+        .filter(|(name, _)| name != "host")
+        .collect();
+
+    PresignedRequest { uri, headers }
 }
 
 /// Send a raw signed S3 request, bypassing SDK auto-checksum behavior.
@@ -536,14 +682,8 @@ where
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         sha256_hex(canonical_request.as_bytes())
     );
-    let k_date = hmac_sha256(
-        format!("AWS4{}", credentials.secret_key).as_bytes(),
-        date_stamp.as_bytes(),
-    );
-    let k_region = hmac_sha256(&k_date, credentials.region.as_bytes());
-    let k_service = hmac_sha256(&k_region, b"s3");
-    let k_signing = hmac_sha256(&k_service, b"aws4_request");
-    let signature: String = hmac_sha256(&k_signing, string_to_sign.as_bytes())
+    let signing_key = derive_signing_key(credentials.secret_key, date_stamp, credentials.region);
+    let signature: String = hmac_sha256(&signing_key, string_to_sign.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect();
@@ -664,6 +804,16 @@ fn sha256_hex(data: &[u8]) -> String {
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     let key = hmac::Key::new(hmac::HMAC_SHA256, key);
     hmac::sign(&key, data).as_ref().to_vec()
+}
+
+fn derive_signing_key(secret_key: &str, date_stamp: &str, region: &str) -> Vec<u8> {
+    let k_date = hmac_sha256(
+        format!("AWS4{secret_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, b"s3");
+    hmac_sha256(&k_service, b"aws4_request")
 }
 
 fn format_amz_date(epoch_secs: u64) -> String {

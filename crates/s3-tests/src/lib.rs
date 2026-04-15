@@ -7,9 +7,10 @@ pub use helpers::{
     copy_source_with_version, create_bucket_with_sse_c_enabled, create_objects,
     create_objects_with_keys, create_public_bucket, create_public_write_bucket,
     delete_all_and_bucket, delete_objects_with_md5, disable_bucket_public_access_block,
-    enable_bucket_sse_c, err_status, put_bucket_lifecycle_with_md5, sdk_checksum_headers,
-    send_signed_request, send_signed_request_with_credentials, sse_c_header_values, test_sse_c_key,
-    unique_bucket, RawResponse, SignedRequestCredentials,
+    enable_bucket_sse_c, err_status, object_url, presign_url, presign_url_with_credentials,
+    put_bucket_lifecycle_with_md5, sdk_checksum_headers, send_signed_request,
+    send_signed_request_with_credentials, sse_c_header_values, test_sse_c_key, unique_bucket,
+    PresignedRequest, RawResponse, SignedRequestCredentials,
 };
 pub use post_form::{
     post_object_raw_to_test_endpoint_with_headers, post_object_to_test_endpoint,
@@ -64,6 +65,8 @@ pub struct TestContext {
     endpoint: String,
     access_key: String,
     secret_key: String,
+    alt_access_key: String,
+    alt_secret_key: String,
     account_id: String,
     alt_account_id: String,
     region: String,
@@ -192,6 +195,8 @@ impl TestContext {
                 endpoint,
                 access_key,
                 secret_key,
+                alt_access_key,
+                alt_secret_key,
                 account_id,
                 alt_account_id,
                 region,
@@ -237,6 +242,8 @@ impl TestContext {
                 endpoint,
                 access_key: server::TEST_ACCESS_KEY.to_string(),
                 secret_key: server::TEST_SECRET_KEY.to_string(),
+                alt_access_key: server::ALT_ACCESS_KEY.to_string(),
+                alt_secret_key: server::ALT_SECRET_KEY.to_string(),
                 account_id: server::TEST_ACCOUNT_ID.to_string(),
                 alt_account_id: server::ALT_ACCOUNT_ID.to_string(),
                 region: server::TEST_REGION.to_string(),
@@ -301,6 +308,16 @@ impl TestContext {
     /// The secret access key.
     pub fn secret_key(&self) -> &str {
         &self.secret_key
+    }
+
+    /// The alternate access key ID.
+    pub fn alt_access_key(&self) -> &str {
+        &self.alt_access_key
+    }
+
+    /// The alternate secret access key.
+    pub fn alt_secret_key(&self) -> &str {
+        &self.alt_secret_key
     }
 
     /// The primary test account ID.
