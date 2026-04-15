@@ -363,22 +363,27 @@ pub async fn build_client_with_ca(
         .operation_attempt_timeout(timeout)
         .build();
 
-    let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
+    let http_client = if endpoint.starts_with("https://") {
+        let mut builder =
+            aws_smithy_http_client::Builder::new().tls_provider(Provider::Rustls(CryptoMode::Ring));
+        if let Some(tls_ca_pem) = tls_ca_pem {
+            let tls_context = TlsContext::builder()
+                .with_trust_store(TrustStore::empty().with_pem_certificate(tls_ca_pem))
+                .build()
+                .expect("valid custom trust store");
+            builder = builder.tls_context(tls_context);
+        }
+        builder.build_https()
+    } else {
+        aws_smithy_http_client::Builder::new().build_http()
+    };
+
+    let loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .credentials_provider(creds)
         .region(aws_config::Region::new(region.to_string()))
         .endpoint_url(endpoint)
-        .timeout_config(timeout_config);
-    if let Some(tls_ca_pem) = tls_ca_pem.filter(|_| endpoint.starts_with("https://")) {
-        let tls_context = TlsContext::builder()
-            .with_trust_store(TrustStore::empty().with_pem_certificate(tls_ca_pem))
-            .build()
-            .expect("valid custom trust store");
-        let http_client = aws_smithy_http_client::Builder::new()
-            .tls_provider(Provider::Rustls(CryptoMode::Ring))
-            .tls_context(tls_context)
-            .build_https();
-        loader = loader.http_client(http_client);
-    }
+        .timeout_config(timeout_config)
+        .http_client(http_client);
     let config = loader.load().await;
 
     let mut s3_config = aws_sdk_s3::config::Builder::from(&config);
