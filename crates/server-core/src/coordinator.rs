@@ -755,8 +755,8 @@ impl AuthorizedPutObjectWrite {
 }
 
 impl BucketScopedRequest for AuthorizedPutObjectWrite {
-    fn bucket_name(&self) -> &str {
-        AuthorizedPutObjectWrite::bucket(self)
+    fn bucket_name_typed(&self) -> &BucketName {
+        AuthorizedPutObjectWrite::bucket_typed(self)
     }
 }
 
@@ -2935,7 +2935,7 @@ trait ExpectedBucketOwnerRequest {
 }
 
 trait BucketScopedRequest: ExpectedBucketOwnerRequest {
-    fn bucket_name(&self) -> &str;
+    fn bucket_name_typed(&self) -> &BucketName;
 }
 
 trait BucketScopedAuthorizationRequest: BucketScopedRequest {
@@ -2973,8 +2973,8 @@ impl<'a> BucketRequest<'a> {
 }
 
 impl BucketScopedRequest for BucketRequest<'_> {
-    fn bucket_name(&self) -> &str {
-        BucketRequest::name(self)
+    fn bucket_name_typed(&self) -> &BucketName {
+        BucketRequest::name_typed(self)
     }
 }
 
@@ -3015,6 +3015,10 @@ impl<'a> ObjectRequest<'a> {
         self.bucket.name()
     }
 
+    pub fn bucket_name_typed(&self) -> &BucketName {
+        self.bucket.name_typed()
+    }
+
     pub fn key(&self) -> &str {
         self.key.as_str()
     }
@@ -3033,8 +3037,8 @@ impl<'a> ObjectRequest<'a> {
 }
 
 impl BucketScopedRequest for ObjectRequest<'_> {
-    fn bucket_name(&self) -> &str {
-        ObjectRequest::bucket_name(self)
+    fn bucket_name_typed(&self) -> &BucketName {
+        ObjectRequest::bucket_name_typed(self)
     }
 }
 
@@ -3106,8 +3110,8 @@ impl<'a> ObjectVersionRequest<'a> {
 }
 
 impl BucketScopedRequest for ObjectVersionRequest<'_> {
-    fn bucket_name(&self) -> &str {
-        ObjectVersionRequest::bucket_name(self)
+    fn bucket_name_typed(&self) -> &BucketName {
+        ObjectVersionRequest::bucket_name_typed(self)
     }
 }
 
@@ -3179,8 +3183,8 @@ impl<'a> MultipartObjectRequest<'a> {
 }
 
 impl BucketScopedRequest for MultipartObjectRequest<'_> {
-    fn bucket_name(&self) -> &str {
-        MultipartObjectRequest::bucket_name(self)
+    fn bucket_name_typed(&self) -> &BucketName {
+        MultipartObjectRequest::bucket_name_typed(self)
     }
 }
 
@@ -5780,6 +5784,13 @@ impl Coordinator {
         }
     }
 
+    fn unchecked_bucket_write_reservation_for(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketSummary, ServerError> {
+        self.unchecked_bucket_write_reservation(bucket.as_str())
+    }
+
     fn release_bucket_write_reservation(&self, bucket: &str) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg(bucket)?;
         bucket_pg
@@ -5792,14 +5803,18 @@ impl Coordinator {
             })
     }
 
-    fn with_unchecked_bucket_write_reservation<T>(
+    fn release_bucket_write_reservation_for(&self, bucket: &BucketName) -> Result<(), ServerError> {
+        self.release_bucket_write_reservation(bucket.as_str())
+    }
+
+    fn with_unchecked_bucket_write_reservation_for<T>(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
         action: impl FnOnce(BucketSummary) -> Result<T, ServerError>,
     ) -> Result<T, ServerError> {
-        let bucket_info = self.unchecked_bucket_write_reservation(bucket)?;
+        let bucket_info = self.unchecked_bucket_write_reservation_for(bucket)?;
         let result = action(bucket_info);
-        let release_result = self.release_bucket_write_reservation(bucket);
+        let release_result = self.release_bucket_write_reservation_for(bucket);
         match (result, release_result) {
             (Ok(value), Ok(())) => Ok(value),
             (Ok(_), Err(err)) => Err(err),
@@ -5817,7 +5832,7 @@ impl Coordinator {
         R: BucketScopedRequest + ?Sized,
     {
         let expected_bucket_owner = req.expected_bucket_owner();
-        self.with_unchecked_bucket_write_reservation(req.bucket_name(), |bucket_info| {
+        self.with_unchecked_bucket_write_reservation_for(req.bucket_name_typed(), |bucket_info| {
             let bucket_info =
                 Self::validate_expected_bucket_owner(bucket_info, expected_bucket_owner)?;
             action(bucket_info)
@@ -5971,6 +5986,13 @@ impl Coordinator {
         self.load_active_bucket_summary_from_pg(&bucket_pg, name)
     }
 
+    fn unchecked_active_bucket_summary_for(
+        &self,
+        name: &BucketName,
+    ) -> Result<BucketSummary, ServerError> {
+        self.unchecked_active_bucket_summary(name.as_str())
+    }
+
     fn checked_active_bucket_summary(
         &self,
         name: &str,
@@ -5982,11 +6004,22 @@ impl Coordinator {
         )
     }
 
+    fn checked_active_bucket_summary_for(
+        &self,
+        name: &BucketName,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<ValidatedBucket, ServerError> {
+        Self::validate_expected_bucket_owner(
+            self.unchecked_active_bucket_summary_for(name)?,
+            expected_bucket_owner,
+        )
+    }
+
     fn active_bucket_summary_for<R>(&self, req: &R) -> Result<ValidatedBucket, ServerError>
     where
         R: BucketScopedRequest + ?Sized,
     {
-        self.checked_active_bucket_summary(req.bucket_name(), req.expected_bucket_owner())
+        self.checked_active_bucket_summary_for(req.bucket_name_typed(), req.expected_bucket_owner())
     }
 
     /// Create a new coordinator.
@@ -6173,14 +6206,17 @@ impl Coordinator {
         Ok(self.storage_node.get_pg(pg_id)?)
     }
 
-    fn lock_bucket_and_object_pgs(
+    fn lock_bucket_and_object_pgs_for(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
     ) -> Result<BucketObjectPgGuards<'_>, ServerError> {
         let (bucket_guard, object_guard) = self
             .storage_node
-            .lock_two_pgs(self.bucket_pg_id(bucket), self.object_pg_id(bucket, key))
+            .lock_two_pgs(
+                self.bucket_pg_id_for(bucket),
+                self.object_pg_id_for(bucket, key),
+            )
             .map_err(ServerError::Store)?;
         Ok(BucketObjectPgGuards::new(bucket_guard, object_guard))
     }
@@ -9927,15 +9963,16 @@ impl Coordinator {
     /// payload lease before this guard is released. Committed payload
     /// generations are immutable, and reclaim is lease-gated, so read-side
     /// paths no longer need to relock a synthetic shard PG.
-    fn lock_object_pgs_for_read<'a>(
+    fn lock_object_pgs_for_read_typed<'a>(
         &'a self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: Option<VersionId>,
     ) -> Result<LockedReadObject<'a>, ServerError> {
-        let meta_pg_id = self.object_pg_id(bucket, key);
+        let meta_pg_id = self.object_pg_id_for(bucket, key);
         let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-        let record = Self::lookup_object_record(&meta_guard, bucket, key, version_id)?;
+        let record =
+            Self::lookup_object_record(&meta_guard, bucket.as_str(), key.as_str(), version_id)?;
         Ok(LockedReadObject {
             record,
             pgs: ObjectPgGuards::new(meta_guard),

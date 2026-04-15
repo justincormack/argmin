@@ -45,8 +45,8 @@ impl MissingObjectDiscovery {
 
 struct ObjectStateLoadRequest<'a> {
     requester: &'a Requester,
-    bucket: &'a str,
-    key: &'a str,
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
     version_id: Option<VersionId>,
     expected_bucket_owner: Option<&'a str>,
     policy_requirement: ObjectBucketPolicyRequirement,
@@ -1321,11 +1321,11 @@ impl Coordinator {
     pub(super) fn authorize_bucket_admin_or_bucket_policy_action(
         &self,
         requester: &Requester,
-        bucket: &str,
+        bucket: &BucketName,
         expected_bucket_owner: Option<&str>,
         action: auth::PolicyAction,
     ) -> Result<ValidatedBucket, ServerError> {
-        let info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
+        let info = self.checked_active_bucket_summary_for(bucket, expected_bucket_owner)?;
         let bucket_policy = self.cached_bucket_policy(&info)?;
         if Self::requester_can_bucket_action_with_bucket_policy(
             requester,
@@ -1350,7 +1350,7 @@ impl Coordinator {
     {
         self.authorize_bucket_admin_or_bucket_policy_action(
             req.requester(),
-            req.bucket_name(),
+            req.bucket_name_typed(),
             req.expected_bucket_owner(),
             action,
         )
@@ -1833,8 +1833,8 @@ impl Coordinator {
             ..
         } = self.authorize_object_acl_access(
             req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key(),
+            req.object.bucket_name_typed(),
+            req.object.key_typed(),
             req.version_id,
             ObjectAclAuthorization::ReadWithPolicy(Self::get_object_acl_policy_action(
                 req.version_id,
@@ -1878,8 +1878,8 @@ impl Coordinator {
             ..
         } = self.authorize_object_acl_access(
             req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key(),
+            req.object.bucket_name_typed(),
+            req.object.key_typed(),
             req.object.version_id,
             ObjectAclAuthorization::WriteWithPolicy {
                 action: Self::put_object_acl_policy_action(req.object.version_id),
@@ -1936,8 +1936,8 @@ impl Coordinator {
                 },
         } = self.authorize_object_lock_access(
             req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key(),
+            req.object.bucket_name_typed(),
+            req.object.key_typed(),
             req.object.version_id,
             auth::PolicyAction::PutObjectRetention,
             req.object.expected_bucket_owner(),
@@ -1974,8 +1974,8 @@ impl Coordinator {
             ..
         } = self.authorize_object_lock_access(
             req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key(),
+            req.object.bucket_name_typed(),
+            req.object.key_typed(),
             req.version_id,
             auth::PolicyAction::GetObjectRetention,
             req.expected_bucket_owner(),
@@ -1999,8 +1999,8 @@ impl Coordinator {
             ..
         } = self.authorize_object_lock_access(
             req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key(),
+            req.object.bucket_name_typed(),
+            req.object.key_typed(),
             req.object.version_id,
             auth::PolicyAction::PutObjectLegalHold,
             req.object.expected_bucket_owner(),
@@ -2024,8 +2024,8 @@ impl Coordinator {
             ..
         } = self.authorize_object_lock_access(
             req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key(),
+            req.object.bucket_name_typed(),
+            req.object.key_typed(),
             req.version_id,
             auth::PolicyAction::GetObjectLegalHold,
             req.expected_bucket_owner(),
@@ -2039,10 +2039,10 @@ impl Coordinator {
     pub(super) fn authorize_bucket_read_requester(
         &self,
         requester: &Requester,
-        bucket: &str,
+        bucket: &BucketName,
         expected_bucket_owner: Option<&str>,
     ) -> Result<ValidatedBucket, ServerError> {
-        let info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
+        let info = self.checked_active_bucket_summary_for(bucket, expected_bucket_owner)?;
         if Self::requester_can_read_bucket(
             requester,
             &info,
@@ -2065,7 +2065,7 @@ impl Coordinator {
     {
         self.authorize_bucket_read_requester(
             req.requester(),
-            req.bucket_name(),
+            req.bucket_name_typed(),
             req.expected_bucket_owner(),
         )
     }
@@ -2073,10 +2073,10 @@ impl Coordinator {
     pub(super) fn authorize_bucket_owner_account_admin_requester(
         &self,
         requester: &Requester,
-        bucket: &str,
+        bucket: &BucketName,
         expected_bucket_owner: Option<&str>,
     ) -> Result<ValidatedBucket, ServerError> {
-        let info = self.checked_active_bucket_summary(bucket, expected_bucket_owner)?;
+        let info = self.checked_active_bucket_summary_for(bucket, expected_bucket_owner)?;
         if Self::requester_can_bucket_owner_account_admin(requester, &info) {
             Ok(info)
         } else {
@@ -2093,7 +2093,7 @@ impl Coordinator {
     {
         self.authorize_bucket_owner_account_admin_requester(
             req.requester(),
-            req.bucket_name(),
+            req.bucket_name_typed(),
             req.expected_bucket_owner(),
         )
     }
@@ -2263,8 +2263,10 @@ impl Coordinator {
         &self,
         req: &PutBucketPolicyRequest<'_>,
     ) -> Result<AuthorizedPutBucketPolicy, ServerError> {
-        let bucket_info = self
-            .checked_active_bucket_summary(req.bucket.name(), req.bucket.expected_bucket_owner)?;
+        let bucket_info = self.checked_active_bucket_summary_for(
+            req.bucket.name_typed(),
+            req.bucket.expected_bucket_owner,
+        )?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_bucket_policy_action_with_bucket_policy(
             &req.bucket.requester,
@@ -2315,7 +2317,7 @@ impl Coordinator {
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
         let bucket_info =
-            self.checked_active_bucket_summary(req.name(), req.expected_bucket_owner)?;
+            self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner)?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_bucket_policy_action_with_bucket_policy(
             &req.requester,
@@ -2337,7 +2339,7 @@ impl Coordinator {
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
         let bucket_info =
-            self.checked_active_bucket_summary(req.name(), req.expected_bucket_owner)?;
+            self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner)?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_bucket_policy_action_with_bucket_policy(
             &req.requester,
@@ -2571,8 +2573,10 @@ impl Coordinator {
         &self,
         req: &ListObjectsV2Request<'_>,
     ) -> Result<AuthorizedListObjectsV2, ServerError> {
-        let bucket_info = self
-            .checked_active_bucket_summary(req.bucket.name(), req.bucket.expected_bucket_owner())?;
+        let bucket_info = self.checked_active_bucket_summary_for(
+            req.bucket.name_typed(),
+            req.bucket.expected_bucket_owner(),
+        )?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_list_bucket_with_bucket_policy(
             &req.bucket.requester,
@@ -2600,8 +2604,10 @@ impl Coordinator {
         &self,
         req: &ListObjectVersionsRequest<'_>,
     ) -> Result<AuthorizedListObjectVersions, ServerError> {
-        let bucket_info = self
-            .checked_active_bucket_summary(req.bucket.name(), req.bucket.expected_bucket_owner())?;
+        let bucket_info = self.checked_active_bucket_summary_for(
+            req.bucket.name_typed(),
+            req.bucket.expected_bucket_owner(),
+        )?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_bucket_action_with_bucket_policy(
             &req.bucket.requester,
@@ -2627,8 +2633,10 @@ impl Coordinator {
         &self,
         req: &ListMultipartUploadsRequest<'_>,
     ) -> Result<AuthorizedListMultipartUploads, ServerError> {
-        let bucket_info = self
-            .checked_active_bucket_summary(req.bucket.name(), req.bucket.expected_bucket_owner())?;
+        let bucket_info = self.checked_active_bucket_summary_for(
+            req.bucket.name_typed(),
+            req.bucket.expected_bucket_owner(),
+        )?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_bucket_action_with_bucket_policy(
             &req.bucket.requester,
@@ -2758,7 +2766,8 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketAcl, ServerError> {
-        let bucket = self.checked_active_bucket_summary(req.name(), req.expected_bucket_owner())?;
+        let bucket =
+            self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket)?;
         if !Self::requester_can_bucket_action_with_bucket_policy(
             &req.requester,
@@ -2794,8 +2803,10 @@ impl Coordinator {
         &self,
         req: &PutBucketAclRequest<'_>,
     ) -> Result<AuthorizedPutBucketAcl, ServerError> {
-        let bucket_info = self
-            .checked_active_bucket_summary(req.bucket.name(), req.bucket.expected_bucket_owner())?;
+        let bucket_info = self.checked_active_bucket_summary_for(
+            req.bucket.name_typed(),
+            req.bucket.expected_bucket_owner(),
+        )?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         let policy_decision = Self::bucket_policy_decision_for_bucket_with_context(
             &req.bucket.requester,
@@ -2927,23 +2938,24 @@ impl Coordinator {
         object: &ObjectVersionRequest<'_>,
         bypass_governance: bool,
     ) -> Result<AuthorizedDeleteObject<'a>, ServerError> {
-        let bucket = object.bucket_name();
-        let key = object.key();
+        let bucket = object.bucket_name_typed();
+        let key = object.key_typed();
+        let key_str = key.as_str();
         let request_version_id = object.version_id();
         let requester = object.requester();
         let bucket_info =
-            self.checked_active_bucket_summary(bucket, object.expected_bucket_owner())?;
+            self.checked_active_bucket_summary_for(bucket, object.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
 
         match (bucket_info.versioning, request_version_id) {
             (BucketVersioningState::Disabled, _) => {
-                let locked = match self.lock_object_pgs_for_read(bucket, key, None) {
+                let locked = match self.lock_object_pgs_for_read_typed(bucket, key, None) {
                     Ok(locked) => locked,
                     Err(ServerError::ObjectNotFound { .. }) => {
                         if !Self::requester_can_delete_object_with_bucket_policy(
                             requester,
                             &bucket_info,
-                            key,
+                            key_str,
                             None,
                             Self::delete_object_policy_action(None),
                             bucket_policy.as_deref(),
@@ -2958,7 +2970,7 @@ impl Coordinator {
                 if !Self::requester_can_delete_object_with_bucket_policy(
                     requester,
                     &bucket_info,
-                    key,
+                    key_str,
                     Some(&locked.record),
                     Self::delete_object_policy_action(None),
                     bucket_policy.as_deref(),
@@ -2978,7 +2990,11 @@ impl Coordinator {
                 })
             }
             (_, Some(version_id)) => {
-                let locked = match self.lock_object_pgs_for_read(bucket, key, Some(version_id)) {
+                let locked = match self.lock_object_pgs_for_read_typed(
+                    bucket,
+                    key,
+                    Some(version_id),
+                ) {
                     Ok(locked) => locked,
                     Err(
                         ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. },
@@ -2986,7 +3002,7 @@ impl Coordinator {
                         if !Self::requester_can_delete_object_with_bucket_policy(
                             requester,
                             &bucket_info,
-                            key,
+                            key_str,
                             None,
                             Self::delete_object_policy_action(Some(version_id)),
                             bucket_policy.as_deref(),
@@ -2998,7 +3014,7 @@ impl Coordinator {
                             && !Self::requester_can_bypass_governance_retention_for_missing_version_with_bucket_policy(
                                 requester,
                                 &bucket_info,
-                                key,
+                                key_str,
                                 bucket_policy.as_deref(),
                             )?
                         {
@@ -3012,7 +3028,7 @@ impl Coordinator {
                 if !Self::requester_can_delete_object_with_bucket_policy(
                     requester,
                     &bucket_info,
-                    key,
+                    key_str,
                     Some(&locked.record),
                     Self::delete_object_policy_action(Some(version_id)),
                     bucket_policy.as_deref(),
@@ -3051,12 +3067,12 @@ impl Coordinator {
             (_, None) => {
                 let owner =
                     Self::effective_object_owner(&bucket_info, requester, PutObjectAcl::None);
-                match self.lock_object_pgs_for_read(bucket, key, None) {
+                match self.lock_object_pgs_for_read_typed(bucket, key, None) {
                     Ok(locked) => {
                         if !Self::requester_can_delete_object_with_bucket_policy(
                             requester,
                             &bucket_info,
-                            key,
+                            key_str,
                             Some(&locked.record),
                             Self::delete_object_policy_action(None),
                             bucket_policy.as_deref(),
@@ -3074,7 +3090,7 @@ impl Coordinator {
                         if !Self::requester_can_delete_object_with_bucket_policy(
                             requester,
                             &bucket_info,
-                            key,
+                            key_str,
                             None,
                             Self::delete_object_policy_action(None),
                             bucket_policy.as_deref(),
@@ -3122,8 +3138,6 @@ impl Coordinator {
         &'a self,
         req: &CopyObjectRequest<'_>,
     ) -> Result<AuthorizedCopyObject<'a>, ServerError> {
-        let src_bucket = req.source.bucket.as_str();
-        let src_key = req.source.key.as_str();
         let src_version_id = req.source.version_id;
         let requester = &req.destination.bucket.requester;
         let acl = req.acl.clone();
@@ -3173,8 +3187,8 @@ impl Coordinator {
         })?;
         let source = self.authorize_object_read(
             requester,
-            src_bucket,
-            src_key,
+            &req.source.bucket,
+            &req.source.key,
             src_version_id,
             req.source.expected_bucket_owner(),
             Self::get_object_policy_action(src_version_id),
@@ -3245,11 +3259,9 @@ impl Coordinator {
         &'a self,
         req: &UploadPartCopyRequest<'_>,
     ) -> Result<AuthorizedUploadPartCopy<'a>, ServerError> {
-        let src_bucket = req.source.bucket.as_str();
-        let src_key = req.source.key.as_str();
         let src_version_id = req.source.version_id;
-        let dst_bucket = req.upload.bucket_name();
-        let dst_key = req.upload.key();
+        let dst_bucket = req.upload.bucket_name_typed();
+        let dst_key = req.upload.key_typed();
         let upload_id = req.upload.upload_id;
         let part_number = req.part_number;
         let requester = req.upload.requester();
@@ -3267,14 +3279,14 @@ impl Coordinator {
                 .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm));
 
         let dst_bucket_info =
-            self.checked_active_bucket_summary(dst_bucket, req.expected_bucket_owner())?;
+            self.checked_active_bucket_summary_for(dst_bucket, req.expected_bucket_owner())?;
         let dst_bucket_policy = self.cached_bucket_policy(&dst_bucket_info)?;
         {
             let dst_meta_pg = self
                 .storage_node
-                .get_pg(self.object_pg_id(dst_bucket, dst_key))?;
+                .get_pg(self.object_pg_id_for(dst_bucket, dst_key))?;
             let dst_upload = dst_meta_pg.get_multipart_upload(upload_id)?;
-            if dst_upload.bucket != dst_bucket || dst_upload.key != dst_key {
+            if dst_upload.bucket != dst_bucket.as_str() || dst_upload.key != dst_key.as_str() {
                 return Err(ServerError::NoSuchUpload {
                     upload_id: upload_id.to_string(),
                 });
@@ -3312,8 +3324,8 @@ impl Coordinator {
 
             let source = self.authorize_object_read(
                 requester,
-                src_bucket,
-                src_key,
+                &req.source.bucket,
+                &req.source.key,
                 src_version_id,
                 req.source.expected_bucket_owner(),
                 Self::get_object_policy_action(src_version_id),
@@ -3336,17 +3348,19 @@ impl Coordinator {
         &'a self,
         req: &BeginStreamPartRequest<'_>,
     ) -> Result<AuthorizedBeginStreamPart<'a>, ServerError> {
-        let bucket = req.upload.bucket_name();
-        let key = req.upload.key();
+        let bucket = req.upload.bucket_name_typed();
+        let key = req.upload.key_typed();
         let upload_id = req.upload.upload_id;
         let part_number = req.part_number;
         let policy_context = req.effective_policy_context();
         let bucket_info =
-            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
+            self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
+        let meta_pg = self
+            .storage_node
+            .get_pg(self.object_pg_id_for(bucket, key))?;
         let upload = meta_pg.get_multipart_upload(upload_id)?;
-        if upload.bucket != bucket || upload.key != key {
+        if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
             return Err(ServerError::NoSuchUpload {
                 upload_id: upload_id.to_string(),
             });
@@ -3391,14 +3405,16 @@ impl Coordinator {
         &self,
         req: &CompleteMultipartUploadRequest<'_>,
     ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
-        let bucket = req.upload.bucket_name();
-        let key = req.upload.key();
+        let bucket = req.upload.bucket_name_typed();
+        let key = req.upload.key_typed();
         let upload_id = req.upload.upload_id;
         self.with_bucket_write_reservation_for(&req.upload, |bucket_info| {
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-            let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
+            let meta_pg = self
+                .storage_node
+                .get_pg(self.object_pg_id_for(bucket, key))?;
             let upload = meta_pg.get_multipart_upload(upload_id)?;
-            if upload.bucket != bucket || upload.key != key {
+            if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
                 return Err(ServerError::NoSuchUpload {
                     upload_id: upload_id.to_string(),
                 });
@@ -3450,15 +3466,17 @@ impl Coordinator {
         &self,
         req: &MultipartObjectRequest<'_>,
     ) -> Result<AuthorizedAbortMultipartUpload, ServerError> {
-        let bucket = req.object.bucket_name();
-        let key = req.object.key();
+        let bucket = req.object.bucket_name_typed();
+        let key = req.object.key_typed();
         let upload_id = req.upload_id;
         let bucket_info =
-            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
-        let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
+            self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
+        let meta_pg = self
+            .storage_node
+            .get_pg(self.object_pg_id_for(bucket, key))?;
         let authorized = match meta_pg.get_multipart_upload(upload_id) {
             Ok(upload) => {
-                if upload.bucket != bucket || upload.key != key {
+                if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
                     return Err(ServerError::NoSuchUpload {
                         upload_id: upload_id.to_string(),
                     });
@@ -3482,7 +3500,7 @@ impl Coordinator {
                         upload_id: upload_id.to_string(),
                     });
                 };
-                if completed.bucket != bucket || completed.key != key {
+                if completed.bucket != bucket.as_str() || completed.key != key.as_str() {
                     return Err(ServerError::NoSuchUpload {
                         upload_id: upload_id.to_string(),
                     });
@@ -3506,14 +3524,16 @@ impl Coordinator {
         &'a self,
         req: &ListPartsRequest<'_>,
     ) -> Result<AuthorizedListParts<'a>, ServerError> {
-        let bucket = req.upload.bucket_name();
-        let key = req.upload.key();
+        let bucket = req.upload.bucket_name_typed();
+        let key = req.upload.key_typed();
         let upload_id = req.upload.upload_id;
         let bucket_info =
-            self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
-        let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
+            self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
+        let meta_pg = self
+            .storage_node
+            .get_pg(self.object_pg_id_for(bucket, key))?;
         let upload = meta_pg.get_multipart_upload(upload_id)?;
-        if upload.bucket != bucket || upload.key != key {
+        if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
             return Err(ServerError::NoSuchUpload {
                 upload_id: upload_id.to_string(),
             });
@@ -3543,7 +3563,7 @@ impl Coordinator {
         &'a self,
         req: ObjectStateLoadRequest<'_>,
     ) -> Result<LoadedObjectState<'a>, ServerError> {
-        let fast_bucket_info = match self.storage_node.get_bucket_fast_path(req.bucket) {
+        let fast_bucket_info = match self.storage_node.get_bucket_fast_path(req.bucket.as_str()) {
             Some(info) if info.state == BucketState::Active => {
                 Some(Self::validate_expected_bucket_owner(
                     Self::bucket_summary_fast(info),
@@ -3571,11 +3591,11 @@ impl Coordinator {
             });
 
         if need_ordered_bucket_load {
-            let guards = self.lock_bucket_and_object_pgs(req.bucket, req.key)?;
+            let guards = self.lock_bucket_and_object_pgs_for(req.bucket, req.key)?;
             let bucket_info = match fast_bucket_info {
                 Some(bucket_info) => bucket_info,
                 None => Self::validate_expected_bucket_owner(
-                    self.load_active_bucket_summary_from_pg(guards.bucket(), req.bucket)?,
+                    self.load_active_bucket_summary_from_pg(guards.bucket(), req.bucket.as_str())?,
                     req.expected_bucket_owner,
                 )?,
             };
@@ -3587,14 +3607,14 @@ impl Coordinator {
             let can_discover_missing = req.missing_discovery.requester_can_discover_missing(
                 req.requester,
                 &bucket_info,
-                req.key,
+                req.key.as_str(),
                 req.version_id,
                 bucket_policy.as_deref(),
             )?;
             let record = match Self::lookup_object_record(
                 guards.object(),
-                req.bucket,
-                req.key,
+                req.bucket.as_str(),
+                req.key.as_str(),
                 req.version_id,
             ) {
                 Ok(record) => record,
@@ -3623,11 +3643,12 @@ impl Coordinator {
         let can_discover_missing = req.missing_discovery.requester_can_discover_missing(
             req.requester,
             &bucket_info,
-            req.key,
+            req.key.as_str(),
             req.version_id,
             bucket_policy.as_deref(),
         )?;
-        let locked = match self.lock_object_pgs_for_read(req.bucket, req.key, req.version_id) {
+        let locked = match self.lock_object_pgs_for_read_typed(req.bucket, req.key, req.version_id)
+        {
             Ok(locked) => locked,
             Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
                 if !can_discover_missing =>
@@ -3686,8 +3707,8 @@ impl Coordinator {
     fn authorize_object_read<'a>(
         &'a self,
         requester: &Requester,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: Option<VersionId>,
         expected_bucket_owner: Option<&str>,
         policy_action: auth::PolicyAction,
@@ -3733,8 +3754,8 @@ impl Coordinator {
     ) -> Result<LockedReadObject<'a>, ServerError> {
         let loaded = self.load_locked_object_state(ObjectStateLoadRequest {
             requester: object.object.requester(),
-            bucket: object.object.bucket_name(),
-            key: object.object.key(),
+            bucket: object.object.bucket_name_typed(),
+            key: object.object.key_typed(),
             version_id: object.version_id,
             expected_bucket_owner: object.expected_bucket_owner(),
             policy_requirement: ObjectBucketPolicyRequirement::Required,
@@ -3786,8 +3807,8 @@ impl Coordinator {
     fn authorize_object_acl_access<'a>(
         &'a self,
         requester: &Requester,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: Option<VersionId>,
         authorization: ObjectAclAuthorization<'_>,
         expected_bucket_owner: Option<&str>,
@@ -3826,8 +3847,8 @@ impl Coordinator {
     fn authorize_object_lock_access<'a>(
         &'a self,
         requester: &Requester,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         version_id: Option<VersionId>,
         policy_action: auth::PolicyAction,
         expected_bucket_owner: Option<&str>,
@@ -3852,8 +3873,8 @@ impl Coordinator {
     ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
         let locked = self.authorize_object_read(
             req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key(),
+            req.object.bucket_name_typed(),
+            req.object.key_typed(),
             req.object.version_id,
             req.expected_bucket_owner(),
             Self::get_object_policy_action(req.object.version_id),
@@ -3867,8 +3888,8 @@ impl Coordinator {
     ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
         let locked = self.authorize_object_read(
             req.object.requester(),
-            req.object.bucket_name(),
-            req.object.key(),
+            req.object.bucket_name_typed(),
+            req.object.key_typed(),
             req.object.version_id,
             req.expected_bucket_owner(),
             Self::get_object_policy_action(req.object.version_id),
@@ -3882,8 +3903,8 @@ impl Coordinator {
     ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
         let loaded = self.load_locked_object_state(ObjectStateLoadRequest {
             requester: req.object.requester(),
-            bucket: req.object.bucket_name(),
-            key: req.object.key(),
+            bucket: req.object.bucket_name_typed(),
+            key: req.object.key_typed(),
             version_id: req.object.version_id,
             expected_bucket_owner: req.expected_bucket_owner(),
             policy_requirement: ObjectBucketPolicyRequirement::Required,

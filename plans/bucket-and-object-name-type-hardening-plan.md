@@ -25,6 +25,12 @@ What has landed so far:
 6. PG routing now has explicit typed entry points for validated S3
    bucket/object names, while the separate internal shard namespace
    (`segment/...`, `mpu/...`) continues to use a distinct raw path.
+7. Generic bucket-scoped coordinator helpers such as active-bucket summary
+   loading and bucket write reservations now take typed `BucketName`
+   references rather than rediscovering raw strings from request wrappers.
+8. Object delete, object read/authz state loading, and multipart authz entry
+   points now use typed bucket/object PG routing and typed bucket-summary
+   helpers instead of the older raw-string coordinator helpers.
 
 What is still open before Phase 3 can be marked complete:
 
@@ -272,6 +278,9 @@ Current status:
 3. Partially complete:
    authz, PG selection, and the main object/multipart authorized-state path now
    preserve typed values much further downstream than before.
+   Bucket-scoped coordinator helper traits now expose typed bucket access, and
+   the raw read-lock and bucket-write-reservation helper variants that were
+   only serving older request shapes have been removed from the touched paths.
 4. Still open:
    storage-dispatch and many coordinator-internal helper APIs still accept raw
    `&str` bucket/key parameters.
@@ -279,6 +288,10 @@ Current status:
    the final Phase 3 answer on the failure model is only partly in place today.
    Typed PG entry points exist for validated S3 names, but raw helper entry
    points still remain for internal namespaces and older call paths.
+6. Still open:
+   `crates/storage/src/traits.rs` and `crates/storage/src/pg_store.rs` remain
+   predominantly raw-string bucket/key interfaces, so coordinator-to-storage
+   dispatch still has a large mixed typed/raw boundary.
 
 Exit criteria:
 
