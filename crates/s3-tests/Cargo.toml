@@ -16,14 +16,18 @@ observability = { path = "../observability" }
 s3-types = { path = "../s3-types" }
 
 # AWS SDK (independent S3 client for validation)
-aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls", "http-1x", "sigv4a"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "http-1x", "sigv4a"] }
 aws-credential-types = "1"
-aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
+aws-smithy-runtime-api = "1"
+aws-smithy-types = { version = "1", features = ["http-body-1-x"] }
 
 # Async runtime (required by AWS SDK)
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
 tokio-rustls = "0.26"
 rustls = { version = "0.23", features = ["ring"] }
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "ring", "tls12"] }
 
 # Test infrastructure
 tempfile = "3"

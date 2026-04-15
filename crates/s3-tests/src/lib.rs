@@ -1,4 +1,5 @@
 pub mod helpers;
+mod hyper_client;
 mod post_form;
 pub mod server;
 
@@ -24,7 +25,6 @@ use std::sync::LazyLock;
 
 use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
 use aws_sdk_s3::Client;
-use aws_smithy_http_client::tls::{rustls_provider::CryptoMode, Provider, TlsContext, TrustStore};
 use s3_types::is_legacy_create_bucket_region;
 use ureq::tls::{Certificate, RootCerts, TlsConfig, TlsProvider};
 
@@ -372,20 +372,7 @@ pub fn build_client_with_ca(
         .operation_attempt_timeout(timeout)
         .build();
 
-    let http_client = if endpoint.starts_with("https://") {
-        let mut builder =
-            aws_smithy_http_client::Builder::new().tls_provider(Provider::Rustls(CryptoMode::Ring));
-        if let Some(tls_ca_pem) = tls_ca_pem {
-            let tls_context = TlsContext::builder()
-                .with_trust_store(TrustStore::empty().with_pem_certificate(tls_ca_pem))
-                .build()
-                .expect("valid custom trust store");
-            builder = builder.tls_context(tls_context);
-        }
-        builder.build_https()
-    } else {
-        aws_smithy_http_client::Builder::new().build_http()
-    };
+    let http_client = hyper_client::TestHttpClient::new(tls_ca_pem);
 
     let mut s3_config = aws_sdk_s3::config::Builder::new()
         .behavior_version_latest()
