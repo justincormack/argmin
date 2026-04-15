@@ -1,0 +1,101 @@
+PCLMUL CRC loop uses out-of-bounds pointer arithmetic
+Link: https://chatgpt.com/codex/cloud/security/findings/ab2555b3a9c88191b7dd80f7a8ee27b6?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: ae442f5
+Author: justin@specialbusservice.com
+Created: 14/04/2026, 18:08:45
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced a memory-safety/UB risk in the new PCLMUL CRC64 loop by performing out-of-bounds pointer arithmetic in the loop condition.
+The added PCLMUL-accelerated CRC64 implementation uses `while ptr.add(128) <= end` to decide whether another 128‑byte block remains. When `ptr` is already equal to `end` (e.g., data lengths of exactly 128 bytes or multiples of 128), evaluating `ptr.add(128)` computes a pointer 128 bytes past the one‑past‑end boundary, which is undefined behavior in Rust even if it is not dereferenced. This is reachable with attacker‑controlled object sizes on x86_64 builds that enable the `pure-rust` feature and run on CPUs with `pclmulqdq`, potentially leading to crashes or miscompilation in the checksum path.
+
+Fixed in commit `99c70c1` (`Fix CRC64 pclmul pointer arithmetic UB`).
+The loop now tracks remaining bytes explicitly instead of probing
+`ptr.add(128)` in the loop condition, so it no longer forms out-of-bounds
+raw pointers during block iteration.
+
+# Validation
+## Rubric
+- [x] Exercise pclmul fast path with 128/256-byte inputs under pure-rust feature
+- [ ] Produce a crash or sanitizer/valgrind report confirming UB at runtime
+- [x] Attempt debugger tracing of the PoC
+- [x] Inspect loop condition for out-of-bounds pointer arithmetic UB
+- [x] Verify runtime/feature gating for reachability on x86_64 pclmul systems
+## Report
+Rubric-driven steps: (1) Built and ran a minimal PoC to hit the pclmul path on 128/256-byte inputs: `cargo run -p checksum --bin poc_crc64 --no-default-features --features pure-rust` produced `crc128=0xa5296136625de4f7` and `crc256=0xff71e21279d9966e` with no crash. (2) Attempted ASan: `RUSTFLAGS='-Zsanitizer=address' cargo run ...` failed because the available toolchains are stable only (error: option `Z` only accepted on nightly). (3) Valgrind not available (`valgrind: command not found`). (4) Debugger attempt with lldb ran the PoC without a crash (see artifacts/lldb_run.txt). (5) Code inspection confirms UB: in `extend_blocks_only` the loop condition `while ptr.add(128) <= end` computes `ptr.add(128)` even when `ptr == end`, which is 128 bytes past the one-past-end boundary, violating Rust’s pointer arithmetic rules even without dereference (crates/checksum/src/crc64.rs:242-270). This path is reachable on x86_64 with `pure-rust` + runtime `pclmulqdq` detection (`extend` chooses this path; crates/checksum/src/crc64.rs:230-239). Thus the reported UB risk is valid though it did not crash in this environment.
+
+# Evidence
+/workspace/argmin/crates/checksum/src/crc64.rs (L242 to 270)
+  Note: The loop condition computes `ptr.add(128)` even when `ptr == end`, which exceeds the one‑past‑end boundary and is undefined behavior.
+```
+    #[target_feature(enable = "pclmulqdq")]
+    unsafe fn extend_blocks_only(crc: u64, data: &[u8]) -> u64 {
+        let fold_1 = load_aligned(&FOLD_1);
+        let mut ptr = data.as_ptr();
+        let end = ptr.add(data.len());
+
+        let mut state = if data.len() >= 128 {
+            let fold_8 = load_aligned(&FOLD_8);
+            let mut x0 = xor_crc(load_block(ptr), !crc);
+            let mut x1 = load_block(ptr.add(16));
+            let mut x2 = load_block(ptr.add(32));
+            let mut x3 = load_block(ptr.add(48));
+            let mut x4 = load_block(ptr.add(64));
+            let mut x5 = load_block(ptr.add(80));
+            let mut x6 = load_block(ptr.add(96));
+            let mut x7 = load_block(ptr.add(112));
+            ptr = ptr.add(128);
+
+            while ptr.add(128) <= end {
+                x0 = fold_block(x0, load_block(ptr), fold_8);
+                x1 = fold_block(x1, load_block(ptr.add(16)), fold_8);
+                x2 = fold_block(x2, load_block(ptr.add(32)), fold_8);
+                x3 = fold_block(x3, load_block(ptr.add(48)), fold_8);
+                x4 = fold_block(x4, load_block(ptr.add(64)), fold_8);
+                x5 = fold_block(x5, load_block(ptr.add(80)), fold_8);
+                x6 = fold_block(x6, load_block(ptr.add(96)), fold_8);
+                x7 = fold_block(x7, load_block(ptr.add(112)), fold_8);
+                ptr = ptr.add(128);
+            }
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Original severity assumed a broadly reachable runtime issue. In practice, the UB is confined to the opt-in pure-rust build (README notes test-only), requires x86_64 pclmul, and no crash was demonstrated; the plausible impact is availability-only. These constraints reduce likelihood and impact to low.
+## Likelihood
+low - Requires a non-default pure-rust build and x86_64 pclmul hardware; deployments are described as test-only. Even then, only a potential UB/DoS was demonstrated without a crash.
+## Impact
+low - Undefined behavior in checksum computation could lead to crashes or miscompilation, primarily affecting availability; no crash was observed in validation and the path is limited to non-default builds.
+## Assumptions
+- Deployment is built with the non-default pure-rust CRC feature (e.g., --no-default-features --features pure-rust or pure-rust-crc).
+- The server runs on x86_64 hardware with pclmulqdq available so the PCLMUL fast path is selected.
+- Attacker can trigger CRC64 on object data by uploading/reading objects (authenticated or via public bucket ACL).
+- Build with pure-rust CRC feature enabled (non-default)
+- x86_64 CPU with pclmulqdq feature detected
+- CRC64 invoked on data length >=128 and multiple of 128
+- Attacker can read/write object data (auth or public bucket)
+## Path
+HTTP client -> ReadHandle::next_chunk/crc64.update -> crc64::extend_blocks_only (pclmul) -> UB/DoS
+## Path evidence
+- `crates/checksum/src/crc64.rs:242-270` - PCLMUL loop uses `while ptr.add(128) <= end`, which computes an out-of-bounds pointer when ptr == end.
+- `crates/checksum/src/crc64.rs:80-87` - The PCLMUL fast path is only used in the pure-rust build on x86_64 with pclmulqdq detected.
+- `crates/server-core/src/coordinator.rs:1600-1609` - Object reads stream data chunks and call crc64.update on bytes, making checksum reachable in runtime data paths.
+- `README.md:33-57` - Pure-rust build is described as test-only/non-production, reducing real-world exposure.
+- `crates/server-core/Cargo.toml:19-24` - Default features use ISA-L CRC; pure-rust CRC is an opt-in feature.
+- `crates/argmin-s3/src/config.rs:27-63` - Shows default listen address (127.0.0.1:9000) and env-sourced secrets/credentials.
+## Narrative
+The PCLMUL-accelerated CRC64 loop computes ptr.add(128) in the loop condition even when ptr == end, which is undefined behavior in Rust. This path is only selected when the pure-rust feature is enabled and the CPU supports pclmulqdq. The server’s runtime streams object data and updates a CRC64 hasher over attacker-controlled bytes, so the UB is reachable with object sizes that yield chunk lengths that are multiples of 128. The README explicitly labels pure-rust builds as test-only/non-production, and the provided validation PoC did not trigger a crash, so the practical impact is limited to potential availability issues in non-default builds.
+## Controls
+- SigV4 authentication for private buckets
+- Configurable max_connections/max_inflight_requests
+- Optional TLS when cert/key env vars are set
+## Blindspots
+- No runtime sanitizer or crash evidence in this environment; UB impact remains theoretical.
+- No deployment manifests/IaC to confirm whether pure-rust builds are used in production or exposed publicly.
