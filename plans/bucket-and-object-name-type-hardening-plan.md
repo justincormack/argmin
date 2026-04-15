@@ -294,11 +294,20 @@ Current status:
    The list fan-out paths now reuse typed buckets and parsed typed
    prefix/marker keys instead of rebuilding trusted names inside each PG query,
    and the streaming append/abort helper path now keeps typed bucket/key values
-   through PG routing and session binding as well. This pushes the remaining
+   through PG routing and session binding as well. Bucket-only coordinator
+   helpers such as bucket write reservations, delete-bucket drain/wait, active
+   bucket summary loading, and completed-multipart tombstone ordering now use
+   typed bucket names on their main path implementations rather than bouncing
+   through raw-string wrappers. The lifecycle sweep now also carries typed
+   bucket/object names from stored metadata through current-object expiration,
+   noncurrent-version expiration, and aborting-upload completion instead of
+   reconstructing trusted names at each operation. This pushes the remaining
    raw-string boundary outward toward the true ingress points.
 4. Still open:
-   storage-dispatch and many coordinator-internal helper APIs still accept raw
-   `&str` bucket/key parameters.
+   storage-dispatch and some older coordinator-internal helper APIs still
+   accept raw `&str` bucket/key parameters, especially around bucket creation /
+   existence helpers and a few compatibility wrappers that still sit above
+   typed PG entry points.
 5. Still open:
    the final Phase 3 answer on the failure model is only partly in place today.
    Typed PG entry points exist for validated S3 names, but raw helper entry

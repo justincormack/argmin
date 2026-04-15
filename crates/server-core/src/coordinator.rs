@@ -4014,7 +4014,7 @@ impl ReadRuntime {
                     stats.scanned_buckets += 1;
                 }
                 stats.aborted_multipart_uploads +=
-                    self.finish_aborting_multipart_uploads_for_bucket(bucket.as_str())?;
+                    self.finish_aborting_multipart_uploads_for_bucket(&bucket)?;
             }
 
             Ok::<(), ServerError>(())
@@ -4063,7 +4063,7 @@ impl ReadRuntime {
                     continue;
                 };
                 if expiration.expiry_time_millis <= now_millis {
-                    candidates.push((record.key.to_string(), record.version_id));
+                    candidates.push((record.key, record.version_id));
                 }
             }
 
@@ -4071,12 +4071,7 @@ impl ReadRuntime {
         })?;
 
         for (key, version_id) in candidates {
-            if self.expire_current_object_if_due(
-                bucket_info.name.as_str(),
-                &key,
-                version_id,
-                now_millis,
-            )? {
+            if self.expire_current_object_if_due(&bucket_info.name, &key, version_id, now_millis)? {
                 stats.expired_current_objects += 1;
             }
         }
@@ -4086,13 +4081,13 @@ impl ReadRuntime {
 
     fn finish_aborting_multipart_uploads_for_bucket(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
     ) -> Result<u64, ServerError> {
         let mut candidates = Vec::new();
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
             let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: trusted_bucket_name(bucket),
+                bucket: bucket.clone(),
                 prefix: None,
                 key_marker: None,
                 upload_id_marker: None,
@@ -4102,7 +4097,7 @@ impl ReadRuntime {
 
             for upload in uploads.uploads {
                 if upload.state == UploadState::Aborting {
-                    candidates.push((upload.key.to_string(), upload.upload_id.to_string()));
+                    candidates.push((upload.key, upload.upload_id.to_string()));
                 }
             }
 
@@ -4111,7 +4106,7 @@ impl ReadRuntime {
 
         let mut finished = 0u64;
         for (key, upload_id) in candidates {
-            if self.abort_multipart_upload_internal(bucket, &key, &upload_id)? {
+            if self.abort_multipart_upload_internal_for(bucket, &key, &upload_id)? {
                 finished += 1;
             }
         }
@@ -4142,10 +4137,10 @@ impl ReadRuntime {
 
             let mut group_start = 0usize;
             while group_start < versions.versions.len() {
-                let key = versions.versions[group_start].key().to_string();
+                let key = versions.versions[group_start].key().clone();
                 let mut group_end = group_start + 1;
                 while group_end < versions.versions.len()
-                    && versions.versions[group_end].key().as_str() == key
+                    && versions.versions[group_end].key() == &key
                 {
                     group_end += 1;
                 }
@@ -4166,11 +4161,8 @@ impl ReadRuntime {
         })?;
 
         for key in candidate_keys {
-            stats.expired_noncurrent_versions += self.expire_noncurrent_versions_if_due(
-                bucket_info.name.as_str(),
-                &key,
-                now_millis,
-            )?;
+            stats.expired_noncurrent_versions +=
+                self.expire_noncurrent_versions_if_due(&bucket_info.name, &key, now_millis)?;
         }
 
         Ok(())
@@ -4178,16 +4170,16 @@ impl ReadRuntime {
 
     fn expire_current_object_if_due(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         expected_version_id: VersionId,
         now_millis: u64,
     ) -> Result<bool, ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(bucket);
+        let _bucket_guard = self.storage_node.lock_bucket(bucket.as_str());
         let bucket_pg = self
             .storage_node
-            .get_pg(self.pg_topology.bucket_pg(bucket))?;
-        let bucket_info = match bucket_pg.head_bucket(bucket) {
+            .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
+        let bucket_info = match bucket_pg.head_bucket(bucket.as_str()) {
             Ok(info) => info,
             Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4200,8 +4192,8 @@ impl ReadRuntime {
 
         let meta_pg = self
             .storage_node
-            .get_pg(self.pg_topology.object_pg(bucket, key))?;
-        let stored = match meta_pg.get_object_meta(bucket, key) {
+            .get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let stored = match meta_pg.get_object_meta(bucket.as_str(), key.as_str()) {
             Ok(stored) => stored,
             Err(storage::MetadataError::ObjectNotFound) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4236,50 +4228,41 @@ impl ReadRuntime {
             bucket_info.owner_canonical_id.clone(),
         );
         let reclaim = match bucket_info.versioning {
-            BucketVersioningState::Disabled => Coordinator::permanently_delete_live_object_locked(
-                &meta_pg,
-                &trusted_bucket_name(bucket),
-                &trusted_object_key(key),
-                &record,
-            )?,
+            BucketVersioningState::Disabled => {
+                Coordinator::permanently_delete_live_object_locked(&meta_pg, bucket, key, &record)?
+            }
             BucketVersioningState::Enabled => {
-                let marker_vid = meta_pg.next_version_id(bucket, key)?;
-                Coordinator::put_delete_marker_locked(
-                    &meta_pg,
-                    &trusted_bucket_name(bucket),
-                    &trusted_object_key(key),
-                    marker_vid,
-                    owner,
-                )?;
+                let marker_vid = meta_pg.next_version_id(bucket.as_str(), key.as_str())?;
+                Coordinator::put_delete_marker_locked(&meta_pg, bucket, key, marker_vid, owner)?;
                 None
             }
             BucketVersioningState::Suspended => Coordinator::expire_current_live_suspended_locked(
-                &meta_pg,
-                &trusted_bucket_name(bucket),
-                &trusted_object_key(key),
-                &record,
-                owner,
+                &meta_pg, bucket, key, &record, owner,
             )?,
         };
 
         drop(meta_pg);
         if let Some(reclaim) = reclaim {
-            self.enqueue_object_payload_reclaim(bucket, key, reclaim.generation_id);
+            self.enqueue_object_payload_reclaim(
+                bucket.as_str(),
+                key.as_str(),
+                reclaim.generation_id,
+            );
         }
         Ok(true)
     }
 
     fn expire_noncurrent_versions_if_due(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         now_millis: u64,
     ) -> Result<u64, ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(bucket);
+        let _bucket_guard = self.storage_node.lock_bucket(bucket.as_str());
         let bucket_pg = self
             .storage_node
-            .get_pg(self.pg_topology.bucket_pg(bucket))?;
-        let bucket_info = match bucket_pg.head_bucket(bucket) {
+            .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
+        let bucket_info = match bucket_pg.head_bucket(bucket.as_str()) {
             Ok(info) => info,
             Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(0),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4292,8 +4275,8 @@ impl ReadRuntime {
 
         let meta_pg = self
             .storage_node
-            .get_pg(self.pg_topology.object_pg(bucket, key))?;
-        let versions = meta_pg.list_object_versions_for_key(bucket, key)?;
+            .get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let versions = meta_pg.list_object_versions_for_key(bucket.as_str(), key.as_str())?;
         let due_versions = Coordinator::evaluate_due_noncurrent_version_expirations(
             &config, &versions, now_millis,
         )?;
@@ -4327,12 +4310,9 @@ impl ReadRuntime {
                 continue;
             }
 
-            if let Some(reclaim) = Coordinator::permanently_delete_live_object_locked(
-                &meta_pg,
-                &trusted_bucket_name(bucket),
-                &trusted_object_key(key),
-                &record,
-            )? {
+            if let Some(reclaim) =
+                Coordinator::permanently_delete_live_object_locked(&meta_pg, bucket, key, &record)?
+            {
                 reclaims.push(reclaim);
             }
             deleted += 1;
@@ -4340,7 +4320,11 @@ impl ReadRuntime {
 
         drop(meta_pg);
         for reclaim in reclaims {
-            self.enqueue_object_payload_reclaim(bucket, key, reclaim.generation_id);
+            self.enqueue_object_payload_reclaim(
+                bucket.as_str(),
+                key.as_str(),
+                reclaim.generation_id,
+            );
         }
 
         Ok(deleted)
@@ -4483,7 +4467,7 @@ impl ReadRuntime {
                     continue;
                 };
                 if headers.abort_time_millis <= now_millis {
-                    candidates.push((upload.key.to_string(), upload.upload_id.to_string()));
+                    candidates.push((upload.key, upload.upload_id.to_string()));
                 }
             }
 
@@ -4492,7 +4476,7 @@ impl ReadRuntime {
 
         for (key, upload_id) in candidates {
             if self.abort_multipart_upload_if_due(
-                bucket_info.name.as_str(),
+                &bucket_info.name,
                 &key,
                 &upload_id,
                 now_millis,
@@ -4506,36 +4490,36 @@ impl ReadRuntime {
 
     fn abort_multipart_upload_if_due(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         upload_id: &str,
         now_millis: u64,
     ) -> Result<bool, ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(bucket);
+        let _bucket_guard = self.storage_node.lock_bucket(bucket.as_str());
         let bucket_pg = self
             .storage_node
-            .get_pg(self.pg_topology.bucket_pg(bucket))?;
-        let bucket_info = match bucket_pg.head_bucket(bucket) {
+            .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
+        let bucket_info = match bucket_pg.head_bucket(bucket.as_str()) {
             Ok(info) => info,
             Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
         };
         drop(bucket_pg);
 
-        let meta_pg_id = self.pg_topology.object_pg(bucket, key);
+        let meta_pg_id = self.pg_topology.object_pg_for(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
         let upload = match meta_pg.get_multipart_upload(upload_id) {
             Ok(upload) => upload,
             Err(storage::MetadataError::NoSuchUpload { .. }) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
         };
-        if upload.bucket != bucket || upload.key != key {
+        if upload.bucket != *bucket || upload.key != *key {
             return Ok(false);
         }
 
         if upload.state == UploadState::Aborting {
             drop(meta_pg);
-            return self.abort_multipart_upload_internal(bucket, key, upload_id);
+            return self.abort_multipart_upload_internal_for(bucket, key, upload_id);
         }
         if upload.state != UploadState::InProgress {
             return Ok(false);
@@ -4557,7 +4541,7 @@ impl ReadRuntime {
         }
 
         drop(meta_pg);
-        self.abort_multipart_upload_internal(bucket, key, upload_id)
+        self.abort_multipart_upload_internal_for(bucket, key, upload_id)
     }
 
     fn abort_multipart_upload_internal(
@@ -4566,7 +4550,20 @@ impl ReadRuntime {
         key: &str,
         upload_id: &str,
     ) -> Result<bool, ServerError> {
-        let meta_pg_id = self.pg_topology.object_pg(bucket, key);
+        self.abort_multipart_upload_internal_for(
+            &trusted_bucket_name(bucket),
+            &trusted_object_key(key),
+            upload_id,
+        )
+    }
+
+    fn abort_multipart_upload_internal_for(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &str,
+    ) -> Result<bool, ServerError> {
+        let meta_pg_id = self.pg_topology.object_pg_for(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
 
         let upload = match meta_pg.get_multipart_upload(upload_id) {
@@ -4574,7 +4571,7 @@ impl ReadRuntime {
             Err(storage::MetadataError::NoSuchUpload { .. }) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
         };
-        if upload.bucket != bucket || upload.key != key {
+        if upload.bucket != *bucket || upload.key != *key {
             return Ok(false);
         }
 
@@ -5775,13 +5772,13 @@ impl Coordinator {
         self.authorize_put_object_write(req)
     }
 
-    fn unchecked_bucket_write_reservation(
+    fn unchecked_bucket_write_reservation_for(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
     ) -> Result<BucketSummary, ServerError> {
         loop {
-            let bucket_pg = self.get_bucket_pg(bucket)?;
-            match bucket_pg.acquire_bucket_write_reservation(bucket) {
+            let bucket_pg = self.get_bucket_pg_for(bucket)?;
+            match bucket_pg.acquire_bucket_write_reservation(bucket.as_str()) {
                 Ok(info) => {
                     self.storage_node.upsert_bucket_fast_path((&info).into());
                     return Ok(Self::bucket_summary(info));
@@ -5800,27 +5797,16 @@ impl Coordinator {
         }
     }
 
-    fn unchecked_bucket_write_reservation_for(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<BucketSummary, ServerError> {
-        self.unchecked_bucket_write_reservation(bucket.as_str())
-    }
-
-    fn release_bucket_write_reservation(&self, bucket: &str) -> Result<(), ServerError> {
-        let bucket_pg = self.get_bucket_pg(bucket)?;
+    fn release_bucket_write_reservation_for(&self, bucket: &BucketName) -> Result<(), ServerError> {
+        let bucket_pg = self.get_bucket_pg_for(bucket)?;
         bucket_pg
-            .release_bucket_write_reservation(bucket)
+            .release_bucket_write_reservation(bucket.as_str())
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
                 },
                 other => ServerError::Metadata(other),
             })
-    }
-
-    fn release_bucket_write_reservation_for(&self, bucket: &BucketName) -> Result<(), ServerError> {
-        self.release_bucket_write_reservation(bucket.as_str())
     }
 
     fn with_unchecked_bucket_write_reservation_for<T>(
@@ -5855,13 +5841,13 @@ impl Coordinator {
         })
     }
 
-    fn next_completed_multipart_upload_order_for_bucket(
+    fn next_completed_multipart_upload_order_for_bucket_name(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
     ) -> Result<u64, ServerError> {
-        let bucket_pg = self.get_bucket_pg(bucket)?;
+        let bucket_pg = self.get_bucket_pg_for(bucket)?;
         bucket_pg
-            .next_completed_multipart_upload_order_for_bucket(bucket)
+            .next_completed_multipart_upload_order_for_bucket(bucket.as_str())
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -5904,10 +5890,10 @@ impl Coordinator {
         Ok(())
     }
 
-    fn begin_bucket_write_drain(&self, bucket: &str) -> Result<(), ServerError> {
+    fn begin_bucket_write_drain_for(&self, bucket: &BucketName) -> Result<(), ServerError> {
         loop {
-            let bucket_pg = self.get_bucket_pg(bucket)?;
-            match bucket_pg.begin_bucket_write_drain(bucket) {
+            let bucket_pg = self.get_bucket_pg_for(bucket)?;
+            match bucket_pg.begin_bucket_write_drain(bucket.as_str()) {
                 Ok(()) => return Ok(()),
                 Err(storage::MetadataError::BucketWriteDraining) => {
                     drop(bucket_pg);
@@ -5923,15 +5909,22 @@ impl Coordinator {
         }
     }
 
-    fn wait_for_bucket_write_reservations_to_drain(&self, bucket: &str) -> Result<(), ServerError> {
+    fn wait_for_bucket_write_reservations_to_drain_for(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), ServerError> {
         loop {
-            let bucket_pg = self.get_bucket_pg(bucket)?;
-            let info = bucket_pg.head_bucket_raw(bucket).map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+            let bucket_pg = self.get_bucket_pg_for(bucket)?;
+            let info = bucket_pg
+                .head_bucket(bucket.as_str())
+                .map_err(|e| match e {
+                    storage::MetadataError::BucketNotFound { name } => {
+                        ServerError::BucketNotFound {
+                            name: name.to_string(),
+                        }
+                    }
+                    other => ServerError::Metadata(other),
+                })?;
             if info.active_write_reservations == 0 {
                 return Ok(());
             }
@@ -6006,18 +5999,17 @@ impl Coordinator {
         &self,
         name: &BucketName,
     ) -> Result<BucketSummary, ServerError> {
-        self.unchecked_active_bucket_summary(name.as_str())
-    }
+        if let Some(info) = self.storage_node.get_bucket_fast_path(name.as_str()) {
+            if info.state == BucketState::Active {
+                return Ok(Self::bucket_summary_fast(info));
+            }
+            return Err(ServerError::BucketNotFound {
+                name: name.to_string(),
+            });
+        }
 
-    fn checked_active_bucket_summary(
-        &self,
-        name: &str,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<ValidatedBucket, ServerError> {
-        Self::validate_expected_bucket_owner(
-            self.unchecked_active_bucket_summary(name)?,
-            expected_bucket_owner,
-        )
+        let bucket_pg = self.get_bucket_pg_for(name)?;
+        self.load_active_bucket_summary_from_pg(&bucket_pg, name.as_str())
     }
 
     fn checked_active_bucket_summary_for(
@@ -6310,7 +6302,8 @@ impl Coordinator {
                 {
                     return Err(ServerError::BucketAlreadyOwnedByYou);
                 }
-                let existing = self.unchecked_active_bucket_summary(&authorized.name)?;
+                let existing = self
+                    .unchecked_active_bucket_summary_for(&trusted_bucket_name(&authorized.name))?;
                 let authorized_acl = self.resolve_create_bucket_recreate_acl_update(
                     &existing,
                     &authorized.owner,
@@ -6499,11 +6492,11 @@ impl Coordinator {
             req.name
         );
         let AuthorizedDeleteBucket { name } = self.authorize_delete_bucket(req)?;
-        self.begin_bucket_write_drain(name.as_str())?;
+        self.begin_bucket_write_drain_for(&name)?;
 
         let mut marked_deleting = false;
         let result = (|| {
-            self.wait_for_bucket_write_reservations_to_drain(name.as_str())?;
+            self.wait_for_bucket_write_reservations_to_drain_for(&name)?;
 
             // Check emptiness: list all object versions (including delete markers),
             // multipart uploads, and in-progress stream sessions across all PGs.
@@ -10621,8 +10614,10 @@ impl Coordinator {
             );
             drop(pgs);
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                let lifecycle_bucket =
-                    self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                let lifecycle_bucket = self.checked_active_bucket_summary_for(
+                    req.object.bucket_name_typed(),
+                    req.expected_bucket_owner(),
+                )?;
                 self.current_object_lifecycle_expiration(
                     &lifecycle_bucket,
                     key,
@@ -10688,8 +10683,10 @@ impl Coordinator {
                 body
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                let lifecycle_bucket =
-                    self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                let lifecycle_bucket = self.checked_active_bucket_summary_for(
+                    req.object.bucket_name_typed(),
+                    req.expected_bucket_owner(),
+                )?;
                 self.current_object_lifecycle_expiration(
                     &lifecycle_bucket,
                     key,
@@ -10840,8 +10837,10 @@ impl Coordinator {
             );
             drop(pgs);
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                let lifecycle_bucket =
-                    self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                let lifecycle_bucket = self.checked_active_bucket_summary_for(
+                    req.object.bucket_name_typed(),
+                    req.expected_bucket_owner(),
+                )?;
                 self.current_object_lifecycle_expiration(
                     &lifecycle_bucket,
                     key,
@@ -10909,8 +10908,10 @@ impl Coordinator {
                 body
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                let lifecycle_bucket =
-                    self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                let lifecycle_bucket = self.checked_active_bucket_summary_for(
+                    req.object.bucket_name_typed(),
+                    req.expected_bucket_owner(),
+                )?;
                 self.current_object_lifecycle_expiration(
                     &lifecycle_bucket,
                     key,
@@ -11017,8 +11018,10 @@ impl Coordinator {
                 .map_err(ServerError::Metadata)?;
             drop(pgs);
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                let lifecycle_bucket =
-                    self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                let lifecycle_bucket = self.checked_active_bucket_summary_for(
+                    req.object.bucket_name_typed(),
+                    req.expected_bucket_owner(),
+                )?;
                 self.current_object_lifecycle_expiration(
                     &lifecycle_bucket,
                     key,
@@ -11087,8 +11090,10 @@ impl Coordinator {
             }
             drop(pgs);
             let lifecycle_expiration = if emit_lifecycle_expiration {
-                let lifecycle_bucket =
-                    self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
+                let lifecycle_bucket = self.checked_active_bucket_summary_for(
+                    req.object.bucket_name_typed(),
+                    req.expected_bucket_owner(),
+                )?;
                 self.current_object_lifecycle_expiration(
                     &lifecycle_bucket,
                     key,
@@ -11183,8 +11188,10 @@ impl Coordinator {
         )?;
         drop(pgs);
         let lifecycle_expiration = if emit_lifecycle_expiration {
-            let lifecycle_bucket =
-                self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
+            let lifecycle_bucket = self.checked_active_bucket_summary_for(
+                req.object.bucket_name_typed(),
+                req.expected_bucket_owner(),
+            )?;
             self.current_object_lifecycle_expiration(
                 &lifecycle_bucket,
                 key,
@@ -11530,8 +11537,10 @@ impl Coordinator {
             (metadata, system_metadata, body)
         };
         let lifecycle_expiration = if emit_lifecycle_expiration {
-            let lifecycle_bucket =
-                self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
+            let lifecycle_bucket = self.checked_active_bucket_summary_for(
+                req.object.bucket_name_typed(),
+                req.expected_bucket_owner(),
+            )?;
             self.current_object_lifecycle_expiration(
                 &lifecycle_bucket,
                 key,
@@ -12224,9 +12233,11 @@ impl Coordinator {
             req.entries.len(),
             req.bypass_governance
         );
-        let bucket = req.bucket.name();
         let entries = req.entries;
-        self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
+        self.checked_active_bucket_summary_for(
+            req.bucket.name_typed(),
+            req.expected_bucket_owner(),
+        )?;
 
         let mut deleted = Vec::new();
         let mut errors = Vec::new();
@@ -12632,7 +12643,7 @@ impl Coordinator {
             .storage_node
             .lock_multipart_completion_bucket(bucket.as_str());
         let completion_order =
-            self.next_completed_multipart_upload_order_for_bucket(bucket.as_str())?;
+            self.next_completed_multipart_upload_order_for_bucket_name(&bucket)?;
         let meta_pg_id = self.object_pg_id_for(&bucket, &key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
         let current_upload = meta_pg.get_multipart_upload(upload_id.as_str())?;
@@ -17386,7 +17397,12 @@ mod tests {
 
         assert!(!coord
             .read_runtime()
-            .abort_multipart_upload_if_due("bucket", "logs/app", &upload.upload_id, deadline)
+            .abort_multipart_upload_if_due(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("logs/app"),
+                &upload.upload_id,
+                deadline,
+            )
             .unwrap());
 
         let meta_pg = coord
