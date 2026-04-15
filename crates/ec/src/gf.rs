@@ -51,6 +51,7 @@ const fn build_inv_table(mul_table: &[u8; GF_TABLE_SIZE]) -> [u8; 256] {
     table
 }
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const fn build_all_nibble_tables() -> [[u8; 32]; 256] {
     let mut tables = [[0u8; 32]; 256];
     let mut coeff = 0usize;
@@ -110,6 +111,7 @@ pub(crate) fn build_mul_tables(coefficients: &[u8]) -> Vec<u8> {
     tables
 }
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) fn build_nibble_tables(coefficients: &[u8]) -> Vec<u8> {
     let mut tables = vec![0u8; coefficients.len() * 32];
     for (index, &coefficient) in coefficients.iter().enumerate() {
@@ -120,6 +122,7 @@ pub(crate) fn build_nibble_tables(coefficients: &[u8]) -> Vec<u8> {
     tables
 }
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 fn build_nibble_table(coeff: u8) -> [u8; 32] {
     let full = gf_mul_table(coeff);
     let mut table = [0u8; 32];

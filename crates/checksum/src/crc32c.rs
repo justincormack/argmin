@@ -77,6 +77,7 @@ fn read_u32_le(ptr: *const u8) -> u32 {
     unsafe { u32::from_le(ptr.cast::<u32>().read_unaligned()) }
 }
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[inline]
 fn read_u64_le(ptr: *const u8) -> u64 {
     // SAFETY: callers only pass pointers proven to be valid for at least
