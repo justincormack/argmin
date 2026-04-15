@@ -215,8 +215,8 @@ pub struct PreparedStreamPut {
 
 #[derive(Debug)]
 pub struct AuthorizedPutObjectWrite {
-    bucket: String,
-    key: String,
+    bucket: BucketName,
+    key: ObjectKey,
     requester: Requester,
     expected_bucket_owner: Option<String>,
     acl: AuthorizedPutObjectWriteAcl,
@@ -418,8 +418,8 @@ struct AuthorizedCopyObject<'a> {
 #[derive(Debug)]
 struct AuthorizedCreateMultipartUpload {
     bucket_info: BucketSummary,
-    bucket: String,
-    key: String,
+    bucket: BucketName,
+    key: ObjectKey,
     tags: Option<String>,
     checksum: Option<MultipartChecksumConfig>,
     initiator: Option<OwnerIdentity>,
@@ -431,8 +431,8 @@ struct AuthorizedCreateMultipartUpload {
 }
 
 struct AuthorizedBeginStreamPart<'a> {
-    bucket: String,
-    key: String,
+    bucket: BucketName,
+    key: ObjectKey,
     upload_id: String,
     part_number: u32,
     upload: MultipartUploadRecord,
@@ -442,8 +442,8 @@ struct AuthorizedBeginStreamPart<'a> {
 
 #[derive(Debug)]
 struct AuthorizedMultipartPartWrite {
-    bucket: String,
-    key: String,
+    bucket: BucketName,
+    key: ObjectKey,
     upload_id: String,
     part_number: u32,
     upload: MultipartUploadRecord,
@@ -458,8 +458,8 @@ struct AuthorizedUploadPartCopy<'a> {
 #[derive(Debug)]
 struct AuthorizedCompleteMultipartUpload {
     bucket_info: BucketSummary,
-    bucket: String,
-    key: String,
+    bucket: BucketName,
+    key: ObjectKey,
     upload_id: String,
     upload: MultipartUploadRecord,
     multipart_write_encryption: ActiveWriteEncryption,
@@ -468,8 +468,8 @@ struct AuthorizedCompleteMultipartUpload {
 #[derive(Debug)]
 enum AuthorizedAbortMultipartUpload {
     InProgress {
-        bucket: String,
-        key: String,
+        bucket: BucketName,
+        key: ObjectKey,
         upload_id: String,
     },
     Completed,
@@ -477,7 +477,7 @@ enum AuthorizedAbortMultipartUpload {
 
 struct AuthorizedListParts<'a> {
     bucket_info: BucketSummary,
-    key: String,
+    key: ObjectKey,
     upload: MultipartUploadRecord,
     meta_pg: MutexGuard<'a, storage::PgStore>,
 }
@@ -494,7 +494,7 @@ struct AuthorizedListObjectVersions {
 
 #[derive(Debug)]
 struct AuthorizedListMultipartUploads {
-    bucket: String,
+    bucket: BucketName,
 }
 
 #[derive(Debug)]
@@ -505,8 +505,8 @@ struct AuthorizedListBuckets {
 enum AuthorizedDeleteObject<'a> {
     UnversionedMissing,
     UnversionedStored {
-        bucket: String,
-        key: String,
+        bucket: BucketName,
+        key: ObjectKey,
         stored: StoredObject,
         pgs: ObjectPgGuards<'a>,
     },
@@ -514,15 +514,15 @@ enum AuthorizedDeleteObject<'a> {
         version_id: VersionId,
     },
     SpecificVersionStored {
-        bucket: String,
-        key: String,
+        bucket: BucketName,
+        key: ObjectKey,
         version_id: VersionId,
         stored: StoredObject,
         pgs: ObjectPgGuards<'a>,
     },
     CurrentDeleteMarkerInsert {
-        bucket: String,
-        key: String,
+        bucket: BucketName,
+        key: ObjectKey,
         owner: OwnerIdentity,
         current: Option<LockedReadObject<'a>>,
     },
@@ -718,10 +718,18 @@ impl AuthorizedPutObjectWriteAcl {
 
 impl AuthorizedPutObjectWrite {
     fn bucket(&self) -> &str {
-        &self.bucket
+        self.bucket.as_str()
     }
 
     fn key(&self) -> &str {
+        self.key.as_str()
+    }
+
+    pub fn bucket_typed(&self) -> &BucketName {
+        &self.bucket
+    }
+
+    pub fn key_typed(&self) -> &ObjectKey {
         &self.key
     }
 
@@ -2373,7 +2381,7 @@ pub struct ListBucketsRequest {
 /// Request for a bucket-scoped operation.
 #[derive(Debug)]
 pub struct BucketRequest<'a> {
-    pub name: &'a str,
+    pub name: BucketName,
     pub requester: Requester,
     expected_bucket_owner: Option<&'a str>,
 }
@@ -2382,7 +2390,7 @@ pub struct BucketRequest<'a> {
 #[derive(Debug)]
 pub struct ObjectRequest<'a> {
     pub bucket: BucketRequest<'a>,
-    pub key: &'a str,
+    pub key: ObjectKey,
 }
 
 /// Request for a bucket-scoped string configuration operation.
@@ -2851,8 +2859,8 @@ pub struct ListMultipartUploadsRequest<'a> {
 /// A single entry in a batch-delete request, with an already-parsed version ID
 /// and any per-object conditional delete settings from the XML body.
 #[derive(Debug)]
-pub struct DeleteEntry<'a> {
-    pub key: &'a str,
+pub struct DeleteEntry {
+    pub key: ObjectKey,
     pub version_id: Option<VersionId>,
     pub cond: DeleteCondition,
 }
@@ -2861,7 +2869,7 @@ pub struct DeleteEntry<'a> {
 #[derive(Debug)]
 pub struct DeleteObjectsRequest<'a> {
     pub bucket: BucketRequest<'a>,
-    pub entries: &'a [DeleteEntry<'a>],
+    pub entries: &'a [DeleteEntry],
     pub bypass_governance: bool,
 }
 
@@ -2913,8 +2921,8 @@ pub struct BeginStreamPartRequest<'a> {
 /// Parsed request for appending plaintext to a streaming UploadPart session.
 #[derive(Debug)]
 pub struct AppendStreamPartRequest<'a> {
-    pub bucket: &'a str,
-    pub key: &'a str,
+    pub bucket: BucketName,
+    pub key: ObjectKey,
     pub session_id: &'a str,
     pub part_number: u32,
     pub segment_index: u32,
@@ -2936,7 +2944,7 @@ trait BucketScopedAuthorizationRequest: BucketScopedRequest {
 
 impl<'a> BucketRequest<'a> {
     pub fn new(
-        name: &'a str,
+        name: BucketName,
         requester: Requester,
         expected_bucket_owner: Option<&'a str>,
     ) -> Self {
@@ -2947,8 +2955,12 @@ impl<'a> BucketRequest<'a> {
         }
     }
 
-    pub fn name(&self) -> &'a str {
-        self.name
+    pub fn name(&self) -> &str {
+        self.name.as_str()
+    }
+
+    pub fn name_typed(&self) -> &BucketName {
+        &self.name
     }
 
     pub fn requester(&self) -> &Requester {
@@ -2980,8 +2992,8 @@ impl BucketScopedAuthorizationRequest for BucketRequest<'_> {
 
 impl<'a> ObjectRequest<'a> {
     pub fn new(
-        bucket: &'a str,
-        key: &'a str,
+        bucket: BucketName,
+        key: ObjectKey,
         requester: Requester,
         expected_bucket_owner: Option<&'a str>,
     ) -> Self {
@@ -2991,7 +3003,7 @@ impl<'a> ObjectRequest<'a> {
         }
     }
 
-    pub fn from_bucket(bucket: BucketRequest<'a>, key: &'a str) -> Self {
+    pub fn from_bucket(bucket: BucketRequest<'a>, key: ObjectKey) -> Self {
         Self { bucket, key }
     }
 
@@ -2999,12 +3011,16 @@ impl<'a> ObjectRequest<'a> {
         &self.bucket
     }
 
-    pub fn bucket_name(&self) -> &'a str {
+    pub fn bucket_name(&self) -> &str {
         self.bucket.name()
     }
 
-    pub fn key(&self) -> &'a str {
-        self.key
+    pub fn key(&self) -> &str {
+        self.key.as_str()
+    }
+
+    pub fn key_typed(&self) -> &ObjectKey {
+        &self.key
     }
 
     pub fn requester(&self) -> &Requester {
@@ -3036,8 +3052,8 @@ impl BucketScopedAuthorizationRequest for ObjectRequest<'_> {
 
 impl<'a> ObjectVersionRequest<'a> {
     pub fn new(
-        bucket: &'a str,
-        key: &'a str,
+        bucket: BucketName,
+        key: ObjectKey,
         version_id: Option<VersionId>,
         requester: Requester,
         expected_bucket_owner: Option<&'a str>,
@@ -3060,12 +3076,20 @@ impl<'a> ObjectVersionRequest<'a> {
         self.object.bucket()
     }
 
-    pub fn bucket_name(&self) -> &'a str {
+    pub fn bucket_name(&self) -> &str {
         self.object.bucket_name()
     }
 
-    pub fn key(&self) -> &'a str {
+    pub fn bucket_name_typed(&self) -> &BucketName {
+        self.object.bucket.name_typed()
+    }
+
+    pub fn key(&self) -> &str {
         self.object.key()
+    }
+
+    pub fn key_typed(&self) -> &ObjectKey {
+        self.object.key_typed()
     }
 
     pub fn version_id(&self) -> Option<VersionId> {
@@ -3101,8 +3125,8 @@ impl BucketScopedAuthorizationRequest for ObjectVersionRequest<'_> {
 
 impl<'a> MultipartObjectRequest<'a> {
     pub fn new(
-        bucket: &'a str,
-        key: &'a str,
+        bucket: BucketName,
+        key: ObjectKey,
         upload_id: &'a str,
         requester: Requester,
         expected_bucket_owner: Option<&'a str>,
@@ -3125,12 +3149,20 @@ impl<'a> MultipartObjectRequest<'a> {
         self.object.bucket()
     }
 
-    pub fn bucket_name(&self) -> &'a str {
+    pub fn bucket_name(&self) -> &str {
         self.object.bucket_name()
     }
 
-    pub fn key(&self) -> &'a str {
+    pub fn bucket_name_typed(&self) -> &BucketName {
+        self.object.bucket.name_typed()
+    }
+
+    pub fn key(&self) -> &str {
         self.object.key()
+    }
+
+    pub fn key_typed(&self) -> &ObjectKey {
+        self.object.key_typed()
     }
 
     pub fn upload_id(&self) -> &'a str {
@@ -4548,8 +4580,8 @@ impl ReadRuntime {
                 continue;
             }
             let shard_pg_id = self.pg_topology.shard_pg(
-                &format!("mpu/{upload_id}"),
-                &format!("{}/{}", part.part_number, part.generation),
+                format!("mpu/{upload_id}"),
+                format!("{}/{}", part.part_number, part.generation),
                 part.part_vid.get(),
             );
             if let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) {
@@ -5688,8 +5720,6 @@ impl Coordinator {
         &self,
         authorized: &AuthorizedPutObjectWrite,
     ) -> Result<String, ServerError> {
-        let bucket = authorized.bucket();
-        let key = authorized.key();
         let stored_encryption = authorized.write_encryption.object_encryption();
 
         let rng = ring::rand::SystemRandom::new();
@@ -5705,12 +5735,12 @@ impl Coordinator {
             s
         });
 
-        let meta_pg_id = self.object_pg_id(bucket, key);
+        let meta_pg_id = self.object_pg_id_for(authorized.bucket_typed(), authorized.key_typed());
         let pg = self.storage_node.get_pg(meta_pg_id)?;
         pg.create_stream_upload(&CreateStreamUploadReq {
             session_id: SessionId::from(session_id.as_str()),
-            bucket: trusted_bucket_name(bucket),
-            key: trusted_object_key(key),
+            bucket: authorized.bucket_typed().clone(),
+            key: authorized.key_typed().clone(),
             target: StreamUploadTarget::PutObject,
             encryption: stored_encryption,
         })?;
@@ -6113,12 +6143,20 @@ impl Coordinator {
         &self.region
     }
 
+    fn bucket_pg_id_for(&self, bucket: &BucketName) -> u32 {
+        self.pg_topology.bucket_pg_for(bucket)
+    }
+
+    fn object_pg_id_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
+        self.pg_topology.object_pg_for(bucket, key)
+    }
+
     fn bucket_pg_id(&self, bucket: &str) -> u32 {
-        self.pg_topology.bucket_pg(bucket)
+        self.bucket_pg_id_for(&trusted_bucket_name(bucket))
     }
 
     fn object_pg_id(&self, bucket: &str, key: &str) -> u32 {
-        self.pg_topology.object_pg(bucket, key)
+        self.object_pg_id_for(&trusted_bucket_name(bucket), &trusted_object_key(key))
     }
 
     fn shard_pg_id_raw(&self, bucket: &str, key: &str, generation: u64) -> u32 {
@@ -6196,7 +6234,7 @@ impl Coordinator {
             BucketCreateOutcome::Created => {
                 self.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
                     bucket: BucketRequest {
-                        name: &authorized.name,
+                        name: trusted_bucket_name(&authorized.name),
                         requester: authorized.requester.clone(),
                         expected_bucket_owner: None,
                     },
@@ -6765,7 +6803,7 @@ impl Coordinator {
         )?;
         let bucket_pg = self.get_bucket_pg(&authorized.bucket)?;
         let info = bucket_pg
-            .head_bucket_raw(req.bucket.name)
+            .head_bucket_raw(req.bucket.name())
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -7862,14 +7900,16 @@ impl Coordinator {
 
     pub fn load_stream_put_write_encryption(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         session_id: &str,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
-        let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
+        let meta_pg = self
+            .storage_node
+            .get_pg(self.object_pg_id_for(bucket, key))?;
         let session = meta_pg.get_stream_upload(session_id)?;
-        if session.bucket != bucket || session.key != key {
+        if session.bucket != *bucket || session.key != *key {
             return Err(ServerError::InvalidRequest {
                 reason: "session bucket/key mismatch".to_string(),
             });
@@ -7884,15 +7924,17 @@ impl Coordinator {
 
     pub fn load_stream_part_write_encryption(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         session_id: &str,
         part_number: u32,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
-        let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
+        let meta_pg = self
+            .storage_node
+            .get_pg(self.object_pg_id_for(bucket, key))?;
         let session = meta_pg.get_stream_upload(session_id)?;
-        if session.bucket != bucket || session.key != key {
+        if session.bucket != *bucket || session.key != *key {
             return Err(ServerError::InvalidRequest {
                 reason: "session bucket/key mismatch".to_string(),
             });
@@ -7908,12 +7950,14 @@ impl Coordinator {
     #[cfg(test)]
     fn load_stream_session_write_encryption(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         session_id: &str,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
-        let meta_pg = self.storage_node.get_pg(self.object_pg_id(bucket, key))?;
+        let meta_pg = self
+            .storage_node
+            .get_pg(self.object_pg_id_for(bucket, key))?;
         let target = meta_pg.get_stream_upload(session_id)?.target;
         drop(meta_pg);
         match target {
@@ -7940,8 +7984,12 @@ impl Coordinator {
         segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
-        let write_encryption =
-            self.load_stream_session_write_encryption(bucket, key, session_id, None)?;
+        let write_encryption = self.load_stream_session_write_encryption(
+            &trusted_bucket_name(bucket),
+            &trusted_object_key(key),
+            session_id,
+            None,
+        )?;
         let storage_data = write_encryption.encrypt_segment(segment_index, data)?;
         self.append_stream_segment(bucket, key, session_id, segment_index, &storage_data)
     }
@@ -8056,12 +8104,12 @@ impl Coordinator {
 
     fn put_target_existing_live_object(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
     ) -> Result<Option<StoredObject>, ServerError> {
-        let meta_pg_id = self.object_pg_id(bucket, key);
+        let meta_pg_id = self.object_pg_id_for(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-        match meta_pg.get_object_meta(bucket, key) {
+        match meta_pg.get_object_meta(bucket.as_str(), key.as_str()) {
             Ok(object @ StoredObject::Live(_)) => Ok(Some(object)),
             Ok(StoredObject::DeleteMarker(_)) | Err(storage::MetadataError::ObjectNotFound) => {
                 Ok(None)
@@ -8074,8 +8122,8 @@ impl Coordinator {
     pub fn put_object(&self, req: &PutObjectRequest<'_>) -> Result<PutObjectResult, ServerError> {
         let authorized = self.authorize_put_object_write(&AuthorizePutObjectRequest {
             object: ObjectRequest::new(
-                req.object.bucket_name(),
-                req.object.key(),
+                req.object.bucket.name_typed().clone(),
+                req.object.key_typed().clone(),
                 req.object.requester().clone(),
                 req.expected_bucket_owner(),
             ),
@@ -8342,8 +8390,8 @@ impl Coordinator {
 
     pub fn append_stream_put_data(
         &self,
-        bucket: &str,
-        key: &str,
+        bucket: &BucketName,
+        key: &ObjectKey,
         session_id: &str,
         segment_index: u32,
         data: &[u8],
@@ -8352,7 +8400,13 @@ impl Coordinator {
         let write_encryption =
             self.load_stream_put_write_encryption(bucket, key, session_id, sse_customer)?;
         let storage_data = write_encryption.encrypt_segment(segment_index, data)?;
-        self.append_stream_segment(bucket, key, session_id, segment_index, &storage_data)
+        self.append_stream_segment(
+            bucket.as_str(),
+            key.as_str(),
+            session_id,
+            segment_index,
+            &storage_data,
+        )
     }
 
     pub fn append_stream_part_data(
@@ -8360,16 +8414,16 @@ impl Coordinator {
         req: &AppendStreamPartRequest<'_>,
     ) -> Result<(), ServerError> {
         let write_encryption = self.load_stream_part_write_encryption(
-            req.bucket,
-            req.key,
+            &req.bucket,
+            &req.key,
             req.session_id,
             req.part_number,
             req.sse_customer,
         )?;
         let storage_data = write_encryption.encrypt_segment(req.segment_index, req.data)?;
         self.append_stream_segment(
-            req.bucket,
-            req.key,
+            &req.bucket,
+            &req.key,
             req.session_id,
             req.segment_index,
             &storage_data,
@@ -8831,8 +8885,8 @@ impl Coordinator {
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<PutObjectResult, ServerError> {
         let write_encryption = self.load_stream_put_write_encryption(
-            authorized.bucket(),
-            authorized.key(),
+            authorized.bucket_typed(),
+            authorized.key_typed(),
             req.session_id,
             sse_customer,
         )?;
@@ -8862,8 +8916,8 @@ impl Coordinator {
         };
         self.finalize_stream_put(&FinalizeStreamPutRequest {
             object: ObjectRequest::new(
-                authorized.bucket(),
-                authorized.key(),
+                trusted_bucket_name(authorized.bucket()),
+                trusted_object_key(authorized.key()),
                 authorized.requester().clone(),
                 authorized.expected_bucket_owner(),
             ),
@@ -9410,14 +9464,14 @@ impl Coordinator {
             "src_bucket={:?} src_key={:?} dst_bucket={:?} dst_key={:?}",
             req.source.bucket,
             req.source.key,
-            req.destination.bucket.name,
-            req.destination.key
+            req.destination.bucket.name(),
+            req.destination.key()
         );
         let src_bucket = req.source.bucket.as_str();
         let src_key = req.source.key.as_str();
         let src_version_id = req.source.version_id;
-        let dst_bucket = req.destination.bucket.name;
-        let dst_key = req.destination.key;
+        let dst_bucket = req.destination.bucket.name();
+        let dst_key = req.destination.key();
         let src_cond = req.source.condition;
         let dst_cond = req.dst_condition;
         let directive = &req.directive;
@@ -10558,8 +10612,8 @@ impl Coordinator {
                 },
         } = self.authorize_get_object(&GetObjectRequest {
             object: ObjectVersionRequest::new(
-                req.object.bucket_name(),
-                req.object.key(),
+                req.object.bucket_name_typed().clone(),
+                req.object.key_typed().clone(),
                 req.object.version_id,
                 req.object.requester().clone(),
                 req.expected_bucket_owner(),
@@ -10787,8 +10841,8 @@ impl Coordinator {
                 },
         } = self.authorize_head_object(&GetObjectRequest {
             object: ObjectVersionRequest::new(
-                req.object.bucket_name(),
-                req.object.key(),
+                req.object.bucket_name_typed().clone(),
+                req.object.key_typed().clone(),
                 req.object.version_id,
                 req.object.requester().clone(),
                 req.expected_bucket_owner(),
@@ -11192,8 +11246,8 @@ impl Coordinator {
                 },
         } = self.authorize_get_object(&GetObjectRequest {
             object: ObjectVersionRequest::new(
-                req.object.bucket_name(),
-                req.object.key(),
+                req.object.bucket_name_typed().clone(),
+                req.object.key_typed().clone(),
                 req.object.version_id,
                 req.object.requester().clone(),
                 req.expected_bucket_owner(),
@@ -11579,10 +11633,10 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::list_objects_v2",
             "bucket={:?} max_keys={}",
-            req.bucket.name,
+            req.bucket.name(),
             req.max_keys
         );
-        let bucket = req.bucket.name;
+        let bucket = req.bucket.name();
         let prefix = req.prefix;
         let delimiter = req.delimiter;
         let continuation_token = req.continuation_token;
@@ -11873,10 +11927,10 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::list_object_versions",
             "bucket={:?} max_keys={}",
-            req.bucket.name,
+            req.bucket.name(),
             max_keys
         );
-        let bucket = req.bucket.name;
+        let bucket = req.bucket.name();
         let prefix = req.prefix;
         let key_marker = req.key_marker;
         let version_id_marker = req.version_id_marker;
@@ -12025,11 +12079,11 @@ impl Coordinator {
             TRACE_TARGET,
             "Coordinator::delete_objects",
             "bucket={:?} objects={} bypass={}",
-            req.bucket.name,
+            req.bucket.name(),
             req.entries.len(),
             req.bypass_governance
         );
-        let bucket = req.bucket.name;
+        let bucket = req.bucket.name();
         let entries = req.entries;
         self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
 
@@ -12108,12 +12162,12 @@ impl Coordinator {
 
         let metadata_blob = req.metadata.serialize()?;
         let system_metadata_blob = req.system_metadata.serialize()?;
-        let meta_pg_id = self.object_pg_id(&bucket, &key);
+        let meta_pg_id = self.object_pg_id_for(&bucket, &key);
         let pg = self.storage_node.get_pg(meta_pg_id)?;
         pg.create_multipart_upload(&CreateMultipartUploadReq {
             upload_id: UploadId::from(upload_id.as_str()),
-            bucket: trusted_bucket_name(bucket.as_str()),
-            key: trusted_object_key(key.as_str()),
+            bucket: bucket.clone(),
+            key: key.clone(),
             tags: tags.as_deref().map(SerializedTagSet::from),
             metadata_blob: SerializedMetadataBlob::from(metadata_blob),
             system_metadata_blob: SerializedSystemMetadataBlob::from(system_metadata_blob),
@@ -12129,7 +12183,7 @@ impl Coordinator {
         let initiated_at = upload.initiated_at;
         drop(pg);
         let lifecycle_abort =
-            self.multipart_lifecycle_abort_headers(&bucket_info, &key, initiated_at)?;
+            self.multipart_lifecycle_abort_headers(&bucket_info, key.as_str(), initiated_at)?;
 
         Ok(CreateMultipartUploadResult {
             upload_id,
@@ -12288,7 +12342,9 @@ impl Coordinator {
             upload,
             sse_customer,
         } = destination;
-        let dst_meta_pg = self.storage_node.get_pg(self.object_pg_id(&bucket, &key))?;
+        let dst_meta_pg = self
+            .storage_node
+            .get_pg(self.object_pg_id_for(&bucket, &key))?;
         let current_upload = dst_meta_pg.get_multipart_upload(upload_id.as_str())?;
         if current_upload.bucket != bucket || current_upload.key != key {
             return Err(ServerError::NoSuchUpload { upload_id });
@@ -12369,8 +12425,8 @@ impl Coordinator {
 
             self.finalize_stream_part(FinalizeStreamPartRequest {
                 upload: MultipartObjectRequest::new(
-                    &bucket,
-                    &key,
+                    bucket.clone(),
+                    key.clone(),
                     upload_id.as_str(),
                     req.upload.requester().clone(),
                     req.expected_bucket_owner(),
@@ -12434,7 +12490,7 @@ impl Coordinator {
             .lock_multipart_completion_bucket(bucket.as_str());
         let completion_order =
             self.next_completed_multipart_upload_order_for_bucket(bucket.as_str())?;
-        let meta_pg_id = self.object_pg_id(bucket.as_str(), key.as_str());
+        let meta_pg_id = self.object_pg_id_for(&bucket, &key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
         let current_upload = meta_pg.get_multipart_upload(upload_id.as_str())?;
         if current_upload.bucket != bucket.as_str() || current_upload.key != key.as_str() {
@@ -12456,8 +12512,8 @@ impl Coordinator {
             };
             if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
                 return Err(ServerError::ObjectNotFound {
-                    bucket: bucket.clone(),
-                    key: key.clone(),
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
                 });
             }
             check_write_conditions(req.cond, existing_etag.as_deref())?;
@@ -12767,8 +12823,8 @@ impl Coordinator {
         let managed_encryption = final_encryption.managed_encryption_algorithm();
 
         let obj_req = CommitMultipartReq {
-            bucket: trusted_bucket_name(bucket.as_str()),
-            key: trusted_object_key(key.as_str()),
+            bucket: bucket.clone(),
+            key: key.clone(),
             version_id,
             owner: upload.owner.clone(),
             acl_grants: upload.acl_grants.clone(),
@@ -12793,8 +12849,8 @@ impl Coordinator {
                     p.part_vid.get(),
                 );
                 ObjectPartRecord {
-                    bucket: trusted_bucket_name(bucket.as_str()),
-                    key: trusted_object_key(key.as_str()),
+                    bucket: bucket.clone(),
+                    key: key.clone(),
                     version_id,
                     part_number: p.part_number,
                     size: p.size,
@@ -12906,10 +12962,11 @@ impl Coordinator {
                 key,
                 upload_id,
             } => {
-                if self
-                    .read_runtime()
-                    .abort_multipart_upload_internal(&bucket, &key, &upload_id)?
-                {
+                if self.read_runtime().abort_multipart_upload_internal(
+                    bucket.as_str(),
+                    key.as_str(),
+                    &upload_id,
+                )? {
                     Ok(())
                 } else {
                     Err(ServerError::NoSuchUpload { upload_id })
@@ -12980,7 +13037,7 @@ impl Coordinator {
             checksum_type,
             lifecycle_abort: self.multipart_lifecycle_abort_headers(
                 &bucket_info,
-                &key,
+                key.as_str(),
                 upload_initiated_at,
             )?,
         })
@@ -13026,7 +13083,7 @@ impl Coordinator {
             }
             let pg = self.storage_node.get_pg(pg_id)?;
             let resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: trusted_bucket_name(bucket.as_str()),
+                bucket: bucket.clone(),
                 prefix: optional_list_object_key(prefix)?,
                 key_marker: optional_list_object_key(key_marker)?,
                 upload_id_marker: upload_id_marker.map(UploadId::from),
@@ -13409,7 +13466,7 @@ mod tests {
         let metadata = MetadataBlob::default();
         let system_metadata = SystemMetadata::default();
         let request = PutObjectRequest {
-            object: ObjectRequest::new("bucket", "key", test_requester(), None),
+            object: object_request("bucket", "key", test_requester()),
             data: b"body",
             metadata: &metadata,
             system_metadata: &system_metadata,
@@ -13433,7 +13490,7 @@ mod tests {
         let system_metadata = SystemMetadata::default();
         let sse_customer = test_sse_customer_request();
         let request = PutObjectRequest {
-            object: ObjectRequest::new("bucket", "key", test_requester(), None),
+            object: object_request("bucket", "key", test_requester()),
             data: b"body",
             metadata: &metadata,
             system_metadata: &system_metadata,
@@ -13459,7 +13516,7 @@ mod tests {
         let metadata = MetadataBlob::default();
         let system_metadata = SystemMetadata::default();
         let request = CreateMultipartUploadRequest {
-            object: ObjectRequest::new("bucket", "key", test_requester(), None),
+            object: object_request("bucket", "key", test_requester()),
             metadata: &metadata,
             system_metadata: &system_metadata,
             tags: None,
@@ -13513,7 +13570,7 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&'a str>,
     ) -> BucketRequest<'a> {
-        BucketRequest::new(name, requester, expected_bucket_owner)
+        BucketRequest::new(trusted_bucket_name(name), requester, expected_bucket_owner)
     }
 
     fn put_bucket_config_request_with_expected_owner<'a>(
@@ -13556,7 +13613,12 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&'a str>,
     ) -> ObjectRequest<'a> {
-        ObjectRequest::new(bucket, key, requester, expected_bucket_owner)
+        ObjectRequest::new(
+            trusted_bucket_name(bucket),
+            trusted_object_key(key),
+            requester,
+            expected_bucket_owner,
+        )
     }
 
     fn object_version_request<'a>(
@@ -13575,7 +13637,13 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&'a str>,
     ) -> ObjectVersionRequest<'a> {
-        ObjectVersionRequest::new(bucket, key, version_id, requester, expected_bucket_owner)
+        ObjectVersionRequest::new(
+            trusted_bucket_name(bucket),
+            trusted_object_key(key),
+            version_id,
+            requester,
+            expected_bucket_owner,
+        )
     }
 
     fn multipart_object_request<'a>(
@@ -13594,7 +13662,13 @@ mod tests {
         requester: Requester,
         expected_bucket_owner: Option<&'a str>,
     ) -> MultipartObjectRequest<'a> {
-        MultipartObjectRequest::new(bucket, key, upload_id, requester, expected_bucket_owner)
+        MultipartObjectRequest::new(
+            trusted_bucket_name(bucket),
+            trusted_object_key(key),
+            upload_id,
+            requester,
+            expected_bucket_owner,
+        )
     }
 
     fn copy_source<'a>(
@@ -14310,8 +14384,8 @@ mod tests {
     ) -> Result<String, ServerError> {
         let authorized = coord.authorize_put_object_write(&AuthorizePutObjectRequest {
             object: ObjectRequest::new(
-                object.bucket_name(),
-                object.key(),
+                object.bucket.name_typed().clone(),
+                object.key_typed().clone(),
                 object.requester().clone(),
                 object.expected_bucket_owner(),
             ),
@@ -23084,18 +23158,18 @@ mod tests {
 
         let entries = vec![
             DeleteEntry {
-                key: "key1",
+                key: trusted_object_key("key1"),
                 version_id: None,
                 cond: DeleteCondition::None,
             },
             DeleteEntry {
-                key: "key2",
+                key: trusted_object_key("key2"),
                 version_id: None,
                 cond: DeleteCondition::None,
             },
             // key3 doesn't exist — should still succeed (idempotent)
             DeleteEntry {
-                key: "key3",
+                key: trusted_object_key("key3"),
                 version_id: None,
                 cond: DeleteCondition::None,
             },
@@ -23146,7 +23220,7 @@ mod tests {
         let coord = setup_coordinator(tmp.path());
 
         let entries = vec![DeleteEntry {
-            key: "key1",
+            key: trusted_object_key("key1"),
             version_id: None,
             cond: DeleteCondition::None,
         }];
@@ -28553,7 +28627,7 @@ mod tests {
             .unwrap();
 
         let entries = vec![DeleteEntry {
-            key: "key",
+            key: trusted_object_key("key"),
             version_id: None,
             cond: DeleteCondition::None,
         }];
@@ -28583,7 +28657,7 @@ mod tests {
             .unwrap();
 
         let entries = vec![DeleteEntry {
-            key: "key",
+            key: trusted_object_key("key"),
             version_id: None,
             cond: DeleteCondition::None,
         }];
@@ -29141,7 +29215,7 @@ mod tests {
 
         let err = coord
             .head_bucket(&BucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("other-user"),
                 expected_bucket_owner: None,
             })
@@ -29177,7 +29251,7 @@ mod tests {
 
         let info = coord
             .head_bucket(&BucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("111122223333"),
                 expected_bucket_owner: None,
             })
@@ -29196,7 +29270,7 @@ mod tests {
 
         let info = coord
             .head_bucket(&BucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("111122223333"),
                 expected_bucket_owner: None,
             })
@@ -29216,7 +29290,7 @@ mod tests {
 
         let info = coord
             .head_bucket(&BucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::anonymous(),
                 expected_bucket_owner: None,
             })
@@ -29455,7 +29529,7 @@ mod tests {
 
         let err = coord
             .delete_bucket(&BucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("other-user"),
                 expected_bucket_owner: None,
             })
@@ -30460,12 +30534,12 @@ mod tests {
         // Use key1's etag for both entries; key2 will fail the condition.
         let entries = vec![
             DeleteEntry {
-                key: "key1",
+                key: trusted_object_key("key1"),
                 version_id: None,
                 cond: DeleteCondition::IfMatch(p1.etag.clone().into()),
             },
             DeleteEntry {
-                key: "key2",
+                key: trusted_object_key("key2"),
                 version_id: None,
                 cond: DeleteCondition::IfMatch(p1.etag.into()),
             },
@@ -41733,7 +41807,12 @@ mod tests {
         let crc = checksum::crc64::checksum(&full_data);
         let metadata = MetadataBlob::from_headers(&[("x-amz-meta-foo", "bar")]).unwrap();
         let write_encryption = coord
-            .load_stream_put_write_encryption("bucket", "mykey", &session_id, None)
+            .load_stream_put_write_encryption(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("mykey"),
+                &session_id,
+                None,
+            )
             .unwrap();
         let result = coord
             .finalize_stream_put(&FinalizeStreamPutRequest {
@@ -42118,7 +42197,12 @@ mod tests {
         )
         .unwrap();
         let write_encryption = coord
-            .load_stream_put_write_encryption("bucket", "obj", &session_id, Some(&sse_customer))
+            .load_stream_put_write_encryption(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("obj"),
+                &session_id,
+                Some(&sse_customer),
+            )
             .unwrap();
         let storage_data = write_encryption.encrypt_segment(0, b"hello").unwrap();
         coord

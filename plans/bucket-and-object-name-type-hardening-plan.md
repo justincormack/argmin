@@ -2,7 +2,39 @@
 
 ## Status
 
-Proposed.
+In progress.
+
+Phases 1 and 2 are complete.
+
+Phase 3 is started, but not complete yet.
+
+What has landed so far:
+
+1. `BucketName` / `ObjectKey` are now strict validated types.
+2. Alternate parse paths such as copy-source and XML/multipart key parsing now
+   return typed values instead of raw bucket/key strings.
+3. Coordinator request wrappers such as `BucketRequest`, `ObjectRequest`,
+   `ObjectVersionRequest`, `MultipartObjectRequest`, `DeleteEntry`, and
+   `AppendStreamPartRequest` now carry typed bucket/key values directly.
+4. `server-http` now constructs typed coordinator requests at the boundary and
+   reuses typed authorized values for the streaming PUT path instead of feeding
+   raw strings back into `server-core`.
+5. Authz and the main object/multipart authorized-state path in `server-core`
+   now preserve typed bucket/key values instead of immediately degrading them to
+   `String`.
+6. PG routing now has explicit typed entry points for validated S3
+   bucket/object names, while the separate internal shard namespace
+   (`segment/...`, `mpu/...`) continues to use a distinct raw path.
+
+What is still open before Phase 3 can be marked complete:
+
+1. `server-core` still has many internal helper and storage-dispatch APIs that
+   take raw `&str` bucket/key values.
+2. `crates/storage/src/traits.rs` still exposes raw-string bucket/key methods,
+   so the typed invariant is not yet carried through the storage trait boundary.
+3. There is still a mixed model of typed request ingress plus downstream
+   trusted reconstruction in parts of coordinator/storage interaction, which is
+   exactly what the rest of Phase 3 needs to remove or narrow.
 
 `security/codex-23ffb1b` remains open until the early migration phases in this
 plan land. This plan is the intended fix path; it is not documenting work that
@@ -229,6 +261,24 @@ Exit criteria:
    - either it accepts only strict validated types and keeps any remaining
      assertion as a trusted invariant
    - or it is changed to fail closed without panicking on invalid input
+
+Current status:
+
+1. Complete:
+   coordinator-facing request structs now carry typed bucket/key values.
+2. Complete:
+   `server-http` request construction and the streaming PUT append path now use
+   typed values at the coordinator boundary.
+3. Partially complete:
+   authz, PG selection, and the main object/multipart authorized-state path now
+   preserve typed values much further downstream than before.
+4. Still open:
+   storage-dispatch and many coordinator-internal helper APIs still accept raw
+   `&str` bucket/key parameters.
+5. Still open:
+   the final Phase 3 answer on the failure model is only partly in place today.
+   Typed PG entry points exist for validated S3 names, but raw helper entry
+   points still remain for internal namespaces and older call paths.
 
 Exit criteria:
 

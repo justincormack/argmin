@@ -36,8 +36,8 @@ pub fn upload_part(
 ) -> Result<UploadPartResult, ServerError> {
     let session = coord.begin_stream_part(&BeginStreamPartRequest {
         upload: MultipartObjectRequest::new(
-            req.upload.bucket_name(),
-            req.upload.key(),
+            req.upload.object.bucket.name_typed().clone(),
+            req.upload.object.key_typed().clone(),
             req.upload.upload_id(),
             req.upload.requester().clone(),
             req.upload.expected_bucket_owner(),
@@ -51,8 +51,8 @@ pub fn upload_part(
     let result = (|| {
         for (idx, chunk) in req.data.chunks(INTERNAL_SEGMENT_SIZE).enumerate() {
             coord.append_stream_part_data(&AppendStreamPartRequest {
-                bucket: req.upload.bucket_name(),
-                key: req.upload.key(),
+                bucket: req.upload.object.bucket.name_typed().clone(),
+                key: req.upload.object.key_typed().clone(),
                 session_id,
                 part_number: req.part_number,
                 segment_index: idx as u32,
@@ -70,8 +70,8 @@ pub fn upload_part(
         };
         coord.finalize_stream_part(FinalizeStreamPartRequest {
             upload: MultipartObjectRequest::new(
-                req.upload.bucket_name(),
-                req.upload.key(),
+                req.upload.object.bucket.name_typed().clone(),
+                req.upload.object.key_typed().clone(),
                 req.upload.upload_id(),
                 req.upload.requester().clone(),
                 req.upload.expected_bucket_owner(),

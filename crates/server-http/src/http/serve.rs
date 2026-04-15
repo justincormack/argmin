@@ -3150,7 +3150,12 @@ mod tests {
         frontend
             .coordinator
             .create_multipart_upload(&crate::coordinator::CreateMultipartUploadRequest {
-                object: crate::coordinator::ObjectRequest::new(bucket, key, requester, None),
+                object: crate::coordinator::ObjectRequest::new(
+                    storage::BucketName::try_from(bucket.to_string()).unwrap(),
+                    storage::ObjectKey::try_from(key.to_string()).unwrap(),
+                    requester,
+                    None,
+                ),
                 metadata: &MetadataBlob::new(),
                 system_metadata: &server_core::system_metadata::SystemMetadata::EMPTY,
                 tags: None,

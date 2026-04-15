@@ -4067,14 +4067,23 @@ mod tests {
     }
 
     fn test_bucket_request(name: &str) -> crate::coordinator::BucketRequest<'_> {
-        crate::coordinator::BucketRequest::new(name, test_requester(), None)
+        crate::coordinator::BucketRequest::new(
+            storage::BucketName::try_from(name.to_string()).unwrap(),
+            test_requester(),
+            None,
+        )
     }
 
     fn test_object_request<'a>(
         bucket: &'a str,
         key: &'a str,
     ) -> crate::coordinator::ObjectRequest<'a> {
-        crate::coordinator::ObjectRequest::new(bucket, key, test_requester(), None)
+        crate::coordinator::ObjectRequest::new(
+            storage::BucketName::try_from(bucket.to_string()).unwrap(),
+            storage::ObjectKey::try_from(key.to_string()).unwrap(),
+            test_requester(),
+            None,
+        )
     }
 
     fn create_test_bucket(coord: &Coordinator, name: &str) {
@@ -6800,7 +6809,7 @@ mod tests {
         let entries: Vec<DeleteEntry> = xml_entries
             .iter()
             .map(|e| DeleteEntry {
-                key: e.key.as_str(),
+                key: e.key.clone(),
                 version_id: None,
                 cond: DeleteCondition::None,
             })
@@ -6828,7 +6837,7 @@ mod tests {
         assert!(list_after.objects.is_empty());
         coord
             .delete_bucket(&crate::coordinator::BucketRequest::new(
-                "test-bucket",
+                storage::BucketName::try_from("test-bucket".to_string()).unwrap(),
                 test_requester(),
                 None,
             ))
@@ -6919,7 +6928,7 @@ mod tests {
         let entries: Vec<DeleteEntry> = xml_entries
             .iter()
             .map(|e| DeleteEntry {
-                key: e.key.as_str(),
+                key: e.key.clone(),
                 version_id: None,
                 cond: DeleteCondition::None,
             })
@@ -6942,7 +6951,7 @@ mod tests {
 
         coord
             .delete_bucket(&crate::coordinator::BucketRequest::new(
-                "bucket",
+                storage::BucketName::try_from("bucket".to_string()).unwrap(),
                 test_requester(),
                 None,
             ))

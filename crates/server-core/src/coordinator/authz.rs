@@ -1834,7 +1834,7 @@ impl Coordinator {
         } = self.authorize_object_acl_access(
             req.object.requester(),
             req.object.bucket_name(),
-            req.object.key,
+            req.object.key(),
             req.version_id,
             ObjectAclAuthorization::ReadWithPolicy(Self::get_object_acl_policy_action(
                 req.version_id,
@@ -1975,7 +1975,7 @@ impl Coordinator {
         } = self.authorize_object_lock_access(
             req.object.requester(),
             req.object.bucket_name(),
-            req.object.key,
+            req.object.key(),
             req.version_id,
             auth::PolicyAction::GetObjectRetention,
             req.expected_bucket_owner(),
@@ -2025,7 +2025,7 @@ impl Coordinator {
         } = self.authorize_object_lock_access(
             req.object.requester(),
             req.object.bucket_name(),
-            req.object.key,
+            req.object.key(),
             req.version_id,
             auth::PolicyAction::GetObjectLegalHold,
             req.expected_bucket_owner(),
@@ -2263,8 +2263,8 @@ impl Coordinator {
         &self,
         req: &PutBucketPolicyRequest<'_>,
     ) -> Result<AuthorizedPutBucketPolicy, ServerError> {
-        let bucket_info =
-            self.checked_active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner)?;
+        let bucket_info = self
+            .checked_active_bucket_summary(req.bucket.name(), req.bucket.expected_bucket_owner)?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_bucket_policy_action_with_bucket_policy(
             &req.bucket.requester,
@@ -2315,7 +2315,7 @@ impl Coordinator {
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
         let bucket_info =
-            self.checked_active_bucket_summary(req.name, req.expected_bucket_owner)?;
+            self.checked_active_bucket_summary(req.name(), req.expected_bucket_owner)?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_bucket_policy_action_with_bucket_policy(
             &req.requester,
@@ -2337,7 +2337,7 @@ impl Coordinator {
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
         let bucket_info =
-            self.checked_active_bucket_summary(req.name, req.expected_bucket_owner)?;
+            self.checked_active_bucket_summary(req.name(), req.expected_bucket_owner)?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_bucket_policy_action_with_bucket_policy(
             &req.requester,
@@ -2572,7 +2572,7 @@ impl Coordinator {
         req: &ListObjectsV2Request<'_>,
     ) -> Result<AuthorizedListObjectsV2, ServerError> {
         let bucket_info = self
-            .checked_active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
+            .checked_active_bucket_summary(req.bucket.name(), req.bucket.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_list_bucket_with_bucket_policy(
             &req.bucket.requester,
@@ -2601,7 +2601,7 @@ impl Coordinator {
         req: &ListObjectVersionsRequest<'_>,
     ) -> Result<AuthorizedListObjectVersions, ServerError> {
         let bucket_info = self
-            .checked_active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
+            .checked_active_bucket_summary(req.bucket.name(), req.bucket.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_bucket_action_with_bucket_policy(
             &req.bucket.requester,
@@ -2628,7 +2628,7 @@ impl Coordinator {
         req: &ListMultipartUploadsRequest<'_>,
     ) -> Result<AuthorizedListMultipartUploads, ServerError> {
         let bucket_info = self
-            .checked_active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
+            .checked_active_bucket_summary(req.bucket.name(), req.bucket.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_bucket_action_with_bucket_policy(
             &req.bucket.requester,
@@ -2646,7 +2646,7 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedListMultipartUploads {
-            bucket: req.bucket.name.to_string(),
+            bucket: req.bucket.name_typed().clone(),
         })
     }
 
@@ -2758,7 +2758,7 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketAcl, ServerError> {
-        let bucket = self.checked_active_bucket_summary(req.name, req.expected_bucket_owner())?;
+        let bucket = self.checked_active_bucket_summary(req.name(), req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket)?;
         if !Self::requester_can_bucket_action_with_bucket_policy(
             &req.requester,
@@ -2795,7 +2795,7 @@ impl Coordinator {
         req: &PutBucketAclRequest<'_>,
     ) -> Result<AuthorizedPutBucketAcl, ServerError> {
         let bucket_info = self
-            .checked_active_bucket_summary(req.bucket.name, req.bucket.expected_bucket_owner())?;
+            .checked_active_bucket_summary(req.bucket.name(), req.bucket.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         let policy_decision = Self::bucket_policy_decision_for_bucket_with_context(
             &req.bucket.requester,
@@ -2888,10 +2888,12 @@ impl Coordinator {
         &self,
         req: &AuthorizePutObjectRequest<'_>,
     ) -> Result<AuthorizedPutObjectWrite, ServerError> {
-        let bucket = req.object.bucket_name();
-        let key = req.object.key;
+        let key = req.object.key();
         self.with_bucket_write_reservation_for(&req.object, |bucket_info| {
-            let existing_object = self.put_target_existing_live_object(bucket, key)?;
+            let existing_object = self.put_target_existing_live_object(
+                req.object.bucket.name_typed(),
+                req.object.key_typed(),
+            )?;
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             if !Self::requester_can_put_object_with_bucket_policy(
                 req.object.requester(),
@@ -2908,8 +2910,8 @@ impl Coordinator {
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
             Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
             Ok(AuthorizedPutObjectWrite {
-                bucket: bucket.to_string(),
-                key: key.to_string(),
+                bucket: req.object.bucket.name_typed().clone(),
+                key: req.object.key_typed().clone(),
                 requester: req.object.requester().clone(),
                 expected_bucket_owner: req.object.expected_bucket_owner().map(str::to_string),
                 acl: AuthorizedPutObjectWriteAcl::from_parsed(&req.acl),
@@ -2969,8 +2971,8 @@ impl Coordinator {
                     pgs,
                 } = locked;
                 Ok(AuthorizedDeleteObject::UnversionedStored {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
+                    bucket: object.bucket_name_typed().clone(),
+                    key: object.key_typed().clone(),
                     stored,
                     pgs,
                 })
@@ -3039,8 +3041,8 @@ impl Coordinator {
                     pgs,
                 } = locked;
                 Ok(AuthorizedDeleteObject::SpecificVersionStored {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
+                    bucket: object.bucket_name_typed().clone(),
+                    key: object.key_typed().clone(),
                     version_id,
                     stored,
                     pgs,
@@ -3062,8 +3064,8 @@ impl Coordinator {
                             return Err(ServerError::AccessDenied);
                         }
                         Ok(AuthorizedDeleteObject::CurrentDeleteMarkerInsert {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
+                            bucket: object.bucket_name_typed().clone(),
+                            key: object.key_typed().clone(),
                             owner,
                             current: Some(locked),
                         })
@@ -3080,8 +3082,8 @@ impl Coordinator {
                             return Err(ServerError::AccessDenied);
                         }
                         Ok(AuthorizedDeleteObject::CurrentDeleteMarkerInsert {
-                            bucket: bucket.to_string(),
-                            key: key.to_string(),
+                            bucket: object.bucket_name_typed().clone(),
+                            key: object.key_typed().clone(),
                             owner,
                             current: None,
                         })
@@ -3102,12 +3104,12 @@ impl Coordinator {
     pub(super) fn authorize_delete_objects_entry<'a>(
         &'a self,
         req: &DeleteObjectsRequest<'_>,
-        entry: &DeleteEntry<'_>,
+        entry: &DeleteEntry,
     ) -> Result<AuthorizedDeleteObject<'a>, ServerError> {
         let object = ObjectVersionRequest::from_object(
             ObjectRequest::new(
-                req.bucket.name,
-                entry.key,
+                req.bucket.name_typed().clone(),
+                entry.key.clone(),
                 req.bucket.requester.clone(),
                 req.expected_bucket_owner(),
             ),
@@ -3123,8 +3125,6 @@ impl Coordinator {
         let src_bucket = req.source.bucket.as_str();
         let src_key = req.source.key.as_str();
         let src_version_id = req.source.version_id;
-        let dst_bucket = req.destination.bucket.name;
-        let dst_key = req.destination.key;
         let requester = &req.destination.bucket.requester;
         let acl = req.acl.clone();
         let copy_source_policy_value = req.source.version_id.map_or_else(
@@ -3160,8 +3160,8 @@ impl Coordinator {
             .with_policy_context(copy_policy_context);
         let destination = self.authorize_put_object_write(&AuthorizePutObjectRequest {
             object: ObjectRequest::new(
-                dst_bucket,
-                dst_key,
+                req.destination.bucket.name_typed().clone(),
+                req.destination.key_typed().clone(),
                 requester.clone(),
                 req.expected_bucket_owner(),
             ),
@@ -3190,14 +3190,16 @@ impl Coordinator {
         &self,
         req: &CreateMultipartUploadRequest<'_>,
     ) -> Result<AuthorizedCreateMultipartUpload, ServerError> {
-        let bucket = req.object.bucket_name();
-        let key = req.object.key;
+        let key = req.object.key();
         let policy_context = req.effective_policy_context();
         self.with_bucket_write_reservation_for(&req.object, |bucket_info| {
             if req.object.requester().is_anonymous() {
                 return Err(ServerError::AccessDenied);
             }
-            let existing_object = self.put_target_existing_live_object(bucket, key)?;
+            let existing_object = self.put_target_existing_live_object(
+                req.object.bucket.name_typed(),
+                req.object.key_typed(),
+            )?;
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             if !Self::requester_can_put_object_with_bucket_policy(
                 req.object.requester(),
@@ -3225,8 +3227,8 @@ impl Coordinator {
 
             Ok(AuthorizedCreateMultipartUpload {
                 bucket_info: bucket_info.into_inner(),
-                bucket: bucket.to_string(),
-                key: key.to_string(),
+                bucket: req.object.bucket.name_typed().clone(),
+                key: req.object.key_typed().clone(),
                 tags: req.tags.map(str::to_string),
                 checksum: req.checksum,
                 initiator,
@@ -3319,8 +3321,8 @@ impl Coordinator {
             Ok(AuthorizedUploadPartCopy {
                 source,
                 destination: AuthorizedMultipartPartWrite {
-                    bucket: dst_bucket.to_string(),
-                    key: dst_key.to_string(),
+                    bucket: req.upload.bucket_name_typed().clone(),
+                    key: req.upload.key_typed().clone(),
                     upload_id: upload_id.to_string(),
                     part_number,
                     upload: dst_upload,
@@ -3375,8 +3377,8 @@ impl Coordinator {
         )?;
 
         Ok(AuthorizedBeginStreamPart {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
+            bucket: req.upload.bucket_name_typed().clone(),
+            key: req.upload.key_typed().clone(),
             upload_id: upload_id.to_string(),
             part_number,
             upload,
@@ -3435,8 +3437,8 @@ impl Coordinator {
 
             Ok(AuthorizedCompleteMultipartUpload {
                 bucket_info: bucket_info.into_inner(),
-                bucket: bucket.to_string(),
-                key: key.to_string(),
+                bucket: req.upload.bucket_name_typed().clone(),
+                key: req.upload.key_typed().clone(),
                 upload_id: upload_id.to_string(),
                 upload,
                 multipart_write_encryption,
@@ -3449,7 +3451,7 @@ impl Coordinator {
         req: &MultipartObjectRequest<'_>,
     ) -> Result<AuthorizedAbortMultipartUpload, ServerError> {
         let bucket = req.object.bucket_name();
-        let key = req.object.key;
+        let key = req.object.key();
         let upload_id = req.upload_id;
         let bucket_info =
             self.checked_active_bucket_summary(bucket, req.expected_bucket_owner())?;
@@ -3469,8 +3471,8 @@ impl Coordinator {
                     return Err(ServerError::AccessDenied);
                 }
                 AuthorizedAbortMultipartUpload::InProgress {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
+                    bucket: req.bucket_name_typed().clone(),
+                    key: req.key_typed().clone(),
                     upload_id: upload_id.to_string(),
                 }
             }
@@ -3531,7 +3533,7 @@ impl Coordinator {
 
         Ok(AuthorizedListParts {
             bucket_info: bucket_info.into_inner(),
-            key: key.to_string(),
+            key: req.upload.key_typed().clone(),
             upload,
             meta_pg,
         })

@@ -1473,7 +1473,7 @@ mod harness {
 
         coord.put_bucket_versioning(&PutBucketVersioningRequest {
             bucket: BucketRequest::new(
-                bucket,
+                trusted_bucket_name(bucket),
                 fixtures.bucket_owner_requester(shape.owner_principal),
                 None,
             ),
@@ -1483,7 +1483,7 @@ mod harness {
         if shape.ownership == OwnershipShape::BucketOwnerEnforced {
             coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
                 bucket: BucketRequest::new(
-                    bucket,
+                    trusted_bucket_name(bucket),
                     fixtures.bucket_owner_requester(shape.owner_principal),
                     None,
                 ),
@@ -1496,7 +1496,7 @@ mod harness {
         if shape.block_public_acls || shape.ignore_public_acls || shape.restrict_public_buckets {
             coord.put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
                 bucket: BucketRequest::new(
-                    bucket,
+                    trusted_bucket_name(bucket),
                     fixtures.bucket_owner_requester(shape.owner_principal),
                     None,
                 ),
@@ -1528,7 +1528,7 @@ mod harness {
             );
             coord.put_bucket_policy(&PutBucketPolicyRequest {
                 bucket: BucketRequest::new(
-                    bucket,
+                    trusted_bucket_name(bucket),
                     fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
                     None,
                 ),
@@ -1545,7 +1545,12 @@ mod harness {
                 encryption: WriteEncryptionRequest::none(),
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                object: ObjectRequest::new(bucket, KEY, writer, None),
+                object: ObjectRequest::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(KEY),
+                    writer,
+                    None,
+                ),
                 data: b"phase-1-data",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
@@ -1593,8 +1598,8 @@ mod harness {
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
                 object: ObjectRequest::new(
-                    bucket,
-                    KEY,
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(KEY),
                     fixtures.bucket_owner_requester(owner_principal),
                     None,
                 ),
@@ -1618,7 +1623,7 @@ mod harness {
         let Some(policy) = policy_document(fixtures, bucket, scenario) else {
             if scenario.object.owner_kind != ObjectOwnerKind::BucketOwner {
                 coord.delete_bucket_policy(&BucketRequest::new(
-                    bucket,
+                    trusted_bucket_name(bucket),
                     fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
                     None,
                 ))?;
@@ -1628,7 +1633,7 @@ mod harness {
 
         coord.put_bucket_policy(&PutBucketPolicyRequest {
             bucket: BucketRequest::new(
-                bucket,
+                trusted_bucket_name(bucket),
                 fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
                 None,
             ),
@@ -1650,7 +1655,7 @@ mod harness {
 
         coord.put_bucket_policy(&PutBucketPolicyRequest {
             bucket: BucketRequest::new(
-                bucket,
+                trusted_bucket_name(bucket),
                 fixtures.bucket_owner_requester(scenario.bucket.owner_principal),
                 None,
             ),
@@ -1671,7 +1676,13 @@ mod harness {
             ExistingTarget::Current => None,
             ExistingTarget::Versioned => Some(object_version),
         };
-        let object = ObjectVersionRequest::new(bucket, KEY, version_id, requester, None);
+        let object = ObjectVersionRequest::new(
+            trusted_bucket_name(bucket),
+            trusted_object_key(KEY),
+            version_id,
+            requester,
+            None,
+        );
 
         run_action_for_object(coord, scenario.action, object)
     }
@@ -1685,7 +1696,13 @@ mod harness {
         version_id: Option<VersionId>,
     ) -> Result<(), ServerError> {
         let requester = fixtures.requester(scenario.bucket.owner_principal, scenario.requester);
-        let object = ObjectVersionRequest::new(bucket, key, version_id, requester, None);
+        let object = ObjectVersionRequest::new(
+            trusted_bucket_name(bucket),
+            trusted_object_key(key),
+            version_id,
+            requester,
+            None,
+        );
 
         run_action_for_object(coord, scenario.action, object)
     }
@@ -2914,7 +2931,7 @@ mod phase4_harness {
         if shape.ownership == OwnershipShape::BucketOwnerEnforced {
             coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
                 bucket: BucketRequest::new(
-                    bucket,
+                    trusted_bucket_name(bucket),
                     Requester::authenticated(fixtures.owner_user.clone()),
                     None,
                 ),
@@ -2927,7 +2944,7 @@ mod phase4_harness {
         if shape.block_public_acls || shape.ignore_public_acls || shape.restrict_public_buckets {
             coord.put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
                 bucket: BucketRequest::new(
-                    bucket,
+                    trusted_bucket_name(bucket),
                     Requester::authenticated(fixtures.owner_user.clone()),
                     None,
                 ),
@@ -2954,7 +2971,7 @@ mod phase4_harness {
         };
         coord.put_bucket_policy(&PutBucketPolicyRequest {
             bucket: BucketRequest::new(
-                bucket,
+                trusted_bucket_name(bucket),
                 Requester::authenticated(fixtures.owner_user.clone()),
                 None,
             ),
@@ -3003,7 +3020,12 @@ mod phase4_harness {
                     encryption: WriteEncryptionRequest::none(),
                     policy_context: PutObjectPolicyContext::default(),
                     object_lock: ObjectLockState::default(),
-                    object: ObjectRequest::new(bucket, PHASE4_KEY, requester, None),
+                    object: ObjectRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(PHASE4_KEY),
+                        requester,
+                        None,
+                    ),
                     data: b"phase-4-write",
                     metadata: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
@@ -3015,7 +3037,12 @@ mod phase4_harness {
             .map(|_| ()),
             WriteAction::CreateMultipartUpload => {
                 let upload = coord.create_multipart_upload(&CreateMultipartUploadRequest {
-                    object: ObjectRequest::new(bucket, PHASE4_KEY, requester.clone(), None),
+                    object: ObjectRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(PHASE4_KEY),
+                        requester.clone(),
+                        None,
+                    ),
                     metadata: &MetadataBlob::new(),
                     system_metadata: &SystemMetadata::EMPTY,
                     tags: None,
@@ -3026,8 +3053,8 @@ mod phase4_harness {
                     encryption: WriteEncryptionRequest::none(),
                 })?;
                 coord.abort_multipart_upload(&MultipartObjectRequest::new(
-                    bucket,
-                    PHASE4_KEY,
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(PHASE4_KEY),
                     &upload.upload_id,
                     requester,
                     None,
@@ -3035,7 +3062,12 @@ mod phase4_harness {
             }
             WriteAction::BeginStreamPut => {
                 let prepared = coord.begin_stream_put(&AuthorizePutObjectRequest {
-                    object: ObjectRequest::new(bucket, PHASE4_KEY, requester, None),
+                    object: ObjectRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(PHASE4_KEY),
+                        requester,
+                        None,
+                    ),
                     acl: put_object_write_acl(fixtures, scenario.acl),
                     policy_context: WriteEncryptionRequest::none().with_policy_context(
                         PutObjectPolicyContext::default()
@@ -3064,7 +3096,7 @@ mod phase4_harness {
         coord.create_bucket_with_acl_grants(&owner, bucket, grants, false)?;
         coord.put_bucket_versioning(&PutBucketVersioningRequest {
             bucket: BucketRequest::new(
-                bucket,
+                trusted_bucket_name(bucket),
                 Requester::authenticated(fixtures.owner_user.clone()),
                 None,
             ),
@@ -3074,7 +3106,7 @@ mod phase4_harness {
         if shape.ownership == OwnershipShape::BucketOwnerEnforced {
             coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
                 bucket: BucketRequest::new(
-                    bucket,
+                    trusted_bucket_name(bucket),
                     Requester::authenticated(fixtures.owner_user.clone()),
                     None,
                 ),
@@ -3087,7 +3119,7 @@ mod phase4_harness {
         if shape.block_public_acls || shape.restrict_public_buckets {
             coord.put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
                 bucket: BucketRequest::new(
-                    bucket,
+                    trusted_bucket_name(bucket),
                     Requester::authenticated(fixtures.owner_user.clone()),
                     None,
                 ),
@@ -3116,7 +3148,7 @@ mod phase4_harness {
             );
             coord.put_bucket_policy(&PutBucketPolicyRequest {
                 bucket: BucketRequest::new(
-                    bucket,
+                    trusted_bucket_name(bucket),
                     Requester::authenticated(fixtures.owner_user.clone()),
                     None,
                 ),
@@ -3132,7 +3164,12 @@ mod phase4_harness {
                 encryption: WriteEncryptionRequest::none(),
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
-                object: ObjectRequest::new(bucket, PHASE4_KEY, writer, None),
+                object: ObjectRequest::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(PHASE4_KEY),
+                    writer,
+                    None,
+                ),
                 data: b"phase-4-acl",
                 metadata: &MetadataBlob::new(),
                 system_metadata: &SystemMetadata::EMPTY,
@@ -3153,7 +3190,7 @@ mod phase4_harness {
         let Some(policy) = acl_policy_document(fixtures, bucket, scenario) else {
             if scenario.owner == AclOwnerKind::SameAccountOther {
                 coord.delete_bucket_policy(&BucketRequest::new(
-                    bucket,
+                    trusted_bucket_name(bucket),
                     Requester::authenticated(fixtures.owner_user.clone()),
                     None,
                 ))?;
@@ -3162,7 +3199,7 @@ mod phase4_harness {
         };
         coord.put_bucket_policy(&PutBucketPolicyRequest {
             bucket: BucketRequest::new(
-                bucket,
+                trusted_bucket_name(bucket),
                 Requester::authenticated(fixtures.owner_user.clone()),
                 None,
             ),
@@ -3244,8 +3281,8 @@ mod phase4_harness {
         coord
             .put_object_acl(&PutObjectAclRequest {
                 object: ObjectVersionRequest::new(
-                    bucket,
-                    PHASE4_KEY,
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(PHASE4_KEY),
                     request_version_id,
                     requester,
                     None,
@@ -3977,8 +4014,8 @@ mod phase5_harness {
                 policy_context: PutObjectPolicyContext::default(),
                 object_lock: ObjectLockState::default(),
                 object: ObjectRequest::new(
-                    bucket,
-                    PHASE5_KEY,
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(PHASE5_KEY),
                     Requester::authenticated(fixtures.owner_user.clone()),
                     None,
                 ),
@@ -4003,18 +4040,18 @@ mod phase5_harness {
         match mutation {
             TransitionMutation::EnableBucketOwnerEnforced => {
                 coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
-                    bucket: BucketRequest::new(bucket, owner_requester, None),
+                    bucket: BucketRequest::new(trusted_bucket_name(bucket), owner_requester, None),
                     config: BucketOwnershipControls {
                         object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
                     },
                 })
             }
             TransitionMutation::DeleteOwnershipControls => coord.delete_bucket_ownership_controls(
-                &BucketRequest::new(bucket, owner_requester, None),
+                &BucketRequest::new(trusted_bucket_name(bucket), owner_requester, None),
             ),
             TransitionMutation::EnableIgnorePublicAcls => {
                 coord.put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
-                    bucket: BucketRequest::new(bucket, owner_requester, None),
+                    bucket: BucketRequest::new(trusted_bucket_name(bucket), owner_requester, None),
                     config: PublicAccessBlockConfig {
                         block_public_acls: false,
                         ignore_public_acls: true,
@@ -4024,17 +4061,23 @@ mod phase5_harness {
                 })
             }
             TransitionMutation::DeletePublicAccessBlock => coord.delete_bucket_public_access_block(
-                &BucketRequest::new(bucket, owner_requester, None),
+                &BucketRequest::new(trusted_bucket_name(bucket), owner_requester, None),
             ),
             TransitionMutation::SetPolicy(policy) => match policy {
-                TransitionPolicyState::None => {
-                    coord.delete_bucket_policy(&BucketRequest::new(bucket, owner_requester, None))
-                }
+                TransitionPolicyState::None => coord.delete_bucket_policy(&BucketRequest::new(
+                    trusted_bucket_name(bucket),
+                    owner_requester,
+                    None,
+                )),
                 TransitionPolicyState::AllowCrossAccountRead
                 | TransitionPolicyState::DenyCrossAccountRead => {
                     let policy_document = transition_policy_document(fixtures, bucket, policy);
                     coord.put_bucket_policy(&PutBucketPolicyRequest {
-                        bucket: BucketRequest::new(bucket, owner_requester, None),
+                        bucket: BucketRequest::new(
+                            trusted_bucket_name(bucket),
+                            owner_requester,
+                            None,
+                        ),
                         config: &policy_document,
                         confirm_remove_self_bucket_access: false,
                     })
@@ -4074,7 +4117,13 @@ mod phase5_harness {
         coord
             .get_object(&GetObjectRequest {
                 sse_customer: None,
-                object: ObjectVersionRequest::new(bucket, PHASE5_KEY, None, requester, None),
+                object: ObjectVersionRequest::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(PHASE5_KEY),
+                    None,
+                    requester,
+                    None,
+                ),
                 cond: NO_READ,
             })
             .and_then(|result| {
