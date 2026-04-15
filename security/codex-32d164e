@@ -1,0 +1,141 @@
+AArch64 CRC fast path lacks PMULL feature gating
+Link: https://chatgpt.com/codex/cloud/security/findings/7da1d923cb248191bdfae714cae281ad?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 32d164e
+Author: justin@specialbusservice.com
+Created: 14/04/2026, 18:08:51
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Introduced: the new aarch64 fast path is selected without verifying PMULL support, leading to potential illegal-instruction crashes.
+The commit introduces aarch64 CRC32/CRC32C implementations that rely on vmull_p64 (PMULL). However, the runtime feature check only gates on "crc" and "aes" and the target_feature attributes also omit "pmull". On hardware where AES and CRC are present but PMULL is not, the backend selection will enable this path and execute PMULL, causing an illegal instruction and process crash during checksum calculation (e.g., on any request that triggers checksum work). This is a remote DoS on affected deployments.
+
+# Reviewer note
+Reviewed against the current tree and Rust's aarch64 intrinsic definitions. This is not a valid issue.
+
+For Rust/LLVM aarch64 targets, PMULL is not exposed as a separate runtime feature that should be checked independently:
+
+- `rustc --print target-features --target aarch64-unknown-linux-gnu` lists `aes`, `crc`, `sha3`, and `crypto`, but no standalone `pmull`.
+- Rust `stdarch` defines `vmull_p64` itself with `#[target_feature(enable = "neon,aes")]`:
+  - `/home/justin/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/stdarch/crates/core_arch/src/aarch64/neon/generated.rs:15185`
+
+That means our use of `is_aarch64_feature_detected!("aes")` together with `#[target_feature(enable = "crc,neon,aes")]` already matches the compiler/runtime contract for these intrinsics. The report is assuming a separate PMULL gate that Rust does not provide on aarch64, so there is no missing runtime check to add here. `security/codex-2cf85f1` is the same false-positive pattern applied to the CRC64 path.
+
+# Validation
+## Rubric
+- [x] Confirm aarch64 fast path selection uses `has_crc_pmull_aarch64` (crc32.rs:170-174; crc32c.rs:169-173).
+- [x] Confirm `has_crc_pmull_aarch64` checks only `crc`+`aes`, omitting `pmull` (crc32.rs:203-206; crc32c.rs:202-206).
+- [x] Confirm PMULL intrinsic `vmull_p64` is used under target_feature lacking `pmull` (crc32.rs:493-499; crc32c.rs:476-482).
+- [ ] Reproduce crash on aarch64 hardware lacking PMULL (blocked: missing aarch64 target/runtime; valgrind/gdb unavailable).
+## Report
+Attempted dynamic reproduction first: host is x86_64 (uname -m). `cargo build -p checksum --features pure-rust --target aarch64-unknown-linux-gnu` failed due to cross-compiling ec-sys (libisal/pkg-config missing). Retried with `--no-default-features --features pure-rust`, but rustc reported the aarch64 target is not installed. valgrind and gdb are not available in the container, so crash/valgrind/debugger reproduction could not be performed here. Code review confirms the issue: in crc32.rs, the aarch64 backend is selected via `has_crc_pmull_aarch64()` (pure_rust_backend at crc32.rs:170-174), but that check only tests `crc` and `aes` (crc32.rs:203-206) and omits `pmull`. The aarch64 fast path uses `vmull_p64` under `#[target_feature(enable = "crc,neon,aes")]` (crc32.rs:493-499), which requires PMULL instructions. The same pattern exists in crc32c.rs (backend selection at 169-173, detection at 202-206, PMULL usage at 476-482). On hardware with AES+CRC but no PMULL, the runtime detection will incorrectly choose the PMULL path and execute `vmull_p64`, leading to an illegal-instruction crash.
+
+# Evidence
+/workspace/argmin/crates/checksum/src/crc32.rs (L203 to 207)
+  Note: Runtime feature detection for the aarch64 fast path checks AES+CRC but not PMULL.
+```
+#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[inline]
+fn has_crc_pmull_aarch64() -> bool {
+    std::arch::is_aarch64_feature_detected!("crc") && std::arch::is_aarch64_feature_detected!("aes")
+}
+```
+
+/workspace/argmin/crates/checksum/src/crc32.rs (L482 to 499)
+  Note: The aarch64 fast path uses vmull_p64 under target_feature("crc,neon,aes"), so PMULL can execute without proper gating.
+```
+#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+mod aarch64_crc_pmull {
+    use core::arch::aarch64::{
+        __crc32b, __crc32d, __crc32h, __crc32w, vgetq_lane_u64, vmull_p64, vreinterpretq_u64_p128,
+    };
+
+    const BLOCK_SIZE: usize = 1024;
+    const STRIPE_BYTES: usize = 336;
+    const FOLD_CRC0: u64 = 0x0000_0000_B486_819B;
+    const FOLD_CRC1: u64 = 0x0000_0000_7627_8617;
+
+    #[inline]
+    #[target_feature(enable = "crc,neon,aes")]
+    unsafe fn fold_crc_word(crc: u32, constant: u64) -> u32 {
+        let folded = vmull_p64(crc as u64, constant);
+        let folded_words = vreinterpretq_u64_p128(folded);
+        __crc32d(0, vgetq_lane_u64::<0>(folded_words))
+    }
+```
+
+/workspace/argmin/crates/checksum/src/crc32c.rs (L202 to 206)
+  Note: CRC32C fast path selects the aarch64 backend based on AES+CRC only.
+```
+#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+#[inline]
+fn has_crc_pmull_aarch64() -> bool {
+    std::arch::is_aarch64_feature_detected!("crc") && std::arch::is_aarch64_feature_detected!("aes")
+}
+```
+
+/workspace/argmin/crates/checksum/src/crc32c.rs (L464 to 482)
+  Note: CRC32C aarch64 implementation uses vmull_p64 without enabling or checking the PMULL feature.
+```
+#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+mod aarch64_crc_pmull {
+    use core::arch::aarch64::{
+        __crc32cb, __crc32cd, __crc32ch, __crc32cw, vgetq_lane_u64, vmull_p64,
+        vreinterpretq_u64_p128,
+    };
+
+    const BLOCK_SIZE: usize = 1024;
+    const STRIPE_BYTES: usize = 336;
+    const FOLD_CRC0: u64 = 0x0000_0000_E417_F38A;
+    const FOLD_CRC1: u64 = 0x0000_0000_8F15_8014;
+
+    #[inline]
+    #[target_feature(enable = "crc,neon,aes")]
+    unsafe fn fold_crc_word(crc: u32, constant: u64) -> u32 {
+        let folded = vmull_p64(crc as u64, constant);
+        let folded_words = vreinterpretq_u64_p128(folded);
+        __crc32cd(0, vgetq_lane_u64::<0>(folded_words))
+    }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Downgraded from high to medium because the impact is availability-only (process crash) with no confidentiality/integrity compromise, and exploitation depends on a specific aarch64 hardware feature mismatch plus a pure-rust build. Default binding is localhost, and no deployment manifests indicate public exposure.
+## Likelihood
+high - Requires a pure-rust aarch64 build and a CPU with CRC+AES but no PMULL; if present, a single checksum-bearing request can trigger the crash. Deployment exposure is configuration-dependent. | Remote network vector
+## Impact
+medium - If the PMULL backend is selected on a CPU lacking PMULL, vmull_p64 can SIGILL and terminate the server process, causing availability loss for the instance.
+## Assumptions
+- argmin-s3 is built with the pure-rust CRC feature on aarch64 (ISA-L not available on that target).
+- The deployment runs on an aarch64 CPU that reports CRC+AES but lacks PMULL.
+- An attacker can send requests that cause CRC32/CRC32C computation (checksum headers or trailers) and can reach the HTTP service (ARGMIN_LISTEN_ADDR not localhost-only).
+- argmin-s3 compiled with pure-rust CRC on aarch64
+- CPU has CRC+AES but not PMULL
+- attacker can issue requests that trigger CRC32/CRC32C validation
+- service reachable on its configured listen address
+## Path
+n1 -> n2 -> n3 -> n4
+## Path evidence
+- `crates/checksum/src/crc32.rs:170-207` - aarch64 backend selection uses has_crc_pmull_aarch64(), which only checks CRC+AES (no PMULL).
+- `crates/checksum/src/crc32.rs:482-499` - aarch64 PMULL path uses vmull_p64 under target_feature("crc,neon,aes") without PMULL gating.
+- `crates/checksum/src/crc32c.rs:202-206` - CRC32C aarch64 PMULL backend selection checks CRC+AES only.
+- `crates/checksum/src/crc32c.rs:464-482` - CRC32C aarch64 PMULL implementation uses vmull_p64 under target_feature without PMULL.
+- `crates/server-http/src/http/serve.rs:47-114` - Streaming uploads create CRC32/CRC32C hashers based on request trailer headers.
+- `crates/server-http/src/http/mod.rs:4639-4658` - Checksum headers trigger CRC32/CRC32C computation over request bodies.
+- `crates/argmin-s3/src/config.rs:24-62` - HTTP service listen address defaults to 127.0.0.1:9000; exposure depends on configuration.
+## Narrative
+The aarch64 pure-rust CRC32/CRC32C backend is selected when has_crc_pmull_aarch64() returns true, but that check only verifies "crc" and "aes" and omits "pmull". The aarch64 fast path uses vmull_p64 under #[target_feature(enable = "crc,neon,aes")], so on hardware that has AES+CRC but no PMULL, the server can execute an illegal instruction and crash. The HTTP layer computes CRC32/CRC32C over attacker-controlled request bodies when checksum headers/trailers are present, making this reachable from normal S3 request flows. Default binding is localhost and a PoC was described but not executed, so exposure depends on deployment and hardware specifics.
+## Controls
+- SigV4 authentication for standard S3 operations
+- Checksum header/trailer validation
+- Configurable max connections/in-flight limits
+## Blindspots
+- No deployment manifests or ingress configs to confirm public exposure.
+- No runtime PoC executed in this environment; hardware feature mismatch not verified here.
+- Build feature selection for production aarch64 targets not confirmed beyond Cargo feature definitions.

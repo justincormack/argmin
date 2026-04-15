@@ -1,0 +1,191 @@
+AArch64 PMULL CRC path enabled without PMULL feature check
+Link: https://chatgpt.com/codex/cloud/security/findings/b6056785f1588191b777e1b7c9bbb79c?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 2cf85f1
+Author: justin@specialbusservice.com
+Created: 14/04/2026, 18:09:35
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+Bug introduced: runtime feature detection enables the PMULL path with only AES support, allowing illegal PMULL instruction execution on hardware lacking PMULL.
+The commit adds a PMULL-accelerated CRC64 implementation for aarch64. Runtime dispatch checks only for the "aes" feature and then calls the PMULL path. The PMULL implementation uses vmull_p64/vmull_high_p64 and is compiled with #[target_feature(enable = "neon,aes")], but it never verifies the PMULL feature. On aarch64 systems that advertise AES but not PMULL, this will execute unsupported PMULL instructions and cause an illegal-instruction crash. Since CRC64 is computed for object reads/writes and integrity checks, a remote client can trigger the crash with a normal request, yielding a denial-of-service on affected hardware.
+
+# Reviewer note
+Reviewed against the current tree and Rust's own aarch64 intrinsic gating. This is not a valid issue.
+
+For Rust/LLVM aarch64 targets, there is no separate `pmull` runtime feature to gate here:
+
+- `rustc --print target-features --target aarch64-unknown-linux-gnu` exposes `aes`, `crc`, `sha3`, and `crypto`, but not `pmull`.
+- Rust's `stdarch` defines both `vmull_p64` and `vmull_high_p64` with `#[target_feature(enable = "neon,aes")]`, which is the contract our code already follows:
+  - `/home/justin/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/stdarch/crates/core_arch/src/aarch64/neon/generated.rs:15085`
+  - `/home/justin/.rustup/toolchains/stable-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/stdarch/crates/core_arch/src/aarch64/neon/generated.rs:15185`
+
+So this report assumes a standalone PMULL gate that Rust does not model on aarch64. In this codebase, checking `aes` and compiling the PMULL path with `#[target_feature(enable = "neon,aes")]` is the correct Rust-level gating for these intrinsics. The same root cause appears in `security/codex-32d164e`, but that report covers the CRC32/CRC32C paths rather than CRC64.
+
+# Validation
+## Rubric
+- [x] Confirm aarch64 runtime dispatch checks only AES and not PMULL (crc64.rs:78-93)
+- [x] Confirm PMULL intrinsics are used and target_feature lacks PMULL (crc64.rs:365-371, 398-409, 415-428)
+- [ ] Reproduce illegal-instruction crash on AES-only aarch64 hardware (blocked: missing aarch64 target/runtime)
+- [ ] Capture valgrind/asan or debugger evidence (blocked: tools not installed, target unavailable)
+## Report
+Crash/asan attempt: tried cross-building the checksum crate for aarch64 with pure-rust to run a crashing PoC, but the target toolchain is missing (`cargo build -p checksum --no-default-features --features pure-rust --target aarch64-unknown-linux-gnu` failed with `can't find crate for 'std'` and suggested `rustup target add aarch64-unknown-linux-gnu`). Valgrind/gdb attempts failed because the tools are not installed (`valgrind: command not found`, `gdb: command not found`). Host x86_64 tests (`cargo test -p checksum --no-default-features --features pure-rust`) pass but do not exercise the aarch64 path.
+
+Code review shows the suspected issue: `crc64::extend` enables the aarch64 PMULL path solely on `is_aarch64_feature_detected!("aes")` and immediately calls `extend_pmull_aarch64` with no PMULL feature check (crates/checksum/src/crc64.rs:78-93). The PMULL implementation uses `vmull_p64`/`vmull_high_p64` (PMULL instructions) in the aarch64 module (crc64.rs:365-371, 398-409), yet the entrypoints are annotated only with `#[target_feature(enable = "neon,aes")]` (crc64.rs:415-428). This means CPUs that advertise AES but not PMULL will still execute PMULL instructions once AES is detected, causing an illegal-instruction crash. The logic matches the reported vulnerability even though I could not execute it in this x86_64 container.
+
+# Evidence
+/workspace/argmin/crates/checksum/src/crc64.rs (L315 to 416)
+  Note: The aarch64 PMULL implementation uses vmull_p64/vmull_high_p64 (PMULL instructions) but is only annotated with target_feature "neon,aes", so it can execute PMULL without verifying PMULL availability.
+```
+#[cfg(all(feature = "pure-rust", target_arch = "aarch64"))]
+mod aarch64_pmull {
+    use core::arch::aarch64::{
+        poly64x2_t, uint64x2_t, uint8x16_t, vdupq_n_u64, veorq_u8, vget_lane_p64, vget_low_p64,
+        vgetq_lane_u64, vld1q_u8, vmull_high_p64, vmull_p64, vreinterpretq_p64_u64,
+        vreinterpretq_p64_u8, vreinterpretq_u64_p128, vreinterpretq_u64_u8, vreinterpretq_u8_p128,
+        vreinterpretq_u8_u64, vsetq_lane_u64,
+    };
+
+    const P4_LOW: u64 = 0x0C32_CDB3_1E18_A84A;
+    const P4_HIGH: u64 = 0x6224_2240_ACE5_045A;
+    const P1_LOW: u64 = 0xEADC_41FD_2BA3_D420;
+    const P1_HIGH: u64 = 0x21E9_761E_2526_21AC;
+    const P0_LOW: u64 = 0x21E9_761E_2526_21AC;
+    const BR_LOW: u64 = 0x27EC_FA32_9AEF_9F77;
+    const BR_HIGH: u64 = 0x34D9_2653_5897_936B;
+
+    #[inline]
+    unsafe fn u64x2(lo: u64, hi: u64) -> uint64x2_t {
+        let value = vdupq_n_u64(0);
+        let value = vsetq_lane_u64::<0>(lo, value);
+        vsetq_lane_u64::<1>(hi, value)
+    }
+
+    #[inline]
+    unsafe fn poly64x2(lo: u64, hi: u64) -> poly64x2_t {
+        vreinterpretq_p64_u64(u64x2(lo, hi))
+    }
+
+    #[inline]
+    unsafe fn low64_as_u8x16(value: u64) -> uint8x16_t {
+        vreinterpretq_u8_u64(u64x2(value, 0))
+    }
+
+    #[inline]
+    fn load_block(ptr: *const u8) -> uint8x16_t {
+        unsafe { vld1q_u8(ptr) }
+    }
+
+    #[inline]
+    fn xor_crc(block: uint8x16_t, crc: u64) -> uint8x16_t {
+        unsafe { veorq_u8(block, low64_as_u8x16(crc)) }
+    }
+
+    #[inline]
+    fn low_p64(x: poly64x2_t) -> u64 {
+        unsafe { vget_lane_p64::<0>(vget_low_p64(x)) }
+    }
+
+    #[inline]
+    fn clmul_low(x: poly64x2_t, y: poly64x2_t) -> uint8x16_t {
+        unsafe { vreinterpretq_u8_p128(vmull_p64(low_p64(x), low_p64(y))) }
+    }
+
+    #[inline]
+    fn clmul_high(x: poly64x2_t, y: poly64x2_t) -> uint8x16_t {
+        unsafe { vreinterpretq_u8_p128(vmull_high_p64(x, y)) }
+    }
+
+    #[inline]
+    fn fold_block(x: uint8x16_t, next: uint8x16_t, constant: poly64x2_t) -> uint8x16_t {
+        unsafe {
+            let poly = vreinterpretq_p64_u8(x);
+            veorq_u8(
+                veorq_u8(clmul_low(poly, constant), clmul_high(poly, constant)),
+                next,
+            )
+        }
+    }
+
+    #[inline]
+    fn fold_without_next(x: uint8x16_t, constant: poly64x2_t) -> uint8x16_t {
+        unsafe {
+            let poly = vreinterpretq_p64_u8(x);
+            veorq_u8(clmul_low(poly, constant), clmul_high(poly, constant))
+        }
+    }
+
+    #[inline]
+    fn reduce_to_crc(x: uint8x16_t) -> u64 {
+        unsafe {
+            let folded = {
+                let x_poly = vreinterpretq_p64_u8(x);
+                let tmp_low = vreinterpretq_u8_p128(vmull_p64(low_p64(x_poly), P0_LOW));
+                let x_words = vreinterpretq_u64_u8(x);
+                let tmp_high = low64_as_u8x16(vgetq_lane_u64::<1>(x_words));
+                veorq_u8(tmp_low, tmp_high)
+            };
+
+            let folded_poly = vreinterpretq_p64_u8(folded);
+            let y = vmull_p64(low_p64(folded_poly), BR_LOW);
+            let y_words = vreinterpretq_u64_p128(y);
+            let y_low = vgetq_lane_u64::<0>(y_words);
+            let y_shifted = vreinterpretq_u8_u64(u64x2(0, y_low));
+            let z = vreinterpretq_u8_p128(vmull_p64(y_low, BR_HIGH));
+            let reduced = veorq_u8(veorq_u8(z, y_shifted), folded);
+            vgetq_lane_u64::<1>(vreinterpretq_u64_u8(reduced))
+        }
+    }
+
+    #[target_feature(enable = "neon,aes")]
+    pub unsafe fn extend(crc: u64, data: &[u8]) -> u64 {
+```
+
+/workspace/argmin/crates/checksum/src/crc64.rs (L89 to 93)
+  Note: Runtime dispatch enables the PMULL fast path based solely on the AES feature, without checking for PMULL support.
+```
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("aes") {
+                return unsafe { extend_pmull_aarch64(crc, data) };
+            }
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+The bug is real (AES-only gate for PMULL instructions), but it is limited to the non-default pure-rust build that the README states is test-only, and it only impacts availability. These constraints reduce likelihood and overall impact compared to the original high rating.
+## Likelihood
+low - Requires a non-default pure-rust build plus aarch64 hardware that supports AES but not PMULL, making real-world reachability less common even though triggering is trivial once conditions are met.
+## Impact
+medium - Successful triggering causes an illegal instruction crash of the single-node server, resulting in loss of availability until restart; no data confidentiality or integrity impact is shown.
+## Assumptions
+- The deployment is built with the non-default `pure-rust` feature (or otherwise enables `checksum/pure-rust`).
+- The server runs on aarch64 hardware that reports AES but not PMULL support.
+- An attacker can access the S3 HTTP endpoint with valid credentials or via a public bucket to trigger normal object read/write/copy paths that compute CRC64.
+- An illegal instruction on the target platform terminates the process (no signal handler that masks SIGILL).
+- pure-rust checksum feature enabled
+- aarch64 CPU with AES but no PMULL
+- CRC64 computation during request handling
+## Path
+Remote client -> HTTP listener -> CRC64 update -> PMULL fast path (AES-only gate) -> SIGILL crash
+## Path evidence
+- `crates/checksum/src/crc64.rs:80-96` - Runtime dispatch enables the aarch64 PMULL path based only on AES feature detection.
+- `crates/checksum/src/crc64.rs:365-428` - PMULL intrinsics are used while the functions are only annotated with `neon,aes` target features.
+- `crates/server-core/src/coordinator.rs:1600-1609` - CRC64 is updated during streaming reads, showing checksum computation is on request-driven paths.
+- `README.md:33-56` - The `pure-rust` feature is documented as a non-default, test-only build variant.
+- `crates/argmin-s3/src/config.rs:24-62` - Default listen address is 127.0.0.1:9000, indicating local-only exposure by default.
+## Narrative
+In the pure-rust checksum backend, the aarch64 fast path checks only for the AES feature before calling the PMULL implementation. The PMULL code uses `vmull_p64`/`vmull_high_p64` instructions but is annotated with `#[target_feature(enable = "neon,aes")]`, so on CPUs that expose AES without PMULL, a normal CRC64 computation (triggered by object read/write/copy requests) will execute unsupported PMULL instructions and crash the process. This is reachable from normal S3 operations but only when the non-default `pure-rust` build is used, which the README states is a test-only configuration.
+## Controls
+- SigV4 authentication and authorization for S3 requests
+- Configurable max connections and in-flight request limits
+- Optional TLS termination
+## Blindspots
+- No runtime verification on aarch64 hardware; impact inferred from instruction usage.
+- No deployment manifests to confirm whether pure-rust builds are used in production or whether the service is publicly exposed.
