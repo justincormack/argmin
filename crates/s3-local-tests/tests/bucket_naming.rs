@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use aws_sdk_s3::primitives::ByteStream;
-use s3_tests::{build_client_with_ca, err_status, TestServer, RT};
+use s3_tests::{
+    aws_sdk_s3::{self, primitives::ByteStream},
+    build_client_with_ca, err_status, TestServer, RT,
+};
 
 static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 

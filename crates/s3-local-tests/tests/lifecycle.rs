@@ -1,15 +1,18 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_sdk_s3::primitives::{ByteStream, DateTime};
-use aws_sdk_s3::types::{
-    AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, BucketVersioningStatus,
-    ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
-    NoncurrentVersionExpiration, ObjectLockMode, Tag, VersioningConfiguration,
-};
 use s3_tests::server::{TEST_ACCESS_KEY, TEST_REGION, TEST_SECRET_KEY};
 use s3_tests::{
-    assert_s3_err_code, build_client_with_ca, err_status, put_bucket_lifecycle_with_md5,
-    TestServer, RT,
+    assert_s3_err_code,
+    aws_sdk_s3::{
+        self,
+        primitives::{ByteStream, DateTime},
+        types::{
+            AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, BucketVersioningStatus,
+            ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
+            NoncurrentVersionExpiration, ObjectLockMode, Tag, VersioningConfiguration,
+        },
+    },
+    build_client_with_ca, err_status, put_bucket_lifecycle_with_md5, TestServer, RT,
 };
 
 const DAY_MILLIS: u64 = 24 * 60 * 60 * 1000;

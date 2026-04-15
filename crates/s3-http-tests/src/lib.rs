@@ -1,9 +1,14 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::LazyLock;
 
-use aws_sdk_s3::types::{BucketLocationConstraint, CreateBucketConfiguration};
-use aws_sdk_s3::Client;
-use s3_tests::{build_client_with_ca, build_test_agent, server, TestServer, RT};
+use s3_tests::{
+    aws_sdk_s3::{
+        self,
+        types::{BucketLocationConstraint, CreateBucketConfiguration},
+        Client,
+    },
+    build_client_with_ca, build_test_agent, server, TestServer, RT,
+};
 
 static BUCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 

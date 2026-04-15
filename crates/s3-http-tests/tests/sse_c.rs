@@ -1,5 +1,5 @@
-use aws_sdk_s3::primitives::ByteStream;
 use s3_http_tests::{create_bucket, run, unique_bucket, CTX};
+use s3_tests::aws_sdk_s3::primitives::ByteStream;
 use s3_tests::{assert_s3_err_code, err_status, sse_c_header_values, test_sse_c_key};
 
 #[test]

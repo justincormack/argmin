@@ -2,6 +2,7 @@ pub mod helpers;
 mod post_form;
 pub mod server;
 
+pub use aws_sdk_s3;
 pub use helpers::{
     assert_s3_err_code, bucket_prefix, cleanup_versioned_bucket, content_md5_header,
     copy_source_with_version, create_bucket_with_sse_c_enabled, create_objects,

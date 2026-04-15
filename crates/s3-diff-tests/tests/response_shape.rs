@@ -1,19 +1,23 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use aws_sdk_s3::primitives::{ByteStream, DateTime};
-use aws_sdk_s3::types::{
-    BucketLifecycleConfiguration, BucketLocationConstraint, BucketVersioningStatus,
-    CorsConfiguration, CorsRule, CreateBucketConfiguration, DefaultRetention, ExpirationStatus,
-    LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectLockConfiguration,
-    ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode,
-    ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership,
-    OwnershipControls, OwnershipControlsRule, PublicAccessBlockConfiguration, ServerSideEncryption,
-    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
-    Tag, Tagging, VersioningConfiguration,
-};
-use aws_sdk_s3::Client;
 use s3_tests::{
+    aws_sdk_s3::{
+        self,
+        primitives::{ByteStream, DateTime},
+        types::{
+            BucketLifecycleConfiguration, BucketLocationConstraint, BucketVersioningStatus,
+            CorsConfiguration, CorsRule, CreateBucketConfiguration, DefaultRetention,
+            ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
+            ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold,
+            ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
+            ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership, OwnershipControls,
+            OwnershipControlsRule, PublicAccessBlockConfiguration, ServerSideEncryption,
+            ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+            ServerSideEncryptionRule, Tag, Tagging, VersioningConfiguration,
+        },
+        Client,
+    },
     build_client_with_ca, build_test_agent, cleanup_versioned_bucket, content_md5_header,
     delete_all_and_bucket, post_object_raw_to_test_endpoint_with_headers,
     put_bucket_lifecycle_with_md5, send_signed_request_with_credentials,
