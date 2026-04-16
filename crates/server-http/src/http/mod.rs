@@ -777,7 +777,7 @@ impl HttpFrontend {
             .unwrap_or_default();
 
         // Load CORS config
-        let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket.as_str()) {
+        let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket) {
             Ok(Some(xml)) => xml,
             _ => return S3Response::forbidden(),
         };
@@ -812,7 +812,7 @@ impl HttpFrontend {
         origin: &str,
         method: &str,
     ) -> Vec<(String, String)> {
-        let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket.as_str()) {
+        let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket) {
             Ok(Some(xml)) => xml,
             _ => return Vec::new(),
         };

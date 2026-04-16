@@ -396,6 +396,23 @@ Exit criteria:
    - validate on load if data can still be attacker-derived
    - or justify trusted loading based on already-validated storage invariants
 
+Current status:
+
+1. Complete:
+   persistence and deserialization now validate on load for
+   `BucketName` / `ObjectKey`, and the production storage/coordinator
+   path no longer depends on raw-string reconstruction helpers.
+2. Complete:
+   the remaining production raw coordinator convenience entrypoint,
+   `load_bucket_cors_config`, now takes `&BucketName`, so the HTTP CORS
+   handling path reuses routed validated buckets end to end rather than
+   dropping back to `&str`.
+3. Complete:
+   the remaining `trusted_*` helpers are confined to `#[cfg(test)]`
+   code, and the residual internal `ObjectKey::try_from(...).expect(...)`
+   sites on the production path have been audited down to narrow local
+   invariants rather than broad convenience constructors.
+
 Exit criteria:
 
 1. There is no casual unchecked way to construct these domain types.

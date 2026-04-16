@@ -6885,17 +6885,17 @@ impl Coordinator {
     /// CORS preflight handling and actual-response header decoration need the
     /// stored CORS rules without turning those paths into authenticated bucket
     /// config reads.
-    pub fn load_bucket_cors_config(&self, name: &str) -> Result<Option<String>, ServerError> {
+    pub fn load_bucket_cors_config(
+        &self,
+        name: &BucketName,
+    ) -> Result<Option<String>, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::load_bucket_cors_config",
             "bucket={:?}",
             name
         );
-        let Ok(name) = BucketName::try_from(name) else {
-            return Ok(None);
-        };
-        let authorized = self.authorize_load_bucket_cors_config_for(&name);
+        let authorized = self.authorize_load_bucket_cors_config_for(name);
         self.load_authorized_bucket_subresource(&authorized)
     }
 
@@ -18573,14 +18573,6 @@ mod tests {
             .unwrap(),
             None
         );
-    }
-
-    #[test]
-    fn load_bucket_cors_config_invalid_bucket_name_returns_none() {
-        let tmp = test_util::tempdir();
-        let coord = setup_coordinator(tmp.path());
-
-        assert_eq!(coord.load_bucket_cors_config("BadBucket").unwrap(), None);
     }
 
     #[test]
