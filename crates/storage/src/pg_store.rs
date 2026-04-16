@@ -5894,12 +5894,15 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
-    fn get_stream_upload(&self, session_id: &str) -> Result<StreamUploadRecord, MetadataError> {
+    fn get_stream_upload(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<StreamUploadRecord, MetadataError> {
         self.conn
             .query_row(
                 "SELECT session_id, bucket, key, op_kind, upload_id, part_number, state, \
                  created_at, encryption_type, encryption_state FROM stream_uploads WHERE session_id = ?1",
-                params![session_id],
+                params![session_id.as_str()],
                 |row| {
                     let op_kind_raw: u8 = row.get(3)?;
                     let state_raw: u8 = row.get(6)?;
@@ -5944,14 +5947,14 @@ impl PgMetadataStore for PgStore {
 
     fn set_stream_upload_state(
         &self,
-        session_id: &str,
+        session_id: &SessionId,
         new_state: StreamUploadState,
     ) -> Result<(), MetadataError> {
         let current: u8 = self
             .conn
             .query_row(
                 "SELECT state FROM stream_uploads WHERE session_id = ?1",
-                params![session_id],
+                params![session_id.as_str()],
                 |row| row.get(0),
             )
             .optional()
@@ -5970,7 +5973,7 @@ impl PgMetadataStore for PgStore {
         self.conn
             .execute(
                 "UPDATE stream_uploads SET state = ?1 WHERE session_id = ?2",
-                params![new_state as u8, session_id],
+                params![new_state as u8, session_id.as_str()],
             )
             .map_err(|e| MetadataError::Db {
                 context: "set stream upload state",
@@ -5979,11 +5982,11 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
-    fn delete_stream_upload(&self, session_id: &str) -> Result<(), MetadataError> {
+    fn delete_stream_upload(&self, session_id: &SessionId) -> Result<(), MetadataError> {
         self.conn
             .execute(
                 "DELETE FROM stream_uploads WHERE session_id = ?1",
-                params![session_id],
+                params![session_id.as_str()],
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete stream upload",
@@ -6041,12 +6044,15 @@ impl PgMetadataStore for PgStore {
             })
     }
 
-    fn allocate_stream_segment_vid(&self, session_id: &str) -> Result<GenerationId, MetadataError> {
+    fn allocate_stream_segment_vid(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<GenerationId, MetadataError> {
         let (state, next_segment_vid): (u8, i64) = self
             .conn
             .query_row(
                 "SELECT state, next_segment_vid FROM stream_uploads WHERE session_id = ?1",
-                params![session_id],
+                params![session_id.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
@@ -6082,7 +6088,7 @@ impl PgMetadataStore for PgStore {
         self.conn
             .execute(
                 "UPDATE stream_uploads SET next_segment_vid = ?1 WHERE session_id = ?2",
-                params![next_segment_vid, session_id],
+                params![next_segment_vid, session_id.as_str()],
             )
             .map_err(|e| MetadataError::Db {
                 context: "advance next stream segment vid",
@@ -6122,7 +6128,7 @@ impl PgMetadataStore for PgStore {
 
     fn list_stream_segments(
         &self,
-        session_id: &str,
+        session_id: &SessionId,
     ) -> Result<Vec<StreamUploadSegmentRecord>, MetadataError> {
         let mut stmt = self
             .conn
@@ -6137,7 +6143,7 @@ impl PgMetadataStore for PgStore {
             })?;
 
         let rows = stmt
-            .query_map(params![session_id], |row| {
+            .query_map(params![session_id.as_str()], |row| {
                 let okh_blob: Vec<u8> = row.get(3)?;
                 let okh = PgStore::parse_okh_blob(&okh_blob, 3)?;
                 Ok(StreamUploadSegmentRecord {
@@ -6173,7 +6179,7 @@ impl PgMetadataStore for PgStore {
 
     fn commit_stream_put(
         &self,
-        session_id: &str,
+        session_id: &SessionId,
         obj: &CommitStreamPutReq,
         segments: &[ObjectSegmentRecord],
     ) -> Result<(), MetadataError> {
@@ -6203,7 +6209,7 @@ impl PgMetadataStore for PgStore {
                     "SELECT state, op_kind, bucket, key, upload_id, part_number \
                      FROM stream_uploads \
                      WHERE session_id = ?1",
-                    params![session_id],
+                    params![session_id.as_str()],
                     |row| {
                         Ok((
                             row.get(0)?,
@@ -6246,7 +6252,7 @@ impl PgMetadataStore for PgStore {
             self.conn
                 .execute(
                     "UPDATE stream_uploads SET state = ?1 WHERE session_id = ?2",
-                    params![StreamUploadState::Completing as u8, session_id],
+                    params![StreamUploadState::Completing as u8, session_id.as_str()],
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "commit stream put (set completing)",
@@ -6391,7 +6397,7 @@ impl PgMetadataStore for PgStore {
             self.conn
                 .execute(
                     "DELETE FROM stream_uploads WHERE session_id = ?1",
-                    params![session_id],
+                    params![session_id.as_str()],
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "commit stream put (delete staging)",
@@ -6612,7 +6618,7 @@ impl PgMetadataStore for PgStore {
 
     fn commit_stream_part(
         &self,
-        session_id: &str,
+        session_id: &SessionId,
         part: &MultipartPartRecord,
         segments: &[MultipartPartSegmentRecord],
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError> {
@@ -6631,7 +6637,7 @@ impl PgMetadataStore for PgStore {
                     .query_row(
                         "SELECT session_id, state, op_kind, bucket, key, upload_id, part_number \
                      FROM stream_uploads WHERE session_id = ?1",
-                        params![session_id],
+                        params![session_id.as_str()],
                         |row| {
                             let op_kind_raw: u8 = row.get(2)?;
                             let upload_id: Option<UploadId> = row.get(5)?;
@@ -6691,7 +6697,7 @@ impl PgMetadataStore for PgStore {
             self.conn
                 .execute(
                     "UPDATE stream_uploads SET state = ?1 WHERE session_id = ?2",
-                    params![StreamUploadState::Completing as u8, session_id],
+                    params![StreamUploadState::Completing as u8, session_id.as_str()],
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "commit stream part (set completing)",
@@ -6864,7 +6870,7 @@ impl PgMetadataStore for PgStore {
             self.conn
                 .execute(
                     "DELETE FROM stream_uploads WHERE session_id = ?1",
-                    params![session_id],
+                    params![session_id.as_str()],
                 )
                 .map_err(|e| MetadataError::Db {
                     context: "commit stream part (delete staging)",

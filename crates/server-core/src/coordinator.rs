@@ -232,7 +232,7 @@ pub struct GetObjectAclResult {
 /// Result of beginning a streaming UploadPart session.
 #[derive(Debug)]
 pub struct BeginStreamPartResult {
-    pub session_id: String,
+    pub session_id: SessionId,
     pub checksum_algorithm: Option<ChecksumAlgorithm>,
     pub sse_customer: Option<SseCustomerWriteContext>,
 }
@@ -240,7 +240,7 @@ pub struct BeginStreamPartResult {
 #[derive(Debug)]
 pub struct PreparedStreamPut {
     pub authorized_write: AuthorizedPutObjectWrite,
-    pub session_id: String,
+    pub session_id: SessionId,
 }
 
 #[derive(Debug)]
@@ -2161,7 +2161,7 @@ pub struct AuthorizedPutObjectCommitRequest<'a> {
 }
 
 pub struct AuthorizedFinalizeStreamPutRequest<'a> {
-    pub session_id: &'a str,
+    pub session_id: &'a SessionId,
     pub crc64: u64,
     pub total_size: u64,
     pub metadata_blob: &'a MetadataBlob,
@@ -2953,7 +2953,7 @@ pub struct BeginStreamPartRequest<'a> {
 pub struct AppendStreamPartRequest<'a> {
     pub bucket: BucketName,
     pub key: ObjectKey,
-    pub session_id: &'a str,
+    pub session_id: &'a SessionId,
     pub part_number: u32,
     pub segment_index: u32,
     pub data: &'a [u8],
@@ -3347,7 +3347,7 @@ impl<'a> CreateMultipartUploadRequest<'a> {
 #[derive(Debug)]
 pub struct FinalizeStreamPutRequest<'a> {
     pub object: ObjectRequest<'a>,
-    pub session_id: &'a str,
+    pub session_id: &'a SessionId,
     pub crc64: u64,
     pub total_size: u64,
     pub metadata_blob: &'a MetadataBlob,
@@ -3364,7 +3364,7 @@ pub struct FinalizeStreamPutRequest<'a> {
 #[derive(Debug)]
 pub struct FinalizeStreamPartRequest<'a> {
     pub upload: MultipartObjectRequest<'a>,
-    pub session_id: &'a str,
+    pub session_id: &'a SessionId,
     pub part_number: u32,
     pub crc64: u64,
     pub total_size: u64,
@@ -3922,7 +3922,7 @@ fn maybe_run_multipart_delete_metadata_hook(bucket: &str, key: &str) {
 }
 
 #[cfg(test)]
-fn maybe_run_stream_append_prepare_hook(session_id: &str, segment_index: u32) {
+fn maybe_run_stream_append_prepare_hook(session_id: &SessionId, segment_index: u32) {
     let hooks = STREAM_APPEND_TEST_HOOKS
         .get_or_init(|| Mutex::new(StreamAppendTestHooks::default()))
         .lock()
@@ -5845,7 +5845,7 @@ impl Coordinator {
     fn create_stream_put_session_for_authorized_write(
         &self,
         authorized: &AuthorizedPutObjectWrite,
-    ) -> Result<String, ServerError> {
+    ) -> Result<SessionId, ServerError> {
         let stored_encryption = authorized.write_encryption.object_encryption();
 
         let rng = ring::rand::SystemRandom::new();
@@ -5855,17 +5855,18 @@ impl Coordinator {
                 reason: "failed to generate session ID".to_string(),
             }
         })?;
-        let session_id = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+        let encoded = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
             use std::fmt::Write;
             write!(s, "{b:02x}").unwrap();
             s
         });
+        let session_id =
+            SessionId::try_from(encoded).expect("generated stream put session IDs must be valid");
 
         let meta_pg_id = self.object_pg_id_for(authorized.bucket_typed(), authorized.key_typed());
         let pg = self.storage_node.get_pg(meta_pg_id)?;
         pg.create_stream_upload(&CreateStreamUploadReq {
-            session_id: SessionId::try_from(session_id.clone())
-                .expect("generated stream put session IDs must be valid"),
+            session_id: session_id.clone(),
             bucket: authorized.bucket_typed().clone(),
             key: authorized.key_typed().clone(),
             target: StreamUploadTarget::PutObject,
@@ -8116,7 +8117,7 @@ impl Coordinator {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-        session_id: &str,
+        session_id: &SessionId,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
         let meta_pg = self
@@ -8140,7 +8141,7 @@ impl Coordinator {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-        session_id: &str,
+        session_id: &SessionId,
         part_number: u32,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
@@ -8166,7 +8167,7 @@ impl Coordinator {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-        session_id: &str,
+        session_id: &SessionId,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
         let meta_pg = self
@@ -8194,7 +8195,7 @@ impl Coordinator {
         &self,
         bucket: &str,
         key: &str,
-        session_id: &str,
+        session_id: &SessionId,
         segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
@@ -8442,11 +8443,13 @@ impl Coordinator {
                         reason: "failed to generate direct put segment ID".to_string(),
                     }
                 })?;
-                id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+                let encoded = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
                     use std::fmt::Write;
                     write!(s, "{b:02x}").unwrap();
                     s
-                })
+                });
+                SessionId::try_from(encoded)
+                    .expect("generated direct put segment IDs must be valid session IDs")
             };
 
             let segment_index = 0;
@@ -8616,7 +8619,7 @@ impl Coordinator {
     pub fn begin_stream_put_session(
         &self,
         authorized: &AuthorizedPutObjectWrite,
-    ) -> Result<String, ServerError> {
+    ) -> Result<SessionId, ServerError> {
         self.create_stream_put_session_for_authorized_write(authorized)
     }
 
@@ -8624,7 +8627,7 @@ impl Coordinator {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-        session_id: &str,
+        session_id: &SessionId,
         segment_index: u32,
         data: &[u8],
         sse_customer: Option<&SseCustomerRequest>,
@@ -8717,7 +8720,7 @@ impl Coordinator {
         upload_id: &UploadId,
         part_number: u32,
         upload: &MultipartUploadRecord,
-    ) -> Result<String, ServerError> {
+    ) -> Result<SessionId, ServerError> {
         Self::validate_upload_part_number(part_number)?;
 
         let rng = ring::rand::SystemRandom::new();
@@ -8727,15 +8730,16 @@ impl Coordinator {
                 reason: "failed to generate session ID".to_string(),
             }
         })?;
-        let session_id = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
+        let encoded = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
             use std::fmt::Write;
             write!(s, "{b:02x}").unwrap();
             s
         });
+        let session_id =
+            SessionId::try_from(encoded).expect("generated upload-part session IDs must be valid");
 
         pg.create_stream_upload(&CreateStreamUploadReq {
-            session_id: SessionId::try_from(session_id.clone())
-                .expect("generated upload-part session IDs must be valid"),
+            session_id: session_id.clone(),
             bucket: bucket.clone(),
             key: key.clone(),
             target: StreamUploadTarget::UploadPart {
@@ -8770,7 +8774,7 @@ impl Coordinator {
         target: &StreamUploadTarget,
         bucket: &str,
         key: &str,
-        session_id: &str,
+        session_id: &SessionId,
         segment_index: u32,
         data_len: usize,
     ) {
@@ -8825,7 +8829,7 @@ impl Coordinator {
 
     fn reject_duplicate_stream_segment_index(
         meta_pg: &storage::PgStore,
-        session_id: &str,
+        session_id: &SessionId,
         segment_index: u32,
     ) -> Result<(), ServerError> {
         let existing_segments = meta_pg
@@ -8954,7 +8958,7 @@ impl Coordinator {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-        session_id: &str,
+        session_id: &SessionId,
         segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
@@ -8999,8 +9003,7 @@ impl Coordinator {
                 segment_vid.get(),
             );
             let segment_record = StreamUploadSegmentRecord {
-                session_id: SessionId::try_from(session_id)
-                    .expect("stream session IDs must be valid while appending segments"),
+                session_id: session_id.clone(),
                 segment_index,
                 size: logical_size,
                 segment_crc64: Some(checksum::crc64::checksum(data)),
@@ -9091,7 +9094,7 @@ impl Coordinator {
         &self,
         bucket: &str,
         key: &str,
-        session_id: &str,
+        session_id: &SessionId,
         segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
@@ -9602,7 +9605,7 @@ impl Coordinator {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-        session_id: &str,
+        session_id: &SessionId,
     ) -> Result<(), ServerError> {
         let meta_pg_id = self.object_pg_id_for(bucket, key);
         let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
@@ -9653,7 +9656,7 @@ impl Coordinator {
         &self,
         bucket: &str,
         key: &str,
-        session_id: &str,
+        session_id: &SessionId,
     ) -> Result<(), ServerError> {
         self.abort_stream_put_for(
             &trusted_bucket_name(bucket),
@@ -9666,7 +9669,7 @@ impl Coordinator {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-        session_id: &str,
+        session_id: &SessionId,
     ) -> Result<(), ServerError> {
         self.abort_stream_put_for(bucket, key, session_id)
     }
@@ -9675,7 +9678,7 @@ impl Coordinator {
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
-        session_id: &str,
+        session_id: &SessionId,
     ) -> Result<(), ServerError> {
         self.abort_stream_put_for(bucket, key, session_id)
     }
@@ -9713,11 +9716,7 @@ impl Coordinator {
             for session in sessions {
                 if session.created_at < cutoff
                     && self
-                        .abort_stream_put_for(
-                            &session.bucket,
-                            &session.key,
-                            session.session_id.as_str(),
-                        )
+                        .abort_stream_put_for(&session.bucket, &session.key, &session.session_id)
                         .is_ok()
                 {
                     count += 1;
@@ -14783,7 +14782,7 @@ mod tests {
         coord: &Coordinator,
         bucket: &str,
         key: &str,
-    ) -> Result<String, ServerError> {
+    ) -> Result<SessionId, ServerError> {
         begin_stream_put_with_authorized_request_test(
             coord,
             object_request(bucket, key, test_requester()),
@@ -14801,7 +14800,7 @@ mod tests {
         policy_context: PutObjectPolicyContext<'a>,
         encryption: WriteEncryptionRequest<'a>,
         object_lock: ObjectLockState,
-    ) -> Result<String, ServerError> {
+    ) -> Result<SessionId, ServerError> {
         let authorized = coord.authorize_put_object_write(&AuthorizePutObjectRequest {
             object: ObjectRequest::new(
                 object.bucket.name_typed().clone(),
@@ -14961,7 +14960,7 @@ mod tests {
     }
 
     fn install_stream_append_race_hooks(
-        session_id: &str,
+        session_id: &SessionId,
         segment_index: u32,
     ) -> StreamAppendRaceSync {
         let serial = STREAM_APPEND_TEST_SERIAL
@@ -14988,7 +14987,7 @@ mod tests {
         bucket: &str,
         key_prefix: &str,
         require_cross_pg: bool,
-    ) -> (String, String) {
+    ) -> (String, SessionId) {
         for suffix in 0..256 {
             let key = format!("{key_prefix}-{suffix}");
             let session_id = begin_stream_put_test(coord, bucket, &key).unwrap();
@@ -42554,7 +42553,7 @@ mod tests {
 
         // Begin session.
         let session_id = begin_stream_put_test(&coord, "bucket", "mykey").unwrap();
-        assert_eq!(session_id.len(), 32);
+        assert_eq!(session_id.as_str().len(), 32);
 
         // Append two segments.
         let segment0 = b"hello ";
@@ -45409,13 +45408,7 @@ mod tests {
 
         let session_id = trusted_session_id("upload-part-session");
         coord
-            .append_plaintext_stream_segment_for_test(
-                "bucket",
-                "key",
-                session_id.as_str(),
-                0,
-                b"data",
-            )
+            .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"data")
             .unwrap();
     }
 

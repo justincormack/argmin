@@ -2,7 +2,7 @@
 
 ## Status
 
-Planned.
+Completed.
 
 This is a narrower internal follow-up after the completed bucket/object and
 upload-id hardening work.
@@ -110,6 +110,16 @@ Exit criteria:
 2. stored rows have one explicit audited load rule.
 3. the type-level tests pin the emitted 32-char lowercase-hex shape.
 
+Current state:
+
+1. `SessionId` is now a validated 32-char lowercase-hex type with
+   `SessionIdError`.
+2. infallible `From<&str>` / `From<String>` and `Deref<str>` are gone.
+3. `FromSql` revalidates stored rows through the typed constructor.
+4. direct type-level tests cover valid, invalid-length, and invalid-character
+   cases.
+5. the Phase 1 code landed in commit `287e879`.
+
 ## Phase 2: Type the internal streaming-session boundary
 
 1. Change streaming-session storage traits in
@@ -129,6 +139,16 @@ Exit criteria:
    session IDs.
 2. string use is explicit at SQL and formatting boundaries only.
 
+Current state:
+
+1. `PgMetadataStore` streaming-session methods now take `&SessionId`.
+2. `PgStore` implementations use typed `SessionId` end to end, dropping to
+   `.as_str()` only at SQL boundaries.
+3. coordinator streaming helpers, session loaders, and abort/finalize paths now
+   take `&SessionId`.
+4. `stream_segment_key_hash` now takes `&SessionId`, so the typed identifier
+   flows through the PG/hash boundary too.
+
 ## Phase 3: Type HTTP streaming bindings and test helpers
 
 1. Change `StreamObjectBinding` and related streaming HTTP context structs in
@@ -145,6 +165,18 @@ Exit criteria:
 1. session IDs remain typed through HTTP streaming contexts.
 2. remaining raw string conversions are local and explicit.
 
+Current state:
+
+1. `BeginStreamPartResult`, `PreparedStreamPut`, and the internal streaming
+   request structs now carry typed `SessionId`.
+2. `StreamObjectBinding` and the streaming HTTP contexts now store `SessionId`
+   instead of `String`.
+3. the streaming serve path keeps `Option<SessionId>` through
+   start/append/finalize/abort rather than erasing session IDs back to
+   strings.
+4. storage/coordinator/server-http tests were updated to use typed session IDs
+   instead of calling `.as_str()` on test helpers.
+
 ## Phase 4: Coverage and closeout
 
 1. Add persistence regressions for invalid stored session IDs.
@@ -160,3 +192,24 @@ Exit criteria:
 1. the typed `SessionId` boundary is covered by direct tests.
 2. the plan records any intentionally remaining raw seams.
 3. the final state is documented accurately.
+
+Current state:
+
+1. persistence revalidation is covered directly by the `SessionId` type-level
+   and `FromSql` tests added in Phase 1.
+2. the main stream-put and stream-part paths are covered by the existing
+   storage/coordinator/server-http tests, which now exercise typed session IDs
+   end to end.
+3. the production audit no longer finds raw `session_id: &str` seams in
+   storage, coordinator, PG hashing, or HTTP streaming bindings.
+4. the remaining string uses are non-session fields or test-only helpers, not
+   production `SessionId` boundaries.
+
+Final state:
+
+1. `SessionId` is now a strict internal identifier type with explicit string
+   boundaries only.
+2. production streaming session APIs are typed end to end through storage,
+   coordinator, PG hashing, and HTTP streaming contexts.
+3. the remaining follow-up work, if any, is ordinary maintenance rather than
+   another hardening phase.

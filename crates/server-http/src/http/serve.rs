@@ -27,7 +27,7 @@ use super::{HttpFrontend, S3HyperBody};
 use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
-use storage::BucketName;
+use storage::{BucketName, SessionId};
 
 const TRACE_TARGET: &str = "server_http";
 const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
@@ -1615,7 +1615,7 @@ async fn handle_streaming_put(
     // 2. Stream body frames, accumulating into internal segment-sized buffers.
     let ctx = Arc::new(ctx);
     let mut hasher = checksum::crc64::Hasher::new();
-    let mut session_id: Option<String> = None;
+    let mut session_id: Option<SessionId> = None;
     let mut segment_index: u32 = 0;
     let mut buf = PooledSegmentBuffer::new(&state);
     let mut total_size: u64 = 0;
@@ -1705,7 +1705,7 @@ async fn handle_streaming_put(
             "bucket={:?} key={:?} session_id={:?} body_bytes_received={} full_segments_flushed={} buffered_tail_bytes={} data_frames={} frame_wait_us={} decode_us={} ingest_local_us={} append_wait_us={}",
             ctx.bucket,
             ctx.key,
-            streaming_put_session_label(session_id.as_deref()),
+            streaming_put_session_label(session_id.as_ref()),
             total_size,
             segment_index,
             buf.len(),
@@ -1834,7 +1834,7 @@ async fn handle_streaming_put(
                 "bucket={:?} key={:?} session_id={:?} segment_index={} segment_bytes={} body_bytes_received={}",
                 ctx.bucket,
                 ctx.key,
-                streaming_put_session_label(session_id.as_deref()),
+                streaming_put_session_label(session_id.as_ref()),
                 idx,
                 buf.len(),
                 total_size
@@ -1931,7 +1931,7 @@ async fn handle_streaming_put(
 async fn abort_streaming(
     state: &Arc<ServerState>,
     ctx: &Arc<super::StreamingPutContext>,
-    session_id: Option<String>,
+    session_id: Option<SessionId>,
 ) {
     let Some(session_id) = session_id else {
         return;
@@ -1952,14 +1952,14 @@ struct StreamingPutIngestState<'a> {
     trailing_hasher: &'a mut Option<TrailingChecksumHasher>,
     total_size: &'a mut u64,
     buf: &'a mut PooledSegmentBuffer,
-    session_id: &'a mut Option<String>,
+    session_id: &'a mut Option<SessionId>,
     segment_index: &'a mut u32,
     body_started_emitted: &'a mut bool,
     timing: &'a mut StreamingBodyTiming,
 }
 
-fn streaming_put_session_label(session_id: Option<&str>) -> &str {
-    session_id.unwrap_or("-")
+fn streaming_put_session_label(session_id: Option<&SessionId>) -> &str {
+    session_id.map(SessionId::as_str).unwrap_or("-")
 }
 
 fn emit_streaming_put_event(
@@ -1973,7 +1973,7 @@ fn emit_streaming_put_event(
 async fn ensure_streaming_put_session(
     state: &Arc<ServerState>,
     ctx: &Arc<super::StreamingPutContext>,
-    session_id: &mut Option<String>,
+    session_id: &mut Option<SessionId>,
     body_bytes_received: u64,
 ) -> Result<(), S3Response> {
     if session_id.is_some() {
@@ -2027,7 +2027,7 @@ async fn ensure_streaming_put_session(
 async fn append_streaming_put_buffer(
     state: &Arc<ServerState>,
     ctx: &Arc<super::StreamingPutContext>,
-    session_id: &mut Option<String>,
+    session_id: &mut Option<SessionId>,
     segment_index: &mut u32,
     flush_data: PooledSegmentBuffer,
     body_bytes_received: u64,
@@ -2035,7 +2035,7 @@ async fn append_streaming_put_buffer(
 ) -> Result<(), S3Response> {
     ensure_streaming_put_session(state, ctx, session_id, body_bytes_received).await?;
     let session_id_value = session_id
-        .as_deref()
+        .as_ref()
         .expect("session must exist before appending a promoted segment");
     let idx = *segment_index;
     emit_streaming_put_event(
@@ -2068,7 +2068,7 @@ async fn append_streaming_put_buffer(
         ),
     );
     let trace = ctx.trace.clone();
-    let session_id_owned = session_id_value.to_string();
+    let session_id_owned = session_id_value.clone();
     match spawn_blocking_with_trace(trace, move || {
         emit_streaming_put_event(
             &ctx_ref,
@@ -2155,7 +2155,7 @@ async fn ingest_streaming_put_payload(
                 "bucket={:?} key={:?} session_id={:?} frame_bytes={} body_bytes_received={}",
                 ctx.bucket,
                 ctx.key,
-                streaming_put_session_label(ingest.session_id.as_deref()),
+                streaming_put_session_label(ingest.session_id.as_ref()),
                 payload.len(),
                 *ingest.total_size
             ),

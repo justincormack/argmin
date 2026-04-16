@@ -466,7 +466,9 @@ fn streaming_put_object_lifecycle() {
         .unwrap();
 
     // Verify staging segments.
-    let staging = store.list_stream_segments(stream_session_id("ss-put").as_str()).unwrap();
+    let staging = store
+        .list_stream_segments(&stream_session_id("ss-put"))
+        .unwrap();
     assert_eq!(staging.len(), 2);
 
     // Commit: atomically writes object + object_segments, deletes session.
@@ -502,7 +504,7 @@ fn streaming_put_object_lifecycle() {
 
     store
         .commit_stream_put(
-            stream_session_id("ss-put").as_str(),
+            &stream_session_id("ss-put"),
             &CommitStreamPutReq {
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
@@ -539,7 +541,9 @@ fn streaming_put_object_lifecycle() {
     assert_eq!(segs[1].segment_okh, hash1);
 
     // Session is gone.
-    let err = store.get_stream_upload(stream_session_id("ss-put").as_str()).unwrap_err();
+    let err = store
+        .get_stream_upload(&stream_session_id("ss-put"))
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::StreamSessionNotFound { .. }
@@ -634,7 +638,7 @@ fn streaming_upload_part_lifecycle() {
 
     let displaced_segments = store
         .commit_stream_part(
-            stream_session_id("ss-part").as_str(),
+            &stream_session_id("ss-part"),
             &MultipartPartRecord {
                 upload_id: multipart_upload_id("mpu-sp"),
                 part_number: 1,
@@ -658,7 +662,9 @@ fn streaming_upload_part_lifecycle() {
     );
 
     // Session gone.
-    let err = store.get_stream_upload(stream_session_id("ss-part").as_str()).unwrap_err();
+    let err = store
+        .get_stream_upload(&stream_session_id("ss-part"))
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::StreamSessionNotFound { .. }
@@ -1352,9 +1358,7 @@ fn persistence_complex_state_through_reopen() {
         let store = crate::PgStore::open(&pg_dir, 0).unwrap();
 
         // Stream session survives.
-        let session = store
-            .get_stream_upload(persisted_session_id.as_str())
-            .unwrap();
+        let session = store.get_stream_upload(&persisted_session_id).unwrap();
         assert_eq!(session.bucket.as_str(), "bucket");
         assert_eq!(session.key.as_str(), "k1");
 
@@ -1364,9 +1368,7 @@ fn persistence_complex_state_through_reopen() {
         assert_eq!(all[0].session_id, persisted_session_id);
 
         // Staging segment survives.
-        let segs = store
-            .list_stream_segments(persisted_session_id.as_str())
-            .unwrap();
+        let segs = store.list_stream_segments(&persisted_session_id).unwrap();
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].segment_okh, [0xEE; 16]);
 

@@ -1,5 +1,5 @@
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
-use storage::{BucketName, GenerationId, ObjectKey, UploadId};
+use storage::{BucketName, GenerationId, ObjectKey, SessionId, UploadId};
 
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
 const PG_HASH_STACK_LIMIT: usize = 63 + 1 + 1024 + 1 + 20;
@@ -165,7 +165,7 @@ pub fn object_key_hash(bucket: &str, key: &str) -> [u8; 16] {
 /// Compute the 16-byte segment key hash for streaming upload shard keys.
 ///
 /// `segment_okh = SHA-256("segment/" + session_id + "/" + segment_index)[:16]`
-pub fn stream_segment_key_hash(session_id: &str, segment_index: u32) -> [u8; 16] {
+pub fn stream_segment_key_hash(session_id: &SessionId, segment_index: u32) -> [u8; 16] {
     use ring::digest;
     let input = format!("segment/{session_id}/{segment_index}");
     let hash = digest::digest(&digest::SHA256, input.as_bytes());
@@ -230,10 +230,14 @@ pub fn multipart_part_segment_key_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use storage::UploadId;
+    use storage::{SessionId, UploadId};
 
     fn upload_id() -> UploadId {
         UploadId::try_from(".".repeat(128)).expect("test upload id is valid")
+    }
+
+    fn session_id(value: &str) -> SessionId {
+        SessionId::try_from(value).expect("test session id is valid")
     }
 
     #[test]
@@ -390,28 +394,30 @@ mod tests {
 
     #[test]
     fn stream_segment_key_hash_deterministic() {
-        let a = stream_segment_key_hash("session-abc", 0);
-        let b = stream_segment_key_hash("session-abc", 0);
+        let session = session_id("0123456789abcdef0123456789abcdef");
+        let a = stream_segment_key_hash(&session, 0);
+        let b = stream_segment_key_hash(&session, 0);
         assert_eq!(a, b);
     }
 
     #[test]
     fn stream_segment_key_hash_different_indices() {
-        let a = stream_segment_key_hash("session-abc", 0);
-        let b = stream_segment_key_hash("session-abc", 1);
+        let session = session_id("0123456789abcdef0123456789abcdef");
+        let a = stream_segment_key_hash(&session, 0);
+        let b = stream_segment_key_hash(&session, 1);
         assert_ne!(a, b);
     }
 
     #[test]
     fn stream_segment_key_hash_different_sessions() {
-        let a = stream_segment_key_hash("session-abc", 0);
-        let b = stream_segment_key_hash("session-def", 0);
+        let a = stream_segment_key_hash(&session_id("0123456789abcdef0123456789abcdef"), 0);
+        let b = stream_segment_key_hash(&session_id("fedcba9876543210fedcba9876543210"), 0);
         assert_ne!(a, b);
     }
 
     #[test]
     fn stream_segment_key_hash_length() {
-        let hash = stream_segment_key_hash("session", 42);
+        let hash = stream_segment_key_hash(&session_id("0123456789abcdef0123456789abcdef"), 42);
         assert_eq!(hash.len(), 16);
     }
 

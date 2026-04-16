@@ -55,7 +55,7 @@ use server_core::sse::{
     SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
 };
 use server_core::system_metadata::SystemMetadata;
-use storage::{BucketName, ManagedEncryptionAlgorithm, ObjectKey, UploadId};
+use storage::{BucketName, ManagedEncryptionAlgorithm, ObjectKey, SessionId, UploadId};
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 
 const TRACE_TARGET: &str = "server_http";
@@ -3538,7 +3538,7 @@ impl HttpFrontend {
     pub fn start_streaming_put_session(
         &self,
         ctx: &StreamingPutContext,
-    ) -> Result<String, ServerError> {
+    ) -> Result<SessionId, ServerError> {
         let _trace = observability::AttachedTrace::new(ctx.trace.clone());
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3555,7 +3555,7 @@ impl HttpFrontend {
     pub fn streaming_append_segment(
         &self,
         ctx: &StreamingPutContext,
-        session_id: &str,
+        session_id: &SessionId,
         segment_index: u32,
         data: &[u8],
     ) -> Result<(), ServerError> {
@@ -3622,7 +3622,7 @@ impl HttpFrontend {
     pub fn finalize_streaming_put(
         &self,
         ctx: &StreamingPutContext,
-        session_id: &str,
+        session_id: &SessionId,
         crc64: u64,
         total_size: u64,
         trailer_checksums: &[(String, String)],
@@ -3660,7 +3660,7 @@ impl HttpFrontend {
     }
 
     /// Abort a streaming session (best-effort cleanup).
-    pub fn abort_streaming_put(&self, ctx: &StreamingPutContext, session_id: &str) {
+    pub fn abort_streaming_put(&self, ctx: &StreamingPutContext, session_id: &SessionId) {
         let _trace = observability::AttachedTrace::new(ctx.trace.clone());
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3915,7 +3915,7 @@ impl HttpFrontend {
 
 /// Session binding for a streaming object-scoped upload.
 pub struct StreamObjectBinding {
-    pub session_id: String,
+    pub session_id: SessionId,
     pub bucket: BucketName,
     pub key: ObjectKey,
 }

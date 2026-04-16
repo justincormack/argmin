@@ -516,17 +516,20 @@ pub trait PgMetadataStore {
     fn create_stream_upload(&self, req: &CreateStreamUploadReq) -> Result<(), MetadataError>;
 
     /// Get a streaming upload session by ID.
-    fn get_stream_upload(&self, session_id: &str) -> Result<StreamUploadRecord, MetadataError>;
+    fn get_stream_upload(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<StreamUploadRecord, MetadataError>;
 
     /// Transition a streaming upload session state. Only valid from InProgress.
     fn set_stream_upload_state(
         &self,
-        session_id: &str,
+        session_id: &SessionId,
         new_state: StreamUploadState,
     ) -> Result<(), MetadataError>;
 
     /// Delete a streaming upload session and its staging segments (CASCADE).
-    fn delete_stream_upload(&self, session_id: &str) -> Result<(), MetadataError>;
+    fn delete_stream_upload(&self, session_id: &SessionId) -> Result<(), MetadataError>;
 
     /// List all streaming upload sessions on this PG.
     ///
@@ -534,7 +537,10 @@ pub trait PgMetadataStore {
     fn list_all_stream_uploads(&self) -> Result<Vec<StreamUploadRecord>, MetadataError>;
 
     /// Allocate the next unique staged segment payload generation for a session.
-    fn allocate_stream_segment_vid(&self, session_id: &str) -> Result<GenerationId, MetadataError>;
+    fn allocate_stream_segment_vid(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<GenerationId, MetadataError>;
 
     /// Append a staging segment record to an in-progress streaming session.
     fn append_stream_segment(
@@ -545,7 +551,7 @@ pub trait PgMetadataStore {
     /// List staging segment records for a streaming session, ordered by segment_index.
     fn list_stream_segments(
         &self,
-        session_id: &str,
+        session_id: &SessionId,
     ) -> Result<Vec<StreamUploadSegmentRecord>, MetadataError>;
 
     /// Atomically finalize a streaming PutObject.
@@ -559,7 +565,7 @@ pub trait PgMetadataStore {
     /// 6. Mark session Completed (implicitly via deletion)
     fn commit_stream_put(
         &self,
-        session_id: &str,
+        session_id: &SessionId,
         obj: &CommitStreamPutReq,
         segments: &[ObjectSegmentRecord],
     ) -> Result<(), MetadataError>;
@@ -587,7 +593,7 @@ pub trait PgMetadataStore {
     /// 5. Delete the stream_uploads + stream_upload_segments staging rows
     fn commit_stream_part(
         &self,
-        session_id: &str,
+        session_id: &SessionId,
         part: &MultipartPartRecord,
         segments: &[MultipartPartSegmentRecord],
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError>;
