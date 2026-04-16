@@ -2100,6 +2100,11 @@ impl Coordinator {
         &self,
         req: &CreateBucketRequest<'_>,
     ) -> Result<AuthorizedCreateBucket, ServerError> {
+        let name = BucketName::try_from(req.name.to_string()).map_err(|error| {
+            ServerError::InvalidBucketName {
+                reason: error.to_string(),
+            }
+        })?;
         let owner_account = req.requester.account().ok_or(ServerError::AccessDenied)?;
         let locked_to_account_region =
             self.validate_create_bucket_namespace(req.name, req.namespace, owner_account)?;
@@ -2124,7 +2129,7 @@ impl Coordinator {
             return Err(ServerError::InvalidBucketAclWithBlockPublicAccessError);
         }
         Ok(AuthorizedCreateBucket {
-            name: req.name.to_string(),
+            name,
             requester: req.requester.clone(),
             owner,
             locked_to_account_region,
@@ -2190,12 +2195,12 @@ impl Coordinator {
     /// CORS preflight handling and actual-response header decoration need the
     /// stored CORS rules without turning those paths into authenticated bucket
     /// config reads.
-    pub(super) fn authorize_load_bucket_cors_config(
+    pub(super) fn authorize_load_bucket_cors_config_for(
         &self,
-        name: &str,
+        name: &BucketName,
     ) -> AuthorizedBucketSubresourceGet {
         AuthorizedBucketSubresourceGet {
-            bucket: trusted_bucket_name(name),
+            bucket: name.clone(),
             kind: storage::BucketSubresourceKind::Cors,
         }
     }
@@ -2498,12 +2503,12 @@ impl Coordinator {
     ///
     /// This intentionally bypasses request auth because the coordinator is
     /// loading already-authoritative stored state for cache population.
-    pub(super) fn authorize_load_bucket_lifecycle(
+    pub(super) fn authorize_load_bucket_lifecycle_for(
         &self,
-        name: &str,
+        name: &BucketName,
     ) -> AuthorizedBucketSubresourceGet {
         AuthorizedBucketSubresourceGet {
-            bucket: trusted_bucket_name(name),
+            bucket: name.clone(),
             kind: storage::BucketSubresourceKind::Lifecycle,
         }
     }

@@ -49,6 +49,7 @@ fn lock_mutex_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
 
+#[cfg(test)]
 fn trusted_bucket_name(name: impl Into<String>) -> BucketName {
     BucketName::try_from(name.into())
         .expect("coordinator must only construct BucketName from validated values")
@@ -312,7 +313,7 @@ struct AuthorizedDeleteBucketEncryption {
 
 #[derive(Debug)]
 struct AuthorizedCreateBucket {
-    name: String,
+    name: BucketName,
     requester: Requester,
     owner: OwnerIdentity,
     locked_to_account_region: bool,
@@ -3972,14 +3973,16 @@ impl ReadRuntime {
 
         let bucket_pg = self
             .storage_node
-            .get_pg(self.pg_topology.bucket_pg(bucket_info.name.as_str()))?;
+            .get_pg(self.pg_topology.bucket_pg_for(&bucket_info.name))?;
         let raw_config = bucket_pg
-            .get_bucket_subresource(
-                bucket_info.name.as_str(),
-                storage::BucketSubresourceKind::Lifecycle,
-            )
-            .map_err(ServerError::Metadata)?
-            .map(|stored| stored.body);
+            .get_bucket_subresource(&bucket_info.name, storage::BucketSubresourceKind::Lifecycle)
+            .map(|stored| stored.map(|stored| stored.body))
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
         drop(bucket_pg);
 
         raw_config
@@ -4005,7 +4008,7 @@ impl ReadRuntime {
             expired_delete_markers: 0,
             aborted_multipart_uploads: 0,
         };
-        let mut processed_buckets = HashSet::new();
+        let mut processed_buckets: HashSet<BucketName> = HashSet::new();
 
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
@@ -4014,7 +4017,7 @@ impl ReadRuntime {
             drop(pg);
 
             for bucket in buckets {
-                if processed_buckets.insert(bucket.name.to_string()) {
+                if processed_buckets.insert(bucket.name.clone()) {
                     stats.scanned_buckets += 1;
                 }
                 self.expire_due_current_objects_for_bucket(&bucket, now_millis, &mut stats)?;
@@ -4024,7 +4027,7 @@ impl ReadRuntime {
             }
 
             for bucket in aborting_buckets {
-                if processed_buckets.insert(bucket.to_string()) {
+                if processed_buckets.insert(bucket.clone()) {
                     stats.scanned_buckets += 1;
                 }
                 stats.aborted_multipart_uploads +=
@@ -4193,7 +4196,7 @@ impl ReadRuntime {
         let bucket_pg = self
             .storage_node
             .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        let bucket_info = match bucket_pg.head_bucket(bucket.as_str()) {
+        let bucket_info = match bucket_pg.head_bucket(bucket) {
             Ok(info) => info,
             Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4272,7 +4275,7 @@ impl ReadRuntime {
         let bucket_pg = self
             .storage_node
             .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        let bucket_info = match bucket_pg.head_bucket(bucket.as_str()) {
+        let bucket_info = match bucket_pg.head_bucket(bucket) {
             Ok(info) => info,
             Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(0),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4401,7 +4404,7 @@ impl ReadRuntime {
         let bucket_pg = self
             .storage_node
             .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        let bucket_info = match bucket_pg.head_bucket(bucket.as_str()) {
+        let bucket_info = match bucket_pg.head_bucket(bucket) {
             Ok(info) => info,
             Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4500,7 +4503,7 @@ impl ReadRuntime {
         let bucket_pg = self
             .storage_node
             .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        let bucket_info = match bucket_pg.head_bucket(bucket.as_str()) {
+        let bucket_info = match bucket_pg.head_bucket(bucket) {
             Ok(info) => info,
             Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4852,7 +4855,7 @@ impl ReadRuntime {
         let bucket_pg_id = self.pg_topology.bucket_pg_for(bucket);
         {
             let bucket_pg = self.storage_node.get_pg(bucket_pg_id)?;
-            let info = match bucket_pg.head_bucket_raw(bucket.as_str()) {
+            let info = match bucket_pg.head_bucket_raw(bucket) {
                 Ok(info) => info,
                 Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(()),
                 Err(other) => return Err(ServerError::Metadata(other)),
@@ -5377,7 +5380,7 @@ impl Coordinator {
             }
         }
 
-        let authorized = self.authorize_load_bucket_lifecycle(bucket.name.as_str());
+        let authorized = self.authorize_load_bucket_lifecycle_for(&bucket.name);
         let raw_config = self.load_authorized_bucket_subresource(&authorized)?;
         let parsed_config = match raw_config {
             Some(config_xml) => Arc::new(
@@ -5931,16 +5934,12 @@ impl Coordinator {
     ) -> Result<(), ServerError> {
         loop {
             let bucket_pg = self.get_bucket_pg_for(bucket)?;
-            let info = bucket_pg
-                .head_bucket(bucket.as_str())
-                .map_err(|e| match e {
-                    storage::MetadataError::BucketNotFound { name } => {
-                        ServerError::BucketNotFound {
-                            name: name.to_string(),
-                        }
-                    }
-                    other => ServerError::Metadata(other),
-                })?;
+            let info = bucket_pg.head_bucket(bucket).map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
             if info.active_write_reservations == 0 {
                 return Ok(());
             }
@@ -6298,11 +6297,9 @@ impl Coordinator {
             req.object_lock_enabled
         );
         let authorized = self.authorize_create_bucket(req)?;
-        let authorized_name = trusted_bucket_name(&authorized.name);
-
         let create_outcome = self.create_bucket_with_acl_grants_for(
             &authorized.owner,
-            &authorized_name,
+            &authorized.name,
             authorized.acl_grants,
             authorized.object_lock_enabled,
         )?;
@@ -6310,7 +6307,7 @@ impl Coordinator {
             BucketCreateOutcome::Created => {
                 self.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
                     bucket: BucketRequest {
-                        name: authorized_name,
+                        name: authorized.name,
                         requester: authorized.requester.clone(),
                         expected_bucket_owner: None,
                     },
@@ -6325,7 +6322,7 @@ impl Coordinator {
                 {
                     return Err(ServerError::BucketAlreadyOwnedByYou);
                 }
-                let existing = self.unchecked_active_bucket_summary_for(&authorized_name)?;
+                let existing = self.unchecked_active_bucket_summary_for(&authorized.name)?;
                 let authorized_acl = self.resolve_create_bucket_recreate_acl_update(
                     &existing,
                     &authorized.owner,
@@ -6453,7 +6450,7 @@ impl Coordinator {
             object_lock: initial_object_lock,
         }) {
             Ok(()) => {
-                let info = bucket_pg.head_bucket(name.as_str()).map_err(|e| match e {
+                let info = bucket_pg.head_bucket(name).map_err(|e| match e {
                     storage::MetadataError::BucketNotFound { name } => {
                         ServerError::BucketNotFound {
                             name: name.to_string(),
@@ -6465,16 +6462,14 @@ impl Coordinator {
                 Ok(BucketCreateOutcome::Created)
             }
             Err(storage::MetadataError::BucketAlreadyExists) => {
-                let existing = bucket_pg
-                    .head_bucket_raw(name.as_str())
-                    .map_err(|e| match e {
-                        storage::MetadataError::BucketNotFound { name } => {
-                            ServerError::BucketNotFound {
-                                name: name.to_string(),
-                            }
+                let existing = bucket_pg.head_bucket_raw(name).map_err(|e| match e {
+                    storage::MetadataError::BucketNotFound { name } => {
+                        ServerError::BucketNotFound {
+                            name: name.to_string(),
                         }
-                        other => ServerError::Metadata(other),
-                    })?;
+                    }
+                    other => ServerError::Metadata(other),
+                })?;
                 match existing.state {
                     BucketState::Active
                         if existing.owner_principal == owner.principal
@@ -6842,7 +6837,10 @@ impl Coordinator {
             "bucket={:?}",
             name
         );
-        let authorized = self.authorize_load_bucket_cors_config(name);
+        let Ok(name) = BucketName::try_from(name) else {
+            return Ok(None);
+        };
+        let authorized = self.authorize_load_bucket_cors_config_for(&name);
         self.load_authorized_bucket_subresource(&authorized)
     }
 
@@ -18315,6 +18313,14 @@ mod tests {
             .unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn load_bucket_cors_config_invalid_bucket_name_returns_none() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+
+        assert_eq!(coord.load_bucket_cors_config("BadBucket").unwrap(), None);
     }
 
     #[test]
