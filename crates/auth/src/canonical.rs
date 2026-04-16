@@ -28,8 +28,8 @@ pub fn uri_encode(value: &str) -> String {
 
 /// Percent-encode a URI path, preserving '/' separators.
 ///
-/// This preserves any existing %XX sequences (uppercasing hex digits) to avoid
-/// double-encoding already-encoded bytes in the raw request path.
+/// This preserves any existing %XX sequences verbatim to avoid double-encoding
+/// already-encoded bytes in the raw request path.
 pub fn uri_encode_path(path: &str) -> String {
     let bytes = path.as_bytes();
     let mut encoded = String::with_capacity(path.len());
@@ -41,14 +41,16 @@ pub fn uri_encode_path(path: &str) -> String {
             i += 1;
             continue;
         }
-        if byte == b'%' && i + 2 < bytes.len() {
-            if let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
-                encoded.push('%');
-                encoded.push(HEX_UPPER[hi as usize] as char);
-                encoded.push(HEX_UPPER[lo as usize] as char);
-                i += 3;
-                continue;
-            }
+        if byte == b'%'
+            && i + 2 < bytes.len()
+            && hex_val(bytes[i + 1]).is_some()
+            && hex_val(bytes[i + 2]).is_some()
+        {
+            encoded.push('%');
+            encoded.push(bytes[i + 1] as char);
+            encoded.push(bytes[i + 2] as char);
+            i += 3;
+            continue;
         }
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
@@ -122,14 +124,14 @@ pub fn canonical_headers(headers: &[(&str, &str)]) -> String {
     result
 }
 
-/// Trim leading/trailing whitespace and collapse interior runs of whitespace
-/// to a single space, per SigV4 canonical header value rules.
+/// Trim leading/trailing spaces and collapse interior runs of spaces to a
+/// single space, matching AWS SigV4 canonical header normalization.
 fn normalize_header_value(value: &str) -> String {
-    let trimmed = value.trim();
+    let trimmed = value.trim_matches(' ');
     let mut result = String::with_capacity(trimmed.len());
     let mut prev_was_space = false;
     for ch in trimmed.chars() {
-        if ch.is_ascii_whitespace() {
+        if ch == ' ' {
             if !prev_was_space {
                 result.push(' ');
                 prev_was_space = true;
@@ -488,7 +490,7 @@ mod tests {
     #[test]
     fn uri_encode_path_preserves_percent_encoding() {
         assert_eq!(uri_encode_path("/bucket/1999%23"), "/bucket/1999%23");
-        assert_eq!(uri_encode_path("/bucket/%2f"), "/bucket/%2F");
+        assert_eq!(uri_encode_path("/bucket/%2f"), "/bucket/%2f");
     }
 
     #[test]
@@ -551,6 +553,19 @@ mod tests {
         assert_eq!(
             result,
             "host:example.com\nx-amz-meta-desc:hello world foo\n"
+        );
+    }
+
+    #[test]
+    fn canonical_headers_preserves_tabs() {
+        let headers = [
+            ("host", "example.com"),
+            ("x-amz-meta-desc", "\thello\tworld\t"),
+        ];
+        let result = canonical_headers(&headers);
+        assert_eq!(
+            result,
+            "host:example.com\nx-amz-meta-desc:\thello\tworld\t\n"
         );
     }
 
@@ -700,11 +715,11 @@ mod tests {
     // ── Property-based tests ────────────────────────────────────────
 
     fn normalize_value_ref(value: &str) -> String {
-        let trimmed = value.trim();
+        let trimmed = value.trim_matches(' ');
         let mut result = String::with_capacity(trimmed.len());
         let mut prev_was_space = false;
         for ch in trimmed.chars() {
-            if ch.is_ascii_whitespace() {
+            if ch == ' ' {
                 if !prev_was_space {
                     result.push(' ');
                     prev_was_space = true;

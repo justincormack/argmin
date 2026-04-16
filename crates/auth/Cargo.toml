@@ -13,4 +13,7 @@ subtle = "2"
 thiserror = "2"
 
 [dev-dependencies]
+aws-credential-types = "1"
+aws-sigv4 = { version = "1", default-features = false, features = ["sign-http", "http1"] }
+aws-smithy-runtime-api = { version = "1", features = ["client"] }
 proptest = "1"
