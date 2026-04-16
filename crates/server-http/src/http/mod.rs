@@ -135,25 +135,25 @@ fn parse_object_key(key: &str) -> Result<ObjectKey, ServerError> {
 }
 
 fn bucket_request<'a>(
-    bucket: &str,
+    bucket: &BucketName,
     requester: crate::coordinator::Requester,
     expected_bucket_owner: Option<&'a str>,
 ) -> Result<BucketRequest<'a>, ServerError> {
     Ok(BucketRequest::new(
-        parse_bucket_name(bucket)?,
+        bucket.clone(),
         requester,
         expected_bucket_owner,
     ))
 }
 
 fn object_request<'a>(
-    bucket: &str,
+    bucket: &BucketName,
     key: &str,
     requester: crate::coordinator::Requester,
     expected_bucket_owner: Option<&'a str>,
 ) -> Result<ObjectRequest<'a>, ServerError> {
     Ok(ObjectRequest::new(
-        parse_bucket_name(bucket)?,
+        bucket.clone(),
         parse_object_key(key)?,
         requester,
         expected_bucket_owner,
@@ -161,14 +161,14 @@ fn object_request<'a>(
 }
 
 fn object_version_request<'a>(
-    bucket: &str,
+    bucket: &BucketName,
     key: &str,
     version_id: Option<VersionId>,
     requester: crate::coordinator::Requester,
     expected_bucket_owner: Option<&'a str>,
 ) -> Result<ObjectVersionRequest<'a>, ServerError> {
     Ok(ObjectVersionRequest::new(
-        parse_bucket_name(bucket)?,
+        bucket.clone(),
         parse_object_key(key)?,
         version_id,
         requester,
@@ -177,14 +177,14 @@ fn object_version_request<'a>(
 }
 
 fn multipart_object_request<'a>(
-    bucket: &str,
+    bucket: &BucketName,
     key: &str,
     upload_id: &'a str,
     requester: crate::coordinator::Requester,
     expected_bucket_owner: Option<&'a str>,
 ) -> Result<MultipartObjectRequest<'a>, ServerError> {
     Ok(MultipartObjectRequest::new(
-        parse_bucket_name(bucket)?,
+        bucket.clone(),
         parse_object_key(key)?,
         upload_id,
         requester,
@@ -677,6 +677,7 @@ impl HttpFrontend {
             return self.handle_options_request(s3req, bucket);
         }
 
+        let actual_cors_bucket = operation.bucket_name().cloned();
         let defer_region_check = self.should_defer_region_check(&operation);
         let auth = {
             observability::trace_scope!(
@@ -734,8 +735,7 @@ impl HttpFrontend {
 
         // CORS response headers on actual (non-preflight) requests.
         if let Some(origin) = s3req.header("origin") {
-            let bucket = self.extract_bucket_from_path(s3req.path());
-            if let Some(bucket) = bucket {
+            if let Some(bucket) = actual_cors_bucket {
                 observability::trace_scope!(
                     TRACE_TARGET,
                     "HttpFrontend::apply_actual_cors",
@@ -752,7 +752,7 @@ impl HttpFrontend {
     }
 
     /// Handle an OPTIONS (CORS preflight) request. No auth required.
-    fn handle_options_request(&self, req: &S3Request, bucket: &str) -> S3Response {
+    fn handle_options_request(&self, req: &S3Request, bucket: &BucketName) -> S3Response {
         let origin = match req.header("origin") {
             Some(o) => o,
             None => {
@@ -777,7 +777,7 @@ impl HttpFrontend {
             .unwrap_or_default();
 
         // Load CORS config
-        let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket) {
+        let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket.as_str()) {
             Ok(Some(xml)) => xml,
             _ => return S3Response::forbidden(),
         };
@@ -808,11 +808,11 @@ impl HttpFrontend {
     /// has an Origin header and a matching CORS rule exists.
     pub(crate) fn actual_cors_headers(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
         origin: &str,
         method: &str,
     ) -> Vec<(String, String)> {
-        let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket) {
+        let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket.as_str()) {
             Ok(Some(xml)) => xml,
             _ => return Vec::new(),
         };
@@ -828,26 +828,15 @@ impl HttpFrontend {
         }
     }
 
-    fn apply_cors_headers(&self, resp: &mut S3Response, bucket: &str, origin: &str, method: &str) {
+    fn apply_cors_headers(
+        &self,
+        resp: &mut S3Response,
+        bucket: &BucketName,
+        origin: &str,
+        method: &str,
+    ) {
         for (k, v) in self.actual_cors_headers(bucket, origin, method) {
             resp.headers.push((k, v));
-        }
-    }
-
-    /// Extract bucket name from the request path (first path segment).
-    fn extract_bucket_from_path(&self, path: &str) -> Option<String> {
-        let trimmed = path.strip_prefix('/').unwrap_or(path);
-        if trimmed.is_empty() {
-            return None;
-        }
-        let bucket = match trimmed.find('/') {
-            Some(pos) => &trimmed[..pos],
-            None => trimmed,
-        };
-        if bucket.is_empty() {
-            None
-        } else {
-            Some(bucket.to_string())
         }
     }
 
@@ -986,14 +975,14 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .create_bucket(&crate::coordinator::CreateBucketRequest {
-                        name: parse_bucket_name(&bucket)?,
+                        name: bucket.clone(),
                         requester,
                         namespace,
                         acl,
                         ownership,
                         object_lock_enabled,
                     })?;
-                Ok(S3Response::create_bucket(&bucket))
+                Ok(S3Response::create_bucket(bucket.as_str()))
             }
             S3Operation::DeleteBucket { bucket } => {
                 let requester = Self::requester_from_auth(auth);
@@ -1046,7 +1035,7 @@ impl HttpFrontend {
                     },
                 )?;
                 Ok(S3Response::list_objects_v1(
-                    &bucket,
+                    bucket.as_str(),
                     self.coordinator.region(),
                     prefix.as_deref(),
                     delimiter.as_deref(),
@@ -1097,7 +1086,7 @@ impl HttpFrontend {
                     },
                 )?;
                 Ok(S3Response::list_objects_v2(
-                    &bucket,
+                    bucket.as_str(),
                     self.coordinator.region(),
                     prefix.as_deref(),
                     delimiter.as_deref(),
@@ -1799,7 +1788,7 @@ impl HttpFrontend {
                 )?)? {
                     Some(config_xml) => Ok(S3Response::get_bucket_cors(&config_xml)),
                     None => Err(ServerError::NoSuchCorsConfiguration {
-                        bucket: bucket.clone(),
+                        bucket: bucket.to_string(),
                     }),
                 }
             }
@@ -1836,7 +1825,7 @@ impl HttpFrontend {
                 )?)? {
                     Some(tags_xml) => Ok(S3Response::get_bucket_tagging(&tags_xml)),
                     None => Err(ServerError::NoSuchTagSet {
-                        resource: bucket.clone(),
+                        resource: bucket.to_string(),
                     }),
                 }
             }
@@ -1873,7 +1862,7 @@ impl HttpFrontend {
                 )?)? {
                     Some(config_xml) => Ok(S3Response::get_bucket_lifecycle(&config_xml)),
                     None => Err(ServerError::NoSuchLifecycleConfiguration {
-                        bucket: bucket.clone(),
+                        bucket: bucket.to_string(),
                     }),
                 }
             }
@@ -2106,7 +2095,7 @@ impl HttpFrontend {
                         &xml::get_public_access_block_xml(&config),
                     )),
                     None => Err(ServerError::NoSuchPublicAccessBlockConfiguration {
-                        bucket: bucket.clone(),
+                        bucket: bucket.to_string(),
                     }),
                 }
             }
@@ -2145,7 +2134,7 @@ impl HttpFrontend {
                         &xml::get_ownership_controls_xml(&config),
                     )),
                     None => Err(ServerError::OwnershipControlsNotFound {
-                        bucket: bucket.clone(),
+                        bucket: bucket.to_string(),
                     }),
                 }
             }
@@ -2192,7 +2181,7 @@ impl HttpFrontend {
                 )?)? {
                     Some(policy) => Ok(S3Response::get_bucket_policy(&policy)),
                     None => Err(ServerError::NoSuchBucketPolicy {
-                        bucket: bucket.clone(),
+                        bucket: bucket.to_string(),
                     }),
                 }
             }
@@ -2356,7 +2345,7 @@ impl HttpFrontend {
                     },
                 )?;
                 Ok(S3Response::create_multipart_upload(
-                    &bucket,
+                    bucket.as_str(),
                     &key,
                     &result.upload_id,
                     crate::http::response::CreateMultipartUploadResponseContext {
@@ -2464,7 +2453,9 @@ impl HttpFrontend {
                     },
                 )?;
                 Ok(S3Response::complete_multipart_upload(
-                    &bucket, &key, &result,
+                    bucket.as_str(),
+                    &key,
+                    &result,
                 ))
             }
             S3Operation::AbortMultipartUpload { bucket, key } => {
@@ -2506,7 +2497,7 @@ impl HttpFrontend {
                 )?;
                 let rendered = self.render_multipart_uploads(result);
                 Ok(S3Response::list_multipart_uploads(
-                    &bucket,
+                    bucket.as_str(),
                     prefix.as_deref(),
                     key_marker.as_deref(),
                     upload_id_marker.as_deref(),
@@ -2545,7 +2536,7 @@ impl HttpFrontend {
                             max_parts,
                         })?;
                 Ok(S3Response::list_parts(
-                    &bucket,
+                    bucket.as_str(),
                     &key,
                     &upload_id,
                     part_number_marker,
@@ -2585,7 +2576,7 @@ impl HttpFrontend {
                     },
                 )?;
                 Ok(S3Response::list_object_versions(
-                    &bucket,
+                    bucket.as_str(),
                     prefix.as_deref(),
                     key_marker.as_deref(),
                     encoding_type.as_deref(),
@@ -2745,7 +2736,11 @@ impl HttpFrontend {
         self.enforce_bucket_region(bucket, auth)
     }
 
-    fn enforce_bucket_region(&self, bucket: &str, auth: &AuthContext) -> Result<(), ServerError> {
+    fn enforce_bucket_region(
+        &self,
+        bucket: &BucketName,
+        auth: &AuthContext,
+    ) -> Result<(), ServerError> {
         let Some(signing_region) = auth.signing_region.as_deref() else {
             return Ok(());
         };
@@ -2759,6 +2754,15 @@ impl HttpFrontend {
             provided_region: signing_region.to_string(),
             expected_region: self.coordinator.region().to_string(),
         })
+    }
+
+    fn enforce_bucket_region_raw(
+        &self,
+        bucket: &str,
+        auth: &AuthContext,
+    ) -> Result<(), ServerError> {
+        let bucket = parse_bucket_name(bucket)?;
+        self.enforce_bucket_region(&bucket, auth)
     }
 
     /// Reject streaming requests that fell through `is_streaming_write` in serve.rs.
@@ -3006,7 +3010,7 @@ impl HttpFrontend {
         } else {
             &post_auth
         };
-        self.enforce_bucket_region(bucket, effective_auth)?;
+        self.enforce_bucket_region_raw(bucket, effective_auth)?;
 
         // Build metadata headers from form fields.
         let mut header_pairs: Vec<(String, String)> = Vec::new();
@@ -3340,7 +3344,7 @@ impl HttpFrontend {
         );
         Self::require_content_sha256_for_sigv4_header_auth(req)?;
         let auth = self.authenticate_with_payload_check(req, false, true)?;
-        self.enforce_bucket_region(bucket, &auth)?;
+        self.enforce_bucket_region_raw(bucket, &auth)?;
         reject_directory_bucket_only_object_features(req)?;
 
         let object_lock = parse_object_lock_headers(req)?;
@@ -3428,7 +3432,7 @@ impl HttpFrontend {
             self.coordinator
                 .prepare_put_object_write(&AuthorizePutObjectRequest {
                     object: object_request(
-                        bucket,
+                        &parse_bucket_name(bucket)?,
                         key,
                         requester.clone(),
                         expected_bucket_owner(req),
@@ -3646,7 +3650,7 @@ impl HttpFrontend {
         );
         Self::require_content_sha256_for_sigv4_header_auth(req)?;
         let auth = self.authenticate_with_payload_check(req, false, true)?;
-        self.enforce_bucket_region(bucket, &auth)?;
+        self.enforce_bucket_region_raw(bucket, &auth)?;
 
         validate_request_checksum_headers(req, false, false)?;
         let content_md5 = ContentMd5Claim::from_request(req)?;
@@ -3662,8 +3666,9 @@ impl HttpFrontend {
             }
         }
 
+        let bucket_name = parse_bucket_name(bucket)?;
         let upload = multipart_object_request(
-            bucket,
+            &bucket_name,
             key,
             upload_id,
             requester.clone(),
@@ -5283,6 +5288,10 @@ mod tests {
             .unwrap();
     }
 
+    fn test_bucket_name(name: &str) -> BucketName {
+        parse_bucket_name(name).unwrap()
+    }
+
     fn hex_lower(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
@@ -5432,7 +5441,7 @@ mod tests {
 
         match fe.enforce_bucket_region_for_operation(
             &S3Operation::PutObject {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
                 key: "key".to_string(),
             },
             &auth,
@@ -5465,7 +5474,7 @@ mod tests {
 
         fe.enforce_bucket_region_for_operation(
             &S3Operation::PutObject {
-                bucket: "missing".to_string(),
+                bucket: test_bucket_name("missing"),
                 key: "key".to_string(),
             },
             &auth,
@@ -5479,13 +5488,13 @@ mod tests {
         let fe = setup_frontend(tmp.path());
 
         assert!(fe.should_defer_region_check(&S3Operation::CreateBucket {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
         }));
     }
 
     fn test_bucket_request(name: &str) -> crate::coordinator::BucketRequest<'_> {
         crate::coordinator::BucketRequest::new(
-            parse_bucket_name(name).unwrap(),
+            test_bucket_name(name),
             crate::coordinator::test_helpers::requester("testuser"),
             None,
         )
@@ -5561,7 +5570,7 @@ mod tests {
                 &req,
                 &test_auth(),
                 S3Operation::GetBucketLocation {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -5931,7 +5940,7 @@ mod tests {
                 &put_req,
                 &test_auth(),
                 S3Operation::PutObject {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                     key: "mykey".to_string(),
                 },
             )
@@ -5948,7 +5957,7 @@ mod tests {
                 &head_req,
                 &test_auth(),
                 S3Operation::HeadObject {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                     key: "mykey".to_string(),
                 },
             )
@@ -5992,7 +6001,7 @@ mod tests {
             &req,
             &test_auth(),
             S3Operation::PutObject {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
                 key: "mykey".to_string(),
             },
         ) {
@@ -6027,7 +6036,7 @@ mod tests {
             &req,
             &test_auth(),
             S3Operation::PutObject {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
                 key: "mykey".to_string(),
             },
         ) {
@@ -6050,7 +6059,7 @@ mod tests {
             &put_req,
             &test_auth(),
             S3Operation::PutObject {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
                 key: "mykey".to_string(),
             },
         )
@@ -6067,7 +6076,7 @@ mod tests {
             &head_req,
             &test_auth(),
             S3Operation::HeadObject {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
                 key: "mykey".to_string(),
             },
         ) {
@@ -6298,7 +6307,7 @@ mod tests {
             &put_req,
             &test_auth(),
             S3Operation::PutBucketAcl {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         )
         .unwrap();
@@ -6309,7 +6318,7 @@ mod tests {
                 &get_req,
                 &test_auth(),
                 S3Operation::GetBucketAcl {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -6337,7 +6346,7 @@ mod tests {
                 &put_req,
                 &test_auth(),
                 S3Operation::PutBucketPolicy {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -6349,7 +6358,7 @@ mod tests {
                 &get_req,
                 &test_auth(),
                 S3Operation::GetBucketPolicy {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -6366,7 +6375,7 @@ mod tests {
                 &delete_req,
                 &test_auth(),
                 S3Operation::DeleteBucketPolicy {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -6376,7 +6385,7 @@ mod tests {
             &get_req,
             &test_auth(),
             S3Operation::GetBucketPolicy {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         ) {
             Err(ServerError::NoSuchBucketPolicy { bucket }) => assert_eq!(bucket, "mybucket"),
@@ -6402,7 +6411,7 @@ mod tests {
             &put_req,
             &test_auth(),
             S3Operation::PutBucketPolicy {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         ) {
             Err(ServerError::InvalidArgument { reason }) => {
@@ -6430,7 +6439,7 @@ mod tests {
             &put_req,
             &test_auth(),
             S3Operation::PutBucketPolicy {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         ) {
             Err(ServerError::MalformedPolicy { reason }) => {
@@ -6470,7 +6479,7 @@ mod tests {
             &put_req,
             &test_auth(),
             S3Operation::PutBucketPolicy {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         ) {
             Err(ServerError::MalformedPolicy { reason }) => {
@@ -6506,7 +6515,7 @@ mod tests {
                 &get_req,
                 &test_auth(),
                 S3Operation::GetBucketPolicyStatus {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -6547,7 +6556,7 @@ mod tests {
                 &put_req,
                 &test_auth(),
                 S3Operation::PutBucketLifecycle {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -6559,7 +6568,7 @@ mod tests {
                 &get_req,
                 &test_auth(),
                 S3Operation::GetBucketLifecycle {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -6576,7 +6585,7 @@ mod tests {
                 &delete_req,
                 &test_auth(),
                 S3Operation::DeleteBucketLifecycle {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -6586,7 +6595,7 @@ mod tests {
             &get_req,
             &test_auth(),
             S3Operation::GetBucketLifecycle {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         ) {
             Err(ServerError::NoSuchLifecycleConfiguration { bucket }) => {
@@ -6629,7 +6638,7 @@ mod tests {
                 &put_req,
                 &test_auth(),
                 S3Operation::PutBucketLifecycle {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -6641,7 +6650,7 @@ mod tests {
                 &get_req,
                 &test_auth(),
                 S3Operation::GetBucketLifecycle {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -6669,7 +6678,7 @@ mod tests {
             &get_req,
             &test_auth(),
             S3Operation::GetBucketLifecycle {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         ) {
             Err(ServerError::NoSuchLifecycleConfiguration { bucket }) => {
@@ -6703,7 +6712,7 @@ mod tests {
             &put_req,
             &test_auth(),
             S3Operation::PutBucketLifecycle {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         ) {
             Err(ServerError::MalformedXML { .. }) => {}
@@ -6735,7 +6744,7 @@ mod tests {
             &put_req,
             &test_auth(),
             S3Operation::PutBucketLifecycle {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         ) {
             Err(ServerError::MalformedXML { .. }) => {}
@@ -6767,7 +6776,7 @@ mod tests {
             &put_req,
             &test_auth(),
             S3Operation::PutBucketLifecycle {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         ) {
             Err(ServerError::InvalidRequest { reason }) => {
@@ -6804,7 +6813,7 @@ mod tests {
             &put_req,
             &test_auth(),
             S3Operation::PutBucketLifecycle {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         ) {
             Err(ServerError::InvalidDigest) => {}
@@ -6839,7 +6848,7 @@ mod tests {
             &put_req,
             &test_auth(),
             S3Operation::PutBucketLifecycle {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         ) {
             Err(ServerError::BadDigest) => {}
@@ -6873,7 +6882,7 @@ mod tests {
             &put_lifecycle_req,
             &test_auth(),
             S3Operation::PutBucketLifecycle {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         )
         .unwrap();
@@ -6890,7 +6899,7 @@ mod tests {
                 &put_req,
                 &test_auth(),
                 S3Operation::PutObject {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                     key: "logs/app.txt".to_string(),
                 },
             )
@@ -6931,7 +6940,7 @@ mod tests {
             &put_lifecycle_req,
             &test_auth(),
             S3Operation::PutBucketLifecycle {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         )
         .unwrap();
@@ -6948,7 +6957,7 @@ mod tests {
                 &put_req,
                 &test_auth(),
                 S3Operation::PutObject {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                     key: "logs/app.txt".to_string(),
                 },
             )
@@ -6969,7 +6978,7 @@ mod tests {
                 &get_req,
                 &test_auth(),
                 S3Operation::GetObject {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                     key: "logs/app.txt".to_string(),
                 },
             )
@@ -7002,7 +7011,7 @@ mod tests {
             &put_lifecycle_req,
             &test_auth(),
             S3Operation::PutBucketLifecycle {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         )
         .unwrap();
@@ -7018,7 +7027,7 @@ mod tests {
             &put_req,
             &test_auth(),
             S3Operation::PutObject {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
                 key: "logs/app.txt".to_string(),
             },
         )
@@ -7030,7 +7039,7 @@ mod tests {
                 &head_req,
                 &test_auth(),
                 S3Operation::HeadObject {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                     key: "logs/app.txt".to_string(),
                 },
             )
@@ -7063,7 +7072,7 @@ mod tests {
             &put_lifecycle_req,
             &test_auth(),
             S3Operation::PutBucketLifecycle {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         )
         .unwrap();
@@ -7074,7 +7083,7 @@ mod tests {
                 &create_req,
                 &test_auth(),
                 S3Operation::CreateMultipartUpload {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                     key: "uploads/archive.bin".to_string(),
                 },
             )
@@ -7103,7 +7112,7 @@ mod tests {
                 &list_req,
                 &test_auth(),
                 S3Operation::ListParts {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                     key: "uploads/archive.bin".to_string(),
                 },
             )
@@ -7145,7 +7154,7 @@ mod tests {
             &put_req,
             &test_auth(),
             S3Operation::PutObject {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
                 key: "mykey".to_string(),
             },
         )
@@ -7157,7 +7166,7 @@ mod tests {
                 &get_req,
                 &test_auth(),
                 S3Operation::GetObjectAcl {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                     key: "mykey".to_string(),
                 },
             )
@@ -7193,7 +7202,7 @@ mod tests {
             &put_req,
             &test_auth(),
             S3Operation::PutBucketAcl {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         )
         .unwrap();
@@ -7204,7 +7213,7 @@ mod tests {
                 &get_req,
                 &test_auth(),
                 S3Operation::GetBucketAcl {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -7232,7 +7241,7 @@ mod tests {
                 &req,
                 &test_auth(),
                 S3Operation::CreateBucket {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -7264,7 +7273,7 @@ mod tests {
             &create_req,
             &test_auth(),
             S3Operation::CreateBucket {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         )
         .unwrap();
@@ -7310,7 +7319,7 @@ mod tests {
                 &put_req,
                 &test_auth(),
                 S3Operation::PutBucketObjectLockConfiguration {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -7328,7 +7337,7 @@ mod tests {
                 &get_req,
                 &test_auth(),
                 S3Operation::GetBucketObjectLockConfiguration {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -7380,7 +7389,7 @@ mod tests {
                 &put_req,
                 &test_auth(),
                 S3Operation::PutObjectAcl {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                     key: "mykey".to_string(),
                 },
             )
@@ -7479,7 +7488,7 @@ mod tests {
 
         let req = make_req("partNumber=1");
         let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -7497,7 +7506,7 @@ mod tests {
 
         let req = make_req("partNumber=abc&uploadId=xyz");
         let op = S3Operation::UploadPart {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -7552,7 +7561,7 @@ mod tests {
             b"hello world".to_vec(),
         );
         let op = S3Operation::PutObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -7579,7 +7588,7 @@ mod tests {
             b"hello world".to_vec(),
         );
         let op = S3Operation::PutObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -7597,7 +7606,7 @@ mod tests {
 
         let req = new_req(http::Method::PUT, "", "", vec![], b"hello world".to_vec());
         let op = S3Operation::PutObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -7617,7 +7626,7 @@ mod tests {
                 &req,
                 &test_auth(),
                 S3Operation::PutBucketVersioning {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -7642,7 +7651,7 @@ mod tests {
             vec![],
             body,
             S3Operation::PutBucketObjectLockConfiguration {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
             "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
         );
@@ -7667,7 +7676,7 @@ mod tests {
                 &req,
                 &test_auth(),
                 S3Operation::PutBucketEncryption {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -7689,7 +7698,7 @@ mod tests {
             vec![],
             body,
             S3Operation::PutBucketCors {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
             "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
         );
@@ -7706,7 +7715,7 @@ mod tests {
             vec![],
             body,
             S3Operation::PutBucketTagging {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
             "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
         );
@@ -7725,7 +7734,7 @@ mod tests {
             vec![],
             body,
             S3Operation::PutObjectRetention {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
                 key: "mykey".to_string(),
             },
             "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
@@ -7741,7 +7750,7 @@ mod tests {
             vec![],
             body,
             S3Operation::PutObjectLegalHold {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
                 key: "mykey".to_string(),
             },
             "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
@@ -7778,7 +7787,7 @@ mod tests {
                 &req,
                 &test_auth(),
                 S3Operation::PutObjectTagging {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                     key: "mykey".to_string(),
                 },
             )
@@ -7822,7 +7831,7 @@ mod tests {
                 &req,
                 &test_auth(),
                 S3Operation::PutObjectAcl {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                     key: "mykey".to_string(),
                 },
             )
@@ -7864,7 +7873,7 @@ mod tests {
                 &req,
                 &test_auth(),
                 S3Operation::PutObjectAcl {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                     key: "mykey".to_string(),
                 },
             )
@@ -7899,7 +7908,7 @@ mod tests {
             &req,
             &test_auth(),
             S3Operation::PutObjectAcl {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
                 key: "mykey".to_string(),
             },
         ) {
@@ -7929,7 +7938,7 @@ mod tests {
                 &req,
                 &test_auth(),
                 S3Operation::PutBucketPublicAccessBlock {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -7949,7 +7958,7 @@ mod tests {
                 &req,
                 &test_auth(),
                 S3Operation::PutBucketOwnershipControls {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -7968,7 +7977,7 @@ mod tests {
                 &req,
                 &test_auth(),
                 S3Operation::PutBucketPolicy {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -7995,7 +8004,7 @@ mod tests {
                 &req,
                 &test_auth(),
                 S3Operation::PutBucketAcl {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -8020,7 +8029,7 @@ mod tests {
                 &req,
                 &test_auth(),
                 S3Operation::PutBucketAcl {
-                    bucket: "mybucket".to_string(),
+                    bucket: test_bucket_name("mybucket"),
                 },
             )
             .unwrap();
@@ -8044,7 +8053,7 @@ mod tests {
             &req,
             &auth::AuthContext::anonymous(),
             S3Operation::PutBucketAcl {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         ) {
             Err(ServerError::AccessDenied) => {}
@@ -8070,7 +8079,7 @@ mod tests {
             vec![],
             body,
             S3Operation::PutBucketLifecycle {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         );
     }
@@ -8084,7 +8093,7 @@ mod tests {
             vec![],
             body,
             S3Operation::PutBucketPolicy {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         );
     }
@@ -8097,7 +8106,7 @@ mod tests {
             vec![("x-amz-acl".to_string(), "private".to_string())],
             vec![],
             S3Operation::PutBucketAcl {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         );
     }
@@ -8119,7 +8128,7 @@ mod tests {
             &req,
             &test_auth(),
             S3Operation::PutBucketLifecycle {
-                bucket: "mybucket".to_string(),
+                bucket: test_bucket_name("mybucket"),
             },
         ) {
             Err(ServerError::InvalidRequest { reason }) => {
@@ -8259,7 +8268,7 @@ mod tests {
             b"hello world".to_vec(),
         );
         let op = S3Operation::PutObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8279,7 +8288,7 @@ mod tests {
 
         let req = make_req("");
         let op = S3Operation::CompleteMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8311,7 +8320,7 @@ mod tests {
             xml.into_bytes(),
         );
         let op = S3Operation::CompleteMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8344,7 +8353,7 @@ mod tests {
             xml.into_bytes(),
         );
         let op = S3Operation::CompleteMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8376,7 +8385,7 @@ mod tests {
             xml.into_bytes(),
         );
         let op = S3Operation::CompleteMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8409,7 +8418,7 @@ mod tests {
             xml.into_bytes(),
         );
         let op = S3Operation::CompleteMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8453,7 +8462,7 @@ mod tests {
             xml.into_bytes(),
         );
         let op = S3Operation::CompleteMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8485,7 +8494,7 @@ mod tests {
             xml.into_bytes(),
         );
         let op = S3Operation::CompleteMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8505,7 +8514,7 @@ mod tests {
 
         let req = make_req("");
         let op = S3Operation::AbortMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8525,7 +8534,7 @@ mod tests {
 
         let req = make_req("");
         let op = S3Operation::ListParts {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8543,7 +8552,7 @@ mod tests {
 
         let req = make_req("uploadId=abc&part-number-marker=xyz");
         let op = S3Operation::ListParts {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8561,7 +8570,7 @@ mod tests {
 
         let req = make_req("uploadId=abc&max-parts=notanumber");
         let op = S3Operation::ListParts {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8593,7 +8602,7 @@ mod tests {
             vec![],
         );
         let op = S3Operation::GetObjectAttributes {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8623,7 +8632,7 @@ mod tests {
             vec![],
         );
         let op = S3Operation::GetObjectAttributes {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8644,7 +8653,7 @@ mod tests {
         // 1. CreateMultipartUpload
         let req = make_req("uploads");
         let op = S3Operation::CreateMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -8681,7 +8690,7 @@ mod tests {
             complete_xml.into_bytes(),
         );
         let op = S3Operation::CompleteMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -8706,7 +8715,7 @@ mod tests {
 
         let req = make_req("uploads&max-uploads=abc");
         let op = S3Operation::ListMultipartUploads {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidArgument { .. }) => {}
@@ -8723,7 +8732,7 @@ mod tests {
 
         let req = make_req("versions&max-keys=abc");
         let op = S3Operation::ListObjectVersions {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidArgument { .. }) => {}
@@ -8740,7 +8749,7 @@ mod tests {
 
         let req = make_req("versions&max-keys=5000");
         let op = S3Operation::ListObjectVersions {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
         assert_eq!(resp.status_code, 200);
@@ -8760,7 +8769,7 @@ mod tests {
 
         let req = make_req("versions&version-id-marker=abc");
         let op = S3Operation::ListObjectVersions {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidArgument { .. }) => {}
@@ -8777,7 +8786,7 @@ mod tests {
 
         let req = make_req("versions&version-id-marker=1");
         let op = S3Operation::ListObjectVersions {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidArgument { reason }) => {
@@ -8804,7 +8813,7 @@ mod tests {
             vec![],
         );
         let op = S3Operation::GetObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "key".to_string(),
         };
         match fe.dispatch_routed(&req, &auth::AuthContext::anonymous(), op) {
@@ -8843,7 +8852,7 @@ mod tests {
             vec![],
         );
         let op = S3Operation::CreateMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8867,7 +8876,7 @@ mod tests {
             vec![],
         );
         let op = S3Operation::CreateMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8894,7 +8903,7 @@ mod tests {
             vec![],
         );
         let op = S3Operation::CreateMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8918,7 +8927,7 @@ mod tests {
             vec![],
         );
         let op = S3Operation::CreateMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8945,7 +8954,7 @@ mod tests {
             vec![],
         );
         let op = S3Operation::CreateMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -8972,7 +8981,7 @@ mod tests {
             vec![],
         );
         let op = S3Operation::CreateMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -9006,7 +9015,7 @@ mod tests {
             vec![],
         );
         let op = S3Operation::CreateMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -9037,7 +9046,7 @@ mod tests {
             vec![],
         );
         let op = S3Operation::CreateMultipartUpload {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -9069,7 +9078,7 @@ mod tests {
         }
         let req = new_req(http::Method::GET, "", "uploads", headers, vec![]);
         let op = S3Operation::CreateMultipartUpload {
-            bucket: bucket.to_string(),
+            bucket: test_bucket_name(bucket),
             key: key.to_string(),
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -9113,11 +9122,18 @@ mod tests {
         checksum_algorithm: Option<ChecksumAlgorithm>,
     ) -> crate::coordinator::UploadPartResult {
         let requester = HttpFrontend::requester_from_auth(&test_auth());
+        let bucket_name = test_bucket_name(bucket);
         let session = fe
             .coordinator
             .begin_stream_part(&BeginStreamPartRequest {
-                upload: multipart_object_request(bucket, key, upload_id, requester.clone(), None)
-                    .unwrap(),
+                upload: multipart_object_request(
+                    &bucket_name,
+                    key,
+                    upload_id,
+                    requester.clone(),
+                    None,
+                )
+                .unwrap(),
                 part_number,
                 policy_context: crate::coordinator::PutObjectPolicyContext::default(),
                 sse_customer: None,
@@ -9151,7 +9167,7 @@ mod tests {
             });
             fe.coordinator
                 .finalize_stream_part(FinalizeStreamPartRequest {
-                    upload: multipart_object_request(bucket, key, upload_id, requester, None)
+                    upload: multipart_object_request(&bucket_name, key, upload_id, requester, None)
                         .unwrap(),
                     session_id: &session.session_id,
                     part_number,
@@ -9223,7 +9239,7 @@ mod tests {
             xml.into_bytes(),
         );
         let op = S3Operation::CompleteMultipartUpload {
-            bucket: bucket.to_string(),
+            bucket: test_bucket_name(bucket),
             key: key.to_string(),
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -9251,7 +9267,7 @@ mod tests {
         // GET partNumber=2
         let req = make_req("partNumber=2");
         let op = S3Operation::GetObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -9298,7 +9314,7 @@ mod tests {
         // PUT a simple object
         let req = new_req(http::Method::GET, "", "", vec![], b"hello".to_vec());
         let op = S3Operation::PutObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -9306,7 +9322,7 @@ mod tests {
         // partNumber=0 → InvalidArgument
         let req = make_req("partNumber=0");
         let op = S3Operation::GetObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -9336,7 +9352,7 @@ mod tests {
         // partNumber=99 on a 3-part object → 416 InvalidRange
         let req = make_req("partNumber=99");
         let op = S3Operation::GetObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -9364,7 +9380,7 @@ mod tests {
             vec![],
         );
         let op = S3Operation::GetObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -9388,7 +9404,7 @@ mod tests {
         let data = b"hello world";
         let req = new_req(http::Method::GET, "", "", vec![], data.to_vec());
         let op = S3Operation::PutObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -9396,7 +9412,7 @@ mod tests {
         // partNumber=1 on inline object → 206 with full data
         let req = make_req("partNumber=1");
         let op = S3Operation::GetObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -9432,7 +9448,7 @@ mod tests {
 
         let req = new_req(http::Method::GET, "", "", vec![], b"hello".to_vec());
         let op = S3Operation::PutObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -9440,7 +9456,7 @@ mod tests {
         // partNumber=2 on non-multipart → 416 InvalidRange
         let req = make_req("partNumber=2");
         let op = S3Operation::GetObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -9469,7 +9485,7 @@ mod tests {
         // GET partNumber=1 — checksum always emitted for part GETs
         let req = make_req("partNumber=1");
         let op = S3Operation::GetObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         let resp = fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -9646,7 +9662,7 @@ mod tests {
             xml.to_vec(),
         );
         let op = S3Operation::DeleteObjects {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidArgument { .. }) => {}
@@ -9673,7 +9689,7 @@ mod tests {
             xml.to_vec(),
         );
         let op = S3Operation::DeleteObjects {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
         };
         // "null" is a valid version ID — should not error on parsing
         match fe.dispatch_routed(&req, &test_auth(), op) {
@@ -9700,7 +9716,7 @@ mod tests {
             xml.to_vec(),
         );
         let op = S3Operation::DeleteObjects {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidRequest { .. }) => {}
@@ -9727,7 +9743,7 @@ mod tests {
             xml.to_vec(),
         );
         let op = S3Operation::DeleteObjects {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidDigest) => {}
@@ -9757,7 +9773,7 @@ mod tests {
             xml.to_vec(),
         );
         let op = S3Operation::DeleteObjects {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::BadDigest) => {}
@@ -9780,7 +9796,7 @@ mod tests {
         // First put succeeds.
         let req = new_req(http::Method::GET, "", "", vec![], b"hello".to_vec());
         let op = S3Operation::PutObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         fe.dispatch_routed(&req, &test_auth(), op).unwrap();
@@ -9794,7 +9810,7 @@ mod tests {
             b"world".to_vec(),
         );
         let op2 = S3Operation::PutObject {
-            bucket: "mybucket".to_string(),
+            bucket: test_bucket_name("mybucket"),
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req2, &test_auth(), op2) {

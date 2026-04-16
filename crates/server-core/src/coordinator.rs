@@ -6657,17 +6657,14 @@ impl Coordinator {
         Ok(bucket_info)
     }
 
-    pub fn bucket_exists(&self, name: &str) -> Result<bool, ServerError> {
+    pub fn bucket_exists(&self, name: &BucketName) -> Result<bool, ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::bucket_exists",
             "bucket={:?}",
             name
         );
-        let Ok(name) = BucketName::try_from(name) else {
-            return Ok(false);
-        };
-        match self.unchecked_active_bucket_summary_for(&name) {
+        match self.unchecked_active_bucket_summary_for(name) {
             Ok(_) => Ok(true),
             Err(ServerError::BucketNotFound { .. }) => Ok(false),
             Err(err) => Err(err),

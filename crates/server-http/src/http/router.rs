@@ -7,68 +7,204 @@ use storage::{BucketName, ObjectKey};
 #[derive(Debug, PartialEq, Eq)]
 pub enum S3Operation {
     ListBuckets,
-    CreateBucket { bucket: String },
-    DeleteBucket { bucket: String },
-    HeadBucket { bucket: String },
-    GetBucketLocation { bucket: String },
-    ListObjectsV1 { bucket: String },
-    ListObjectsV2 { bucket: String },
-    PutObject { bucket: String, key: String },
-    GetObject { bucket: String, key: String },
-    DeleteObject { bucket: String, key: String },
-    HeadObject { bucket: String, key: String },
-    PostObject { bucket: String },
-    DeleteObjects { bucket: String },
-    ListObjectVersions { bucket: String },
-    PutBucketVersioning { bucket: String },
-    GetBucketVersioning { bucket: String },
-    PutBucketObjectLockConfiguration { bucket: String },
-    GetBucketObjectLockConfiguration { bucket: String },
-    PutBucketEncryption { bucket: String },
-    GetBucketEncryption { bucket: String },
-    DeleteBucketEncryption { bucket: String },
-    PutBucketCors { bucket: String },
-    GetBucketCors { bucket: String },
-    DeleteBucketCors { bucket: String },
-    PutBucketTagging { bucket: String },
-    GetBucketTagging { bucket: String },
-    DeleteBucketTagging { bucket: String },
-    PutBucketLifecycle { bucket: String },
-    GetBucketLifecycle { bucket: String },
-    DeleteBucketLifecycle { bucket: String },
-    PutObjectTagging { bucket: String, key: String },
-    GetObjectTagging { bucket: String, key: String },
-    DeleteObjectTagging { bucket: String, key: String },
-    PutObjectRetention { bucket: String, key: String },
-    GetObjectRetention { bucket: String, key: String },
-    PutObjectLegalHold { bucket: String, key: String },
-    GetObjectLegalHold { bucket: String, key: String },
-    PutObjectAcl { bucket: String, key: String },
-    GetObjectAcl { bucket: String, key: String },
-    PutBucketPublicAccessBlock { bucket: String },
-    GetBucketPublicAccessBlock { bucket: String },
-    DeleteBucketPublicAccessBlock { bucket: String },
-    GetBucketAcl { bucket: String },
-    PutBucketAcl { bucket: String },
-    PutBucketOwnershipControls { bucket: String },
-    GetBucketOwnershipControls { bucket: String },
-    DeleteBucketOwnershipControls { bucket: String },
-    GetObjectAttributes { bucket: String, key: String },
-    CreateMultipartUpload { bucket: String, key: String },
-    UploadPart { bucket: String, key: String },
-    CompleteMultipartUpload { bucket: String, key: String },
-    AbortMultipartUpload { bucket: String, key: String },
-    ListMultipartUploads { bucket: String },
-    ListParts { bucket: String, key: String },
-    PutBucketPolicy { bucket: String },
-    GetBucketPolicy { bucket: String },
-    GetBucketPolicyStatus { bucket: String },
-    DeleteBucketPolicy { bucket: String },
-    OptionsRequest { bucket: String, key: Option<String> },
+    CreateBucket {
+        bucket: BucketName,
+    },
+    DeleteBucket {
+        bucket: BucketName,
+    },
+    HeadBucket {
+        bucket: BucketName,
+    },
+    GetBucketLocation {
+        bucket: BucketName,
+    },
+    ListObjectsV1 {
+        bucket: BucketName,
+    },
+    ListObjectsV2 {
+        bucket: BucketName,
+    },
+    PutObject {
+        bucket: BucketName,
+        key: String,
+    },
+    GetObject {
+        bucket: BucketName,
+        key: String,
+    },
+    DeleteObject {
+        bucket: BucketName,
+        key: String,
+    },
+    HeadObject {
+        bucket: BucketName,
+        key: String,
+    },
+    PostObject {
+        bucket: BucketName,
+    },
+    DeleteObjects {
+        bucket: BucketName,
+    },
+    ListObjectVersions {
+        bucket: BucketName,
+    },
+    PutBucketVersioning {
+        bucket: BucketName,
+    },
+    GetBucketVersioning {
+        bucket: BucketName,
+    },
+    PutBucketObjectLockConfiguration {
+        bucket: BucketName,
+    },
+    GetBucketObjectLockConfiguration {
+        bucket: BucketName,
+    },
+    PutBucketEncryption {
+        bucket: BucketName,
+    },
+    GetBucketEncryption {
+        bucket: BucketName,
+    },
+    DeleteBucketEncryption {
+        bucket: BucketName,
+    },
+    PutBucketCors {
+        bucket: BucketName,
+    },
+    GetBucketCors {
+        bucket: BucketName,
+    },
+    DeleteBucketCors {
+        bucket: BucketName,
+    },
+    PutBucketTagging {
+        bucket: BucketName,
+    },
+    GetBucketTagging {
+        bucket: BucketName,
+    },
+    DeleteBucketTagging {
+        bucket: BucketName,
+    },
+    PutBucketLifecycle {
+        bucket: BucketName,
+    },
+    GetBucketLifecycle {
+        bucket: BucketName,
+    },
+    DeleteBucketLifecycle {
+        bucket: BucketName,
+    },
+    PutObjectTagging {
+        bucket: BucketName,
+        key: String,
+    },
+    GetObjectTagging {
+        bucket: BucketName,
+        key: String,
+    },
+    DeleteObjectTagging {
+        bucket: BucketName,
+        key: String,
+    },
+    PutObjectRetention {
+        bucket: BucketName,
+        key: String,
+    },
+    GetObjectRetention {
+        bucket: BucketName,
+        key: String,
+    },
+    PutObjectLegalHold {
+        bucket: BucketName,
+        key: String,
+    },
+    GetObjectLegalHold {
+        bucket: BucketName,
+        key: String,
+    },
+    PutObjectAcl {
+        bucket: BucketName,
+        key: String,
+    },
+    GetObjectAcl {
+        bucket: BucketName,
+        key: String,
+    },
+    PutBucketPublicAccessBlock {
+        bucket: BucketName,
+    },
+    GetBucketPublicAccessBlock {
+        bucket: BucketName,
+    },
+    DeleteBucketPublicAccessBlock {
+        bucket: BucketName,
+    },
+    GetBucketAcl {
+        bucket: BucketName,
+    },
+    PutBucketAcl {
+        bucket: BucketName,
+    },
+    PutBucketOwnershipControls {
+        bucket: BucketName,
+    },
+    GetBucketOwnershipControls {
+        bucket: BucketName,
+    },
+    DeleteBucketOwnershipControls {
+        bucket: BucketName,
+    },
+    GetObjectAttributes {
+        bucket: BucketName,
+        key: String,
+    },
+    CreateMultipartUpload {
+        bucket: BucketName,
+        key: String,
+    },
+    UploadPart {
+        bucket: BucketName,
+        key: String,
+    },
+    CompleteMultipartUpload {
+        bucket: BucketName,
+        key: String,
+    },
+    AbortMultipartUpload {
+        bucket: BucketName,
+        key: String,
+    },
+    ListMultipartUploads {
+        bucket: BucketName,
+    },
+    ListParts {
+        bucket: BucketName,
+        key: String,
+    },
+    PutBucketPolicy {
+        bucket: BucketName,
+    },
+    GetBucketPolicy {
+        bucket: BucketName,
+    },
+    GetBucketPolicyStatus {
+        bucket: BucketName,
+    },
+    DeleteBucketPolicy {
+        bucket: BucketName,
+    },
+    OptionsRequest {
+        bucket: BucketName,
+        key: Option<String>,
+    },
 }
 
 impl S3Operation {
-    pub fn bucket_name(&self) -> Option<&str> {
+    pub fn bucket_name(&self) -> Option<&BucketName> {
         match self {
             Self::ListBuckets => None,
             Self::CreateBucket { bucket }
@@ -109,7 +245,7 @@ impl S3Operation {
             | Self::GetBucketPolicy { bucket }
             | Self::GetBucketPolicyStatus { bucket }
             | Self::DeleteBucketPolicy { bucket }
-            | Self::OptionsRequest { bucket, .. } => Some(bucket.as_str()),
+            | Self::OptionsRequest { bucket, .. } => Some(bucket),
             Self::PutObject { bucket, .. }
             | Self::GetObject { bucket, .. }
             | Self::DeleteObject { bucket, .. }
@@ -128,7 +264,7 @@ impl S3Operation {
             | Self::UploadPart { bucket, .. }
             | Self::CompleteMultipartUpload { bucket, .. }
             | Self::AbortMultipartUpload { bucket, .. }
-            | Self::ListParts { bucket, .. } => Some(bucket.as_str()),
+            | Self::ListParts { bucket, .. } => Some(bucket),
         }
     }
 }
@@ -143,12 +279,10 @@ impl S3Operation {
 /// - No dot-dash (`.-`) or dash-dot (`-.`)
 /// - Not formatted as an IP address
 /// - Must not start with `xn--` (reserved for IDN/Punycode)
-fn validate_bucket_name(name: &str) -> Result<(), ServerError> {
-    BucketName::try_from(name)
-        .map(|_| ())
-        .map_err(|error| ServerError::InvalidBucketName {
-            reason: error.to_string(),
-        })
+fn parse_bucket_name(name: &str) -> Result<BucketName, ServerError> {
+    BucketName::try_from(name).map_err(|error| ServerError::InvalidBucketName {
+        reason: error.to_string(),
+    })
 }
 
 /// Validate an S3 object key.
@@ -186,7 +320,7 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         None => (trimmed, None),
     };
 
-    validate_bucket_name(bucket)?;
+    let bucket = parse_bucket_name(bucket)?;
 
     let decoded_key = key
         .map(crate::http::request::percent_decode_strict)
@@ -198,194 +332,194 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
     match (method, decoded_key) {
         // OPTIONS requests (preflight CORS)
         ("OPTIONS", key) => Ok(S3Operation::OptionsRequest {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
             key,
         }),
 
         // Bucket-level operations (no key)
         ("PUT", None) if query_has_key(query, "versioning") => {
             Ok(S3Operation::PutBucketVersioning {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
             })
         }
         ("PUT", None) if query_has_key(query, "object-lock") => {
             Ok(S3Operation::PutBucketObjectLockConfiguration {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
             })
         }
         ("PUT", None) if query_has_key(query, "encryption") => {
             Ok(S3Operation::PutBucketEncryption {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
             })
         }
         ("PUT", None) if query_has_key(query, "cors") => Ok(S3Operation::PutBucketCors {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
         }),
         ("PUT", None) if query_has_key(query, "tagging") => Ok(S3Operation::PutBucketTagging {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
         }),
         ("PUT", None) if query_has_key(query, "lifecycle") => Ok(S3Operation::PutBucketLifecycle {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
         }),
         ("PUT", None) if query_has_key(query, "publicAccessBlock") => {
             Ok(S3Operation::PutBucketPublicAccessBlock {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
             })
         }
         ("PUT", None) if query_has_key(query, "acl") => Ok(S3Operation::PutBucketAcl {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
         }),
         ("PUT", None) if query_has_key(query, "ownershipControls") => {
             Ok(S3Operation::PutBucketOwnershipControls {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
             })
         }
         ("PUT", None) if query_has_key(query, "policy") => Ok(S3Operation::PutBucketPolicy {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
         }),
         ("PUT", None) => Ok(S3Operation::CreateBucket {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
         }),
         ("DELETE", None) if query_has_key(query, "cors") => Ok(S3Operation::DeleteBucketCors {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
         }),
         ("DELETE", None) if query_has_key(query, "encryption") => {
             Ok(S3Operation::DeleteBucketEncryption {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
             })
         }
         ("DELETE", None) if query_has_key(query, "publicAccessBlock") => {
             Ok(S3Operation::DeleteBucketPublicAccessBlock {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
             })
         }
         ("DELETE", None) if query_has_key(query, "ownershipControls") => {
             Ok(S3Operation::DeleteBucketOwnershipControls {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
             })
         }
         ("DELETE", None) if query_has_key(query, "tagging") => {
             Ok(S3Operation::DeleteBucketTagging {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
             })
         }
         ("DELETE", None) if query_has_key(query, "lifecycle") => {
             Ok(S3Operation::DeleteBucketLifecycle {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
             })
         }
         ("DELETE", None) if query_has_key(query, "policy") => Ok(S3Operation::DeleteBucketPolicy {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
         }),
         ("DELETE", None) => Ok(S3Operation::DeleteBucket {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
         }),
         ("HEAD", None) => Ok(S3Operation::HeadBucket {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
         }),
         ("GET", None) => {
             if query_has_key(query, "location") {
                 return Ok(S3Operation::GetBucketLocation {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             // Check for ?uploads → ListMultipartUploads
             if query_has_key(query, "uploads") {
                 return Ok(S3Operation::ListMultipartUploads {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             // Check for ?ownershipControls → GetBucketOwnershipControls
             if query_has_key(query, "ownershipControls") {
                 return Ok(S3Operation::GetBucketOwnershipControls {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             // Check for ?publicAccessBlock → GetBucketPublicAccessBlock
             if query_has_key(query, "publicAccessBlock") {
                 return Ok(S3Operation::GetBucketPublicAccessBlock {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             // Check for ?cors → GetBucketCors
             if query_has_key(query, "cors") {
                 return Ok(S3Operation::GetBucketCors {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             // Check for ?tagging → GetBucketTagging
             if query_has_key(query, "tagging") {
                 return Ok(S3Operation::GetBucketTagging {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             if query_has_key(query, "lifecycle") {
                 return Ok(S3Operation::GetBucketLifecycle {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             // Check for ?policy → GetBucketPolicy
             if query_has_key(query, "policy") {
                 return Ok(S3Operation::GetBucketPolicy {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             // Check for ?policyStatus → GetBucketPolicyStatus
             if query_has_key(query, "policyStatus") {
                 return Ok(S3Operation::GetBucketPolicyStatus {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             // Check for ?acl → GetBucketAcl
             if query_has_key(query, "acl") {
                 return Ok(S3Operation::GetBucketAcl {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             // Check for ?versioning → GetBucketVersioning
             if query_has_key(query, "versioning") {
                 return Ok(S3Operation::GetBucketVersioning {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             // Check for ?object-lock → GetBucketObjectLockConfiguration
             if query_has_key(query, "object-lock") {
                 return Ok(S3Operation::GetBucketObjectLockConfiguration {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             // Check for ?encryption → GetBucketEncryption
             if query_has_key(query, "encryption") {
                 return Ok(S3Operation::GetBucketEncryption {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             // Check for ?versions → ListObjectVersions
             if query_has_key(query, "versions") {
                 return Ok(S3Operation::ListObjectVersions {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 });
             }
             // Check for list-type=2 → V2, otherwise → V1
             let is_v2 = query_has_param(query, "list-type", "2");
             if is_v2 {
                 Ok(S3Operation::ListObjectsV2 {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 })
             } else {
                 Ok(S3Operation::ListObjectsV1 {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 })
             }
         }
         ("POST", None) => {
             if query_has_key(query, "delete") {
                 Ok(S3Operation::DeleteObjects {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 })
             } else {
                 Ok(S3Operation::PostObject {
-                    bucket: bucket.to_string(),
+                    bucket: bucket.clone(),
                 })
             }
         }
@@ -393,51 +527,51 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         // Object-level tagging (must appear before catch-all)
         ("PUT", Some(key)) if query_has_key(query, "tagging") => {
             Ok(S3Operation::PutObjectTagging {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
                 key,
             })
         }
         ("PUT", Some(key)) if query_has_key(query, "acl") => Ok(S3Operation::PutObjectAcl {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
             key,
         }),
         ("GET", Some(key)) if query_has_key(query, "tagging") => {
             Ok(S3Operation::GetObjectTagging {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
                 key,
             })
         }
         ("GET", Some(key)) if query_has_key(query, "acl") => Ok(S3Operation::GetObjectAcl {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
             key,
         }),
         ("DELETE", Some(key)) if query_has_key(query, "tagging") => {
             Ok(S3Operation::DeleteObjectTagging {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
                 key,
             })
         }
         ("PUT", Some(key)) if query_has_key(query, "retention") => {
             Ok(S3Operation::PutObjectRetention {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
                 key,
             })
         }
         ("GET", Some(key)) if query_has_key(query, "retention") => {
             Ok(S3Operation::GetObjectRetention {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
                 key,
             })
         }
         ("PUT", Some(key)) if query_has_key(query, "legal-hold") => {
             Ok(S3Operation::PutObjectLegalHold {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
                 key,
             })
         }
         ("GET", Some(key)) if query_has_key(query, "legal-hold") => {
             Ok(S3Operation::GetObjectLegalHold {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
                 key,
             })
         }
@@ -445,7 +579,7 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         // GetObjectAttributes (must appear before catch-all GET)
         ("GET", Some(key)) if query_has_key(query, "attributes") => {
             Ok(S3Operation::GetObjectAttributes {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
                 key,
             })
         }
@@ -453,46 +587,46 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         // Multipart upload operations (must appear before catch-all object operations)
         ("POST", Some(key)) if query_has_key(query, "uploads") => {
             Ok(S3Operation::CreateMultipartUpload {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
                 key,
             })
         }
         ("POST", Some(key)) if query_has_key(query, "uploadId") => {
             Ok(S3Operation::CompleteMultipartUpload {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
                 key,
             })
         }
         ("PUT", Some(key)) if query_has_key(query, "partNumber") => Ok(S3Operation::UploadPart {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
             key,
         }),
         ("DELETE", Some(key)) if query_has_key(query, "uploadId") => {
             Ok(S3Operation::AbortMultipartUpload {
-                bucket: bucket.to_string(),
+                bucket: bucket.clone(),
                 key,
             })
         }
         ("GET", Some(key)) if query_has_key(query, "uploadId") => Ok(S3Operation::ListParts {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
             key,
         }),
 
         // Object-level operations
         ("PUT", Some(key)) => Ok(S3Operation::PutObject {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
             key,
         }),
         ("GET", Some(key)) => Ok(S3Operation::GetObject {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
             key,
         }),
         ("DELETE", Some(key)) => Ok(S3Operation::DeleteObject {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
             key,
         }),
         ("HEAD", Some(key)) => Ok(S3Operation::HeadObject {
-            bucket: bucket.to_string(),
+            bucket: bucket.clone(),
             key,
         }),
 
@@ -504,6 +638,10 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
 mod tests {
     use super::*;
 
+    fn bucket_name(name: &str) -> BucketName {
+        parse_bucket_name(name).unwrap()
+    }
+
     #[test]
     fn list_buckets() {
         assert_eq!(route("GET", "/", "").unwrap(), S3Operation::ListBuckets);
@@ -514,7 +652,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "").unwrap(),
             S3Operation::CreateBucket {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -524,7 +662,7 @@ mod tests {
         assert_eq!(
             route("DELETE", "/mybucket", "").unwrap(),
             S3Operation::DeleteBucket {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -534,7 +672,7 @@ mod tests {
         assert_eq!(
             route("HEAD", "/mybucket", "").unwrap(),
             S3Operation::HeadBucket {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -544,7 +682,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "location").unwrap(),
             S3Operation::GetBucketLocation {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -554,7 +692,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "list-type=2").unwrap(),
             S3Operation::ListObjectsV2 {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -564,7 +702,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "").unwrap(),
             S3Operation::ListObjectsV1 {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -574,7 +712,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "prefix=foo").unwrap(),
             S3Operation::ListObjectsV1 {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -584,7 +722,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "list-type=1").unwrap(),
             S3Operation::ListObjectsV1 {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -594,7 +732,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "list-type=2&prefix=foo&max-keys=10").unwrap(),
             S3Operation::ListObjectsV2 {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -604,7 +742,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "list-type=1&list-type=2").unwrap(),
             S3Operation::ListObjectsV2 {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -614,7 +752,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket/", "").unwrap(),
             S3Operation::ListObjectsV1 {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -624,7 +762,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/bucket/key.txt", "").unwrap(),
             S3Operation::PutObject {
-                bucket: "bucket".to_string(),
+                bucket: bucket_name("bucket"),
                 key: "key.txt".to_string()
             }
         );
@@ -635,7 +773,7 @@ mod tests {
         assert_eq!(
             route("GET", "/bucket/path/to/key", "").unwrap(),
             S3Operation::GetObject {
-                bucket: "bucket".to_string(),
+                bucket: bucket_name("bucket"),
                 key: "path/to/key".to_string()
             }
         );
@@ -646,7 +784,7 @@ mod tests {
         assert_eq!(
             route("DELETE", "/bucket/key", "").unwrap(),
             S3Operation::DeleteObject {
-                bucket: "bucket".to_string(),
+                bucket: bucket_name("bucket"),
                 key: "key".to_string()
             }
         );
@@ -657,7 +795,7 @@ mod tests {
         assert_eq!(
             route("HEAD", "/bucket/key", "").unwrap(),
             S3Operation::HeadObject {
-                bucket: "bucket".to_string(),
+                bucket: bucket_name("bucket"),
                 key: "key".to_string()
             }
         );
@@ -668,7 +806,7 @@ mod tests {
         assert_eq!(
             route("GET", "/bucket/a/b/c/d.txt", "").unwrap(),
             S3Operation::GetObject {
-                bucket: "bucket".to_string(),
+                bucket: bucket_name("bucket"),
                 key: "a/b/c/d.txt".to_string()
             }
         );
@@ -741,7 +879,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/bucket/key/", "").unwrap(),
             S3Operation::PutObject {
-                bucket: "bucket".to_string(),
+                bucket: bucket_name("bucket"),
                 key: "key/".to_string()
             }
         );
@@ -752,7 +890,7 @@ mod tests {
         assert_eq!(
             route("HEAD", "/mybucket/", "").unwrap(),
             S3Operation::HeadBucket {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -762,7 +900,7 @@ mod tests {
         assert_eq!(
             route("GET", "/bucket/a/b/c/", "").unwrap(),
             S3Operation::GetObject {
-                bucket: "bucket".to_string(),
+                bucket: bucket_name("bucket"),
                 key: "a/b/c/".to_string()
             }
         );
@@ -780,7 +918,7 @@ mod tests {
         assert_eq!(
             route("POST", "/mybucket", "delete").unwrap(),
             S3Operation::DeleteObjects {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -790,7 +928,7 @@ mod tests {
         assert_eq!(
             route("POST", "/mybucket", "delete&foo=bar").unwrap(),
             S3Operation::DeleteObjects {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -800,13 +938,13 @@ mod tests {
         assert_eq!(
             route("POST", "/mybucket", "").unwrap(),
             S3Operation::PostObject {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
         assert_eq!(
             route("POST", "/mybucket", "foo=bar").unwrap(),
             S3Operation::PostObject {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -816,7 +954,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "versions").unwrap(),
             S3Operation::ListObjectVersions {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -826,7 +964,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "versions&prefix=foo&max-keys=10").unwrap(),
             S3Operation::ListObjectVersions {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -836,7 +974,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "versioning").unwrap(),
             S3Operation::PutBucketVersioning {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -846,7 +984,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "versioning").unwrap(),
             S3Operation::GetBucketVersioning {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -856,7 +994,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "object-lock").unwrap(),
             S3Operation::PutBucketObjectLockConfiguration {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -866,7 +1004,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "object-lock").unwrap(),
             S3Operation::GetBucketObjectLockConfiguration {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -876,7 +1014,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "encryption").unwrap(),
             S3Operation::PutBucketEncryption {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -886,7 +1024,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "encryption").unwrap(),
             S3Operation::GetBucketEncryption {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -896,7 +1034,7 @@ mod tests {
         assert_eq!(
             route("DELETE", "/mybucket", "encryption").unwrap(),
             S3Operation::DeleteBucketEncryption {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -906,7 +1044,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "cors").unwrap(),
             S3Operation::PutBucketCors {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -916,7 +1054,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "cors").unwrap(),
             S3Operation::GetBucketCors {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -926,7 +1064,7 @@ mod tests {
         assert_eq!(
             route("DELETE", "/mybucket", "cors").unwrap(),
             S3Operation::DeleteBucketCors {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -936,7 +1074,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "lifecycle").unwrap(),
             S3Operation::PutBucketLifecycle {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -946,7 +1084,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "lifecycle").unwrap(),
             S3Operation::GetBucketLifecycle {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -956,7 +1094,7 @@ mod tests {
         assert_eq!(
             route("DELETE", "/mybucket", "lifecycle").unwrap(),
             S3Operation::DeleteBucketLifecycle {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -966,7 +1104,7 @@ mod tests {
         assert_eq!(
             route("OPTIONS", "/mybucket", "").unwrap(),
             S3Operation::OptionsRequest {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: None,
             }
         );
@@ -977,7 +1115,7 @@ mod tests {
         assert_eq!(
             route("OPTIONS", "/mybucket/path/to/key", "").unwrap(),
             S3Operation::OptionsRequest {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: Some("path/to/key".to_string()),
             }
         );
@@ -989,7 +1127,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "versioning").unwrap(),
             S3Operation::PutBucketVersioning {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -999,7 +1137,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "encryption").unwrap(),
             S3Operation::PutBucketEncryption {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1009,7 +1147,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "publicAccessBlock").unwrap(),
             S3Operation::PutBucketPublicAccessBlock {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1019,7 +1157,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "publicAccessBlock").unwrap(),
             S3Operation::GetBucketPublicAccessBlock {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1029,7 +1167,7 @@ mod tests {
         assert_eq!(
             route("DELETE", "/mybucket", "publicAccessBlock").unwrap(),
             S3Operation::DeleteBucketPublicAccessBlock {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1039,7 +1177,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "acl").unwrap(),
             S3Operation::PutBucketAcl {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1049,7 +1187,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "acl").unwrap(),
             S3Operation::GetBucketAcl {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1059,7 +1197,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "ownershipControls").unwrap(),
             S3Operation::PutBucketOwnershipControls {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1069,7 +1207,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "ownershipControls").unwrap(),
             S3Operation::GetBucketOwnershipControls {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1079,7 +1217,7 @@ mod tests {
         assert_eq!(
             route("DELETE", "/mybucket", "ownershipControls").unwrap(),
             S3Operation::DeleteBucketOwnershipControls {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1089,7 +1227,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket", "policy").unwrap(),
             S3Operation::PutBucketPolicy {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1099,7 +1237,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "policy").unwrap(),
             S3Operation::GetBucketPolicy {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1109,7 +1247,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "policyStatus").unwrap(),
             S3Operation::GetBucketPolicyStatus {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1119,7 +1257,7 @@ mod tests {
         assert_eq!(
             route("DELETE", "/mybucket", "policy").unwrap(),
             S3Operation::DeleteBucketPolicy {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1129,7 +1267,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket/mykey", "attributes").unwrap(),
             S3Operation::GetObjectAttributes {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1140,7 +1278,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket/mykey", "attributes&versionId=123").unwrap(),
             S3Operation::GetObjectAttributes {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1151,7 +1289,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket/mykey", "").unwrap(),
             S3Operation::GetObject {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1162,7 +1300,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket/mykey", "retention&versionId=123").unwrap(),
             S3Operation::PutObjectRetention {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1173,7 +1311,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket/mykey", "retention").unwrap(),
             S3Operation::GetObjectRetention {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1184,7 +1322,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket/mykey", "legal-hold").unwrap(),
             S3Operation::PutObjectLegalHold {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1195,7 +1333,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket/mykey", "legal-hold").unwrap(),
             S3Operation::GetObjectLegalHold {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1206,7 +1344,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "foo=bar").unwrap(),
             S3Operation::ListObjectsV1 {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1216,7 +1354,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket/mykey", "foo=bar").unwrap(),
             S3Operation::PutObject {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1229,7 +1367,7 @@ mod tests {
         assert_eq!(
             route("POST", "/mybucket/mykey", "uploads").unwrap(),
             S3Operation::CreateMultipartUpload {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1240,7 +1378,7 @@ mod tests {
         assert_eq!(
             route("POST", "/mybucket/a/b/c.txt", "uploads").unwrap(),
             S3Operation::CreateMultipartUpload {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "a/b/c.txt".to_string()
             }
         );
@@ -1251,7 +1389,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket/mykey", "partNumber=1&uploadId=abc").unwrap(),
             S3Operation::UploadPart {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1263,7 +1401,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket/mykey", "partNumber=5").unwrap(),
             S3Operation::UploadPart {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1274,7 +1412,7 @@ mod tests {
         assert_eq!(
             route("POST", "/mybucket/mykey", "uploadId=abc123").unwrap(),
             S3Operation::CompleteMultipartUpload {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1285,7 +1423,7 @@ mod tests {
         assert_eq!(
             route("DELETE", "/mybucket/mykey", "uploadId=abc123").unwrap(),
             S3Operation::AbortMultipartUpload {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1296,7 +1434,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "uploads").unwrap(),
             S3Operation::ListMultipartUploads {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1306,7 +1444,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "uploads&prefix=foo&max-uploads=10").unwrap(),
             S3Operation::ListMultipartUploads {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }
@@ -1316,7 +1454,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket/mykey", "uploadId=abc123").unwrap(),
             S3Operation::ListParts {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1332,7 +1470,7 @@ mod tests {
             )
             .unwrap(),
             S3Operation::ListParts {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1346,7 +1484,7 @@ mod tests {
         assert_eq!(
             route("POST", "/mybucket/mykey", "uploads").unwrap(),
             S3Operation::CreateMultipartUpload {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1358,7 +1496,7 @@ mod tests {
         assert_eq!(
             route("PUT", "/mybucket/mykey", "partNumber=1").unwrap(),
             S3Operation::UploadPart {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1370,7 +1508,7 @@ mod tests {
         assert_eq!(
             route("DELETE", "/mybucket/mykey", "uploadId=x").unwrap(),
             S3Operation::AbortMultipartUpload {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1382,7 +1520,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket/mykey", "uploadId=x").unwrap(),
             S3Operation::ListParts {
-                bucket: "mybucket".to_string(),
+                bucket: bucket_name("mybucket"),
                 key: "mykey".to_string()
             }
         );
@@ -1394,7 +1532,7 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "uploads").unwrap(),
             S3Operation::ListMultipartUploads {
-                bucket: "mybucket".to_string()
+                bucket: bucket_name("mybucket")
             }
         );
     }

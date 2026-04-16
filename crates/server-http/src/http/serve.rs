@@ -27,6 +27,7 @@ use super::{HttpFrontend, S3HyperBody};
 use crate::coordinator::MAX_OBJECT_SIZE;
 use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
+use storage::BucketName;
 
 const TRACE_TARGET: &str = "server_http";
 const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
@@ -165,11 +166,11 @@ impl ChunkedMode {
 #[derive(Debug, PartialEq)]
 enum StreamingWriteOp {
     PutObject {
-        bucket: String,
+        bucket: BucketName,
         key: String,
     },
     UploadPart {
-        bucket: String,
+        bucket: BucketName,
         key: String,
         upload_id: String,
         part_number: u32,
@@ -721,7 +722,7 @@ async fn handle(
 async fn append_actual_cors_headers(
     state: &Arc<ServerState>,
     resp: &mut S3Response,
-    bucket: &str,
+    bucket: &BucketName,
     origin: Option<&str>,
     method: &str,
     trace: &observability::TraceContext,
@@ -731,7 +732,7 @@ async fn append_actual_cors_headers(
     };
 
     let st = Arc::clone(state);
-    let bucket = bucket.to_string();
+    let bucket = bucket.clone();
     let origin = origin.to_string();
     let method = method.to_string();
     let headers = spawn_blocking_with_trace(trace.clone(), move || {
@@ -832,7 +833,7 @@ fn parse_chunked_mode(req: &S3Request) -> Result<ChunkedMode, ServerError> {
     }
 }
 
-fn post_object_bucket(parts: &http::request::Parts) -> Option<String> {
+fn post_object_bucket(parts: &http::request::Parts) -> Option<BucketName> {
     route(
         parts.method.as_str(),
         parts.uri.path(),
@@ -1258,7 +1259,7 @@ async fn handle_streaming_post_object(
     state: Arc<ServerState>,
     s3req: S3Request,
     body: Incoming,
-    bucket: String,
+    bucket: BucketName,
     trace: observability::TraceContext,
 ) -> S3Response {
     use base64::Engine;
@@ -1359,7 +1360,7 @@ async fn handle_streaming_post_object(
                                     let frontend = acquire_frontend(&st);
                                     frontend.prepare_streaming_post_object(
                                         &req,
-                                        &bucket_clone,
+                                        bucket_clone.as_str(),
                                         &fields_clone,
                                         file_name.as_deref(),
                                     )
@@ -1535,7 +1536,7 @@ async fn handle_streaming_put(
     state: Arc<ServerState>,
     s3req: S3Request,
     body: Incoming,
-    bucket: String,
+    bucket: BucketName,
     key: String,
     chunked: ChunkedMode,
     trace: observability::TraceContext,
@@ -1561,7 +1562,7 @@ async fn handle_streaming_put(
         let frontend = acquire_frontend(&state2);
         frontend.prepare_streaming_put(
             &s3req,
-            &bucket_clone,
+            bucket_clone.as_str(),
             &key_clone,
             uses_aws_chunked_transport,
         )
@@ -2188,7 +2189,7 @@ async fn handle_streaming_part(
     state: Arc<ServerState>,
     s3req: S3Request,
     body: Incoming,
-    bucket: String,
+    bucket: BucketName,
     key: String,
     upload_id: String,
     part_number: u32,
@@ -2216,7 +2217,7 @@ async fn handle_streaming_part(
         let frontend = acquire_frontend(&state2);
         frontend.prepare_streaming_part(
             &s3req,
-            &bucket_clone,
+            bucket_clone.as_str(),
             &key_clone,
             &upload_id_clone,
             part_number,
@@ -3714,7 +3715,10 @@ mod tests {
     #[test]
     fn post_object_detected() {
         let parts = make_parts("POST", "/mybucket", &[]);
-        assert_eq!(post_object_bucket(&parts).as_deref(), Some("mybucket"));
+        assert_eq!(
+            post_object_bucket(&parts).as_ref().map(BucketName::as_str),
+            Some("mybucket")
+        );
     }
 
     #[test]
