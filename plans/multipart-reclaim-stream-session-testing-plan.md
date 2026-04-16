@@ -14,7 +14,7 @@ In scope:
   where needed
 - bounded stateful/property tests over short traces
 - loom-style micro-models only for small synchronization units if they are
-  clearly justified
+  justified
 
 Out of scope:
 
@@ -157,8 +157,7 @@ storage state after each step.
 
 ### 3. Narrow Loom-Style Micro-Models Where Needed
 
-There is no current `loom` dependency, and this repo is careful about adding
-new dependencies. Keep the bar high.
+If a loom dependency is needed, that can be added.
 
 If existing hooks plus `proptest` still leave a genuinely important
 synchronization gap, use loom-style testing only for tiny in-memory state

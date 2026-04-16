@@ -25,7 +25,8 @@ this repository.
 ## Dependencies
 
 We are trying to not have too many dependencies and to keep code simple and understandable. Ask before adding
-new dependencies.
+new production dependencies. Dependencies for testing such as cargo extensions have a lower bar, but we do
+keep the test dependencies manageable and under control.
 
 ## Testing
 
