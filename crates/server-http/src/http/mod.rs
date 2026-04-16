@@ -956,7 +956,7 @@ impl HttpFrontend {
                 };
                 xml::RenderedMultipartUploadEntry {
                     key: upload.key,
-                    upload_id: upload.upload_id,
+                    upload_id: upload.upload_id.to_string(),
                     initiated: upload.initiated,
                     owner,
                     initiator,
@@ -969,7 +969,9 @@ impl HttpFrontend {
             uploads,
             is_truncated: result.is_truncated,
             next_key_marker: result.next_key_marker,
-            next_upload_id_marker: result.next_upload_id_marker,
+            next_upload_id_marker: result
+                .next_upload_id_marker
+                .map(|upload_id| upload_id.to_string()),
         }
     }
 

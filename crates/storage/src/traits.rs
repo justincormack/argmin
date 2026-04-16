@@ -401,24 +401,26 @@ pub trait PgMetadataStore {
     fn create_multipart_upload(&self, req: &CreateMultipartUploadReq) -> Result<(), MetadataError>;
 
     /// Get an in-progress multipart upload record.
-    fn get_multipart_upload(&self, upload_id: &str)
-        -> Result<MultipartUploadRecord, MetadataError>;
+    fn get_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, MetadataError>;
 
     /// Transition an upload's state. Only valid transitions from InProgress
     /// are accepted; returns `UploadNotInProgress` otherwise.
     fn set_upload_state(
         &self,
-        upload_id: &str,
+        upload_id: &UploadId,
         new_state: UploadState,
     ) -> Result<(), MetadataError>;
 
     /// Delete a multipart upload and its parts (CASCADE).
-    fn delete_multipart_upload(&self, upload_id: &str) -> Result<(), MetadataError>;
+    fn delete_multipart_upload(&self, upload_id: &UploadId) -> Result<(), MetadataError>;
 
     /// Get a completed multipart upload record retained for abort semantics.
     fn get_completed_multipart_upload(
         &self,
-        upload_id: &str,
+        upload_id: &UploadId,
     ) -> Result<Option<CompletedMultipartUploadRecord>, MetadataError>;
 
     /// Delete all completed multipart upload records for a bucket.
@@ -453,7 +455,7 @@ pub trait PgMetadataStore {
     /// Get a specific part of an in-progress upload.
     fn get_multipart_part(
         &self,
-        upload_id: &str,
+        upload_id: &UploadId,
         part_number: u32,
     ) -> Result<MultipartPartRecord, MetadataError>;
 
@@ -502,7 +504,7 @@ pub trait PgMetadataStore {
     /// 6. Delete the `multipart_uploads` + `multipart_parts` rows
     fn complete_multipart_commit(
         &self,
-        upload_id: &str,
+        upload_id: &UploadId,
         completion_order: u64,
         obj: &CommitMultipartReq,
         parts: &[ObjectPartRecord],
@@ -627,13 +629,13 @@ pub trait PgMetadataStore {
     /// Used during abort to collect shard refs before deletion.
     fn get_all_multipart_part_segments_for_upload(
         &self,
-        upload_id: &str,
+        upload_id: &UploadId,
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError>;
 
     /// Delete all segment records for a given upload_id.
     fn delete_multipart_part_segments_by_upload_id(
         &self,
-        upload_id: &str,
+        upload_id: &UploadId,
     ) -> Result<(), MetadataError>;
 }
 

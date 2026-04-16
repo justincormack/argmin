@@ -2126,7 +2126,7 @@ impl PgStore {
     pub fn list_completed_multipart_uploads_for_bucket(
         &self,
         bucket: &str,
-    ) -> Result<Vec<(String, u64)>, MetadataError> {
+    ) -> Result<Vec<(UploadId, u64)>, MetadataError> {
         let mut stmt = self
             .conn
             .prepare(
@@ -2153,7 +2153,14 @@ impl PgStore {
                 source: e,
             })?;
             uploads.push((
-                upload_id,
+                UploadId::try_from(upload_id).map_err(|error| MetadataError::Db {
+                    context: "decode completed multipart upload id",
+                    source: rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    ),
+                })?,
                 completion_order.try_into().map_err(|_| MetadataError::Db {
                     context: "decode completed multipart upload completion order",
                     source: rusqlite::Error::FromSqlConversionFailure(
@@ -2167,11 +2174,14 @@ impl PgStore {
         Ok(uploads)
     }
 
-    pub fn delete_completed_multipart_upload(&self, upload_id: &str) -> Result<(), MetadataError> {
+    pub fn delete_completed_multipart_upload(
+        &self,
+        upload_id: &UploadId,
+    ) -> Result<(), MetadataError> {
         self.conn
             .execute(
                 "DELETE FROM completed_multipart_uploads WHERE upload_id = ?1",
-                params![upload_id],
+                params![upload_id.as_str()],
             )
             .map(|_| ())
             .map_err(|e| MetadataError::Db {
@@ -4566,7 +4576,7 @@ impl PgMetadataStore for PgStore {
 
     fn get_multipart_upload(
         &self,
-        upload_id: &str,
+        upload_id: &UploadId,
     ) -> Result<MultipartUploadRecord, MetadataError> {
         self.conn
             .query_row(
@@ -4574,7 +4584,7 @@ impl PgMetadataStore for PgStore {
                  system_metadata_blob, owner_principal, owner_canonical_id, initiator_principal, initiator_canonical_id, \
                  checksum_algorithm, checksum_type, encryption_type, encryption_state, acl_grants, public_read, object_lock_retention_mode, object_lock_retain_until, object_lock_legal_hold \
                  FROM multipart_uploads WHERE upload_id = ?1",
-                params![upload_id],
+                params![upload_id.as_str()],
                 |row| {
                     let state_raw = row.get::<_, u8>(4)?;
                     let algo_raw: Option<u8> = row.get(12)?;
@@ -4678,7 +4688,7 @@ impl PgMetadataStore for PgStore {
 
     fn set_upload_state(
         &self,
-        upload_id: &str,
+        upload_id: &UploadId,
         new_state: UploadState,
     ) -> Result<(), MetadataError> {
         // Only Completing and Aborting are valid transition targets.
@@ -4688,7 +4698,7 @@ impl PgMetadataStore for PgStore {
                 .conn
                 .query_row(
                     "SELECT state FROM multipart_uploads WHERE upload_id = ?1",
-                    params![upload_id],
+                    params![upload_id.as_str()],
                     |row| row.get::<_, u8>(0),
                 )
                 .optional()
@@ -4708,7 +4718,7 @@ impl PgMetadataStore for PgStore {
             .execute(
                 "UPDATE multipart_uploads SET state = ?1 \
                  WHERE upload_id = ?2 AND state = 0",
-                params![new_state as u8, upload_id],
+                params![new_state as u8, upload_id.as_str()],
             )
             .map_err(|e| MetadataError::Db {
                 context: "set upload state",
@@ -4720,7 +4730,7 @@ impl PgMetadataStore for PgStore {
                 .conn
                 .query_row(
                     "SELECT state FROM multipart_uploads WHERE upload_id = ?1",
-                    params![upload_id],
+                    params![upload_id.as_str()],
                     |row| row.get::<_, u8>(0),
                 )
                 .optional()
@@ -4738,12 +4748,12 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
-    fn delete_multipart_upload(&self, upload_id: &str) -> Result<(), MetadataError> {
+    fn delete_multipart_upload(&self, upload_id: &UploadId) -> Result<(), MetadataError> {
         let deleted = self
             .conn
             .execute(
                 "DELETE FROM multipart_uploads WHERE upload_id = ?1",
-                params![upload_id],
+                params![upload_id.as_str()],
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete multipart upload",
@@ -4759,14 +4769,14 @@ impl PgMetadataStore for PgStore {
 
     fn get_completed_multipart_upload(
         &self,
-        upload_id: &str,
+        upload_id: &UploadId,
     ) -> Result<Option<CompletedMultipartUploadRecord>, MetadataError> {
         self.conn
             .query_row(
                 "SELECT upload_id, bucket, key, completed_at, owner_principal, owner_canonical_id, \
                  initiator_principal, initiator_canonical_id \
                  FROM completed_multipart_uploads WHERE upload_id = ?1",
-                params![upload_id],
+                params![upload_id.as_str()],
                 |row| {
                     let owner = Self::parse_owner_identity(
                         row,
@@ -5262,7 +5272,7 @@ impl PgMetadataStore for PgStore {
 
     fn get_multipart_part(
         &self,
-        upload_id: &str,
+        upload_id: &UploadId,
         part_number: u32,
     ) -> Result<MultipartPartRecord, MetadataError> {
         self.conn
@@ -5270,7 +5280,7 @@ impl PgMetadataStore for PgStore {
                 "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
                  part_okh, part_vid, ec_k, ec_m, last_modified, checksum \
                  FROM multipart_parts WHERE upload_id = ?1 AND part_number = ?2",
-                params![upload_id, part_number],
+                params![upload_id.as_str(), part_number],
                 Self::row_to_multipart_part,
             )
             .optional()
@@ -5583,7 +5593,7 @@ impl PgMetadataStore for PgStore {
 
     fn complete_multipart_commit(
         &self,
-        upload_id: &str,
+        upload_id: &UploadId,
         completion_order: u64,
         obj: &CommitMultipartReq,
         parts: &[ObjectPartRecord],
@@ -5639,7 +5649,7 @@ impl PgMetadataStore for PgStore {
             let updated = self.conn.execute(
                 "UPDATE multipart_uploads SET state = ?1 \
                  WHERE upload_id = ?2 AND state = 0",
-                params![UploadState::Completing as u8, upload_id],
+                params![UploadState::Completing as u8, upload_id.as_str()],
             )?;
             if updated == 0 {
                 // Check if it's already Completing (idempotent retry).
@@ -5647,7 +5657,7 @@ impl PgMetadataStore for PgStore {
                     .conn
                     .query_row(
                         "SELECT state FROM multipart_uploads WHERE upload_id = ?1",
-                        params![upload_id],
+                        params![upload_id.as_str()],
                         |row| row.get(0),
                     )
                     .optional()?;
@@ -7040,7 +7050,7 @@ impl PgMetadataStore for PgStore {
 
     fn get_all_multipart_part_segments_for_upload(
         &self,
-        upload_id: &str,
+        upload_id: &UploadId,
     ) -> Result<Vec<MultipartPartSegmentRecord>, MetadataError> {
         let mut stmt = self
             .conn
@@ -7056,7 +7066,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?;
         let rows = stmt
-            .query_map(params![upload_id], |row| {
+            .query_map(params![upload_id.as_str()], |row| {
                 let okh_blob: Vec<u8> = row.get(8)?;
                 let segment_okh = PgStore::parse_okh_blob(&okh_blob, 8)?;
                 Ok(MultipartPartSegmentRecord {
@@ -7092,12 +7102,12 @@ impl PgMetadataStore for PgStore {
 
     fn delete_multipart_part_segments_by_upload_id(
         &self,
-        upload_id: &str,
+        upload_id: &UploadId,
     ) -> Result<(), MetadataError> {
         self.conn
             .execute(
                 "DELETE FROM multipart_part_segments WHERE upload_id = ?1",
-                params![upload_id],
+                params![upload_id.as_str()],
             )
             .map_err(|e| MetadataError::Db {
                 context: "delete multipart part segments by upload_id",

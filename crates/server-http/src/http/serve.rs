@@ -3186,6 +3186,7 @@ mod tests {
             })
             .unwrap()
             .upload_id
+            .to_string()
     }
 
     async fn start_test_server(frontend: Arc<HttpFrontend>) -> (String, ServerGuard) {

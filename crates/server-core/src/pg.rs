@@ -1,5 +1,5 @@
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
-use storage::{BucketName, GenerationId, ObjectKey};
+use storage::{BucketName, GenerationId, ObjectKey, UploadId};
 
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
 const PG_HASH_STACK_LIMIT: usize = 63 + 1 + 1024 + 1 + 20;
@@ -200,7 +200,7 @@ pub fn segment_key_hash(
 /// Compute the 16-byte part key hash for multipart upload shard keys.
 ///
 /// `part_okh = SHA-256("mpu/" + upload_id + "/" + part_number + "/" + generation)[:16]`
-pub fn part_key_hash(upload_id: &str, part_number: u32, generation: u32) -> [u8; 16] {
+pub fn part_key_hash(upload_id: &UploadId, part_number: u32, generation: u32) -> [u8; 16] {
     use ring::digest;
     let input = format!("mpu/{upload_id}/{part_number}/{generation}");
     let hash = digest::digest(&digest::SHA256, input.as_bytes());
@@ -214,7 +214,7 @@ pub fn part_key_hash(upload_id: &str, part_number: u32, generation: u32) -> [u8;
 /// `segment_okh = SHA-256("mpu-segment/" + upload_id + "/" + part_number + "/" + generation +
 /// "/" + segment_index)[:16]`
 pub fn multipart_part_segment_key_hash(
-    upload_id: &str,
+    upload_id: &UploadId,
     part_number: u32,
     generation: u32,
     segment_index: u32,
@@ -230,6 +230,11 @@ pub fn multipart_part_segment_key_hash(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use storage::UploadId;
+
+    fn upload_id() -> UploadId {
+        UploadId::try_from(".".repeat(128)).expect("test upload id is valid")
+    }
 
     #[test]
     fn derive_pg_deterministic() {
@@ -462,28 +467,31 @@ mod tests {
 
     #[test]
     fn multipart_part_segment_key_hash_deterministic() {
-        let a = multipart_part_segment_key_hash("upload", 1, 0, 0);
-        let b = multipart_part_segment_key_hash("upload", 1, 0, 0);
+        let upload_id = upload_id();
+        let a = multipart_part_segment_key_hash(&upload_id, 1, 0, 0);
+        let b = multipart_part_segment_key_hash(&upload_id, 1, 0, 0);
         assert_eq!(a, b);
     }
 
     #[test]
     fn multipart_part_segment_key_hash_different_segments() {
-        let a = multipart_part_segment_key_hash("upload", 1, 0, 0);
-        let b = multipart_part_segment_key_hash("upload", 1, 0, 1);
+        let upload_id = upload_id();
+        let a = multipart_part_segment_key_hash(&upload_id, 1, 0, 0);
+        let b = multipart_part_segment_key_hash(&upload_id, 1, 0, 1);
         assert_ne!(a, b);
     }
 
     #[test]
     fn multipart_part_segment_key_hash_different_generations() {
-        let a = multipart_part_segment_key_hash("upload", 1, 0, 0);
-        let b = multipart_part_segment_key_hash("upload", 1, 1, 0);
+        let upload_id = upload_id();
+        let a = multipart_part_segment_key_hash(&upload_id, 1, 0, 0);
+        let b = multipart_part_segment_key_hash(&upload_id, 1, 1, 0);
         assert_ne!(a, b);
     }
 
     #[test]
     fn multipart_part_segment_key_hash_length() {
-        let hash = multipart_part_segment_key_hash("upload", 1, 0, 0);
+        let hash = multipart_part_segment_key_hash(&upload_id(), 1, 0, 0);
         assert_eq!(hash.len(), 16);
     }
 }

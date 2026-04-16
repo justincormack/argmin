@@ -232,9 +232,9 @@ Current state:
    - the response uses the fixed AWS message
    - the submitted token is echoed in a separate `<UploadId>` element
    - for the tested cases, `NoSuchUpload` takes precedence over `AccessDenied`
-5. Remaining: Phase 3 still needs to finish the storage/hash boundary audit so
-   multipart low-level helpers stop taking raw upload-id strings where they
-   model the external identifier.
+5. Done: Phase 3 then finished the storage/hash boundary audit so multipart
+   low-level helpers stop taking raw upload-id strings where they model the
+   external identifier.
 
 Phase 2 is complete.
 
@@ -256,6 +256,26 @@ Exit criteria:
    to take `&UploadId`.
 3. Audit any remaining raw-string upload-id surfaces in production code and
    either type them or make the raw boundary explicit and justified.
+
+Current state:
+
+1. Done: multipart storage trait methods that model the external upload
+   identifier now take `&UploadId` instead of `&str`.
+2. Done: low-level multipart key/hash helpers in
+   [crates/server-core/src/pg.rs](/home/justin/src/github.com/justincormack/argmin/crates/server-core/src/pg.rs)
+   now take `&UploadId`.
+3. Done: coordinator/authz multipart storage calls now stay typed through the
+   production path, including abort cleanup, part lookup, and multipart
+   completion.
+4. Done: completed multipart upload pruning/listing now decodes stored IDs to
+   typed `UploadId`, so this internal storage seam is no longer raw.
+5. Done: internal multipart results now carry typed `UploadId` values until
+   the explicit HTTP/XML rendering boundary.
+6. Done: the remaining raw upload-id uses on the production path are explicit
+   HTTP/parser/response seams and SQL `.as_str()` boundaries inside storage,
+   not coordinator/storage/hash APIs.
+
+Phase 3 is complete.
 
 Exit criteria:
 

@@ -376,18 +376,10 @@ fn multipart_upload_lifecycle() {
     ];
 
     store
-        .set_upload_state(
-            multipart_upload_id("mpu-1").as_str(),
-            UploadState::Completing,
-        )
+        .set_upload_state(&multipart_upload_id("mpu-1"), UploadState::Completing)
         .unwrap();
     store
-        .complete_multipart_commit(
-            multipart_upload_id("mpu-1").as_str(),
-            1,
-            &obj,
-            &committed_parts,
-        )
+        .complete_multipart_commit(&multipart_upload_id("mpu-1"), 1, &obj, &committed_parts)
         .unwrap();
 
     // Read back the committed object.
@@ -674,13 +666,13 @@ fn streaming_upload_part_lifecycle() {
 
     // Part readable.
     let part = store
-        .get_multipart_part(multipart_upload_id("mpu-sp").as_str(), 1)
+        .get_multipart_part(&multipart_upload_id("mpu-sp"), 1)
         .unwrap();
     assert_eq!(part.size, seg_data.len() as u64);
 
     // Part segments readable.
     let segs = store
-        .get_all_multipart_part_segments_for_upload(multipart_upload_id("mpu-sp").as_str())
+        .get_all_multipart_part_segments_for_upload(&multipart_upload_id("mpu-sp"))
         .unwrap();
     assert_eq!(segs.len(), 1);
     assert_eq!(segs[0].segment_okh, hash);
@@ -1086,31 +1078,28 @@ fn multipart_abort_cleanup() {
 
     // Verify part and segments exist.
     let p = store
-        .get_multipart_part(multipart_upload_id("mpu-abort").as_str(), 1)
+        .get_multipart_part(&multipart_upload_id("mpu-abort"), 1)
         .unwrap();
     assert_eq!(p.size, 8);
     let segs = store
-        .get_all_multipart_part_segments_for_upload(multipart_upload_id("mpu-abort").as_str())
+        .get_all_multipart_part_segments_for_upload(&multipart_upload_id("mpu-abort"))
         .unwrap();
     assert_eq!(segs.len(), 1);
 
     // Abort: clean up segments, then set state, then delete upload.
     store
-        .delete_multipart_part_segments_by_upload_id(multipart_upload_id("mpu-abort").as_str())
+        .delete_multipart_part_segments_by_upload_id(&multipart_upload_id("mpu-abort"))
         .unwrap();
     store
-        .set_upload_state(
-            multipart_upload_id("mpu-abort").as_str(),
-            UploadState::Aborting,
-        )
+        .set_upload_state(&multipart_upload_id("mpu-abort"), UploadState::Aborting)
         .unwrap();
     store
-        .delete_multipart_upload(multipart_upload_id("mpu-abort").as_str())
+        .delete_multipart_upload(&multipart_upload_id("mpu-abort"))
         .unwrap();
 
     // Verify upload gone.
     let err = store
-        .get_multipart_upload(multipart_upload_id("mpu-abort").as_str())
+        .get_multipart_upload(&multipart_upload_id("mpu-abort"))
         .unwrap_err();
     assert!(matches!(
         err,
@@ -1119,7 +1108,7 @@ fn multipart_abort_cleanup() {
 
     // Segments gone.
     let segs = store
-        .get_all_multipart_part_segments_for_upload(multipart_upload_id("mpu-abort").as_str())
+        .get_all_multipart_part_segments_for_upload(&multipart_upload_id("mpu-abort"))
         .unwrap();
     assert!(segs.is_empty());
 
@@ -1378,11 +1367,11 @@ fn persistence_complex_state_through_reopen() {
         assert_eq!(segs[0].segment_okh, [0xEE; 16]);
 
         // Multipart upload survives.
-        let upload = store.get_multipart_upload(upload_id.as_str()).unwrap();
+        let upload = store.get_multipart_upload(&upload_id).unwrap();
         assert_eq!(upload.state, UploadState::InProgress);
 
         // Part survives.
-        let part = store.get_multipart_part(upload_id.as_str(), 1).unwrap();
+        let part = store.get_multipart_part(&upload_id, 1).unwrap();
         assert_eq!(part.size, 200);
 
         // Shard survives.

@@ -3283,7 +3283,7 @@ impl Coordinator {
             let dst_meta_pg = self
                 .storage_node
                 .get_pg(self.object_pg_id_for(dst_bucket, dst_key))?;
-            let dst_upload = dst_meta_pg.get_multipart_upload(upload_id.as_str())?;
+            let dst_upload = dst_meta_pg.get_multipart_upload(upload_id)?;
             if dst_upload.bucket != dst_bucket.as_str() || dst_upload.key != dst_key.as_str() {
                 return Err(ServerError::NoSuchUpload {
                     upload_id: upload_id.to_string(),
@@ -3357,7 +3357,7 @@ impl Coordinator {
         let meta_pg = self
             .storage_node
             .get_pg(self.object_pg_id_for(bucket, key))?;
-        let upload = meta_pg.get_multipart_upload(upload_id.as_str())?;
+        let upload = meta_pg.get_multipart_upload(upload_id)?;
         if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
             return Err(ServerError::NoSuchUpload {
                 upload_id: upload_id.to_string(),
@@ -3411,7 +3411,7 @@ impl Coordinator {
             let meta_pg = self
                 .storage_node
                 .get_pg(self.object_pg_id_for(bucket, key))?;
-            let upload = meta_pg.get_multipart_upload(upload_id.as_str())?;
+            let upload = meta_pg.get_multipart_upload(upload_id)?;
             if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
                 return Err(ServerError::NoSuchUpload {
                     upload_id: upload_id.to_string(),
@@ -3472,7 +3472,7 @@ impl Coordinator {
         let meta_pg = self
             .storage_node
             .get_pg(self.object_pg_id_for(bucket, key))?;
-        let authorized = match meta_pg.get_multipart_upload(upload_id.as_str()) {
+        let authorized = match meta_pg.get_multipart_upload(upload_id) {
             Ok(upload) => {
                 if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
                     return Err(ServerError::NoSuchUpload {
@@ -3489,12 +3489,11 @@ impl Coordinator {
                 AuthorizedAbortMultipartUpload::InProgress {
                     bucket: req.bucket_name_typed().clone(),
                     key: req.key_typed().clone(),
-                    upload_id: upload_id.to_string(),
+                    upload_id: upload_id.clone(),
                 }
             }
             Err(storage::MetadataError::NoSuchUpload { .. }) => {
-                let Some(completed) = meta_pg.get_completed_multipart_upload(upload_id.as_str())?
-                else {
+                let Some(completed) = meta_pg.get_completed_multipart_upload(upload_id)? else {
                     return Err(ServerError::NoSuchUpload {
                         upload_id: upload_id.to_string(),
                     });
@@ -3531,7 +3530,7 @@ impl Coordinator {
         let meta_pg = self
             .storage_node
             .get_pg(self.object_pg_id_for(bucket, key))?;
-        let upload = meta_pg.get_multipart_upload(upload_id.as_str())?;
+        let upload = meta_pg.get_multipart_upload(upload_id)?;
         if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
             return Err(ServerError::NoSuchUpload {
                 upload_id: upload_id.to_string(),

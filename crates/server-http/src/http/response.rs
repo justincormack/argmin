@@ -16,7 +16,7 @@ use s3_types::{
 };
 use server_core::sse::{SseCustomerResponseHeaders, SSE_CUSTOMER_ALGORITHM};
 use server_core::system_metadata::SystemMetadata;
-use storage::{EffectiveBucketEncryptionConfig, ManagedEncryptionAlgorithm};
+use storage::{EffectiveBucketEncryptionConfig, ManagedEncryptionAlgorithm, UploadId};
 
 use super::xml;
 
@@ -1044,13 +1044,13 @@ impl S3Response {
     pub fn create_multipart_upload(
         bucket: &str,
         key: &str,
-        upload_id: &str,
+        upload_id: &UploadId,
         ctx: CreateMultipartUploadResponseContext<'_>,
     ) -> Self {
         let body = xml::initiate_multipart_upload_xml(
             bucket,
             key,
-            upload_id,
+            upload_id.as_str(),
             ctx.checksum_algorithm.map(ChecksumAlgorithm::as_str),
             ctx.checksum_type.map(ChecksumType::as_str),
         );
@@ -2558,10 +2558,11 @@ mod tests {
 
     #[test]
     fn create_multipart_upload_response_includes_lifecycle_abort_headers() {
+        let upload_id = UploadId::try_from(".".repeat(storage::UPLOAD_ID_LEN)).unwrap();
         let resp = S3Response::create_multipart_upload(
             "bucket",
             "key",
-            "upload-1",
+            &upload_id,
             CreateMultipartUploadResponseContext {
                 managed_encryption: None,
                 checksum_algorithm: Some(ChecksumAlgorithm::Sha256),
@@ -2595,10 +2596,11 @@ mod tests {
 
     #[test]
     fn create_multipart_upload_response_includes_managed_encryption_header() {
+        let upload_id = UploadId::try_from(".".repeat(storage::UPLOAD_ID_LEN)).unwrap();
         let resp = S3Response::create_multipart_upload(
             "bucket",
             "key",
-            "upload-1",
+            &upload_id,
             CreateMultipartUploadResponseContext {
                 managed_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
                 checksum_algorithm: None,
