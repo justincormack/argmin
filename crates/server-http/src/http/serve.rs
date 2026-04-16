@@ -1209,13 +1209,13 @@ pub fn fuzz_request_parser_entrypoints(
     delete_objects_xml: &[u8],
     post_key: &str,
     file_name: &str,
-    upload_id: Option<&str>,
+    multipart_query: &str,
     list_multipart_query: &str,
     upload_part_query: &str,
 ) {
     let _ = crate::http::parse_copy_source_header(copy_source);
     crate::http::fuzz_upload_id_query_entrypoints(
-        upload_id,
+        multipart_query,
         list_multipart_query,
         upload_part_query,
     );

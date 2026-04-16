@@ -232,11 +232,12 @@ fn parse_required_upload_id(raw: Option<&str>) -> Result<UploadId, ServerError> 
 
 #[doc(hidden)]
 pub fn fuzz_upload_id_query_entrypoints(
-    upload_id: Option<&str>,
+    multipart_query: &str,
     list_multipart_query: &str,
     upload_part_query: &str,
 ) {
-    let _ = parse_required_upload_id(upload_id);
+    let multipart_upload_id = request::query_param_lossy(multipart_query, "uploadId");
+    let _ = parse_required_upload_id(multipart_upload_id.as_deref());
     let upload_id_marker = request::query_param_lossy(list_multipart_query, "upload-id-marker");
     let _ = parse_optional_upload_id_marker(upload_id_marker.as_deref());
     if let Ok((upload_id_raw, _)) = request::parse_upload_part_query(upload_part_query) {
