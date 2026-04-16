@@ -688,7 +688,7 @@ Acceptance criteria:
 
 ### Phase 6: Copy and Multipart Copy Matrix
 
-Status: planned
+Status: complete
 
 Add a bounded copy-focused matrix for:
 
@@ -727,6 +727,29 @@ Acceptance criteria:
   covered by the modeled harness, not only by `s3-tests`
 - copy-specific request-context failures print the exact scenario fields that
   diverged
+
+Current state:
+
+- `server-core` now has a dedicated Phase 6 authz model matrix for
+  `CopyObject` and `UploadPartCopy`.
+- The `CopyObject` matrix covers:
+  - copy-source policy conditions
+  - explicit `COPY` metadata-directive context
+  - tagging replacement needing `PutObjectTagging`
+  - exact copy request-context handling for:
+    - `s3:x-amz-acl`
+    - `s3:x-amz-grant-read`
+    - `s3:x-amz-grant-read-acp`
+    - `s3:x-amz-grant-write`
+    - `s3:x-amz-grant-write-acp`
+  - destination BOE / BlockPublicAcls / RestrictPublicBuckets behavior
+- The `UploadPartCopy` matrix covers:
+  - readable versus unreadable source objects
+  - in-progress versus completed multipart targets
+  - requester-owned versus bucket-owner-owned uploads
+  - copy-source-conditioned destination policy
+  - the deliberate request-context distinction from `CopyObject`
+    (`UploadPartCopy` does not satisfy metadata-directive conditions)
 
 ### Phase 7: Delete and Object-Lock Matrix
 

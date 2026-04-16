@@ -4152,6 +4152,1569 @@ mod phase5_harness {
     }
 }
 
+mod phase6_model {
+    use super::model::OwnershipShape;
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum CopyRequesterShape {
+        BucketOwnerPrincipal,
+        CrossAccountPrincipal,
+    }
+
+    impl CopyRequesterShape {
+        fn is_bucket_owner_account(self) -> bool {
+            self == Self::BucketOwnerPrincipal
+        }
+    }
+
+    impl fmt::Display for CopyRequesterShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::BucketOwnerPrincipal => f.write_str("bucket-owner-principal"),
+                Self::CrossAccountPrincipal => f.write_str("cross-account"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct CopyBucketShape {
+        pub(super) ownership: OwnershipShape,
+        pub(super) block_public_acls: bool,
+        pub(super) restrict_public_buckets: bool,
+        pub(super) bucket_public_write: bool,
+    }
+
+    impl CopyBucketShape {
+        const PRIVATE: Self = Self {
+            ownership: OwnershipShape::ObjectWriter,
+            block_public_acls: false,
+            restrict_public_buckets: false,
+            bucket_public_write: false,
+        };
+
+        const BLOCK_PUBLIC_ACLS: Self = Self {
+            ownership: OwnershipShape::ObjectWriter,
+            block_public_acls: true,
+            restrict_public_buckets: false,
+            bucket_public_write: false,
+        };
+
+        const RESTRICT_PUBLIC_BUCKETS: Self = Self {
+            ownership: OwnershipShape::ObjectWriter,
+            block_public_acls: false,
+            restrict_public_buckets: true,
+            bucket_public_write: false,
+        };
+
+        const BOE: Self = Self {
+            ownership: OwnershipShape::BucketOwnerEnforced,
+            block_public_acls: false,
+            restrict_public_buckets: false,
+            bucket_public_write: false,
+        };
+    }
+
+    impl fmt::Display for CopyBucketShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "{}(block_public_acls={}, restrict_public_buckets={}, public_write={})",
+                self.ownership,
+                self.block_public_acls,
+                self.restrict_public_buckets,
+                self.bucket_public_write
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum CopySourceAccess {
+        Readable,
+        Unreadable,
+    }
+
+    impl fmt::Display for CopySourceAccess {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Readable => f.write_str("readable"),
+                Self::Unreadable => f.write_str("unreadable"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum CopyDirectiveShape {
+        CopyImplicit,
+        CopyExplicit,
+    }
+
+    impl fmt::Display for CopyDirectiveShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::CopyImplicit => f.write_str("copy-implicit"),
+                Self::CopyExplicit => f.write_str("copy-explicit"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum CopyTaggingShape {
+        Copy,
+        ReplaceMatching,
+    }
+
+    impl fmt::Display for CopyTaggingShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Copy => f.write_str("copy"),
+                Self::ReplaceMatching => f.write_str("replace-matching"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum CopyAclShape {
+        None,
+        CannedPrivate,
+        CannedPublicRead,
+        GrantRead,
+        GrantReadAcp,
+        GrantWrite,
+        GrantWriteAcp,
+    }
+
+    impl fmt::Display for CopyAclShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("none"),
+                Self::CannedPrivate => f.write_str("canned-private"),
+                Self::CannedPublicRead => f.write_str("canned-public-read"),
+                Self::GrantRead => f.write_str("grant-read"),
+                Self::GrantReadAcp => f.write_str("grant-read-acp"),
+                Self::GrantWrite => f.write_str("grant-write"),
+                Self::GrantWriteAcp => f.write_str("grant-write-acp"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum CopyPolicyShape {
+        NoPolicy,
+        AllowPrivate,
+        AllowPublic,
+        AllowWithCopySourceCondition,
+        AllowWithMetadataDirectiveCopy,
+        AllowPrivateWithPublicAclDeny,
+        AllowWithGrantReadCondition,
+        AllowWithGrantReadAcpCondition,
+        AllowWithGrantWriteCondition,
+        AllowWithGrantWriteAcpCondition,
+        AllowWithRequestTagsAndTaggingPermission,
+        AllowWithRequestTagsWithoutTaggingPermission,
+    }
+
+    impl fmt::Display for CopyPolicyShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::NoPolicy => f.write_str("no-policy"),
+                Self::AllowPrivate => f.write_str("allow-private"),
+                Self::AllowPublic => f.write_str("allow-public"),
+                Self::AllowWithCopySourceCondition => f.write_str("allow-copy-source-condition"),
+                Self::AllowWithMetadataDirectiveCopy => {
+                    f.write_str("allow-metadata-directive-copy")
+                }
+                Self::AllowPrivateWithPublicAclDeny => {
+                    f.write_str("allow-private-with-public-acl-deny")
+                }
+                Self::AllowWithGrantReadCondition => f.write_str("allow-grant-read-condition"),
+                Self::AllowWithGrantReadAcpCondition => {
+                    f.write_str("allow-grant-read-acp-condition")
+                }
+                Self::AllowWithGrantWriteCondition => f.write_str("allow-grant-write-condition"),
+                Self::AllowWithGrantWriteAcpCondition => {
+                    f.write_str("allow-grant-write-acp-condition")
+                }
+                Self::AllowWithRequestTagsAndTaggingPermission => {
+                    f.write_str("allow-request-tags-with-tagging-permission")
+                }
+                Self::AllowWithRequestTagsWithoutTaggingPermission => {
+                    f.write_str("allow-request-tags-without-tagging-permission")
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum CopyContextShape {
+        Exact,
+        CopySourceMismatch,
+        GrantReadMismatch,
+        GrantReadAcpMismatch,
+        GrantWriteMismatch,
+        GrantWriteAcpMismatch,
+    }
+
+    impl fmt::Display for CopyContextShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Exact => f.write_str("exact"),
+                Self::CopySourceMismatch => f.write_str("copy-source-mismatch"),
+                Self::GrantReadMismatch => f.write_str("grant-read-mismatch"),
+                Self::GrantReadAcpMismatch => f.write_str("grant-read-acp-mismatch"),
+                Self::GrantWriteMismatch => f.write_str("grant-write-mismatch"),
+                Self::GrantWriteAcpMismatch => f.write_str("grant-write-acp-mismatch"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum CopyOutcome {
+        Allow,
+        Deny,
+        AclNotSupported,
+    }
+
+    impl fmt::Display for CopyOutcome {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Allow => f.write_str("Allow"),
+                Self::Deny => f.write_str("Deny"),
+                Self::AclNotSupported => f.write_str("AclNotSupported"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct CopyObjectScenario {
+        pub(super) name: &'static str,
+        pub(super) requester: CopyRequesterShape,
+        pub(super) bucket: CopyBucketShape,
+        pub(super) source_access: CopySourceAccess,
+        pub(super) acl: CopyAclShape,
+        pub(super) directive: CopyDirectiveShape,
+        pub(super) tagging: CopyTaggingShape,
+        pub(super) policy: CopyPolicyShape,
+        pub(super) context: CopyContextShape,
+    }
+
+    impl CopyObjectScenario {
+        pub(super) fn scenarios() -> Vec<Self> {
+            vec![
+                Self {
+                    name: "owner-default-copy-allowed",
+                    requester: CopyRequesterShape::BucketOwnerPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::None,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::NoPolicy,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-copy-source-condition-allowed",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::None,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowWithCopySourceCondition,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-copy-source-condition-mismatch-denied",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::None,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowWithCopySourceCondition,
+                    context: CopyContextShape::CopySourceMismatch,
+                },
+                Self {
+                    name: "cross-account-metadata-directive-copy-explicit-allowed",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::None,
+                    directive: CopyDirectiveShape::CopyExplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowWithMetadataDirectiveCopy,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-metadata-directive-copy-implicit-denied",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::None,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowWithMetadataDirectiveCopy,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-request-tags-need-tagging-permission",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::None,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::ReplaceMatching,
+                    policy: CopyPolicyShape::AllowWithRequestTagsWithoutTaggingPermission,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-request-tags-with-tagging-permission-allowed",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::None,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::ReplaceMatching,
+                    policy: CopyPolicyShape::AllowWithRequestTagsAndTaggingPermission,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-private-acl-allowed-with-public-acl-deny-policy",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::CannedPrivate,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowPrivateWithPublicAclDeny,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-public-acl-denied-by-policy-condition",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::CannedPublicRead,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowPrivateWithPublicAclDeny,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-grant-read-condition-allowed",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::GrantRead,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowWithGrantReadCondition,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-grant-read-condition-mismatch-denied",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::GrantRead,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowWithGrantReadCondition,
+                    context: CopyContextShape::GrantReadMismatch,
+                },
+                Self {
+                    name: "cross-account-grant-read-acp-condition-allowed",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::GrantReadAcp,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowWithGrantReadAcpCondition,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-grant-read-acp-condition-mismatch-denied",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::GrantReadAcp,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowWithGrantReadAcpCondition,
+                    context: CopyContextShape::GrantReadAcpMismatch,
+                },
+                Self {
+                    name: "cross-account-grant-write-condition-allowed",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::GrantWrite,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowWithGrantWriteCondition,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-grant-write-condition-mismatch-denied",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::GrantWrite,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowWithGrantWriteCondition,
+                    context: CopyContextShape::GrantWriteMismatch,
+                },
+                Self {
+                    name: "cross-account-grant-write-acp-condition-allowed",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::GrantWriteAcp,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowWithGrantWriteAcpCondition,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-grant-write-acp-condition-mismatch-denied",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::GrantWriteAcp,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowWithGrantWriteAcpCondition,
+                    context: CopyContextShape::GrantWriteAcpMismatch,
+                },
+                Self {
+                    name: "cross-account-public-acl-denied-by-block-public-acls",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::BLOCK_PUBLIC_ACLS,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::CannedPublicRead,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowPrivate,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-public-policy-restricted-by-public-access-block",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::RESTRICT_PUBLIC_BUCKETS,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::None,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowPublic,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "owner-copy-public-read-acl-not-supported-under-boe",
+                    requester: CopyRequesterShape::BucketOwnerPrincipal,
+                    bucket: CopyBucketShape::BOE,
+                    source_access: CopySourceAccess::Readable,
+                    acl: CopyAclShape::CannedPublicRead,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::NoPolicy,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-unreadable-source-denied",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Unreadable,
+                    acl: CopyAclShape::None,
+                    directive: CopyDirectiveShape::CopyImplicit,
+                    tagging: CopyTaggingShape::Copy,
+                    policy: CopyPolicyShape::AllowPrivate,
+                    context: CopyContextShape::Exact,
+                },
+            ]
+        }
+
+        pub(super) fn expected_outcome(self) -> CopyOutcome {
+            if self.source_access == CopySourceAccess::Unreadable {
+                return CopyOutcome::Deny;
+            }
+
+            let fallback =
+                self.requester.is_bucket_owner_account() || self.bucket.bucket_public_write;
+            let allowed = match self.policy {
+                CopyPolicyShape::NoPolicy => fallback,
+                CopyPolicyShape::AllowPrivate => true,
+                CopyPolicyShape::AllowPublic => {
+                    if !self.bucket.restrict_public_buckets
+                        || self.requester.is_bucket_owner_account()
+                    {
+                        true
+                    } else {
+                        fallback
+                    }
+                }
+                CopyPolicyShape::AllowWithCopySourceCondition => {
+                    self.context == CopyContextShape::Exact
+                }
+                CopyPolicyShape::AllowWithMetadataDirectiveCopy => {
+                    self.directive == CopyDirectiveShape::CopyExplicit
+                }
+                CopyPolicyShape::AllowPrivateWithPublicAclDeny => !self.acl.is_public_acl(),
+                CopyPolicyShape::AllowWithGrantReadCondition => {
+                    self.acl == CopyAclShape::GrantRead && self.context == CopyContextShape::Exact
+                }
+                CopyPolicyShape::AllowWithGrantReadAcpCondition => {
+                    self.acl == CopyAclShape::GrantReadAcp
+                        && self.context == CopyContextShape::Exact
+                }
+                CopyPolicyShape::AllowWithGrantWriteCondition => {
+                    self.acl == CopyAclShape::GrantWrite && self.context == CopyContextShape::Exact
+                }
+                CopyPolicyShape::AllowWithGrantWriteAcpCondition => {
+                    self.acl == CopyAclShape::GrantWriteAcp
+                        && self.context == CopyContextShape::Exact
+                }
+                CopyPolicyShape::AllowWithRequestTagsAndTaggingPermission => {
+                    self.tagging == CopyTaggingShape::ReplaceMatching
+                }
+                CopyPolicyShape::AllowWithRequestTagsWithoutTaggingPermission => false,
+            };
+            if !allowed {
+                return CopyOutcome::Deny;
+            }
+            if self.bucket.ownership == OwnershipShape::BucketOwnerEnforced
+                && !self.acl.is_supported_under_boe()
+            {
+                return CopyOutcome::AclNotSupported;
+            }
+            if self.bucket.block_public_acls && self.acl.is_public_acl() {
+                return CopyOutcome::Deny;
+            }
+            CopyOutcome::Allow
+        }
+    }
+
+    impl fmt::Display for CopyObjectScenario {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "name={} requester={} bucket={} source={} acl={} directive={} tagging={} policy={} context={}",
+                self.name,
+                self.requester,
+                self.bucket,
+                self.source_access,
+                self.acl,
+                self.directive,
+                self.tagging,
+                self.policy,
+                self.context
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum UploadOwnerShape {
+        Requester,
+        BucketOwner,
+    }
+
+    impl fmt::Display for UploadOwnerShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Requester => f.write_str("requester"),
+                Self::BucketOwner => f.write_str("bucket-owner"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum UploadStateShape {
+        InProgress,
+        Completed,
+    }
+
+    impl fmt::Display for UploadStateShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::InProgress => f.write_str("in-progress"),
+                Self::Completed => f.write_str("completed"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum UploadPartCopyPolicyShape {
+        NoPolicy,
+        AllowPrivate,
+        AllowWithCopySourceCondition,
+        AllowWithMetadataDirectiveCopy,
+    }
+
+    impl fmt::Display for UploadPartCopyPolicyShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::NoPolicy => f.write_str("no-policy"),
+                Self::AllowPrivate => f.write_str("allow-private"),
+                Self::AllowWithCopySourceCondition => f.write_str("allow-copy-source-condition"),
+                Self::AllowWithMetadataDirectiveCopy => {
+                    f.write_str("allow-metadata-directive-copy")
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum UploadPartCopyOutcome {
+        Allow,
+        Deny,
+        NoSuchUpload,
+    }
+
+    impl fmt::Display for UploadPartCopyOutcome {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Allow => f.write_str("Allow"),
+                Self::Deny => f.write_str("Deny"),
+                Self::NoSuchUpload => f.write_str("NoSuchUpload"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct UploadPartCopyScenario {
+        pub(super) name: &'static str,
+        pub(super) requester: CopyRequesterShape,
+        pub(super) bucket: CopyBucketShape,
+        pub(super) source_access: CopySourceAccess,
+        pub(super) upload_owner: UploadOwnerShape,
+        pub(super) upload_state: UploadStateShape,
+        pub(super) policy: UploadPartCopyPolicyShape,
+        pub(super) context: CopyContextShape,
+    }
+
+    impl UploadPartCopyScenario {
+        pub(super) fn scenarios() -> Vec<Self> {
+            vec![
+                Self {
+                    name: "owner-in-progress-default-allowed",
+                    requester: CopyRequesterShape::BucketOwnerPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    upload_owner: UploadOwnerShape::BucketOwner,
+                    upload_state: UploadStateShape::InProgress,
+                    policy: UploadPartCopyPolicyShape::NoPolicy,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "owner-completed-upload-no-such-upload",
+                    requester: CopyRequesterShape::BucketOwnerPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    upload_owner: UploadOwnerShape::BucketOwner,
+                    upload_state: UploadStateShape::Completed,
+                    policy: UploadPartCopyPolicyShape::NoPolicy,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-non-owner-no-policy-denied",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    upload_owner: UploadOwnerShape::BucketOwner,
+                    upload_state: UploadStateShape::InProgress,
+                    policy: UploadPartCopyPolicyShape::NoPolicy,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-own-upload-copy-source-condition-allowed",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    upload_owner: UploadOwnerShape::Requester,
+                    upload_state: UploadStateShape::InProgress,
+                    policy: UploadPartCopyPolicyShape::AllowWithCopySourceCondition,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-own-upload-copy-source-condition-mismatch-denied",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    upload_owner: UploadOwnerShape::Requester,
+                    upload_state: UploadStateShape::InProgress,
+                    policy: UploadPartCopyPolicyShape::AllowWithCopySourceCondition,
+                    context: CopyContextShape::CopySourceMismatch,
+                },
+                Self {
+                    name: "cross-account-own-upload-metadata-directive-policy-denied",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Readable,
+                    upload_owner: UploadOwnerShape::Requester,
+                    upload_state: UploadStateShape::InProgress,
+                    policy: UploadPartCopyPolicyShape::AllowWithMetadataDirectiveCopy,
+                    context: CopyContextShape::Exact,
+                },
+                Self {
+                    name: "cross-account-own-upload-unreadable-source-denied",
+                    requester: CopyRequesterShape::CrossAccountPrincipal,
+                    bucket: CopyBucketShape::PRIVATE,
+                    source_access: CopySourceAccess::Unreadable,
+                    upload_owner: UploadOwnerShape::Requester,
+                    upload_state: UploadStateShape::InProgress,
+                    policy: UploadPartCopyPolicyShape::AllowPrivate,
+                    context: CopyContextShape::Exact,
+                },
+            ]
+        }
+
+        pub(super) fn expected_outcome(self) -> UploadPartCopyOutcome {
+            if self.upload_state == UploadStateShape::Completed {
+                return UploadPartCopyOutcome::NoSuchUpload;
+            }
+            if self.source_access == CopySourceAccess::Unreadable {
+                return UploadPartCopyOutcome::Deny;
+            }
+
+            let can_manage = match self.upload_owner {
+                UploadOwnerShape::Requester => true,
+                UploadOwnerShape::BucketOwner => {
+                    self.requester == CopyRequesterShape::BucketOwnerPrincipal
+                }
+            };
+            let can_write_bucket = self.requester == CopyRequesterShape::BucketOwnerPrincipal
+                || self.bucket.bucket_public_write;
+            let fallback = can_manage && can_write_bucket;
+            let allowed = match self.policy {
+                UploadPartCopyPolicyShape::NoPolicy => fallback,
+                UploadPartCopyPolicyShape::AllowPrivate => true,
+                UploadPartCopyPolicyShape::AllowWithCopySourceCondition => {
+                    self.context == CopyContextShape::Exact
+                }
+                UploadPartCopyPolicyShape::AllowWithMetadataDirectiveCopy => false,
+            };
+
+            if allowed {
+                UploadPartCopyOutcome::Allow
+            } else {
+                UploadPartCopyOutcome::Deny
+            }
+        }
+    }
+
+    impl fmt::Display for UploadPartCopyScenario {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "name={} requester={} bucket={} source={} upload_owner={} upload_state={} policy={} context={}",
+                self.name,
+                self.requester,
+                self.bucket,
+                self.source_access,
+                self.upload_owner,
+                self.upload_state,
+                self.policy,
+                self.context
+            )
+        }
+    }
+
+    impl CopyAclShape {
+        fn is_public_acl(self) -> bool {
+            matches!(self, Self::CannedPublicRead)
+        }
+
+        fn is_supported_under_boe(self) -> bool {
+            matches!(self, Self::None | Self::CannedPrivate)
+        }
+
+        pub(super) fn canned_acl_condition_value(self) -> Option<&'static str> {
+            match self {
+                Self::None
+                | Self::GrantRead
+                | Self::GrantReadAcp
+                | Self::GrantWrite
+                | Self::GrantWriteAcp => None,
+                Self::CannedPrivate => Some("private"),
+                Self::CannedPublicRead => Some("public-read"),
+            }
+        }
+    }
+}
+
+mod phase6_harness {
+    use super::harness::{setup_coordinator, IdentityFixtures};
+    use super::model::OwnershipShape;
+    use super::phase6_model::{
+        CopyAclShape, CopyBucketShape, CopyContextShape, CopyDirectiveShape, CopyObjectScenario,
+        CopyOutcome, CopyPolicyShape, CopyRequesterShape, CopySourceAccess, CopyTaggingShape,
+        UploadOwnerShape, UploadPartCopyOutcome, UploadPartCopyPolicyShape, UploadPartCopyScenario,
+        UploadStateShape,
+    };
+    use super::*;
+
+    const SRC_KEY: &str = "source-key";
+    const DST_KEY: &str = "dest-key";
+    const REPLACEMENT_TAGS_XML: &str =
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ClassifiedPhase6Result {
+        Allow,
+        Deny,
+        AclNotSupported,
+        NoSuchUpload,
+    }
+
+    pub(super) struct Phase6Harness {
+        _tmp: test_util::TempDir,
+        coord: Coordinator,
+        fixtures: IdentityFixtures,
+    }
+
+    impl Phase6Harness {
+        pub(super) fn new() -> Self {
+            let tmp = test_util::tempdir();
+            let coord = setup_coordinator(tmp.path());
+            let fixtures = IdentityFixtures::new();
+            Self {
+                _tmp: tmp,
+                coord,
+                fixtures,
+            }
+        }
+
+        pub(super) fn run_copy_object(
+            &self,
+            bucket: &str,
+            scenario: CopyObjectScenario,
+        ) -> ClassifiedPhase6Result {
+            let src_bucket = format!("{bucket}-src");
+            let dst_bucket = format!("{bucket}-dst");
+            materialize_source_bucket(
+                &self.coord,
+                &self.fixtures,
+                &src_bucket,
+                scenario.requester,
+                scenario.source_access,
+            )
+            .unwrap_or_else(|err| {
+                panic!("failed to materialize phase 6 source for {scenario}: {err:?}");
+            });
+            materialize_copy_bucket(&self.coord, &self.fixtures, &dst_bucket, scenario.bucket)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize phase 6 bucket for {scenario}: {err:?}");
+                });
+            materialize_copy_policy(&self.coord, &self.fixtures, &dst_bucket, scenario)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize phase 6 copy policy for {scenario}: {err:?}");
+                });
+            classify(run_copy_object_action(
+                &self.coord,
+                &self.fixtures,
+                &src_bucket,
+                &dst_bucket,
+                scenario,
+            ))
+        }
+
+        pub(super) fn run_upload_part_copy(
+            &self,
+            bucket: &str,
+            scenario: UploadPartCopyScenario,
+        ) -> ClassifiedPhase6Result {
+            let src_bucket = format!("{bucket}-src");
+            let dst_bucket = format!("{bucket}-dst");
+            materialize_source_bucket(
+                &self.coord,
+                &self.fixtures,
+                &src_bucket,
+                scenario.requester,
+                scenario.source_access,
+            )
+            .unwrap_or_else(|err| {
+                panic!("failed to materialize phase 6 source for {scenario}: {err:?}");
+            });
+            materialize_copy_bucket(&self.coord, &self.fixtures, &dst_bucket, scenario.bucket)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize phase 6 bucket for {scenario}: {err:?}");
+                });
+            let upload_id =
+                materialize_upload_target(&self.coord, &self.fixtures, &dst_bucket, scenario)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "failed to materialize phase 6 upload target for {scenario}: {err:?}"
+                        );
+                    });
+            materialize_upload_part_copy_policy(
+                &self.coord,
+                &self.fixtures,
+                &dst_bucket,
+                scenario,
+            )
+            .unwrap_or_else(|err| {
+                panic!("failed to materialize phase 6 upload-part-copy policy for {scenario}: {err:?}");
+            });
+            classify(run_upload_part_copy_action(
+                &self.coord,
+                &self.fixtures,
+                &src_bucket,
+                &dst_bucket,
+                &upload_id,
+                scenario,
+            ))
+        }
+    }
+
+    pub(super) fn copy_bucket_name_for(index: usize) -> String {
+        format!("authz-phase6-copy-{index:05}")
+    }
+
+    pub(super) fn upload_part_copy_bucket_name_for(index: usize) -> String {
+        format!("authz-phase6-upc-{index:05}")
+    }
+
+    pub(super) fn to_copy_outcome(result: ClassifiedPhase6Result) -> CopyOutcome {
+        match result {
+            ClassifiedPhase6Result::Allow => CopyOutcome::Allow,
+            ClassifiedPhase6Result::Deny => CopyOutcome::Deny,
+            ClassifiedPhase6Result::AclNotSupported => CopyOutcome::AclNotSupported,
+            ClassifiedPhase6Result::NoSuchUpload => {
+                panic!("copy-object matrix produced unexpected NoSuchUpload")
+            }
+        }
+    }
+
+    pub(super) fn to_upload_part_copy_outcome(
+        result: ClassifiedPhase6Result,
+    ) -> UploadPartCopyOutcome {
+        match result {
+            ClassifiedPhase6Result::Allow => UploadPartCopyOutcome::Allow,
+            ClassifiedPhase6Result::Deny => UploadPartCopyOutcome::Deny,
+            ClassifiedPhase6Result::NoSuchUpload => UploadPartCopyOutcome::NoSuchUpload,
+            ClassifiedPhase6Result::AclNotSupported => {
+                panic!("upload-part-copy matrix produced unexpected AclNotSupported")
+            }
+        }
+    }
+
+    fn materialize_source_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        requester: CopyRequesterShape,
+        source_access: CopySourceAccess,
+    ) -> Result<(), ServerError> {
+        let owner = OwnerIdentity::new(
+            fixtures.owner_user.principal(),
+            fixtures.owner_user.canonical_user_id().clone(),
+        );
+        let grants = Coordinator::bucket_acl_grants_from_flags(&owner, false, false);
+        coord.create_bucket_with_acl_grants(&owner, bucket, grants, false)?;
+        test_helpers::put_object(
+            coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: phase6_object_request(
+                    bucket,
+                    SRC_KEY,
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                ),
+                data: b"phase-6-source",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: Some(REPLACEMENT_TAGS_XML),
+                cond: NO_WRITE,
+                acl: PutObjectAcl::None.into(),
+            },
+        )?;
+
+        if requester == CopyRequesterShape::CrossAccountPrincipal
+            && source_access == CopySourceAccess::Readable
+        {
+            let policy = format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/{SRC_KEY}"}}]}}"#,
+                fixtures.cross_account.principal()
+            );
+            coord.put_bucket_policy(&PutBucketPolicyRequest {
+                bucket: phase6_bucket_request(
+                    bucket,
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                ),
+                config: &policy,
+                confirm_remove_self_bucket_access: false,
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn materialize_copy_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        shape: CopyBucketShape,
+    ) -> Result<(), ServerError> {
+        let owner = OwnerIdentity::new(
+            fixtures.owner_user.principal(),
+            fixtures.owner_user.canonical_user_id().clone(),
+        );
+        let grants =
+            Coordinator::bucket_acl_grants_from_flags(&owner, false, shape.bucket_public_write);
+        coord.create_bucket_with_acl_grants(&owner, bucket, grants, false)?;
+
+        if shape.ownership == OwnershipShape::BucketOwnerEnforced {
+            coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
+                bucket: BucketRequest::new(
+                    trusted_bucket_name(bucket),
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                config: BucketOwnershipControls {
+                    object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                },
+            })?;
+        }
+
+        if shape.block_public_acls || shape.restrict_public_buckets {
+            coord.put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
+                bucket: BucketRequest::new(
+                    trusted_bucket_name(bucket),
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                config: PublicAccessBlockConfig {
+                    block_public_acls: shape.block_public_acls,
+                    ignore_public_acls: false,
+                    block_public_policy: false,
+                    restrict_public_buckets: shape.restrict_public_buckets,
+                },
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn materialize_copy_policy(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: CopyObjectScenario,
+    ) -> Result<(), ServerError> {
+        let Some(policy) = copy_policy_document(fixtures, bucket, scenario) else {
+            return Ok(());
+        };
+        coord.put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: BucketRequest::new(
+                trusted_bucket_name(bucket),
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            config: &policy,
+            confirm_remove_self_bucket_access: false,
+        })
+    }
+
+    fn copy_policy_document(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: CopyObjectScenario,
+    ) -> Option<String> {
+        let principal = copy_requester_principal(fixtures, scenario.requester)?;
+        let object_resource = format!("arn:aws:s3:::{bucket}/{DST_KEY}");
+        let mut statements = Vec::new();
+        match scenario.policy {
+            CopyPolicyShape::NoPolicy => {}
+            CopyPolicyShape::AllowPrivate => statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}"}}"#
+            )),
+            CopyPolicyShape::AllowPublic => statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"{object_resource}"}}"#
+            )),
+            CopyPolicyShape::AllowWithCopySourceCondition => statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringLike":{{"s3:x-amz-copy-source":"{}"}}}}}}"#,
+                copy_source_policy_value(scenario.context)
+            )),
+            CopyPolicyShape::AllowWithMetadataDirectiveCopy => statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringEquals":{{"s3:x-amz-metadata-directive":"COPY"}}}}}}"#
+            )),
+            CopyPolicyShape::AllowPrivateWithPublicAclDeny => {
+                statements.push(format!(
+                    r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}"}}"#
+                ));
+                statements.push(format!(
+                    r#"{{"Effect":"Deny","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringLike":{{"s3:x-amz-acl":"public*"}}}}}}"#
+                ));
+            }
+            CopyPolicyShape::AllowWithGrantReadCondition => {
+                let grant_read = expected_copy_grant_header(fixtures);
+                let grant_read_json = phase6_json_string(grant_read);
+                statements.push(format!(
+                    r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringEquals":{{"s3:x-amz-grant-read":{grant_read_json}}}}}}}"#
+                ));
+            }
+            CopyPolicyShape::AllowWithGrantReadAcpCondition => {
+                let grant_read_acp = expected_copy_grant_header(fixtures);
+                let grant_read_acp_json = phase6_json_string(grant_read_acp);
+                statements.push(format!(
+                    r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringEquals":{{"s3:x-amz-grant-read-acp":{grant_read_acp_json}}}}}}}"#
+                ));
+            }
+            CopyPolicyShape::AllowWithGrantWriteCondition => {
+                let grant_write = expected_copy_grant_header(fixtures);
+                let grant_write_json = phase6_json_string(grant_write);
+                statements.push(format!(
+                    r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringEquals":{{"s3:x-amz-grant-write":{grant_write_json}}}}}}}"#
+                ));
+            }
+            CopyPolicyShape::AllowWithGrantWriteAcpCondition => {
+                let grant_write_acp = expected_copy_grant_header(fixtures);
+                let grant_write_acp_json = phase6_json_string(grant_write_acp);
+                statements.push(format!(
+                    r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringEquals":{{"s3:x-amz-grant-write-acp":{grant_write_acp_json}}}}}}}"#
+                ));
+            }
+            CopyPolicyShape::AllowWithRequestTagsAndTaggingPermission => {
+                let condition = r#"{"StringEquals":{"s3:RequestObjectTag/security":"public"}}"#;
+                statements.push(format!(
+                    r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{condition}}}"#
+                ));
+                statements.push(format!(
+                    r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObjectTagging","Resource":"{object_resource}","Condition":{condition}}}"#
+                ));
+            }
+            CopyPolicyShape::AllowWithRequestTagsWithoutTaggingPermission => statements.push(format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringEquals":{{"s3:RequestObjectTag/security":"public"}}}}}}"#
+            )),
+        }
+
+        if statements.is_empty() {
+            None
+        } else {
+            Some(format!(
+                r#"{{"Version":"2012-10-17","Statement":[{}]}}"#,
+                statements.join(",")
+            ))
+        }
+    }
+
+    fn run_copy_object_action(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        src_bucket: &str,
+        dst_bucket: &str,
+        scenario: CopyObjectScenario,
+    ) -> Result<(), ServerError> {
+        let requester = copy_requester(fixtures, scenario.requester);
+        let tagging = match scenario.tagging {
+            CopyTaggingShape::Copy => TaggingDirective::Copy,
+            CopyTaggingShape::ReplaceMatching => {
+                TaggingDirective::Replace(Some(REPLACEMENT_TAGS_XML))
+            }
+        };
+        let directive = match scenario.directive {
+            CopyDirectiveShape::CopyImplicit => MetadataDirective::Copy,
+            CopyDirectiveShape::CopyExplicit => MetadataDirective::CopyExplicit,
+        };
+        coord
+            .copy_object(&CopyObjectRequest {
+                source: phase6_copy_source(src_bucket, SRC_KEY),
+                destination: phase6_object_request(dst_bucket, DST_KEY, requester),
+                dst_condition: NO_WRITE,
+                directive,
+                tagging,
+                acl: copy_acl(fixtures, scenario.acl),
+                policy_context: copy_policy_context(fixtures, scenario),
+                source_sse_customer: None,
+                destination_encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+            })
+            .map(|_| ())
+    }
+
+    fn materialize_upload_target(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: UploadPartCopyScenario,
+    ) -> Result<UploadId, ServerError> {
+        let owner_requester = match scenario.upload_owner {
+            UploadOwnerShape::Requester => copy_requester(fixtures, scenario.requester),
+            UploadOwnerShape::BucketOwner => Requester::authenticated(fixtures.owner_user.clone()),
+        };
+
+        let temporary_policy = match (scenario.requester, scenario.upload_owner) {
+            (CopyRequesterShape::CrossAccountPrincipal, UploadOwnerShape::Requester) => {
+                Some(format!(
+                    r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/{DST_KEY}"}}]}}"#,
+                    fixtures.cross_account.principal()
+                ))
+            }
+            _ => None,
+        };
+
+        if let Some(policy) = temporary_policy.as_deref() {
+            coord.put_bucket_policy(&PutBucketPolicyRequest {
+                bucket: BucketRequest::new(
+                    trusted_bucket_name(bucket),
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                config: policy,
+                confirm_remove_self_bucket_access: false,
+            })?;
+        }
+
+        let upload = coord.create_multipart_upload(&CreateMultipartUploadRequest {
+            object: phase6_object_request(bucket, DST_KEY, owner_requester.clone()),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: PutObjectAcl::None.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })?;
+
+        if scenario.upload_state == UploadStateShape::Completed {
+            let part = test_helpers::upload_part(
+                coord,
+                &test_helpers::UploadPartRequest {
+                    upload: phase6_multipart_object_request(
+                        bucket,
+                        DST_KEY,
+                        &upload.upload_id,
+                        owner_requester,
+                    ),
+                    part_number: 1,
+                    data: b"phase-6-part",
+                    claimed_checksum: None,
+                    sse_customer: None,
+                },
+            )?;
+            coord.complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: phase6_multipart_object_request(
+                    bucket,
+                    DST_KEY,
+                    &upload.upload_id,
+                    match scenario.upload_owner {
+                        UploadOwnerShape::Requester => copy_requester(fixtures, scenario.requester),
+                        UploadOwnerShape::BucketOwner => {
+                            Requester::authenticated(fixtures.owner_user.clone())
+                        }
+                    },
+                ),
+                parts: &[CompletePart {
+                    part_number: 1,
+                    etag: part.etag,
+                    checksum: None,
+                }],
+                claimed_checksum: None,
+                expected_object_size: None,
+                cond: NO_WRITE,
+                sse_customer: None,
+            })?;
+        }
+
+        Ok(upload.upload_id)
+    }
+
+    fn materialize_upload_part_copy_policy(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: UploadPartCopyScenario,
+    ) -> Result<(), ServerError> {
+        let Some(policy) = upload_part_copy_policy_document(fixtures, bucket, scenario) else {
+            return Ok(());
+        };
+        coord.put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: BucketRequest::new(
+                trusted_bucket_name(bucket),
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            config: &policy,
+            confirm_remove_self_bucket_access: false,
+        })
+    }
+
+    fn upload_part_copy_policy_document(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: UploadPartCopyScenario,
+    ) -> Option<String> {
+        let principal = copy_requester_principal(fixtures, scenario.requester)?;
+        let object_resource = format!("arn:aws:s3:::{bucket}/{DST_KEY}");
+        let statement = match scenario.policy {
+            UploadPartCopyPolicyShape::NoPolicy => return None,
+            UploadPartCopyPolicyShape::AllowPrivate => format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}"}}"#
+            ),
+            UploadPartCopyPolicyShape::AllowWithCopySourceCondition => format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringLike":{{"s3:x-amz-copy-source":"{}"}}}}}}"#,
+                copy_source_policy_value(scenario.context)
+            ),
+            UploadPartCopyPolicyShape::AllowWithMetadataDirectiveCopy => format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringEquals":{{"s3:x-amz-metadata-directive":"COPY"}}}}}}"#
+            ),
+        };
+        Some(format!(
+            r#"{{"Version":"2012-10-17","Statement":[{statement}]}}"#
+        ))
+    }
+
+    fn run_upload_part_copy_action(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        src_bucket: &str,
+        dst_bucket: &str,
+        upload_id: &UploadId,
+        scenario: UploadPartCopyScenario,
+    ) -> Result<(), ServerError> {
+        let requester = copy_requester(fixtures, scenario.requester);
+        coord
+            .upload_part_copy(&UploadPartCopyRequest {
+                source: phase6_copy_source(src_bucket, SRC_KEY),
+                upload: phase6_multipart_object_request(dst_bucket, DST_KEY, upload_id, requester),
+                part_number: 1,
+                copy_source_range: None,
+                source_sse_customer: None,
+                sse_customer: None,
+            })
+            .map(|_| ())
+    }
+
+    fn classify(result: Result<(), ServerError>) -> ClassifiedPhase6Result {
+        match result {
+            Ok(()) => ClassifiedPhase6Result::Allow,
+            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
+                ClassifiedPhase6Result::Deny
+            }
+            Err(ServerError::AccessControlListNotSupported) => {
+                ClassifiedPhase6Result::AclNotSupported
+            }
+            Err(ServerError::NoSuchUpload { .. }) => ClassifiedPhase6Result::NoSuchUpload,
+            Err(other) => panic!("unexpected phase 6 classified result: {other:?}"),
+        }
+    }
+
+    fn copy_requester(fixtures: &IdentityFixtures, shape: CopyRequesterShape) -> Requester {
+        match shape {
+            CopyRequesterShape::BucketOwnerPrincipal => {
+                Requester::authenticated(fixtures.owner_user.clone())
+            }
+            CopyRequesterShape::CrossAccountPrincipal => {
+                Requester::authenticated(fixtures.cross_account.clone())
+            }
+        }
+    }
+
+    fn copy_requester_principal(
+        fixtures: &IdentityFixtures,
+        shape: CopyRequesterShape,
+    ) -> Option<&str> {
+        match shape {
+            CopyRequesterShape::BucketOwnerPrincipal => Some(fixtures.owner_user.principal()),
+            CopyRequesterShape::CrossAccountPrincipal => Some(fixtures.cross_account.principal()),
+        }
+    }
+
+    fn copy_acl(fixtures: &IdentityFixtures, acl: CopyAclShape) -> PutObjectWriteAcl<'static> {
+        match acl {
+            CopyAclShape::None => PutObjectAcl::None.into(),
+            CopyAclShape::CannedPrivate => PutObjectAcl::Private.into(),
+            CopyAclShape::CannedPublicRead => PutObjectAcl::PublicRead.into(),
+            CopyAclShape::GrantRead => PutObjectWriteAcl::Grants(AclGrants::new(vec![
+                AclGrant::new(
+                    AclGrantee::CanonicalUser(fixtures.owner_user.canonical_user_id().clone()),
+                    AclPermission::FullControl,
+                ),
+                AclGrant::new(
+                    AclGrantee::CanonicalUser(fixtures.cross_account.canonical_user_id().clone()),
+                    AclPermission::Read,
+                ),
+            ])),
+            CopyAclShape::GrantReadAcp => phase6_acl_grants(fixtures, AclPermission::ReadAcp),
+            CopyAclShape::GrantWrite => phase6_acl_grants(fixtures, AclPermission::Write),
+            CopyAclShape::GrantWriteAcp => phase6_acl_grants(fixtures, AclPermission::WriteAcp),
+        }
+    }
+
+    fn copy_policy_context(
+        fixtures: &IdentityFixtures,
+        scenario: CopyObjectScenario,
+    ) -> PutObjectPolicyContext<'static> {
+        PutObjectPolicyContext::new(None, None, scenario.acl.canned_acl_condition_value())
+            .with_acl_grant_headers(
+                match scenario.acl {
+                    CopyAclShape::GrantRead => {
+                        Some(copy_grant_read_header(fixtures, scenario.context))
+                    }
+                    _ => None,
+                },
+                match scenario.acl {
+                    CopyAclShape::GrantWrite => {
+                        Some(copy_grant_write_header(fixtures, scenario.context))
+                    }
+                    _ => None,
+                },
+                match scenario.acl {
+                    CopyAclShape::GrantReadAcp => {
+                        Some(copy_grant_read_acp_header(fixtures, scenario.context))
+                    }
+                    _ => None,
+                },
+                match scenario.acl {
+                    CopyAclShape::GrantWriteAcp => {
+                        Some(copy_grant_write_acp_header(fixtures, scenario.context))
+                    }
+                    _ => None,
+                },
+                None,
+            )
+    }
+
+    fn copy_source_policy_value(context: CopyContextShape) -> &'static str {
+        match context {
+            CopyContextShape::CopySourceMismatch => "*different-source-key",
+            CopyContextShape::Exact
+            | CopyContextShape::GrantReadMismatch
+            | CopyContextShape::GrantReadAcpMismatch
+            | CopyContextShape::GrantWriteMismatch
+            | CopyContextShape::GrantWriteAcpMismatch => "*source-key",
+        }
+    }
+
+    fn copy_grant_read_header(
+        fixtures: &IdentityFixtures,
+        context: CopyContextShape,
+    ) -> &'static str {
+        phase6_grant_header(
+            context,
+            CopyContextShape::GrantReadMismatch,
+            fixtures.cross_account.canonical_user_id(),
+        )
+    }
+
+    fn copy_grant_read_acp_header(
+        fixtures: &IdentityFixtures,
+        context: CopyContextShape,
+    ) -> &'static str {
+        phase6_grant_header(
+            context,
+            CopyContextShape::GrantReadAcpMismatch,
+            fixtures.cross_account.canonical_user_id(),
+        )
+    }
+
+    fn copy_grant_write_header(
+        fixtures: &IdentityFixtures,
+        context: CopyContextShape,
+    ) -> &'static str {
+        phase6_grant_header(
+            context,
+            CopyContextShape::GrantWriteMismatch,
+            fixtures.cross_account.canonical_user_id(),
+        )
+    }
+
+    fn copy_grant_write_acp_header(
+        fixtures: &IdentityFixtures,
+        context: CopyContextShape,
+    ) -> &'static str {
+        phase6_grant_header(
+            context,
+            CopyContextShape::GrantWriteAcpMismatch,
+            fixtures.cross_account.canonical_user_id(),
+        )
+    }
+
+    fn expected_copy_grant_header(fixtures: &IdentityFixtures) -> &'static str {
+        Box::leak(
+            format!(r#"id="{}""#, fixtures.cross_account.canonical_user_id()).into_boxed_str(),
+        )
+    }
+
+    fn phase6_grant_header(
+        context: CopyContextShape,
+        mismatch: CopyContextShape,
+        canonical_id: &CanonicalUserId,
+    ) -> &'static str {
+        if context == mismatch {
+            r#"id="different-grantee""#
+        } else {
+            Box::leak(format!(r#"id="{}""#, canonical_id).into_boxed_str())
+        }
+    }
+
+    fn phase6_acl_grants(
+        fixtures: &IdentityFixtures,
+        permission: AclPermission,
+    ) -> PutObjectWriteAcl<'static> {
+        PutObjectWriteAcl::Grants(AclGrants::new(vec![
+            AclGrant::new(
+                AclGrantee::CanonicalUser(fixtures.owner_user.canonical_user_id().clone()),
+                AclPermission::FullControl,
+            ),
+            AclGrant::new(
+                AclGrantee::CanonicalUser(fixtures.cross_account.canonical_user_id().clone()),
+                permission,
+            ),
+        ]))
+    }
+
+    fn phase6_json_string(value: &str) -> String {
+        format!(r#""{}""#, value.replace('\\', "\\\\").replace('"', "\\\""))
+    }
+
+    fn phase6_bucket_request<'a>(bucket: &'a str, requester: Requester) -> BucketRequest<'a> {
+        BucketRequest::new(trusted_bucket_name(bucket), requester, None)
+    }
+
+    fn phase6_object_request<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        requester: Requester,
+    ) -> ObjectRequest<'a> {
+        ObjectRequest::new(
+            trusted_bucket_name(bucket),
+            trusted_object_key(key),
+            requester,
+            None,
+        )
+    }
+
+    fn phase6_multipart_object_request<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        upload_id: &UploadId,
+        requester: Requester,
+    ) -> MultipartObjectRequest<'a> {
+        MultipartObjectRequest::new(
+            trusted_bucket_name(bucket),
+            trusted_object_key(key),
+            upload_id.clone(),
+            requester,
+            None,
+        )
+    }
+
+    fn phase6_copy_source<'a>(bucket: &'a str, key: &'a str) -> CopySource<'a> {
+        CopySource::new(
+            trusted_bucket_name(bucket),
+            trusted_object_key(key),
+            None,
+            NO_READ,
+            None,
+        )
+    }
+}
+
 use harness::{bucket_name_for, to_existing_outcome, to_missing_outcome, MatrixHarness};
 use model::{Action, MissingScenario, Scenario};
 use phase4_harness::{
@@ -4160,6 +5723,11 @@ use phase4_harness::{
 use phase4_model::{AclUpdateAction, AclUpdateScenario, WriteAction, WriteScenario};
 use phase5_harness::{phase5_bucket_name_for, to_transition_outcome, Phase5Harness};
 use phase5_model::{TransitionScenario, TransitionStep};
+use phase6_harness::{
+    copy_bucket_name_for, to_copy_outcome, to_upload_part_copy_outcome,
+    upload_part_copy_bucket_name_for, Phase6Harness,
+};
+use phase6_model::{CopyObjectScenario, UploadPartCopyScenario};
 
 #[test]
 fn authz_model_phase1_get_object_existing_matrix() {
@@ -4282,6 +5850,46 @@ fn authz_model_phase5_transition_matrix() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn authz_model_phase6_copy_object_matrix() {
+    let scenarios = CopyObjectScenario::scenarios();
+    assert!(
+        !scenarios.is_empty(),
+        "phase 6 copy matrix unexpectedly produced no scenarios"
+    );
+    let harness = Phase6Harness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = copy_bucket_name_for(index);
+        let expected = scenario.expected_outcome();
+        let actual = to_copy_outcome(harness.run_copy_object(&bucket, scenario));
+        assert_eq!(
+            actual, expected,
+            "phase 6 copy-object mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+        );
+    }
+}
+
+#[test]
+fn authz_model_phase6_upload_part_copy_matrix() {
+    let scenarios = UploadPartCopyScenario::scenarios();
+    assert!(
+        !scenarios.is_empty(),
+        "phase 6 upload-part-copy matrix unexpectedly produced no scenarios"
+    );
+    let harness = Phase6Harness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = upload_part_copy_bucket_name_for(index);
+        let expected = scenario.expected_outcome();
+        let actual = to_upload_part_copy_outcome(harness.run_upload_part_copy(&bucket, scenario));
+        assert_eq!(
+            actual, expected,
+            "phase 6 upload-part-copy mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+        );
     }
 }
 
