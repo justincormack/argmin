@@ -12195,16 +12195,10 @@ impl Coordinator {
                 .expect("selected cursor should have a current object")
                 .clone();
             let obj_key = current.key().to_string();
-            let after_prefix = obj_key
-                .strip_prefix(prefix_str)
-                .expect("list_objects query must respect the requested prefix");
-
-            if let Some(pos) = after_prefix.find(delimiter) {
-                let common_prefix =
-                    format!("{}{}", prefix_str, &after_prefix[..pos + delimiter.len()]);
-                let common_prefix_key = ObjectKey::try_from(common_prefix.as_str()).expect(
-                    "common prefix derived from a listed valid object key must remain valid",
-                );
+            if let Some(common_prefix_key) =
+                storage::object_key_common_prefix(current.key(), prefix_str, delimiter)
+            {
+                let common_prefix = common_prefix_key.to_string();
                 let upper_bound = storage::object_key_prefix_upper_bound(&common_prefix_key);
                 active_common_prefix = Some((common_prefix.clone(), upper_bound));
                 if objects.len() + common_prefixes.len() >= max {

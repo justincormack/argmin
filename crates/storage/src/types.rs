@@ -391,6 +391,32 @@ pub fn object_key_prefix_upper_bound(prefix: &ObjectKey) -> Option<ObjectKey> {
         .and_then(|upper_bound| ObjectKey::try_from(upper_bound).ok())
 }
 
+/// Return the common-prefix key ending at the first `delimiter` occurrence
+/// after `prefix`, if `key` matches the requested prefix and delimiter.
+///
+/// The derived value is reconstructed from a prefix slice of an already-valid
+/// `ObjectKey`, so validity is expected to hold unless the slicing invariant is
+/// broken locally.
+#[must_use]
+pub fn object_key_common_prefix(
+    key: &ObjectKey,
+    prefix: &str,
+    delimiter: &str,
+) -> Option<ObjectKey> {
+    if delimiter.is_empty() {
+        return None;
+    }
+
+    let key_str = key.as_str();
+    let after_prefix = key_str.strip_prefix(prefix)?;
+    let pos = after_prefix.find(delimiter)?;
+    let common_prefix = &key_str[..prefix.len() + pos + delimiter.len()];
+    Some(
+        ObjectKey::try_from(common_prefix.to_owned())
+            .expect("prefix slice of a valid object key must remain a valid object key"),
+    )
+}
+
 string_newtype!(
     /// Multipart upload identifier.
     UploadId
@@ -2787,6 +2813,27 @@ mod tests {
     fn object_key_prefix_upper_bound_returns_none_when_derived_bound_exceeds_limit() {
         let prefix = ObjectKey::try_from(format!("{}{}", "a".repeat(1023), '\x7f')).unwrap();
         assert_eq!(object_key_prefix_upper_bound(&prefix), None);
+    }
+
+    #[test]
+    fn object_key_common_prefix_stays_typed() {
+        let key = ObjectKey::try_from("photos/2025/image.jpg").unwrap();
+        assert_eq!(
+            object_key_common_prefix(&key, "photos/", "/"),
+            Some(ObjectKey::try_from("photos/2025/").unwrap())
+        );
+    }
+
+    #[test]
+    fn object_key_common_prefix_returns_none_without_delimiter_match() {
+        let key = ObjectKey::try_from("photos-top.jpg").unwrap();
+        assert_eq!(object_key_common_prefix(&key, "photos-", "/"), None);
+    }
+
+    #[test]
+    fn object_key_common_prefix_returns_none_for_empty_delimiter() {
+        let key = ObjectKey::try_from("photos/2025/image.jpg").unwrap();
+        assert_eq!(object_key_common_prefix(&key, "", ""), None);
     }
 
     #[test]
