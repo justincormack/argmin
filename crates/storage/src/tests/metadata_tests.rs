@@ -1,4 +1,4 @@
-use super::{bucket_name, multipart_upload_id, object_key};
+use super::{bucket_name, multipart_upload_id, object_key, stream_session_id};
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::*;
 use std::num::NonZeroU64;
@@ -4634,7 +4634,7 @@ fn stream_upload_create_get_delete() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-1".into(),
+            session_id: stream_session_id("sess-1"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -4642,16 +4642,16 @@ fn stream_upload_create_get_delete() {
         })
         .unwrap();
 
-    let rec = store.get_stream_upload("sess-1").unwrap();
-    assert_eq!(rec.session_id, "sess-1");
+    let rec = store.get_stream_upload(stream_session_id("sess-1").as_str()).unwrap();
+    assert_eq!(rec.session_id, stream_session_id("sess-1"));
     assert_eq!(rec.bucket, "bucket");
     assert_eq!(rec.key, "k");
     assert_eq!(rec.target, StreamUploadTarget::PutObject);
     assert_eq!(rec.state, StreamUploadState::InProgress);
 
-    store.delete_stream_upload("sess-1").unwrap();
+    store.delete_stream_upload(stream_session_id("sess-1").as_str()).unwrap();
 
-    let err = store.get_stream_upload("sess-1").unwrap_err();
+    let err = store.get_stream_upload(stream_session_id("sess-1").as_str()).unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::StreamSessionNotFound { .. }
@@ -4664,7 +4664,7 @@ fn stream_upload_state_transitions() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-2".into(),
+            session_id: stream_session_id("sess-2"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -4674,15 +4674,15 @@ fn stream_upload_state_transitions() {
 
     // Transition to Completing
     store
-        .set_stream_upload_state("sess-2", StreamUploadState::Completing)
+        .set_stream_upload_state(stream_session_id("sess-2").as_str(), StreamUploadState::Completing)
         .unwrap();
 
-    let rec = store.get_stream_upload("sess-2").unwrap();
+    let rec = store.get_stream_upload(stream_session_id("sess-2").as_str()).unwrap();
     assert_eq!(rec.state, StreamUploadState::Completing);
 
     // Cannot transition again (not InProgress)
     let err = store
-        .set_stream_upload_state("sess-2", StreamUploadState::Aborted)
+        .set_stream_upload_state(stream_session_id("sess-2").as_str(), StreamUploadState::Aborted)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -4694,14 +4694,14 @@ fn stream_upload_state_transitions() {
 fn stream_upload_not_found() {
     let (_dir, store) = make_pg_store();
 
-    let err = store.get_stream_upload("nonexistent").unwrap_err();
+    let err = store.get_stream_upload(stream_session_id("nonexistent").as_str()).unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::StreamSessionNotFound { .. }
     ));
 
     let err = store
-        .set_stream_upload_state("nonexistent", StreamUploadState::Aborted)
+        .set_stream_upload_state(stream_session_id("nonexistent").as_str(), StreamUploadState::Aborted)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -4715,7 +4715,7 @@ fn stream_upload_upload_part_kind() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-part".into(),
+            session_id: stream_session_id("sess-part"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
@@ -4726,7 +4726,7 @@ fn stream_upload_upload_part_kind() {
         })
         .unwrap();
 
-    let rec = store.get_stream_upload("sess-part").unwrap();
+    let rec = store.get_stream_upload(stream_session_id("sess-part").as_str()).unwrap();
     assert_eq!(
         rec.target,
         StreamUploadTarget::UploadPart {
@@ -4742,7 +4742,7 @@ fn stream_upload_segment_vid_allocation_is_monotonic() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-vid".into(),
+            session_id: stream_session_id("sess-vid"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -4751,15 +4751,15 @@ fn stream_upload_segment_vid_allocation_is_monotonic() {
         .unwrap();
 
     assert_eq!(
-        store.allocate_stream_segment_vid("sess-vid").unwrap(),
+        store.allocate_stream_segment_vid(stream_session_id("sess-vid").as_str()).unwrap(),
         GenerationId::new(1).unwrap()
     );
     assert_eq!(
-        store.allocate_stream_segment_vid("sess-vid").unwrap(),
+        store.allocate_stream_segment_vid(stream_session_id("sess-vid").as_str()).unwrap(),
         GenerationId::new(2).unwrap()
     );
     assert_eq!(
-        store.allocate_stream_segment_vid("sess-vid").unwrap(),
+        store.allocate_stream_segment_vid(stream_session_id("sess-vid").as_str()).unwrap(),
         GenerationId::new(3).unwrap()
     );
 }
@@ -4770,7 +4770,7 @@ fn stream_upload_segment_vid_allocation_requires_in_progress_session() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-vid-state".into(),
+            session_id: stream_session_id("sess-vid-state"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -4778,11 +4778,11 @@ fn stream_upload_segment_vid_allocation_requires_in_progress_session() {
         })
         .unwrap();
     store
-        .set_stream_upload_state("sess-vid-state", StreamUploadState::Completing)
+        .set_stream_upload_state(stream_session_id("sess-vid-state").as_str(), StreamUploadState::Completing)
         .unwrap();
 
     let err = store
-        .allocate_stream_segment_vid("sess-vid-state")
+        .allocate_stream_segment_vid(stream_session_id("sess-vid-state").as_str())
         .unwrap_err();
     assert!(matches!(
         err,
@@ -4796,7 +4796,7 @@ fn stream_segment_append_and_list() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-segments".into(),
+            session_id: stream_session_id("sess-segments"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -4807,7 +4807,7 @@ fn stream_segment_append_and_list() {
     for i in 0..3u32 {
         store
             .append_stream_segment(&StreamUploadSegmentRecord {
-                session_id: "sess-segments".into(),
+                session_id: stream_session_id("sess-segments"),
                 segment_index: i,
                 size: (i as u64 + 1) * 1000,
                 segment_crc64: Some((i as u64) + 10),
@@ -4820,7 +4820,7 @@ fn stream_segment_append_and_list() {
             .unwrap();
     }
 
-    let segments = store.list_stream_segments("sess-segments").unwrap();
+    let segments = store.list_stream_segments(stream_session_id("sess-segments").as_str()).unwrap();
     assert_eq!(segments.len(), 3);
     assert_eq!(segments[0].segment_index, 0);
     assert_eq!(segments[0].size, 1000);
@@ -4840,7 +4840,7 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-publish".into(),
+            session_id: stream_session_id("sess-publish"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -4863,7 +4863,7 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
     ));
 
     let segment = StreamUploadSegmentRecord {
-        session_id: "sess-publish".into(),
+        session_id: stream_session_id("sess-publish"),
         segment_index: 0,
         size: 4,
         segment_crc64: Some(99),
@@ -4879,7 +4879,7 @@ fn stream_segment_publish_with_shards_same_pg_is_atomic() {
         .register_written_shards_and_append_stream_segment(&shard_batch, &segment)
         .unwrap();
 
-    let segments = store.list_stream_segments("sess-publish").unwrap();
+    let segments = store.list_stream_segments(stream_session_id("sess-publish").as_str()).unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].segment_index, 0);
     assert_eq!(store.read_shard(&shard).unwrap().data, b"bbbb");
@@ -4891,7 +4891,7 @@ fn stream_segment_cascade_delete() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-cascade".into(),
+            session_id: stream_session_id("sess-cascade"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -4901,7 +4901,7 @@ fn stream_segment_cascade_delete() {
 
     store
         .append_stream_segment(&StreamUploadSegmentRecord {
-            session_id: "sess-cascade".into(),
+            session_id: stream_session_id("sess-cascade"),
             segment_index: 0,
             size: 4096,
             segment_crc64: None,
@@ -4914,9 +4914,9 @@ fn stream_segment_cascade_delete() {
         .unwrap();
 
     // Delete session cascades to segments
-    store.delete_stream_upload("sess-cascade").unwrap();
+    store.delete_stream_upload(stream_session_id("sess-cascade").as_str()).unwrap();
 
-    let segments = store.list_stream_segments("sess-cascade").unwrap();
+    let segments = store.list_stream_segments(stream_session_id("sess-cascade").as_str()).unwrap();
     assert!(segments.is_empty());
 }
 
@@ -4927,7 +4927,7 @@ fn commit_stream_put_atomic() {
     // Create session and append segments
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-commit".into(),
+            session_id: stream_session_id("sess-commit"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -4937,7 +4937,7 @@ fn commit_stream_put_atomic() {
 
     store
         .append_stream_segment(&StreamUploadSegmentRecord {
-            session_id: "sess-commit".into(),
+            session_id: stream_session_id("sess-commit"),
             segment_index: 0,
             size: 4_000_000,
             segment_crc64: None,
@@ -4951,7 +4951,7 @@ fn commit_stream_put_atomic() {
 
     store
         .append_stream_segment(&StreamUploadSegmentRecord {
-            session_id: "sess-commit".into(),
+            session_id: stream_session_id("sess-commit"),
             segment_index: 1,
             size: 2_000_000,
             segment_crc64: None,
@@ -5012,7 +5012,7 @@ fn commit_stream_put_atomic() {
     ];
 
     store
-        .commit_stream_put("sess-commit", &obj, &committed_segments)
+        .commit_stream_put(stream_session_id("sess-commit").as_str(), &obj, &committed_segments)
         .unwrap();
 
     // Object metadata is committed
@@ -5039,12 +5039,12 @@ fn commit_stream_put_atomic() {
     assert_eq!(segments[1].shard_pg_id, 1);
 
     // Staging rows are cleaned up
-    let err = store.get_stream_upload("sess-commit").unwrap_err();
+    let err = store.get_stream_upload(stream_session_id("sess-commit").as_str()).unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::StreamSessionNotFound { .. }
     ));
-    let staging = store.list_stream_segments("sess-commit").unwrap();
+    let staging = store.list_stream_segments(stream_session_id("sess-commit").as_str()).unwrap();
     assert!(staging.is_empty());
 }
 
@@ -5055,7 +5055,7 @@ fn commit_stream_put_overwrite_unversioned() {
     // First write
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "s1".into(),
+            session_id: stream_session_id("s1"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -5064,7 +5064,7 @@ fn commit_stream_put_overwrite_unversioned() {
         .unwrap();
     store
         .commit_stream_put(
-            "s1",
+            stream_session_id("s1").as_str(),
             &CommitStreamPutReq {
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
@@ -5101,7 +5101,7 @@ fn commit_stream_put_overwrite_unversioned() {
     // Second write overwrites
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "s2".into(),
+            session_id: stream_session_id("s2"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -5110,7 +5110,7 @@ fn commit_stream_put_overwrite_unversioned() {
         .unwrap();
     store
         .commit_stream_put(
-            "s2",
+            stream_session_id("s2").as_str(),
             &CommitStreamPutReq {
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
@@ -5324,7 +5324,7 @@ fn delete_object_segments_cleanup() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "s-del".into(),
+            session_id: stream_session_id("s-del"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -5333,7 +5333,7 @@ fn delete_object_segments_cleanup() {
         .unwrap();
     store
         .commit_stream_put(
-            "s-del",
+            stream_session_id("s-del").as_str(),
             &CommitStreamPutReq {
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
@@ -5388,7 +5388,7 @@ fn commit_stream_put_rejects_non_in_progress() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-bad".into(),
+            session_id: stream_session_id("sess-bad"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -5398,13 +5398,13 @@ fn commit_stream_put_rejects_non_in_progress() {
 
     // Manually transition to Aborted
     store
-        .set_stream_upload_state("sess-bad", StreamUploadState::Aborted)
+        .set_stream_upload_state(stream_session_id("sess-bad").as_str(), StreamUploadState::Aborted)
         .unwrap();
 
     // commit_stream_put should fail with StreamSessionNotInProgress
     let err = store
         .commit_stream_put(
-            "sess-bad",
+            stream_session_id("sess-bad").as_str(),
             &CommitStreamPutReq {
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
@@ -5619,7 +5619,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
     // First upload: 3 segments
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-1".into(),
+            session_id: stream_session_id("sp-1"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
@@ -5649,7 +5649,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         .collect();
 
     let displaced_segments = store
-        .commit_stream_part("sp-1", &make_part(3000), &segments_v1)
+        .commit_stream_part(stream_session_id("sp-1").as_str(), &make_part(3000), &segments_v1)
         .unwrap();
     assert!(
         displaced_segments.is_empty(),
@@ -5669,7 +5669,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
     // Re-upload same part: only 1 segment (fewer than before)
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-2".into(),
+            session_id: stream_session_id("sp-2"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
@@ -5697,7 +5697,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
     }];
 
     let displaced_segments = store
-        .commit_stream_part("sp-2", &make_part(5000), &segments_v2)
+        .commit_stream_part(stream_session_id("sp-2").as_str(), &make_part(5000), &segments_v2)
         .unwrap();
     assert_eq!(displaced_segments.len(), 3);
     assert!(displaced_segments
@@ -5729,7 +5729,7 @@ fn commit_stream_put_rejects_wrong_kind() {
     // Create an UploadPart session
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-wrong-kind".into(),
+            session_id: stream_session_id("sess-wrong-kind"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
@@ -5743,7 +5743,7 @@ fn commit_stream_put_rejects_wrong_kind() {
     // Try to commit_stream_put with it — should fail
     let err = store
         .commit_stream_put(
-            "sess-wrong-kind",
+            stream_session_id("sess-wrong-kind").as_str(),
             &CommitStreamPutReq {
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
@@ -5779,7 +5779,7 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sess-mismatch".into(),
+            session_id: stream_session_id("sess-mismatch"),
             bucket: bucket_name("bucket-one"),
             key: object_key("k1"),
             target: StreamUploadTarget::PutObject,
@@ -5790,7 +5790,7 @@ fn commit_stream_put_rejects_wrong_bucket_key() {
     // Commit with different bucket/key
     let err = store
         .commit_stream_put(
-            "sess-mismatch",
+            stream_session_id("sess-mismatch").as_str(),
             &CommitStreamPutReq {
                 bucket: bucket_name("bucket-two"),
                 key: object_key("k2"),
@@ -5845,7 +5845,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-mismatch".into(),
+            session_id: stream_session_id("sp-mismatch"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
@@ -5859,7 +5859,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
     // Commit with wrong upload_id in part record
     let err = store
         .commit_stream_part(
-            "sp-mismatch",
+            stream_session_id("sp-mismatch").as_str(),
             &MultipartPartRecord {
                 upload_id: multipart_upload_id("mpu-WRONG"),
                 part_number: 1,
@@ -5912,7 +5912,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
     // First upload: 2 segments
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-zc1".into(),
+            session_id: stream_session_id("sp-zc1"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
@@ -5924,7 +5924,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
         .unwrap();
     store
         .commit_stream_part(
-            "sp-zc1",
+            stream_session_id("sp-zc1").as_str(),
             &MultipartPartRecord {
                 upload_id: multipart_upload_id("mpu-zc"),
                 part_number: 1,
@@ -5990,7 +5990,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
     // Re-upload with zero segments — must clear prior rows
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-zc2".into(),
+            session_id: stream_session_id("sp-zc2"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
@@ -6002,7 +6002,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
         .unwrap();
     store
         .commit_stream_part(
-            "sp-zc2",
+            stream_session_id("sp-zc2").as_str(),
             &MultipartPartRecord {
                 upload_id: multipart_upload_id("mpu-zc"),
                 part_number: 1,
@@ -6041,7 +6041,7 @@ fn commit_stream_put_rejects_mismatched_segment_target() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-ct".into(),
+            session_id: stream_session_id("sp-ct"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -6052,7 +6052,7 @@ fn commit_stream_put_rejects_mismatched_segment_target() {
     // Segment with wrong bucket
     let err = store
         .commit_stream_put(
-            "sp-ct",
+            stream_session_id("sp-ct").as_str(),
             &CommitStreamPutReq {
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
@@ -6414,7 +6414,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-cpc".into(),
+            session_id: stream_session_id("sp-cpc"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
@@ -6428,7 +6428,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
     // Chunk has part_number=99, but session is for part 1
     let err = store
         .commit_stream_part(
-            "sp-cpc",
+            stream_session_id("sp-cpc").as_str(),
             &MultipartPartRecord {
                 upload_id: multipart_upload_id("mpu-cpc"),
                 part_number: 1,
@@ -6494,7 +6494,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "sp-vid".into(),
+            session_id: stream_session_id("sp-vid"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
@@ -6508,7 +6508,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
     // Segment has version_id=42 — must be PART_SEGMENT_STAGING_VERSION_ID (u64::MAX) pre-CompleteMultipartUpload
     let err = store
         .commit_stream_part(
-            "sp-vid",
+            stream_session_id("sp-vid").as_str(),
             &MultipartPartRecord {
                 upload_id: multipart_upload_id("mpu-vid"),
                 part_number: 1,
@@ -7634,7 +7634,7 @@ fn list_all_stream_uploads_returns_sessions() {
 
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "s1".into(),
+            session_id: stream_session_id("s1"),
             bucket: bucket_name("bucket"),
             key: object_key("k1"),
             target: StreamUploadTarget::PutObject,
@@ -7643,7 +7643,7 @@ fn list_all_stream_uploads_returns_sessions() {
         .unwrap();
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "s2".into(),
+            session_id: stream_session_id("s2"),
             bucket: bucket_name("bucket"),
             key: object_key("k2"),
             target: StreamUploadTarget::PutObject,
@@ -7655,8 +7655,10 @@ fn list_all_stream_uploads_returns_sessions() {
     assert_eq!(uploads.len(), 2);
 
     let ids: Vec<&str> = uploads.iter().map(|u| u.session_id.as_str()).collect();
-    assert!(ids.contains(&"s1"));
-    assert!(ids.contains(&"s2"));
+    let s1 = stream_session_id("s1");
+    let s2 = stream_session_id("s2");
+    assert!(ids.contains(&s1.as_str()));
+    assert!(ids.contains(&s2.as_str()));
 }
 
 // ── delete_multipart_part_segments_by_upload_id ────────────────────────

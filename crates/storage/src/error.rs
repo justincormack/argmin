@@ -72,7 +72,7 @@ pub enum MetadataError {
     PartNotFound { upload_id: String, part_number: u32 },
 
     #[error("stream session not found: {session_id}")]
-    StreamSessionNotFound { session_id: crate::types::SessionId },
+    StreamSessionNotFound { session_id: String },
 
     #[error("stream session not in InProgress state (current: {state})")]
     StreamSessionNotInProgress { state: u8 },

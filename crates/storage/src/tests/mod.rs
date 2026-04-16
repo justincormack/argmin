@@ -1,4 +1,4 @@
-use crate::types::{BucketName, ObjectKey, UploadId, UPLOAD_ID_LEN};
+use crate::types::{BucketName, ObjectKey, SessionId, UploadId, SESSION_ID_LEN, UPLOAD_ID_LEN};
 
 mod integration_tests;
 mod metadata_tests;
@@ -25,4 +25,18 @@ pub(super) fn multipart_upload_id(upload_id: impl Into<String>) -> UploadId {
         UPLOAD_ID_LEN.saturating_sub(encoded.len()),
     ));
     UploadId::try_from(encoded).expect("storage tests must use valid upload IDs")
+}
+
+pub(super) fn stream_session_id(session_id: impl Into<String>) -> SessionId {
+    let session_id = session_id.into();
+    let mut encoded = String::with_capacity(SESSION_ID_LEN);
+    for byte in session_id.bytes() {
+        use std::fmt::Write;
+        write!(encoded, "{byte:02x}").unwrap();
+    }
+    encoded.extend(std::iter::repeat_n(
+        '0',
+        SESSION_ID_LEN.saturating_sub(encoded.len()),
+    ));
+    SessionId::try_from(encoded).expect("storage tests must use valid session IDs")
 }

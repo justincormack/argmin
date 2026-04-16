@@ -75,6 +75,20 @@ fn trusted_upload_id(seed: &str) -> UploadId {
         .expect("coordinator tests must use valid upload IDs")
 }
 
+#[cfg(test)]
+fn trusted_session_id(seed: &str) -> SessionId {
+    let mut bytes = [b'0'; storage::SESSION_ID_LEN];
+    let mut encoded = String::with_capacity(seed.len() * 2);
+    for byte in seed.bytes() {
+        use std::fmt::Write;
+        write!(encoded, "{byte:02x}").unwrap();
+    }
+    let take = encoded.len().min(storage::SESSION_ID_LEN);
+    bytes[..take].copy_from_slice(&encoded.as_bytes()[..take]);
+    SessionId::try_from(String::from_utf8(bytes.to_vec()).unwrap())
+        .expect("coordinator tests must use valid session IDs")
+}
+
 fn parse_list_object_key(value: &str) -> Result<ObjectKey, ServerError> {
     ObjectKey::try_from(value).map_err(|error| ServerError::InvalidArgument {
         reason: error.to_string(),
@@ -5850,7 +5864,8 @@ impl Coordinator {
         let meta_pg_id = self.object_pg_id_for(authorized.bucket_typed(), authorized.key_typed());
         let pg = self.storage_node.get_pg(meta_pg_id)?;
         pg.create_stream_upload(&CreateStreamUploadReq {
-            session_id: SessionId::from(session_id.as_str()),
+            session_id: SessionId::try_from(session_id.clone())
+                .expect("generated stream put session IDs must be valid"),
             bucket: authorized.bucket_typed().clone(),
             key: authorized.key_typed().clone(),
             target: StreamUploadTarget::PutObject,
@@ -8719,7 +8734,8 @@ impl Coordinator {
         });
 
         pg.create_stream_upload(&CreateStreamUploadReq {
-            session_id: SessionId::from(session_id.as_str()),
+            session_id: SessionId::try_from(session_id.clone())
+                .expect("generated upload-part session IDs must be valid"),
             bucket: bucket.clone(),
             key: key.clone(),
             target: StreamUploadTarget::UploadPart {
@@ -8983,7 +8999,8 @@ impl Coordinator {
                 segment_vid.get(),
             );
             let segment_record = StreamUploadSegmentRecord {
-                session_id: SessionId::from(session_id),
+                session_id: SessionId::try_from(session_id)
+                    .expect("stream session IDs must be valid while appending segments"),
                 segment_index,
                 size: logical_size,
                 segment_crc64: Some(checksum::crc64::checksum(data)),
@@ -9696,7 +9713,11 @@ impl Coordinator {
             for session in sessions {
                 if session.created_at < cutoff
                     && self
-                        .abort_stream_put_for(&session.bucket, &session.key, &session.session_id)
+                        .abort_stream_put_for(
+                            &session.bucket,
+                            &session.key,
+                            session.session_id.as_str(),
+                        )
                         .is_ok()
                 {
                     count += 1;
@@ -45374,7 +45395,7 @@ mod tests {
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         pg.create_stream_upload(&CreateStreamUploadReq {
-            session_id: SessionId::from("upload-part-session"),
+            session_id: trusted_session_id("upload-part-session"),
             bucket: trusted_bucket_name("bucket"),
             key: trusted_object_key("key"),
             target: StreamUploadTarget::UploadPart {
@@ -45386,11 +45407,12 @@ mod tests {
         .unwrap();
         drop(pg);
 
+        let session_id = trusted_session_id("upload-part-session");
         coord
             .append_plaintext_stream_segment_for_test(
                 "bucket",
                 "key",
-                "upload-part-session",
+                session_id.as_str(),
                 0,
                 b"data",
             )

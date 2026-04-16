@@ -1,4 +1,4 @@
-use super::{bucket_name, multipart_upload_id, object_key};
+use super::{bucket_name, multipart_upload_id, object_key, stream_session_id};
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::*;
 use std::num::NonZeroU64;
@@ -429,7 +429,7 @@ fn streaming_put_object_lifecycle() {
     // Create streaming session.
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "ss-put".into(),
+            session_id: stream_session_id("ss-put"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::PutObject,
@@ -440,7 +440,7 @@ fn streaming_put_object_lifecycle() {
     // Append staging segments.
     store
         .append_stream_segment(&StreamUploadSegmentRecord {
-            session_id: "ss-put".into(),
+            session_id: stream_session_id("ss-put"),
             segment_index: 0,
             size: seg0_data.len() as u64,
             segment_crc64: Some(123),
@@ -453,7 +453,7 @@ fn streaming_put_object_lifecycle() {
         .unwrap();
     store
         .append_stream_segment(&StreamUploadSegmentRecord {
-            session_id: "ss-put".into(),
+            session_id: stream_session_id("ss-put"),
             segment_index: 1,
             size: seg1_data.len() as u64,
             segment_crc64: Some(456),
@@ -466,7 +466,7 @@ fn streaming_put_object_lifecycle() {
         .unwrap();
 
     // Verify staging segments.
-    let staging = store.list_stream_segments("ss-put").unwrap();
+    let staging = store.list_stream_segments(stream_session_id("ss-put").as_str()).unwrap();
     assert_eq!(staging.len(), 2);
 
     // Commit: atomically writes object + object_segments, deletes session.
@@ -502,7 +502,7 @@ fn streaming_put_object_lifecycle() {
 
     store
         .commit_stream_put(
-            "ss-put",
+            stream_session_id("ss-put").as_str(),
             &CommitStreamPutReq {
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
@@ -539,7 +539,7 @@ fn streaming_put_object_lifecycle() {
     assert_eq!(segs[1].segment_okh, hash1);
 
     // Session is gone.
-    let err = store.get_stream_upload("ss-put").unwrap_err();
+    let err = store.get_stream_upload(stream_session_id("ss-put").as_str()).unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::StreamSessionNotFound { .. }
@@ -589,7 +589,7 @@ fn streaming_upload_part_lifecycle() {
     // Create streaming session for part 1.
     store
         .create_stream_upload(&CreateStreamUploadReq {
-            session_id: "ss-part".into(),
+            session_id: stream_session_id("ss-part"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
@@ -603,7 +603,7 @@ fn streaming_upload_part_lifecycle() {
     // Append staging segment.
     store
         .append_stream_segment(&StreamUploadSegmentRecord {
-            session_id: "ss-part".into(),
+            session_id: stream_session_id("ss-part"),
             segment_index: 0,
             size: seg_data.len() as u64,
             segment_crc64: Some(ack.crc64),
@@ -634,7 +634,7 @@ fn streaming_upload_part_lifecycle() {
 
     let displaced_segments = store
         .commit_stream_part(
-            "ss-part",
+            stream_session_id("ss-part").as_str(),
             &MultipartPartRecord {
                 upload_id: multipart_upload_id("mpu-sp"),
                 part_number: 1,
@@ -658,7 +658,7 @@ fn streaming_upload_part_lifecycle() {
     );
 
     // Session gone.
-    let err = store.get_stream_upload("ss-part").unwrap_err();
+    let err = store.get_stream_upload(stream_session_id("ss-part").as_str()).unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::StreamSessionNotFound { .. }
@@ -1272,7 +1272,7 @@ fn persistence_complex_state_through_reopen() {
     let dir = test_util::tempdir();
     let pg_dir = dir.path().join("pg-0000");
 
-    let stream_session_id = "ss-persist";
+    let persisted_session_id = stream_session_id("ss-persist");
     let upload_id = multipart_upload_id("mpu-persist");
 
     // Phase 1: create state, then drop the store.
@@ -1282,7 +1282,7 @@ fn persistence_complex_state_through_reopen() {
         // Create a streaming session.
         store
             .create_stream_upload(&CreateStreamUploadReq {
-                session_id: stream_session_id.into(),
+                session_id: persisted_session_id.clone(),
                 bucket: bucket_name("bucket"),
                 key: object_key("k1"),
                 target: StreamUploadTarget::PutObject,
@@ -1293,7 +1293,7 @@ fn persistence_complex_state_through_reopen() {
         // Append a staging segment.
         store
             .append_stream_segment(&StreamUploadSegmentRecord {
-                session_id: stream_session_id.into(),
+                session_id: persisted_session_id.clone(),
                 segment_index: 0,
                 size: 100,
                 segment_crc64: Some(42),
@@ -1352,17 +1352,21 @@ fn persistence_complex_state_through_reopen() {
         let store = crate::PgStore::open(&pg_dir, 0).unwrap();
 
         // Stream session survives.
-        let session = store.get_stream_upload(stream_session_id).unwrap();
+        let session = store
+            .get_stream_upload(persisted_session_id.as_str())
+            .unwrap();
         assert_eq!(session.bucket.as_str(), "bucket");
         assert_eq!(session.key.as_str(), "k1");
 
         // list_all_stream_uploads finds it.
         let all = store.list_all_stream_uploads().unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].session_id.as_str(), stream_session_id);
+        assert_eq!(all[0].session_id, persisted_session_id);
 
         // Staging segment survives.
-        let segs = store.list_stream_segments(stream_session_id).unwrap();
+        let segs = store
+            .list_stream_segments(persisted_session_id.as_str())
+            .unwrap();
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].segment_okh, [0xEE; 16]);
 

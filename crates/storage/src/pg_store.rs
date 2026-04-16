@@ -5938,7 +5938,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or_else(|| MetadataError::StreamSessionNotFound {
-                session_id: SessionId::from(session_id),
+                session_id: session_id.to_string(),
             })
     }
 
@@ -5960,7 +5960,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or_else(|| MetadataError::StreamSessionNotFound {
-                session_id: SessionId::from(session_id),
+                session_id: session_id.to_string(),
             })?;
 
         if current != StreamUploadState::InProgress as u8 {
@@ -6055,7 +6055,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or_else(|| MetadataError::StreamSessionNotFound {
-                session_id: SessionId::from(session_id),
+                session_id: session_id.to_string(),
             })?;
 
         if state != StreamUploadState::InProgress as u8 {
@@ -6223,7 +6223,7 @@ impl PgMetadataStore for PgStore {
 
             let (current, op_kind_raw, sess_bucket, sess_key, upload_id, part_number) = row
                 .ok_or_else(|| MetadataError::StreamSessionNotFound {
-                    session_id: SessionId::from(session_id),
+                    session_id: session_id.to_string(),
                 })?;
             let target = PgStore::parse_stream_target(op_kind_raw, upload_id, part_number, 1)
                 .map_err(|e| MetadataError::Db {
@@ -6239,7 +6239,7 @@ impl PgMetadataStore for PgStore {
                 || sess_key != obj.key
             {
                 return Err(MetadataError::StreamSessionNotFound {
-                    session_id: SessionId::from(session_id),
+                    session_id: session_id.to_string(),
                 });
             }
 
@@ -6364,7 +6364,7 @@ impl PgMetadataStore for PgStore {
                         || segment.version_id != obj.version_id
                     {
                         return Err(MetadataError::StreamSessionNotFound {
-                            session_id: SessionId::from(session_id),
+                            session_id: session_id.to_string(),
                         });
                     }
                     stmt.execute(params![
@@ -6629,19 +6629,19 @@ impl PgMetadataStore for PgStore {
             let sess_row =
                 self.conn
                     .query_row(
-                        "SELECT state, op_kind, bucket, key, upload_id, part_number \
+                        "SELECT session_id, state, op_kind, bucket, key, upload_id, part_number \
                      FROM stream_uploads WHERE session_id = ?1",
                         params![session_id],
                         |row| {
-                            let op_kind_raw: u8 = row.get(1)?;
-                            let upload_id: Option<UploadId> = row.get(4)?;
-                            let part_number: Option<i64> = row.get(5)?;
+                            let op_kind_raw: u8 = row.get(2)?;
+                            let upload_id: Option<UploadId> = row.get(5)?;
+                            let part_number: Option<i64> = row.get(6)?;
                             Ok(StreamUploadRecord {
-                                session_id: SessionId::from(session_id),
-                                state: StreamUploadState::from_u8(row.get::<_, u8>(0)?)
+                                session_id: row.get(0)?,
+                                state: StreamUploadState::from_u8(row.get::<_, u8>(1)?)
                                     .ok_or_else(|| {
                                         rusqlite::Error::FromSqlConversionFailure(
-                                            0,
+                                            1,
                                             rusqlite::types::Type::Integer,
                                             Box::from("invalid stream state"),
                                         )
@@ -6652,8 +6652,8 @@ impl PgMetadataStore for PgStore {
                                     part_number,
                                     1,
                                 )?,
-                                bucket: row.get(2)?,
-                                key: row.get(3)?,
+                                bucket: row.get(3)?,
+                                key: row.get(4)?,
                                 created_at: 0,
                                 encryption: ObjectEncryption::None,
                             })
@@ -6665,7 +6665,7 @@ impl PgMetadataStore for PgStore {
                         source: e,
                     })?
                     .ok_or_else(|| MetadataError::StreamSessionNotFound {
-                        session_id: SessionId::from(session_id),
+                        session_id: session_id.to_string(),
                     })?;
 
             if sess_row.state != StreamUploadState::InProgress {
@@ -6681,7 +6681,7 @@ impl PgMetadataStore for PgStore {
                 } if upload_id == &part.upload_id && *part_number == part.part_number => {}
                 _ => {
                     return Err(MetadataError::StreamSessionNotFound {
-                        session_id: SessionId::from(session_id),
+                        session_id: session_id.to_string(),
                     })
                 }
             }
@@ -6835,7 +6835,7 @@ impl PgMetadataStore for PgStore {
                         || segment.part_number != part.part_number
                     {
                         return Err(MetadataError::StreamSessionNotFound {
-                            session_id: SessionId::from(session_id),
+                            session_id: session_id.to_string(),
                         });
                     }
                     stmt.execute(params![

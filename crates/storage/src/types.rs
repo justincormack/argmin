@@ -78,9 +78,18 @@ pub enum UploadIdError {
     InvalidCharacterSet,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SessionIdError {
+    #[error("session ID must be 32 characters, got {length}")]
+    InvalidLength { length: usize },
+    #[error("session ID must contain only lowercase hexadecimal characters")]
+    InvalidCharacterSet,
+}
+
 pub const UPLOAD_ID_LEN: usize = 128;
 pub const UPLOAD_ID_ALPHABET: &[u8; 64] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._";
+pub const SESSION_ID_LEN: usize = 32;
 
 fn validate_bucket_name(name: &str) -> Result<(), BucketNameError> {
     if name.len() < 3 || name.len() > 63 {
@@ -151,6 +160,21 @@ fn validate_upload_id(upload_id: &str) -> Result<(), UploadIdError> {
         .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
     {
         return Err(UploadIdError::InvalidCharacterSet);
+    }
+    Ok(())
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), SessionIdError> {
+    if session_id.len() != SESSION_ID_LEN {
+        return Err(SessionIdError::InvalidLength {
+            length: session_id.len(),
+        });
+    }
+    if !session_id
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(SessionIdError::InvalidCharacterSet);
     }
     Ok(())
 }
@@ -268,109 +292,6 @@ macro_rules! validated_string_newtype {
     };
 }
 
-macro_rules! string_newtype {
-    ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
-        #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-        pub struct $name(String);
-
-        impl $name {
-            pub fn new(s: impl Into<String>) -> Self {
-                Self(s.into())
-            }
-
-            pub fn into_string(self) -> String {
-                self.0
-            }
-
-            pub fn as_str(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl std::ops::Deref for $name {
-            type Target = str;
-            fn deref(&self) -> &str {
-                &self.0
-            }
-        }
-
-        impl std::fmt::Display for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str(&self.0)
-            }
-        }
-
-        impl std::fmt::Debug for $name {
-            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                std::fmt::Debug::fmt(&observability::escaped(&self.0), f)
-            }
-        }
-
-        impl From<String> for $name {
-            fn from(s: String) -> Self {
-                Self(s)
-            }
-        }
-
-        impl From<&str> for $name {
-            fn from(s: &str) -> Self {
-                Self(s.to_string())
-            }
-        }
-
-        impl PartialEq<str> for $name {
-            fn eq(&self, other: &str) -> bool {
-                self.0 == other
-            }
-        }
-
-        impl PartialEq<&str> for $name {
-            fn eq(&self, other: &&str) -> bool {
-                self.0.as_str() == *other
-            }
-        }
-
-        impl PartialEq<$name> for str {
-            fn eq(&self, other: &$name) -> bool {
-                self == other.0
-            }
-        }
-
-        impl PartialEq<$name> for &str {
-            fn eq(&self, other: &$name) -> bool {
-                *self == other.0
-            }
-        }
-
-        impl PartialEq<String> for $name {
-            fn eq(&self, other: &String) -> bool {
-                self.0 == *other
-            }
-        }
-
-        impl PartialEq<$name> for String {
-            fn eq(&self, other: &$name) -> bool {
-                *self == other.0
-            }
-        }
-
-        impl rusqlite::types::ToSql for $name {
-            fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
-                self.0.to_sql()
-            }
-        }
-
-        impl rusqlite::types::FromSql for $name {
-            fn column_result(
-                value: rusqlite::types::ValueRef<'_>,
-            ) -> rusqlite::types::FromSqlResult<Self> {
-                String::column_result(value).map(Self)
-            }
-        }
-    };
-}
-
 validated_string_newtype!(
     /// S3 bucket name.
     BucketName,
@@ -451,9 +372,11 @@ validated_string_newtype!(
     validate_upload_id
 );
 
-string_newtype!(
+validated_string_newtype!(
     /// Streaming upload session identifier.
-    SessionId
+    SessionId,
+    SessionIdError,
+    validate_session_id
 );
 
 /// Serialized user metadata blob.
@@ -2789,12 +2712,31 @@ mod tests {
         let bucket = BucketName::try_from("bucket-1").unwrap();
         let key = ObjectKey::try_from("obj\t\u{1b}[31m").unwrap();
         let upload = UploadId::try_from(format!("{}._", "A".repeat(126))).unwrap();
-        let session = SessionId::from("sess\rion");
+        let session = SessionId::try_from("0123456789abcdef0123456789abcdef").unwrap();
 
         assert_eq!(format!("{bucket:?}"), r#""bucket-1""#);
         assert_eq!(format!("{key:?}"), r#""obj\t\u{1b}[31m""#);
         assert_eq!(format!("{upload:?}"), format!(r#""{}._""#, "A".repeat(126)));
-        assert_eq!(format!("{session:?}"), r#""sess\rion""#);
+        assert_eq!(
+            format!("{session:?}"),
+            r#""0123456789abcdef0123456789abcdef""#
+        );
+    }
+
+    #[test]
+    fn session_id_try_from_rejects_invalid_inputs() {
+        assert_eq!(
+            SessionId::try_from("abc").unwrap_err(),
+            SessionIdError::InvalidLength { length: 3 }
+        );
+        assert_eq!(
+            SessionId::try_from("0123456789abcdef0123456789abcdeg").unwrap_err(),
+            SessionIdError::InvalidCharacterSet
+        );
+        assert_eq!(
+            SessionId::try_from("0123456789abcdef0123456789abcdeF").unwrap_err(),
+            SessionIdError::InvalidCharacterSet
+        );
     }
 
     #[test]
