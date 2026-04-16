@@ -1,0 +1,252 @@
+Copy-source header can crash PG hashing via length assert
+Link: https://chatgpt.com/codex/cloud/security/findings/392dc70ae2748191907e8442f9f09c45?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: medium (attack path: medium)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 23ffb1b
+Author: justin@specialbusservice.com
+Created: 15/04/2026, 14:25:25
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Resolution
+Fixed by the bucket/object identifier hardening work that removed unchecked
+bucket/object-name flow from the copy-source path and the surrounding
+coordinator/storage/PG-routing boundary.
+
+Primary fixing commit:
+- `cd818a4` `Harden bucket and object identifier validation`
+
+Follow-on hardening series that completed the broader boundary rewrite and its
+coverage/closeout:
+- `23de659` `Validate object keys in multipart and delete parsers`
+- `4717270` `Start phase 3 typed coordinator request hardening`
+- `4440b3c` `Advance phase 3 typed coordinator boundaries`
+- `844ab92` `Advance phase 3 storage bucket typing`
+- `1020705` `Advance phase 3 coordinator object typing`
+- `49a355c` `Advance phase 3 typed list and stream helpers`
+- `291234c` `Advance phase 3 typed lifecycle and bucket helpers`
+- `b2419a8` `Finish phase 3 typed lifecycle bucket paths`
+- `748d303` `Advance phase 3 typed streaming contexts`
+- `93ba7e6` `Tighten phase 3 typed bucket state and raw store fallbacks`
+- `e3a9a52` `Tighten typed bucket access on lifecycle and create paths`
+- `a5aca0b` `Finish phase 3 typed storage boundary hardening`
+- `8d5f3d4` `Remove raw PgStore compatibility methods`
+- `25f493f` `Remove BucketName and ObjectKey str deref footguns`
+- `2441bf2` `Remove remaining implicit string conversions`
+- `f0011f3` `Harden list upper-bound handling for typed object keys`
+- `3c47e6c` `Type routed HTTP buckets end to end`
+- `b331ae8` `Complete phase 4 internal constructor audit`
+- `8a1cb4a` `Centralize typed common-prefix key derivation`
+- `ed7a5d3` `Add phase 5 parser boundary regressions`
+- `3a891b7` `Complete phase 5 boundary coverage hardening`
+- `3257d7f` `Finalize completed name hardening plan closeout`
+
+Re-validation at `3257d7f` confirms the original attack path is closed:
+
+1. low-level copy-source parsing no longer yields raw unchecked object keys
+   into coordinator logic
+2. the shared `server-http` copy-source boundary revalidates source bucket
+   names before coordinator dispatch while preserving AWS-compatible
+   `BucketNotFound`/`NoSuchBucket` mapping
+3. coordinator/storage/PG-routing paths now consume typed validated
+   bucket/object identifiers rather than raw attacker-derived strings
+4. direct regression coverage and fuzz coverage now exercise the hardened
+   copy-source boundary
+
+The original issue description and evidence below refer to the vulnerable state
+at commit `23ffb1b`.
+
+# Summary
+A new assert in PG hashing assumes validated input sizes; copy-source header parsing does not enforce those limits, so oversized copy-source values now panic the server and cause a remote DoS.
+The commit replaces PG hashing with a stack-buffered `hash_parts` helper that asserts the combined bucket/key/version length fits `PG_HASH_STACK_LIMIT`. This is safe only if all callers validate bucket/key lengths. However, `parse_copy_source` percent-decodes `x-amz-copy-source` without applying `validate_bucket_name`/`validate_object_key`, allowing bucket or key strings longer than the 63/1024 byte limits. When CopyObject or UploadPartCopy uses these unvalidated values, the coordinator ultimately hashes them for PG selection; the new assert will panic, crashing the worker or process. An authenticated (or public-write) client can therefore trigger a denial-of-service by sending a long copy-source header within the header-size limit. The issue is introduced by this commit because the previous hashing path did not assert on length.
+
+# Validation
+## Rubric
+- [x] Locate PG hashing assert and stack limit in server-core (pg.rs:12-17)
+- [x] Confirm copy-source parsing lacks bucket/key length validation (request.rs:368-409)
+- [x] Construct overlong copy-source input using parse_copy_source in a unit test (request.rs:805-812)
+- [x] Trigger panic in PgTopology::object_pg from oversized inputs (pg.rs:14; test output)
+- [x] Capture crash output/backtrace for evidence
+## Report
+Rubric-guided crash reproduction: added a focused unit test in server-http that uses parse_copy_source to accept an overlong key, then calls PgTopology::object_pg. parse_copy_source percent-decodes bucket/key but performs no length validation (crates/server-http/src/http/request.rs:368-409). PgTopology::object_pg calls hash_parts, which asserts total_len <= PG_HASH_STACK_LIMIT (crates/server-core/src/pg.rs:12-17, 74-77). Running the test with a 1200-byte key panics at pg.rs:14 with "PG hash input exceeded validated bound: 1207 > 1109" (see crash output), demonstrating an overlong copy-source value can trigger a server panic when hashed.
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator/authz.rs (L3119 to 3181)
+  Note: CopyObject authorization uses the copy-source bucket/key directly, which later drives PG hashing and can trigger the new length assert.
+```
+    pub(super) fn authorize_copy_object<'a>(
+        &'a self,
+        req: &CopyObjectRequest<'_>,
+    ) -> Result<AuthorizedCopyObject<'a>, ServerError> {
+        let src_bucket = req.source.bucket;
+        let src_key = req.source.key;
+        let src_version_id = req.source.version_id;
+        let dst_bucket = req.destination.bucket.name;
+        let dst_key = req.destination.key;
+        let requester = &req.destination.bucket.requester;
+        let acl = req.acl.clone();
+        let copy_source_policy_value = req.source.version_id.map_or_else(
+            || format!("{}/{}", req.source.bucket, req.source.key),
+            |version_id| {
+                format!(
+                    "{}/{}?versionId={}",
+                    req.source.bucket, req.source.key, version_id
+                )
+            },
+        );
+        let metadata_directive = req.directive.policy_condition_value();
+        let canned_acl = acl.policy_condition_value();
+        let request_object_tags_xml = match &req.tagging {
+            TaggingDirective::Copy => None,
+            TaggingDirective::Replace(tags) => *tags,
+        };
+        let copy_policy_context = PutObjectPolicyContext::new(
+            Some(copy_source_policy_value.as_str()),
+            metadata_directive,
+            canned_acl,
+        )
+        .with_acl_grant_headers(
+            req.policy_context.grant_read,
+            req.policy_context.grant_write,
+            req.policy_context.grant_read_acp,
+            req.policy_context.grant_write_acp,
+            req.policy_context.grant_full_control,
+        )
+        .with_request_object_tags_xml(request_object_tags_xml);
+        let dst_policy_context = req
+            .destination_encryption
+            .with_policy_context(copy_policy_context);
+        let destination = self.authorize_put_object_write(&AuthorizePutObjectRequest {
+            object: ObjectRequest::new(
+                dst_bucket,
+                dst_key,
+                requester.clone(),
+                req.expected_bucket_owner(),
+            ),
+            acl,
+            policy_context: dst_policy_context,
+            object_lock: req.object_lock,
+            tags: request_object_tags_xml,
+            encryption: req.destination_encryption,
+        })?;
+        let source = self.authorize_object_read(
+            requester,
+            src_bucket,
+            src_key,
+            src_version_id,
+            req.source.expected_bucket_owner(),
+            Self::get_object_policy_action(src_version_id),
+        )?;
+```
+
+/workspace/argmin/crates/server-core/src/pg.rs (L3 to 27)
+  Note: New stack-buffered PG hashing asserts total input length is within a fixed limit, panicking on oversized bucket/key inputs.
+```
+const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
+const PG_HASH_STACK_LIMIT: usize = 63 + 1 + 1024 + 1 + 20;
+
+#[inline]
+fn hash_bytes(data: &[u8]) -> u64 {
+    rapidhash_v3_micro_inline::<true, false>(data, &RAPIDHASH_SECRETS)
+}
+
+#[inline]
+fn hash_parts(parts: &[&[u8]]) -> u64 {
+    let total_len = parts.iter().map(|part| part.len()).sum::<usize>();
+    assert!(
+        total_len <= PG_HASH_STACK_LIMIT,
+        "PG hash input exceeded validated bound: {total_len} > {PG_HASH_STACK_LIMIT}"
+    );
+
+    let mut data = [0u8; PG_HASH_STACK_LIMIT];
+    let mut offset = 0;
+    for part in parts {
+        let end = offset + part.len();
+        data[offset..end].copy_from_slice(part);
+        offset = end;
+    }
+    hash_bytes(&data[..total_len])
+}
+```
+
+/workspace/argmin/crates/server-http/src/http/request.rs (L368 to 409)
+  Note: parse_copy_source percent-decodes bucket/key from x-amz-copy-source but does not validate bucket/key length or enforce the 63/1024-byte limits.
+```
+/// Parse the `x-amz-copy-source` header value into `(bucket, key, version_id)`.
+///
+/// Accepts `[/]bucket/key[?versionId=...]`. Strips optional leading `/`.
+/// Both bucket and key are percent-decoded. Returns the raw `versionId`
+/// query-parameter value (if present) as-is.
+pub(crate) fn parse_copy_source(
+    header: &str,
+) -> Result<(String, String, Option<String>), ServerError> {
+    // Strip optional leading slash
+    let s = header.strip_prefix('/').unwrap_or(header);
+
+    // Extract ?versionId=... query string
+    let (s, version_id) = match s.find('?') {
+        Some(pos) => {
+            let query = &s[pos + 1..];
+            let vid = query_param_raw(query, "versionId").map(std::string::ToString::to_string);
+            (&s[..pos], vid)
+        }
+        None => (s, None),
+    };
+
+    // Split into bucket/key at first '/'
+    let slash_pos = s.find('/').ok_or_else(|| ServerError::InvalidArgument {
+        reason: "Invalid copy source object key".to_string(),
+    })?;
+
+    let bucket =
+        percent_decode_strict(&s[..slash_pos]).map_err(|_| ServerError::InvalidArgument {
+            reason: "Invalid copy source object key".to_string(),
+        })?;
+    let key =
+        percent_decode_strict(&s[slash_pos + 1..]).map_err(|_| ServerError::InvalidArgument {
+            reason: "Invalid copy source object key".to_string(),
+        })?;
+
+    if key.is_empty() {
+        return Err(ServerError::InvalidArgument {
+            reason: "Invalid copy source object key".to_string(),
+        });
+    }
+
+    Ok((bucket, key, version_id))
+```
+
+# Attack-path analysis
+Final: medium | Decider: model_decided | Matrix severity: medium | Policy adjusted: medium
+## Rationale
+Kept at medium: the path is reachable from in-scope HTTP operations and leads to a panic-based DoS (availability impact), but requires copy privileges and does not compromise confidentiality or integrity.
+## Likelihood
+high - Requires ability to call CopyObject/UploadPartCopy and craft an oversized x-amz-copy-source; feasible for authenticated users or public-write buckets, but not unauthenticated in default configs. | Remote network vector
+## Impact
+medium - An attacker who can issue copy operations can trigger a panic in PG hashing, crashing a worker or process and causing service availability loss. No data confidentiality or integrity impact is shown.
+## Assumptions
+- The argmin-s3 HTTP listener is bound to a non-loopback interface and reachable by the attacker (ARGMIN_LISTEN_ADDR can be set beyond 127.0.0.1:9000).
+- The attacker can issue CopyObject or UploadPartCopy requests (valid credentials or a public-write bucket).
+- Panics from assert! are not caught and can terminate a worker/process, causing visible availability loss.
+- Send CopyObject or UploadPartCopy request with x-amz-copy-source
+- Valid credentials or public-write bucket permitting copy operations
+## Path
+[HTTP listener] -> [CopyObject/UploadPartCopy x-amz-copy-source] -> [parse_copy_source] -> [PgTopology::object_pg/hash_parts assert] -> [panic/DoS]
+## Path evidence
+- `crates/server-http/src/http/request.rs:368-409` - parse_copy_source percent-decodes bucket/key without length validation.
+- `crates/server-core/src/pg.rs:12-17` - hash_parts asserts total input length must be within PG_HASH_STACK_LIMIT; panic on oversize.
+- `crates/server-http/src/http/router.rs:145-213` - Normal bucket/key validation enforces 3-63 bucket length and 1-1024 key length; copy-source path omits these checks.
+- `crates/server-http/src/http/mod.rs:1047-1053` - CopyObject path parses x-amz-copy-source via parse_copy_source.
+- `crates/server-core/src/coordinator.rs:3875-3878` - Coordinator uses PgTopology::object_pg(bucket, key) to select PG, which invokes hash_parts.
+## Narrative
+CopyObject/UploadPartCopy uses the x-amz-copy-source header, parsed by parse_copy_source, which percent-decodes bucket/key but does not enforce the 63/1024-byte limits (request.rs:368-409). PG hashing now asserts total length <= PG_HASH_STACK_LIMIT (pg.rs:12-17). Normal path validation enforces these limits (router.rs:145-213), but the copy-source path skips them; an oversized copy-source can reach PgTopology::object_pg (coordinator.rs:3875-3878) and trigger the assert, causing a panic and availability loss. The provided validation report describes a unit test that reproduces this panic with a 1200-byte key.
+## Controls
+- SigV4 authentication and bucket/object authorization (auth crate, server-core)
+- Connection and in-flight request caps (ARGMIN_MAX_CONNECTIONS / ARGMIN_MAX_INFLIGHT_REQUESTS)
+- Header section size validation on write requests
+## Blindspots
+- No deployment manifests or runtime config to confirm public exposure or listener binding.
+- Panic strategy (abort vs unwind) and runtime containment are not verified in this static review.
