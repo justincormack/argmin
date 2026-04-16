@@ -34,11 +34,12 @@ pub fn upload_part(
     coord: &Coordinator,
     req: &UploadPartRequest<'_>,
 ) -> Result<UploadPartResult, ServerError> {
+    let upload_id = req.upload.upload_id_typed().clone();
     let session = coord.begin_stream_part(&BeginStreamPartRequest {
         upload: MultipartObjectRequest::new(
             req.upload.object.bucket.name_typed().clone(),
             req.upload.object.key_typed().clone(),
-            req.upload.upload_id(),
+            upload_id.clone(),
             req.upload.requester().clone(),
             req.upload.expected_bucket_owner(),
         ),
@@ -72,7 +73,7 @@ pub fn upload_part(
             upload: MultipartObjectRequest::new(
                 req.upload.object.bucket.name_typed().clone(),
                 req.upload.object.key_typed().clone(),
-                req.upload.upload_id(),
+                upload_id,
                 req.upload.requester().clone(),
                 req.upload.expected_bucket_owner(),
             ),

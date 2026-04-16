@@ -3055,7 +3055,8 @@ mod phase4_harness {
                 coord.abort_multipart_upload(&MultipartObjectRequest::new(
                     trusted_bucket_name(bucket),
                     trusted_object_key(PHASE4_KEY),
-                    &upload.upload_id,
+                    UploadId::try_from(upload.upload_id.as_str())
+                        .expect("test-created upload IDs should be valid"),
                     requester,
                     None,
                 ))

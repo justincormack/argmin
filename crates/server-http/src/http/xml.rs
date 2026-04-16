@@ -125,6 +125,22 @@ pub fn no_such_key_error_xml(key: &str, request_id: &str, host_id: &str) -> Stri
     )
 }
 
+/// Format a NoSuchUpload error response XML.
+#[must_use]
+pub fn no_such_upload_error_xml(upload_id: &str, request_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>NoSuchUpload</Code>\
+         <Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message>\
+         <UploadId>{}</UploadId>\
+         <RequestId>{}</RequestId>\
+         </Error>",
+        xml_escape(upload_id),
+        xml_escape(request_id),
+    )
+}
+
 /// Format an S3 `NoSuchBucketPolicy` error response.
 #[must_use]
 pub fn no_such_bucket_policy_error_xml(
@@ -6619,14 +6635,12 @@ mod tests {
 
     #[test]
     fn error_xml_no_such_upload() {
-        let xml = error_xml(
-            "NoSuchUpload",
-            "no such upload: abc",
-            "/bucket/key",
-            "req-1",
-        );
+        let xml = no_such_upload_error_xml("abc", "req-1");
         assert!(xml.contains("<Code>NoSuchUpload</Code>"));
-        assert!(xml.contains("<Message>no such upload: abc</Message>"));
+        assert!(xml.contains(
+            "<Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message>"
+        ));
+        assert!(xml.contains("<UploadId>abc</UploadId>"));
     }
 
     #[test]

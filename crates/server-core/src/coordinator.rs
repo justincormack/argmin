@@ -449,7 +449,7 @@ struct AuthorizedCreateMultipartUpload {
 struct AuthorizedBeginStreamPart<'a> {
     bucket: BucketName,
     key: ObjectKey,
-    upload_id: String,
+    upload_id: UploadId,
     part_number: u32,
     upload: MultipartUploadRecord,
     sse_customer: Option<SseCustomerWriteContext>,
@@ -460,7 +460,7 @@ struct AuthorizedBeginStreamPart<'a> {
 struct AuthorizedMultipartPartWrite {
     bucket: BucketName,
     key: ObjectKey,
-    upload_id: String,
+    upload_id: UploadId,
     part_number: u32,
     upload: MultipartUploadRecord,
     sse_customer: Option<SseCustomerWriteContext>,
@@ -476,7 +476,7 @@ struct AuthorizedCompleteMultipartUpload {
     bucket_info: BucketSummary,
     bucket: BucketName,
     key: ObjectKey,
-    upload_id: String,
+    upload_id: UploadId,
     upload: MultipartUploadRecord,
     multipart_write_encryption: ActiveWriteEncryption,
 }
@@ -2559,7 +2559,7 @@ pub struct ObjectVersionRequest<'a> {
 #[derive(Debug)]
 pub struct MultipartObjectRequest<'a> {
     pub object: ObjectRequest<'a>,
-    pub upload_id: &'a str,
+    upload_id: UploadId,
 }
 
 /// Request for a PutObjectTagging operation.
@@ -3147,7 +3147,7 @@ impl<'a> MultipartObjectRequest<'a> {
     pub fn new(
         bucket: BucketName,
         key: ObjectKey,
-        upload_id: &'a str,
+        upload_id: UploadId,
         requester: Requester,
         expected_bucket_owner: Option<&'a str>,
     ) -> Self {
@@ -3157,8 +3157,25 @@ impl<'a> MultipartObjectRequest<'a> {
         }
     }
 
-    pub fn from_object(object: ObjectRequest<'a>, upload_id: &'a str) -> Self {
+    pub fn from_object(object: ObjectRequest<'a>, upload_id: UploadId) -> Self {
         Self { object, upload_id }
+    }
+
+    pub fn from_object_typed(object: ObjectRequest<'a>, upload_id: UploadId) -> Self {
+        Self { object, upload_id }
+    }
+
+    pub fn new_typed(
+        bucket: BucketName,
+        key: ObjectKey,
+        upload_id: UploadId,
+        requester: Requester,
+        expected_bucket_owner: Option<&'a str>,
+    ) -> Self {
+        Self::from_object_typed(
+            ObjectRequest::new(bucket, key, requester, expected_bucket_owner),
+            upload_id,
+        )
     }
 
     pub fn object(&self) -> &ObjectRequest<'a> {
@@ -3185,8 +3202,12 @@ impl<'a> MultipartObjectRequest<'a> {
         self.object.key_typed()
     }
 
-    pub fn upload_id(&self) -> &'a str {
-        self.upload_id
+    pub fn upload_id(&self) -> &str {
+        self.upload_id.as_str()
+    }
+
+    pub fn upload_id_typed(&self) -> &UploadId {
+        &self.upload_id
     }
 
     pub fn requester(&self) -> &Requester {
@@ -8638,7 +8659,7 @@ impl Coordinator {
             "bucket={:?} key={:?} upload_id={:?} part_number={}",
             req.upload.bucket_name(),
             req.upload.key(),
-            req.upload.upload_id,
+            req.upload.upload_id(),
             req.part_number
         );
         Self::validate_upload_part_number(req.part_number)?;
@@ -8656,7 +8677,7 @@ impl Coordinator {
             &pg,
             &bucket,
             &key,
-            upload_id.as_str(),
+            &upload_id,
             part_number,
             &upload,
         )?;
@@ -8682,7 +8703,7 @@ impl Coordinator {
         pg: &storage::PgStore,
         bucket: &BucketName,
         key: &ObjectKey,
-        upload_id: &str,
+        upload_id: &UploadId,
         part_number: u32,
         upload: &MultipartUploadRecord,
     ) -> Result<String, ServerError> {
@@ -8706,11 +8727,7 @@ impl Coordinator {
             bucket: bucket.clone(),
             key: key.clone(),
             target: StreamUploadTarget::UploadPart {
-                upload_id: UploadId::try_from(upload_id).map_err(|_| {
-                    ServerError::NoSuchUpload {
-                        upload_id: upload_id.to_string(),
-                    }
-                })?,
+                upload_id: upload_id.clone(),
                 part_number,
             },
             encryption: upload.encryption.clone(),
@@ -9351,7 +9368,7 @@ impl Coordinator {
         let bucket = req.upload.bucket_name();
         let key = req.upload.key();
         let session_id = req.session_id;
-        let upload_id = req.upload.upload_id();
+        let upload_id = req.upload.upload_id_typed();
         let part_number = req.part_number;
         let crc64 = req.crc64;
         let total_size = req.total_size;
@@ -9393,7 +9410,7 @@ impl Coordinator {
         }
 
         // Validate upload still exists and is InProgress.
-        let upload = meta_guard.get_multipart_upload(upload_id)?;
+        let upload = meta_guard.get_multipart_upload(upload_id.as_str())?;
         if upload.bucket != bucket || upload.key != key {
             return Err(ServerError::NoSuchUpload {
                 upload_id: upload_id.to_string(),
@@ -9464,7 +9481,7 @@ impl Coordinator {
         };
 
         // Determine generation for this part.
-        let generation = match meta_guard.get_multipart_part(upload_id, part_number) {
+        let generation = match meta_guard.get_multipart_part(upload_id.as_str(), part_number) {
             Ok(existing) => existing.generation + 1,
             Err(storage::MetadataError::PartNotFound { .. }) => 0,
             Err(e) => return Err(ServerError::Metadata(e)),
@@ -9488,8 +9505,7 @@ impl Coordinator {
             .map(|segment| MultipartPartSegmentRecord {
                 bucket: upload.bucket.clone(),
                 key: upload.key.clone(),
-                upload_id: UploadId::try_from(upload_id)
-                    .expect("validated multipart upload lookup must yield a valid UploadId"),
+                upload_id: upload_id.clone(),
                 version_id: u64::MAX, // staging sentinel — reparented at CompleteMultipartUpload time
                 part_number,
                 segment_index: segment.segment_index,
@@ -9509,8 +9525,7 @@ impl Coordinator {
             .as_millis() as u64;
 
         let part_record = MultipartPartRecord {
-            upload_id: UploadId::try_from(upload_id)
-                .expect("validated multipart upload lookup must yield a valid UploadId"),
+            upload_id: upload_id.clone(),
             part_number,
             generation,
             size: total_size,
@@ -9537,7 +9552,7 @@ impl Coordinator {
         if generation > 0 {
             let old_gen = generation - 1;
             // Clean old non-streaming shards.
-            let old_okh = part_key_hash(upload_id, part_number, old_gen);
+            let old_okh = part_key_hash(upload_id.as_str(), part_number, old_gen);
             let old_vid =
                 GenerationId::new(u64::from(old_gen) + 1).expect("old generation must be nonzero");
             let old_shard_pg_id = self.shard_pg_id_raw(
@@ -12566,7 +12581,7 @@ impl Coordinator {
             req.source.key,
             req.upload.bucket_name(),
             req.upload.key(),
-            req.upload.upload_id,
+            req.upload.upload_id(),
             req.part_number
         );
         Self::validate_upload_part_number(req.part_number)?;
@@ -12712,16 +12727,20 @@ impl Coordinator {
             .get_pg(self.object_pg_id_for(&bucket, &key))?;
         let current_upload = dst_meta_pg.get_multipart_upload(upload_id.as_str())?;
         if current_upload.bucket != bucket || current_upload.key != key {
-            return Err(ServerError::NoSuchUpload { upload_id });
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
         }
         if current_upload.state != UploadState::InProgress {
-            return Err(ServerError::NoSuchUpload { upload_id });
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
         }
         let session_id = self.create_upload_part_stream_session(
             &dst_meta_pg,
             &bucket,
             &key,
-            upload_id.as_str(),
+            &upload_id,
             part_number,
             &upload,
         )?;
@@ -12789,10 +12808,10 @@ impl Coordinator {
                 .map(|checksum| ChecksumClaim::from_raw(checksum.clone()));
 
             self.finalize_stream_part(FinalizeStreamPartRequest {
-                upload: MultipartObjectRequest::new(
+                upload: MultipartObjectRequest::new_typed(
                     bucket.clone(),
                     key.clone(),
-                    upload_id.as_str(),
+                    upload_id.clone(),
                     req.upload.requester().clone(),
                     req.expected_bucket_owner(),
                 ),
@@ -12838,7 +12857,7 @@ impl Coordinator {
             "bucket={:?} key={:?} upload_id={:?} parts={}",
             req.upload.bucket_name(),
             req.upload.key(),
-            req.upload.upload_id,
+            req.upload.upload_id(),
             req.parts.len()
         );
         let AuthorizedCompleteMultipartUpload {
@@ -12860,12 +12879,12 @@ impl Coordinator {
         let current_upload = meta_pg.get_multipart_upload(upload_id.as_str())?;
         if current_upload.bucket != bucket.as_str() || current_upload.key != key.as_str() {
             return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.clone(),
+                upload_id: upload_id.to_string(),
             });
         }
         if current_upload.state != UploadState::InProgress {
             return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.clone(),
+                upload_id: upload_id.to_string(),
             });
         }
 
@@ -13310,7 +13329,7 @@ impl Coordinator {
             "bucket={:?} key={:?} upload_id={:?}",
             req.object.bucket_name(),
             req.object.key,
-            req.upload_id
+            req.upload_id()
         );
         match self.authorize_abort_multipart_upload(req)? {
             AuthorizedAbortMultipartUpload::Completed => Ok(()),
@@ -13339,7 +13358,7 @@ impl Coordinator {
             "bucket={:?} key={:?} upload_id={:?} max_parts={}",
             req.upload.bucket_name(),
             req.upload.key(),
-            req.upload.upload_id,
+            req.upload.upload_id(),
             req.max_parts
         );
         let part_number_marker = req.part_number_marker;
@@ -14021,7 +14040,7 @@ mod tests {
         MultipartObjectRequest::new(
             trusted_bucket_name(bucket),
             trusted_object_key(key),
-            upload_id,
+            UploadId::try_from(upload_id).unwrap_or_else(|_| trusted_upload_id(upload_id)),
             requester,
             expected_bucket_owner,
         )

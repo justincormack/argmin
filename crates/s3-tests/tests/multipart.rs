@@ -13,13 +13,73 @@ use aws_sdk_s3::types::{
 };
 use s3_tests::{
     assert_s3_err_code, copy_source_with_version, create_public_write_bucket, err_status,
-    send_signed_request, unique_bucket, CTX,
+    object_url, send_signed_request, send_signed_request_with_credentials, unique_bucket,
+    RawResponse, SignedRequestCredentials, CTX,
 };
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MB minimum part size
 
 fn owner_root_client() -> &'static aws_sdk_s3::Client {
     CTX.require_owner_root_client()
+}
+
+fn external_test_mode() -> bool {
+    std::env::var_os("S3_TEST_ENDPOINT").is_some()
+}
+
+fn primary_credentials() -> SignedRequestCredentials<'static> {
+    SignedRequestCredentials {
+        access_key: CTX.access_key(),
+        secret_key: CTX.secret_key(),
+        region: CTX.region(),
+        tls_ca_pem: CTX.tls_ca_pem(),
+    }
+}
+
+fn alt_credentials() -> SignedRequestCredentials<'static> {
+    SignedRequestCredentials {
+        access_key: CTX.alt_access_key(),
+        secret_key: CTX.alt_secret_key(),
+        region: CTX.region(),
+        tls_ca_pem: CTX.tls_ca_pem(),
+    }
+}
+
+fn complete_multipart_upload_xml(etag: &str, part_number: u32) -> Vec<u8> {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+<CompleteMultipartUpload>\
+<Part><PartNumber>{part_number}</PartNumber><ETag>{etag}</ETag></Part>\
+</CompleteMultipartUpload>"
+    )
+    .into_bytes()
+}
+
+fn assert_invalid_upload_id_no_such_upload(response: &RawResponse, invalid_upload_id: &str) {
+    assert_eq!(
+        response.status, 404,
+        "unexpected response body: {}",
+        response.body
+    );
+    assert!(
+        response.body.contains("<Code>NoSuchUpload</Code>"),
+        "unexpected response body: {}",
+        response.body
+    );
+    assert!(
+        response.body.contains(
+            "<Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message>"
+        ),
+        "unexpected response body: {}",
+        response.body
+    );
+    assert!(
+        response
+            .body
+            .contains(&format!("<UploadId>{invalid_upload_id}</UploadId>")),
+        "unexpected response body: {}",
+        response.body
+    );
 }
 
 async fn setup_bucket() -> String {
@@ -588,6 +648,236 @@ fn test_abort_multipart_upload_after_complete_wrong_upload_id_fails() {
             .send()
             .await;
         assert_s3_err_code(&result, "NoSuchUpload");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_abort_multipart_upload_invalid_present_upload_id_overlong_message_external() {
+    s3_tests::run(async {
+        if !external_test_mode() {
+            return;
+        }
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multipart-invalid-upload-id-message";
+
+        let create = client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        let valid_upload_id = create.upload_id().unwrap().to_string();
+        let invalid_upload_id = "a".repeat(1025);
+        let url = object_url(
+            CTX.endpoint(),
+            &bucket,
+            key,
+            Some(&format!("uploadId={invalid_upload_id}")),
+        );
+
+        let response = send_signed_request_with_credentials(
+            "DELETE",
+            &url,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+            primary_credentials(),
+        );
+        assert_invalid_upload_id_no_such_upload(&response, &invalid_upload_id);
+
+        client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&valid_upload_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_upload_part_invalid_present_upload_id_overlong_auth_precedence_external() {
+    s3_tests::run(async {
+        if !external_test_mode() {
+            return;
+        }
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multipart-invalid-upload-id-auth-precedence";
+
+        client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+
+        let invalid_upload_id = "a".repeat(1025);
+        let url = object_url(
+            CTX.endpoint(),
+            &bucket,
+            key,
+            Some(&format!("partNumber=1&uploadId={invalid_upload_id}")),
+        );
+
+        let response = send_signed_request_with_credentials(
+            "PUT",
+            &url,
+            b"x",
+            std::iter::empty::<(&str, &str)>(),
+            alt_credentials(),
+        );
+        assert_invalid_upload_id_no_such_upload(&response, &invalid_upload_id);
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_upload_invalid_present_upload_id_overlong_message_external() {
+    s3_tests::run(async {
+        if !external_test_mode() {
+            return;
+        }
+
+        let bucket = setup_bucket().await;
+        let key = "multipart-complete-invalid-upload-id-message";
+        let invalid_upload_id = "a".repeat(1025);
+        let url = object_url(
+            CTX.endpoint(),
+            &bucket,
+            key,
+            Some(&format!("uploadId={invalid_upload_id}")),
+        );
+        let body = complete_multipart_upload_xml("\"abc\"", 1);
+
+        let response = send_signed_request_with_credentials(
+            "POST",
+            &url,
+            &body,
+            [("content-type", "application/xml")],
+            primary_credentials(),
+        );
+        assert_invalid_upload_id_no_such_upload(&response, &invalid_upload_id);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_upload_invalid_present_upload_id_overlong_auth_precedence_external() {
+    s3_tests::run(async {
+        if !external_test_mode() {
+            return;
+        }
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multipart-complete-invalid-upload-id-auth-precedence";
+
+        client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+
+        let invalid_upload_id = "a".repeat(1025);
+        let url = object_url(
+            CTX.endpoint(),
+            &bucket,
+            key,
+            Some(&format!("uploadId={invalid_upload_id}")),
+        );
+        let body = complete_multipart_upload_xml("\"abc\"", 1);
+
+        let response = send_signed_request_with_credentials(
+            "POST",
+            &url,
+            &body,
+            [("content-type", "application/xml")],
+            alt_credentials(),
+        );
+        assert_invalid_upload_id_no_such_upload(&response, &invalid_upload_id);
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_list_parts_invalid_present_upload_id_overlong_message_external() {
+    s3_tests::run(async {
+        if !external_test_mode() {
+            return;
+        }
+
+        let bucket = setup_bucket().await;
+        let key = "multipart-list-parts-invalid-upload-id-message";
+        let invalid_upload_id = "a".repeat(1025);
+        let url = object_url(
+            CTX.endpoint(),
+            &bucket,
+            key,
+            Some(&format!("uploadId={invalid_upload_id}")),
+        );
+
+        let response = send_signed_request_with_credentials(
+            "GET",
+            &url,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+            primary_credentials(),
+        );
+        assert_invalid_upload_id_no_such_upload(&response, &invalid_upload_id);
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_list_parts_invalid_present_upload_id_overlong_auth_precedence_external() {
+    s3_tests::run(async {
+        if !external_test_mode() {
+            return;
+        }
+
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let key = "multipart-list-parts-invalid-upload-id-auth-precedence";
+
+        client
+            .create_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+
+        let invalid_upload_id = "a".repeat(1025);
+        let url = object_url(
+            CTX.endpoint(),
+            &bucket,
+            key,
+            Some(&format!("uploadId={invalid_upload_id}")),
+        );
+
+        let response = send_signed_request_with_credentials(
+            "GET",
+            &url,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+            alt_credentials(),
+        );
+        assert_invalid_upload_id_no_such_upload(&response, &invalid_upload_id);
 
         cleanup(&bucket, &[key]).await;
     });

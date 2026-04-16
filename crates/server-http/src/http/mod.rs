@@ -200,7 +200,7 @@ fn object_version_request<'a>(
 fn multipart_object_request<'a>(
     bucket: &BucketName,
     key: &str,
-    upload_id: &'a str,
+    upload_id: UploadId,
     requester: crate::coordinator::Requester,
     expected_bucket_owner: Option<&'a str>,
 ) -> Result<MultipartObjectRequest<'a>, ServerError> {
@@ -211,6 +211,23 @@ fn multipart_object_request<'a>(
         requester,
         expected_bucket_owner,
     ))
+}
+
+fn invalid_upload_id_error(upload_id: &str) -> ServerError {
+    ServerError::NoSuchUpload {
+        upload_id: upload_id.to_string(),
+    }
+}
+
+fn parse_present_upload_id(upload_id: &str) -> Result<UploadId, ServerError> {
+    UploadId::try_from(upload_id).map_err(|_| invalid_upload_id_error(upload_id))
+}
+
+fn parse_required_upload_id(raw: Option<&str>) -> Result<UploadId, ServerError> {
+    let upload_id = raw.ok_or_else(|| ServerError::InvalidRequest {
+        reason: "missing uploadId query parameter".to_string(),
+    })?;
+    parse_present_upload_id(upload_id)
 }
 
 const MAX_WRITE_REQUEST_HEADER_SECTION_SIZE: usize = 8 * 1024;
@@ -2377,8 +2394,9 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::UploadPart { bucket, key } => {
-                let (upload_id, part_number) =
+                let (upload_id_raw, part_number) =
                     request::parse_upload_part_query(req.query_string())?;
+                let upload_id = parse_present_upload_id(upload_id_raw.as_str())?;
                 // Normal UploadPart requests are intercepted in serve.rs and
                 // streamed before they reach dispatch_routed(). Only copy-source
                 // variants should remain on this buffered path.
@@ -2411,7 +2429,7 @@ impl HttpFrontend {
                     upload: multipart_object_request(
                         &bucket,
                         &key,
-                        &upload_id,
+                        upload_id,
                         requester,
                         expected_bucket_owner,
                     )?,
@@ -2429,11 +2447,8 @@ impl HttpFrontend {
             }
             S3Operation::CompleteMultipartUpload { bucket, key } => {
                 reject_managed_encryption_read_headers(req)?;
-                let upload_id = req.query_param_lossy("uploadId").ok_or_else(|| {
-                    ServerError::InvalidRequest {
-                        reason: "missing uploadId query parameter".to_string(),
-                    }
-                })?;
+                let upload_id =
+                    parse_required_upload_id(req.query_param_lossy("uploadId").as_deref())?;
                 let parts = xml::parse_complete_multipart_upload_xml(&req.body)?;
                 let cond = write_condition_from_headers(req)?;
                 // Extract object-level checksum claim from request headers as a raw
@@ -2457,7 +2472,7 @@ impl HttpFrontend {
                         upload: multipart_object_request(
                             &bucket,
                             &key,
-                            &upload_id,
+                            upload_id,
                             requester,
                             expected_bucket_owner,
                         )?,
@@ -2475,17 +2490,14 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::AbortMultipartUpload { bucket, key } => {
-                let upload_id = req.query_param_lossy("uploadId").ok_or_else(|| {
-                    ServerError::InvalidRequest {
-                        reason: "missing uploadId query parameter".to_string(),
-                    }
-                })?;
+                let upload_id =
+                    parse_required_upload_id(req.query_param_lossy("uploadId").as_deref())?;
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .abort_multipart_upload(&multipart_object_request(
                         &bucket,
                         &key,
-                        &upload_id,
+                        upload_id,
                         requester,
                         expected_bucket_owner,
                     )?)?;
@@ -2525,11 +2537,8 @@ impl HttpFrontend {
                 ))
             }
             S3Operation::ListParts { bucket, key } => {
-                let upload_id = req.query_param_lossy("uploadId").ok_or_else(|| {
-                    ServerError::InvalidRequest {
-                        reason: "missing uploadId query parameter".to_string(),
-                    }
-                })?;
+                let upload_id =
+                    parse_required_upload_id(req.query_param_lossy("uploadId").as_deref())?;
                 let part_number_marker = parse_optional_u32(
                     req.query_param_lossy("part-number-marker"),
                     "part-number-marker must be an integer",
@@ -2546,7 +2555,7 @@ impl HttpFrontend {
                             upload: multipart_object_request(
                                 &bucket,
                                 &key,
-                                &upload_id,
+                                upload_id.clone(),
                                 requester,
                                 expected_bucket_owner,
                             )?,
@@ -2556,7 +2565,7 @@ impl HttpFrontend {
                 Ok(S3Response::list_parts(
                     bucket.as_str(),
                     &key,
-                    &upload_id,
+                    upload_id.as_str(),
                     part_number_marker,
                     max_parts,
                     &result,
@@ -3688,10 +3697,11 @@ impl HttpFrontend {
         let upload = multipart_object_request(
             &bucket_name,
             key,
-            upload_id,
+            parse_present_upload_id(upload_id)?,
             requester.clone(),
             expected_bucket_owner.as_deref(),
         )?;
+        let binding_upload_id = upload.upload_id_typed().clone();
         let binding_bucket = upload.object.bucket.name.clone();
         let binding_key = upload.object.key.clone();
         let begin = self
@@ -3716,7 +3726,7 @@ impl HttpFrontend {
                     bucket: binding_bucket,
                     key: binding_key,
                 },
-                upload_id: upload_id.to_string(),
+                upload_id: binding_upload_id,
                 part_number,
             },
             requester,
@@ -3807,10 +3817,10 @@ impl HttpFrontend {
         let result = self
             .coordinator
             .finalize_stream_part(FinalizeStreamPartRequest {
-                upload: MultipartObjectRequest::new(
+                upload: MultipartObjectRequest::new_typed(
                     ctx.binding.object.bucket.clone(),
                     ctx.binding.object.key.clone(),
-                    &ctx.binding.upload_id,
+                    ctx.binding.upload_id.clone(),
                     ctx.requester.clone(),
                     ctx.expected_bucket_owner.as_deref(),
                 ),
@@ -3896,7 +3906,7 @@ pub struct StreamObjectBinding {
 /// Session binding for a streaming multipart-part upload.
 pub struct StreamPartBinding {
     pub object: StreamObjectBinding,
-    pub upload_id: String,
+    pub upload_id: UploadId,
     pub part_number: u32,
 }
 
@@ -8593,8 +8603,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
+        let upload_id = create_upload_with_checksum(&fe, "mybucket", "mykey", None);
 
-        let req = make_req("uploadId=abc&part-number-marker=xyz");
+        let req = make_req(&format!("uploadId={upload_id}&part-number-marker=xyz"));
         let op = S3Operation::ListParts {
             bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
@@ -8611,8 +8622,9 @@ mod tests {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");
+        let upload_id = create_upload_with_checksum(&fe, "mybucket", "mykey", None);
 
-        let req = make_req("uploadId=abc&max-parts=notanumber");
+        let req = make_req(&format!("uploadId={upload_id}&max-parts=notanumber"));
         let op = S3Operation::ListParts {
             bucket: test_bucket_name("mybucket"),
             key: "mykey".to_string(),
@@ -8620,6 +8632,24 @@ mod tests {
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidArgument { .. }) => {}
             Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn list_parts_invalid_upload_id_returns_no_such_upload() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = make_req("uploadId=abc");
+        let op = S3Operation::ListParts {
+            bucket: test_bucket_name("mybucket"),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::NoSuchUpload { upload_id }) => assert_eq!(upload_id, "abc"),
+            Err(e) => panic!("expected NoSuchUpload, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
@@ -9192,7 +9222,7 @@ mod tests {
                 upload: multipart_object_request(
                     &bucket_name,
                     key,
-                    upload_id,
+                    parse_present_upload_id(upload_id).unwrap(),
                     requester.clone(),
                     None,
                 )
@@ -9230,8 +9260,14 @@ mod tests {
             });
             fe.coordinator
                 .finalize_stream_part(FinalizeStreamPartRequest {
-                    upload: multipart_object_request(&bucket_name, key, upload_id, requester, None)
-                        .unwrap(),
+                    upload: multipart_object_request(
+                        &bucket_name,
+                        key,
+                        parse_present_upload_id(upload_id).unwrap(),
+                        requester,
+                        None,
+                    )
+                    .unwrap(),
                     session_id: &session.session_id,
                     part_number,
                     crc64: checksum::crc64::checksum(data),

@@ -3260,7 +3260,7 @@ impl Coordinator {
         let src_version_id = req.source.version_id;
         let dst_bucket = req.upload.bucket_name_typed();
         let dst_key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id;
+        let upload_id = req.upload.upload_id_typed();
         let part_number = req.part_number;
         let requester = req.upload.requester();
         let copy_source_policy_value = req.source.version_id.map_or_else(
@@ -3283,7 +3283,7 @@ impl Coordinator {
             let dst_meta_pg = self
                 .storage_node
                 .get_pg(self.object_pg_id_for(dst_bucket, dst_key))?;
-            let dst_upload = dst_meta_pg.get_multipart_upload(upload_id)?;
+            let dst_upload = dst_meta_pg.get_multipart_upload(upload_id.as_str())?;
             if dst_upload.bucket != dst_bucket.as_str() || dst_upload.key != dst_key.as_str() {
                 return Err(ServerError::NoSuchUpload {
                     upload_id: upload_id.to_string(),
@@ -3333,7 +3333,7 @@ impl Coordinator {
                 destination: AuthorizedMultipartPartWrite {
                     bucket: req.upload.bucket_name_typed().clone(),
                     key: req.upload.key_typed().clone(),
-                    upload_id: upload_id.to_string(),
+                    upload_id: dst_upload.upload_id.clone(),
                     part_number,
                     upload: dst_upload,
                     sse_customer,
@@ -3348,7 +3348,7 @@ impl Coordinator {
     ) -> Result<AuthorizedBeginStreamPart<'a>, ServerError> {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id;
+        let upload_id = req.upload.upload_id_typed();
         let part_number = req.part_number;
         let policy_context = req.effective_policy_context();
         let bucket_info =
@@ -3357,7 +3357,7 @@ impl Coordinator {
         let meta_pg = self
             .storage_node
             .get_pg(self.object_pg_id_for(bucket, key))?;
-        let upload = meta_pg.get_multipart_upload(upload_id)?;
+        let upload = meta_pg.get_multipart_upload(upload_id.as_str())?;
         if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
             return Err(ServerError::NoSuchUpload {
                 upload_id: upload_id.to_string(),
@@ -3391,7 +3391,7 @@ impl Coordinator {
         Ok(AuthorizedBeginStreamPart {
             bucket: req.upload.bucket_name_typed().clone(),
             key: req.upload.key_typed().clone(),
-            upload_id: upload_id.to_string(),
+            upload_id: upload.upload_id.clone(),
             part_number,
             upload,
             sse_customer,
@@ -3405,13 +3405,13 @@ impl Coordinator {
     ) -> Result<AuthorizedCompleteMultipartUpload, ServerError> {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id;
+        let upload_id = req.upload.upload_id_typed();
         self.with_bucket_write_reservation_for(&req.upload, |bucket_info| {
             let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
             let meta_pg = self
                 .storage_node
                 .get_pg(self.object_pg_id_for(bucket, key))?;
-            let upload = meta_pg.get_multipart_upload(upload_id)?;
+            let upload = meta_pg.get_multipart_upload(upload_id.as_str())?;
             if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
                 return Err(ServerError::NoSuchUpload {
                     upload_id: upload_id.to_string(),
@@ -3453,7 +3453,7 @@ impl Coordinator {
                 bucket_info: bucket_info.into_inner(),
                 bucket: req.upload.bucket_name_typed().clone(),
                 key: req.upload.key_typed().clone(),
-                upload_id: upload_id.to_string(),
+                upload_id: upload.upload_id.clone(),
                 upload,
                 multipart_write_encryption,
             })
@@ -3466,13 +3466,13 @@ impl Coordinator {
     ) -> Result<AuthorizedAbortMultipartUpload, ServerError> {
         let bucket = req.object.bucket_name_typed();
         let key = req.object.key_typed();
-        let upload_id = req.upload_id;
+        let upload_id = req.upload_id_typed();
         let bucket_info =
             self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
         let meta_pg = self
             .storage_node
             .get_pg(self.object_pg_id_for(bucket, key))?;
-        let authorized = match meta_pg.get_multipart_upload(upload_id) {
+        let authorized = match meta_pg.get_multipart_upload(upload_id.as_str()) {
             Ok(upload) => {
                 if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
                     return Err(ServerError::NoSuchUpload {
@@ -3493,7 +3493,8 @@ impl Coordinator {
                 }
             }
             Err(storage::MetadataError::NoSuchUpload { .. }) => {
-                let Some(completed) = meta_pg.get_completed_multipart_upload(upload_id)? else {
+                let Some(completed) = meta_pg.get_completed_multipart_upload(upload_id.as_str())?
+                else {
                     return Err(ServerError::NoSuchUpload {
                         upload_id: upload_id.to_string(),
                     });
@@ -3524,13 +3525,13 @@ impl Coordinator {
     ) -> Result<AuthorizedListParts<'a>, ServerError> {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
-        let upload_id = req.upload.upload_id;
+        let upload_id = req.upload.upload_id_typed();
         let bucket_info =
             self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
         let meta_pg = self
             .storage_node
             .get_pg(self.object_pg_id_for(bucket, key))?;
-        let upload = meta_pg.get_multipart_upload(upload_id)?;
+        let upload = meta_pg.get_multipart_upload(upload_id.as_str())?;
         if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
             return Err(ServerError::NoSuchUpload {
                 upload_id: upload_id.to_string(),

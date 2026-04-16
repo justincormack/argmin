@@ -1438,6 +1438,10 @@ impl S3Response {
                 );
                 return Self::new(400).chunked_xml_body(body);
             }
+            ServerError::NoSuchUpload { upload_id } => {
+                let body = xml::no_such_upload_error_xml(upload_id, Self::TEST_REQUEST_ID);
+                return Self::new(404).chunked_xml_body(body);
+            }
             _ => {}
         }
 
@@ -2799,6 +2803,21 @@ mod tests {
         assert_eq!(find_header(&resp, "Content-Length"), None);
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("NoSuchBucket"));
+    }
+
+    #[test]
+    fn error_response_no_such_upload_uses_aws_shape() {
+        let err = ServerError::NoSuchUpload {
+            upload_id: "abc".into(),
+        };
+        let resp = S3Response::error(&err, "/bucket/key");
+        assert_eq!(resp.status_code, 404);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("<Code>NoSuchUpload</Code>"));
+        assert!(body.contains(
+            "<Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message>"
+        ));
+        assert!(body.contains("<UploadId>abc</UploadId>"));
     }
 
     #[test]

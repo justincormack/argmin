@@ -214,16 +214,29 @@ Exit criteria:
 
 Current state:
 
-1. Partial: `ListMultipartUploads` now validates `upload-id-marker` at the
-   HTTP boundary, passes typed `UploadId` markers through coordinator/storage,
-   and returns AWS-matching `InvalidArgument` for malformed markers.
-2. Remaining: the main multipart operation `uploadId` paths still enter as raw
-   query strings and rely on later typed conversion or `NoSuchUpload` mapping.
-3. Remaining: streaming multipart request state/bindings still need the same
-   end-to-end typed treatment.
-4. Remaining: once the main operation paths are typed, the response/request
-   multipart seams should be audited again for any leftover raw-string upload
-   identifier handling.
+1. Done: `ListMultipartUploads` validates `upload-id-marker` at the HTTP
+   boundary, passes typed `UploadId` markers through coordinator/storage, and
+   returns AWS-matching `InvalidArgument` for malformed markers.
+2. Done: the main multipart operation `uploadId` boundary is now split cleanly
+   at the HTTP layer:
+   - missing `uploadId` is still `InvalidRequest`
+   - malformed-present `uploadId` is resolved in `server-http` before
+     coordinator dispatch
+   - only typed `UploadId` values now cross into coordinator request wrappers
+3. Done: streaming multipart request state and bindings now carry typed
+   `UploadId` end to end rather than raw `String`.
+4. Done: the AWS-visible invalid-present multipart `uploadId` behavior is now
+   explicitly pinned for `AbortMultipartUpload`, `UploadPart`,
+   `CompleteMultipartUpload`, and `ListParts`:
+   - overlong present `uploadId` returns `404 NoSuchUpload`
+   - the response uses the fixed AWS message
+   - the submitted token is echoed in a separate `<UploadId>` element
+   - for the tested cases, `NoSuchUpload` takes precedence over `AccessDenied`
+5. Remaining: Phase 3 still needs to finish the storage/hash boundary audit so
+   multipart low-level helpers stop taking raw upload-id strings where they
+   model the external identifier.
+
+Phase 2 is complete.
 
 Exit criteria:
 
