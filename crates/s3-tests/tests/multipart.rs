@@ -1073,6 +1073,61 @@ fn test_list_multipart_uploads_pagination_and_markers() {
 }
 
 #[test]
+fn test_list_multipart_uploads_invalid_present_upload_id_marker_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+
+        let mut created = Vec::new();
+        for key in ["same-key", "same-key", "same-key", "zzz"] {
+            let create = client
+                .create_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await
+                .unwrap();
+            created.push((key.to_string(), create.upload_id().unwrap().to_string()));
+        }
+
+        let invalid_marker = "x".repeat(1025);
+        let url = format!(
+            "{}/{bucket}?uploads&key-marker={}&upload-id-marker={}",
+            CTX.endpoint(),
+            query_encode_value("same-key"),
+            query_encode_value(&invalid_marker),
+        );
+        let response = send_signed_request("GET", &url, b"", std::iter::empty::<(&str, &str)>());
+
+        assert_eq!(response.status, 400, "unexpected body: {}", response.body);
+        assert!(
+            response.body.contains("<Code>InvalidArgument</Code>"),
+            "unexpected body: {}",
+            response.body
+        );
+        assert!(
+            response
+                .body
+                .contains("<Message>Invalid uploadId marker</Message>"),
+            "unexpected body: {}",
+            response.body
+        );
+
+        for (key, upload_id) in created {
+            client
+                .abort_multipart_upload()
+                .bucket(&bucket)
+                .key(key)
+                .upload_id(upload_id)
+                .send()
+                .await
+                .unwrap();
+        }
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_list_multipart_uploads_encoding_type_url() {
     const KEY: &str = "multi part <>&\"+";
 

@@ -423,9 +423,7 @@ impl ServerError {
 impl From<MetadataError> for ServerError {
     fn from(e: MetadataError) -> Self {
         match e {
-            MetadataError::NoSuchUpload { upload_id } => ServerError::NoSuchUpload {
-                upload_id: upload_id.into_string(),
-            },
+            MetadataError::NoSuchUpload { upload_id } => ServerError::NoSuchUpload { upload_id },
             MetadataError::InvalidBucketName { reason } => {
                 ServerError::InvalidBucketName { reason }
             }
@@ -915,7 +913,7 @@ mod tests {
     #[test]
     fn from_metadata_no_such_upload() {
         let err: ServerError = MetadataError::NoSuchUpload {
-            upload_id: storage::types::UploadId::from("abc"),
+            upload_id: "abc".to_string(),
         }
         .into();
         assert!(matches!(err, ServerError::NoSuchUpload { .. }));

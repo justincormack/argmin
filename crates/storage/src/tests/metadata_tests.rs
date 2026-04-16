@@ -1,4 +1,4 @@
-use super::{bucket_name, object_key};
+use super::{bucket_name, multipart_upload_id, object_key};
 use crate::traits::{PgMetadataStore, ShardStore};
 use crate::types::*;
 use std::num::NonZeroU64;
@@ -555,7 +555,7 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
         .unwrap();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "completed-upload".into(),
+            upload_id: multipart_upload_id("completed-upload"),
             bucket: bucket_name("bucket"),
             key: object_key("key"),
             tags: None,
@@ -604,18 +604,23 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
         checksum: None,
     }];
     store
-        .complete_multipart_commit("completed-upload", 1, &obj, &parts)
+        .complete_multipart_commit(
+            multipart_upload_id("completed-upload").as_str(),
+            1,
+            &obj,
+            &parts,
+        )
         .unwrap();
 
     assert!(store
-        .get_completed_multipart_upload("completed-upload")
+        .get_completed_multipart_upload(multipart_upload_id("completed-upload").as_str())
         .unwrap()
         .is_some());
 
     store.delete_bucket(&bucket_name("bucket")).unwrap();
 
     assert!(store
-        .get_completed_multipart_upload("completed-upload")
+        .get_completed_multipart_upload(multipart_upload_id("completed-upload").as_str())
         .unwrap()
         .is_none());
 }
@@ -1356,7 +1361,7 @@ fn list_buckets_with_aborting_multipart_uploads_returns_distinct_bucket_names() 
     ] {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: upload_id.into(),
+                upload_id: multipart_upload_id(upload_id),
                 bucket: bucket_name(bucket),
                 key: object_key(key),
                 owner: test_owner(),
@@ -1373,13 +1378,22 @@ fn list_buckets_with_aborting_multipart_uploads_returns_distinct_bucket_names() 
             .unwrap();
     }
     store
-        .set_upload_state("upload-a1", UploadState::Aborting)
+        .set_upload_state(
+            multipart_upload_id("upload-a1").as_str(),
+            UploadState::Aborting,
+        )
         .unwrap();
     store
-        .set_upload_state("upload-a2", UploadState::Aborting)
+        .set_upload_state(
+            multipart_upload_id("upload-a2").as_str(),
+            UploadState::Aborting,
+        )
         .unwrap();
     store
-        .set_upload_state("upload-b1", UploadState::Completing)
+        .set_upload_state(
+            multipart_upload_id("upload-b1").as_str(),
+            UploadState::Completing,
+        )
         .unwrap();
 
     let buckets = store
@@ -1542,7 +1556,7 @@ fn mpu_create_and_get_upload() {
     let tags = "<Tagging><TagSet><Tag><Key>env</Key><Value>prod</Value></Tag></TagSet></Tagging>";
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-1".into(),
+            upload_id: multipart_upload_id("uid-1"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: Some(tags.into()),
@@ -1559,8 +1573,10 @@ fn mpu_create_and_get_upload() {
         })
         .unwrap();
 
-    let rec = store.get_multipart_upload("uid-1").unwrap();
-    assert_eq!(rec.upload_id, "uid-1");
+    let rec = store
+        .get_multipart_upload(multipart_upload_id("uid-1").as_str())
+        .unwrap();
+    assert_eq!(rec.upload_id, multipart_upload_id("uid-1"));
     assert_eq!(rec.bucket, "bucket");
     assert_eq!(rec.key, "k");
     assert_eq!(rec.state, UploadState::InProgress);
@@ -1576,7 +1592,7 @@ fn mpu_create_upload_with_checksum_fields() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-cksum".into(),
+            upload_id: multipart_upload_id("uid-cksum"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -1599,7 +1615,9 @@ fn mpu_create_upload_with_checksum_fields() {
         })
         .unwrap();
 
-    let rec = store.get_multipart_upload("uid-cksum").unwrap();
+    let rec = store
+        .get_multipart_upload(multipart_upload_id("uid-cksum").as_str())
+        .unwrap();
     assert_eq!(
         rec.checksum.map(|c| c.algorithm()),
         Some(ChecksumAlgorithm::Sha256)
@@ -1612,7 +1630,7 @@ fn mpu_create_upload_with_checksum_fields() {
     // None case round-trips as well
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-no-cksum".into(),
+            upload_id: multipart_upload_id("uid-no-cksum"),
             bucket: bucket_name("bucket"),
             key: object_key("k2"),
             tags: None,
@@ -1628,7 +1646,9 @@ fn mpu_create_upload_with_checksum_fields() {
             encryption: ObjectEncryption::None,
         })
         .unwrap();
-    let rec2 = store.get_multipart_upload("uid-no-cksum").unwrap();
+    let rec2 = store
+        .get_multipart_upload(multipart_upload_id("uid-no-cksum").as_str())
+        .unwrap();
     assert_eq!(rec2.checksum, None);
 }
 
@@ -1637,7 +1657,7 @@ fn mpu_part_checksum_round_trip() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-pc".into(),
+            upload_id: multipart_upload_id("uid-pc"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -1663,7 +1683,7 @@ fn mpu_part_checksum_round_trip() {
     let checksum_bytes = ChecksumBytes::new([0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
     store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "uid-pc".into(),
+            upload_id: multipart_upload_id("uid-pc"),
             part_number: 1,
             generation: 0,
             size: 1024,
@@ -1678,13 +1698,15 @@ fn mpu_part_checksum_round_trip() {
         })
         .unwrap();
 
-    let part = store.get_multipart_part("uid-pc", 1).unwrap();
+    let part = store
+        .get_multipart_part(multipart_upload_id("uid-pc").as_str(), 1)
+        .unwrap();
     assert_eq!(part.checksum, Some(checksum_bytes));
 
     // None checksum round-trips
     store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "uid-pc".into(),
+            upload_id: multipart_upload_id("uid-pc"),
             part_number: 2,
             generation: 0,
             size: 512,
@@ -1699,7 +1721,9 @@ fn mpu_part_checksum_round_trip() {
         })
         .unwrap();
 
-    let part2 = store.get_multipart_part("uid-pc", 2).unwrap();
+    let part2 = store
+        .get_multipart_part(multipart_upload_id("uid-pc").as_str(), 2)
+        .unwrap();
     assert_eq!(part2.checksum, None);
 }
 
@@ -1763,7 +1787,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
     // Create upload and object row (needed for complete_multipart_commit).
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-cmc".into(),
+            upload_id: multipart_upload_id("uid-cmc"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: Some(tags.into()),
@@ -1839,7 +1863,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
     ];
 
     store
-        .complete_multipart_commit("uid-cmc", 1, &obj, &parts)
+        .complete_multipart_commit(multipart_upload_id("uid-cmc").as_str(), 1, &obj, &parts)
         .unwrap();
 
     let committed = store
@@ -1856,7 +1880,7 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
     assert_eq!(live.tags.as_deref(), Some(tags));
 
     let completed = store
-        .get_completed_multipart_upload("uid-cmc")
+        .get_completed_multipart_upload(multipart_upload_id("uid-cmc").as_str())
         .unwrap()
         .expect("completed upload record");
     assert_eq!(completed.bucket.as_str(), "bucket");
@@ -1879,7 +1903,7 @@ fn completed_multipart_tombstone_survives_null_version_overwrite() {
         .unwrap();
 
     let upload = CreateMultipartUploadReq {
-        upload_id: "upload-1".into(),
+        upload_id: multipart_upload_id("upload-1"),
         bucket: bucket_name("bucket"),
         key: object_key("key"),
         tags: None,
@@ -1928,11 +1952,11 @@ fn completed_multipart_tombstone_survives_null_version_overwrite() {
         checksum: None,
     }];
     store
-        .complete_multipart_commit("upload-1", 1, &obj, &parts)
+        .complete_multipart_commit(multipart_upload_id("upload-1").as_str(), 1, &obj, &parts)
         .unwrap();
 
     assert!(store
-        .get_completed_multipart_upload("upload-1")
+        .get_completed_multipart_upload(multipart_upload_id("upload-1").as_str())
         .unwrap()
         .is_some());
 
@@ -1958,7 +1982,7 @@ fn completed_multipart_tombstone_survives_null_version_overwrite() {
         .unwrap();
 
     assert!(store
-        .get_completed_multipart_upload("upload-1")
+        .get_completed_multipart_upload(multipart_upload_id("upload-1").as_str())
         .unwrap()
         .is_some());
 }
@@ -1979,7 +2003,7 @@ fn completed_multipart_tombstone_survives_object_version_delete() {
 
     let version_id = VersionId::Versioned(NonZeroU64::new(1).unwrap());
     let upload = CreateMultipartUploadReq {
-        upload_id: "upload-versioned".into(),
+        upload_id: multipart_upload_id("upload-versioned"),
         bucket: bucket_name("bucket"),
         key: object_key("key"),
         tags: None,
@@ -2028,11 +2052,16 @@ fn completed_multipart_tombstone_survives_object_version_delete() {
         checksum: None,
     }];
     store
-        .complete_multipart_commit("upload-versioned", 1, &obj, &parts)
+        .complete_multipart_commit(
+            multipart_upload_id("upload-versioned").as_str(),
+            1,
+            &obj,
+            &parts,
+        )
         .unwrap();
 
     let completed = store
-        .get_completed_multipart_upload("upload-versioned")
+        .get_completed_multipart_upload(multipart_upload_id("upload-versioned").as_str())
         .unwrap()
         .expect("completed upload record");
     assert_eq!(completed.bucket.as_str(), "bucket");
@@ -2043,7 +2072,7 @@ fn completed_multipart_tombstone_survives_object_version_delete() {
         .unwrap();
 
     assert!(store
-        .get_completed_multipart_upload("upload-versioned")
+        .get_completed_multipart_upload(multipart_upload_id("upload-versioned").as_str())
         .unwrap()
         .is_some());
 }
@@ -2063,9 +2092,10 @@ fn completed_multipart_upload_list_reports_global_completion_orders() {
         .unwrap();
 
     let complete_upload = |upload_id: &str, key: &str| {
+        let upload_id = multipart_upload_id(upload_id);
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: upload_id.into(),
+                upload_id: upload_id.clone(),
                 bucket: bucket_name("bucket"),
                 key: object_key(key),
                 tags: None,
@@ -2082,8 +2112,12 @@ fn completed_multipart_upload_list_reports_global_completion_orders() {
             .unwrap();
         store
             .complete_multipart_commit(
-                upload_id,
-                if upload_id == "z-first" { 1 } else { 2 },
+                upload_id.as_str(),
+                if upload_id == multipart_upload_id("z-first") {
+                    1
+                } else {
+                    2
+                },
                 &CommitMultipartReq {
                     bucket: bucket_name("bucket"),
                     key: object_key(key),
@@ -2128,14 +2162,16 @@ fn completed_multipart_upload_list_reports_global_completion_orders() {
     let uploads = store
         .list_completed_multipart_uploads_for_bucket("bucket")
         .unwrap();
-    assert!(uploads.contains(&(String::from("z-first"), 1)));
-    assert!(uploads.contains(&(String::from("a-second"), 2)));
+    assert!(uploads.contains(&(multipart_upload_id("z-first").into_string(), 1)));
+    assert!(uploads.contains(&(multipart_upload_id("a-second").into_string(), 2)));
 }
 
 #[test]
 fn mpu_get_missing_upload_returns_no_such_upload() {
     let (_dir, store) = make_pg_store();
-    let err = store.get_multipart_upload("nonexistent").unwrap_err();
+    let err = store
+        .get_multipart_upload(multipart_upload_id("nonexistent").as_str())
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::NoSuchUpload { .. }
@@ -2147,7 +2183,7 @@ fn mpu_set_upload_state_transition() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-2".into(),
+            upload_id: multipart_upload_id("uid-2"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -2166,14 +2202,19 @@ fn mpu_set_upload_state_transition() {
 
     // InProgress -> Completing succeeds
     store
-        .set_upload_state("uid-2", UploadState::Completing)
+        .set_upload_state(
+            multipart_upload_id("uid-2").as_str(),
+            UploadState::Completing,
+        )
         .unwrap();
-    let rec = store.get_multipart_upload("uid-2").unwrap();
+    let rec = store
+        .get_multipart_upload(multipart_upload_id("uid-2").as_str())
+        .unwrap();
     assert_eq!(rec.state, UploadState::Completing);
 
     // Completing -> Aborting fails (not InProgress)
     let err = store
-        .set_upload_state("uid-2", UploadState::Aborting)
+        .set_upload_state(multipart_upload_id("uid-2").as_str(), UploadState::Aborting)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -2185,7 +2226,10 @@ fn mpu_set_upload_state_transition() {
 fn mpu_set_upload_state_missing_returns_no_such_upload() {
     let (_dir, store) = make_pg_store();
     let err = store
-        .set_upload_state("nonexistent", UploadState::Completing)
+        .set_upload_state(
+            multipart_upload_id("nonexistent").as_str(),
+            UploadState::Completing,
+        )
         .unwrap_err();
     assert!(matches!(
         err,
@@ -2198,7 +2242,7 @@ fn mpu_delete_upload_cascades_parts() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-3".into(),
+            upload_id: multipart_upload_id("uid-3"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -2218,7 +2262,7 @@ fn mpu_delete_upload_cascades_parts() {
     // Add a part
     store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "uid-3".into(),
+            upload_id: multipart_upload_id("uid-3"),
             part_number: 1,
             generation: 0,
             size: 1024,
@@ -2234,10 +2278,14 @@ fn mpu_delete_upload_cascades_parts() {
         .unwrap();
 
     // Delete upload — should cascade to parts
-    store.delete_multipart_upload("uid-3").unwrap();
+    store
+        .delete_multipart_upload(multipart_upload_id("uid-3").as_str())
+        .unwrap();
 
     assert!(matches!(
-        store.get_multipart_upload("uid-3").unwrap_err(),
+        store
+            .get_multipart_upload(multipart_upload_id("uid-3").as_str())
+            .unwrap_err(),
         crate::error::MetadataError::NoSuchUpload { .. }
     ));
 }
@@ -2245,7 +2293,9 @@ fn mpu_delete_upload_cascades_parts() {
 #[test]
 fn mpu_delete_missing_upload_returns_no_such_upload() {
     let (_dir, store) = make_pg_store();
-    let err = store.delete_multipart_upload("nonexistent").unwrap_err();
+    let err = store
+        .delete_multipart_upload(multipart_upload_id("nonexistent").as_str())
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::NoSuchUpload { .. }
@@ -2257,7 +2307,7 @@ fn mpu_upsert_part_and_get() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-4".into(),
+            upload_id: multipart_upload_id("uid-4"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -2277,7 +2327,7 @@ fn mpu_upsert_part_and_get() {
     // First upload: no previous generation
     let prev = store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "uid-4".into(),
+            upload_id: multipart_upload_id("uid-4"),
             part_number: 1,
             generation: 0,
             size: 5 * 1024 * 1024,
@@ -2294,7 +2344,9 @@ fn mpu_upsert_part_and_get() {
     assert_eq!(prev, None);
 
     // Verify get
-    let part = store.get_multipart_part("uid-4", 1).unwrap();
+    let part = store
+        .get_multipart_part(multipart_upload_id("uid-4").as_str(), 1)
+        .unwrap();
     assert_eq!(part.generation, 0);
     assert_eq!(part.size, 5 * 1024 * 1024);
     assert_eq!(part.etag, vec![0xBB]);
@@ -2303,7 +2355,7 @@ fn mpu_upsert_part_and_get() {
     // Re-upload same part: returns previous generation
     let prev = store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "uid-4".into(),
+            upload_id: multipart_upload_id("uid-4"),
             part_number: 1,
             generation: 1,
             size: 6 * 1024 * 1024,
@@ -2320,7 +2372,9 @@ fn mpu_upsert_part_and_get() {
     assert_eq!(prev, Some(0));
 
     // Verify updated
-    let part = store.get_multipart_part("uid-4", 1).unwrap();
+    let part = store
+        .get_multipart_part(multipart_upload_id("uid-4").as_str(), 1)
+        .unwrap();
     assert_eq!(part.generation, 1);
     assert_eq!(part.size, 6 * 1024 * 1024);
 }
@@ -2330,7 +2384,7 @@ fn mpu_list_parts_pagination() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-5".into(),
+            upload_id: multipart_upload_id("uid-5"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -2351,7 +2405,7 @@ fn mpu_list_parts_pagination() {
     for i in 1..=5 {
         store
             .upsert_multipart_part(&MultipartPartRecord {
-                upload_id: "uid-5".into(),
+                upload_id: multipart_upload_id("uid-5"),
                 part_number: i,
                 generation: 0,
                 size: 1024 * i as u64,
@@ -2370,7 +2424,7 @@ fn mpu_list_parts_pagination() {
     // List first page (max 2)
     let resp = store
         .list_multipart_parts(&ListPartsReq {
-            upload_id: "uid-5".into(),
+            upload_id: multipart_upload_id("uid-5"),
             part_number_marker: None,
             max_parts: 2,
         })
@@ -2384,7 +2438,7 @@ fn mpu_list_parts_pagination() {
     // List second page
     let resp = store
         .list_multipart_parts(&ListPartsReq {
-            upload_id: "uid-5".into(),
+            upload_id: multipart_upload_id("uid-5"),
             part_number_marker: Some(2),
             max_parts: 2,
         })
@@ -2397,7 +2451,7 @@ fn mpu_list_parts_pagination() {
     // List last page
     let resp = store
         .list_multipart_parts(&ListPartsReq {
-            upload_id: "uid-5".into(),
+            upload_id: multipart_upload_id("uid-5"),
             part_number_marker: Some(4),
             max_parts: 2,
         })
@@ -2415,7 +2469,7 @@ fn mpu_list_uploads_pagination() {
     for (uid, key) in [("u1", "a"), ("u2", "b"), ("u3", "c")] {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: uid.into(),
+                upload_id: multipart_upload_id(uid),
                 bucket: bucket_name("bkt"),
                 key: object_key(key),
                 tags: None,
@@ -2474,7 +2528,7 @@ fn mpu_list_uploads_with_prefix() {
     ] {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: uid.into(),
+                upload_id: multipart_upload_id(uid),
                 bucket: bucket_name("bkt"),
                 key: object_key(key),
                 tags: None,
@@ -2516,7 +2570,7 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
     for uid in ["u-a", "u-b", "u-c"] {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: uid.into(),
+                upload_id: multipart_upload_id(uid),
                 bucket: bucket_name("bkt"),
                 key: object_key("same-key"),
                 tags: None,
@@ -2547,8 +2601,8 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
     assert!(resp.is_truncated);
     assert_eq!(resp.uploads.len(), 2);
     // All same key, ordered by upload_id
-    assert_eq!(resp.uploads[0].upload_id, "u-a");
-    assert_eq!(resp.uploads[1].upload_id, "u-b");
+    assert_eq!(resp.uploads[0].upload_id, multipart_upload_id("u-a"));
+    assert_eq!(resp.uploads[1].upload_id, multipart_upload_id("u-b"));
 
     // Page 2: resume with markers
     let resp2 = store
@@ -2562,7 +2616,7 @@ fn mpu_list_uploads_same_key_multiple_upload_ids() {
         .unwrap();
     assert!(!resp2.is_truncated);
     assert_eq!(resp2.uploads.len(), 1);
-    assert_eq!(resp2.uploads[0].upload_id, "u-c");
+    assert_eq!(resp2.uploads[0].upload_id, multipart_upload_id("u-c"));
 }
 
 #[test]
@@ -2573,7 +2627,7 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
     for uid in ["u-x", "u-y", "u-z"] {
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: uid.into(),
+                upload_id: multipart_upload_id(uid),
                 bucket: bucket_name("bkt"),
                 key: object_key("key"),
                 tags: None,
@@ -2592,7 +2646,9 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
     }
 
     // Delete the middle upload (simulating it being aborted between pages).
-    store.delete_multipart_upload("u-y").unwrap();
+    store
+        .delete_multipart_upload(multipart_upload_id("u-y").as_str())
+        .unwrap();
 
     // Paginate using u-y as the marker — it no longer exists.
     // COALESCE to 0 means all remaining uploads for "key" are returned.
@@ -2601,7 +2657,7 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
             bucket: bucket_name("bkt"),
             prefix: None,
             key_marker: Some(object_key("key")),
-            upload_id_marker: Some("u-y".into()),
+            upload_id_marker: Some(multipart_upload_id("u-y")),
             max_uploads: 10,
         })
         .unwrap();
@@ -2610,7 +2666,7 @@ fn mpu_list_uploads_stale_marker_returns_remaining() {
     // The stale marker must not cause u-z to be silently dropped.
     let ids: Vec<&str> = resp.uploads.iter().map(|u| u.upload_id.as_str()).collect();
     assert!(
-        ids.contains(&"u-z"),
+        ids.contains(&multipart_upload_id("u-z").as_str()),
         "u-z must not be dropped; got: {ids:?}"
     );
 }
@@ -2620,7 +2676,7 @@ fn mpu_corrupted_part_okh_returns_error() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-okh".into(),
+            upload_id: multipart_upload_id("uid-okh"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -2640,7 +2696,7 @@ fn mpu_corrupted_part_okh_returns_error() {
     // Insert a part with valid okh
     store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "uid-okh".into(),
+            upload_id: multipart_upload_id("uid-okh"),
             part_number: 1,
             generation: 0,
             size: 1024,
@@ -2660,13 +2716,15 @@ fn mpu_corrupted_part_okh_returns_error() {
         .connection()
         .execute(
             "UPDATE multipart_parts SET part_okh = X'AABB' \
-             WHERE upload_id = 'uid-okh' AND part_number = 1",
-            [],
+             WHERE upload_id = ?1 AND part_number = 1",
+            [multipart_upload_id("uid-okh").into_string()],
         )
         .unwrap();
 
     // Reading should fail, not silently zero the okh
-    let err = store.get_multipart_part("uid-okh", 1).unwrap_err();
+    let err = store
+        .get_multipart_part(multipart_upload_id("uid-okh").as_str(), 1)
+        .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::Db { .. }),
         "expected Db error for corrupted part_okh, got: {err:?}"
@@ -2723,7 +2781,7 @@ fn mpu_get_missing_part_returns_part_not_found() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-pnf".into(),
+            upload_id: multipart_upload_id("uid-pnf"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -2740,14 +2798,16 @@ fn mpu_get_missing_part_returns_part_not_found() {
         })
         .unwrap();
 
-    let err = store.get_multipart_part("uid-pnf", 42).unwrap_err();
+    let err = store
+        .get_multipart_part(multipart_upload_id("uid-pnf").as_str(), 42)
+        .unwrap_err();
     assert!(
         matches!(
             err,
             crate::error::MetadataError::PartNotFound {
                 ref upload_id,
                 part_number: 42
-            } if upload_id == "uid-pnf"
+            } if upload_id == multipart_upload_id("uid-pnf").as_str()
         ),
         "expected PartNotFound, got: {err:?}"
     );
@@ -2758,7 +2818,7 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
     let (_dir, store) = make_pg_store();
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "uid-ip".into(),
+            upload_id: multipart_upload_id("uid-ip"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -2777,7 +2837,10 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
 
     // InProgress -> InProgress should be rejected, reporting actual state
     let err = store
-        .set_upload_state("uid-ip", UploadState::InProgress)
+        .set_upload_state(
+            multipart_upload_id("uid-ip").as_str(),
+            UploadState::InProgress,
+        )
         .unwrap_err();
     assert!(
         matches!(
@@ -2789,10 +2852,16 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
 
     // Transition to Completing, then try InProgress again — should report state 1
     store
-        .set_upload_state("uid-ip", UploadState::Completing)
+        .set_upload_state(
+            multipart_upload_id("uid-ip").as_str(),
+            UploadState::Completing,
+        )
         .unwrap();
     let err = store
-        .set_upload_state("uid-ip", UploadState::InProgress)
+        .set_upload_state(
+            multipart_upload_id("uid-ip").as_str(),
+            UploadState::InProgress,
+        )
         .unwrap_err();
     assert!(
         matches!(
@@ -2803,7 +2872,9 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
     );
 
     // Upload should still be Completing (InProgress target was rejected)
-    let rec = store.get_multipart_upload("uid-ip").unwrap();
+    let rec = store
+        .get_multipart_upload(multipart_upload_id("uid-ip").as_str())
+        .unwrap();
     assert_eq!(rec.state, UploadState::Completing);
 }
 
@@ -2811,7 +2882,10 @@ fn mpu_set_upload_state_rejects_in_progress_target() {
 fn mpu_set_upload_state_in_progress_target_nonexistent_returns_no_such_upload() {
     let (_dir, store) = make_pg_store();
     let err = store
-        .set_upload_state("nonexistent", UploadState::InProgress)
+        .set_upload_state(
+            multipart_upload_id("nonexistent").as_str(),
+            UploadState::InProgress,
+        )
         .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::NoSuchUpload { .. }),
@@ -2824,7 +2898,7 @@ fn mpu_upsert_part_nonexistent_upload_returns_no_such_upload() {
     let (_dir, store) = make_pg_store();
     let err = store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "nonexistent".into(),
+            upload_id: multipart_upload_id("nonexistent"),
             part_number: 1,
             generation: 0,
             size: 1024,
@@ -2849,7 +2923,7 @@ fn mpu_list_parts_nonexistent_upload_returns_no_such_upload() {
     let (_dir, store) = make_pg_store();
     let err = store
         .list_multipart_parts(&ListPartsReq {
-            upload_id: "nonexistent".into(),
+            upload_id: multipart_upload_id("nonexistent"),
             part_number_marker: None,
             max_parts: 10,
         })
@@ -3105,7 +3179,7 @@ fn mpu_delete_object_parts() {
 fn create_upload(store: &dyn PgMetadataStore, upload_id: &str) {
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: upload_id.into(),
+            upload_id: multipart_upload_id(upload_id),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -3126,7 +3200,7 @@ fn create_upload(store: &dyn PgMetadataStore, upload_id: &str) {
 /// Helper: build a MultipartPartRecord for a given upload/part/generation.
 fn make_part(upload_id: &str, part_number: u32, generation: u32) -> MultipartPartRecord {
     MultipartPartRecord {
-        upload_id: upload_id.into(),
+        upload_id: multipart_upload_id(upload_id),
         part_number,
         generation,
         size: 1024,
@@ -3181,7 +3255,9 @@ fn mpu_upsert_fk_rollback_preserves_existing_parts() {
     );
 
     // Original part should be unaffected.
-    let part = store.get_multipart_part("uid-a", 1).unwrap();
+    let part = store
+        .get_multipart_part(multipart_upload_id("uid-a").as_str(), 1)
+        .unwrap();
     assert_eq!(part.generation, 0);
 }
 
@@ -3268,13 +3344,15 @@ fn mpu_upsert_rapid_generation_overwrites() {
     }
 
     // Only the last generation should be visible.
-    let part = store.get_multipart_part("uid-rapid", 1).unwrap();
+    let part = store
+        .get_multipart_part(multipart_upload_id("uid-rapid").as_str(), 1)
+        .unwrap();
     assert_eq!(part.generation, 9);
 
     // List should return exactly one part.
     let resp = store
         .list_multipart_parts(&ListPartsReq {
-            upload_id: "uid-rapid".into(),
+            upload_id: multipart_upload_id("uid-rapid"),
             part_number_marker: None,
             max_parts: 100,
         })
@@ -3302,13 +3380,21 @@ fn mpu_concurrent_upserts_different_parts() {
         .unwrap();
 
     // Both parts should be visible from either connection.
-    let p1 = store1.get_multipart_part("uid-conc", 1).unwrap();
-    let p2 = store1.get_multipart_part("uid-conc", 2).unwrap();
+    let p1 = store1
+        .get_multipart_part(multipart_upload_id("uid-conc").as_str(), 1)
+        .unwrap();
+    let p2 = store1
+        .get_multipart_part(multipart_upload_id("uid-conc").as_str(), 2)
+        .unwrap();
     assert_eq!(p1.part_number, 1);
     assert_eq!(p2.part_number, 2);
 
-    let p1b = store2.get_multipart_part("uid-conc", 1).unwrap();
-    let p2b = store2.get_multipart_part("uid-conc", 2).unwrap();
+    let p1b = store2
+        .get_multipart_part(multipart_upload_id("uid-conc").as_str(), 1)
+        .unwrap();
+    let p2b = store2
+        .get_multipart_part(multipart_upload_id("uid-conc").as_str(), 2)
+        .unwrap();
     assert_eq!(p1b.part_number, 1);
     assert_eq!(p2b.part_number, 2);
 }
@@ -3336,9 +3422,13 @@ fn mpu_concurrent_upserts_same_part() {
     assert_eq!(prev, Some(0), "store2 should see store1's generation 0");
 
     // The latest generation should be visible from both connections.
-    let p1 = store1.get_multipart_part("uid-race", 1).unwrap();
+    let p1 = store1
+        .get_multipart_part(multipart_upload_id("uid-race").as_str(), 1)
+        .unwrap();
     assert_eq!(p1.generation, 1);
-    let p2 = store2.get_multipart_part("uid-race", 1).unwrap();
+    let p2 = store2
+        .get_multipart_part(multipart_upload_id("uid-race").as_str(), 1)
+        .unwrap();
     assert_eq!(p2.generation, 1);
 }
 
@@ -3355,12 +3445,18 @@ fn mpu_concurrent_state_transition_one_wins() {
 
     // Store1 transitions to Completing.
     store1
-        .set_upload_state("uid-trans", UploadState::Completing)
+        .set_upload_state(
+            multipart_upload_id("uid-trans").as_str(),
+            UploadState::Completing,
+        )
         .unwrap();
 
     // Store2 tries to transition to Aborting — should fail (no longer InProgress).
     let err = store2
-        .set_upload_state("uid-trans", UploadState::Aborting)
+        .set_upload_state(
+            multipart_upload_id("uid-trans").as_str(),
+            UploadState::Aborting,
+        )
         .unwrap_err();
     assert!(
         matches!(
@@ -3442,7 +3538,9 @@ fn mpu_delete_upload_during_upsert_returns_no_such_upload() {
         .unwrap();
 
     // Delete the upload (cascades parts).
-    store.delete_multipart_upload("uid-del").unwrap();
+    store
+        .delete_multipart_upload(multipart_upload_id("uid-del").as_str())
+        .unwrap();
 
     // Upsert should now fail with NoSuchUpload (FK violation).
     let err = store
@@ -3454,7 +3552,9 @@ fn mpu_delete_upload_during_upsert_returns_no_such_upload() {
     );
 
     // Part from before delete should also be gone (CASCADE).
-    let err = store.get_multipart_part("uid-del", 1).unwrap_err();
+    let err = store
+        .get_multipart_part(multipart_upload_id("uid-del").as_str(), 1)
+        .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::PartNotFound { .. }),
         "expected PartNotFound after cascade delete, got: {err:?}"
@@ -3495,7 +3595,9 @@ fn mpu_upsert_commit_failure_via_deferred_fk() {
     store
         .upsert_multipart_part(&make_part("uid-after", 1, 0))
         .unwrap();
-    let part = store.get_multipart_part("uid-after", 1).unwrap();
+    let part = store
+        .get_multipart_part(multipart_upload_id("uid-after").as_str(), 1)
+        .unwrap();
     assert_eq!(part.generation, 0);
 }
 
@@ -3519,7 +3621,9 @@ fn mpu_upsert_commit_failure_preserves_prior_state() {
         .unwrap_err();
 
     // Prior data should be intact.
-    let part = store.get_multipart_part("uid-prior", 1).unwrap();
+    let part = store
+        .get_multipart_part(multipart_upload_id("uid-prior").as_str(), 1)
+        .unwrap();
     assert_eq!(part.generation, 0);
 }
 
@@ -3649,8 +3753,12 @@ fn mpu_threaded_upserts_different_parts() {
 
     // Both parts should exist.
     let verify = crate::PgStore::open(&pg_dir, 0).unwrap();
-    let p1 = verify.get_multipart_part("uid-mt", 1).unwrap();
-    let p2 = verify.get_multipart_part("uid-mt", 2).unwrap();
+    let p1 = verify
+        .get_multipart_part(multipart_upload_id("uid-mt").as_str(), 1)
+        .unwrap();
+    let p2 = verify
+        .get_multipart_part(multipart_upload_id("uid-mt").as_str(), 2)
+        .unwrap();
     assert_eq!(p1.part_number, 1);
     assert_eq!(p2.part_number, 2);
 }
@@ -3682,13 +3790,19 @@ fn mpu_threaded_state_transition_race() {
     let b1 = barrier.clone();
     let t1 = std::thread::spawn(move || {
         b1.wait();
-        store1.set_upload_state("uid-race-t", UploadState::Completing)
+        store1.set_upload_state(
+            multipart_upload_id("uid-race-t").as_str(),
+            UploadState::Completing,
+        )
     });
 
     let b2 = barrier.clone();
     let t2 = std::thread::spawn(move || {
         b2.wait();
-        store2.set_upload_state("uid-race-t", UploadState::Aborting)
+        store2.set_upload_state(
+            multipart_upload_id("uid-race-t").as_str(),
+            UploadState::Aborting,
+        )
     });
 
     let r1 = t1.join().unwrap();
@@ -3748,7 +3862,9 @@ fn mpu_threaded_upsert_same_part_stress() {
 
     // Exactly one part should exist with a generation from one of the threads.
     let verify = crate::PgStore::open(&pg_dir, 0).unwrap();
-    let part = verify.get_multipart_part("uid-stress", 1).unwrap();
+    let part = verify
+        .get_multipart_part(multipart_upload_id("uid-stress").as_str(), 1)
+        .unwrap();
     assert!(
         (part.generation as usize) < n_threads,
         "generation {} should be from one of the {} threads",
@@ -3758,7 +3874,7 @@ fn mpu_threaded_upsert_same_part_stress() {
 
     let resp = verify
         .list_multipart_parts(&ListPartsReq {
-            upload_id: "uid-stress".into(),
+            upload_id: multipart_upload_id("uid-stress"),
             part_number_marker: None,
             max_parts: 100,
         })
@@ -4652,7 +4768,7 @@ fn stream_upload_upload_part_kind() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-123".into(),
+                upload_id: multipart_upload_id("mpu-123"),
                 part_number: 3,
             },
             encryption: ObjectEncryption::None,
@@ -4663,7 +4779,7 @@ fn stream_upload_upload_part_kind() {
     assert_eq!(
         rec.target,
         StreamUploadTarget::UploadPart {
-            upload_id: "mpu-123".into(),
+            upload_id: multipart_upload_id("mpu-123"),
             part_number: 3
         }
     );
@@ -5377,16 +5493,16 @@ fn multipart_part_segments_crud() {
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
           segment_vid, shard_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', 'uid-1', 1, 1, 0, 4000000, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 4, 2)",
-        [],
+         VALUES ('bucket', 'k', ?1, 1, 1, 0, 4000000, X'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 10, 0, 4, 2)",
+        [multipart_upload_id("uid-1").into_string()],
     )
     .unwrap();
     conn.execute(
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
           segment_vid, shard_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', 'uid-1', 1, 1, 1, 2000000, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 4, 2)",
-        [],
+         VALUES ('bucket', 'k', ?1, 1, 1, 1, 2000000, X'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB', 10, 1, 4, 2)",
+        [multipart_upload_id("uid-1").into_string()],
     )
     .unwrap();
 
@@ -5430,7 +5546,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
 
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-1".into(),
+            upload_id: multipart_upload_id("mpu-1"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -5448,7 +5564,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
         .unwrap();
 
     let make_part = |generation, size| MultipartPartRecord {
-        upload_id: "mpu-1".into(),
+        upload_id: multipart_upload_id("mpu-1"),
         part_number: 1,
         generation,
         size,
@@ -5464,7 +5580,7 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
     let make_segment = |segment_index, size, fill| MultipartPartSegmentRecord {
         bucket: bucket_name("bucket"),
         key: object_key("k"),
-        upload_id: "mpu-1".into(),
+        upload_id: multipart_upload_id("mpu-1"),
         version_id: MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
         part_number: 1,
         segment_index,
@@ -5496,12 +5612,14 @@ fn upsert_multipart_part_segments_replaces_prior_segments() {
     assert_eq!(prev_segments[0].segment_okh, [0x11; 16]);
     assert_eq!(prev_segments[1].segment_okh, [0x22; 16]);
 
-    let part = store.get_multipart_part("mpu-1", 1).unwrap();
+    let part = store
+        .get_multipart_part(multipart_upload_id("mpu-1").as_str(), 1)
+        .unwrap();
     assert_eq!(part.generation, 1);
     assert_eq!(part.part_okh, [0u8; 16]);
 
     let segments = store
-        .get_all_multipart_part_segments_for_upload("mpu-1")
+        .get_all_multipart_part_segments_for_upload(multipart_upload_id("mpu-1").as_str())
         .unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].segment_crc64, Some(0x33));
@@ -5515,7 +5633,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
     // Create the multipart upload first
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-1".into(),
+            upload_id: multipart_upload_id("mpu-1"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -5533,7 +5651,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         .unwrap();
 
     let make_part = |size: u64| MultipartPartRecord {
-        upload_id: "mpu-1".into(),
+        upload_id: multipart_upload_id("mpu-1"),
         part_number: 1,
         generation: 0,
         size,
@@ -5554,7 +5672,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-1".into(),
+                upload_id: multipart_upload_id("mpu-1"),
                 part_number: 1,
             },
             encryption: ObjectEncryption::None,
@@ -5565,7 +5683,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
         .map(|i| MultipartPartSegmentRecord {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
-            upload_id: "mpu-1".into(),
+            upload_id: multipart_upload_id("mpu-1"),
             version_id: u64::MAX,
             part_number: 1,
             segment_index: i,
@@ -5604,7 +5722,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-1".into(),
+                upload_id: multipart_upload_id("mpu-1"),
                 part_number: 1,
             },
             encryption: ObjectEncryption::None,
@@ -5614,7 +5732,7 @@ fn commit_stream_part_replaces_prior_segments_on_reupload() {
     let segments_v2 = vec![MultipartPartSegmentRecord {
         bucket: bucket_name("bucket"),
         key: object_key("k"),
-        upload_id: "mpu-1".into(),
+        upload_id: multipart_upload_id("mpu-1"),
         version_id: u64::MAX,
         part_number: 1,
         segment_index: 0,
@@ -5664,7 +5782,7 @@ fn commit_stream_put_rejects_wrong_kind() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-x".into(),
+                upload_id: multipart_upload_id("mpu-x"),
                 part_number: 1,
             },
             encryption: ObjectEncryption::None,
@@ -5757,7 +5875,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
 
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-correct".into(),
+            upload_id: multipart_upload_id("mpu-correct"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -5780,7 +5898,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-correct".into(),
+                upload_id: multipart_upload_id("mpu-correct"),
                 part_number: 1,
             },
             encryption: ObjectEncryption::None,
@@ -5792,7 +5910,7 @@ fn commit_stream_part_rejects_wrong_upload_id() {
         .commit_stream_part(
             "sp-mismatch",
             &MultipartPartRecord {
-                upload_id: "mpu-WRONG".into(),
+                upload_id: multipart_upload_id("mpu-WRONG"),
                 part_number: 1,
                 generation: 0,
                 size: 100,
@@ -5823,7 +5941,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
 
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-zc".into(),
+            upload_id: multipart_upload_id("mpu-zc"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -5847,7 +5965,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-zc".into(),
+                upload_id: multipart_upload_id("mpu-zc"),
                 part_number: 1,
             },
             encryption: ObjectEncryption::None,
@@ -5857,7 +5975,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
         .commit_stream_part(
             "sp-zc1",
             &MultipartPartRecord {
-                upload_id: "mpu-zc".into(),
+                upload_id: multipart_upload_id("mpu-zc"),
                 part_number: 1,
                 generation: 0,
                 size: 2000,
@@ -5874,7 +5992,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                 MultipartPartSegmentRecord {
                     bucket: bucket_name("bucket"),
                     key: object_key("k"),
-                    upload_id: "mpu-zc".into(),
+                    upload_id: multipart_upload_id("mpu-zc"),
                     version_id: u64::MAX,
                     part_number: 1,
                     segment_index: 0,
@@ -5889,7 +6007,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
                 MultipartPartSegmentRecord {
                     bucket: bucket_name("bucket"),
                     key: object_key("k"),
-                    upload_id: "mpu-zc".into(),
+                    upload_id: multipart_upload_id("mpu-zc"),
                     version_id: u64::MAX,
                     part_number: 1,
                     segment_index: 1,
@@ -5925,7 +6043,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-zc".into(),
+                upload_id: multipart_upload_id("mpu-zc"),
                 part_number: 1,
             },
             encryption: ObjectEncryption::None,
@@ -5935,7 +6053,7 @@ fn commit_stream_part_zero_segments_clears_prior() {
         .commit_stream_part(
             "sp-zc2",
             &MultipartPartRecord {
-                upload_id: "mpu-zc".into(),
+                upload_id: multipart_upload_id("mpu-zc"),
                 part_number: 1,
                 generation: 0,
                 size: 0,
@@ -6326,7 +6444,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
 
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-cpc".into(),
+            upload_id: multipart_upload_id("mpu-cpc"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -6349,7 +6467,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-cpc".into(),
+                upload_id: multipart_upload_id("mpu-cpc"),
                 part_number: 1,
             },
             encryption: ObjectEncryption::None,
@@ -6361,7 +6479,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
         .commit_stream_part(
             "sp-cpc",
             &MultipartPartRecord {
-                upload_id: "mpu-cpc".into(),
+                upload_id: multipart_upload_id("mpu-cpc"),
                 part_number: 1,
                 generation: 0,
                 size: 100,
@@ -6377,7 +6495,7 @@ fn commit_stream_part_rejects_mismatched_segment_part_number() {
             &[MultipartPartSegmentRecord {
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
-                upload_id: "mpu-cpc".into(),
+                upload_id: multipart_upload_id("mpu-cpc"),
                 version_id: u64::MAX,
                 part_number: 99, // wrong!
                 segment_index: 0,
@@ -6406,7 +6524,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
 
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-vid".into(),
+            upload_id: multipart_upload_id("mpu-vid"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -6429,7 +6547,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-vid".into(),
+                upload_id: multipart_upload_id("mpu-vid"),
                 part_number: 1,
             },
             encryption: ObjectEncryption::None,
@@ -6441,7 +6559,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
         .commit_stream_part(
             "sp-vid",
             &MultipartPartRecord {
-                upload_id: "mpu-vid".into(),
+                upload_id: multipart_upload_id("mpu-vid"),
                 part_number: 1,
                 generation: 0,
                 size: 100,
@@ -6457,7 +6575,7 @@ fn commit_stream_part_rejects_non_staging_segment_version_id() {
             &[MultipartPartSegmentRecord {
                 bucket: bucket_name("bucket"),
                 key: object_key("k"),
-                upload_id: "mpu-vid".into(),
+                upload_id: multipart_upload_id("mpu-vid"),
                 version_id: 42, // wrong — must be u64::MAX (staging sentinel)
                 part_number: 1,
                 segment_index: 0,
@@ -6514,13 +6632,13 @@ fn malformed_multipart_segment_okh_returns_db_error() {
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, segment_okh, \
           segment_vid, shard_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', 'mpu-bad', 0, 1, 0, 100, X'AABB', 1, 0, 4, 2)",
-        [],
+         VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, X'AABB', 1, 0, 4, 2)",
+        [multipart_upload_id("mpu-bad").into_string()],
     )
     .unwrap();
 
     let err = store
-        .get_all_multipart_part_segments_for_upload("mpu-bad")
+        .get_all_multipart_part_segments_for_upload(multipart_upload_id("mpu-bad").as_str())
         .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::Db { .. }),
@@ -7598,7 +7716,7 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
 
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-seg".into(),
+            upload_id: multipart_upload_id("mpu-seg"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -7618,7 +7736,7 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
     // Upsert a part (needed before segments can be inserted).
     store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "mpu-seg".into(),
+            upload_id: multipart_upload_id("mpu-seg"),
             part_number: 1,
             generation: 0,
             size: 100,
@@ -7643,23 +7761,24 @@ fn delete_multipart_part_segments_by_upload_id_cleans_up() {
         "INSERT INTO multipart_part_segments \
          (bucket, key, upload_id, version_id, part_number, segment_index, size, \
           segment_okh, segment_vid, shard_pg_id, ec_k, ec_m) \
-         VALUES ('bucket', 'k', 'mpu-seg', 0, 1, 0, 100, X'00112233445566778899AABBCCDDEEFF', 1, 0, 4, 2)",
-        [],
-    ).unwrap();
+         VALUES ('bucket', 'k', ?1, 0, 1, 0, 100, X'00112233445566778899AABBCCDDEEFF', 1, 0, 4, 2)",
+        [multipart_upload_id("mpu-seg").into_string()],
+    )
+    .unwrap();
 
     // Verify segments exist
     let segs = store
-        .get_all_multipart_part_segments_for_upload("mpu-seg")
+        .get_all_multipart_part_segments_for_upload(multipart_upload_id("mpu-seg").as_str())
         .unwrap();
     assert_eq!(segs.len(), 1);
 
     // Delete segments by upload_id
     store
-        .delete_multipart_part_segments_by_upload_id("mpu-seg")
+        .delete_multipart_part_segments_by_upload_id(multipart_upload_id("mpu-seg").as_str())
         .unwrap();
 
     let segs = store
-        .get_all_multipart_part_segments_for_upload("mpu-seg")
+        .get_all_multipart_part_segments_for_upload(multipart_upload_id("mpu-seg").as_str())
         .unwrap();
     assert!(segs.is_empty());
 }
@@ -7669,7 +7788,7 @@ fn delete_multipart_part_segments_by_upload_id_noop_on_missing() {
     let (_dir, store) = make_pg_store();
     // Should not error on nonexistent upload_id
     store
-        .delete_multipart_part_segments_by_upload_id("nonexistent")
+        .delete_multipart_part_segments_by_upload_id(multipart_upload_id("nonexistent").as_str())
         .unwrap();
 }
 
@@ -7932,7 +8051,7 @@ fn complete_multipart_commit_no_such_upload() {
     }];
     // Should fail — upload "nonexistent" does not exist.
     let err = store
-        .complete_multipart_commit("nonexistent", 1, &obj, &parts)
+        .complete_multipart_commit(multipart_upload_id("nonexistent").as_str(), 1, &obj, &parts)
         .unwrap_err();
     assert!(
         matches!(
@@ -8196,7 +8315,7 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
 
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "upload-1".into(),
+            upload_id: multipart_upload_id("upload-1"),
             bucket: bucket_name("bucket"),
             key: object_key("key"),
             tags: None,
@@ -8212,7 +8331,9 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
         })
         .unwrap();
 
-    let upload = store.get_multipart_upload("upload-1").unwrap();
+    let upload = store
+        .get_multipart_upload(multipart_upload_id("upload-1").as_str())
+        .unwrap();
     assert_eq!(upload.object_lock, object_lock);
     let uploads = store
         .list_multipart_uploads(&ListMultipartUploadsReq {
@@ -8259,7 +8380,7 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
     }];
 
     store
-        .complete_multipart_commit("upload-1", 1, &obj, &parts)
+        .complete_multipart_commit(multipart_upload_id("upload-1").as_str(), 1, &obj, &parts)
         .unwrap();
 
     let committed = store

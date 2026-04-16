@@ -34,6 +34,7 @@ use storage::{
     ReclaimWorkItem, SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet,
     SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadRecord,
     StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
 };
 
 pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
@@ -58,6 +59,20 @@ fn trusted_bucket_name(name: impl Into<String>) -> BucketName {
 fn trusted_object_key(key: impl Into<String>) -> ObjectKey {
     ObjectKey::try_from(key.into())
         .expect("coordinator must only construct ObjectKey from validated values")
+}
+
+#[cfg(test)]
+fn trusted_upload_id(seed: &str) -> UploadId {
+    let mut bytes = [b'.'; UPLOAD_ID_LEN];
+    let mut encoded = String::with_capacity(seed.len() * 2);
+    for byte in seed.bytes() {
+        use std::fmt::Write;
+        write!(encoded, "{byte:02x}").unwrap();
+    }
+    let take = encoded.len().min(UPLOAD_ID_LEN);
+    bytes[..take].copy_from_slice(&encoded.as_bytes()[..take]);
+    UploadId::try_from(String::from_utf8(bytes.to_vec()).unwrap())
+        .expect("coordinator tests must use valid upload IDs")
 }
 
 fn parse_list_object_key(value: &str) -> Result<ObjectKey, ServerError> {
@@ -2853,7 +2868,7 @@ pub struct ListMultipartUploadsRequest<'a> {
     pub bucket: BucketRequest<'a>,
     pub prefix: Option<&'a str>,
     pub key_marker: Option<&'a str>,
-    pub upload_id_marker: Option<&'a str>,
+    pub upload_id_marker: Option<UploadId>,
     pub max_uploads: u32,
 }
 
@@ -4583,12 +4598,16 @@ impl ReadRuntime {
             Err(error) => return Err(ServerError::Metadata(error)),
         }
 
+        let upload_id = UploadId::try_from(upload_id).map_err(|_| ServerError::NoSuchUpload {
+            upload_id: upload_id.to_string(),
+        })?;
         let all_parts = meta_pg.list_multipart_parts(&ListPartsReq {
-            upload_id: UploadId::from(upload_id),
+            upload_id: upload_id.clone(),
             part_number_marker: None,
             max_parts: u32::MAX,
         })?;
-        let streaming_segments = meta_pg.get_all_multipart_part_segments_for_upload(upload_id)?;
+        let streaming_segments =
+            meta_pg.get_all_multipart_part_segments_for_upload(upload_id.as_str())?;
 
         drop(meta_pg);
 
@@ -4618,9 +4637,9 @@ impl ReadRuntime {
 
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
         if !streaming_segments.is_empty() {
-            meta_pg.delete_multipart_part_segments_by_upload_id(upload_id)?;
+            meta_pg.delete_multipart_part_segments_by_upload_id(upload_id.as_str())?;
         }
-        match meta_pg.delete_multipart_upload(upload_id) {
+        match meta_pg.delete_multipart_upload(upload_id.as_str()) {
             Ok(()) => Ok(true),
             Err(storage::MetadataError::NoSuchUpload { .. }) => Ok(false),
             Err(error) => Err(ServerError::Metadata(error)),
@@ -8687,7 +8706,11 @@ impl Coordinator {
             bucket: bucket.clone(),
             key: key.clone(),
             target: StreamUploadTarget::UploadPart {
-                upload_id: UploadId::from(upload_id),
+                upload_id: UploadId::try_from(upload_id).map_err(|_| {
+                    ServerError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    }
+                })?,
                 part_number,
             },
             encryption: upload.encryption.clone(),
@@ -9465,7 +9488,8 @@ impl Coordinator {
             .map(|segment| MultipartPartSegmentRecord {
                 bucket: upload.bucket.clone(),
                 key: upload.key.clone(),
-                upload_id: UploadId::from(upload_id),
+                upload_id: UploadId::try_from(upload_id)
+                    .expect("validated multipart upload lookup must yield a valid UploadId"),
                 version_id: u64::MAX, // staging sentinel — reparented at CompleteMultipartUpload time
                 part_number,
                 segment_index: segment.segment_index,
@@ -9485,7 +9509,8 @@ impl Coordinator {
             .as_millis() as u64;
 
         let part_record = MultipartPartRecord {
-            upload_id: UploadId::from(upload_id),
+            upload_id: UploadId::try_from(upload_id)
+                .expect("validated multipart upload lookup must yield a valid UploadId"),
             part_number,
             generation,
             size: total_size,
@@ -12483,24 +12508,25 @@ impl Coordinator {
         } = self.authorize_create_multipart_upload(req)?;
 
         let rng = ring::rand::SystemRandom::new();
-        let mut id_bytes = [0u8; 16];
+        let mut id_bytes = [0u8; UPLOAD_ID_LEN];
         ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
             ServerError::InternalError {
                 reason: "failed to generate upload ID".to_string(),
             }
         })?;
-        let upload_id = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
-            use std::fmt::Write;
-            write!(s, "{b:02x}").unwrap();
-            s
-        });
+        let upload_id: String = id_bytes
+            .iter()
+            .map(|byte| UPLOAD_ID_ALPHABET[(byte & 0x3f) as usize] as char)
+            .collect();
 
         let metadata_blob = req.metadata.serialize()?;
         let system_metadata_blob = req.system_metadata.serialize()?;
         let meta_pg_id = self.object_pg_id_for(&bucket, &key);
         let pg = self.storage_node.get_pg(meta_pg_id)?;
+        let typed_upload_id =
+            UploadId::try_from(upload_id.clone()).expect("generated multipart upload ID is valid");
         pg.create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: UploadId::from(upload_id.as_str()),
+            upload_id: typed_upload_id.clone(),
             bucket: bucket.clone(),
             key: key.clone(),
             tags: tags.as_deref().map(SerializedTagSet::from),
@@ -12514,7 +12540,7 @@ impl Coordinator {
             checksum,
             encryption: write_encryption.object_encryption(),
         })?;
-        let upload = pg.get_multipart_upload(&UploadId::from(upload_id.as_str()))?;
+        let upload = pg.get_multipart_upload(typed_upload_id.as_str())?;
         let initiated_at = upload.initiated_at;
         drop(pg);
         let lifecycle_abort =
@@ -13390,7 +13416,7 @@ impl Coordinator {
         );
         let prefix = req.prefix;
         let key_marker = req.key_marker;
-        let upload_id_marker = req.upload_id_marker;
+        let upload_id_marker = req.upload_id_marker.as_ref();
         let max_uploads = req.max_uploads;
         let AuthorizedListMultipartUploads { bucket } =
             self.authorize_list_multipart_uploads(req)?;
@@ -13416,7 +13442,7 @@ impl Coordinator {
                 bucket: bucket.clone(),
                 prefix: optional_list_object_key(prefix)?,
                 key_marker: optional_list_object_key(key_marker)?,
-                upload_id_marker: upload_id_marker.map(UploadId::from),
+                upload_id_marker: upload_id_marker.cloned(),
                 max_uploads: max_uploads.saturating_add(1),
             })?;
             all_uploads.extend(resp.uploads);
@@ -36969,9 +36995,11 @@ mod tests {
             })
             .unwrap();
 
-        // Upload ID should be 32 hex chars (16 random bytes).
-        assert_eq!(result.upload_id.len(), 32);
-        assert!(result.upload_id.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(result.upload_id.len(), UPLOAD_ID_LEN);
+        assert!(result
+            .upload_id
+            .bytes()
+            .all(|b| { b.is_ascii_alphanumeric() || b == b'.' || b == b'_' }));
     }
 
     #[test]
@@ -37859,7 +37887,12 @@ mod tests {
                 bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 key_marker: page1.next_key_marker.as_deref(),
-                upload_id_marker: page1.next_upload_id_marker.as_deref(),
+                upload_id_marker: page1
+                    .next_upload_id_marker
+                    .clone()
+                    .map(UploadId::try_from)
+                    .transpose()
+                    .unwrap(),
                 max_uploads: 2,
             })
             .unwrap();
@@ -38380,7 +38413,12 @@ mod tests {
                 bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
                 prefix: None,
                 key_marker: page1.next_key_marker.as_deref(),
-                upload_id_marker: page1.next_upload_id_marker.as_deref(),
+                upload_id_marker: page1
+                    .next_upload_id_marker
+                    .clone()
+                    .map(UploadId::try_from)
+                    .transpose()
+                    .unwrap(),
                 max_uploads: 2,
             })
             .unwrap();
@@ -38402,7 +38440,6 @@ mod tests {
     }
 
     // ── UploadPart tests ──────────────────────────────────────────────
-
     #[test]
     fn upload_part_first_upload() {
         let tmp = test_util::tempdir();
@@ -38748,7 +38785,8 @@ mod tests {
 
         let parts_resp = pg
             .list_multipart_parts(&storage::ListPartsReq {
-                upload_id: UploadId::from(create.upload_id.as_str()),
+                upload_id: UploadId::try_from(create.upload_id.as_str())
+                    .expect("generated multipart upload ID is valid"),
                 part_number_marker: None,
                 max_parts: 100,
             })
@@ -45301,7 +45339,7 @@ mod tests {
             bucket: trusted_bucket_name("bucket"),
             key: trusted_object_key("key"),
             target: StreamUploadTarget::UploadPart {
-                upload_id: UploadId::from("mpu-123"),
+                upload_id: trusted_upload_id("mpu-123"),
                 part_number: 1,
             },
             encryption: storage::ObjectEncryption::None,

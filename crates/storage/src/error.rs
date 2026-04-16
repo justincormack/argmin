@@ -63,16 +63,13 @@ pub enum MetadataError {
     },
 
     #[error("multipart upload not found: {upload_id}")]
-    NoSuchUpload { upload_id: crate::types::UploadId },
+    NoSuchUpload { upload_id: String },
 
     #[error("upload not in InProgress state (current: {state})")]
     UploadNotInProgress { state: u8 },
 
     #[error("multipart part not found: upload={upload_id} part={part_number}")]
-    PartNotFound {
-        upload_id: crate::types::UploadId,
-        part_number: u32,
-    },
+    PartNotFound { upload_id: String, part_number: u32 },
 
     #[error("stream session not found: {session_id}")]
     StreamSessionNotFound { session_id: crate::types::SessionId },

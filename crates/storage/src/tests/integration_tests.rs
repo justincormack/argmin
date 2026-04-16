@@ -1,4 +1,4 @@
-use super::{bucket_name, object_key};
+use super::{bucket_name, multipart_upload_id, object_key};
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::*;
 use std::num::NonZeroU64;
@@ -250,7 +250,7 @@ fn multipart_upload_lifecycle() {
     // Create multipart upload.
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-1".into(),
+            upload_id: multipart_upload_id("mpu-1"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -282,7 +282,7 @@ fn multipart_upload_lifecycle() {
     // Upsert parts.
     store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "mpu-1".into(),
+            upload_id: multipart_upload_id("mpu-1"),
             part_number: 1,
             generation: 0,
             size: part1_data.len() as u64,
@@ -298,7 +298,7 @@ fn multipart_upload_lifecycle() {
         .unwrap();
     store
         .upsert_multipart_part(&MultipartPartRecord {
-            upload_id: "mpu-1".into(),
+            upload_id: multipart_upload_id("mpu-1"),
             part_number: 2,
             generation: 0,
             size: part2_data.len() as u64,
@@ -316,7 +316,7 @@ fn multipart_upload_lifecycle() {
     // Verify parts are listed.
     let parts = store
         .list_multipart_parts(&ListPartsReq {
-            upload_id: "mpu-1".into(),
+            upload_id: multipart_upload_id("mpu-1"),
             part_number_marker: None,
             max_parts: 10,
         })
@@ -376,10 +376,18 @@ fn multipart_upload_lifecycle() {
     ];
 
     store
-        .set_upload_state("mpu-1", UploadState::Completing)
+        .set_upload_state(
+            multipart_upload_id("mpu-1").as_str(),
+            UploadState::Completing,
+        )
         .unwrap();
     store
-        .complete_multipart_commit("mpu-1", 1, &obj, &committed_parts)
+        .complete_multipart_commit(
+            multipart_upload_id("mpu-1").as_str(),
+            1,
+            &obj,
+            &committed_parts,
+        )
         .unwrap();
 
     // Read back the committed object.
@@ -563,7 +571,7 @@ fn streaming_upload_part_lifecycle() {
     // Create multipart upload first.
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-sp".into(),
+            upload_id: multipart_upload_id("mpu-sp"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -593,7 +601,7 @@ fn streaming_upload_part_lifecycle() {
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             target: StreamUploadTarget::UploadPart {
-                upload_id: "mpu-sp".into(),
+                upload_id: multipart_upload_id("mpu-sp"),
                 part_number: 1,
             },
             encryption: ObjectEncryption::None,
@@ -619,7 +627,7 @@ fn streaming_upload_part_lifecycle() {
     let part_segments = vec![MultipartPartSegmentRecord {
         bucket: bucket_name("bucket"),
         key: object_key("k"),
-        upload_id: "mpu-sp".into(),
+        upload_id: multipart_upload_id("mpu-sp"),
         version_id: MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
         part_number: 1,
         segment_index: 0,
@@ -636,7 +644,7 @@ fn streaming_upload_part_lifecycle() {
         .commit_stream_part(
             "ss-part",
             &MultipartPartRecord {
-                upload_id: "mpu-sp".into(),
+                upload_id: multipart_upload_id("mpu-sp"),
                 part_number: 1,
                 generation: 0,
                 size: seg_data.len() as u64,
@@ -665,12 +673,14 @@ fn streaming_upload_part_lifecycle() {
     ));
 
     // Part readable.
-    let part = store.get_multipart_part("mpu-sp", 1).unwrap();
+    let part = store
+        .get_multipart_part(multipart_upload_id("mpu-sp").as_str(), 1)
+        .unwrap();
     assert_eq!(part.size, seg_data.len() as u64);
 
     // Part segments readable.
     let segs = store
-        .get_all_multipart_part_segments_for_upload("mpu-sp")
+        .get_all_multipart_part_segments_for_upload(multipart_upload_id("mpu-sp").as_str())
         .unwrap();
     assert_eq!(segs.len(), 1);
     assert_eq!(segs[0].segment_okh, hash);
@@ -1018,7 +1028,7 @@ fn multipart_abort_cleanup() {
 
     store
         .create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: "mpu-abort".into(),
+            upload_id: multipart_upload_id("mpu-abort"),
             bucket: bucket_name("bucket"),
             key: object_key("k"),
             tags: None,
@@ -1042,7 +1052,7 @@ fn multipart_abort_cleanup() {
 
     // Upsert part with segments.
     let part = MultipartPartRecord {
-        upload_id: "mpu-abort".into(),
+        upload_id: multipart_upload_id("mpu-abort"),
         part_number: 1,
         generation: 0,
         size: 8,
@@ -1058,7 +1068,7 @@ fn multipart_abort_cleanup() {
     let segments = vec![MultipartPartSegmentRecord {
         bucket: bucket_name("bucket"),
         key: object_key("k"),
-        upload_id: "mpu-abort".into(),
+        upload_id: multipart_upload_id("mpu-abort"),
         version_id: MULTIPART_PART_SEGMENT_STAGING_VERSION_ID.to_u64(),
         part_number: 1,
         segment_index: 0,
@@ -1075,24 +1085,33 @@ fn multipart_abort_cleanup() {
         .unwrap();
 
     // Verify part and segments exist.
-    let p = store.get_multipart_part("mpu-abort", 1).unwrap();
+    let p = store
+        .get_multipart_part(multipart_upload_id("mpu-abort").as_str(), 1)
+        .unwrap();
     assert_eq!(p.size, 8);
     let segs = store
-        .get_all_multipart_part_segments_for_upload("mpu-abort")
+        .get_all_multipart_part_segments_for_upload(multipart_upload_id("mpu-abort").as_str())
         .unwrap();
     assert_eq!(segs.len(), 1);
 
     // Abort: clean up segments, then set state, then delete upload.
     store
-        .delete_multipart_part_segments_by_upload_id("mpu-abort")
+        .delete_multipart_part_segments_by_upload_id(multipart_upload_id("mpu-abort").as_str())
         .unwrap();
     store
-        .set_upload_state("mpu-abort", UploadState::Aborting)
+        .set_upload_state(
+            multipart_upload_id("mpu-abort").as_str(),
+            UploadState::Aborting,
+        )
         .unwrap();
-    store.delete_multipart_upload("mpu-abort").unwrap();
+    store
+        .delete_multipart_upload(multipart_upload_id("mpu-abort").as_str())
+        .unwrap();
 
     // Verify upload gone.
-    let err = store.get_multipart_upload("mpu-abort").unwrap_err();
+    let err = store
+        .get_multipart_upload(multipart_upload_id("mpu-abort").as_str())
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::NoSuchUpload { .. }
@@ -1100,7 +1119,7 @@ fn multipart_abort_cleanup() {
 
     // Segments gone.
     let segs = store
-        .get_all_multipart_part_segments_for_upload("mpu-abort")
+        .get_all_multipart_part_segments_for_upload(multipart_upload_id("mpu-abort").as_str())
         .unwrap();
     assert!(segs.is_empty());
 
@@ -1265,7 +1284,7 @@ fn persistence_complex_state_through_reopen() {
     let pg_dir = dir.path().join("pg-0000");
 
     let stream_session_id = "ss-persist";
-    let upload_id = "mpu-persist";
+    let upload_id = multipart_upload_id("mpu-persist");
 
     // Phase 1: create state, then drop the store.
     {
@@ -1300,7 +1319,7 @@ fn persistence_complex_state_through_reopen() {
         // Create a multipart upload with a part.
         store
             .create_multipart_upload(&CreateMultipartUploadReq {
-                upload_id: upload_id.into(),
+                upload_id: upload_id.clone(),
                 bucket: bucket_name("bucket"),
                 key: object_key("k2"),
                 tags: None,
@@ -1319,7 +1338,7 @@ fn persistence_complex_state_through_reopen() {
 
         store
             .upsert_multipart_part(&MultipartPartRecord {
-                upload_id: upload_id.into(),
+                upload_id: upload_id.clone(),
                 part_number: 1,
                 generation: 0,
                 size: 200,
@@ -1359,11 +1378,11 @@ fn persistence_complex_state_through_reopen() {
         assert_eq!(segs[0].segment_okh, [0xEE; 16]);
 
         // Multipart upload survives.
-        let upload = store.get_multipart_upload(upload_id).unwrap();
+        let upload = store.get_multipart_upload(upload_id.as_str()).unwrap();
         assert_eq!(upload.state, UploadState::InProgress);
 
         // Part survives.
-        let part = store.get_multipart_part(upload_id, 1).unwrap();
+        let part = store.get_multipart_part(upload_id.as_str(), 1).unwrap();
         assert_eq!(part.size, 200);
 
         // Shard survives.

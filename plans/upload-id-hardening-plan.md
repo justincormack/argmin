@@ -2,7 +2,7 @@
 
 ## Status
 
-Planned.
+In progress.
 
 This is the next identifier-boundary hardening target after the completed
 bucket/object name rewrite.
@@ -119,23 +119,35 @@ This plan needs to keep two questions separate:
 The intended rule is:
 
 1. generated/stored `UploadId` values should satisfy an explicit bounded type
-   invariant aligned with the same size range and character family as
-   AWS-issued upload IDs
+   invariant aligned with observed AWS-issued upload IDs
 2. production code should use typed `UploadId` internally instead of raw
    strings
 3. but HTTP behavior for present multipart query tokens must preserve current
    AWS-visible behavior unless AWS verification explicitly justifies a parser
    rejection
 
-So this plan should allow a split similar to the final copy-source design if
-needed:
+AWS verification since writing the initial draft clarified the split:
 
-1. low-level request parsing may preserve a raw present token temporarily
-2. a shared hardened boundary can then convert to typed `UploadId` while still
-   choosing the correct wire-visible error mapping
-3. "missing uploadId" and "present but unknown uploadId" must remain distinct
-4. "present but malformed uploadId" must not be changed to parser rejection
-   without explicit compatibility evidence
+1. AWS-issued multipart upload IDs observed in practice are `128` characters
+   long and use the character family `[A-Za-z0-9._]`
+2. `upload-id-marker` is validated by AWS as a real pagination cursor:
+   - a real issued marker is accepted
+   - truncating, appending, or mutating a real marker returns
+     `400 InvalidArgument` with `Invalid uploadId marker`
+3. main multipart operation `uploadId` parameters still appear to be closer to
+   opaque lookup tokens, where Argmin should preserve current `NoSuchUpload`
+   miss behavior unless separate AWS verification shows otherwise
+
+So the final design does need a split:
+
+1. generated/stored IDs follow the AWS-observed `128`-character `[A-Za-z0-9._]`
+   shape
+2. `upload-id-marker` should be validated at the HTTP boundary and rejected as
+   `InvalidArgument` when malformed
+3. main multipart operation `uploadId` values can remain raw at the outer HTTP
+   boundary for now if that is required to preserve `NoSuchUpload` semantics,
+   but the hardened conversion point must still be explicit and typed
+4. "missing uploadId" and "present but unknown uploadId" must remain distinct
 
 ## Work Plan
 
@@ -153,6 +165,26 @@ needed:
    current external wire behavior for present multipart query tokens, using
    the AWS-issued size range and character family as the target for generated
    IDs.
+
+Current state:
+
+1. Done: `UploadId` now uses fallible typed construction rather than the old
+   permissive string wrapper.
+2. Done: the internal invariant is now the AWS-observed generated shape:
+   exactly `128` characters from `[A-Za-z0-9._]`.
+3. Done: production code no longer gets infallible `From<&str>` / `From<String>`
+   or `Deref<str>` behavior for `UploadId`.
+4. Done: `FromSql` now revalidates stored values through the typed constructor.
+5. Done: Argmin-generated multipart upload IDs now use the same observed AWS
+   size and character family instead of the earlier `32`-char lowercase hex
+   shape.
+6. Done: the plan’s compatibility rule is now explicit:
+   - malformed `upload-id-marker` is an AWS-verified `InvalidArgument`
+     rejection
+   - main multipart operation `uploadId` behavior is still preserved as a
+     separate seam until independently verified
+
+Phase 1 is complete.
 
 Exit criteria:
 
@@ -179,6 +211,19 @@ Exit criteria:
    including `ListMultipartUploads` marker handling and response-side
    `next_upload_id_marker` shaping where those values are part of the external
    multipart boundary.
+
+Current state:
+
+1. Partial: `ListMultipartUploads` now validates `upload-id-marker` at the
+   HTTP boundary, passes typed `UploadId` markers through coordinator/storage,
+   and returns AWS-matching `InvalidArgument` for malformed markers.
+2. Remaining: the main multipart operation `uploadId` paths still enter as raw
+   query strings and rely on later typed conversion or `NoSuchUpload` mapping.
+3. Remaining: streaming multipart request state/bindings still need the same
+   end-to-end typed treatment.
+4. Remaining: once the main operation paths are typed, the response/request
+   multipart seams should be audited again for any leftover raw-string upload
+   identifier handling.
 
 Exit criteria:
 

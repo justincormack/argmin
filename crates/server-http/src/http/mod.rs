@@ -55,7 +55,7 @@ use server_core::sse::{
     SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
 };
 use server_core::system_metadata::SystemMetadata;
-use storage::{BucketName, ManagedEncryptionAlgorithm, ObjectKey};
+use storage::{BucketName, ManagedEncryptionAlgorithm, ObjectKey, UploadId};
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 
 const TRACE_TARGET: &str = "server_http";
@@ -114,6 +114,15 @@ fn parse_u32_or_default<S: AsRef<str>>(
     invalid_reason: &str,
 ) -> Result<u32, ServerError> {
     Ok(parse_optional_u32(raw, invalid_reason)?.unwrap_or(default))
+}
+
+fn parse_optional_upload_id_marker(raw: Option<&str>) -> Result<Option<UploadId>, ServerError> {
+    raw.map(|value| {
+        UploadId::try_from(value).map_err(|_| ServerError::InvalidArgument {
+            reason: "Invalid uploadId marker".to_string(),
+        })
+    })
+    .transpose()
 }
 
 fn canned_acl_and_header_grants_conflict() -> ServerError {
@@ -2486,6 +2495,8 @@ impl HttpFrontend {
                 let prefix = req.query_param_lossy("prefix");
                 let key_marker = req.query_param_lossy("key-marker");
                 let upload_id_marker = req.query_param_lossy("upload-id-marker");
+                let parsed_upload_id_marker =
+                    parse_optional_upload_id_marker(upload_id_marker.as_deref())?;
                 let encoding_type = req.query_param_lossy("encoding-type");
                 let max_uploads = parse_u32_or_default(
                     req.query_param_lossy("max-uploads"),
@@ -2498,7 +2509,7 @@ impl HttpFrontend {
                         bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
                         prefix: prefix.as_deref(),
                         key_marker: key_marker.as_deref(),
-                        upload_id_marker: upload_id_marker.as_deref(),
+                        upload_id_marker: parsed_upload_id_marker,
                         max_uploads,
                     },
                 )?;
@@ -8752,6 +8763,25 @@ mod tests {
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidArgument { .. }) => {}
+            Err(e) => panic!("expected InvalidArgument, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn list_multipart_uploads_invalid_upload_id_marker() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = make_req("uploads&upload-id-marker=bad");
+        let op = S3Operation::ListMultipartUploads {
+            bucket: test_bucket_name("mybucket"),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert_eq!(reason, "Invalid uploadId marker");
+            }
             Err(e) => panic!("expected InvalidArgument, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }

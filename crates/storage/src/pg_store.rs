@@ -4672,7 +4672,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or_else(|| MetadataError::NoSuchUpload {
-                upload_id: UploadId::from(upload_id),
+                upload_id: upload_id.to_string(),
             })
     }
 
@@ -4699,7 +4699,7 @@ impl PgMetadataStore for PgStore {
             return match current {
                 Some(state) => Err(MetadataError::UploadNotInProgress { state }),
                 None => Err(MetadataError::NoSuchUpload {
-                    upload_id: UploadId::from(upload_id),
+                    upload_id: upload_id.to_string(),
                 }),
             };
         }
@@ -4730,7 +4730,7 @@ impl PgMetadataStore for PgStore {
                 })?;
             return match current {
                 None => Err(MetadataError::NoSuchUpload {
-                    upload_id: UploadId::from(upload_id),
+                    upload_id: upload_id.to_string(),
                 }),
                 Some(s) => Err(MetadataError::UploadNotInProgress { state: s }),
             };
@@ -4751,7 +4751,7 @@ impl PgMetadataStore for PgStore {
             })?;
         if deleted == 0 {
             return Err(MetadataError::NoSuchUpload {
-                upload_id: UploadId::from(upload_id),
+                upload_id: upload_id.to_string(),
             });
         }
         Ok(())
@@ -4846,7 +4846,7 @@ impl PgMetadataStore for PgStore {
         }
 
         if let Some(ref key_marker) = req.key_marker {
-            if let Some(ref uid_marker) = req.upload_id_marker {
+            if let Some(uid_marker) = req.upload_id_marker.as_ref().map(UploadId::as_str) {
                 // Resume after (key_marker, initiated_at of marker, uid_marker).
                 // Use a subquery to resolve the marker's initiated_at so the
                 // cursor is consistent with the (key, initiated_at, upload_id)
@@ -4865,7 +4865,7 @@ impl PgMetadataStore for PgStore {
                     bkt = param_idx + 2
                 ));
                 params_vec.push(Box::new(key_marker.clone()));
-                params_vec.push(Box::new(uid_marker.clone()));
+                params_vec.push(Box::new(uid_marker.to_string()));
                 params_vec.push(Box::new(req.bucket.clone()));
                 param_idx += 3;
             } else {
@@ -5078,7 +5078,7 @@ impl PgMetadataStore for PgStore {
                 if let rusqlite::Error::SqliteFailure(ref err, _) = e {
                     if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation {
                         return Err(MetadataError::NoSuchUpload {
-                            upload_id: part.upload_id.clone(),
+                            upload_id: part.upload_id.to_string(),
                         });
                     }
                 }
@@ -5248,7 +5248,7 @@ impl PgMetadataStore for PgStore {
                 if let rusqlite::Error::SqliteFailure(ref err, _) = e {
                     if err.code == rusqlite::ffi::ErrorCode::ConstraintViolation {
                         return Err(MetadataError::NoSuchUpload {
-                            upload_id: part.upload_id.clone(),
+                            upload_id: part.upload_id.to_string(),
                         });
                     }
                 }
@@ -5279,7 +5279,7 @@ impl PgMetadataStore for PgStore {
                 source: e,
             })?
             .ok_or(MetadataError::PartNotFound {
-                upload_id: UploadId::from(upload_id),
+                upload_id: upload_id.to_string(),
                 part_number,
             })
     }
@@ -5300,7 +5300,7 @@ impl PgMetadataStore for PgStore {
             })?;
         if exists.is_none() {
             return Err(MetadataError::NoSuchUpload {
-                upload_id: req.upload_id.clone(),
+                upload_id: req.upload_id.to_string(),
             });
         }
 

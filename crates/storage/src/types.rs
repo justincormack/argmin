@@ -70,6 +70,18 @@ pub enum ObjectKeyError {
     ContainsNullByte,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum UploadIdError {
+    #[error("upload ID must be 128 characters, got {length}")]
+    InvalidLength { length: usize },
+    #[error("upload ID must contain only ASCII letters, digits, periods, and underscores")]
+    InvalidCharacterSet,
+}
+
+pub const UPLOAD_ID_LEN: usize = 128;
+pub const UPLOAD_ID_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._";
+
 fn validate_bucket_name(name: &str) -> Result<(), BucketNameError> {
     if name.len() < 3 || name.len() > 63 {
         return Err(BucketNameError::InvalidLength { length: name.len() });
@@ -124,6 +136,21 @@ fn validate_object_key(key: &str) -> Result<(), ObjectKeyError> {
     }
     if key.as_bytes().contains(&0) {
         return Err(ObjectKeyError::ContainsNullByte);
+    }
+    Ok(())
+}
+
+fn validate_upload_id(upload_id: &str) -> Result<(), UploadIdError> {
+    if upload_id.len() != UPLOAD_ID_LEN {
+        return Err(UploadIdError::InvalidLength {
+            length: upload_id.len(),
+        });
+    }
+    if !upload_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_')
+    {
+        return Err(UploadIdError::InvalidCharacterSet);
     }
     Ok(())
 }
@@ -417,9 +444,11 @@ pub fn object_key_common_prefix(
     )
 }
 
-string_newtype!(
+validated_string_newtype!(
     /// Multipart upload identifier.
-    UploadId
+    UploadId,
+    UploadIdError,
+    validate_upload_id
 );
 
 string_newtype!(
@@ -2759,12 +2788,12 @@ mod tests {
     fn string_newtype_debug_escapes_control_characters() {
         let bucket = BucketName::try_from("bucket-1").unwrap();
         let key = ObjectKey::try_from("obj\t\u{1b}[31m").unwrap();
-        let upload = UploadId::from("up\nload");
+        let upload = UploadId::try_from(format!("{}._", "A".repeat(126))).unwrap();
         let session = SessionId::from("sess\rion");
 
         assert_eq!(format!("{bucket:?}"), r#""bucket-1""#);
         assert_eq!(format!("{key:?}"), r#""obj\t\u{1b}[31m""#);
-        assert_eq!(format!("{upload:?}"), r#""up\nload""#);
+        assert_eq!(format!("{upload:?}"), format!(r#""{}._""#, "A".repeat(126)));
         assert_eq!(format!("{session:?}"), r#""sess\rion""#);
     }
 
@@ -2798,6 +2827,35 @@ mod tests {
             ObjectKey::try_from("x".repeat(1025)).unwrap_err(),
             ObjectKeyError::InvalidLength { length: 1025 }
         );
+    }
+
+    #[test]
+    fn upload_id_try_from_rejects_invalid_inputs() {
+        assert_eq!(
+            UploadId::try_from("x".repeat(127)).unwrap_err(),
+            UploadIdError::InvalidLength { length: 127 }
+        );
+        assert_eq!(
+            UploadId::try_from("x".repeat(129)).unwrap_err(),
+            UploadIdError::InvalidLength { length: 129 }
+        );
+        assert_eq!(
+            UploadId::try_from(format!("{}-", "x".repeat(127))).unwrap_err(),
+            UploadIdError::InvalidCharacterSet
+        );
+    }
+
+    #[test]
+    fn upload_id_try_from_accepts_aws_observed_shape() {
+        let upload_id = UploadId::try_from(format!(
+            "{}{}{}{}",
+            "A".repeat(32),
+            "a".repeat(32),
+            "0".repeat(32),
+            "._".repeat(16)
+        ))
+        .unwrap();
+        assert_eq!(upload_id.as_str().len(), UPLOAD_ID_LEN);
     }
 
     #[test]
