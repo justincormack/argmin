@@ -1,0 +1,262 @@
+# UploadId Hardening Plan
+
+## Status
+
+Planned.
+
+This is the next identifier-boundary hardening target after the completed
+bucket/object name rewrite.
+
+## Trigger
+
+`UploadId` still has the same broad "string wrapper" shape that bucket/object
+names had before the recent hardening work:
+
+1. [crates/storage/src/types.rs](/home/justin/src/github.com/justincormack/argmin/crates/storage/src/types.rs)
+   defines it through the permissive `string_newtype!` macro.
+2. `uploadId` values still enter through raw query parsing in
+   [crates/server-http/src/http/request.rs](/home/justin/src/github.com/justincormack/argmin/crates/server-http/src/http/request.rs).
+3. Multipart HTTP/coordinator/storage call paths still mostly pass `&str`
+   upload identifiers.
+4. Low-level multipart keying and hashing in
+   [crates/server-core/src/pg.rs](/home/justin/src/github.com/justincormack/argmin/crates/server-core/src/pg.rs)
+   still accept unchecked string upload IDs.
+
+This is lower risk than bucket/object names because `UploadId` is an opaque
+token rather than a namespace identifier, but it is still an externally
+supplied identifier that crosses real routing, storage, and hashing
+boundaries.
+
+## Decision
+
+Treat `UploadId` as a real validated domain type rather than an arbitrary
+string wrapper.
+
+The design target is:
+
+1. parse `uploadId` once at the HTTP boundary
+2. hold `UploadId` through coordinator/storage/hash paths
+3. remove implicit string behavior (`From<&str>`, `From<String>`,
+   `Deref<Target = str>`) from production use
+4. keep actual string boundaries explicit through `.as_str()`
+
+This should be a narrower follow-up than the bucket/object rewrite:
+
+1. `UploadId` remains an opaque token
+2. validation should be bounded and conservative rather than trying to model
+   a rich documented AWS identifier grammar we do not actually have
+3. `SessionId` can be cleaned up as a nearby internal follow-on, but it is not
+   the primary external hardening target
+
+One important compatibility constraint is different from bucket/object names:
+
+1. AWS-visible failure behavior for present-but-arbitrary `uploadId` values is
+   not yet pinned down by this plan
+2. current multipart behavior largely treats a present `uploadId` as an opaque
+   token and lets misses fall through to `NoSuchUpload`
+3. this plan should not assume that "weird but present" upload IDs become
+   parser-level `InvalidArgument` errors without explicit AWS verification
+
+## Why this work is needed
+
+The current shape keeps a footgun alive in the multipart path:
+
+1. the type name suggests structure, but the type does not currently enforce
+   any invariant
+2. raw query-derived upload IDs flow through request/coordinator/storage
+   boundaries as plain strings
+3. low-level multipart keying still accepts raw string upload IDs, so explicit
+   boundary enforcement is not visible in the type system
+4. the codebase now has a clearer "validated identifier types with explicit
+   string boundaries" direction for bucket/object names, and `UploadId` is the
+   next obvious inconsistency
+
+Even if AWS treats upload IDs as opaque, we should still avoid broad implicit
+string behavior and unbounded unchecked propagation for externally supplied
+multipart identifiers.
+
+## Goals
+
+1. Make `UploadId` an explicit bounded domain type.
+2. Parse `uploadId` once at the HTTP boundary and keep it typed through
+   multipart request handling.
+3. Remove implicit string conversions from `UploadId`.
+4. Move multipart storage/hash helpers to typed `UploadId` entry points.
+5. Add regression coverage for malformed or oversized `uploadId` values.
+
+## Non-goals
+
+1. Reworking the multipart feature set itself.
+2. Introducing a speculative AWS-specific upload-ID grammar beyond what is
+   needed for bounded safe handling.
+3. Folding `SessionId` hardening into the same patch set unless it materially
+   simplifies the `UploadId` rewrite.
+
+## Proposed validation model
+
+`UploadId` should remain opaque but no longer arbitrary.
+
+The target internal contract should be based on observed AWS-issued upload IDs:
+
+1. Argmin-generated `UploadId` values should use the same general size range
+   and character family as AWS-issued upload IDs.
+2. `UploadId` should still become a bounded typed token internally, with an
+   explicit invariant chosen to match that AWS-shaped generated form.
+3. The implementation should avoid inventing a stricter external grammar than
+   AWS actually exposes.
+
+The important part is that upload IDs become an auditable bounded type
+internally rather than a free-form string wrapper.
+
+## Failure model and compatibility rule
+
+This plan needs to keep two questions separate:
+
+1. what invariant the server stores and uses internally for `UploadId`
+2. what wire-visible behavior Argmin preserves for client-supplied present
+   `uploadId` tokens
+
+The intended rule is:
+
+1. generated/stored `UploadId` values should satisfy an explicit bounded type
+   invariant aligned with the same size range and character family as
+   AWS-issued upload IDs
+2. production code should use typed `UploadId` internally instead of raw
+   strings
+3. but HTTP behavior for present multipart query tokens must preserve current
+   AWS-visible behavior unless AWS verification explicitly justifies a parser
+   rejection
+
+So this plan should allow a split similar to the final copy-source design if
+needed:
+
+1. low-level request parsing may preserve a raw present token temporarily
+2. a shared hardened boundary can then convert to typed `UploadId` while still
+   choosing the correct wire-visible error mapping
+3. "missing uploadId" and "present but unknown uploadId" must remain distinct
+4. "present but malformed uploadId" must not be changed to parser rejection
+   without explicit compatibility evidence
+
+## Work Plan
+
+## Phase 1: Make UploadId a strict type
+
+1. Rework `UploadId` in
+   [crates/storage/src/types.rs](/home/justin/src/github.com/justincormack/argmin/crates/storage/src/types.rs)
+   to use fallible construction with a dedicated validation error.
+2. Remove infallible `From<&str>` / `From<String>` construction for untrusted
+   input.
+3. Remove `Deref<Target = str>` from `UploadId`.
+4. Decide and implement the persistence/load rule for `UploadId` `FromSql`
+   values.
+5. Make an explicit call on how internal `UploadId` invariants relate to
+   current external wire behavior for present multipart query tokens, using
+   the AWS-issued size range and character family as the target for generated
+   IDs.
+
+Exit criteria:
+
+1. `UploadId` cannot be built casually from arbitrary strings.
+2. Stored multipart rows have one explicit audited load rule.
+3. The plan records whether present arbitrary client tokens are still allowed
+   to fall through to `NoSuchUpload` on the wire.
+
+## Phase 2: Type the HTTP/coordinator multipart boundary
+
+1. Change shared HTTP multipart query parsing helpers so the hardened boundary
+   is explicit for:
+   - `uploadId`
+   - `upload-id-marker`
+2. If AWS-visible behavior requires it, allow the low-level parser to preserve
+   a raw present token long enough for a shared `server-http` helper to choose
+   the correct wire-visible mapping before converting to typed `UploadId`.
+3. Update buffered multipart request handling in
+   [crates/server-http/src/http/mod.rs](/home/justin/src/github.com/justincormack/argmin/crates/server-http/src/http/mod.rs)
+   to use typed upload IDs.
+4. Update streaming multipart request state/bindings to carry `UploadId`
+   instead of raw `String`.
+5. Push typed `UploadId` through coordinator request wrappers and helper APIs,
+   including `ListMultipartUploads` marker handling and response-side
+   `next_upload_id_marker` shaping where those values are part of the external
+   multipart boundary.
+
+Exit criteria:
+
+1. request paths do not carry raw multipart upload identifier tokens into
+   coordinator logic without an explicit hardened boundary
+2. multipart request state uses `UploadId` on both buffered and streaming
+   paths
+3. `upload-id-marker` / `next_upload_id_marker` are part of the same typed
+   boundary rather than a half-typed list path
+
+## Phase 3: Type the storage and hash boundary
+
+1. Convert multipart storage trait methods from `&str upload_id` to
+   `&UploadId` where they represent the external multipart identifier.
+2. Update low-level multipart key/hash helpers in
+   [crates/server-core/src/pg.rs](/home/justin/src/github.com/justincormack/argmin/crates/server-core/src/pg.rs)
+   to take `&UploadId`.
+3. Audit any remaining raw-string upload-id surfaces in production code and
+   either type them or make the raw boundary explicit and justified.
+
+Exit criteria:
+
+1. unchecked raw upload IDs no longer reach multipart storage/hash helpers on
+   the production path
+2. the main multipart routing/storage boundary is typed end to end
+
+## Phase 4: Coverage and closeout
+
+1. Add unit tests for `UploadId` construction and persistence loading.
+2. Add request-parser regressions for missing multipart query parameters and
+   for any malformed/oversized values that are intentionally rejected by the
+   final AWS-verified wire contract.
+3. Add targeted multipart request tests for both buffered and streaming paths,
+   plus `ListMultipartUploads` marker coverage (`upload-id-marker` and
+   `next_upload_id_marker`).
+4. Verify the observed AWS-issued size range and character family for upload
+   IDs, and separately verify AWS-visible behavior for present-but-arbitrary
+   `uploadId` and `upload-id-marker` values before introducing parser-level
+   invalid-ID failures.
+5. Extend parser fuzz coverage if needed so `uploadId` parsing and multipart
+   query boundaries are exercised under the new typed model.
+6. Decide whether to fold `SessionId` cleanup into this closeout or leave it as
+   a smaller internal follow-up.
+
+Exit criteria:
+
+1. the final AWS-visible multipart identifier failure model is explicit and
+   covered by tests
+2. the new `UploadId` boundary is exercised at type, parser, multipart
+   request, and list-marker levels
+
+## Review Checklist
+
+Each patch in this plan should be reviewed against:
+
+1. Does any externally supplied `uploadId` still cross a boundary as `String`
+   or `&str`?
+2. Is the internal validation contract explicit and bounded?
+3. Are HTTP error mappings preserved for missing vs present-but-invalid vs
+   unknown multipart query parameters, with AWS verification where behavior is
+   not already known?
+4. Do multipart storage/hash helpers now take `&UploadId` rather than raw
+   strings?
+5. Has implicit string behavior actually been removed, rather than just adding
+   another validator call upstream?
+
+## Success Criteria
+
+This work is done when all of the following are true:
+
+1. `UploadId` means "already validated and bounded" in production code.
+2. Raw multipart identifier tokens exist only at explicit HTTP/query mapping
+   boundaries.
+3. Multipart coordinator/storage/hash paths no longer rely on unchecked string
+   upload IDs.
+4. `upload-id-marker` / `next_upload_id_marker` follow the same explicit
+   boundary model as the main `uploadId` path.
+5. The wire-visible behavior for present multipart identifier tokens is
+   explicit and AWS-verified where needed.
+6. `SessionId` is either cleaned up at the same boundary or explicitly left as
+   a separate internal-only follow-up with documented reasoning.
