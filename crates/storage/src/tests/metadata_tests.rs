@@ -457,7 +457,7 @@ fn file_bucket_metadata_create_head_list_delete() {
 
     store
         .create_bucket(
-            "alpha",
+            &bucket_name("alpha"),
             "owner-1",
             &CanonicalUserId::from_principal("owner-1"),
             &AclGrants::default(),
@@ -467,7 +467,7 @@ fn file_bucket_metadata_create_head_list_delete() {
         .unwrap();
     store
         .create_bucket(
-            "beta",
+            &bucket_name("beta"),
             "owner-1",
             &CanonicalUserId::from_principal("owner-1"),
             &AclGrants::default(),
@@ -477,7 +477,7 @@ fn file_bucket_metadata_create_head_list_delete() {
         .unwrap();
     store
         .create_bucket(
-            "gamma",
+            &bucket_name("gamma"),
             "owner-2",
             &CanonicalUserId::from_principal("owner-2"),
             &AclGrants::default(),
@@ -488,7 +488,7 @@ fn file_bucket_metadata_create_head_list_delete() {
 
     let err = store
         .create_bucket(
-            "alpha",
+            &bucket_name("alpha"),
             "owner-1",
             &CanonicalUserId::from_principal("owner-1"),
             &AclGrants::default(),
@@ -501,7 +501,7 @@ fn file_bucket_metadata_create_head_list_delete() {
         crate::error::MetadataError::BucketAlreadyExists
     ));
 
-    let beta = store.head_bucket("beta").unwrap();
+    let beta = store.head_bucket(&bucket_name("beta")).unwrap();
     assert_eq!(beta.name, "beta");
     assert_eq!(beta.owner_principal, "owner-1");
     assert_eq!(
@@ -517,8 +517,8 @@ fn file_bucket_metadata_create_head_list_delete() {
     assert_eq!(owner1[0].name, "alpha");
     assert_eq!(owner1[1].name, "beta");
 
-    store.delete_bucket("alpha").unwrap();
-    let err = store.head_bucket("alpha").unwrap_err();
+    store.delete_bucket(&bucket_name("alpha")).unwrap();
+    let err = store.head_bucket(&bucket_name("alpha")).unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }
@@ -528,7 +528,9 @@ fn file_bucket_metadata_create_head_list_delete() {
 #[test]
 fn file_bucket_metadata_delete_nonexistent() {
     let (_dir, store) = make_pg_store();
-    let err = store.delete_bucket("no-such-bucket").unwrap_err();
+    let err = store
+        .delete_bucket(&bucket_name("no-such-bucket"))
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }
@@ -540,7 +542,7 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -607,7 +609,7 @@ fn delete_bucket_clears_completed_multipart_upload_records() {
         .unwrap()
         .is_some());
 
-    store.delete_bucket("bucket").unwrap();
+    store.delete_bucket(&bucket_name("bucket")).unwrap();
 
     assert!(store
         .get_completed_multipart_upload("completed-upload")
@@ -620,7 +622,7 @@ fn file_bucket_metadata_versioning_transitions() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -630,17 +632,17 @@ fn file_bucket_metadata_versioning_transitions() {
         .unwrap();
 
     store
-        .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
+        .put_bucket_versioning(&bucket_name("bucket"), BucketVersioningState::Enabled)
         .unwrap();
     store
-        .put_bucket_versioning("bucket", BucketVersioningState::Suspended)
+        .put_bucket_versioning(&bucket_name("bucket"), BucketVersioningState::Suspended)
         .unwrap();
     store
-        .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
+        .put_bucket_versioning(&bucket_name("bucket"), BucketVersioningState::Enabled)
         .unwrap();
 
     let err = store
-        .put_bucket_versioning("bucket", BucketVersioningState::Disabled)
+        .put_bucket_versioning(&bucket_name("bucket"), BucketVersioningState::Disabled)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -653,7 +655,7 @@ fn file_bucket_metadata_versioning_disabled_noop() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -662,10 +664,13 @@ fn file_bucket_metadata_versioning_disabled_noop() {
         )
         .unwrap();
     store
-        .put_bucket_versioning("bucket", BucketVersioningState::Disabled)
+        .put_bucket_versioning(&bucket_name("bucket"), BucketVersioningState::Disabled)
         .unwrap();
     assert_eq!(
-        store.head_bucket("bucket").unwrap().versioning,
+        store
+            .head_bucket(&bucket_name("bucket"))
+            .unwrap()
+            .versioning,
         BucketVersioningState::Disabled
     );
 }
@@ -675,7 +680,7 @@ fn file_bucket_metadata_config_roundtrip() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -692,7 +697,7 @@ fn file_bucket_metadata_config_roundtrip() {
         };
         store
             .put_bucket_subresource(
-                "bucket",
+                &bucket_name("bucket"),
                 PutBucketSubresource {
                     kind,
                     body,
@@ -702,31 +707,47 @@ fn file_bucket_metadata_config_roundtrip() {
             .unwrap();
         assert_eq!(
             store
-                .get_bucket_subresource("bucket", kind)
+                .get_bucket_subresource(&bucket_name("bucket"), kind)
                 .unwrap()
                 .map(|stored| stored.body),
             Some(body.to_string())
         );
-        store.delete_bucket_subresource("bucket", kind).unwrap();
-        assert_eq!(store.get_bucket_subresource("bucket", kind).unwrap(), None);
+        store
+            .delete_bucket_subresource(&bucket_name("bucket"), kind)
+            .unwrap();
+        assert_eq!(
+            store
+                .get_bucket_subresource(&bucket_name("bucket"), kind)
+                .unwrap(),
+            None
+        );
     }
 
     let ownership_controls = BucketOwnershipControls {
         object_ownership: BucketObjectOwnership::BucketOwnerPreferred,
     };
     store
-        .put_bucket_ownership_controls("bucket", ownership_controls)
+        .put_bucket_ownership_controls(&bucket_name("bucket"), ownership_controls)
         .unwrap();
     assert_eq!(
-        store.get_bucket_ownership_controls("bucket").unwrap(),
+        store
+            .get_bucket_ownership_controls(&bucket_name("bucket"))
+            .unwrap(),
         Some(ownership_controls)
     );
-    store.delete_bucket_ownership_controls("bucket").unwrap();
-    assert_eq!(store.get_bucket_ownership_controls("bucket").unwrap(), None);
+    store
+        .delete_bucket_ownership_controls(&bucket_name("bucket"))
+        .unwrap();
+    assert_eq!(
+        store
+            .get_bucket_ownership_controls(&bucket_name("bucket"))
+            .unwrap(),
+        None
+    );
 
     store
         .put_bucket_subresource(
-            "bucket",
+            &bucket_name("bucket"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Policy,
                 body: "{\"Version\":\"2012-10-17\"}",
@@ -736,34 +757,54 @@ fn file_bucket_metadata_config_roundtrip() {
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Policy)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Policy)
             .unwrap()
             .map(|stored| stored.body),
         Some("{\"Version\":\"2012-10-17\"}".to_string())
     );
-    assert!(store.head_bucket("bucket").unwrap().bucket_policy_present);
-    assert!(store.head_bucket("bucket").unwrap().bucket_policy_public);
+    assert!(
+        store
+            .head_bucket(&bucket_name("bucket"))
+            .unwrap()
+            .bucket_policy_present
+    );
+    assert!(
+        store
+            .head_bucket(&bucket_name("bucket"))
+            .unwrap()
+            .bucket_policy_public
+    );
     assert_eq!(
         store
-            .head_bucket("bucket")
+            .head_bucket(&bucket_name("bucket"))
             .unwrap()
             .bucket_policy_generation,
         1
     );
     store
-        .delete_bucket_subresource("bucket", BucketSubresourceKind::Policy)
+        .delete_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Policy)
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Policy)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Policy)
             .unwrap(),
         None
     );
-    assert!(!store.head_bucket("bucket").unwrap().bucket_policy_present);
-    assert!(!store.head_bucket("bucket").unwrap().bucket_policy_public);
+    assert!(
+        !store
+            .head_bucket(&bucket_name("bucket"))
+            .unwrap()
+            .bucket_policy_present
+    );
+    assert!(
+        !store
+            .head_bucket(&bucket_name("bucket"))
+            .unwrap()
+            .bucket_policy_public
+    );
     assert_eq!(
         store
-            .head_bucket("bucket")
+            .head_bucket(&bucket_name("bucket"))
             .unwrap()
             .bucket_policy_generation,
         2
@@ -771,7 +812,7 @@ fn file_bucket_metadata_config_roundtrip() {
 
     store
         .put_bucket_subresource(
-            "bucket",
+            &bucket_name("bucket"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Lifecycle,
                 body: "<LifecycleConfiguration/>",
@@ -781,27 +822,27 @@ fn file_bucket_metadata_config_roundtrip() {
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Lifecycle)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Lifecycle)
             .unwrap()
             .map(|stored| stored.body),
         Some("<LifecycleConfiguration/>".to_string())
     );
     assert!(
         store
-            .head_bucket("bucket")
+            .head_bucket(&bucket_name("bucket"))
             .unwrap()
             .bucket_lifecycle_present
     );
     assert_eq!(
         store
-            .head_bucket("bucket")
+            .head_bucket(&bucket_name("bucket"))
             .unwrap()
             .bucket_lifecycle_generation,
         1
     );
     store
         .put_bucket_subresource(
-            "bucket",
+            &bucket_name("bucket"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Lifecycle,
                 body: "<LifecycleConfiguration><Rule/></LifecycleConfiguration>",
@@ -811,36 +852,36 @@ fn file_bucket_metadata_config_roundtrip() {
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Lifecycle)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Lifecycle)
             .unwrap()
             .map(|stored| stored.body),
         Some("<LifecycleConfiguration><Rule/></LifecycleConfiguration>".to_string())
     );
     assert_eq!(
         store
-            .head_bucket("bucket")
+            .head_bucket(&bucket_name("bucket"))
             .unwrap()
             .bucket_lifecycle_generation,
         2
     );
     store
-        .delete_bucket_subresource("bucket", BucketSubresourceKind::Lifecycle)
+        .delete_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Lifecycle)
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Lifecycle)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Lifecycle)
             .unwrap(),
         None
     );
     assert!(
         !store
-            .head_bucket("bucket")
+            .head_bucket(&bucket_name("bucket"))
             .unwrap()
             .bucket_lifecycle_present
     );
     assert_eq!(
         store
-            .head_bucket("bucket")
+            .head_bucket(&bucket_name("bucket"))
             .unwrap()
             .bucket_lifecycle_generation,
         3
@@ -850,13 +891,13 @@ fn file_bucket_metadata_config_roundtrip() {
     assert!(lifecycle_buckets.is_empty());
 
     assert_eq!(
-        store.get_bucket_encryption("bucket").unwrap(),
+        store.get_bucket_encryption(&bucket_name("bucket")).unwrap(),
         BucketEncryptionConfig::default()
     );
 
     store
         .put_bucket_encryption(
-            "bucket",
+            &bucket_name("bucket"),
             BucketEncryptionConfig {
                 default_encryption: None,
                 sse_c_blocked: true,
@@ -864,7 +905,7 @@ fn file_bucket_metadata_config_roundtrip() {
         )
         .unwrap();
     assert_eq!(
-        store.get_bucket_encryption("bucket").unwrap(),
+        store.get_bucket_encryption(&bucket_name("bucket")).unwrap(),
         BucketEncryptionConfig {
             default_encryption: None,
             sse_c_blocked: true,
@@ -872,27 +913,37 @@ fn file_bucket_metadata_config_roundtrip() {
     );
     assert!(
         store
-            .head_bucket("bucket")
+            .head_bucket(&bucket_name("bucket"))
             .unwrap()
             .encryption
             .sse_c_blocked
     );
     store
-        .put_bucket_encryption("bucket", BucketEncryptionConfig::default())
+        .put_bucket_encryption(&bucket_name("bucket"), BucketEncryptionConfig::default())
         .unwrap();
     assert_eq!(
-        store.get_bucket_encryption("bucket").unwrap(),
+        store.get_bucket_encryption(&bucket_name("bucket")).unwrap(),
         BucketEncryptionConfig::default()
     );
 
     store
-        .put_bucket_acl("bucket", &AclGrants::default(), true, false)
+        .put_bucket_acl(&bucket_name("bucket"), &AclGrants::default(), true, false)
         .unwrap();
-    assert!(store.head_bucket("bucket").unwrap().public_read);
+    assert!(
+        store
+            .head_bucket(&bucket_name("bucket"))
+            .unwrap()
+            .public_read
+    );
     store
-        .put_bucket_acl("bucket", &AclGrants::default(), false, false)
+        .put_bucket_acl(&bucket_name("bucket"), &AclGrants::default(), false, false)
         .unwrap();
-    assert!(!store.head_bucket("bucket").unwrap().public_read);
+    assert!(
+        !store
+            .head_bucket(&bucket_name("bucket"))
+            .unwrap()
+            .public_read
+    );
 }
 
 #[test]
@@ -900,7 +951,7 @@ fn file_bucket_subresource_roundtrip() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -911,7 +962,7 @@ fn file_bucket_subresource_roundtrip() {
 
     store
         .put_bucket_subresource(
-            "bucket",
+            &bucket_name("bucket"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Cors,
                 body: "<Cors/>",
@@ -921,7 +972,7 @@ fn file_bucket_subresource_roundtrip() {
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Cors)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Cors)
             .unwrap(),
         Some(StoredBucketSubresource {
             body: "<Cors/>".to_string(),
@@ -930,18 +981,18 @@ fn file_bucket_subresource_roundtrip() {
         })
     );
     store
-        .delete_bucket_subresource("bucket", BucketSubresourceKind::Cors)
+        .delete_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Cors)
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Cors)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Cors)
             .unwrap(),
         None
     );
 
     store
         .put_bucket_subresource(
-            "bucket",
+            &bucket_name("bucket"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Tagging,
                 body: "<Tagging/>",
@@ -951,7 +1002,7 @@ fn file_bucket_subresource_roundtrip() {
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Tagging)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Tagging)
             .unwrap(),
         Some(StoredBucketSubresource {
             body: "<Tagging/>".to_string(),
@@ -964,10 +1015,12 @@ fn file_bucket_subresource_roundtrip() {
         object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
     };
     store
-        .put_bucket_ownership_controls("bucket", ownership_controls)
+        .put_bucket_ownership_controls(&bucket_name("bucket"), ownership_controls)
         .unwrap();
     assert_eq!(
-        store.get_bucket_ownership_controls("bucket").unwrap(),
+        store
+            .get_bucket_ownership_controls(&bucket_name("bucket"))
+            .unwrap(),
         Some(ownership_controls)
     );
 
@@ -978,21 +1031,27 @@ fn file_bucket_subresource_roundtrip() {
         restrict_public_buckets: false,
     };
     store
-        .put_bucket_public_access_block("bucket", public_access_block)
+        .put_bucket_public_access_block(&bucket_name("bucket"), public_access_block)
         .unwrap();
     assert_eq!(
-        store.get_bucket_public_access_block("bucket").unwrap(),
+        store
+            .get_bucket_public_access_block(&bucket_name("bucket"))
+            .unwrap(),
         Some(public_access_block)
     );
-    store.delete_bucket_public_access_block("bucket").unwrap();
+    store
+        .delete_bucket_public_access_block(&bucket_name("bucket"))
+        .unwrap();
     assert_eq!(
-        store.get_bucket_public_access_block("bucket").unwrap(),
+        store
+            .get_bucket_public_access_block(&bucket_name("bucket"))
+            .unwrap(),
         None
     );
 
     store
         .put_bucket_subresource(
-            "bucket",
+            &bucket_name("bucket"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Policy,
                 body: "{\"Version\":\"2012-10-17\"}",
@@ -1002,7 +1061,7 @@ fn file_bucket_subresource_roundtrip() {
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Policy)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Policy)
             .unwrap(),
         Some(StoredBucketSubresource {
             body: "{\"Version\":\"2012-10-17\"}".to_string(),
@@ -1013,7 +1072,7 @@ fn file_bucket_subresource_roundtrip() {
 
     store
         .put_bucket_subresource(
-            "bucket",
+            &bucket_name("bucket"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Lifecycle,
                 body: "<LifecycleConfiguration/>",
@@ -1023,7 +1082,7 @@ fn file_bucket_subresource_roundtrip() {
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Lifecycle)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Lifecycle)
             .unwrap(),
         Some(StoredBucketSubresource {
             body: "<LifecycleConfiguration/>".to_string(),
@@ -1032,17 +1091,17 @@ fn file_bucket_subresource_roundtrip() {
         })
     );
     store
-        .delete_bucket_subresource("bucket", BucketSubresourceKind::Lifecycle)
+        .delete_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Lifecycle)
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Lifecycle)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Lifecycle)
             .unwrap(),
         None
     );
     assert_eq!(
         store
-            .head_bucket("bucket")
+            .head_bucket(&bucket_name("bucket"))
             .unwrap()
             .bucket_lifecycle_generation,
         2
@@ -1054,7 +1113,7 @@ fn file_bucket_subresource_rejects_aux_kind_mismatch() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -1065,7 +1124,7 @@ fn file_bucket_subresource_rejects_aux_kind_mismatch() {
 
     let err = store
         .put_bucket_subresource(
-            "bucket",
+            &bucket_name("bucket"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Cors,
                 body: "<Cors/>",
@@ -1077,7 +1136,7 @@ fn file_bucket_subresource_rejects_aux_kind_mismatch() {
 
     let err = store
         .put_bucket_subresource(
-            "bucket",
+            &bucket_name("bucket"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Policy,
                 body: "{\"Version\":\"2012-10-17\"}",
@@ -1093,7 +1152,7 @@ fn file_bucket_subresource_generations_bump_across_overwrite_and_delete() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -1104,7 +1163,7 @@ fn file_bucket_subresource_generations_bump_across_overwrite_and_delete() {
 
     store
         .put_bucket_subresource(
-            "bucket",
+            &bucket_name("bucket"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Cors,
                 body: "<Cors/>",
@@ -1114,7 +1173,7 @@ fn file_bucket_subresource_generations_bump_across_overwrite_and_delete() {
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Cors)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Cors)
             .unwrap()
             .unwrap()
             .generation,
@@ -1123,7 +1182,7 @@ fn file_bucket_subresource_generations_bump_across_overwrite_and_delete() {
 
     store
         .put_bucket_subresource(
-            "bucket",
+            &bucket_name("bucket"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Cors,
                 body: "<Cors><Rule/></Cors>",
@@ -1133,7 +1192,7 @@ fn file_bucket_subresource_generations_bump_across_overwrite_and_delete() {
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Cors)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Cors)
             .unwrap()
             .unwrap(),
         StoredBucketSubresource {
@@ -1144,18 +1203,18 @@ fn file_bucket_subresource_generations_bump_across_overwrite_and_delete() {
     );
 
     store
-        .delete_bucket_subresource("bucket", BucketSubresourceKind::Cors)
+        .delete_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Cors)
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Cors)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Cors)
             .unwrap(),
         None
     );
 
     store
         .put_bucket_subresource(
-            "bucket",
+            &bucket_name("bucket"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Cors,
                 body: "<Cors><Rule>again</Rule></Cors>",
@@ -1165,7 +1224,7 @@ fn file_bucket_subresource_generations_bump_across_overwrite_and_delete() {
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Cors)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Cors)
             .unwrap()
             .unwrap(),
         StoredBucketSubresource {
@@ -1181,7 +1240,7 @@ fn delete_bucket_cascades_bucket_subresources() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -1191,7 +1250,7 @@ fn delete_bucket_cascades_bucket_subresources() {
         .unwrap();
     store
         .put_bucket_subresource(
-            "bucket",
+            &bucket_name("bucket"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Policy,
                 body: "{\"Version\":\"2012-10-17\"}",
@@ -1200,15 +1259,15 @@ fn delete_bucket_cascades_bucket_subresources() {
         )
         .unwrap();
     assert!(store
-        .get_bucket_subresource("bucket", BucketSubresourceKind::Policy)
+        .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Policy)
         .unwrap()
         .is_some());
 
-    store.delete_bucket("bucket").unwrap();
+    store.delete_bucket(&bucket_name("bucket")).unwrap();
 
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -1218,7 +1277,7 @@ fn delete_bucket_cascades_bucket_subresources() {
         .unwrap();
     assert_eq!(
         store
-            .get_bucket_subresource("bucket", BucketSubresourceKind::Policy)
+            .get_bucket_subresource(&bucket_name("bucket"), BucketSubresourceKind::Policy)
             .unwrap(),
         None
     );
@@ -1230,7 +1289,7 @@ fn list_buckets_with_lifecycle_returns_only_active_lifecycle_buckets() {
     for bucket in ["alpha", "beta", "gamma"] {
         store
             .create_bucket(
-                bucket,
+                &bucket_name(bucket),
                 "owner",
                 &CanonicalUserId::from_principal("owner"),
                 &AclGrants::default(),
@@ -1249,7 +1308,7 @@ fn list_buckets_with_lifecycle_returns_only_active_lifecycle_buckets() {
     ] {
         store
             .put_bucket_subresource(
-                bucket,
+                &bucket_name(bucket),
                 PutBucketSubresource {
                     kind: BucketSubresourceKind::Lifecycle,
                     body,
@@ -1258,8 +1317,10 @@ fn list_buckets_with_lifecycle_returns_only_active_lifecycle_buckets() {
             )
             .unwrap();
     }
-    store.begin_bucket_write_drain("beta").unwrap();
-    store.mark_bucket_deleting("beta").unwrap();
+    store
+        .begin_bucket_write_drain(&bucket_name("beta"))
+        .unwrap();
+    store.mark_bucket_deleting(&bucket_name("beta")).unwrap();
 
     let buckets = store.list_buckets_with_lifecycle().unwrap();
     let names: Vec<String> = buckets
@@ -1275,7 +1336,7 @@ fn list_buckets_with_aborting_multipart_uploads_returns_distinct_bucket_names() 
     for bucket in ["alpha", "beta"] {
         store
             .create_bucket(
-                bucket,
+                &bucket_name(bucket),
                 "owner",
                 &CanonicalUserId::from_principal("owner"),
                 &AclGrants::default(),
@@ -1330,7 +1391,7 @@ fn file_bucket_subresource_operations_on_nonexistent_bucket() {
 
     let err = store
         .put_bucket_subresource(
-            "nope",
+            &bucket_name("nope"),
             PutBucketSubresource {
                 kind: BucketSubresourceKind::Cors,
                 body: "<Cors/>",
@@ -1344,7 +1405,7 @@ fn file_bucket_subresource_operations_on_nonexistent_bucket() {
     ));
 
     let err = store
-        .get_bucket_subresource("nope", BucketSubresourceKind::Tagging)
+        .get_bucket_subresource(&bucket_name("nope"), BucketSubresourceKind::Tagging)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -1352,7 +1413,7 @@ fn file_bucket_subresource_operations_on_nonexistent_bucket() {
     ));
 
     let err = store
-        .get_bucket_subresource("nope", BucketSubresourceKind::Policy)
+        .get_bucket_subresource(&bucket_name("nope"), BucketSubresourceKind::Policy)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -1360,7 +1421,7 @@ fn file_bucket_subresource_operations_on_nonexistent_bucket() {
     ));
 
     let err = store
-        .delete_bucket_subresource("nope", BucketSubresourceKind::Lifecycle)
+        .delete_bucket_subresource(&bucket_name("nope"), BucketSubresourceKind::Lifecycle)
         .unwrap_err();
     assert!(matches!(
         err,
@@ -1369,7 +1430,7 @@ fn file_bucket_subresource_operations_on_nonexistent_bucket() {
 
     let err = store
         .put_bucket_encryption(
-            "nope",
+            &bucket_name("nope"),
             BucketEncryptionConfig {
                 default_encryption: None,
                 sse_c_blocked: true,
@@ -1381,7 +1442,9 @@ fn file_bucket_subresource_operations_on_nonexistent_bucket() {
         crate::error::MetadataError::BucketNotFound { .. }
     ));
 
-    let err = store.delete_bucket_public_access_block("nope").unwrap_err();
+    let err = store
+        .delete_bucket_public_access_block(&bucket_name("nope"))
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }
@@ -1414,7 +1477,9 @@ fn file_metadata_object_has_inline_legacy_layout() {
         }))
         .unwrap();
 
-    let obj = store.get_object_meta("bucket", "k").unwrap();
+    let obj = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     let live = obj.as_live().unwrap();
     assert_eq!(live.layout, ObjectLayout::Standard);
     assert_eq!(live.metadata_blob, None);
@@ -1460,7 +1525,9 @@ fn file_metadata_invalid_data_layout_returns_error() {
     );
 
     // Record remains readable and unchanged.
-    let obj = store.get_object_meta("bucket", "k").unwrap();
+    let obj = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     assert_eq!(obj.as_live().unwrap().layout, ObjectLayout::Standard);
 }
 
@@ -1674,7 +1741,11 @@ fn mpu_object_part_checksum_round_trip() {
         .unwrap();
 
     let committed = store
-        .get_object_parts("bucket", "k", VersionId::from_u64(1))
+        .get_object_parts(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+        )
         .unwrap();
     assert_eq!(committed.len(), 2);
     assert_eq!(committed[0].checksum, Some(checksum_bytes));
@@ -1769,13 +1840,13 @@ fn mpu_complete_multipart_commit_preserves_checksums() {
         .unwrap();
 
     let committed = store
-        .get_object_parts("bucket", "k", VersionId::Null)
+        .get_object_parts(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert_eq!(committed.len(), 2);
     assert_eq!(committed[0].checksum, Some(cksum));
     assert_eq!(committed[1].checksum, None);
     let live = store
-        .get_object_meta("bucket", "k")
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
         .unwrap()
         .into_live()
         .unwrap();
@@ -1795,7 +1866,7 @@ fn completed_multipart_tombstone_survives_null_version_overwrite() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -1894,7 +1965,7 @@ fn completed_multipart_tombstone_survives_object_version_delete() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -1965,7 +2036,7 @@ fn completed_multipart_tombstone_survives_object_version_delete() {
     assert_eq!(completed.key.as_str(), "key");
 
     store
-        .delete_object_version("bucket", "key", version_id)
+        .delete_object_version(&bucket_name("bucket"), &object_key("key"), version_id)
         .unwrap();
 
     assert!(store
@@ -1979,7 +2050,7 @@ fn completed_multipart_upload_list_reports_global_completion_orders() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -2629,7 +2700,11 @@ fn mpu_corrupted_object_part_okh_returns_error() {
         .unwrap();
 
     let err = store
-        .get_object_parts("bucket", "k", VersionId::from_u64(1))
+        .get_object_parts(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+        )
         .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::Db { .. }),
@@ -2813,7 +2888,11 @@ fn mpu_commit_object_parts_rollback_on_duplicate() {
 
     // The connection should still be usable (no poisoned transaction)
     let parts = store
-        .get_object_parts("bucket", "k", VersionId::from_u64(1))
+        .get_object_parts(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+        )
         .unwrap();
     assert_eq!(parts.len(), 1, "original commit should still be intact");
 }
@@ -2858,7 +2937,11 @@ fn mpu_commit_and_get_object_parts() {
     store.commit_object_parts(&parts).unwrap();
 
     let committed = store
-        .get_object_parts("bucket", "k", VersionId::from_u64(1))
+        .get_object_parts(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+        )
         .unwrap();
     assert_eq!(committed.len(), 2);
     assert_eq!(committed[0].part_number, 1);
@@ -2869,7 +2952,11 @@ fn mpu_commit_and_get_object_parts() {
 
     // Get for non-existent version returns empty
     let empty = store
-        .get_object_parts("bucket", "k", VersionId::from_u64(999))
+        .get_object_parts(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(999),
+        )
         .unwrap();
     assert!(empty.is_empty());
 }
@@ -3140,7 +3227,11 @@ fn mpu_commit_partial_batch_failure_rolls_back_all() {
 
     // Only part 1 from the original commit should exist — parts 2 and 3 were rolled back.
     let parts = store
-        .get_object_parts("bucket", "k", VersionId::from_u64(1))
+        .get_object_parts(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+        )
         .unwrap();
     assert_eq!(parts.len(), 1, "batch should have been fully rolled back");
     assert_eq!(parts[0].part_number, 1);
@@ -3308,7 +3399,11 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
 
     // Connection should still work fine after repeated failures.
     let parts = store
-        .get_object_parts("bucket", "k", VersionId::from_u64(1))
+        .get_object_parts(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+        )
         .unwrap();
     assert_eq!(parts.len(), 1);
 
@@ -3321,7 +3416,11 @@ fn mpu_commit_object_parts_connection_usable_after_multiple_failures() {
         .commit_object_parts(std::slice::from_ref(&part2))
         .unwrap();
     let parts = store
-        .get_object_parts("bucket", "k", VersionId::from_u64(1))
+        .get_object_parts(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+        )
         .unwrap();
     assert_eq!(parts.len(), 2);
 }
@@ -3475,7 +3574,11 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
 
     // Rolled-back parts should not be visible.
     let parts = store
-        .get_object_parts("bucket", "k", VersionId::from_u64(1))
+        .get_object_parts(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+        )
         .unwrap();
     assert!(parts.is_empty(), "rolled-back parts should not be visible");
 
@@ -3484,7 +3587,11 @@ fn mpu_commit_object_parts_commit_failure_via_lock_contention() {
         .commit_object_parts(std::slice::from_ref(&part))
         .unwrap();
     let parts = store
-        .get_object_parts("bucket", "k", VersionId::from_u64(1))
+        .get_object_parts(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::from_u64(1),
+        )
         .unwrap();
     assert_eq!(parts.len(), 1);
 }
@@ -3742,7 +3849,7 @@ mod prop_tests {
         let (dir, store) = super::make_pg_store();
         store
             .create_bucket(
-                PROP_TEST_BUCKET,
+                &bucket_name(PROP_TEST_BUCKET),
                 "owner",
                 &CanonicalUserId::from_principal("owner"),
                 &AclGrants::default(),
@@ -3787,7 +3894,7 @@ mod prop_tests {
         match op {
             ModelOp::SetVersioning(state) => {
                 store
-                    .put_bucket_versioning(PROP_TEST_BUCKET, *state)
+                    .put_bucket_versioning(&bucket_name(PROP_TEST_BUCKET), *state)
                     .unwrap();
             }
             ModelOp::PutLive {
@@ -3806,7 +3913,7 @@ mod prop_tests {
             }
             ModelOp::DeleteVersion { key, version_id } => {
                 store
-                    .delete_object_version(PROP_TEST_BUCKET, key.as_str(), *version_id)
+                    .delete_object_version(&bucket_name(PROP_TEST_BUCKET), key, *version_id)
                     .unwrap();
             }
         }
@@ -3816,7 +3923,7 @@ mod prop_tests {
         store: &crate::PgStore,
         key: &ObjectKey,
     ) -> Result<Option<ObjectSnapshot>, TestCaseError> {
-        match store.get_object_meta(PROP_TEST_BUCKET, key.as_str()) {
+        match store.get_object_meta(&bucket_name(PROP_TEST_BUCKET), key) {
             Ok(object) => Ok(Some(ObjectSnapshot::from(&object))),
             Err(crate::MetadataError::ObjectNotFound) => Ok(None),
             Err(err) => Err(TestCaseError::fail(format!(
@@ -4836,14 +4943,16 @@ fn commit_stream_put_atomic() {
         .unwrap();
 
     // Object metadata is committed
-    let record = store.get_object_meta("bucket", "k").unwrap();
+    let record = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     let live = record.as_live().unwrap();
     assert_eq!(live.size, 6_000_000);
     assert_eq!(live.layout, ObjectLayout::Standard);
 
     // Committed segments are readable
     let segments = store
-        .get_object_segments("bucket", "k", VersionId::Null)
+        .get_object_segments(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert_eq!(segments.len(), 2);
     assert_eq!(segments[0].segment_index, 0);
@@ -4963,12 +5072,14 @@ fn commit_stream_put_overwrite_unversioned() {
         .unwrap();
 
     // Verify overwrite: new data
-    let record = store.get_object_meta("bucket", "k").unwrap();
+    let record = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     assert_eq!(record.as_live().unwrap().size, 200);
 
     // Segments replaced
     let segments = store
-        .get_object_segments("bucket", "k", VersionId::Null)
+        .get_object_segments(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].size, 200);
@@ -5030,13 +5141,15 @@ fn put_object_with_segments_persists_manifest() {
         )
         .unwrap();
 
-    let record = store.get_object_meta("bucket", "k").unwrap();
+    let record = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     let live = record.as_live().unwrap();
     assert_eq!(live.size, 6_000_000);
     assert_eq!(live.layout, ObjectLayout::Standard);
 
     let segments = store
-        .get_object_segments("bucket", "k", VersionId::Null)
+        .get_object_segments(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert_eq!(segments.len(), 2);
     assert_eq!(segments[0].segment_okh, [0x11; 16]);
@@ -5119,11 +5232,13 @@ fn put_object_with_segments_overwrite_unversioned_replaces_manifest() {
         )
         .unwrap();
 
-    let record = store.get_object_meta("bucket", "k").unwrap();
+    let record = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     assert_eq!(record.as_live().unwrap().size, 200);
 
     let segments = store
-        .get_object_segments("bucket", "k", VersionId::Null)
+        .get_object_segments(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].size, 200);
@@ -5935,16 +6050,16 @@ fn object_segments_reclaim_round_trip() {
     store.put_object_segments_reclaim(&reclaim).unwrap();
 
     let got = store
-        .get_object_segments_reclaim("bucket", "k", generation_id)
+        .get_object_segments_reclaim(&bucket_name("bucket"), &object_key("k"), generation_id)
         .unwrap()
         .expect("object segments reclaim should exist");
     assert_eq!(got, reclaim);
 
     store
-        .delete_object_segments_reclaim("bucket", "k", generation_id)
+        .delete_object_segments_reclaim(&bucket_name("bucket"), &object_key("k"), generation_id)
         .unwrap();
     assert!(store
-        .get_object_segments_reclaim("bucket", "k", generation_id)
+        .get_object_segments_reclaim(&bucket_name("bucket"), &object_key("k"), generation_id)
         .unwrap()
         .is_none());
 }
@@ -5970,7 +6085,9 @@ fn next_generation_id_skips_object_segments_reclaim_generation() {
         .unwrap();
 
     assert_eq!(
-        store.next_generation_id("bucket", "k").unwrap(),
+        store
+            .next_generation_id(&bucket_name("bucket"), &object_key("k"))
+            .unwrap(),
         GenerationId::new(8).unwrap()
     );
 }
@@ -6020,16 +6137,16 @@ fn multipart_reclaim_round_trip() {
     store.put_multipart_reclaim(&reclaim).unwrap();
 
     let got = store
-        .get_multipart_reclaim("bucket", "k", generation_id)
+        .get_multipart_reclaim(&bucket_name("bucket"), &object_key("k"), generation_id)
         .unwrap()
         .expect("multipart reclaim should exist");
     assert_eq!(got, reclaim);
 
     store
-        .delete_multipart_reclaim("bucket", "k", generation_id)
+        .delete_multipart_reclaim(&bucket_name("bucket"), &object_key("k"), generation_id)
         .unwrap();
     assert!(store
-        .get_multipart_reclaim("bucket", "k", generation_id)
+        .get_multipart_reclaim(&bucket_name("bucket"), &object_key("k"), generation_id)
         .unwrap()
         .is_none());
 }
@@ -6055,7 +6172,9 @@ fn next_generation_id_skips_multipart_reclaim_generation() {
         .unwrap();
 
     assert_eq!(
-        store.next_generation_id("bucket", "k").unwrap(),
+        store
+            .next_generation_id(&bucket_name("bucket"), &object_key("k"))
+            .unwrap(),
         GenerationId::new(12).unwrap()
     );
 }
@@ -6090,7 +6209,7 @@ fn get_bucket_payload_reclaim_root_returns_first_root() {
         .unwrap();
 
     let root = store
-        .get_bucket_payload_reclaim_root("bucket")
+        .get_bucket_payload_reclaim_root(&bucket_name("bucket"))
         .unwrap()
         .expect("bucket reclaim root should exist");
     assert_eq!(root.bucket, "bucket");
@@ -6107,7 +6226,7 @@ fn payload_reclaim_exists_checks_all_reclaim_tables() {
     let multipart_generation = GenerationId::new(11).unwrap();
 
     assert!(!store
-        .payload_reclaim_exists("bucket", "k", simple_generation)
+        .payload_reclaim_exists(&bucket_name("bucket"), &object_key("k"), simple_generation)
         .unwrap());
 
     store
@@ -6120,10 +6239,10 @@ fn payload_reclaim_exists_checks_all_reclaim_tables() {
         })
         .unwrap();
     assert!(store
-        .payload_reclaim_exists("bucket", "k", simple_generation)
+        .payload_reclaim_exists(&bucket_name("bucket"), &object_key("k"), simple_generation)
         .unwrap());
     store
-        .delete_simple_payload_reclaim("bucket", "k", simple_generation)
+        .delete_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), simple_generation)
         .unwrap();
 
     store
@@ -6142,10 +6261,18 @@ fn payload_reclaim_exists_checks_all_reclaim_tables() {
         })
         .unwrap();
     assert!(store
-        .payload_reclaim_exists("bucket", "k", segments_generation)
+        .payload_reclaim_exists(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            segments_generation
+        )
         .unwrap());
     store
-        .delete_object_segments_reclaim("bucket", "k", segments_generation)
+        .delete_object_segments_reclaim(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            segments_generation,
+        )
         .unwrap();
 
     store
@@ -6164,14 +6291,26 @@ fn payload_reclaim_exists_checks_all_reclaim_tables() {
         })
         .unwrap();
     assert!(store
-        .payload_reclaim_exists("bucket", "k", multipart_generation)
+        .payload_reclaim_exists(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            multipart_generation
+        )
         .unwrap());
     store
-        .delete_multipart_reclaim("bucket", "k", multipart_generation)
+        .delete_multipart_reclaim(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            multipart_generation,
+        )
         .unwrap();
 
     assert!(!store
-        .payload_reclaim_exists("bucket", "k", multipart_generation)
+        .payload_reclaim_exists(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            multipart_generation
+        )
         .unwrap());
 }
 
@@ -6351,7 +6490,7 @@ fn malformed_segment_okh_returns_db_error() {
     .unwrap();
 
     let err = store
-        .get_object_segments("bucket", "k", VersionId::Null)
+        .get_object_segments(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::Db { .. }),
@@ -6410,7 +6549,7 @@ fn get_object_version_null() {
         .unwrap();
 
     let obj = store
-        .get_object_version("bucket", "k", VersionId::Null)
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     let live = obj.as_live().unwrap();
     assert_eq!(live.size, 100);
@@ -6441,7 +6580,9 @@ fn get_object_version_versioned() {
         }))
         .unwrap();
 
-    let obj = store.get_object_version("bucket", "k", vid).unwrap();
+    let obj = store
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), vid)
+        .unwrap();
     let live = obj.as_live().unwrap();
     assert_eq!(live.size, 200);
     assert_eq!(live.version_id, vid);
@@ -6451,7 +6592,7 @@ fn get_object_version_versioned() {
 fn get_object_version_not_found() {
     let (_dir, store) = make_pg_store();
     let err = store
-        .get_object_version("bucket", "k", VersionId::Null)
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::ObjectNotFound));
 }
@@ -6481,10 +6622,10 @@ fn delete_object_version_null() {
         .unwrap();
 
     store
-        .delete_object_version("bucket", "k", VersionId::Null)
+        .delete_object_version(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     let err = store
-        .get_object_version("bucket", "k", VersionId::Null)
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::ObjectNotFound));
 }
@@ -6518,13 +6659,19 @@ fn delete_object_version_specific_leaves_others() {
             .unwrap();
     }
 
-    store.delete_object_version("bucket", "k", vid1).unwrap();
+    store
+        .delete_object_version(&bucket_name("bucket"), &object_key("k"), vid1)
+        .unwrap();
 
     // vid1 gone
-    let err = store.get_object_version("bucket", "k", vid1).unwrap_err();
+    let err = store
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), vid1)
+        .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::ObjectNotFound));
     // vid2 still exists
-    let obj = store.get_object_version("bucket", "k", vid2).unwrap();
+    let obj = store
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), vid2)
+        .unwrap();
     assert_eq!(obj.as_live().unwrap().size, 200);
 }
 
@@ -6729,7 +6876,7 @@ fn suspended_null_live_version_stays_current_when_last_modified_ties() {
 
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -6738,7 +6885,7 @@ fn suspended_null_live_version_stays_current_when_last_modified_ties() {
         )
         .unwrap();
     store
-        .put_bucket_versioning("bucket", BucketVersioningState::Suspended)
+        .put_bucket_versioning(&bucket_name("bucket"), BucketVersioningState::Suspended)
         .unwrap();
 
     store
@@ -6789,7 +6936,9 @@ fn suspended_null_live_version_stays_current_when_last_modified_ties() {
         )
         .unwrap();
 
-    let current = store.get_object_meta("bucket", "k").unwrap();
+    let current = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     assert_eq!(current.version_id(), VersionId::Null);
     assert_eq!(current.as_live().unwrap().size, 200);
 
@@ -6827,7 +6976,7 @@ fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
 
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -6836,7 +6985,7 @@ fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
         )
         .unwrap();
     store
-        .put_bucket_versioning("bucket", BucketVersioningState::Suspended)
+        .put_bucket_versioning(&bucket_name("bucket"), BucketVersioningState::Suspended)
         .unwrap();
 
     store
@@ -6875,7 +7024,9 @@ fn suspended_null_delete_marker_stays_current_when_last_modified_ties() {
         )
         .unwrap();
 
-    let current = store.get_object_meta("bucket", "k").unwrap();
+    let current = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     assert_eq!(current.version_id(), VersionId::Null);
     assert!(current.is_delete_marker());
 
@@ -6935,9 +7086,13 @@ fn put_object_meta_marks_displaced_live_version_noncurrent() {
             .unwrap();
     }
 
-    let current_record = store.get_object_version("bucket", "k", current).unwrap();
+    let current_record = store
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), current)
+        .unwrap();
     let current_live = current_record.as_live().unwrap();
-    let older_record = store.get_object_version("bucket", "k", older).unwrap();
+    let older_record = store
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), older)
+        .unwrap();
     let older_live = older_record.as_live().unwrap();
 
     assert_eq!(current_live.became_noncurrent_at, None);
@@ -6982,11 +7137,13 @@ fn put_delete_marker_marks_displaced_live_version_noncurrent() {
         }))
         .unwrap();
 
-    let current = store.get_object_meta("bucket", "k").unwrap();
+    let current = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     assert!(current.is_delete_marker());
 
     let older_record = store
-        .get_object_version("bucket", "k", live_version)
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), live_version)
         .unwrap();
     let older_live = older_record.as_live().unwrap();
     assert_eq!(
@@ -7041,10 +7198,14 @@ fn null_live_write_marks_displaced_numbered_version_noncurrent() {
         }))
         .unwrap();
 
-    let current = store.get_object_meta("bucket", "k").unwrap();
+    let current = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     assert_eq!(current.version_id(), VersionId::Null);
 
-    let older_record = store.get_object_version("bucket", "k", numbered).unwrap();
+    let older_record = store
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), numbered)
+        .unwrap();
     let older_live = older_record.as_live().unwrap();
     assert_eq!(
         older_live.became_noncurrent_at,
@@ -7081,16 +7242,22 @@ fn deleting_current_live_version_clears_revealed_live_noncurrent_timestamp() {
             .unwrap();
     }
 
-    let older_record = store.get_object_version("bucket", "k", older).unwrap();
+    let older_record = store
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), older)
+        .unwrap();
     assert!(older_record
         .as_live()
         .unwrap()
         .became_noncurrent_at
         .is_some());
 
-    store.delete_object_version("bucket", "k", current).unwrap();
+    store
+        .delete_object_version(&bucket_name("bucket"), &object_key("k"), current)
+        .unwrap();
 
-    let revealed = store.get_object_meta("bucket", "k").unwrap();
+    let revealed = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     assert_eq!(revealed.version_id(), older);
     assert_eq!(revealed.as_live().unwrap().became_noncurrent_at, None);
 }
@@ -7131,7 +7298,7 @@ fn deleting_current_delete_marker_clears_revealed_live_noncurrent_timestamp() {
         .unwrap();
 
     let live_record = store
-        .get_object_version("bucket", "k", live_version)
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), live_version)
         .unwrap();
     assert!(live_record
         .as_live()
@@ -7140,10 +7307,12 @@ fn deleting_current_delete_marker_clears_revealed_live_noncurrent_timestamp() {
         .is_some());
 
     store
-        .delete_object_version("bucket", "k", delete_marker)
+        .delete_object_version(&bucket_name("bucket"), &object_key("k"), delete_marker)
         .unwrap();
 
-    let revealed = store.get_object_meta("bucket", "k").unwrap();
+    let revealed = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     assert_eq!(revealed.version_id(), live_version);
     assert_eq!(revealed.as_live().unwrap().became_noncurrent_at, None);
 }
@@ -7155,7 +7324,9 @@ fn next_version_id_increments() {
     let (_dir, store) = make_pg_store();
 
     // First call with no prior versions starts at 1.
-    let v1 = store.next_version_id("bucket", "k").unwrap();
+    let v1 = store
+        .next_version_id(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     assert!(matches!(v1, VersionId::Versioned(_)));
 
     // Write an object at v1 so the counter advances.
@@ -7180,7 +7351,9 @@ fn next_version_id_increments() {
         }))
         .unwrap();
 
-    let v2 = store.next_version_id("bucket", "k").unwrap();
+    let v2 = store
+        .next_version_id(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     assert!(matches!(v2, VersionId::Versioned(_)));
     assert_ne!(v1, v2);
 }
@@ -7189,8 +7362,12 @@ fn next_version_id_increments() {
 fn next_version_id_independent_per_key() {
     let (_dir, store) = make_pg_store();
 
-    let v1 = store.next_version_id("bucket", "k1").unwrap();
-    let v2 = store.next_version_id("bucket", "k2").unwrap();
+    let v1 = store
+        .next_version_id(&bucket_name("bucket"), &object_key("k1"))
+        .unwrap();
+    let v2 = store
+        .next_version_id(&bucket_name("bucket"), &object_key("k2"))
+        .unwrap();
     // Different keys should each get the first version ID
     assert_eq!(v1, v2);
 }
@@ -7223,34 +7400,44 @@ fn object_tags_round_trip() {
 
     // Initially no tags
     let tags = store
-        .get_object_tags("bucket", "k", VersionId::Null)
+        .get_object_tags(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert!(tags.is_none());
 
     // Put tags
     store
-        .put_object_tags("bucket", "k", VersionId::Null, "<tags>env=prod</tags>")
+        .put_object_tags(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::Null,
+            "<tags>env=prod</tags>",
+        )
         .unwrap();
     let tags = store
-        .get_object_tags("bucket", "k", VersionId::Null)
+        .get_object_tags(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert_eq!(tags.as_deref(), Some("<tags>env=prod</tags>"));
 
     // Overwrite tags
     store
-        .put_object_tags("bucket", "k", VersionId::Null, "<tags>env=staging</tags>")
+        .put_object_tags(
+            &bucket_name("bucket"),
+            &object_key("k"),
+            VersionId::Null,
+            "<tags>env=staging</tags>",
+        )
         .unwrap();
     let tags = store
-        .get_object_tags("bucket", "k", VersionId::Null)
+        .get_object_tags(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert_eq!(tags.as_deref(), Some("<tags>env=staging</tags>"));
 
     // Delete tags
     store
-        .delete_object_tags("bucket", "k", VersionId::Null)
+        .delete_object_tags(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     let tags = store
-        .get_object_tags("bucket", "k", VersionId::Null)
+        .get_object_tags(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert!(tags.is_none());
 }
@@ -7259,7 +7446,7 @@ fn object_tags_round_trip() {
 fn object_tags_on_nonexistent_object() {
     let (_dir, store) = make_pg_store();
     let err = store
-        .get_object_tags("bucket", "k", VersionId::Null)
+        .get_object_tags(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::ObjectNotFound));
 }
@@ -7278,7 +7465,7 @@ fn object_tags_on_delete_marker() {
         .unwrap();
 
     let err = store
-        .put_object_tags("bucket", "k", vid, "<tags/>")
+        .put_object_tags(&bucket_name("bucket"), &object_key("k"), vid, "<tags/>")
         .unwrap_err();
     assert!(
         matches!(
@@ -7288,7 +7475,9 @@ fn object_tags_on_delete_marker() {
         "expected MethodNotAllowedOnDeleteMarker, got {err:?}"
     );
 
-    let err = store.get_object_tags("bucket", "k", vid).unwrap_err();
+    let err = store
+        .get_object_tags(&bucket_name("bucket"), &object_key("k"), vid)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -7297,7 +7486,9 @@ fn object_tags_on_delete_marker() {
         "expected MethodNotAllowedOnDeleteMarker, got {err:?}"
     );
 
-    let err = store.delete_object_tags("bucket", "k", vid).unwrap_err();
+    let err = store
+        .delete_object_tags(&bucket_name("bucket"), &object_key("k"), vid)
+        .unwrap_err();
     assert!(
         matches!(
             err,
@@ -7325,7 +7516,7 @@ fn simple_payload_reclaim_round_trip() {
         .unwrap();
 
     let rec = store
-        .get_simple_payload_reclaim("bucket", "k", gen)
+        .get_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), gen)
         .unwrap();
     assert!(rec.is_some());
     let rec = rec.unwrap();
@@ -7336,10 +7527,10 @@ fn simple_payload_reclaim_round_trip() {
     assert_eq!(rec.ec.m, 2);
 
     store
-        .delete_simple_payload_reclaim("bucket", "k", gen)
+        .delete_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), gen)
         .unwrap();
     let rec = store
-        .get_simple_payload_reclaim("bucket", "k", gen)
+        .get_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), gen)
         .unwrap();
     assert!(rec.is_none());
 }
@@ -7349,7 +7540,7 @@ fn simple_payload_reclaim_delete_idempotent() {
     let (_dir, store) = make_pg_store();
     // Deleting a nonexistent reclaim should not error
     store
-        .delete_simple_payload_reclaim("bucket", "k", GenerationId::MIN)
+        .delete_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), GenerationId::MIN)
         .unwrap();
 }
 
@@ -7484,7 +7675,7 @@ fn mark_bucket_deleting_and_head_bucket_raw() {
 
     store
         .create_bucket(
-            "mybucket",
+            &bucket_name("mybucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -7494,29 +7685,33 @@ fn mark_bucket_deleting_and_head_bucket_raw() {
         .unwrap();
 
     // head_bucket sees it
-    let info = store.head_bucket("mybucket").unwrap();
+    let info = store.head_bucket(&bucket_name("mybucket")).unwrap();
     assert_eq!(info.state, BucketState::Active);
 
     // head_bucket_raw also sees it
-    let raw = store.head_bucket_raw("mybucket").unwrap();
+    let raw = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
     assert_eq!(raw.state, BucketState::Active);
     assert!(!raw.write_reservations_blocked);
     assert_eq!(raw.active_write_reservations, 0);
 
-    store.begin_bucket_write_drain("mybucket").unwrap();
+    store
+        .begin_bucket_write_drain(&bucket_name("mybucket"))
+        .unwrap();
 
     // Mark as deleting
-    store.mark_bucket_deleting("mybucket").unwrap();
+    store
+        .mark_bucket_deleting(&bucket_name("mybucket"))
+        .unwrap();
 
     // head_bucket should NOT find it anymore (filters Deleting)
-    let err = store.head_bucket("mybucket").unwrap_err();
+    let err = store.head_bucket(&bucket_name("mybucket")).unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::BucketNotFound { .. }),
         "expected BucketNotFound from head_bucket on Deleting bucket, got {err:?}"
     );
 
     // head_bucket_raw SHOULD still find it (includes Deleting)
-    let raw = store.head_bucket_raw("mybucket").unwrap();
+    let raw = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
     assert_eq!(raw.state, BucketState::Deleting);
     assert!(raw.write_reservations_blocked);
     assert_eq!(raw.active_write_reservations, 0);
@@ -7525,7 +7720,9 @@ fn mark_bucket_deleting_and_head_bucket_raw() {
 #[test]
 fn mark_bucket_deleting_nonexistent() {
     let (_dir, store) = make_pg_store();
-    let err = store.mark_bucket_deleting("nope").unwrap_err();
+    let err = store
+        .mark_bucket_deleting(&bucket_name("nope"))
+        .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::BucketNotFound { .. }),
         "expected BucketNotFound, got {err:?}"
@@ -7535,7 +7732,7 @@ fn mark_bucket_deleting_nonexistent() {
 #[test]
 fn head_bucket_raw_nonexistent() {
     let (_dir, store) = make_pg_store();
-    let err = store.head_bucket_raw("nope").unwrap_err();
+    let err = store.head_bucket_raw(&bucket_name("nope")).unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::BucketNotFound { .. }),
         "expected BucketNotFound, got {err:?}"
@@ -7543,48 +7740,26 @@ fn head_bucket_raw_nonexistent() {
 }
 
 #[test]
-fn raw_bucket_methods_reject_invalid_bucket_names_without_panicking() {
-    let (_dir, store) = make_pg_store();
-
-    let err = store.head_bucket_raw("BadBucket").unwrap_err();
+fn bucket_name_validation_rejects_invalid_inputs() {
     assert!(matches!(
-        err,
-        crate::error::MetadataError::InvalidBucketName { .. }
+        BucketName::try_from("BadBucket"),
+        Err(BucketNameError::InvalidCharacterSet | BucketNameError::InvalidStartCharacter)
     ));
-
-    let err = store.mark_bucket_deleting("b").unwrap_err();
     assert!(matches!(
-        err,
-        crate::error::MetadataError::InvalidBucketName { .. }
-    ));
-
-    let err = store.delete_bucket("b").unwrap_err();
-    assert!(matches!(
-        err,
-        crate::error::MetadataError::InvalidBucketName { .. }
+        BucketName::try_from("b"),
+        Err(BucketNameError::InvalidLength { length: 1 })
     ));
 }
 
 #[test]
-fn raw_object_methods_reject_invalid_names_without_panicking() {
-    let (_dir, store) = make_pg_store();
-
-    let err = store.get_object_meta("BadBucket", "key").unwrap_err();
+fn object_key_validation_rejects_invalid_inputs() {
     assert!(matches!(
-        err,
-        crate::error::MetadataError::InvalidBucketName { .. }
+        ObjectKey::try_from(""),
+        Err(ObjectKeyError::InvalidLength { length: 0 })
     ));
-
-    let err = store.get_object_meta("bucket", "").unwrap_err();
     assert!(matches!(
-        err,
-        crate::error::MetadataError::InvalidObjectKey { .. }
-    ));
-
-    let err = store.next_generation_id("bucket", "\0").unwrap_err();
-    assert!(matches!(
-        err,
-        crate::error::MetadataError::InvalidObjectKey { .. }
+        ObjectKey::try_from("\0"),
+        Err(ObjectKeyError::ContainsNullByte)
     ));
 }
 
@@ -7593,7 +7768,7 @@ fn bucket_write_reservations_and_drain_round_trip() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "mybucket",
+            &bucket_name("mybucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -7602,34 +7777,42 @@ fn bucket_write_reservations_and_drain_round_trip() {
         )
         .unwrap();
 
-    let reserved = store.acquire_bucket_write_reservation("mybucket").unwrap();
+    let reserved = store
+        .acquire_bucket_write_reservation(&bucket_name("mybucket"))
+        .unwrap();
     assert_eq!(reserved.state, BucketState::Active);
     assert_eq!(reserved.active_write_reservations, 1);
     assert!(!reserved.write_reservations_blocked);
 
-    let raw = store.head_bucket_raw("mybucket").unwrap();
+    let raw = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
     assert_eq!(raw.active_write_reservations, 1);
     assert!(!raw.write_reservations_blocked);
 
-    store.release_bucket_write_reservation("mybucket").unwrap();
-    let raw = store.head_bucket_raw("mybucket").unwrap();
+    store
+        .release_bucket_write_reservation(&bucket_name("mybucket"))
+        .unwrap();
+    let raw = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
     assert_eq!(raw.active_write_reservations, 0);
 
-    store.begin_bucket_write_drain("mybucket").unwrap();
-    let raw = store.head_bucket_raw("mybucket").unwrap();
+    store
+        .begin_bucket_write_drain(&bucket_name("mybucket"))
+        .unwrap();
+    let raw = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
     assert!(raw.write_reservations_blocked);
     assert_eq!(raw.active_write_reservations, 0);
 
     let err = store
-        .acquire_bucket_write_reservation("mybucket")
+        .acquire_bucket_write_reservation(&bucket_name("mybucket"))
         .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketWriteDraining
     ));
 
-    store.end_bucket_write_drain("mybucket").unwrap();
-    let raw = store.head_bucket_raw("mybucket").unwrap();
+    store
+        .end_bucket_write_drain(&bucket_name("mybucket"))
+        .unwrap();
+    let raw = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
     assert!(!raw.write_reservations_blocked);
     assert_eq!(raw.active_write_reservations, 0);
 }
@@ -7639,7 +7822,7 @@ fn mark_bucket_deleting_requires_drained_reservations() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "mybucket",
+            &bucket_name("mybucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -7648,28 +7831,46 @@ fn mark_bucket_deleting_requires_drained_reservations() {
         )
         .unwrap();
 
-    let err = store.mark_bucket_deleting("mybucket").unwrap_err();
+    let err = store
+        .mark_bucket_deleting(&bucket_name("mybucket"))
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }
     ));
 
-    store.begin_bucket_write_drain("mybucket").unwrap();
-    store.acquire_bucket_write_reservation("mybucket").err();
-    let reservation = store.head_bucket_raw("mybucket").unwrap();
+    store
+        .begin_bucket_write_drain(&bucket_name("mybucket"))
+        .unwrap();
+    store
+        .acquire_bucket_write_reservation(&bucket_name("mybucket"))
+        .err();
+    let reservation = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
     assert_eq!(reservation.active_write_reservations, 0);
 
-    store.end_bucket_write_drain("mybucket").unwrap();
-    store.acquire_bucket_write_reservation("mybucket").unwrap();
-    store.begin_bucket_write_drain("mybucket").unwrap();
-    let err = store.mark_bucket_deleting("mybucket").unwrap_err();
+    store
+        .end_bucket_write_drain(&bucket_name("mybucket"))
+        .unwrap();
+    store
+        .acquire_bucket_write_reservation(&bucket_name("mybucket"))
+        .unwrap();
+    store
+        .begin_bucket_write_drain(&bucket_name("mybucket"))
+        .unwrap();
+    let err = store
+        .mark_bucket_deleting(&bucket_name("mybucket"))
+        .unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }
     ));
 
-    store.release_bucket_write_reservation("mybucket").unwrap();
-    store.mark_bucket_deleting("mybucket").unwrap();
+    store
+        .release_bucket_write_reservation(&bucket_name("mybucket"))
+        .unwrap();
+    store
+        .mark_bucket_deleting(&bucket_name("mybucket"))
+        .unwrap();
 }
 
 // ── put_bucket_versioning on nonexistent bucket ────────────────────────
@@ -7678,7 +7879,7 @@ fn mark_bucket_deleting_requires_drained_reservations() {
 fn put_bucket_versioning_nonexistent_bucket() {
     let (_dir, store) = make_pg_store();
     let err = store
-        .put_bucket_versioning("nope", BucketVersioningState::Enabled)
+        .put_bucket_versioning(&bucket_name("nope"), BucketVersioningState::Enabled)
         .unwrap_err();
     assert!(
         matches!(err, crate::error::MetadataError::BucketNotFound { .. }),
@@ -7742,7 +7943,7 @@ fn bucket_object_lock_round_trip() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "mybucket",
+            &bucket_name("mybucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -7751,13 +7952,15 @@ fn bucket_object_lock_round_trip() {
         )
         .unwrap();
     store
-        .put_bucket_versioning("mybucket", BucketVersioningState::Enabled)
+        .put_bucket_versioning(&bucket_name("mybucket"), BucketVersioningState::Enabled)
         .unwrap();
 
     let config = sample_bucket_object_lock();
-    store.put_bucket_object_lock("mybucket", config).unwrap();
+    store
+        .put_bucket_object_lock(&bucket_name("mybucket"), config)
+        .unwrap();
 
-    let info = store.head_bucket_raw("mybucket").unwrap();
+    let info = store.head_bucket_raw(&bucket_name("mybucket")).unwrap();
     assert_eq!(info.object_lock, config);
 }
 
@@ -7766,7 +7969,7 @@ fn bucket_object_lock_requires_enabled_versioning() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "mybucket",
+            &bucket_name("mybucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -7777,15 +7980,15 @@ fn bucket_object_lock_requires_enabled_versioning() {
 
     let config = sample_bucket_object_lock();
     let err = store
-        .put_bucket_object_lock("mybucket", config)
+        .put_bucket_object_lock(&bucket_name("mybucket"), config)
         .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::Db { .. }));
 
     store
-        .put_bucket_versioning("mybucket", BucketVersioningState::Suspended)
+        .put_bucket_versioning(&bucket_name("mybucket"), BucketVersioningState::Suspended)
         .unwrap();
     let err = store
-        .put_bucket_object_lock("mybucket", config)
+        .put_bucket_object_lock(&bucket_name("mybucket"), config)
         .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::Db { .. }));
 }
@@ -7795,7 +7998,7 @@ fn bucket_object_lock_rejects_default_retention_without_enablement() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "mybucket",
+            &bucket_name("mybucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -7806,7 +8009,7 @@ fn bucket_object_lock_rejects_default_retention_without_enablement() {
 
     let err = store
         .put_bucket_object_lock(
-            "mybucket",
+            &bucket_name("mybucket"),
             BucketObjectLockConfig {
                 enabled: false,
                 default_retention: sample_bucket_object_lock().default_retention,
@@ -7821,7 +8024,7 @@ fn bucket_object_lock_cannot_be_disabled_or_suspended() {
     let (_dir, store) = make_pg_store();
     store
         .create_bucket(
-            "mybucket",
+            &bucket_name("mybucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -7830,19 +8033,19 @@ fn bucket_object_lock_cannot_be_disabled_or_suspended() {
         )
         .unwrap();
     store
-        .put_bucket_versioning("mybucket", BucketVersioningState::Enabled)
+        .put_bucket_versioning(&bucket_name("mybucket"), BucketVersioningState::Enabled)
         .unwrap();
     store
-        .put_bucket_object_lock("mybucket", sample_bucket_object_lock())
+        .put_bucket_object_lock(&bucket_name("mybucket"), sample_bucket_object_lock())
         .unwrap();
 
     let err = store
-        .put_bucket_versioning("mybucket", BucketVersioningState::Suspended)
+        .put_bucket_versioning(&bucket_name("mybucket"), BucketVersioningState::Suspended)
         .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::Db { .. }));
 
     let err = store
-        .put_bucket_object_lock("mybucket", BucketObjectLockConfig::default())
+        .put_bucket_object_lock(&bucket_name("mybucket"), BucketObjectLockConfig::default())
         .unwrap_err();
     assert!(matches!(err, crate::error::MetadataError::Db { .. }));
 }
@@ -7875,8 +8078,8 @@ fn live_object_object_lock_round_trip() {
 
     let record = store
         .get_object_version(
-            "bucket",
-            "key",
+            &bucket_name("bucket"),
+            &object_key("key"),
             VersionId::Versioned(NonZeroU64::new(1).unwrap()),
         )
         .unwrap();
@@ -8054,7 +8257,7 @@ fn multipart_upload_object_lock_round_trip_and_commit_copies_state() {
         .unwrap();
 
     let committed = store
-        .get_object_version("bucket", "key", obj.version_id)
+        .get_object_version(&bucket_name("bucket"), &object_key("key"), obj.version_id)
         .unwrap();
     assert_eq!(committed.as_live().unwrap().object_lock, object_lock);
 }

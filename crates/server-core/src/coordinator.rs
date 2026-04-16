@@ -14642,7 +14642,10 @@ mod tests {
                 Err(ServerError::BucketNotFound { .. })
             ) {
                 let bucket_pg = coord.get_bucket_pg(name).unwrap();
-                if bucket_pg.head_bucket_raw(name).is_err() {
+                if bucket_pg
+                    .head_bucket_raw(&trusted_bucket_name(name))
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -14801,7 +14804,10 @@ mod tests {
     fn assert_object_maps_meta_pg_gt_shard_pg(coord: &Coordinator, bucket: &str, key: &str) {
         let meta_pg_id = coord.object_pg_id(bucket, key);
         let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        let generation_id = match meta_pg.get_object_meta(bucket, key).unwrap() {
+        let generation_id = match meta_pg
+            .get_object_meta(&trusted_bucket_name(bucket), &trusted_object_key(key))
+            .unwrap()
+        {
             StoredObject::Live(record) => record.generation_id,
             StoredObject::DeleteMarker(other) => {
                 panic!("expected live object for {bucket}/{key}, got {other:?}")
@@ -16413,7 +16419,9 @@ mod tests {
                 .storage_node
                 .get_pg(coord.object_pg_id("bucket", "key"))
                 .unwrap();
-            let stored = meta_pg.get_object_meta("bucket", "key").unwrap();
+            let stored = meta_pg
+                .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+                .unwrap();
             let live = stored.as_live().unwrap();
             (live.last_modified, live.generation_id)
         };
@@ -16432,15 +16440,23 @@ mod tests {
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
         assert!(matches!(
-            meta_pg.get_object_meta("bucket", "key"),
+            meta_pg.get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key")),
             Err(storage::MetadataError::ObjectNotFound)
         ));
         assert!(meta_pg
-            .get_object_segments_reclaim("bucket", "key", generation_id)
+            .get_object_segments_reclaim(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                generation_id
+            )
             .unwrap()
             .is_some());
         assert!(meta_pg
-            .get_object_segments("bucket", "key", VersionId::Null)
+            .get_object_segments(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                VersionId::Null
+            )
             .unwrap()
             .is_empty());
         drop(meta_pg);
@@ -16496,7 +16512,11 @@ mod tests {
                 .get_pg(coord.object_pg_id("bucket", "key"))
                 .unwrap();
             let stored = meta_pg
-                .get_object_version("bucket", "key", put.version_id)
+                .get_object_version(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    put.version_id,
+                )
                 .unwrap();
             let live = stored.as_live().unwrap();
             (live.last_modified, live.generation_id)
@@ -16511,14 +16531,24 @@ mod tests {
             .storage_node
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
-        let current = meta_pg.get_object_meta("bucket", "key").unwrap();
+        let current = meta_pg
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .unwrap();
         assert!(matches!(current, StoredObject::DeleteMarker(_)));
         let original = meta_pg
-            .get_object_version("bucket", "key", put.version_id)
+            .get_object_version(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                put.version_id,
+            )
             .unwrap();
         assert!(matches!(original, StoredObject::Live(_)));
         assert!(meta_pg
-            .get_object_segments_reclaim("bucket", "key", generation_id)
+            .get_object_segments_reclaim(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                generation_id
+            )
             .unwrap()
             .is_none());
     }
@@ -16597,7 +16627,11 @@ mod tests {
                 .get_pg(coord.object_pg_id("bucket", "key"))
                 .unwrap();
             let stored = meta_pg
-                .get_object_version("bucket", "key", VersionId::Null)
+                .get_object_version(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    VersionId::Null,
+                )
                 .unwrap();
             let live = stored.as_live().unwrap();
             (live.last_modified, live.generation_id)
@@ -16616,21 +16650,35 @@ mod tests {
             .storage_node
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
-        let current = meta_pg.get_object_meta("bucket", "key").unwrap();
+        let current = meta_pg
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .unwrap();
         match current {
             StoredObject::DeleteMarker(marker) => assert_eq!(marker.version_id, VersionId::Null),
             other => panic!("expected current delete marker, got {other:?}"),
         }
         let older_version = meta_pg
-            .get_object_version("bucket", "key", older.version_id)
+            .get_object_version(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                older.version_id,
+            )
             .unwrap();
         assert!(matches!(older_version, StoredObject::Live(_)));
         let null_version = meta_pg
-            .get_object_version("bucket", "key", VersionId::Null)
+            .get_object_version(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                VersionId::Null,
+            )
             .unwrap();
         assert!(matches!(null_version, StoredObject::DeleteMarker(_)));
         assert!(meta_pg
-            .get_object_segments_reclaim("bucket", "key", generation_id)
+            .get_object_segments_reclaim(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                generation_id
+            )
             .unwrap()
             .is_some());
         drop(meta_pg);
@@ -16720,7 +16768,11 @@ mod tests {
                 .get_pg(coord.object_pg_id("bucket", "key"))
                 .unwrap();
             let stored = meta_pg
-                .get_object_version("bucket", "key", older.version_id)
+                .get_object_version(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    older.version_id,
+                )
                 .unwrap();
             let live = stored.as_live().unwrap();
             (live.became_noncurrent_at.unwrap(), live.generation_id)
@@ -16740,14 +16792,24 @@ mod tests {
             .storage_node
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
-        let latest = meta_pg.get_object_meta("bucket", "key").unwrap();
+        let latest = meta_pg
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .unwrap();
         assert_eq!(latest.version_id(), current.version_id);
         assert!(matches!(
-            meta_pg.get_object_version("bucket", "key", older.version_id),
+            meta_pg.get_object_version(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                older.version_id
+            ),
             Err(storage::MetadataError::ObjectNotFound)
         ));
         assert!(meta_pg
-            .get_object_segments_reclaim("bucket", "key", generation_id)
+            .get_object_segments_reclaim(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                generation_id
+            )
             .unwrap()
             .is_some());
         drop(meta_pg);
@@ -16827,7 +16889,11 @@ mod tests {
                 .get_pg(coord.object_pg_id("bucket", "key"))
                 .unwrap();
             let stored = meta_pg
-                .get_object_version("bucket", "key", numbered.version_id)
+                .get_object_version(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    numbered.version_id,
+                )
                 .unwrap();
             let live = stored.as_live().unwrap();
             (live.became_noncurrent_at.unwrap(), live.generation_id)
@@ -16847,14 +16913,24 @@ mod tests {
             .storage_node
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
-        let latest = meta_pg.get_object_meta("bucket", "key").unwrap();
+        let latest = meta_pg
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .unwrap();
         assert_eq!(latest.version_id(), VersionId::Null);
         assert!(matches!(
-            meta_pg.get_object_version("bucket", "key", numbered.version_id),
+            meta_pg.get_object_version(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                numbered.version_id
+            ),
             Err(storage::MetadataError::ObjectNotFound)
         ));
         assert!(meta_pg
-            .get_object_segments_reclaim("bucket", "key", generation_id)
+            .get_object_segments_reclaim(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                generation_id
+            )
             .unwrap()
             .is_some());
         drop(meta_pg);
@@ -16942,10 +17018,18 @@ mod tests {
                 .get_pg(coord.object_pg_id("bucket", "key"))
                 .unwrap();
             let oldest_record = meta_pg
-                .get_object_version("bucket", "key", oldest.version_id)
+                .get_object_version(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    oldest.version_id,
+                )
                 .unwrap();
             let middle_record = meta_pg
-                .get_object_version("bucket", "key", middle.version_id)
+                .get_object_version(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    middle.version_id,
+                )
                 .unwrap();
             let oldest_live = oldest_record.as_live().unwrap();
             let middle_live = middle_record.as_live().unwrap();
@@ -16972,22 +17056,40 @@ mod tests {
             .storage_node
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
-        let latest = meta_pg.get_object_meta("bucket", "key").unwrap();
+        let latest = meta_pg
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .unwrap();
         assert_eq!(latest.version_id(), current.version_id);
         assert!(matches!(
-            meta_pg.get_object_version("bucket", "key", oldest.version_id),
+            meta_pg.get_object_version(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                oldest.version_id
+            ),
             Err(storage::MetadataError::ObjectNotFound)
         ));
         assert!(matches!(
-            meta_pg.get_object_version("bucket", "key", middle.version_id),
+            meta_pg.get_object_version(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                middle.version_id
+            ),
             Ok(StoredObject::Live(_))
         ));
         assert!(meta_pg
-            .get_object_segments_reclaim("bucket", "key", oldest_generation_id)
+            .get_object_segments_reclaim(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                oldest_generation_id
+            )
             .unwrap()
             .is_some());
         assert!(meta_pg
-            .get_object_segments_reclaim("bucket", "key", middle_generation_id)
+            .get_object_segments_reclaim(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                middle_generation_id
+            )
             .unwrap()
             .is_none());
         drop(meta_pg);
@@ -17082,7 +17184,11 @@ mod tests {
                 .get_pg(coord.object_pg_id("bucket", "key"))
                 .unwrap();
             let stored = meta_pg
-                .get_object_version("bucket", "key", older.version_id)
+                .get_object_version(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    older.version_id,
+                )
                 .unwrap();
             stored.as_live().unwrap().became_noncurrent_at.unwrap()
         };
@@ -17098,10 +17204,16 @@ mod tests {
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
         assert!(matches!(
-            meta_pg.get_object_version("bucket", "key", older.version_id),
+            meta_pg.get_object_version(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                older.version_id
+            ),
             Ok(StoredObject::Live(_))
         ));
-        let latest = meta_pg.get_object_meta("bucket", "key").unwrap();
+        let latest = meta_pg
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .unwrap();
         assert_eq!(latest.version_id(), current.version_id);
     }
 
@@ -17193,7 +17305,9 @@ mod tests {
                 .storage_node
                 .get_pg(coord.object_pg_id("bucket", "key"))
                 .unwrap();
-            let current = meta_pg.get_object_meta("bucket", "key").unwrap();
+            let current = meta_pg
+                .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+                .unwrap();
             assert_eq!(current.version_id(), v1.version_id);
             assert_eq!(current.as_live().unwrap().became_noncurrent_at, None);
         }
@@ -17225,7 +17339,11 @@ mod tests {
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
         assert!(matches!(
-            meta_pg.get_object_version("bucket", "key", v1.version_id),
+            meta_pg.get_object_version(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                v1.version_id
+            ),
             Ok(StoredObject::Live(_))
         ));
     }
@@ -17288,7 +17406,11 @@ mod tests {
                 .get_pg(coord.object_pg_id("bucket", "key"))
                 .unwrap();
             let stored = meta_pg
-                .get_object_version("bucket", "key", put.version_id)
+                .get_object_version(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    put.version_id,
+                )
                 .unwrap();
             let live = stored.as_live().unwrap();
             Coordinator::lifecycle_day_based_deadline(live.became_noncurrent_at.unwrap(), 1)
@@ -17306,7 +17428,7 @@ mod tests {
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
         assert!(matches!(
-            meta_pg.get_object_meta("bucket", "key"),
+            meta_pg.get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key")),
             Err(storage::MetadataError::ObjectNotFound)
         ));
         drop(meta_pg);
@@ -17380,10 +17502,18 @@ mod tests {
                 .get_pg(coord.object_pg_id("bucket", "key"))
                 .unwrap();
             let noncurrent = meta_pg
-                .get_object_version("bucket", "key", put.version_id)
+                .get_object_version(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    put.version_id,
+                )
                 .unwrap();
             let marker = meta_pg
-                .get_object_version("bucket", "key", delete.version_id)
+                .get_object_version(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    delete.version_id,
+                )
                 .unwrap();
             (
                 Coordinator::lifecycle_day_based_deadline(
@@ -17403,7 +17533,9 @@ mod tests {
             .storage_node
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
-        let current = meta_pg.get_object_meta("bucket", "key").unwrap();
+        let current = meta_pg
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .unwrap();
         assert!(matches!(current, StoredObject::DeleteMarker(_)));
         drop(meta_pg);
 
@@ -17417,7 +17549,7 @@ mod tests {
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
         assert!(matches!(
-            meta_pg.get_object_meta("bucket", "key"),
+            meta_pg.get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key")),
             Err(storage::MetadataError::ObjectNotFound)
         ));
     }
@@ -19543,7 +19675,7 @@ mod tests {
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
         let live = meta_pg
-            .get_object_meta("bucket", "key")
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap()
             .into_live()
             .expect("expected live object");
@@ -19613,7 +19745,10 @@ mod tests {
             .storage_node
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
-        let marker = match meta_pg.get_object_meta("bucket", "key").unwrap() {
+        let marker = match meta_pg
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .unwrap()
+        {
             StoredObject::DeleteMarker(marker) => marker,
             other => panic!("expected delete marker, got {other:?}"),
         };
@@ -19716,7 +19851,7 @@ mod tests {
             .get_pg(coord.object_pg_id("bucket", "key"))
             .unwrap();
         let live = meta_pg
-            .get_object_meta("bucket", "key")
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
             .unwrap()
             .into_live()
             .expect("expected completed object");
@@ -21451,7 +21586,10 @@ mod tests {
         let (generation_id, ec) = {
             let meta_pg_id = coord.object_pg_id("bucket", "key");
             let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-            match pg.get_object_meta("bucket", "key").unwrap() {
+            match pg
+                .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+                .unwrap()
+            {
                 StoredObject::Live(record) => (record.generation_id, record.ec),
                 other @ StoredObject::DeleteMarker(_) => {
                     panic!("expected live object, got {other:?}")
@@ -21832,9 +21970,15 @@ mod tests {
         let (shard_pg_id, okh, generation_id) = {
             let meta_pg_id = coord.object_pg_id(bucket, key);
             let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-            let record = pg.get_object_meta(bucket, key).unwrap();
+            let record = pg
+                .get_object_meta(&trusted_bucket_name(bucket), &trusted_object_key(key))
+                .unwrap();
             let segments = pg
-                .get_object_segments(bucket, key, record.version_id())
+                .get_object_segments(
+                    &trusted_bucket_name(bucket),
+                    &trusted_object_key(key),
+                    record.version_id(),
+                )
                 .unwrap();
             if let Some(segment) = segments.first() {
                 (
@@ -22427,7 +22571,11 @@ mod tests {
             let meta_pg_id = coord.object_pg_id("bucket", "obj7");
             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             let segments = meta_pg
-                .get_object_segments("bucket", "obj7", put.version_id)
+                .get_object_segments(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("obj7"),
+                    put.version_id,
+                )
                 .unwrap();
             assert_eq!(segments.len(), 1);
             segments[0].clone()
@@ -22497,7 +22645,11 @@ mod tests {
             let meta_pg_id = coord.object_pg_id("bucket", "obj8");
             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             let segments = meta_pg
-                .get_object_segments("bucket", "obj8", put.version_id)
+                .get_object_segments(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("obj8"),
+                    put.version_id,
+                )
                 .unwrap();
             assert_eq!(segments.len(), 1);
             segments[0].clone()
@@ -37905,7 +38057,11 @@ mod tests {
 
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         assert!(pg
-            .get_simple_payload_reclaim("bucket", "ghost", generation_id)
+            .get_simple_payload_reclaim(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("ghost"),
+                generation_id
+            )
             .unwrap()
             .is_none());
     }
@@ -37957,7 +38113,10 @@ mod tests {
         let generation_id = {
             let meta_pg_id = admin.object_pg_id("bucket", "key");
             let pg = admin.storage_node.get_pg(meta_pg_id).unwrap();
-            match pg.get_object_meta("bucket", "key").unwrap() {
+            match pg
+                .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+                .unwrap()
+            {
                 StoredObject::Live(record) => record.generation_id,
                 other @ StoredObject::DeleteMarker(_) => {
                     panic!("expected live object, got {other:?}")
@@ -37980,7 +38139,11 @@ mod tests {
         {
             let pg = admin.storage_node.get_pg(meta_pg_id).unwrap();
             assert!(pg
-                .get_object_segments_reclaim("bucket", "key", generation_id)
+                .get_object_segments_reclaim(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    generation_id
+                )
                 .unwrap()
                 .is_some());
         }
@@ -37998,7 +38161,11 @@ mod tests {
         {
             let pg = admin.storage_node.get_pg(meta_pg_id).unwrap();
             assert!(pg
-                .get_object_segments_reclaim("bucket", "key", generation_id)
+                .get_object_segments_reclaim(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    generation_id
+                )
                 .unwrap()
                 .is_some());
         }
@@ -38841,7 +39008,9 @@ mod tests {
         // Object should be visible via get_object metadata.
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        let obj = pg.get_object_meta("bucket", "key").unwrap();
+        let obj = pg
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .unwrap();
         let live_obj = obj.as_live().expect("expected live object");
         assert!(matches!(
             live_obj.layout,
@@ -38855,7 +39024,11 @@ mod tests {
 
         // object_parts should be committed.
         let committed = pg
-            .get_object_parts("bucket", "key", result.version_id)
+            .get_object_parts(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                result.version_id,
+            )
             .unwrap();
         assert_eq!(committed.len(), 2);
         assert_eq!(committed[0].part_number, 1);
@@ -38898,8 +39071,12 @@ mod tests {
         let parts_to_reclaim = {
             let meta_pg_id = coord.object_pg_id("bucket", "key");
             let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-            pg.get_object_parts("bucket", "key", result.version_id)
-                .unwrap()
+            pg.get_object_parts(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                result.version_id,
+            )
+            .unwrap()
         };
 
         coord
@@ -39346,13 +39523,19 @@ mod tests {
         // Verify the object was overwritten — should have 2 parts now.
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        let obj = pg.get_object_meta("bucket", "key").unwrap();
+        let obj = pg
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .unwrap();
         let live_obj = obj.as_live().expect("expected live object");
         assert_eq!(live_obj.layout.parts_count(), Some(2));
 
         // Old manifest parts (from first upload) should be replaced.
         let committed = pg
-            .get_object_parts("bucket", "key", VersionId::Null)
+            .get_object_parts(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                VersionId::Null,
+            )
             .unwrap();
         assert_eq!(committed.len(), 2);
     }
@@ -41338,12 +41521,20 @@ mod tests {
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let real_parts = pg
-            .get_object_parts("bucket", "key", result.version_id)
+            .get_object_parts(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                result.version_id,
+            )
             .unwrap();
         assert_eq!(real_parts.len(), 2);
         let part2_record = real_parts[1].clone(); // real part 2 with valid shards
-        pg.delete_object_parts("bucket", "key", result.version_id)
-            .unwrap();
+        pg.delete_object_parts(
+            &trusted_bucket_name("bucket"),
+            &trusted_object_key("key"),
+            result.version_id,
+        )
+        .unwrap();
         pg.commit_object_parts(&[part2_record]).unwrap();
         drop(pg);
 
@@ -42244,7 +42435,9 @@ mod tests {
                 .storage_node
                 .get_pg(coord.object_pg_id("bucket", "obj"))
                 .unwrap();
-            let record = meta_pg.get_object_meta("bucket", "obj").unwrap();
+            let record = meta_pg
+                .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("obj"))
+                .unwrap();
             let live = record.as_live().unwrap();
             let stored_system =
                 SystemMetadata::deserialize(live.system_metadata_blob.as_ref().unwrap().as_slice())
@@ -43246,7 +43439,11 @@ mod tests {
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let committed = pg
-            .get_object_segments("bucket", "key", result.version_id)
+            .get_object_segments(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                result.version_id,
+            )
             .unwrap();
         assert_eq!(committed.len(), 3);
         for (i, segment) in committed.iter().enumerate() {
@@ -43547,7 +43744,11 @@ mod tests {
             .get_pg(runtime.pg_topology.object_pg("bucket", "key"))
             .unwrap();
         assert!(meta_pg
-            .payload_reclaim_exists("bucket", "key", generation_id)
+            .payload_reclaim_exists(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                generation_id
+            )
             .unwrap());
         drop(meta_pg);
 
@@ -43573,7 +43774,11 @@ mod tests {
             .get_pg(runtime.pg_topology.object_pg("bucket", "key"))
             .unwrap();
         assert!(!meta_pg
-            .payload_reclaim_exists("bucket", "key", generation_id)
+            .payload_reclaim_exists(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                generation_id
+            )
             .unwrap());
     }
 
@@ -43806,7 +44011,11 @@ mod tests {
             let meta_pg_id = coord.object_pg_id("bucket", "dst");
             let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             let segments = pg
-                .get_object_segments("bucket", "dst", VersionId::Null)
+                .get_object_segments(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("dst"),
+                    VersionId::Null,
+                )
                 .unwrap();
             assert_eq!(segments.len(), 1);
             assert_eq!(segments[0].size, 7);
@@ -43857,7 +44066,11 @@ mod tests {
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let segments = pg
-            .get_object_segments("bucket", "key", result.version_id)
+            .get_object_segments(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                result.version_id,
+            )
             .unwrap();
         assert_eq!(segments.len(), 1);
         assert!(pg.list_all_stream_uploads().unwrap().is_empty());
@@ -43914,7 +44127,11 @@ mod tests {
         let meta_pg_id = coord.object_pg_id("bucket", "exact");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
         let segments = pg
-            .get_object_segments("bucket", "exact", result.version_id)
+            .get_object_segments(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("exact"),
+                result.version_id,
+            )
             .unwrap();
         assert_eq!(segments.len(), 1);
         assert_eq!(segments[0].size, INTERNAL_SEGMENT_SIZE as u64);
@@ -43963,7 +44180,11 @@ mod tests {
             let meta_pg_id = coord.object_pg_id("bucket", "key");
             let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             let segments = pg
-                .get_object_segments("bucket", "key", result.version_id)
+                .get_object_segments(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("key"),
+                    result.version_id,
+                )
                 .unwrap();
             assert_eq!(segments.len(), 3);
             assert_eq!(segments[0].segment_index, 0);
@@ -44020,8 +44241,12 @@ mod tests {
         let old_segments = {
             let meta_pg_id = coord.object_pg_id("bucket", "key");
             let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-            pg.get_object_segments("bucket", "key", first.version_id)
-                .unwrap()
+            pg.get_object_segments(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                first.version_id,
+            )
+            .unwrap()
         };
         assert_eq!(old_segments.len(), 2);
 
@@ -44337,8 +44562,12 @@ mod tests {
         let segments = {
             let meta_pg_id = coord.object_pg_id("bucket", "key");
             let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-            pg.get_object_segments("bucket", "key", result.version_id)
-                .unwrap()
+            pg.get_object_segments(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                result.version_id,
+            )
+            .unwrap()
         };
 
         coord
@@ -45863,9 +46092,18 @@ mod tests {
         let meta_pg_id = coord.object_pg_id("bucket", "verify");
         {
             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-            let record = meta_pg.get_object_meta("bucket", "verify").unwrap();
+            let record = meta_pg
+                .get_object_meta(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("verify"),
+                )
+                .unwrap();
             let segments = meta_pg
-                .get_object_segments("bucket", "verify", record.version_id())
+                .get_object_segments(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("verify"),
+                    record.version_id(),
+                )
                 .unwrap();
 
             assert_eq!(segments.len(), 2);
@@ -45933,11 +46171,18 @@ mod tests {
         {
             let meta_pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
             let record = meta_pg
-                .get_object_meta("bucket", "bad-segment-crc")
+                .get_object_meta(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("bad-segment-crc"),
+                )
                 .unwrap();
             let live = record.as_live().unwrap();
             let mut segments = meta_pg
-                .get_object_segments("bucket", "bad-segment-crc", put.version_id)
+                .get_object_segments(
+                    &trusted_bucket_name("bucket"),
+                    &trusted_object_key("bad-segment-crc"),
+                    put.version_id,
+                )
                 .unwrap();
             assert_eq!(segments.len(), 1);
             segments[0].segment_crc64 = Some(segments[0].segment_crc64.unwrap() ^ 1);

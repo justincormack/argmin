@@ -48,7 +48,7 @@ fn shard_and_metadata_roundtrip() {
     assert_eq!(read.crc64, ack.crc64);
 
     let obj = store
-        .get_object_meta("test-bucket", "my/object.txt")
+        .get_object_meta(&bucket_name("test-bucket"), &object_key("my/object.txt"))
         .unwrap();
     let live = obj.as_live().unwrap();
     assert_eq!(live.size, shard_data.len() as u64);
@@ -114,7 +114,7 @@ fn full_lifecycle() {
     let node = crate::LocalStorageNode::open(&dir.path().join("data"), &[0]).unwrap();
     let pg = node.get_pg(0).unwrap();
     pg.create_bucket(
-        "my-bucket",
+        &bucket_name("my-bucket"),
         "owner-1",
         &CanonicalUserId::from_principal("owner-1"),
         &AclGrants::default(),
@@ -150,22 +150,27 @@ fn full_lifecycle() {
     .unwrap();
 
     // HeadBucket.
-    let info = pg.head_bucket("my-bucket").unwrap();
+    let info = pg.head_bucket(&bucket_name("my-bucket")).unwrap();
     assert_eq!(info.name, "my-bucket");
 
     // GetObject: read metadata + shard.
-    let obj = pg.get_object_meta("my-bucket", "greeting.txt").unwrap();
+    let obj = pg
+        .get_object_meta(&bucket_name("my-bucket"), &object_key("greeting.txt"))
+        .unwrap();
     assert_eq!(obj.as_live().unwrap().size, 11);
 
     let read = pg.read_shard(&shard_key).unwrap();
     assert_eq!(read.data, b"hello world");
 
     // DeleteObject: remove metadata + shard.
-    pg.delete_object_meta("my-bucket", "greeting.txt").unwrap();
+    pg.delete_object_meta(&bucket_name("my-bucket"), &object_key("greeting.txt"))
+        .unwrap();
     pg.delete_shard(&shard_key).unwrap();
 
     // Verify gone.
-    let err = pg.get_object_meta("my-bucket", "greeting.txt").unwrap_err();
+    let err = pg
+        .get_object_meta(&bucket_name("my-bucket"), &object_key("greeting.txt"))
+        .unwrap_err();
     assert!(matches!(err, crate::MetadataError::ObjectNotFound));
 
     let err = pg.read_shard(&shard_key).unwrap_err();
@@ -214,7 +219,9 @@ fn pg_store_persistence() {
         let read = store.read_shard(&key).unwrap();
         assert_eq!(read.data, data);
 
-        let obj = store.get_object_meta("bucket", "k").unwrap();
+        let obj = store
+            .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+            .unwrap();
         assert_eq!(obj.as_live().unwrap().size, data.len() as u64);
     }
 }
@@ -231,7 +238,7 @@ fn multipart_upload_lifecycle() {
 
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -376,13 +383,15 @@ fn multipart_upload_lifecycle() {
         .unwrap();
 
     // Read back the committed object.
-    let read_obj = store.get_object_meta("bucket", "k").unwrap();
+    let read_obj = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     let live = read_obj.as_live().unwrap();
     assert_eq!(live.size, total_size);
 
     // Read back committed parts.
     let read_parts = store
-        .get_object_parts("bucket", "k", VersionId::Null)
+        .get_object_parts(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert_eq!(read_parts.len(), 2);
     assert_eq!(read_parts[0].part_number, 1);
@@ -516,12 +525,14 @@ fn streaming_put_object_lifecycle() {
         .unwrap();
 
     // Object metadata readable.
-    let obj = store.get_object_meta("bucket", "k").unwrap();
+    let obj = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     assert_eq!(obj.as_live().unwrap().size, total_size);
 
     // Object segments readable.
     let segs = store
-        .get_object_segments("bucket", "k", VersionId::Null)
+        .get_object_segments(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert_eq!(segs.len(), 2);
     assert_eq!(segs[0].segment_okh, hash0);
@@ -680,7 +691,7 @@ fn versioned_object_lifecycle() {
 
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -689,7 +700,7 @@ fn versioned_object_lifecycle() {
         )
         .unwrap();
     store
-        .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
+        .put_bucket_versioning(&bucket_name("bucket"), BucketVersioningState::Enabled)
         .unwrap();
 
     // Write 3 versions with shards.
@@ -741,28 +752,28 @@ fn versioned_object_lifecycle() {
 
     // Get specific version.
     let obj = store
-        .get_object_version("bucket", "k", version_ids[1])
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), version_ids[1])
         .unwrap();
     assert_eq!(obj.as_live().unwrap().size, "version-2-data".len() as u64);
 
     // Delete version 2.
     store
-        .delete_object_version("bucket", "k", version_ids[1])
+        .delete_object_version(&bucket_name("bucket"), &object_key("k"), version_ids[1])
         .unwrap();
     store.delete_shard(&shard_keys[1]).unwrap();
 
     // Version 2 gone.
     let err = store
-        .get_object_version("bucket", "k", version_ids[1])
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), version_ids[1])
         .unwrap_err();
     assert!(matches!(err, crate::MetadataError::ObjectNotFound));
 
     // Versions 1 and 3 intact.
     store
-        .get_object_version("bucket", "k", version_ids[0])
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), version_ids[0])
         .unwrap();
     store
-        .get_object_version("bucket", "k", version_ids[2])
+        .get_object_version(&bucket_name("bucket"), &object_key("k"), version_ids[2])
         .unwrap();
 
     // List now shows 2.
@@ -865,7 +876,9 @@ fn object_overwrite_with_reclaim() {
         .unwrap();
 
     // Current object is gen 2.
-    let obj = store.get_object_meta("bucket", "k").unwrap();
+    let obj = store
+        .get_object_meta(&bucket_name("bucket"), &object_key("k"))
+        .unwrap();
     assert_eq!(
         obj.as_live().unwrap().etag,
         ObjectEtag::SinglePart([2, 0, 0, 0, 0, 0, 0, 0])
@@ -873,27 +886,27 @@ fn object_overwrite_with_reclaim() {
 
     // Reclaim record for gen 1 still exists.
     let reclaim = store
-        .get_simple_payload_reclaim("bucket", "k", gen1)
+        .get_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), gen1)
         .unwrap()
         .expect("reclaim should exist");
     assert_eq!(reclaim.generation_id, gen1);
 
     // Reclaim root points to gen 1 (earliest reclaim in bucket).
     let root = store
-        .get_bucket_payload_reclaim_root("bucket")
+        .get_bucket_payload_reclaim_root(&bucket_name("bucket"))
         .unwrap()
         .expect("root should exist");
     assert_eq!(root.generation_id, gen1);
 
     // Clean up reclaim, then old shard.
     store
-        .delete_simple_payload_reclaim("bucket", "k", gen1)
+        .delete_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), gen1)
         .unwrap();
     store.delete_shard(&sk1).unwrap();
 
     // Reclaim gone.
     assert!(store
-        .get_simple_payload_reclaim("bucket", "k", gen1)
+        .get_simple_payload_reclaim(&bucket_name("bucket"), &object_key("k"), gen1)
         .unwrap()
         .is_none());
 
@@ -913,7 +926,7 @@ fn bucket_deletion_lifecycle() {
 
     store
         .create_bucket(
-            "doomed",
+            &bucket_name("doomed"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -946,25 +959,34 @@ fn bucket_deletion_lifecycle() {
 
     // Add tags to the object.
     store
-        .put_object_tags("doomed", "file.txt", VersionId::Null, "<t>v</t>")
+        .put_object_tags(
+            &bucket_name("doomed"),
+            &object_key("file.txt"),
+            VersionId::Null,
+            "<t>v</t>",
+        )
         .unwrap();
 
     // Delete the object.
-    store.delete_object_meta("doomed", "file.txt").unwrap();
+    store
+        .delete_object_meta(&bucket_name("doomed"), &object_key("file.txt"))
+        .unwrap();
 
     // Mark bucket as deleting.
-    store.begin_bucket_write_drain("doomed").unwrap();
-    store.mark_bucket_deleting("doomed").unwrap();
+    store
+        .begin_bucket_write_drain(&bucket_name("doomed"))
+        .unwrap();
+    store.mark_bucket_deleting(&bucket_name("doomed")).unwrap();
 
     // head_bucket no longer sees it.
-    let err = store.head_bucket("doomed").unwrap_err();
+    let err = store.head_bucket(&bucket_name("doomed")).unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }
     ));
 
     // head_bucket_raw still sees it in Deleting state.
-    let info = store.head_bucket_raw("doomed").unwrap();
+    let info = store.head_bucket_raw(&bucket_name("doomed")).unwrap();
     assert_eq!(info.state, BucketState::Deleting);
 
     // list_buckets does not include it.
@@ -974,10 +996,10 @@ fn bucket_deletion_lifecycle() {
     assert!(buckets.is_empty());
 
     // Final delete.
-    store.delete_bucket("doomed").unwrap();
+    store.delete_bucket(&bucket_name("doomed")).unwrap();
 
     // Completely gone.
-    let err = store.head_bucket_raw("doomed").unwrap_err();
+    let err = store.head_bucket_raw(&bucket_name("doomed")).unwrap_err();
     assert!(matches!(
         err,
         crate::error::MetadataError::BucketNotFound { .. }
@@ -1106,7 +1128,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
 
     store
         .create_bucket(
-            "bucket",
+            &bucket_name("bucket"),
             "owner",
             &CanonicalUserId::from_principal("owner"),
             &AclGrants::default(),
@@ -1138,7 +1160,7 @@ fn object_tags_through_overwrite_and_versioned_delete() {
         .unwrap();
 
     let tags = store
-        .get_object_tags("bucket", "k", VersionId::Null)
+        .get_object_tags(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert_eq!(tags.as_deref(), Some("<t>old</t>"));
 
@@ -1165,13 +1187,13 @@ fn object_tags_through_overwrite_and_versioned_delete() {
         .unwrap();
 
     let tags = store
-        .get_object_tags("bucket", "k", VersionId::Null)
+        .get_object_tags(&bucket_name("bucket"), &object_key("k"), VersionId::Null)
         .unwrap();
     assert!(tags.is_none(), "tags should be cleared after overwrite");
 
     // Versioned: put two versions with independent tags.
     store
-        .put_bucket_versioning("bucket", BucketVersioningState::Enabled)
+        .put_bucket_versioning(&bucket_name("bucket"), BucketVersioningState::Enabled)
         .unwrap();
 
     let vid1 = VersionId::Versioned(NonZeroU64::new(10).unwrap());
@@ -1202,14 +1224,14 @@ fn object_tags_through_overwrite_and_versioned_delete() {
 
     assert_eq!(
         store
-            .get_object_tags("bucket", "tagged", vid1)
+            .get_object_tags(&bucket_name("bucket"), &object_key("tagged"), vid1)
             .unwrap()
             .as_deref(),
         Some("<t>v1</t>")
     );
     assert_eq!(
         store
-            .get_object_tags("bucket", "tagged", vid2)
+            .get_object_tags(&bucket_name("bucket"), &object_key("tagged"), vid2)
             .unwrap()
             .as_deref(),
         Some("<t>v2</t>")
@@ -1217,15 +1239,17 @@ fn object_tags_through_overwrite_and_versioned_delete() {
 
     // Delete version 1 — version 2 tags unaffected.
     store
-        .delete_object_version("bucket", "tagged", vid1)
+        .delete_object_version(&bucket_name("bucket"), &object_key("tagged"), vid1)
         .unwrap();
 
-    let err = store.get_object_tags("bucket", "tagged", vid1).unwrap_err();
+    let err = store
+        .get_object_tags(&bucket_name("bucket"), &object_key("tagged"), vid1)
+        .unwrap_err();
     assert!(matches!(err, crate::MetadataError::ObjectNotFound));
 
     assert_eq!(
         store
-            .get_object_tags("bucket", "tagged", vid2)
+            .get_object_tags(&bucket_name("bucket"), &object_key("tagged"), vid2)
             .unwrap()
             .as_deref(),
         Some("<t>v2</t>")
