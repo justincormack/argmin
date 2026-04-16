@@ -50,6 +50,19 @@ clients:
 - in `crates/s3-tests`, use the bounded recreate helper rather than a fixed
   sleep for delete-then-recreate flows
 
+### `x-amz-copy-source` percent-encoded NUL is intentionally rejected as a client error
+
+AWS currently responds with `500 InternalError` for at least one malformed
+`x-amz-copy-source` case: a percent-encoded NUL byte in the source object key.
+
+Argmin intentionally does not match that behavior. We reject this as
+`400 InvalidArgument` because the input is client-invalid and treating it as a
+server fault would be the wrong contract to preserve.
+
+The AWS-backed `s3-tests` coverage for this case is allowed to diverge
+explicitly, and should not be treated as a general license to ignore AWS
+results elsewhere.
+
 ## Current known gaps
 
 ### 1. Single-part `ETag` is not AWS MD5

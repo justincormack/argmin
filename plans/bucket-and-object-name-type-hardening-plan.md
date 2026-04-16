@@ -2,11 +2,9 @@
 
 ## Status
 
-In progress.
+Complete.
 
-Phases 1, 2, 3, and 3a are complete.
-
-Phases 4 and 5 remain open.
+Phases 1, 2, 3, 3a, 4, and 5 are complete.
 
 What has landed so far:
 
@@ -47,21 +45,13 @@ What has landed so far:
     APIs through method resolution, implicit string-method access, or generic
     `AsRef<str>` adapters. Remaining string boundaries are now explicit
     `.as_str()` conversions.
+13. Phase 5 adds direct type-level construction tests, targeted alternate
+    parser regressions, malformed and oversized copy-source coverage, fuzz
+    coverage that reaches the real typed copy-source bucket validation path,
+    and AWS-facing compatibility coverage for the new boundary behavior.
 
-What remains open in the overall plan:
-
-1. Narrow the remaining unchecked internal constructors and decide which ones
-   should survive as explicit trusted-only creation paths versus being removed
-   entirely.
-2. Finish the final audit of any remaining raw internal namespaces and
-   persistence/deserialization entry points that still rely on trusted
-   invariants rather than typed ingress.
-3. Expand the final regression and fuzz coverage around the new typed boundary
-   so the security-fix path is locked in by tests.
-
-`security/codex-23ffb1b` remains open until the early migration phases in this
-plan land. This plan is the intended fix path; it is not documenting work that
-has already shipped.
+This plan now documents shipped work. `security/codex-23ffb1b` still needs its
+separate follow-up note update to reference the fixing commits.
 
 ## Trigger
 

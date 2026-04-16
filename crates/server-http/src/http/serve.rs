@@ -1204,6 +1204,24 @@ pub fn fuzz_post_multipart_parser(
 }
 
 #[doc(hidden)]
+pub fn fuzz_request_parser_entrypoints(
+    copy_source: &str,
+    delete_objects_xml: &[u8],
+    post_key: &str,
+    file_name: &str,
+) {
+    let _ = crate::http::parse_copy_source_header(copy_source);
+    let _ = crate::http::xml::parse_delete_objects_xml(delete_objects_xml);
+
+    let form = crate::http::multipart::PostFormData {
+        fields: vec![("key".to_string(), post_key.to_string())],
+        file_data: Vec::new(),
+        file_name: (!file_name.is_empty()).then(|| file_name.to_string()),
+    };
+    let _ = form.resolve_key();
+}
+
+#[doc(hidden)]
 pub fn fuzz_streaming_request_entrypoints(
     method: &str,
     uri: &str,

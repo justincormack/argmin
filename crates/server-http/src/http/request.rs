@@ -3,7 +3,7 @@ use std::borrow::Cow;
 
 use crate::error::ServerError;
 use auth::HeaderSource;
-use storage::{BucketName, ObjectKey};
+use storage::ObjectKey;
 
 /// Maximum body size for the buffered request path.
 ///
@@ -373,7 +373,7 @@ pub(crate) fn percent_decode_lossy(s: &str) -> Cow<'_, str> {
 /// query-parameter value (if present) as-is.
 pub(crate) fn parse_copy_source(
     header: &str,
-) -> Result<(BucketName, ObjectKey, Option<String>), ServerError> {
+) -> Result<(String, ObjectKey, Option<String>), ServerError> {
     let invalid_copy_source = || ServerError::InvalidArgument {
         reason: "Invalid copy source object key".to_string(),
     };
@@ -397,7 +397,6 @@ pub(crate) fn parse_copy_source(
     let bucket = percent_decode_strict(&s[..slash_pos]).map_err(|_| invalid_copy_source())?;
     let key = percent_decode_strict(&s[slash_pos + 1..]).map_err(|_| invalid_copy_source())?;
 
-    let bucket = BucketName::try_from(bucket).map_err(|_| invalid_copy_source())?;
     let key = ObjectKey::try_from(key).map_err(|_| invalid_copy_source())?;
 
     Ok((bucket, key, version_id))
@@ -667,7 +666,7 @@ mod tests {
     #[test]
     fn parse_copy_source_basic() {
         let (bucket, key, vid) = parse_copy_source("/bucket/key").unwrap();
-        assert_eq!(bucket.as_str(), "bucket");
+        assert_eq!(bucket, "bucket");
         assert_eq!(key.as_str(), "key");
         assert_eq!(vid, None);
     }
@@ -675,7 +674,7 @@ mod tests {
     #[test]
     fn parse_copy_source_no_leading_slash() {
         let (bucket, key, vid) = parse_copy_source("bucket/key").unwrap();
-        assert_eq!(bucket.as_str(), "bucket");
+        assert_eq!(bucket, "bucket");
         assert_eq!(key.as_str(), "key");
         assert_eq!(vid, None);
     }
@@ -683,7 +682,7 @@ mod tests {
     #[test]
     fn parse_copy_source_encoded() {
         let (bucket, key, vid) = parse_copy_source("/bucket/key%20name").unwrap();
-        assert_eq!(bucket.as_str(), "bucket");
+        assert_eq!(bucket, "bucket");
         assert_eq!(key.as_str(), "key name");
         assert_eq!(vid, None);
     }
@@ -691,7 +690,7 @@ mod tests {
     #[test]
     fn parse_copy_source_nested_key() {
         let (bucket, key, vid) = parse_copy_source("/bucket/a/b/c").unwrap();
-        assert_eq!(bucket.as_str(), "bucket");
+        assert_eq!(bucket, "bucket");
         assert_eq!(key.as_str(), "a/b/c");
         assert_eq!(vid, None);
     }
@@ -699,7 +698,7 @@ mod tests {
     #[test]
     fn parse_copy_source_version_id() {
         let (bucket, key, vid) = parse_copy_source("/bucket/key?versionId=xyz").unwrap();
-        assert_eq!(bucket.as_str(), "bucket");
+        assert_eq!(bucket, "bucket");
         assert_eq!(key.as_str(), "key");
         assert_eq!(vid.as_deref(), Some("xyz"));
     }
@@ -742,24 +741,20 @@ mod tests {
     }
 
     #[test]
-    fn parse_copy_source_rejects_invalid_bucket_name() {
-        match parse_copy_source("/BadBucket/key") {
-            Err(ServerError::InvalidArgument { reason }) => {
-                assert_eq!(reason, "Invalid copy source object key");
-            }
-            other => panic!("expected InvalidArgument, got {other:?}"),
-        }
+    fn parse_copy_source_preserves_unvalidated_bucket_name() {
+        let (bucket, key, vid) = parse_copy_source("/BadBucket/key").unwrap();
+        assert_eq!(bucket, "BadBucket");
+        assert_eq!(key.as_str(), "key");
+        assert_eq!(vid, None);
     }
 
     #[test]
-    fn parse_copy_source_rejects_oversized_bucket_name() {
+    fn parse_copy_source_preserves_oversized_bucket_name() {
         let header = format!("/{}/key", "a".repeat(64));
-        match parse_copy_source(&header) {
-            Err(ServerError::InvalidArgument { reason }) => {
-                assert_eq!(reason, "Invalid copy source object key");
-            }
-            other => panic!("expected InvalidArgument, got {other:?}"),
-        }
+        let (bucket, key, vid) = parse_copy_source(&header).unwrap();
+        assert_eq!(bucket, "a".repeat(64));
+        assert_eq!(key.as_str(), "key");
+        assert_eq!(vid, None);
     }
 
     #[test]

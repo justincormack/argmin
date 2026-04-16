@@ -134,6 +134,18 @@ fn parse_object_key(key: &str) -> Result<ObjectKey, ServerError> {
     })
 }
 
+fn parse_copy_source_header(
+    copy_source: &str,
+) -> Result<(BucketName, ObjectKey, Option<VersionId>), ServerError> {
+    let (src_bucket_raw, src_key, src_version_id_str) = request::parse_copy_source(copy_source)?;
+    let src_bucket =
+        BucketName::try_from(src_bucket_raw.clone()).map_err(|_| ServerError::BucketNotFound {
+            name: src_bucket_raw,
+        })?;
+    let src_version_id = parse_optional_version_id(src_version_id_str, "versionId in copy source")?;
+    Ok((src_bucket, src_key, src_version_id))
+}
+
 fn bucket_request<'a>(
     bucket: &BucketName,
     requester: crate::coordinator::Requester,
@@ -1102,10 +1114,8 @@ impl HttpFrontend {
                 reject_directory_bucket_only_object_features(req)?;
                 if let Some(copy_source) = req.header("x-amz-copy-source") {
                     // CopyObject path
-                    let (src_bucket, src_key, src_version_id_str) =
-                        request::parse_copy_source(copy_source)?;
-                    let src_version_id =
-                        parse_optional_version_id(src_version_id_str, "versionId in copy source")?;
+                    let (src_bucket, src_key, src_version_id) =
+                        parse_copy_source_header(copy_source)?;
                     let requester = Self::requester_from_auth(auth);
                     let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                     let dst_sse_customer = parse_sse_customer_request(req)?;
@@ -2369,10 +2379,7 @@ impl HttpFrontend {
                     });
                 };
 
-                let (src_bucket, src_key, src_version_id_str) =
-                    request::parse_copy_source(copy_source)?;
-                let src_version_id =
-                    parse_optional_version_id(src_version_id_str, "versionId in copy source")?;
+                let (src_bucket, src_key, src_version_id) = parse_copy_source_header(copy_source)?;
                 let requester = Self::requester_from_auth(auth);
                 let source_sse_customer = parse_sse_customer_copy_source_request(req)?;
                 let sse_customer = parse_sse_customer_request(req)?;

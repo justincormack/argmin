@@ -69,6 +69,19 @@ async fn canonical_owner_id(client: &Client) -> String {
     owner_id
 }
 
+fn assert_raw_s3_error(response: &s3_tests::RawResponse, status: u16, code: &str) {
+    assert_eq!(
+        response.status, status,
+        "unexpected response body: {}",
+        response.body
+    );
+    assert!(
+        response.body.contains(&format!("<Code>{code}</Code>")),
+        "expected {code} in response body, got: {}",
+        response.body
+    );
+}
+
 fn canonical_user_full_control_grant(canonical_user_id: &str) -> Grant {
     Grant::builder()
         .grantee(
@@ -1352,6 +1365,78 @@ fn test_copy_object_source_empty_key() {
         assert_s3_err_code(&result, "InvalidArgument");
 
         cleanup(&bucket, &["src"]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_source_invalid_percent_encoding_rejected() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let dst_url = format!("{}/{}/dst", CTX.endpoint(), bucket);
+
+        let response = send_signed_request(
+            "PUT",
+            &dst_url,
+            b"",
+            [("x-amz-copy-source", format!("{bucket}/bad%80key"))],
+        );
+        assert_raw_s3_error(&response, 400, "InvalidArgument");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_source_percent_encoded_nul_rejected() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let dst_url = format!("{}/{}/dst", CTX.endpoint(), bucket);
+
+        let response = send_signed_request(
+            "PUT",
+            &dst_url,
+            b"",
+            [("x-amz-copy-source", format!("{bucket}/bad%00key"))],
+        );
+        if std::env::var_os("S3_TEST_ENDPOINT").is_some() {
+            // External mode is not AWS-specific; it may target AWS or another
+            // S3-compatible endpoint such as Argmin itself. AWS currently
+            // returns 500 InternalError here, while Argmin intentionally
+            // rejects the malformed client input as 400 InvalidArgument.
+            let matches_aws_bug =
+                response.status == 500 && response.body.contains("<Code>InternalError</Code>");
+            let matches_argmin =
+                response.status == 400 && response.body.contains("<Code>InvalidArgument</Code>");
+            assert!(
+                matches_aws_bug || matches_argmin,
+                "expected AWS 500/InternalError or Argmin 400/InvalidArgument, got status {} body {}",
+                response.status,
+                response.body
+            );
+        } else {
+            assert_raw_s3_error(&response, 400, "InvalidArgument");
+        }
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_copy_object_source_oversized_bucket_rejected() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let dst_url = format!("{}/{}/dst", CTX.endpoint(), bucket);
+        let oversized_bucket = "a".repeat(64);
+
+        let response = send_signed_request(
+            "PUT",
+            &dst_url,
+            b"",
+            [("x-amz-copy-source", format!("{oversized_bucket}/src"))],
+        );
+        assert_raw_s3_error(&response, 404, "NoSuchBucket");
+
+        cleanup(&bucket, &[]).await;
     });
 }
 
