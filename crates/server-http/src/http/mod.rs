@@ -986,7 +986,7 @@ impl HttpFrontend {
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .create_bucket(&crate::coordinator::CreateBucketRequest {
-                        name: &bucket,
+                        name: parse_bucket_name(&bucket)?,
                         requester,
                         namespace,
                         acl,
@@ -5260,7 +5260,7 @@ mod tests {
     fn create_test_bucket(coord: &Coordinator, name: &str) {
         coord
             .create_bucket(&crate::coordinator::CreateBucketRequest {
-                name,
+                name: parse_bucket_name(name).unwrap(),
                 requester: crate::coordinator::test_helpers::requester("testuser"),
                 namespace: BucketNamespace::Global,
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
@@ -5273,7 +5273,7 @@ mod tests {
     fn create_sigv4_test_bucket(coord: &Coordinator, name: &str, object_lock_enabled: bool) {
         coord
             .create_bucket(&crate::coordinator::CreateBucketRequest {
-                name,
+                name: parse_bucket_name(name).unwrap(),
                 requester: crate::coordinator::test_helpers::requester(TEST_SIGV4_ACCESS_KEY),
                 namespace: BucketNamespace::Global,
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
@@ -5512,7 +5512,7 @@ mod tests {
 
         fe.coordinator
             .create_bucket(&crate::coordinator::CreateBucketRequest {
-                name: "mybucket",
+                name: parse_bucket_name("mybucket").unwrap(),
                 requester: crate::coordinator::Requester::authenticated(account.clone()),
                 namespace: BucketNamespace::Global,
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
@@ -7121,7 +7121,7 @@ mod tests {
         let fe = setup_frontend(tmp.path());
         fe.coordinator
             .create_bucket(&crate::coordinator::CreateBucketRequest {
-                name: "mybucket",
+                name: parse_bucket_name("mybucket").unwrap(),
                 requester: crate::coordinator::test_helpers::requester("testuser"),
                 namespace: BucketNamespace::Global,
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,

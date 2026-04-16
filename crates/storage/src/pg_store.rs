@@ -2373,8 +2373,9 @@ impl PgStore {
 
     pub fn next_completed_multipart_upload_order_for_bucket(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
     ) -> Result<u64, MetadataError> {
+        let bucket = bucket.as_str();
         let updated = self
             .conn
             .execute(

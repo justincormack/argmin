@@ -2098,16 +2098,11 @@ impl Coordinator {
 
     pub(super) fn authorize_create_bucket(
         &self,
-        req: &CreateBucketRequest<'_>,
+        req: &CreateBucketRequest,
     ) -> Result<AuthorizedCreateBucket, ServerError> {
-        let name = BucketName::try_from(req.name.to_string()).map_err(|error| {
-            ServerError::InvalidBucketName {
-                reason: error.to_string(),
-            }
-        })?;
         let owner_account = req.requester.account().ok_or(ServerError::AccessDenied)?;
         let locked_to_account_region =
-            self.validate_create_bucket_namespace(req.name, req.namespace, owner_account)?;
+            self.validate_create_bucket_namespace(&req.name, req.namespace, owner_account)?;
         if req.ownership == BucketObjectOwnership::BucketOwnerEnforced && req.acl.is_explicit() {
             return Err(ServerError::InvalidBucketAclWithObjectOwnership);
         }
@@ -2129,7 +2124,7 @@ impl Coordinator {
             return Err(ServerError::InvalidBucketAclWithBlockPublicAccessError);
         }
         Ok(AuthorizedCreateBucket {
-            name,
+            name: req.name.clone(),
             requester: req.requester.clone(),
             owner,
             locked_to_account_region,
@@ -3598,7 +3593,7 @@ impl Coordinator {
             let bucket_info = match fast_bucket_info {
                 Some(bucket_info) => bucket_info,
                 None => Self::validate_expected_bucket_owner(
-                    self.load_active_bucket_summary_from_pg(guards.bucket(), req.bucket.as_str())?,
+                    self.load_active_bucket_summary_from_pg(guards.bucket(), req.bucket)?,
                     req.expected_bucket_owner,
                 )?,
             };

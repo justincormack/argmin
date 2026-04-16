@@ -3139,7 +3139,7 @@ mod tests {
         frontend
             .coordinator
             .create_bucket(&crate::coordinator::CreateBucketRequest {
-                name: bucket,
+                name: storage::BucketName::try_from(bucket.to_string()).unwrap(),
                 requester: requester.clone(),
                 namespace: s3_types::BucketNamespace::Global,
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,

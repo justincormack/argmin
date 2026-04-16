@@ -2358,8 +2358,8 @@ impl CreateBucketAcl {
 
 /// Request for a CreateBucket operation.
 #[derive(Debug)]
-pub struct CreateBucketRequest<'a> {
-    pub name: &'a str,
+pub struct CreateBucketRequest {
+    pub name: BucketName,
     pub requester: Requester,
     pub namespace: BucketNamespace,
     pub acl: CreateBucketAcl,
@@ -3935,8 +3935,7 @@ impl ReadRuntime {
         let meta_pg = self
             .storage_node
             .get_pg(self.pg_topology.object_pg(bucket.as_str(), key.as_str()))?;
-        meta_pg
-            .payload_reclaim_exists(bucket, key, generation_id)
+        storage::PgMetadataStore::payload_reclaim_exists(&*meta_pg, bucket, key, generation_id)
             .map_err(ServerError::Metadata)
     }
 
@@ -3974,15 +3973,18 @@ impl ReadRuntime {
         let bucket_pg = self
             .storage_node
             .get_pg(self.pg_topology.bucket_pg_for(&bucket_info.name))?;
-        let raw_config = bucket_pg
-            .get_bucket_subresource(&bucket_info.name, storage::BucketSubresourceKind::Lifecycle)
-            .map(|stored| stored.map(|stored| stored.body))
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        let raw_config = storage::PgMetadataStore::get_bucket_subresource(
+            &*bucket_pg,
+            &bucket_info.name,
+            storage::BucketSubresourceKind::Lifecycle,
+        )
+        .map(|stored| stored.map(|stored| stored.body))
+        .map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
         drop(bucket_pg);
 
         raw_config
@@ -4196,7 +4198,7 @@ impl ReadRuntime {
         let bucket_pg = self
             .storage_node
             .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        let bucket_info = match bucket_pg.head_bucket(bucket) {
+        let bucket_info = match storage::PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
             Ok(info) => info,
             Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4210,7 +4212,7 @@ impl ReadRuntime {
         let meta_pg = self
             .storage_node
             .get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let stored = match meta_pg.get_object_meta(bucket, key) {
+        let stored = match storage::PgMetadataStore::get_object_meta(&*meta_pg, bucket, key) {
             Ok(stored) => stored,
             Err(storage::MetadataError::ObjectNotFound) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4249,7 +4251,7 @@ impl ReadRuntime {
                 Coordinator::permanently_delete_live_object_locked(&meta_pg, bucket, key, &record)?
             }
             BucketVersioningState::Enabled => {
-                let marker_vid = meta_pg.next_version_id(bucket, key)?;
+                let marker_vid = storage::PgMetadataStore::next_version_id(&*meta_pg, bucket, key)?;
                 Coordinator::put_delete_marker_locked(&meta_pg, bucket, key, marker_vid, owner)?;
                 None
             }
@@ -4275,7 +4277,7 @@ impl ReadRuntime {
         let bucket_pg = self
             .storage_node
             .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        let bucket_info = match bucket_pg.head_bucket(bucket) {
+        let bucket_info = match storage::PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
             Ok(info) => info,
             Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(0),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4289,7 +4291,8 @@ impl ReadRuntime {
         let meta_pg = self
             .storage_node
             .get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let versions = meta_pg.list_object_versions_for_key(bucket, key)?;
+        let versions =
+            storage::PgMetadataStore::list_object_versions_for_key(&*meta_pg, bucket, key)?;
         let due_versions = Coordinator::evaluate_due_noncurrent_version_expirations(
             &config, &versions, now_millis,
         )?;
@@ -4404,7 +4407,7 @@ impl ReadRuntime {
         let bucket_pg = self
             .storage_node
             .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        let bucket_info = match bucket_pg.head_bucket(bucket) {
+        let bucket_info = match storage::PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
             Ok(info) => info,
             Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4418,11 +4421,12 @@ impl ReadRuntime {
         let meta_pg = self
             .storage_node
             .get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let versions = match meta_pg.list_object_versions_for_key(bucket, key) {
-            Ok(versions) => versions,
-            Err(storage::MetadataError::ObjectNotFound) => return Ok(false),
-            Err(error) => return Err(ServerError::Metadata(error)),
-        };
+        let versions =
+            match storage::PgMetadataStore::list_object_versions_for_key(&*meta_pg, bucket, key) {
+                Ok(versions) => versions,
+                Err(storage::MetadataError::ObjectNotFound) => return Ok(false),
+                Err(error) => return Err(ServerError::Metadata(error)),
+            };
         let Some(expiration) =
             Coordinator::evaluate_due_expired_delete_marker(&config, &versions, now_millis)
         else {
@@ -4432,7 +4436,12 @@ impl ReadRuntime {
             return Ok(false);
         }
 
-        meta_pg.delete_object_version(bucket, key, expected_version_id)?;
+        storage::PgMetadataStore::delete_object_version(
+            &*meta_pg,
+            bucket,
+            key,
+            expected_version_id,
+        )?;
         Ok(true)
     }
 
@@ -4503,7 +4512,7 @@ impl ReadRuntime {
         let bucket_pg = self
             .storage_node
             .get_pg(self.pg_topology.bucket_pg_for(bucket))?;
-        let bucket_info = match bucket_pg.head_bucket(bucket) {
+        let bucket_info = match storage::PgMetadataStore::head_bucket(&*bucket_pg, bucket) {
             Ok(info) => info,
             Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(false),
             Err(error) => return Err(ServerError::Metadata(error)),
@@ -4727,16 +4736,28 @@ impl ReadRuntime {
                 return Ok(());
             }
 
-            if let Some(reclaim) = meta_pg.get_simple_payload_reclaim(bucket, key, generation_id)? {
+            if let Some(reclaim) = storage::PgMetadataStore::get_simple_payload_reclaim(
+                meta_pg,
+                bucket,
+                key,
+                generation_id,
+            )? {
                 Some(ReclaimPayload::Simple(reclaim))
-            } else if let Some(reclaim) =
-                meta_pg.get_object_segments_reclaim(bucket, key, generation_id)?
-            {
+            } else if let Some(reclaim) = storage::PgMetadataStore::get_object_segments_reclaim(
+                meta_pg,
+                bucket,
+                key,
+                generation_id,
+            )? {
                 Some(ReclaimPayload::Segments(reclaim))
             } else {
-                meta_pg
-                    .get_multipart_reclaim(bucket, key, generation_id)?
-                    .map(ReclaimPayload::Multipart)
+                storage::PgMetadataStore::get_multipart_reclaim(
+                    meta_pg,
+                    bucket,
+                    key,
+                    generation_id,
+                )?
+                .map(ReclaimPayload::Multipart)
             }
         };
 
@@ -4823,13 +4844,28 @@ impl ReadRuntime {
 
         match reclaim {
             ReclaimPayload::Simple(_) => {
-                meta_pg.delete_simple_payload_reclaim(bucket, key, generation_id)?;
+                storage::PgMetadataStore::delete_simple_payload_reclaim(
+                    meta_pg,
+                    bucket,
+                    key,
+                    generation_id,
+                )?;
             }
             ReclaimPayload::Segments(_) => {
-                meta_pg.delete_object_segments_reclaim(bucket, key, generation_id)?;
+                storage::PgMetadataStore::delete_object_segments_reclaim(
+                    meta_pg,
+                    bucket,
+                    key,
+                    generation_id,
+                )?;
             }
             ReclaimPayload::Multipart(_) => {
-                meta_pg.delete_multipart_reclaim(bucket, key, generation_id)?;
+                storage::PgMetadataStore::delete_multipart_reclaim(
+                    meta_pg,
+                    bucket,
+                    key,
+                    generation_id,
+                )?;
             }
         }
         self.enqueue_bucket_delete_finalize_for(bucket);
@@ -4855,7 +4891,7 @@ impl ReadRuntime {
         let bucket_pg_id = self.pg_topology.bucket_pg_for(bucket);
         {
             let bucket_pg = self.storage_node.get_pg(bucket_pg_id)?;
-            let info = match bucket_pg.head_bucket_raw(bucket) {
+            let info = match storage::PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket) {
                 Ok(info) => info,
                 Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(()),
                 Err(other) => return Err(ServerError::Metadata(other)),
@@ -4892,7 +4928,9 @@ impl ReadRuntime {
                 found_visible_data = true;
                 return Ok(());
             }
-            if let Some(root) = pg.get_bucket_payload_reclaim_root(bucket)? {
+            if let Some(root) =
+                storage::PgMetadataStore::get_bucket_payload_reclaim_root(&*pg, bucket)?
+            {
                 found_reclaim_root = true;
                 reclaim_roots.push(root);
             }
@@ -4922,12 +4960,12 @@ impl ReadRuntime {
 
         self.pg_topology.for_each_pg(|pg_id| {
             let pg = self.storage_node.get_pg(pg_id)?;
-            pg.delete_completed_multipart_uploads_for_bucket(bucket)
+            storage::PgMetadataStore::delete_completed_multipart_uploads_for_bucket(&*pg, bucket)
                 .map_err(ServerError::Metadata)
         })?;
 
         let bucket_pg = self.storage_node.get_pg(bucket_pg_id)?;
-        match bucket_pg.delete_bucket(bucket.as_str()) {
+        match storage::PgMetadataStore::delete_bucket(&*bucket_pg, bucket) {
             Ok(()) => Ok(()),
             Err(storage::MetadataError::BucketNotFound { .. }) => Ok(()),
             Err(other) => Err(ServerError::Metadata(other)),
@@ -5797,7 +5835,7 @@ impl Coordinator {
     ) -> Result<BucketSummary, ServerError> {
         loop {
             let bucket_pg = self.get_bucket_pg_for(bucket)?;
-            match bucket_pg.acquire_bucket_write_reservation(bucket.as_str()) {
+            match storage::PgMetadataStore::acquire_bucket_write_reservation(&*bucket_pg, bucket) {
                 Ok(info) => {
                     self.storage_node.upsert_bucket_fast_path((&info).into());
                     return Ok(Self::bucket_summary(info));
@@ -5818,14 +5856,14 @@ impl Coordinator {
 
     fn release_bucket_write_reservation_for(&self, bucket: &BucketName) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg_for(bucket)?;
-        bucket_pg
-            .release_bucket_write_reservation(bucket.as_str())
-            .map_err(|e| match e {
+        storage::PgMetadataStore::release_bucket_write_reservation(&*bucket_pg, bucket).map_err(
+            |e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
                 },
                 other => ServerError::Metadata(other),
-            })
+            },
+        )
     }
 
     fn with_unchecked_bucket_write_reservation_for<T>(
@@ -5866,7 +5904,7 @@ impl Coordinator {
     ) -> Result<u64, ServerError> {
         let bucket_pg = self.get_bucket_pg_for(bucket)?;
         bucket_pg
-            .next_completed_multipart_upload_order_for_bucket(bucket.as_str())
+            .next_completed_multipart_upload_order_for_bucket(bucket)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -5912,7 +5950,7 @@ impl Coordinator {
     fn begin_bucket_write_drain_for(&self, bucket: &BucketName) -> Result<(), ServerError> {
         loop {
             let bucket_pg = self.get_bucket_pg_for(bucket)?;
-            match bucket_pg.begin_bucket_write_drain(bucket.as_str()) {
+            match storage::PgMetadataStore::begin_bucket_write_drain(&*bucket_pg, bucket) {
                 Ok(()) => return Ok(()),
                 Err(storage::MetadataError::BucketWriteDraining) => {
                     drop(bucket_pg);
@@ -5934,12 +5972,17 @@ impl Coordinator {
     ) -> Result<(), ServerError> {
         loop {
             let bucket_pg = self.get_bucket_pg_for(bucket)?;
-            let info = bucket_pg.head_bucket(bucket).map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+            let info =
+                storage::PgMetadataStore::head_bucket(&*bucket_pg, bucket).map_err(
+                    |e| match e {
+                        storage::MetadataError::BucketNotFound { name } => {
+                            ServerError::BucketNotFound {
+                                name: name.to_string(),
+                            }
+                        }
+                        other => ServerError::Metadata(other),
+                    },
+                )?;
             if info.active_write_reservations == 0 {
                 return Ok(());
             }
@@ -5998,10 +6041,8 @@ impl Coordinator {
 
     #[cfg(test)]
     fn unchecked_active_bucket_summary(&self, name: &str) -> Result<BucketSummary, ServerError> {
-        if let Some(info) = self
-            .storage_node
-            .get_bucket_fast_path(&trusted_bucket_name(name))
-        {
+        let name = trusted_bucket_name(name);
+        if let Some(info) = self.storage_node.get_bucket_fast_path(&name) {
             if info.state == BucketState::Active {
                 return Ok(Self::bucket_summary_fast(info));
             }
@@ -6010,8 +6051,8 @@ impl Coordinator {
             });
         }
 
-        let bucket_pg = self.get_bucket_pg(name)?;
-        self.load_active_bucket_summary_from_pg(&bucket_pg, name)
+        let bucket_pg = self.get_bucket_pg(name.as_str())?;
+        self.load_active_bucket_summary_from_pg(&bucket_pg, &name)
     }
 
     fn unchecked_active_bucket_summary_for(
@@ -6028,7 +6069,7 @@ impl Coordinator {
         }
 
         let bucket_pg = self.get_bucket_pg_for(name)?;
-        self.load_active_bucket_summary_from_pg(&bucket_pg, name.as_str())
+        self.load_active_bucket_summary_from_pg(&bucket_pg, name)
     }
 
     fn checked_active_bucket_summary_for(
@@ -6274,9 +6315,9 @@ impl Coordinator {
     fn load_active_bucket_summary_from_pg(
         &self,
         bucket_pg: &storage::PgStore,
-        name: &str,
+        name: &BucketName,
     ) -> Result<BucketSummary, ServerError> {
-        let info = bucket_pg.head_bucket(name).map_err(|e| match e {
+        let info = storage::PgMetadataStore::head_bucket(bucket_pg, name).map_err(|e| match e {
             storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                 name: name.to_string(),
             },
@@ -6288,7 +6329,7 @@ impl Coordinator {
 
     // ── Bucket operations ─────────────────────────────────────────────
 
-    pub fn create_bucket(&self, req: &CreateBucketRequest<'_>) -> Result<(), ServerError> {
+    pub fn create_bucket(&self, req: &CreateBucketRequest) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
             "Coordinator::create_bucket",
@@ -6335,11 +6376,11 @@ impl Coordinator {
 
     fn validate_create_bucket_namespace(
         &self,
-        bucket: &str,
+        bucket: &BucketName,
         namespace: BucketNamespace,
         owner_account: &AccountIdentity,
     ) -> Result<bool, ServerError> {
-        let locked = parse_account_regional_bucket_name(bucket);
+        let locked = parse_account_regional_bucket_name(bucket.as_str());
         if namespace == BucketNamespace::AccountRegional && locked.is_none() {
             let account_id =
                 owner_account
@@ -6450,26 +6491,29 @@ impl Coordinator {
             object_lock: initial_object_lock,
         }) {
             Ok(()) => {
-                let info = bucket_pg.head_bucket(name).map_err(|e| match e {
-                    storage::MetadataError::BucketNotFound { name } => {
-                        ServerError::BucketNotFound {
-                            name: name.to_string(),
+                let info = storage::PgMetadataStore::head_bucket(&*bucket_pg, name).map_err(
+                    |e| match e {
+                        storage::MetadataError::BucketNotFound { name } => {
+                            ServerError::BucketNotFound {
+                                name: name.to_string(),
+                            }
                         }
-                    }
-                    other => ServerError::Metadata(other),
-                })?;
+                        other => ServerError::Metadata(other),
+                    },
+                )?;
                 self.storage_node.upsert_bucket_fast_path((&info).into());
                 Ok(BucketCreateOutcome::Created)
             }
             Err(storage::MetadataError::BucketAlreadyExists) => {
-                let existing = bucket_pg.head_bucket_raw(name).map_err(|e| match e {
-                    storage::MetadataError::BucketNotFound { name } => {
-                        ServerError::BucketNotFound {
-                            name: name.to_string(),
+                let existing = storage::PgMetadataStore::head_bucket_raw(&*bucket_pg, name)
+                    .map_err(|e| match e {
+                        storage::MetadataError::BucketNotFound { name } => {
+                            ServerError::BucketNotFound {
+                                name: name.to_string(),
+                            }
                         }
-                    }
-                    other => ServerError::Metadata(other),
-                })?;
+                        other => ServerError::Metadata(other),
+                    })?;
                 match existing.state {
                     BucketState::Active
                         if existing.owner_principal == owner.principal
@@ -6658,19 +6702,22 @@ impl Coordinator {
         );
         let authorized = self.authorize_put_bucket_versioning(req)?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        bucket_pg
-            .put_bucket_versioning(&authorized.bucket, authorized.state)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                storage::MetadataError::InvalidVersioningTransition { from, to } => {
-                    ServerError::InvalidRequest {
-                        reason: format!("invalid versioning transition from {from:?} to {to:?}"),
-                    }
+        storage::PgMetadataStore::put_bucket_versioning(
+            &*bucket_pg,
+            &authorized.bucket,
+            authorized.state,
+        )
+        .map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            storage::MetadataError::InvalidVersioningTransition { from, to } => {
+                ServerError::InvalidRequest {
+                    reason: format!("invalid versioning transition from {from:?} to {to:?}"),
                 }
-                other => ServerError::Metadata(other),
-            })?;
+            }
+            other => ServerError::Metadata(other),
+        })?;
         self.storage_node
             .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
                 info.versioning = authorized.state
@@ -6706,14 +6753,17 @@ impl Coordinator {
         );
         let authorized = self.authorize_put_bucket_object_lock_configuration(req)?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        bucket_pg
-            .put_bucket_object_lock(&authorized.bucket, authorized.config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        storage::PgMetadataStore::put_bucket_object_lock(
+            &*bucket_pg,
+            &authorized.bucket,
+            authorized.config,
+        )
+        .map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
         self.storage_node
             .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
                 info.object_lock = authorized.config
@@ -6748,14 +6798,17 @@ impl Coordinator {
         );
         let authorized = self.authorize_put_bucket_encryption(req)?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        bucket_pg
-            .put_bucket_encryption(&authorized.bucket, authorized.config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        storage::PgMetadataStore::put_bucket_encryption(
+            &*bucket_pg,
+            &authorized.bucket,
+            authorized.config,
+        )
+        .map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
         self.storage_node
             .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
                 info.encryption = authorized.effective_config
@@ -6786,14 +6839,17 @@ impl Coordinator {
         );
         let authorized = self.authorize_delete_bucket_encryption(req)?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        bucket_pg
-            .put_bucket_encryption(&authorized.bucket, BucketEncryptionConfig::default())
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        storage::PgMetadataStore::put_bucket_encryption(
+            &*bucket_pg,
+            &authorized.bucket,
+            BucketEncryptionConfig::default(),
+        )
+        .map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
         self.storage_node
             .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
                 info.encryption = EffectiveBucketEncryptionConfig::default()
@@ -6907,8 +6963,7 @@ impl Coordinator {
             },
         )?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        let info = bucket_pg
-            .head_bucket_raw(&authorized.bucket)
+        let info = storage::PgMetadataStore::head_bucket_raw(&*bucket_pg, &authorized.bucket)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -6959,8 +7014,7 @@ impl Coordinator {
         let authorized = self.authorize_delete_bucket_policy(req)?;
         self.remove_authorized_bucket_subresource(&authorized)?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        let info = bucket_pg
-            .head_bucket_raw(&authorized.bucket)
+        let info = storage::PgMetadataStore::head_bucket_raw(&*bucket_pg, &authorized.bucket)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -6993,8 +7047,7 @@ impl Coordinator {
             },
         )?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        let info = bucket_pg
-            .head_bucket_raw(&authorized.bucket)
+        let info = storage::PgMetadataStore::head_bucket_raw(&*bucket_pg, &authorized.bucket)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -7034,8 +7087,7 @@ impl Coordinator {
         let authorized = self.authorize_delete_bucket_lifecycle(req)?;
         self.remove_authorized_bucket_subresource(&authorized)?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        let info = bucket_pg
-            .head_bucket_raw(&authorized.bucket)
+        let info = storage::PgMetadataStore::head_bucket_raw(&*bucket_pg, &authorized.bucket)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -7060,14 +7112,17 @@ impl Coordinator {
         );
         let authorized = self.authorize_put_bucket_public_access_block(req)?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        bucket_pg
-            .put_bucket_public_access_block(&authorized.bucket, authorized.config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        storage::PgMetadataStore::put_bucket_public_access_block(
+            &*bucket_pg,
+            &authorized.bucket,
+            authorized.config,
+        )
+        .map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
         self.storage_node
             .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
                 info.public_access_block = Some(authorized.config);
@@ -7087,8 +7142,7 @@ impl Coordinator {
         );
         let authorized = self.authorize_get_bucket_public_access_block(req)?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        bucket_pg
-            .get_bucket_public_access_block(&authorized.bucket)
+        storage::PgMetadataStore::get_bucket_public_access_block(&*bucket_pg, &authorized.bucket)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -7109,14 +7163,16 @@ impl Coordinator {
         );
         let authorized = self.authorize_delete_bucket_public_access_block(req)?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        bucket_pg
-            .delete_bucket_public_access_block(&authorized.bucket)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        storage::PgMetadataStore::delete_bucket_public_access_block(
+            &*bucket_pg,
+            &authorized.bucket,
+        )
+        .map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
         self.storage_node
             .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
                 info.public_access_block = None
@@ -7137,14 +7193,17 @@ impl Coordinator {
         );
         let authorized = self.authorize_put_bucket_ownership_controls(req)?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        bucket_pg
-            .put_bucket_ownership_controls(&authorized.bucket, authorized.config)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        storage::PgMetadataStore::put_bucket_ownership_controls(
+            &*bucket_pg,
+            &authorized.bucket,
+            authorized.config,
+        )
+        .map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
         self.storage_node
             .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
                 info.ownership_controls = Some(authorized.config);
@@ -7164,8 +7223,7 @@ impl Coordinator {
         );
         let authorized = self.authorize_get_bucket_ownership_controls(req)?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        bucket_pg
-            .get_bucket_ownership_controls(&authorized.bucket)
+        storage::PgMetadataStore::get_bucket_ownership_controls(&*bucket_pg, &authorized.bucket)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -7186,8 +7244,7 @@ impl Coordinator {
         );
         let authorized = self.authorize_delete_bucket_ownership_controls(req)?;
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        bucket_pg
-            .delete_bucket_ownership_controls(&authorized.bucket)
+        storage::PgMetadataStore::delete_bucket_ownership_controls(&*bucket_pg, &authorized.bucket)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
@@ -7242,19 +7299,19 @@ impl Coordinator {
         authorized: &AuthorizedPutBucketAcl,
     ) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        bucket_pg
-            .put_bucket_acl(
-                &authorized.bucket,
-                &authorized.acl_grants,
-                authorized.public_read,
-                authorized.public_write,
-            )
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
+        storage::PgMetadataStore::put_bucket_acl(
+            &*bucket_pg,
+            &authorized.bucket,
+            &authorized.acl_grants,
+            authorized.public_read,
+            authorized.public_write,
+        )
+        .map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
         self.storage_node
             .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
                 info.acl_grants = authorized.acl_grants.clone();
@@ -7284,14 +7341,14 @@ impl Coordinator {
         req: storage::PutBucketSubresource<'_>,
     ) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg_for(name)?;
-        bucket_pg
-            .put_bucket_subresource(name, req)
-            .map_err(|e| match e {
+        storage::PgMetadataStore::put_bucket_subresource(&*bucket_pg, name, req).map_err(
+            |e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
                 },
                 other => ServerError::Metadata(other),
-            })
+            },
+        )
     }
 
     fn load_authorized_bucket_subresource(
@@ -7307,14 +7364,17 @@ impl Coordinator {
         authorized: &AuthorizedBucketSubresourceDelete,
     ) -> Result<(), ServerError> {
         let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        bucket_pg
-            .delete_bucket_subresource(&authorized.bucket, authorized.kind)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+        storage::PgMetadataStore::delete_bucket_subresource(
+            &*bucket_pg,
+            &authorized.bucket,
+            authorized.kind,
+        )
+        .map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })
     }
 
     fn load_bucket_subresource_from_pg(
@@ -7322,8 +7382,7 @@ impl Coordinator {
         bucket: &BucketName,
         kind: storage::BucketSubresourceKind,
     ) -> Result<Option<String>, ServerError> {
-        bucket_pg
-            .get_bucket_subresource(bucket, kind)
+        storage::PgMetadataStore::get_bucket_subresource(bucket_pg, bucket, kind)
             .map(|stored| stored.map(|stored| stored.body))
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
@@ -7342,18 +7401,22 @@ impl Coordinator {
         acl_grants: AclGrants,
         public_read: bool,
     ) -> Result<VersionId, ServerError> {
-        meta_pg
-            .put_object_acl(bucket, key, version_id, &acl_grants, public_read)
-            .map_err(|e| match e {
-                storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
-                    bucket: bucket.to_string(),
-                    key: key.to_string(),
-                },
-                storage::MetadataError::MethodNotAllowedOnDeleteMarker => {
-                    ServerError::MethodNotAllowed
-                }
-                other => ServerError::Metadata(other),
-            })?;
+        storage::PgMetadataStore::put_object_acl(
+            meta_pg,
+            bucket,
+            key,
+            version_id,
+            &acl_grants,
+            public_read,
+        )
+        .map_err(|e| match e {
+            storage::MetadataError::ObjectNotFound => ServerError::ObjectNotFound {
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+            },
+            storage::MetadataError::MethodNotAllowedOnDeleteMarker => ServerError::MethodNotAllowed,
+            other => ServerError::Metadata(other),
+        })?;
         Ok(version_id)
     }
 
@@ -7599,16 +7662,14 @@ impl Coordinator {
             req.tags.len()
         );
         let authorized = self.authorize_put_object_tags(req)?;
-        authorized
-            .pgs
-            .meta()
-            .put_object_tags(
-                &authorized.bucket,
-                &authorized.key,
-                authorized.version_id,
-                req.tags,
-            )
-            .map_err(ServerError::Metadata)
+        storage::PgMetadataStore::put_object_tags(
+            authorized.pgs.meta(),
+            &authorized.bucket,
+            &authorized.key,
+            authorized.version_id,
+            req.tags,
+        )
+        .map_err(ServerError::Metadata)
     }
 
     pub fn put_object_retention(
@@ -7626,21 +7687,17 @@ impl Coordinator {
             req.bypass_governance
         );
         let authorized = self.authorize_put_object_retention(req)?;
-        authorized
-            .pgs
-            .meta()
-            .put_object_retention(
-                &authorized.bucket,
-                &authorized.key,
-                authorized.version_id,
-                authorized.retention,
-            )
-            .map_err(|e| match e {
-                storage::MetadataError::MethodNotAllowedOnDeleteMarker => {
-                    ServerError::MethodNotAllowed
-                }
-                other => ServerError::Metadata(other),
-            })
+        storage::PgMetadataStore::put_object_retention(
+            authorized.pgs.meta(),
+            &authorized.bucket,
+            &authorized.key,
+            authorized.version_id,
+            authorized.retention,
+        )
+        .map_err(|e| match e {
+            storage::MetadataError::MethodNotAllowedOnDeleteMarker => ServerError::MethodNotAllowed,
+            other => ServerError::Metadata(other),
+        })
     }
 
     pub fn get_object_retention(
@@ -7673,21 +7730,17 @@ impl Coordinator {
             req.legal_hold
         );
         let authorized = self.authorize_put_object_legal_hold(req)?;
-        authorized
-            .pgs
-            .meta()
-            .put_object_legal_hold(
-                &authorized.bucket,
-                &authorized.key,
-                authorized.version_id,
-                authorized.legal_hold,
-            )
-            .map_err(|e| match e {
-                storage::MetadataError::MethodNotAllowedOnDeleteMarker => {
-                    ServerError::MethodNotAllowed
-                }
-                other => ServerError::Metadata(other),
-            })
+        storage::PgMetadataStore::put_object_legal_hold(
+            authorized.pgs.meta(),
+            &authorized.bucket,
+            &authorized.key,
+            authorized.version_id,
+            authorized.legal_hold,
+        )
+        .map_err(|e| match e {
+            storage::MetadataError::MethodNotAllowedOnDeleteMarker => ServerError::MethodNotAllowed,
+            other => ServerError::Metadata(other),
+        })
     }
 
     pub fn get_object_legal_hold(
@@ -7718,11 +7771,13 @@ impl Coordinator {
             req.object.key
         );
         let authorized = self.authorize_get_object_tags(req)?;
-        authorized
-            .pgs
-            .meta()
-            .get_object_tags(&authorized.bucket, &authorized.key, authorized.version_id)
-            .map_err(ServerError::Metadata)
+        storage::PgMetadataStore::get_object_tags(
+            authorized.pgs.meta(),
+            &authorized.bucket,
+            &authorized.key,
+            authorized.version_id,
+        )
+        .map_err(ServerError::Metadata)
     }
 
     pub fn delete_object_tags(&self, req: &ObjectVersionRequest<'_>) -> Result<(), ServerError> {
@@ -7734,11 +7789,13 @@ impl Coordinator {
             req.object.key
         );
         let authorized = self.authorize_delete_object_tags(req)?;
-        authorized
-            .pgs
-            .meta()
-            .delete_object_tags(&authorized.bucket, &authorized.key, authorized.version_id)
-            .map_err(ServerError::Metadata)
+        storage::PgMetadataStore::delete_object_tags(
+            authorized.pgs.meta(),
+            &authorized.bucket,
+            &authorized.key,
+            authorized.version_id,
+        )
+        .map_err(ServerError::Metadata)
     }
 
     pub fn get_object_acl(
@@ -7788,11 +7845,12 @@ impl Coordinator {
             Self::prepare_stored_system_metadata(req.system_metadata, req.write_encryption)?;
 
         if !req.cond.is_empty() {
-            let existing_etag = match meta_pg.get_object_meta(req.bucket, req.key) {
-                Ok(stored) => stored.as_live().map(|record| record.etag.format()),
-                Err(storage::MetadataError::ObjectNotFound) => None,
-                Err(e) => return Err(ServerError::Metadata(e)),
-            };
+            let existing_etag =
+                match storage::PgMetadataStore::get_object_meta(meta_pg, req.bucket, req.key) {
+                    Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+                    Err(storage::MetadataError::ObjectNotFound) => None,
+                    Err(e) => return Err(ServerError::Metadata(e)),
+                };
             if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
                 return Err(ServerError::ObjectNotFound {
                     bucket: req.bucket.to_string(),
@@ -7803,11 +7861,12 @@ impl Coordinator {
         }
 
         let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
-            meta_pg.next_version_id(req.bucket, req.key)?
+            storage::PgMetadataStore::next_version_id(meta_pg, req.bucket, req.key)?
         } else {
             VersionId::Null
         };
-        let generation_id = meta_pg.next_generation_id(req.bucket, req.key)?;
+        let generation_id =
+            storage::PgMetadataStore::next_generation_id(meta_pg, req.bucket, req.key)?;
         let stale_payload = if version_id.is_null() {
             Self::snapshot_overwritten_null_version_payload(meta_pg, req.bucket, req.key)?
         } else {
@@ -8220,7 +8279,7 @@ impl Coordinator {
     ) -> Result<Option<StoredObject>, ServerError> {
         let meta_pg_id = self.object_pg_id_for(bucket, key);
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-        match meta_pg.get_object_meta(bucket, key) {
+        match storage::PgMetadataStore::get_object_meta(&*meta_pg, bucket, key) {
             Ok(object @ StoredObject::Live(_)) => Ok(Some(object)),
             Ok(StoredObject::DeleteMarker(_)) | Err(storage::MetadataError::ObjectNotFound) => {
                 Ok(None)
@@ -8447,9 +8506,12 @@ impl Coordinator {
                 prepared.version_id,
                 prepared.stale_payload.as_ref(),
             )?;
-            let stored = meta_pg
-                .get_object_meta(authorized.bucket_typed(), authorized.key_typed())
-                .map_err(ServerError::Metadata)?;
+            let stored = storage::PgMetadataStore::get_object_meta(
+                meta_pg,
+                authorized.bucket_typed(),
+                authorized.key_typed(),
+            )
+            .map_err(ServerError::Metadata)?;
             let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
                 reason: format!(
                     "stored object {} / {} is not live immediately after PutObject",
@@ -9201,8 +9263,11 @@ impl Coordinator {
                 prepared.version_id,
                 prepared.stale_payload.as_ref(),
             )?;
-        let stored = meta_guard
-            .get_object_meta(req.object.bucket_name_typed(), req.object.key_typed())
+        let stored = storage::PgMetadataStore::get_object_meta(
+            &*meta_guard,
+            req.object.bucket_name_typed(),
+            req.object.key_typed(),
+        )
             .map_err(ServerError::Metadata)?;
             let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
                 reason: format!(
@@ -9754,9 +9819,13 @@ impl Coordinator {
 
                 // Non-multipart payloads now read through committed object segments.
                 let meta_pg = pgs.meta();
-                let segments = meta_pg
-                    .get_object_segments(&req.source.bucket, &req.source.key, src_record.version_id)
-                    .map_err(ServerError::Metadata)?;
+                let segments = storage::PgMetadataStore::get_object_segments(
+                    meta_pg,
+                    &req.source.bucket,
+                    &req.source.key,
+                    src_record.version_id,
+                )
+                .map_err(ServerError::Metadata)?;
 
                 let body = if src_record.size == 0 {
                     drop(pgs);
@@ -9894,12 +9963,12 @@ impl Coordinator {
                 req.destination.bucket.name_typed(),
                 req.destination.key_typed(),
             ))?;
-            let dst_stored = dst_meta_pg
-                .get_object_meta(
-                    req.destination.bucket.name_typed(),
-                    req.destination.key_typed(),
-                )
-                .map_err(ServerError::Metadata)?;
+            let dst_stored = storage::PgMetadataStore::get_object_meta(
+                &*dst_meta_pg,
+                req.destination.bucket.name_typed(),
+                req.destination.key_typed(),
+            )
+            .map_err(ServerError::Metadata)?;
             let dst_live = dst_stored
                 .as_live()
                 .ok_or_else(|| ServerError::InternalError {
@@ -9952,8 +10021,8 @@ impl Coordinator {
         version_id: Option<VersionId>,
     ) -> Result<StoredObject, ServerError> {
         match version_id {
-            Some(vid) => meta_pg.get_object_version(bucket, key, vid),
-            None => meta_pg.get_object_meta(bucket, key),
+            Some(vid) => storage::PgMetadataStore::get_object_version(meta_pg, bucket, key, vid),
+            None => storage::PgMetadataStore::get_object_meta(meta_pg, bucket, key),
         }
         .map_err(|e| match e {
             storage::MetadataError::ObjectNotFound if version_id.is_some() => {
@@ -10130,25 +10199,30 @@ impl Coordinator {
             }]);
         }
 
-        meta_pg
-            .get_multipart_part_segments(bucket, key, version_id, part.part_number)
-            .map(|segments| {
-                segments
-                    .into_iter()
-                    .map(|segment| SegmentPayloadRecord {
-                        segment_index: segment.segment_index,
-                        size: segment.size,
-                        segment_crc64: segment.segment_crc64,
-                        segment_okh: segment.segment_okh,
-                        segment_vid: segment.segment_vid,
-                        shard_pg_id: segment.shard_pg_id,
-                        ec_k: segment.ec_k,
-                        ec_m: segment.ec_m,
-                        encryption: encryption.clone(),
-                    })
-                    .collect()
-            })
-            .map_err(ServerError::Metadata)
+        storage::PgMetadataStore::get_multipart_part_segments(
+            meta_pg,
+            bucket,
+            key,
+            version_id,
+            part.part_number,
+        )
+        .map(|segments| {
+            segments
+                .into_iter()
+                .map(|segment| SegmentPayloadRecord {
+                    segment_index: segment.segment_index,
+                    size: segment.size,
+                    segment_crc64: segment.segment_crc64,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    shard_pg_id: segment.shard_pg_id,
+                    ec_k: segment.ec_k,
+                    ec_m: segment.ec_m,
+                    encryption: encryption.clone(),
+                })
+                .collect()
+        })
+        .map_err(ServerError::Metadata)
     }
 
     fn snapshot_multipart_parts(
@@ -10158,8 +10232,7 @@ impl Coordinator {
         version_id: VersionId,
         encryption: &ObjectEncryption,
     ) -> Result<Vec<SnapshottedMultipartPart>, ServerError> {
-        let parts = meta_pg
-            .get_object_parts(bucket, key, version_id)
+        let parts = storage::PgMetadataStore::get_object_parts(meta_pg, bucket, key, version_id)
             .map_err(ServerError::Metadata)?;
         let mut snapshotted = Vec::with_capacity(parts.len());
         let mut object_offset_start = 0usize;
@@ -10186,9 +10259,15 @@ impl Coordinator {
         start: u64,
         end_exclusive: u64,
     ) -> Result<Vec<SnapshottedMultipartPart>, ServerError> {
-        let parts = meta_pg
-            .get_object_parts_overlapping_range(bucket, key, version_id, start, end_exclusive)
-            .map_err(ServerError::Metadata)?;
+        let parts = storage::PgMetadataStore::get_object_parts_overlapping_range(
+            meta_pg,
+            bucket,
+            key,
+            version_id,
+            start,
+            end_exclusive,
+        )
+        .map_err(ServerError::Metadata)?;
         let mut snapshotted = Vec::with_capacity(parts.len());
         for part in parts {
             let segments = Self::multipart_part_payloads(
@@ -10208,7 +10287,12 @@ impl Coordinator {
         bucket: &BucketName,
         key: &ObjectKey,
     ) -> Result<Option<StaleObjectPayload>, ServerError> {
-        let stored = match meta_pg.get_object_version(bucket, key, VersionId::Null) {
+        let stored = match storage::PgMetadataStore::get_object_version(
+            meta_pg,
+            bucket,
+            key,
+            VersionId::Null,
+        ) {
             Ok(stored) => stored,
             Err(storage::MetadataError::ObjectNotFound) => return Ok(None),
             Err(e) => return Err(ServerError::Metadata(e)),
@@ -10220,20 +10304,24 @@ impl Coordinator {
 
         match record.layout {
             ObjectLayout::MultipartManifest { .. } => {
-                let parts = meta_pg
-                    .get_object_parts(bucket, key, VersionId::Null)
-                    .map_err(ServerError::Metadata)?;
+                let parts = storage::PgMetadataStore::get_object_parts(
+                    meta_pg,
+                    bucket,
+                    key,
+                    VersionId::Null,
+                )
+                .map_err(ServerError::Metadata)?;
                 let mut streaming_segments = Vec::new();
                 for part in &parts {
                     if part.part_okh == [0u8; 16] {
-                        let segments = meta_pg
-                            .get_multipart_part_segments(
-                                bucket,
-                                key,
-                                VersionId::Null,
-                                part.part_number,
-                            )
-                            .map_err(ServerError::Metadata)?;
+                        let segments = storage::PgMetadataStore::get_multipart_part_segments(
+                            meta_pg,
+                            bucket,
+                            key,
+                            VersionId::Null,
+                            part.part_number,
+                        )
+                        .map_err(ServerError::Metadata)?;
                         streaming_segments.extend(segments);
                     }
                 }
@@ -10244,9 +10332,13 @@ impl Coordinator {
                 }))
             }
             ObjectLayout::Standard => {
-                let segments = meta_pg
-                    .get_object_segments(bucket, key, VersionId::Null)
-                    .map_err(ServerError::Metadata)?;
+                let segments = storage::PgMetadataStore::get_object_segments(
+                    meta_pg,
+                    bucket,
+                    key,
+                    VersionId::Null,
+                )
+                .map_err(ServerError::Metadata)?;
                 Ok(Some(StaleObjectPayload::Segments {
                     generation_id: record.generation_id,
                     segments,
@@ -10274,8 +10366,7 @@ impl Coordinator {
                     *generation_id,
                     segments,
                 )?;
-                meta_pg
-                    .delete_object_segments(bucket, key, version_id)
+                storage::PgMetadataStore::delete_object_segments(meta_pg, bucket, key, version_id)
                     .map_err(ServerError::Metadata)
             }
             StaleObjectPayload::Multipart {
@@ -10292,12 +10383,12 @@ impl Coordinator {
                     streaming_segments,
                 )?;
                 if !streaming_segments.is_empty() {
-                    meta_pg
-                        .delete_multipart_part_segments(bucket, key, version_id)
-                        .map_err(ServerError::Metadata)?;
+                    storage::PgMetadataStore::delete_multipart_part_segments(
+                        meta_pg, bucket, key, version_id,
+                    )
+                    .map_err(ServerError::Metadata)?;
                 }
-                meta_pg
-                    .delete_object_parts(bucket, key, version_id)
+                storage::PgMetadataStore::delete_object_parts(meta_pg, bucket, key, version_id)
                     .map_err(ServerError::Metadata)
             }
         }
@@ -10323,20 +10414,20 @@ impl Coordinator {
         record: &LiveObjectRecord,
     ) -> Result<Option<DeletedLiveObjectReclaim>, ServerError> {
         let reclaim = if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
-            let obj_parts = meta_pg
-                .get_object_parts(bucket, key, record.version_id)
-                .map_err(ServerError::Metadata)?;
+            let obj_parts =
+                storage::PgMetadataStore::get_object_parts(meta_pg, bucket, key, record.version_id)
+                    .map_err(ServerError::Metadata)?;
             let mut streaming_segments: Vec<MultipartPartSegmentRecord> = Vec::new();
             for part in &obj_parts {
                 if part.part_okh == [0u8; 16] {
-                    let segments = meta_pg
-                        .get_multipart_part_segments(
-                            bucket,
-                            key,
-                            record.version_id,
-                            part.part_number,
-                        )
-                        .map_err(ServerError::Metadata)?;
+                    let segments = storage::PgMetadataStore::get_multipart_part_segments(
+                        meta_pg,
+                        bucket,
+                        key,
+                        record.version_id,
+                        part.part_number,
+                    )
+                    .map_err(ServerError::Metadata)?;
                     streaming_segments.extend(segments);
                 }
             }
@@ -10349,19 +10440,27 @@ impl Coordinator {
                 &streaming_segments,
             )?;
             if !streaming_segments.is_empty() {
-                meta_pg
-                    .delete_multipart_part_segments(bucket, key, record.version_id)
-                    .map_err(ServerError::Metadata)?;
+                storage::PgMetadataStore::delete_multipart_part_segments(
+                    meta_pg,
+                    bucket,
+                    key,
+                    record.version_id,
+                )
+                .map_err(ServerError::Metadata)?;
             }
-            meta_pg.delete_object_parts(bucket, key, record.version_id)?;
+            storage::PgMetadataStore::delete_object_parts(meta_pg, bucket, key, record.version_id)?;
             Some(DeletedLiveObjectReclaim {
                 generation_id: record.generation_id,
                 kind: DeletedLiveObjectKind::Multipart,
             })
         } else {
-            let segments = meta_pg
-                .get_object_segments(bucket, key, record.version_id)
-                .map_err(ServerError::Metadata)?;
+            let segments = storage::PgMetadataStore::get_object_segments(
+                meta_pg,
+                bucket,
+                key,
+                record.version_id,
+            )
+            .map_err(ServerError::Metadata)?;
             Self::enqueue_object_segments_reclaim(
                 meta_pg,
                 bucket,
@@ -10369,9 +10468,13 @@ impl Coordinator {
                 record.generation_id,
                 &segments,
             )?;
-            meta_pg
-                .delete_object_segments(bucket, key, record.version_id)
-                .map_err(ServerError::Metadata)?;
+            storage::PgMetadataStore::delete_object_segments(
+                meta_pg,
+                bucket,
+                key,
+                record.version_id,
+            )
+            .map_err(ServerError::Metadata)?;
             Some(DeletedLiveObjectReclaim {
                 generation_id: record.generation_id,
                 kind: DeletedLiveObjectKind::Segments,
@@ -10379,11 +10482,15 @@ impl Coordinator {
         };
 
         if record.version_id.is_null() {
-            meta_pg.delete_object_meta(bucket, key)?;
+            storage::PgMetadataStore::delete_object_meta(meta_pg, bucket, key)?;
         } else {
-            meta_pg
-                .delete_object_version(bucket, key, record.version_id)
-                .map_err(ServerError::Metadata)?;
+            storage::PgMetadataStore::delete_object_version(
+                meta_pg,
+                bucket,
+                key,
+                record.version_id,
+            )
+            .map_err(ServerError::Metadata)?;
         }
 
         Ok(reclaim)
@@ -10693,13 +10800,13 @@ impl Coordinator {
 
             // Non-multipart payloads now read through committed object segments.
             let meta_pg = pgs.meta();
-            let segments = meta_pg
-                .get_object_segments(
-                    req.object.bucket_name_typed(),
-                    req.object.key_typed(),
-                    record.version_id,
-                )
-                .map_err(ServerError::Metadata)?;
+            let segments = storage::PgMetadataStore::get_object_segments(
+                meta_pg,
+                req.object.bucket_name_typed(),
+                req.object.key_typed(),
+                record.version_id,
+            )
+            .map_err(ServerError::Metadata)?;
 
             let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
             let system_metadata = self.deserialize_visible_system_metadata(
@@ -10929,13 +11036,13 @@ impl Coordinator {
 
             // Non-multipart payloads now read through committed object segments.
             let meta_pg = pgs.meta();
-            let segments = meta_pg
-                .get_object_segments(
-                    req.object.bucket_name_typed(),
-                    req.object.key_typed(),
-                    record.version_id,
-                )
-                .map_err(ServerError::Metadata)?;
+            let segments = storage::PgMetadataStore::get_object_segments(
+                meta_pg,
+                req.object.bucket_name_typed(),
+                req.object.key_typed(),
+                record.version_id,
+            )
+            .map_err(ServerError::Metadata)?;
 
             let body = if user_size == 0 {
                 drop(pgs);
@@ -11062,13 +11169,13 @@ impl Coordinator {
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
             let meta_pg = pgs.meta();
-            let obj_parts = meta_pg
-                .get_object_parts(
-                    req.object.bucket_name_typed(),
-                    req.object.key_typed(),
-                    record.version_id,
-                )
-                .map_err(ServerError::Metadata)?;
+            let obj_parts = storage::PgMetadataStore::get_object_parts(
+                meta_pg,
+                req.object.bucket_name_typed(),
+                req.object.key_typed(),
+                record.version_id,
+            )
+            .map_err(ServerError::Metadata)?;
             drop(pgs);
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 let lifecycle_bucket = self.checked_active_bucket_summary_for(
@@ -11339,7 +11446,8 @@ impl Coordinator {
                 if has_checksum {
                     // Checksummed multipart: full detail with parts, pagination
                     let meta_pg = pgs.meta();
-                    let all_parts = meta_pg.get_object_parts(
+                    let all_parts = storage::PgMetadataStore::get_object_parts(
+                        meta_pg,
                         req.object.bucket_name_typed(),
                         req.object.key_typed(),
                         record.version_id,
@@ -11388,7 +11496,8 @@ impl Coordinator {
                 } else {
                     // Non-checksummed multipart: only PartsCount
                     let meta_pg = pgs.meta();
-                    let all_parts = meta_pg.get_object_parts(
+                    let all_parts = storage::PgMetadataStore::get_object_parts(
+                        meta_pg,
                         req.object.bucket_name_typed(),
                         req.object.key_typed(),
                         record.version_id,
@@ -11577,13 +11686,13 @@ impl Coordinator {
 
             // Non-multipart payloads now read through committed object segments.
             let meta_pg = pgs.meta();
-            let segments = meta_pg
-                .get_object_segments(
-                    req.object.bucket_name_typed(),
-                    req.object.key_typed(),
-                    record.version_id,
-                )
-                .map_err(ServerError::Metadata)?;
+            let segments = storage::PgMetadataStore::get_object_segments(
+                meta_pg,
+                req.object.bucket_name_typed(),
+                req.object.key_typed(),
+                record.version_id,
+            )
+            .map_err(ServerError::Metadata)?;
 
             let body = ReadHandle::from_segments_range(
                 ReadObjectContext {
@@ -11743,7 +11852,9 @@ impl Coordinator {
                         })
                     }
                     StoredObject::DeleteMarker(_) => {
-                        meta_pg.delete_object_version(&bucket, &key, version_id)?;
+                        storage::PgMetadataStore::delete_object_version(
+                            meta_pg, &bucket, &key, version_id,
+                        )?;
                         Ok(DeleteObjectResult {
                             version_id,
                             delete_marker: true,
@@ -11774,7 +11885,8 @@ impl Coordinator {
                         }
 
                         let meta_pg = pgs.meta();
-                        let marker_vid = meta_pg.next_version_id(&bucket, &key)?;
+                        let marker_vid =
+                            storage::PgMetadataStore::next_version_id(meta_pg, &bucket, &key)?;
                         Self::put_delete_marker_locked(meta_pg, &bucket, &key, marker_vid, owner)?;
                         marker_vid
                     }
@@ -11784,7 +11896,8 @@ impl Coordinator {
                         }
                         let meta_pg_id = self.object_pg_id_for(&bucket, &key);
                         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-                        let marker_vid = meta_pg.next_version_id(&bucket, &key)?;
+                        let marker_vid =
+                            storage::PgMetadataStore::next_version_id(&*meta_pg, &bucket, &key)?;
                         Self::put_delete_marker_locked(&meta_pg, &bucket, &key, marker_vid, owner)?;
                         marker_vid
                     }
@@ -11950,7 +12063,9 @@ impl Coordinator {
                 if let Some(after_prefix) = token_str.strip_prefix(prefix_str) {
                     if after_prefix.ends_with(delimiter) {
                         if let Some(upper_bound) = key_prefix_upper_bound(token_str) {
-                            Some(ListObjectsPageStart::At(trusted_object_key(upper_bound)))
+                            Some(ListObjectsPageStart::At(parse_list_object_key(
+                                upper_bound.as_str(),
+                            )?))
                         } else {
                             Some(ListObjectsPageStart::After(token))
                         }
@@ -12529,9 +12644,13 @@ impl Coordinator {
             } else {
                 // Non-multipart source: check for object segments first.
                 let meta_pg = pgs.meta();
-                let segments = meta_pg
-                    .get_object_segments(&req.source.bucket, &req.source.key, src_record.version_id)
-                    .map_err(ServerError::Metadata)?;
+                let segments = storage::PgMetadataStore::get_object_segments(
+                    meta_pg,
+                    &req.source.bucket,
+                    &req.source.key,
+                    src_record.version_id,
+                )
+                .map_err(ServerError::Metadata)?;
 
                 let body = ReadHandle::from_segments_range(
                     ReadObjectContext {
@@ -12722,11 +12841,12 @@ impl Coordinator {
         }
 
         if !req.cond.is_empty() {
-            let existing_etag = match meta_pg.get_object_meta(&bucket, &key) {
-                Ok(stored) => stored.as_live().map(|record| record.etag.format()),
-                Err(storage::MetadataError::ObjectNotFound) => None,
-                Err(e) => return Err(ServerError::Metadata(e)),
-            };
+            let existing_etag =
+                match storage::PgMetadataStore::get_object_meta(&*meta_pg, &bucket, &key) {
+                    Ok(stored) => stored.as_live().map(|record| record.etag.format()),
+                    Err(storage::MetadataError::ObjectNotFound) => None,
+                    Err(e) => return Err(ServerError::Metadata(e)),
+                };
             if matches!(req.cond, WriteCondition::IfMatch(_)) && existing_etag.is_none() {
                 return Err(ServerError::ObjectNotFound {
                     bucket: bucket.to_string(),
@@ -12833,11 +12953,11 @@ impl Coordinator {
         }
 
         let version_id = if bucket_info.versioning == BucketVersioningState::Enabled {
-            meta_pg.next_version_id(&bucket, &key)?
+            storage::PgMetadataStore::next_version_id(&*meta_pg, &bucket, &key)?
         } else {
             VersionId::Null
         };
-        let generation_id = meta_pg.next_generation_id(&bucket, &key)?;
+        let generation_id = storage::PgMetadataStore::next_generation_id(&*meta_pg, &bucket, &key)?;
         let stale_payload = if version_id.is_null() {
             Self::snapshot_overwritten_null_version_payload(&meta_pg, &bucket, &key)?
         } else {
@@ -13087,8 +13207,7 @@ impl Coordinator {
                 &object_parts,
             )
             .map_err(ServerError::Metadata)?;
-        let stored = meta_pg
-            .get_object_meta(&bucket, &key)
+        let stored = storage::PgMetadataStore::get_object_meta(&*meta_pg, &bucket, &key)
             .map_err(ServerError::Metadata)?;
         let live_record = stored.as_live().ok_or_else(|| ServerError::InternalError {
             reason: format!(
@@ -14555,7 +14674,7 @@ mod tests {
         writer: &AccountIdentity,
     ) -> Result<(), ServerError> {
         coord.create_bucket(&CreateBucketRequest {
-            name,
+            name: trusted_bucket_name(name),
             requester: owner_requester,
             namespace: BucketNamespace::Global,
             acl: CreateBucketAcl::Grants(AclGrants::new(vec![AclGrant::new(
@@ -14992,7 +15111,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15011,7 +15130,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15056,7 +15175,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("default-owner"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15066,7 +15185,7 @@ mod tests {
             .unwrap();
         let err = coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("default-owner"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15084,7 +15203,7 @@ mod tests {
 
         let err = coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket-444455556666-us-east-1-an",
+                name: trusted_bucket_name("bucket-444455556666-us-east-1-an"),
                 requester: test_helpers::requester("111122223333"),
                 namespace: BucketNamespace::AccountRegional,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15112,7 +15231,7 @@ mod tests {
 
         let err = coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket-111122223333-us-east-1-an",
+                name: trusted_bucket_name("bucket-111122223333-us-east-1-an"),
                 requester: test_helpers::requester("111122223333"),
                 namespace: BucketNamespace::AccountRegional,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15140,7 +15259,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket-111122223333-us-east-1-an",
+                name: trusted_bucket_name("bucket-111122223333-us-east-1-an"),
                 requester: test_helpers::requester("arn:aws:iam::111122223333:user/reader"),
                 namespace: BucketNamespace::AccountRegional,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15171,7 +15290,7 @@ mod tests {
 
         let err = coord
             .authorize_create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::anonymous(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15189,7 +15308,7 @@ mod tests {
 
         let err = coord
             .authorize_create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::Canned(BucketAcl::Private),
@@ -15252,7 +15371,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket-root",
+                name: trusted_bucket_name("bucket-root"),
                 requester: Requester::authenticated(owner_root.clone()),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15262,7 +15381,7 @@ mod tests {
             .unwrap();
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket-user",
+                name: trusted_bucket_name("bucket-user"),
                 requester: Requester::authenticated(owner_user.clone()),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15364,7 +15483,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(bucket_owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15389,7 +15508,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15421,7 +15540,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15465,7 +15584,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -15569,7 +15688,7 @@ mod tests {
         let coord = setup_coordinator_without_lifecycle_sweeper(tmp.path());
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_requester(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -16883,7 +17002,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -17558,7 +17677,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -17585,7 +17704,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -17622,7 +17741,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -17658,7 +17777,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -17695,7 +17814,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -17722,7 +17841,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -17750,7 +17869,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -17779,7 +17898,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19021,7 +19140,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: user_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19051,7 +19170,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: user_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19080,7 +19199,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: user_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19113,7 +19232,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: user_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19145,7 +19264,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: user_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19174,7 +19293,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: user_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19207,7 +19326,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: root_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19365,7 +19484,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19389,7 +19508,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19442,7 +19561,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19514,7 +19633,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19623,7 +19742,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(bucket_owner.clone()),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19693,7 +19812,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19704,7 +19823,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19736,7 +19855,7 @@ mod tests {
 
         let err = coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::Canned(BucketAcl::PublicRead),
@@ -19757,7 +19876,7 @@ mod tests {
 
         let err = coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::Canned(BucketAcl::PublicRead),
@@ -19778,7 +19897,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -19920,7 +20039,7 @@ mod tests {
 
         let err = coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: test_helpers::requester("owner-a"),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::Canned(BucketAcl::Private),
@@ -19953,7 +20072,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: owner_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::Grants(AclGrants::new(vec![
@@ -20450,7 +20569,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(bucket_owner.clone()),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -24587,7 +24706,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: owner_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -24683,7 +24802,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: owner_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::Grants(AclGrants::new(vec![AclGrant::new(
@@ -24763,7 +24882,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: owner_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -24825,7 +24944,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: owner_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -24897,7 +25016,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: owner_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -24947,7 +25066,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: owner_requester,
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -27340,7 +27459,7 @@ mod tests {
 
         admin
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: owner_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -28320,7 +28439,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: owner_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -31196,7 +31315,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: owner_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -32438,7 +32557,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -32554,7 +32673,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -32695,7 +32814,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -32877,7 +32996,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33031,7 +33150,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33156,7 +33275,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33188,7 +33307,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33248,7 +33367,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33303,7 +33422,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33356,7 +33475,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33393,7 +33512,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33464,7 +33583,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "plain-bucket",
+                name: trusted_bucket_name("plain-bucket"),
                 requester: Requester::authenticated(owner.clone()),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33474,7 +33593,7 @@ mod tests {
             .unwrap();
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "lock-bucket",
+                name: trusted_bucket_name("lock-bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33550,7 +33669,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33646,7 +33765,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33722,7 +33841,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33809,7 +33928,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: bucket_owner_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33878,7 +33997,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -33955,7 +34074,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: bucket_owner_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -34014,7 +34133,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -34184,7 +34303,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -34371,7 +34490,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -34443,7 +34562,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -34514,7 +34633,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -34588,7 +34707,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -34669,7 +34788,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -34751,7 +34870,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: bucket_owner_requester.clone(),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -34843,7 +34962,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,
@@ -34950,7 +35069,7 @@ mod tests {
 
         coord
             .create_bucket(&CreateBucketRequest {
-                name: "bucket",
+                name: trusted_bucket_name("bucket"),
                 requester: Requester::authenticated(owner),
                 namespace: BucketNamespace::Global,
                 acl: CreateBucketAcl::DefaultPrivate,

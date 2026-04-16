@@ -4089,7 +4089,7 @@ mod tests {
     fn create_test_bucket(coord: &Coordinator, name: &str) {
         coord
             .create_bucket(&crate::coordinator::CreateBucketRequest {
-                name,
+                name: storage::BucketName::try_from(name.to_string()).unwrap(),
                 requester: test_requester(),
                 namespace: s3_types::BucketNamespace::Global,
                 acl: crate::coordinator::CreateBucketAcl::DefaultPrivate,
