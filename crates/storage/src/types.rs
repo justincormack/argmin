@@ -2928,6 +2928,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn upload_id_from_sql_rejects_invalid_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE t (upload_id TEXT NOT NULL)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t (upload_id) VALUES (?1)", ["short"])
+            .unwrap();
+
+        let err = conn
+            .query_row("SELECT upload_id FROM t", [], |row| {
+                row.get::<_, UploadId>(0)
+            })
+            .unwrap_err();
+        match err {
+            rusqlite::Error::FromSqlConversionFailure(_, rusqlite::types::Type::Text, _) => {}
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
     // ── Property-based tests ────────────────────────────────────────
 
     proptest! {

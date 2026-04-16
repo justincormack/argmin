@@ -1209,8 +1209,16 @@ pub fn fuzz_request_parser_entrypoints(
     delete_objects_xml: &[u8],
     post_key: &str,
     file_name: &str,
+    upload_id: Option<&str>,
+    list_multipart_query: &str,
+    upload_part_query: &str,
 ) {
     let _ = crate::http::parse_copy_source_header(copy_source);
+    crate::http::fuzz_upload_id_query_entrypoints(
+        upload_id,
+        list_multipart_query,
+        upload_part_query,
+    );
     let _ = crate::http::xml::parse_delete_objects_xml(delete_objects_xml);
 
     let form = crate::http::multipart::PostFormData {
@@ -3687,6 +3695,27 @@ mod tests {
             is_streaming_write(&parts),
             Err(ServerError::InvalidRequest { reason })
                 if reason == "missing uploadId query parameter"
+        ));
+    }
+
+    #[test]
+    fn streaming_upload_part_invalid_upload_id_is_preserved_for_later_validation() {
+        let invalid_upload_id = "a".repeat(storage::UPLOAD_ID_LEN + 1);
+        let parts = make_parts(
+            "PUT",
+            &format!("/mybucket/mykey?partNumber=3&uploadId={invalid_upload_id}"),
+            &[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")],
+        );
+        let result = is_streaming_write(&parts);
+        assert!(matches!(
+            result,
+            Ok(Some(StreamingWriteOp::UploadPart {
+                ref bucket,
+                ref key,
+                ref upload_id,
+                part_number: 3,
+                ..
+            })) if bucket == "mybucket" && key == "mykey" && upload_id == &invalid_upload_id
         ));
     }
 

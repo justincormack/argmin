@@ -230,6 +230,20 @@ fn parse_required_upload_id(raw: Option<&str>) -> Result<UploadId, ServerError> 
     parse_present_upload_id(upload_id)
 }
 
+#[doc(hidden)]
+pub fn fuzz_upload_id_query_entrypoints(
+    upload_id: Option<&str>,
+    list_multipart_query: &str,
+    upload_part_query: &str,
+) {
+    let _ = parse_required_upload_id(upload_id);
+    let upload_id_marker = request::query_param_lossy(list_multipart_query, "upload-id-marker");
+    let _ = parse_optional_upload_id_marker(upload_id_marker.as_deref());
+    if let Ok((upload_id_raw, _)) = request::parse_upload_part_query(upload_part_query) {
+        let _ = parse_present_upload_id(upload_id_raw.as_str());
+    }
+}
+
 const MAX_WRITE_REQUEST_HEADER_SECTION_SIZE: usize = 8 * 1024;
 
 fn validate_write_request_header_section_size(headers: &[(&str, &str)]) -> Result<(), ServerError> {
@@ -7555,6 +7569,27 @@ mod tests {
     }
 
     #[test]
+    fn upload_part_invalid_upload_id_returns_no_such_upload() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let invalid_upload_id = "a".repeat(storage::UPLOAD_ID_LEN + 1);
+        let req = make_req(&format!("partNumber=1&uploadId={invalid_upload_id}"));
+        let op = S3Operation::UploadPart {
+            bucket: test_bucket_name("mybucket"),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::NoSuchUpload { upload_id }) => {
+                assert_eq!(upload_id, invalid_upload_id);
+            }
+            Err(e) => panic!("expected NoSuchUpload, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
     fn upload_part_invalid_part_number() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
@@ -8355,6 +8390,27 @@ mod tests {
     }
 
     #[test]
+    fn complete_multipart_invalid_upload_id_returns_no_such_upload() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let invalid_upload_id = "a".repeat(storage::UPLOAD_ID_LEN + 1);
+        let req = make_req(&format!("uploadId={invalid_upload_id}"));
+        let op = S3Operation::CompleteMultipartUpload {
+            bucket: test_bucket_name("mybucket"),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::NoSuchUpload { upload_id }) => {
+                assert_eq!(upload_id, invalid_upload_id);
+            }
+            Err(e) => panic!("expected NoSuchUpload, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
     fn complete_multipart_multiple_checksum_headers_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
@@ -8576,6 +8632,27 @@ mod tests {
         match fe.dispatch_routed(&req, &test_auth(), op) {
             Err(ServerError::InvalidRequest { .. }) => {}
             Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
+
+    #[test]
+    fn abort_multipart_invalid_upload_id_returns_no_such_upload() {
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let invalid_upload_id = "a".repeat(storage::UPLOAD_ID_LEN + 1);
+        let req = make_req(&format!("uploadId={invalid_upload_id}"));
+        let op = S3Operation::AbortMultipartUpload {
+            bucket: test_bucket_name("mybucket"),
+            key: "mykey".to_string(),
+        };
+        match fe.dispatch_routed(&req, &test_auth(), op) {
+            Err(ServerError::NoSuchUpload { upload_id }) => {
+                assert_eq!(upload_id, invalid_upload_id);
+            }
+            Err(e) => panic!("expected NoSuchUpload, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }
