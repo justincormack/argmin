@@ -3397,7 +3397,7 @@ impl PgMetadataStore for PgStore {
             params_vec.push(Box::new(prefix.clone()));
             param_idx += 1;
 
-            if let Some(end) = key_prefix_upper_bound(prefix.as_str()) {
+            if let Some(end) = object_key_prefix_upper_bound(prefix) {
                 where_clauses.push(format!("o.key < ?{param_idx}"));
                 params_vec.push(Box::new(end));
                 param_idx += 1;
@@ -3517,7 +3517,7 @@ impl PgMetadataStore for PgStore {
             params_vec.push(Box::new(prefix.clone()));
             param_idx += 1;
 
-            if let Some(end) = key_prefix_upper_bound(prefix.as_str()) {
+            if let Some(end) = object_key_prefix_upper_bound(prefix) {
                 where_clauses.push(format!("key < ?{param_idx}"));
                 params_vec.push(Box::new(end));
                 param_idx += 1;
@@ -4838,7 +4838,7 @@ impl PgMetadataStore for PgStore {
             params_vec.push(Box::new(prefix.clone()));
             param_idx += 1;
 
-            if let Some(end) = key_prefix_upper_bound(prefix.as_str()) {
+            if let Some(end) = object_key_prefix_upper_bound(prefix) {
                 where_clauses.push(format!("key < ?{param_idx}"));
                 params_vec.push(Box::new(end));
                 param_idx += 1;

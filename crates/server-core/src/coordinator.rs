@@ -20,21 +20,20 @@ use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
 use storage::{
-    key_prefix_upper_bound, BucketEncryptionConfig, BucketFastPathInfo, BucketInfo,
-    BucketLifecycleConfiguration, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
-    BucketState, CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq,
-    CreateStreamUploadReq, EcShape, EffectiveBucketEncryptionConfig, GenerationId, LifecycleDate,
-    LifecycleExpiration, LifecycleRule, LifecycleRuleStatus, ListMultipartUploadsReq,
-    ListObjectVersionsReq, ListObjectsReq, ListPartsReq, LiveObjectRecord,
-    ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectLockState,
-    ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PublicAccessBlockConfig, PutDeleteMarkerReq,
-    PutLiveObjectReq, PutObjectReq, ReclaimWorkItem, SerializedMetadataBlob,
-    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey, SharedStorageNode,
-    StoredObject, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState,
-    StreamUploadTarget, UploadId, UploadState,
+    BucketEncryptionConfig, BucketFastPathInfo, BucketInfo, BucketLifecycleConfiguration,
+    BucketName, BucketObjectLockConfig, BucketOwnershipControls, BucketState, CommitMultipartReq,
+    CommitStreamPutReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape,
+    EffectiveBucketEncryptionConfig, GenerationId, LifecycleDate, LifecycleExpiration,
+    LifecycleRule, LifecycleRuleStatus, ListMultipartUploadsReq, ListObjectVersionsReq,
+    ListObjectsReq, ListPartsReq, LiveObjectRecord, ManagedEncryptionAlgorithm,
+    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
+    ObjectEncryption, ObjectKey, ObjectLayout, ObjectLockState, ObjectPartRecord,
+    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
+    OwnerIdentity, PublicAccessBlockConfig, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq,
+    ReclaimWorkItem, SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet,
+    SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadRecord,
+    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
 };
 
 pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
@@ -55,6 +54,7 @@ fn trusted_bucket_name(name: impl Into<String>) -> BucketName {
         .expect("coordinator must only construct BucketName from validated values")
 }
 
+#[cfg(test)]
 fn trusted_object_key(key: impl Into<String>) -> ObjectKey {
     ObjectKey::try_from(key.into())
         .expect("coordinator must only construct ObjectKey from validated values")
@@ -12073,10 +12073,8 @@ impl Coordinator {
                 let token_str = token.as_str();
                 if let Some(after_prefix) = token_str.strip_prefix(prefix_str) {
                     if after_prefix.ends_with(delimiter) {
-                        if let Some(upper_bound) = key_prefix_upper_bound(token_str) {
-                            Some(ListObjectsPageStart::At(parse_list_object_key(
-                                upper_bound.as_str(),
-                            )?))
+                        if let Some(upper_bound) = storage::object_key_prefix_upper_bound(&token) {
+                            Some(ListObjectsPageStart::At(upper_bound))
                         } else {
                             Some(ListObjectsPageStart::After(token))
                         }
@@ -12207,7 +12205,10 @@ impl Coordinator {
             if let Some(pos) = after_prefix.find(delimiter) {
                 let common_prefix =
                     format!("{}{}", prefix_str, &after_prefix[..pos + delimiter.len()]);
-                let upper_bound = key_prefix_upper_bound(&common_prefix).map(trusted_object_key);
+                let common_prefix_key = ObjectKey::try_from(common_prefix.as_str()).expect(
+                    "common prefix derived from a listed valid object key must remain valid",
+                );
+                let upper_bound = storage::object_key_prefix_upper_bound(&common_prefix_key);
                 active_common_prefix = Some((common_prefix.clone(), upper_bound));
                 if objects.len() + common_prefixes.len() >= max {
                     is_truncated = true;
@@ -23112,6 +23113,138 @@ mod tests {
             .unwrap();
         assert!(page2.objects.is_empty());
         assert_eq!(page2.common_prefixes, vec![delimiter.to_string()]);
+        assert!(!page2.is_truncated);
+        assert!(page2.next_continuation_token.is_none());
+    }
+
+    #[test]
+    fn list_objects_delimiter_continuation_with_boundary_token_does_not_panic() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let delimiter = "\x7f";
+        let token = format!("{}{}", "a".repeat(1023), delimiter);
+
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "z", test_requester(), None),
+                data: b"z",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let page2 = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                delimiter: Some(delimiter),
+                continuation_token: Some(&token),
+                max_keys: 1,
+            })
+            .unwrap();
+        assert_eq!(page2.common_prefixes, Vec::<String>::new());
+        assert_eq!(page2.objects.len(), 1);
+        assert_eq!(page2.objects[0].key, "z");
+        assert!(!page2.is_truncated);
+        assert!(page2.next_continuation_token.is_none());
+    }
+
+    #[test]
+    fn list_objects_delimiter_common_prefix_boundary_falls_back_without_error() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        let delimiter = "\x7f";
+        let common_prefix = format!("{}{}", "a".repeat(1023), delimiter);
+
+        coord
+            .create_bucket_for_owner("default-owner", "bucket", false)
+            .unwrap();
+
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    &common_prefix,
+                    test_requester(),
+                    None,
+                ),
+                data: b"prefix",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner("bucket", "z", test_requester(), None),
+                data: b"z",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+
+        let page1 = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                delimiter: Some(delimiter),
+                continuation_token: None,
+                max_keys: 1,
+            })
+            .unwrap();
+        assert!(page1.objects.is_empty());
+        assert_eq!(page1.common_prefixes, vec![common_prefix.clone()]);
+        assert!(page1.is_truncated);
+
+        let token = page1
+            .next_continuation_token
+            .as_deref()
+            .expect("first page should return a continuation token")
+            .to_string();
+        assert_eq!(token, common_prefix);
+
+        let page2 = coord
+            .list_objects_v2(&ListObjectsV2Request {
+                bucket: bucket_request_with_expected_owner("bucket", test_requester(), None),
+                prefix: None,
+                delimiter: Some(delimiter),
+                continuation_token: Some(&token),
+                max_keys: 1,
+            })
+            .unwrap();
+        assert!(page2.common_prefixes.is_empty());
+        assert_eq!(page2.objects.len(), 1);
+        assert_eq!(page2.objects[0].key, "z");
         assert!(!page2.is_truncated);
         assert!(page2.next_continuation_token.is_none());
     }

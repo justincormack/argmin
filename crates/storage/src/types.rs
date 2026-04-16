@@ -383,6 +383,14 @@ pub fn key_prefix_upper_bound(prefix: &str) -> Option<String> {
     None
 }
 
+/// Return the smallest valid object key that sorts after every key beginning
+/// with `prefix`, or `None` if no such bound exists.
+#[must_use]
+pub fn object_key_prefix_upper_bound(prefix: &ObjectKey) -> Option<ObjectKey> {
+    key_prefix_upper_bound(prefix.as_str())
+        .and_then(|upper_bound| ObjectKey::try_from(upper_bound).ok())
+}
+
 string_newtype!(
     /// Multipart upload identifier.
     UploadId
@@ -2764,6 +2772,21 @@ mod tests {
             ObjectKey::try_from("x".repeat(1025)).unwrap_err(),
             ObjectKeyError::InvalidLength { length: 1025 }
         );
+    }
+
+    #[test]
+    fn object_key_prefix_upper_bound_stays_typed() {
+        let prefix = ObjectKey::try_from("foo").unwrap();
+        assert_eq!(
+            object_key_prefix_upper_bound(&prefix),
+            Some(ObjectKey::try_from("fop").unwrap())
+        );
+    }
+
+    #[test]
+    fn object_key_prefix_upper_bound_returns_none_when_derived_bound_exceeds_limit() {
+        let prefix = ObjectKey::try_from(format!("{}{}", "a".repeat(1023), '\x7f')).unwrap();
+        assert_eq!(object_key_prefix_upper_bound(&prefix), None);
     }
 
     #[test]
