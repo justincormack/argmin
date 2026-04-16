@@ -4596,9 +4596,11 @@ impl ReadRuntime {
             if part.part_okh == [0u8; 16] {
                 continue;
             }
+            let multipart_bucket = format!("mpu/{upload_id}");
+            let multipart_key = format!("{}/{}", part.part_number, part.generation);
             let shard_pg_id = self.pg_topology.shard_pg(
-                format!("mpu/{upload_id}"),
-                format!("{}/{}", part.part_number, part.generation),
+                multipart_bucket.as_str(),
+                multipart_key.as_str(),
                 part.part_vid.get(),
             );
             if let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) {
@@ -21606,7 +21608,10 @@ mod tests {
             }
         };
         let shard_pg_id = coord.shard_pg_id("bucket", "key", generation_id);
-        let okh = object_key_hash("bucket", "key");
+        let okh = object_key_hash(
+            trusted_bucket_name("bucket").as_str(),
+            trusted_object_key("key").as_str(),
+        );
 
         coord
             .delete_object(&delete_object_request(
@@ -21997,9 +22002,11 @@ mod tests {
                 )
             } else {
                 let live = record.as_live().expect("expected live object");
+                let bucket_name = trusted_bucket_name(bucket);
+                let object_key = trusted_object_key(key);
                 (
                     coord.shard_pg_id(bucket, key, live.generation_id),
-                    object_key_hash(bucket, key),
+                    object_key_hash(bucket_name.as_str(), object_key.as_str()),
                     live.generation_id,
                 )
             }

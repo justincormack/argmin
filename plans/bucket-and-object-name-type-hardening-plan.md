@@ -42,10 +42,11 @@ What has landed so far:
 11. The raw `PgStore` compatibility methods have been removed rather than kept
     around for tests, and the storage/integration tests now call the real
     typed `PgMetadataStore` entry points directly.
-12. `BucketName` and `ObjectKey` no longer implement `Deref<Target = str>`, so
-    typed values can no longer silently bind to raw `&str` APIs through method
-    resolution or implicit string-method access. Remaining string boundaries
-    are now explicit `.as_str()` conversions.
+12. `BucketName` and `ObjectKey` no longer implement `Deref<Target = str>` or
+    `AsRef<str>`, so typed values can no longer silently bind to raw `&str`
+    APIs through method resolution, implicit string-method access, or generic
+    `AsRef<str>` adapters. Remaining string boundaries are now explicit
+    `.as_str()` conversions.
 
 What remains open in the overall plan:
 
@@ -352,8 +353,9 @@ Exit criteria:
    a same-named inherent `&str` surface alive beside the typed trait methods.
 2. Switch tests to use the real typed `PgMetadataStore` API rather than raw
    storage entry points.
-3. Remove `Deref<Target = str>` from `BucketName` and `ObjectKey` so typed
-   values cannot silently flow into unrelated raw string APIs.
+3. Remove `Deref<Target = str>` and `AsRef<str>` from `BucketName` and
+   `ObjectKey` so typed values cannot silently flow into unrelated raw string
+   APIs.
 4. Audit and fix the resulting explicit string-boundary conversions so every
    remaining raw `&str` use is intentional and visible in the code.
 
@@ -368,9 +370,10 @@ Current status:
    surface, while invalid-input coverage moved to the actual validation
    boundary tests.
 3. Complete:
-   `BucketName` and `ObjectKey` no longer dereference to `str`, and the
-   workspace has been swept to replace the old implicit coercions with explicit
-   `.as_str()` calls or direct typed-value reuse where no reparse was needed.
+   `BucketName` and `ObjectKey` no longer dereference to `str` or implement
+   `AsRef<str>`, and the workspace has been swept to replace the old implicit
+   coercions with explicit `.as_str()` calls or direct typed-value reuse where
+   no reparse was needed.
 
 Exit criteria:
 
@@ -378,7 +381,7 @@ Exit criteria:
    resolution against `PgStore`.
 2. Tests exercise the same typed entry points as production code.
 3. Typed bucket/object names no longer implicitly satisfy arbitrary string APIs
-   outside explicit conversion sites.
+   outside explicit conversion sites, including generic `AsRef<str>` helpers.
 
 ## Phase 4: Narrow or remove unchecked internal construction
 

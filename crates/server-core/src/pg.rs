@@ -73,46 +73,35 @@ impl PgTopology {
     }
 
     /// Derive the PG ID for a given bucket and key.
-    pub fn object_pg<B: AsRef<str>, K: AsRef<str>>(&self, bucket: B, key: K) -> u32 {
-        let hash = hash_parts(&[bucket.as_ref().as_bytes(), b"/", key.as_ref().as_bytes()]);
+    pub fn object_pg(&self, bucket: &str, key: &str) -> u32 {
+        let hash = hash_parts(&[bucket.as_bytes(), b"/", key.as_bytes()]);
         pick_pg(&self.pg_ids, hash)
     }
 
     pub fn object_pg_for(&self, bucket: &BucketName, key: &ObjectKey) -> u32 {
-        self.object_pg(bucket, key)
+        self.object_pg(bucket.as_str(), key.as_str())
     }
 
     /// Derive the PG ID for bucket metadata placement.
-    pub fn bucket_pg<B: AsRef<str>>(&self, bucket: B) -> u32 {
-        let hash = hash_parts(&[b"bucket/", bucket.as_ref().as_bytes()]);
+    pub fn bucket_pg(&self, bucket: &str) -> u32 {
+        let hash = hash_parts(&[b"bucket/", bucket.as_bytes()]);
         pick_pg(&self.pg_ids, hash)
     }
 
     pub fn bucket_pg_for(&self, bucket: &BucketName) -> u32 {
-        self.bucket_pg(bucket)
+        self.bucket_pg(bucket.as_str())
     }
 
     /// Derive the shard PG ID.
-    pub fn shard_pg<B: AsRef<str>, K: AsRef<str>>(
-        &self,
-        bucket: B,
-        key: K,
-        version_id: u64,
-    ) -> u32 {
+    pub fn shard_pg(&self, bucket: &str, key: &str, version_id: u64) -> u32 {
         let mut version_buf = [0u8; 20];
         let version_bytes = decimal_u64_bytes(version_id, &mut version_buf);
-        let hash = hash_parts(&[
-            bucket.as_ref().as_bytes(),
-            b"/",
-            key.as_ref().as_bytes(),
-            b"/",
-            version_bytes,
-        ]);
+        let hash = hash_parts(&[bucket.as_bytes(), b"/", key.as_bytes(), b"/", version_bytes]);
         pick_pg(&self.pg_ids, hash)
     }
 
     pub fn shard_pg_for(&self, bucket: &BucketName, key: &ObjectKey, version_id: u64) -> u32 {
-        self.shard_pg(bucket, key, version_id)
+        self.shard_pg(bucket.as_str(), key.as_str(), version_id)
     }
 
     /// Execute a closure once for every PG in topology order.
@@ -164,9 +153,9 @@ pub(crate) fn derive_pg_shards(bucket: &str, key: &str, version_id: u64, pg_coun
 /// Compute the 16-byte object key hash used in ShardKey construction.
 ///
 /// Uses SHA-256 truncated to 16 bytes for deterministic, well-distributed hashing.
-pub fn object_key_hash<B: AsRef<str>, K: AsRef<str>>(bucket: B, key: K) -> [u8; 16] {
+pub fn object_key_hash(bucket: &str, key: &str) -> [u8; 16] {
     use ring::digest;
-    let full_key = format!("{}/{}", bucket.as_ref(), key.as_ref());
+    let full_key = format!("{bucket}/{key}");
     let hash = digest::digest(&digest::SHA256, full_key.as_bytes());
     let mut result = [0u8; 16];
     result.copy_from_slice(&hash.as_ref()[..16]);
@@ -190,16 +179,16 @@ pub fn stream_segment_key_hash(session_id: &str, segment_index: u32) -> [u8; 16]
 /// `segment_okh = SHA-256("segment/" + bucket + "/" + key + "/" + generation_id + "/" +
 /// segment_index)[:16]`
 pub fn segment_key_hash(
-    bucket: impl AsRef<str>,
-    key: impl AsRef<str>,
+    bucket: &str,
+    key: &str,
     generation_id: GenerationId,
     segment_index: u32,
 ) -> [u8; 16] {
     use ring::digest;
     let input = format!(
         "segment/{}/{}/{}/{segment_index}",
-        bucket.as_ref(),
-        key.as_ref(),
+        bucket,
+        key,
         generation_id.get()
     );
     let hash = digest::digest(&digest::SHA256, input.as_bytes());
