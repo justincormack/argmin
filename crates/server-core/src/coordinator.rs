@@ -46029,6 +46029,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn optional_list_object_key_empty_string_normalizes_to_none() {
+        assert_eq!(optional_list_object_key(Some("")).unwrap(), None);
+    }
+
+    #[test]
+    fn optional_list_object_key_rejects_oversized_value() {
+        let oversized = "x".repeat(1025);
+        let err = optional_list_object_key(Some(&oversized)).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
+    }
+
+    #[test]
+    fn optional_list_object_key_rejects_nul() {
+        let err = optional_list_object_key(Some("bad\0key")).unwrap_err();
+        assert!(matches!(err, ServerError::InvalidArgument { .. }));
+    }
+
     // ── Phase 5: Cleanup hardening tests ────────────────────────────
 
     #[test]

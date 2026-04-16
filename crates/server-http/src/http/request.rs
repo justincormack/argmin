@@ -752,9 +752,40 @@ mod tests {
     }
 
     #[test]
+    fn parse_copy_source_rejects_oversized_bucket_name() {
+        let header = format!("/{}/key", "a".repeat(64));
+        match parse_copy_source(&header) {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert_eq!(reason, "Invalid copy source object key");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn parse_copy_source_rejects_oversized_key() {
         let header = format!("/bucket/{}", "x".repeat(1025));
         match parse_copy_source(&header) {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert_eq!(reason, "Invalid copy source object key");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_copy_source_rejects_percent_encoded_nul_in_key() {
+        match parse_copy_source("/bucket/key%00name") {
+            Err(ServerError::InvalidArgument { reason }) => {
+                assert_eq!(reason, "Invalid copy source object key");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_copy_source_rejects_invalid_percent_decoding_in_bucket() {
+        match parse_copy_source("/bucket%80/key") {
             Err(ServerError::InvalidArgument { reason }) => {
                 assert_eq!(reason, "Invalid copy source object key");
             }
