@@ -217,7 +217,10 @@ fn metadata_list_with_prefix(store: &dyn PgMetadataStore) {
         .unwrap();
 
     assert_eq!(resp.objects.len(), 3);
-    assert!(resp.objects.iter().all(|o| o.key().starts_with("photos/")));
+    assert!(resp
+        .objects
+        .iter()
+        .all(|o| o.key().as_str().starts_with("photos/")));
 }
 
 fn metadata_list_pagination(store: &dyn PgMetadataStore) {
@@ -2499,7 +2502,10 @@ fn mpu_list_uploads_with_prefix() {
         })
         .unwrap();
     assert_eq!(resp.uploads.len(), 2);
-    assert!(resp.uploads.iter().all(|u| u.key.starts_with("photos/")));
+    assert!(resp
+        .uploads
+        .iter()
+        .all(|u| u.key.as_str().starts_with("photos/")));
 }
 
 #[test]
@@ -4453,7 +4459,7 @@ mod prop_tests {
 
             let mut expected: Vec<ObjectKey> = keys
                 .iter()
-                .filter(|k| k.starts_with(&prefix))
+                .filter(|k| k.as_str().starts_with(&prefix))
                 .cloned()
                 .collect();
             expected.sort();

@@ -713,7 +713,7 @@ impl Coordinator {
             .collect();
         let request = auth::PolicyRequest::new(
             action,
-            &bucket.name,
+            bucket.name.as_str(),
             object.key().as_str(),
             requester.principal_opt(),
             requester.canonical_user_id(),
@@ -751,7 +751,7 @@ impl Coordinator {
 
         let request = auth::PolicyRequest::new(
             action,
-            &bucket.name,
+            bucket.name.as_str(),
             key,
             requester.principal_opt(),
             requester.canonical_user_id(),
@@ -771,7 +771,7 @@ impl Coordinator {
 
         let request = auth::PolicyRequest::for_bucket(
             action,
-            &bucket.name,
+            bucket.name.as_str(),
             requester.principal_opt(),
             requester.canonical_user_id(),
         );
@@ -791,7 +791,7 @@ impl Coordinator {
 
         let request = auth::PolicyRequest::for_bucket(
             action,
-            &bucket.name,
+            bucket.name.as_str(),
             requester.principal_opt(),
             requester.canonical_user_id(),
         )
@@ -830,7 +830,7 @@ impl Coordinator {
             .collect();
         let request = auth::PolicyRequest::new(
             action,
-            &bucket.name,
+            bucket.name.as_str(),
             key,
             requester.principal_opt(),
             requester.canonical_user_id(),

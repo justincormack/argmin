@@ -3163,7 +3163,7 @@ impl HttpFrontend {
                 .filter(|(k, _)| !k.eq_ignore_ascii_case("key"))
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            field_pairs.push(("key", &ctx.binding.key));
+            field_pairs.push(("key", ctx.binding.key.as_str()));
 
             auth::validate_post_policy(
                 policy_b64,
@@ -3730,8 +3730,8 @@ impl HttpFrontend {
         );
         self.coordinator
             .append_stream_part_data(&crate::coordinator::AppendStreamPartRequest {
-                bucket: parse_bucket_name(&ctx.binding.object.bucket)?,
-                key: parse_object_key(&ctx.binding.object.key)?,
+                bucket: ctx.binding.object.bucket.clone(),
+                key: ctx.binding.object.key.clone(),
                 session_id: &ctx.binding.object.session_id,
                 part_number: ctx.binding.part_number,
                 segment_index,
@@ -3784,13 +3784,13 @@ impl HttpFrontend {
         let result = self
             .coordinator
             .finalize_stream_part(FinalizeStreamPartRequest {
-                upload: multipart_object_request(
-                    &ctx.binding.object.bucket,
-                    &ctx.binding.object.key,
+                upload: MultipartObjectRequest::new(
+                    ctx.binding.object.bucket.clone(),
+                    ctx.binding.object.key.clone(),
                     &ctx.binding.upload_id,
                     ctx.requester.clone(),
                     ctx.expected_bucket_owner.as_deref(),
-                )?,
+                ),
                 session_id: &ctx.binding.object.session_id,
                 part_number: ctx.binding.part_number,
                 crc64,

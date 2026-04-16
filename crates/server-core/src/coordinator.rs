@@ -4231,7 +4231,7 @@ impl ReadRuntime {
         };
         let Some(expiration) = Coordinator::evaluate_current_object_lifecycle_expiration(
             &config,
-            key,
+            key.as_str(),
             &tags,
             record.size,
             record.last_modified,
@@ -4544,7 +4544,7 @@ impl ReadRuntime {
 
         let Some(headers) = Coordinator::evaluate_multipart_lifecycle_abort_headers(
             &config,
-            key,
+            key.as_str(),
             upload.initiated_at,
         ) else {
             return Ok(false);
@@ -11784,10 +11784,13 @@ impl Coordinator {
                 #[cfg(test)]
                 match record.layout {
                     ObjectLayout::MultipartManifest { .. } => {
-                        maybe_run_multipart_delete_metadata_hook(&bucket, &key);
+                        maybe_run_multipart_delete_metadata_hook(bucket.as_str(), key.as_str());
                     }
                     ObjectLayout::Standard => {
-                        maybe_run_object_segments_delete_metadata_hook(&bucket, &key);
+                        maybe_run_object_segments_delete_metadata_hook(
+                            bucket.as_str(),
+                            key.as_str(),
+                        );
                     }
                 }
                 if let Some(reclaim) = reclaim {
@@ -11832,10 +11835,16 @@ impl Coordinator {
                         #[cfg(test)]
                         match record.layout {
                             ObjectLayout::MultipartManifest { .. } => {
-                                maybe_run_multipart_delete_metadata_hook(&bucket, &key);
+                                maybe_run_multipart_delete_metadata_hook(
+                                    bucket.as_str(),
+                                    key.as_str(),
+                                );
                             }
                             ObjectLayout::Standard => {
-                                maybe_run_object_segments_delete_metadata_hook(&bucket, &key);
+                                maybe_run_object_segments_delete_metadata_hook(
+                                    bucket.as_str(),
+                                    key.as_str(),
+                                );
                             }
                         }
                         if let Some(reclaim) = reclaim {
@@ -12340,11 +12349,11 @@ impl Coordinator {
 
         // Build result entries, tracking is_latest per key
         let mut versions: Vec<VersionEntry> = Vec::new();
-        let mut last_key: Option<&str> = None;
+        let mut last_key: Option<&ObjectKey> = None;
 
         for obj in merged_versions.iter().take(max) {
             let obj_key = obj.key();
-            let is_latest = last_key.is_none_or(|k| k != obj_key.as_str());
+            let is_latest = last_key.is_none_or(|k| k != obj_key);
             if is_latest {
                 last_key = Some(obj_key);
             }

@@ -273,7 +273,7 @@ pub fn list_buckets_xml(
 
     for bucket in buckets {
         xml.push_str("<Bucket><Name>");
-        xml.push_str(&xml_escape(&bucket.name));
+        xml.push_str(&xml_escape(bucket.name.as_str()));
         xml.push_str("</Name><CreationDate>");
         xml.push_str(&format_timestamp(bucket.created_at));
         xml.push_str("</CreationDate></Bucket>");

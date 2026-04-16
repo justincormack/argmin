@@ -4,9 +4,9 @@
 
 In progress.
 
-Phases 1 and 2 are complete.
+Phases 1, 2, 3, and 3a are complete.
 
-Phase 3 is started, but not complete yet.
+Phases 4 and 5 remain open.
 
 What has landed so far:
 
@@ -39,17 +39,24 @@ What has landed so far:
     `SharedStorageNode` bucket fast-path / bucket-lock / multipart-completion
     lock helpers now also carry `BucketName` directly instead of degrading
     hot-path bucket state back to `String`.
+11. The raw `PgStore` compatibility methods have been removed rather than kept
+    around for tests, and the storage/integration tests now call the real
+    typed `PgMetadataStore` entry points directly.
+12. `BucketName` and `ObjectKey` no longer implement `Deref<Target = str>`, so
+    typed values can no longer silently bind to raw `&str` APIs through method
+    resolution or implicit string-method access. Remaining string boundaries
+    are now explicit `.as_str()` conversions.
 
-What is still open before Phase 3 can be marked complete:
+What remains open in the overall plan:
 
-1. `server-core` still has a small number of compatibility and convenience
-   helpers that accept raw `&str` bucket/key values, mostly around external
-   probes, cache keys, older raw PG helpers, and test-only entry points.
-2. The final Phase 3 answer on raw internal PG/cache helper variants versus
-   typed-only access is not complete yet.
-3. The PG hashing failure-model cleanup is still only partly done: typed S3
-   entry points now cover the main request path, but some older raw helper
-   variants remain for internal namespaces and compatibility-shaped paths.
+1. Narrow the remaining unchecked internal constructors and decide which ones
+   should survive as explicit trusted-only creation paths versus being removed
+   entirely.
+2. Finish the final audit of any remaining raw internal namespaces and
+   persistence/deserialization entry points that still rely on trusted
+   invariants rather than typed ingress.
+3. Expand the final regression and fuzz coverage around the new typed boundary
+   so the security-fix path is locked in by tests.
 
 `security/codex-23ffb1b` remains open until the early migration phases in this
 plan land. This plan is the intended fix path; it is not documenting work that
@@ -284,7 +291,7 @@ Current status:
 2. Complete:
    `server-http` request construction and the streaming PUT append path now use
    typed values at the coordinator boundary.
-3. Partially complete:
+3. Complete:
    authz, PG selection, and the main object/multipart authorized-state path now
    preserve typed values much further downstream than before.
    Bucket-scoped coordinator helper traits now expose typed bucket access, and
@@ -326,17 +333,10 @@ Current status:
    `SharedStorageNode` bucket fast-path / bucket-lock / multipart-completion
    lock helpers now also keep typed bucket names on the production path
    instead of downgrading those hot-path coordinator internals back to
-   `String`. This pushes the remaining raw-string boundary outward toward the
-   true ingress points and a shrinking set of compatibility helpers.
-4. Still open:
-   some older coordinator-internal helper APIs still accept raw `&str`
-   bucket/key parameters, now mostly around external convenience probes, older
-   raw PG helper variants, and a few compatibility wrappers that still sit
-   above typed PG entry points.
-5. Still open:
-   the final Phase 3 answer on the failure model is only partly in place today.
-   Typed PG entry points exist for validated S3 names, but raw helper entry
-   points still remain for internal namespaces and older call paths.
+   `String`. The remaining production-path bucket-only coordinator call sites
+   that were still resolving to raw inherent `PgStore` wrappers have also been
+   moved to explicit typed trait calls, so the Phase 3 request/coordinator/PG
+   boundary is now actually typed rather than just mostly typed.
 
 Exit criteria:
 
@@ -345,6 +345,40 @@ Exit criteria:
 2. PG hashing and lock-routing code only sees bounded, validated types.
 3. The code no longer has an ambiguous mix of "typed upstream, panic
    downstream" for bucket/key bound enforcement.
+
+## Phase 3a: Remove compatibility footguns around the typed boundary
+
+1. Remove the remaining raw `PgStore` compatibility methods instead of keeping
+   a same-named inherent `&str` surface alive beside the typed trait methods.
+2. Switch tests to use the real typed `PgMetadataStore` API rather than raw
+   storage entry points.
+3. Remove `Deref<Target = str>` from `BucketName` and `ObjectKey` so typed
+   values cannot silently flow into unrelated raw string APIs.
+4. Audit and fix the resulting explicit string-boundary conversions so every
+   remaining raw `&str` use is intentional and visible in the code.
+
+Current status:
+
+1. Complete:
+   the raw `PgStore` compatibility methods have been deleted, including the
+   bucket/object inherent wrappers that previously shadowed typed trait calls.
+2. Complete:
+   storage and coordinator tests that exercised storage directly now use typed
+   `BucketName` / `ObjectKey` values and the standard `PgMetadataStore`
+   surface, while invalid-input coverage moved to the actual validation
+   boundary tests.
+3. Complete:
+   `BucketName` and `ObjectKey` no longer dereference to `str`, and the
+   workspace has been swept to replace the old implicit coercions with explicit
+   `.as_str()` calls or direct typed-value reuse where no reparse was needed.
+
+Exit criteria:
+
+1. The typed storage boundary cannot be bypassed accidentally through method
+   resolution against `PgStore`.
+2. Tests exercise the same typed entry points as production code.
+3. Typed bucket/object names no longer implicitly satisfy arbitrary string APIs
+   outside explicit conversion sites.
 
 ## Phase 4: Narrow or remove unchecked internal construction
 

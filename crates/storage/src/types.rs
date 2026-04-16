@@ -156,13 +156,6 @@ macro_rules! validated_string_newtype {
             }
         }
 
-        impl std::ops::Deref for $name {
-            type Target = str;
-            fn deref(&self) -> &str {
-                self.as_str()
-            }
-        }
-
         impl std::fmt::Display for $name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str(&self.0)

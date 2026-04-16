@@ -3316,7 +3316,7 @@ impl PgMetadataStore for PgStore {
 
         let result: Result<(), MetadataError> = (|| {
             let deleted_was_current = self
-                .current_object_head(bucket, key)
+                .current_object_head(bucket.as_str(), key.as_str())
                 .map_err(|e| MetadataError::Db {
                     context: "delete object version (lookup current)",
                     source: e,
@@ -3334,7 +3334,7 @@ impl PgMetadataStore for PgStore {
                 })?;
 
             if deleted_was_current {
-                self.clear_current_live_noncurrent(bucket, key)
+                self.clear_current_live_noncurrent(bucket.as_str(), key.as_str())
                     .map_err(|e| MetadataError::Db {
                         context: "delete object version (restore current)",
                         source: e,
@@ -3397,7 +3397,7 @@ impl PgMetadataStore for PgStore {
             params_vec.push(Box::new(prefix.clone()));
             param_idx += 1;
 
-            if let Some(end) = key_prefix_upper_bound(prefix) {
+            if let Some(end) = key_prefix_upper_bound(prefix.as_str()) {
                 where_clauses.push(format!("o.key < ?{param_idx}"));
                 params_vec.push(Box::new(end));
                 param_idx += 1;
@@ -3517,7 +3517,7 @@ impl PgMetadataStore for PgStore {
             params_vec.push(Box::new(prefix.clone()));
             param_idx += 1;
 
-            if let Some(end) = key_prefix_upper_bound(prefix) {
+            if let Some(end) = key_prefix_upper_bound(prefix.as_str()) {
                 where_clauses.push(format!("key < ?{param_idx}"));
                 params_vec.push(Box::new(end));
                 param_idx += 1;
@@ -4838,7 +4838,7 @@ impl PgMetadataStore for PgStore {
             params_vec.push(Box::new(prefix.clone()));
             param_idx += 1;
 
-            if let Some(end) = key_prefix_upper_bound(prefix) {
+            if let Some(end) = key_prefix_upper_bound(prefix.as_str()) {
                 where_clauses.push(format!("key < ?{param_idx}"));
                 params_vec.push(Box::new(end));
                 param_idx += 1;

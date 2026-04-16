@@ -229,7 +229,8 @@ impl SharedStorageNode {
     }
 
     fn bucket_lock_index(&self, bucket: &BucketName) -> usize {
-        (rapidhash_v3_micro_inline::<true, false>(bucket.as_bytes(), &RAPIDHASH_SECRETS) as usize)
+        (rapidhash_v3_micro_inline::<true, false>(bucket.as_str().as_bytes(), &RAPIDHASH_SECRETS)
+            as usize)
             % self.bucket_locks.len()
     }
 
