@@ -113,9 +113,430 @@ pub struct CreateMultipartUploadResponseContext<'a> {
     pub sse_customer: Option<&'a SseCustomerResponseHeaders>,
 }
 
+fn client_error_message(err: &ServerError) -> String {
+    const INTERNAL_ERROR_MESSAGE: &str = "We encountered an internal error. Please try again.";
+
+    match err {
+        ServerError::BucketNotFound { .. } => "The specified bucket does not exist".to_string(),
+        ServerError::BucketAlreadyExists => "bucket already exists".to_string(),
+        ServerError::BucketAlreadyOwnedByYou => "bucket already owned by you".to_string(),
+        ServerError::InvalidBucketAclWithBlockPublicAccessError => {
+            "bucket ACL cannot be public when block public access is enabled".to_string()
+        }
+        ServerError::BucketNotEmpty => "bucket not empty".to_string(),
+        ServerError::ObjectNotFound { .. } | ServerError::DeleteMarkerHit { .. } => {
+            "The specified key does not exist.".to_string()
+        }
+        ServerError::VersionNotFound { .. } => "The specified version does not exist.".to_string(),
+        ServerError::Store(_)
+        | ServerError::Metadata(_)
+        | ServerError::Ec(_)
+        | ServerError::MetadataBlobError { .. }
+        | ServerError::InternalError { .. }
+        | ServerError::IntegrityError { .. } => INTERNAL_ERROR_MESSAGE.to_string(),
+        ServerError::Auth(auth::AuthError::MissingAuth)
+        | ServerError::Auth(auth::AuthError::AccessDenied)
+        | ServerError::AccessDenied
+        | ServerError::BlockPublicPolicyAccessDenied { .. } => "Access Denied".to_string(),
+        ServerError::Auth(auth::AuthError::MalformedAuth) => {
+            "malformed Authorization header".to_string()
+        }
+        ServerError::Auth(auth::AuthError::UnsupportedAuthType) => {
+            "unsupported Authorization type".to_string()
+        }
+        ServerError::Auth(auth::AuthError::MissingQueryParam { param }) => {
+            format!("missing query auth parameter: {param}")
+        }
+        ServerError::Auth(auth::AuthError::InvalidQueryParam { param }) => {
+            format!("invalid query auth parameter: {param}")
+        }
+        ServerError::Auth(auth::AuthError::UnknownAccessKey) => {
+            "unknown access key id".to_string()
+        }
+        ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader) => {
+            "A header you provided implies functionality that is not implemented".to_string()
+        }
+        ServerError::Auth(auth::AuthError::SignatureMismatch) => "signature mismatch".to_string(),
+        ServerError::Auth(auth::AuthError::InvalidToken) => "invalid session token".to_string(),
+        ServerError::Auth(auth::AuthError::UnexpectedSecurityToken { .. }) => {
+            "The provided token is malformed or otherwise invalid.".to_string()
+        }
+        ServerError::Auth(auth::AuthError::ExpiredToken) => "token expired".to_string(),
+        ServerError::Auth(auth::AuthError::MissingSignedHeader { header }) => {
+            format!("missing required signed header: {header}")
+        }
+        ServerError::Auth(auth::AuthError::RequestExpired) => {
+            "request timestamp is too far from server time".to_string()
+        }
+        ServerError::Auth(auth::AuthError::UnsignedHeaders { .. }) => {
+            "There were headers present in the request which were not signed".to_string()
+        }
+        ServerError::WrongRegion {
+            provided_region,
+            expected_region,
+        } => format!(
+            "The authorization header is malformed; the region '{provided_region}' is wrong; expecting '{expected_region}'"
+        ),
+        ServerError::InvalidRequest { reason }
+        | ServerError::InvalidArgument { reason }
+        | ServerError::InvalidURI { reason }
+        | ServerError::InvalidBucketName { reason }
+        | ServerError::MalformedPolicy { reason }
+        | ServerError::MalformedXML { reason }
+        | ServerError::MalformedPOSTRequest { reason }
+        | ServerError::MalformedChunkedBody { reason }
+        | ServerError::MalformedTrailerError { reason }
+        | ServerError::InvalidTag { reason } => reason.clone(),
+        ServerError::KeyTooLongError {
+            size,
+            max_size_allowed,
+        } => format!("key too long: {size} bytes (max {max_size_allowed})"),
+        ServerError::InvalidBucketNamespace { reason, .. } => reason.clone(),
+        ServerError::ObjectTooLarge { size, max } => {
+            format!("object too large: {size} bytes (max {max})")
+        }
+        ServerError::MetadataTooLarge => "metadata too large".to_string(),
+        ServerError::RequestHeaderSectionTooLarge => {
+            "The request header and query parameters used to make the request exceed the maximum allowed size.".to_string()
+        }
+        ServerError::MaxMessageLengthExceeded { .. } => "Your request was too big.".to_string(),
+        ServerError::MethodNotAllowed => "method not allowed".to_string(),
+        ServerError::HeadDeleteMarkerMethodNotAllowed { .. } => {
+            "head on delete marker version not allowed".to_string()
+        }
+        ServerError::InvalidRange { .. } => "invalid range".to_string(),
+        ServerError::PreconditionFailed => "precondition failed".to_string(),
+        ServerError::NotModified { .. } => "not modified".to_string(),
+        ServerError::SlowDown => "please reduce your request rate".to_string(),
+        ServerError::BadDigest => "bad digest".to_string(),
+        ServerError::InvalidDigest => "invalid digest".to_string(),
+        ServerError::InvalidSseCustomerKeyMd5 => {
+            "The calculated MD5 hash of the key did not match the hash that was provided."
+                .to_string()
+        }
+        ServerError::InvalidEncryptionAlgorithmError { .. } => {
+            "The Encryption request you specified is not valid. Supported value: AES256."
+                .to_string()
+        }
+        ServerError::InvalidChunkSize {
+            chunk,
+            chunk_size,
+            min_size,
+        } => format!(
+            "invalid chunk size: only the last chunk may be smaller than {min_size} bytes (chunk {chunk} was {chunk_size} bytes)"
+        ),
+        ServerError::NoSuchCorsConfiguration { .. } => "no CORS configuration".to_string(),
+        ServerError::NoSuchTagSet { .. } => "no such tag set".to_string(),
+        ServerError::NoSuchPublicAccessBlockConfiguration { .. } => {
+            "no public access block configuration".to_string()
+        }
+        ServerError::NoSuchBucketPolicy { .. } => "The bucket policy does not exist".to_string(),
+        ServerError::NoSuchLifecycleConfiguration { .. } => {
+            "The lifecycle configuration does not exist".to_string()
+        }
+        ServerError::OwnershipControlsNotFound { .. } => {
+            "ownership controls not found".to_string()
+        }
+        ServerError::ObjectLockConfigurationNotFound { .. } => {
+            "Object Lock configuration does not exist for this bucket".to_string()
+        }
+        ServerError::ServerSideEncryptionConfigurationNotFound { .. } => {
+            "The server-side encryption configuration was not found".to_string()
+        }
+        ServerError::InvalidBucketState => {
+            "bucket is in an invalid state for this operation".to_string()
+        }
+        ServerError::AccessControlListNotSupported => {
+            "ACLs are not supported for this bucket".to_string()
+        }
+        ServerError::InvalidBucketAclWithObjectOwnership => {
+            "invalid bucket ACL with object ownership".to_string()
+        }
+        ServerError::AnonymousApiAccessDenied => {
+            "Anonymous users cannot invoke this API. Please authenticate.".to_string()
+        }
+        ServerError::NoSuchUpload { .. } => {
+            "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.".to_string()
+        }
+        ServerError::InvalidPart { part_number } => format!("invalid part: part {part_number}"),
+        ServerError::InvalidPartOrder => "invalid part order".to_string(),
+        ServerError::EntityTooSmall {
+            part_number,
+            size,
+            min,
+        } => format!("entity too small: part {part_number} is {size} bytes (min {min})"),
+        ServerError::NotImplemented { feature } => feature.clone(),
+        ServerError::HeaderNotImplemented { .. } => {
+            "A header you provided implies functionality that is not implemented".to_string()
+        }
+        ServerError::QueryParameterNotImplemented { .. } => {
+            "A query parameter you provided implies functionality that is not implemented"
+                .to_string()
+        }
+        ServerError::XAmzContentSHA256Mismatch { .. } => {
+            "The provided 'x-amz-content-sha256' header does not match what was computed."
+                .to_string()
+        }
+        ServerError::IllegalVersioningConfiguration { reason } => reason.clone(),
+        ServerError::IncompleteBody => "incomplete body".to_string(),
+        ServerError::MissingContentLength => "missing content length".to_string(),
+    }
+}
+
 impl S3Response {
     const TEST_REQUEST_ID: &'static str = "request-id";
     const TEST_HOST_ID: &'static str = "host-id";
+
+    fn client_error_response(err: &ServerError, resource: &str) -> Self {
+        match err {
+            ServerError::BucketNotFound { name } => {
+                let body =
+                    xml::no_such_bucket_error_xml(name, Self::TEST_REQUEST_ID, Self::TEST_HOST_ID);
+                Self::new(404).chunked_xml_body(body)
+            }
+            ServerError::ObjectNotFound { key, .. } | ServerError::DeleteMarkerHit { key, .. } => {
+                let body =
+                    xml::no_such_key_error_xml(key, Self::TEST_REQUEST_ID, Self::TEST_HOST_ID);
+                Self::new(404).chunked_xml_body(body)
+            }
+            ServerError::HeadDeleteMarkerMethodNotAllowed {
+                version_id,
+                last_modified,
+            } => Self::head_delete_marker_method_not_allowed(*version_id, *last_modified),
+            ServerError::NoSuchBucketPolicy { bucket } => {
+                let body = xml::no_such_bucket_policy_error_xml(
+                    bucket,
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                Self::new(404).chunked_xml_body(body)
+            }
+            ServerError::AnonymousApiAccessDenied => {
+                let body = xml::error_xml_with_host_id(
+                    "AccessDenied",
+                    &client_error_message(err),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                Self::new(403).chunked_xml_body(body)
+            }
+            ServerError::BlockPublicPolicyAccessDenied {
+                requester_principal,
+                bucket,
+            } => {
+                let body = xml::error_xml_with_host_id(
+                    "AccessDenied",
+                    &format!(
+                        "User: {} is not authorized to perform: s3:PutBucketPolicy on resource: \"arn:aws:s3:::{}\" because public policies are prevented by the BlockPublicPolicy setting in S3 Block Public Access.",
+                        requester_principal, bucket
+                    ),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                Self::new(403).chunked_xml_body(body)
+            }
+            ServerError::AccessDenied
+            | ServerError::Auth(auth::AuthError::MissingAuth)
+            | ServerError::Auth(auth::AuthError::AccessDenied) => {
+                let body = xml::error_xml_with_host_id(
+                    "AccessDenied",
+                    &client_error_message(err),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                Self::new(403).chunked_xml_body(body)
+            }
+            ServerError::XAmzContentSHA256Mismatch {
+                client_hash,
+                server_hash,
+            } => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>XAmzContentSHA256Mismatch</Code>\
+                     <Message>{}</Message>\
+                     <ClientComputedContentSHA256>{}</ClientComputedContentSHA256>\
+                     <S3ComputedContentSHA256>{}</S3ComputedContentSHA256>\
+                     <Resource>{}</Resource>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape(&client_error_message(err)),
+                    xml::xml_escape(client_hash),
+                    xml::xml_escape(server_hash),
+                    xml::xml_escape(resource),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::UnsignedHeaders { headers }) => {
+                let headers_str = headers.join(";");
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>AccessDenied</Code>\
+                     <Message>{}</Message>\
+                     <HeadersNotSigned>{}</HeadersNotSigned>\
+                     <Resource>{}</Resource>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape(&client_error_message(err)),
+                    xml::xml_escape(&headers_str),
+                    xml::xml_escape(resource),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                Self::new(403).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::UnexpectedSecurityToken { token }) => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>InvalidToken</Code>\
+                     <Message>{}</Message>\
+                     <Token-0>{}</Token-0>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape(&client_error_message(err)),
+                    xml::xml_escape(token),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader) => {
+                let body = xml::header_not_implemented_xml(
+                    "Authorization",
+                    resource,
+                    Self::TEST_REQUEST_ID,
+                );
+                Self::new(501).chunked_xml_body(body)
+            }
+            ServerError::MaxMessageLengthExceeded {
+                max_message_length_bytes,
+            } => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>MaxMessageLengthExceeded</Code>\
+                     <Message>{}</Message>\
+                     <MaxMessageLengthBytes>{}</MaxMessageLengthBytes>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape(&client_error_message(err)),
+                    max_message_length_bytes,
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::HeaderNotImplemented { header } => {
+                let body = xml::header_not_implemented_xml(header, resource, Self::TEST_REQUEST_ID);
+                Self::new(501).chunked_xml_body(body)
+            }
+            ServerError::QueryParameterNotImplemented { query_parameter } => {
+                let body = xml::query_parameter_not_implemented_xml(
+                    query_parameter,
+                    resource,
+                    Self::TEST_REQUEST_ID,
+                );
+                Self::new(501).chunked_xml_body(body)
+            }
+            ServerError::InvalidSseCustomerKeyMd5 => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>InvalidArgument</Code>\
+                     <Message>{}</Message>\
+                     <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
+                     <Resource>{}</Resource>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape(&client_error_message(err)),
+                    xml::xml_escape(resource),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::InvalidEncryptionAlgorithmError { value } => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>InvalidEncryptionAlgorithmError</Code>\
+                     <Message>{}</Message>\
+                     <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
+                     <ArgumentValue>{}</ArgumentValue>\
+                     <Resource>{}</Resource>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape(&client_error_message(err)),
+                    xml::xml_escape(value),
+                    xml::xml_escape(resource),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::WrongRegion {
+                expected_region, ..
+            } => {
+                let body = xml::error_xml_with_region(
+                    "AuthorizationHeaderMalformed",
+                    &client_error_message(err),
+                    resource,
+                    Self::TEST_REQUEST_ID,
+                    expected_region,
+                );
+                Self::new(400)
+                    .header("x-amz-bucket-region", expected_region)
+                    .chunked_xml_body(body)
+            }
+            ServerError::InvalidBucketNamespace {
+                bucket_namespace, ..
+            } => {
+                let body = xml::error_xml_with_bucket_namespace(
+                    "InvalidBucketNamespace",
+                    &client_error_message(err),
+                    bucket_namespace,
+                    Self::TEST_REQUEST_ID,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::KeyTooLongError {
+                size,
+                max_size_allowed,
+            } => {
+                let body =
+                    xml::key_too_long_error_xml(*size, *max_size_allowed, Self::TEST_REQUEST_ID);
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::NoSuchUpload { upload_id } => {
+                let body = xml::no_such_upload_error_xml(upload_id, Self::TEST_REQUEST_ID);
+                Self::new(404).chunked_xml_body(body)
+            }
+            _ => {
+                let body = xml::error_xml(
+                    err.s3_error_code(),
+                    &client_error_message(err),
+                    resource,
+                    Self::TEST_REQUEST_ID,
+                );
+                let resp = Self::new(err.http_status()).chunked_xml_body(body);
+                if matches!(err, ServerError::SlowDown) {
+                    resp.header("Retry-After", "1")
+                } else {
+                    resp
+                }
+            }
+        }
+    }
 
     fn new(status_code: u16) -> Self {
         Self {
@@ -1195,292 +1616,7 @@ impl S3Response {
     /// Build an error response.
     #[must_use]
     pub fn error(err: &ServerError, resource: &str) -> Self {
-        const INTERNAL_ERROR_MESSAGE: &str = "We encountered an internal error. Please try again.";
-
-        // Special cases that need extra XML elements
-        match err {
-            ServerError::BucketNotFound { name } => {
-                let body =
-                    xml::no_such_bucket_error_xml(name, Self::TEST_REQUEST_ID, Self::TEST_HOST_ID);
-                return Self::new(404).chunked_xml_body(body);
-            }
-            ServerError::ObjectNotFound { key, .. } | ServerError::DeleteMarkerHit { key, .. } => {
-                let body =
-                    xml::no_such_key_error_xml(key, Self::TEST_REQUEST_ID, Self::TEST_HOST_ID);
-                return Self::new(404).chunked_xml_body(body);
-            }
-            ServerError::HeadDeleteMarkerMethodNotAllowed {
-                version_id,
-                last_modified,
-            } => {
-                return Self::head_delete_marker_method_not_allowed(*version_id, *last_modified);
-            }
-            ServerError::NoSuchBucketPolicy { bucket } => {
-                let body = xml::no_such_bucket_policy_error_xml(
-                    bucket,
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
-                );
-                return Self::new(404).chunked_xml_body(body);
-            }
-            ServerError::AnonymousApiAccessDenied => {
-                let body = xml::error_xml_with_host_id(
-                    "AccessDenied",
-                    "Anonymous users cannot invoke this API. Please authenticate.",
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
-                );
-                return Self::new(403).chunked_xml_body(body);
-            }
-            ServerError::BlockPublicPolicyAccessDenied {
-                requester_principal,
-                bucket,
-            } => {
-                let body = xml::error_xml_with_host_id(
-                    "AccessDenied",
-                    &format!(
-                        "User: {} is not authorized to perform: s3:PutBucketPolicy on resource: \"arn:aws:s3:::{}\" because public policies are prevented by the BlockPublicPolicy setting in S3 Block Public Access.",
-                        requester_principal, bucket
-                    ),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
-                );
-                return Self::new(403).chunked_xml_body(body);
-            }
-            ServerError::AccessDenied
-            | ServerError::Auth(auth::AuthError::MissingAuth)
-            | ServerError::Auth(auth::AuthError::AccessDenied) => {
-                let body = xml::error_xml_with_host_id(
-                    "AccessDenied",
-                    "Access Denied",
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
-                );
-                return Self::new(403).chunked_xml_body(body);
-            }
-            ServerError::XAmzContentSHA256Mismatch {
-                client_hash,
-                server_hash,
-            } => {
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                     <Error>\
-                     <Code>XAmzContentSHA256Mismatch</Code>\
-                     <Message>The provided 'x-amz-content-sha256' header does not match what was computed.</Message>\
-                     <ClientComputedContentSHA256>{}</ClientComputedContentSHA256>\
-                     <S3ComputedContentSHA256>{}</S3ComputedContentSHA256>\
-                     <Resource>{}</Resource>\
-                     <RequestId>{}</RequestId>\
-                     <HostId>{}</HostId>\
-                     </Error>",
-                    xml::xml_escape(client_hash),
-                    xml::xml_escape(server_hash),
-                    xml::xml_escape(resource),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
-                );
-                return Self::new(400).chunked_xml_body(body);
-            }
-            ServerError::Auth(auth::AuthError::UnsignedHeaders { headers }) => {
-                let headers_str = headers.join(";");
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                     <Error>\
-                     <Code>AccessDenied</Code>\
-                     <Message>There were headers present in the request which were not signed</Message>\
-                     <HeadersNotSigned>{}</HeadersNotSigned>\
-                     <Resource>{}</Resource>\
-                     <RequestId>{}</RequestId>\
-                     <HostId>{}</HostId>\
-                     </Error>",
-                    xml::xml_escape(&headers_str),
-                    xml::xml_escape(resource),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
-                );
-                return Self::new(403).chunked_xml_body(body);
-            }
-            ServerError::Auth(auth::AuthError::UnexpectedSecurityToken { token }) => {
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                     <Error>\
-                     <Code>InvalidToken</Code>\
-                     <Message>The provided token is malformed or otherwise invalid.</Message>\
-                     <Token-0>{}</Token-0>\
-                     <RequestId>{}</RequestId>\
-                     <HostId>{}</HostId>\
-                     </Error>",
-                    xml::xml_escape(token),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
-                );
-                return Self::new(400).chunked_xml_body(body);
-            }
-            ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader) => {
-                let body = xml::header_not_implemented_xml(
-                    "Authorization",
-                    resource,
-                    Self::TEST_REQUEST_ID,
-                );
-                return Self::new(501).chunked_xml_body(body);
-            }
-            ServerError::MaxMessageLengthExceeded {
-                max_message_length_bytes,
-            } => {
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                     <Error>\
-                     <Code>MaxMessageLengthExceeded</Code>\
-                     <Message>Your request was too big.</Message>\
-                     <MaxMessageLengthBytes>{}</MaxMessageLengthBytes>\
-                     <RequestId>{}</RequestId>\
-                     <HostId>{}</HostId>\
-                     </Error>",
-                    max_message_length_bytes,
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
-                );
-                return Self::new(400).chunked_xml_body(body);
-            }
-            ServerError::HeaderNotImplemented { ref header } => {
-                let body = xml::header_not_implemented_xml(header, resource, Self::TEST_REQUEST_ID);
-                return Self::new(501).chunked_xml_body(body);
-            }
-            ServerError::QueryParameterNotImplemented {
-                ref query_parameter,
-            } => {
-                let body = xml::query_parameter_not_implemented_xml(
-                    query_parameter,
-                    resource,
-                    Self::TEST_REQUEST_ID,
-                );
-                return Self::new(501).chunked_xml_body(body);
-            }
-            ServerError::InvalidSseCustomerKeyMd5 => {
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                     <Error>\
-                     <Code>InvalidArgument</Code>\
-                     <Message>The calculated MD5 hash of the key did not match the hash that was provided.</Message>\
-                     <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
-                     <Resource>{}</Resource>\
-                     <RequestId>{}</RequestId>\
-                     <HostId>{}</HostId>\
-                     </Error>",
-                    xml::xml_escape(resource),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
-                );
-                return Self::new(400).chunked_xml_body(body);
-            }
-            ServerError::InvalidEncryptionAlgorithmError { value } => {
-                let body = format!(
-                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-                     <Error>\
-                     <Code>InvalidEncryptionAlgorithmError</Code>\
-                     <Message>The Encryption request you specified is not valid. Supported value: AES256.</Message>\
-                     <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
-                     <ArgumentValue>{}</ArgumentValue>\
-                     <Resource>{}</Resource>\
-                     <RequestId>{}</RequestId>\
-                     <HostId>{}</HostId>\
-                     </Error>",
-                    xml::xml_escape(value),
-                    xml::xml_escape(resource),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
-                );
-                return Self::new(400).chunked_xml_body(body);
-            }
-            ServerError::WrongRegion {
-                provided_region,
-                expected_region,
-            } => {
-                let body = xml::error_xml_with_region(
-                    "AuthorizationHeaderMalformed",
-                    &format!(
-                        "The authorization header is malformed; the region '{provided_region}' is wrong; expecting '{expected_region}'"
-                    ),
-                    resource,
-                    Self::TEST_REQUEST_ID,
-                    expected_region,
-                );
-                return Self::new(400)
-                    .header("x-amz-bucket-region", expected_region)
-                    .chunked_xml_body(body);
-            }
-            ServerError::InvalidBucketNamespace {
-                reason,
-                bucket_namespace,
-            } => {
-                let body = xml::error_xml_with_bucket_namespace(
-                    "InvalidBucketNamespace",
-                    reason,
-                    bucket_namespace,
-                    Self::TEST_REQUEST_ID,
-                );
-                return Self::new(400).chunked_xml_body(body);
-            }
-            ServerError::KeyTooLongError {
-                size,
-                max_size_allowed,
-            } => {
-                let body =
-                    xml::key_too_long_error_xml(*size, *max_size_allowed, Self::TEST_REQUEST_ID);
-                return Self::new(400).chunked_xml_body(body);
-            }
-            ServerError::RequestHeaderSectionTooLarge => {
-                let body = xml::error_xml(
-                    "RequestHeaderSectionTooLarge",
-                    "The request header and query parameters used to make the request exceed the maximum allowed size.",
-                    resource,
-                    Self::TEST_REQUEST_ID,
-                );
-                return Self::new(400).chunked_xml_body(body);
-            }
-            ServerError::NoSuchUpload { upload_id } => {
-                let body = xml::no_such_upload_error_xml(upload_id, Self::TEST_REQUEST_ID);
-                return Self::new(404).chunked_xml_body(body);
-            }
-            _ => {}
-        }
-
-        let fallback;
-        let message = match err {
-            ServerError::InvalidRequest { reason } => reason.as_str(),
-            ServerError::InvalidArgument { reason } => reason.as_str(),
-            ServerError::InvalidBucketName { reason } => reason.as_str(),
-            ServerError::InvalidBucketNamespace { reason, .. } => reason.as_str(),
-            ServerError::MalformedPolicy { reason } => reason.as_str(),
-            ServerError::NotImplemented { feature } => feature.as_str(),
-            ServerError::HeaderNotImplemented { header } => header.as_str(),
-            ServerError::QueryParameterNotImplemented { query_parameter } => {
-                query_parameter.as_str()
-            }
-            ServerError::VersionNotFound { .. } => "The specified version does not exist.",
-            ServerError::InternalError { .. }
-            | ServerError::IntegrityError { .. }
-            | ServerError::Store(_)
-            | ServerError::Metadata(_)
-            | ServerError::Ec(_)
-            | ServerError::MetadataBlobError { .. } => INTERNAL_ERROR_MESSAGE,
-            _ => {
-                fallback = err.to_string();
-                fallback.as_str()
-            }
-        };
-        let body = xml::error_xml(
-            err.s3_error_code(),
-            message,
-            resource,
-            Self::TEST_REQUEST_ID,
-        );
-        let resp = Self::new(err.http_status()).chunked_xml_body(body);
-        if matches!(err, ServerError::SlowDown) {
-            resp.header("Retry-After", "1")
-        } else {
-            resp
-        }
+        Self::client_error_response(err, resource)
     }
 }
 
@@ -2870,6 +3006,50 @@ mod tests {
         assert!(body.contains("InternalError"));
         assert!(body.contains("We encountered an internal error. Please try again."));
         assert!(!body.contains("0xFF"));
+    }
+
+    #[test]
+    fn error_response_internal_storage_and_ec_errors_are_sanitized() {
+        let cases: Vec<(ServerError, Vec<&str>)> = vec![
+            (
+                ServerError::Store(storage::StoreError::Io {
+                    context: "read shard row",
+                    source: std::io::Error::other("sqlite path /tmp/secret.db near table shards"),
+                }),
+                vec!["sqlite", "/tmp/secret.db", "read shard row", "table shards"],
+            ),
+            (
+                ServerError::Metadata(storage::error::MetadataError::NotImplemented {
+                    context: "sqlite path /tmp/secret.db UNIQUE constraint failed: objects.key",
+                }),
+                vec![
+                    "UNIQUE constraint",
+                    "objects.key",
+                    "/tmp/secret.db",
+                    "sqlite",
+                ],
+            ),
+            (
+                ServerError::Ec(ec::EcError::SmokeTestFailed {
+                    reason: "matrix inversion failed in /tmp/secret-ec".to_string(),
+                }),
+                vec!["matrix inversion failed", "/tmp/secret-ec"],
+            ),
+        ];
+
+        for (err, leaks) in cases {
+            let body = String::from_utf8(
+                S3Response::error(&err, "/x")
+                    .into_test_body_bytes()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(body.contains("InternalError"));
+            assert!(body.contains("We encountered an internal error. Please try again."));
+            for leak in leaks {
+                assert!(!body.contains(leak), "unexpected leak {leak:?} in {body}");
+            }
+        }
     }
 
     #[test]
