@@ -63,5 +63,110 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "server_http_conditional_headers"
+path = "fuzz_targets/server_http_conditional_headers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_complete_multipart_upload"
+path = "fuzz_targets/server_http_xml_complete_multipart_upload.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_delete_objects"
+path = "fuzz_targets/server_http_xml_delete_objects.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_bucket_lifecycle"
+path = "fuzz_targets/server_http_xml_bucket_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_bucket_cors"
+path = "fuzz_targets/server_http_xml_bucket_cors.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_bucket_acl"
+path = "fuzz_targets/server_http_xml_bucket_acl.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_bucket_object_lock_configuration"
+path = "fuzz_targets/server_http_xml_bucket_object_lock_configuration.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_bucket_versioning"
+path = "fuzz_targets/server_http_xml_bucket_versioning.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_bucket_encryption"
+path = "fuzz_targets/server_http_xml_bucket_encryption.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_bucket_tagging"
+path = "fuzz_targets/server_http_xml_bucket_tagging.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_object_tagging"
+path = "fuzz_targets/server_http_xml_object_tagging.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_object_retention"
+path = "fuzz_targets/server_http_xml_object_retention.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_object_legal_hold"
+path = "fuzz_targets/server_http_xml_object_legal_hold.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_public_access_block"
+path = "fuzz_targets/server_http_xml_public_access_block.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_http_xml_ownership_controls"
+path = "fuzz_targets/server_http_xml_ownership_controls.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

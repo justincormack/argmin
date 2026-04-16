@@ -230,6 +230,29 @@ fn parse_required_upload_id(raw: Option<&str>) -> Result<UploadId, ServerError> 
     parse_present_upload_id(upload_id)
 }
 
+pub(crate) fn enforce_sigv4_time_skew(req: &S3Request, now: u64) -> Result<(), ServerError> {
+    // AWS rejects expired SigV4 requests before signature verification. Only
+    // applies to well-formed SigV4 auth headers.
+    let is_sigv4 = req
+        .header("authorization")
+        .is_some_and(|h| h.starts_with("AWS4-HMAC-SHA256"));
+    if !is_sigv4 {
+        return Ok(());
+    }
+
+    if let Some(date_str) = req.header("x-amz-date") {
+        if let Some(epoch) = auth::parse_amz_date(date_str) {
+            let skew = now.abs_diff(epoch);
+            if skew > 15 * 60 {
+                return Err(ServerError::Auth(auth::AuthError::RequestExpired));
+            }
+        }
+        // malformed date -> fall through to auth which will handle it
+    }
+
+    Ok(())
+}
+
 #[doc(hidden)]
 pub fn fuzz_upload_id_query_entrypoints(
     multipart_query: &str,
@@ -2662,22 +2685,7 @@ impl HttpFrontend {
             .unwrap_or_default()
             .as_secs();
 
-        // Pre-auth time skew check for SigV4 requests: AWS rejects expired requests
-        // before signature verification. Only applies to well-formed SigV4 auth headers.
-        let is_sigv4 = req
-            .header("authorization")
-            .is_some_and(|h| h.starts_with("AWS4-HMAC-SHA256"));
-        if is_sigv4 {
-            if let Some(date_str) = req.header("x-amz-date") {
-                if let Some(epoch) = auth::parse_amz_date(date_str) {
-                    let skew = now.abs_diff(epoch);
-                    if skew > 15 * 60 {
-                        return Err(ServerError::Auth(auth::AuthError::RequestExpired));
-                    }
-                }
-                // malformed date → fall through to auth which will handle it
-            }
-        }
+        enforce_sigv4_time_skew(req, now)?;
 
         let auth_result = if defer_region_check {
             authenticate_request_allow_wrong_region(

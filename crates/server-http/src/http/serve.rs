@@ -1206,7 +1206,6 @@ pub fn fuzz_post_multipart_parser(
 #[doc(hidden)]
 pub fn fuzz_request_parser_entrypoints(
     copy_source: &str,
-    delete_objects_xml: &[u8],
     post_key: &str,
     file_name: &str,
     multipart_query: &str,
@@ -1219,7 +1218,6 @@ pub fn fuzz_request_parser_entrypoints(
         list_multipart_query,
         upload_part_query,
     );
-    let _ = crate::http::xml::parse_delete_objects_xml(delete_objects_xml);
 
     let form = crate::http::multipart::PostFormData {
         fields: vec![("key".to_string(), post_key.to_string())],
@@ -1227,6 +1225,178 @@ pub fn fuzz_request_parser_entrypoints(
         file_name: (!file_name.is_empty()).then(|| file_name.to_string()),
     };
     let _ = form.resolve_key();
+}
+
+#[doc(hidden)]
+pub struct XmlFuzzInputs<'a> {
+    pub complete_multipart_upload_xml: &'a [u8],
+    pub delete_objects_xml: &'a [u8],
+    pub bucket_lifecycle_xml: &'a [u8],
+    pub bucket_cors_xml: &'a [u8],
+    pub bucket_acl_xml: &'a [u8],
+    pub bucket_object_lock_configuration_xml: &'a [u8],
+    pub object_retention_xml: &'a [u8],
+    pub object_legal_hold_xml: &'a [u8],
+    pub bucket_versioning_xml: &'a [u8],
+    pub bucket_encryption_xml: &'a [u8],
+    pub bucket_tagging_xml: &'a [u8],
+    pub object_tagging_xml: &'a [u8],
+    pub public_access_block_xml: &'a [u8],
+    pub ownership_controls_xml: &'a [u8],
+}
+
+#[doc(hidden)]
+pub fn fuzz_xml_parser_entrypoints(inputs: XmlFuzzInputs<'_>) {
+    fn clamp(data: &[u8], max_len: usize) -> &[u8] {
+        &data[..data.len().min(max_len)]
+    }
+
+    const MAX_COMPLETE_MULTIPART_UPLOAD_XML_BYTES: usize = 2_621_440;
+    const MAX_DELETE_OBJECTS_XML_BYTES: usize = 2_048_000;
+    const MAX_BUCKET_LIFECYCLE_XML_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_BUCKET_CORS_XML_BYTES: usize = 64 * 1024;
+    const MAX_BUCKET_OBJECT_LOCK_CONFIGURATION_XML_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_BUCKET_VERSIONING_XML_BYTES: usize = 1024;
+    const MAX_TAGGING_XML_BYTES: usize = 160 * 1024;
+    const MAX_PUBLIC_ACCESS_BLOCK_XML_BYTES: usize = 2 * 1024 * 1024;
+    const MAX_OWNERSHIP_CONTROLS_XML_BYTES: usize = 2048;
+
+    // These parsers do not currently enforce a request-size bound themselves.
+    const MAX_ACL_XML_FUZZ_BYTES: usize = 64 * 1024;
+    const MAX_OBJECT_RETENTION_XML_FUZZ_BYTES: usize = 64 * 1024;
+    const MAX_OBJECT_LEGAL_HOLD_XML_FUZZ_BYTES: usize = 64 * 1024;
+    const MAX_BUCKET_ENCRYPTION_XML_FUZZ_BYTES: usize = 64 * 1024;
+
+    let _ = crate::http::xml::parse_complete_multipart_upload_xml(clamp(
+        inputs.complete_multipart_upload_xml,
+        MAX_COMPLETE_MULTIPART_UPLOAD_XML_BYTES,
+    ));
+    let _ = crate::http::xml::parse_delete_objects_xml(clamp(
+        inputs.delete_objects_xml,
+        MAX_DELETE_OBJECTS_XML_BYTES,
+    ));
+    let _ = crate::http::xml::parse_bucket_lifecycle_configuration_xml(clamp(
+        inputs.bucket_lifecycle_xml,
+        MAX_BUCKET_LIFECYCLE_XML_BYTES,
+    ));
+    let _ = crate::http::xml::parse_cors_config_xml(clamp(
+        inputs.bucket_cors_xml,
+        MAX_BUCKET_CORS_XML_BYTES,
+    ));
+    let _ = crate::http::xml::parse_acl_xml(clamp(inputs.bucket_acl_xml, MAX_ACL_XML_FUZZ_BYTES));
+    let _ = crate::http::xml::parse_bucket_object_lock_configuration_xml(clamp(
+        inputs.bucket_object_lock_configuration_xml,
+        MAX_BUCKET_OBJECT_LOCK_CONFIGURATION_XML_BYTES,
+    ));
+    let _ = crate::http::xml::parse_object_retention_xml(clamp(
+        inputs.object_retention_xml,
+        MAX_OBJECT_RETENTION_XML_FUZZ_BYTES,
+    ));
+    let _ = crate::http::xml::parse_object_legal_hold_xml(clamp(
+        inputs.object_legal_hold_xml,
+        MAX_OBJECT_LEGAL_HOLD_XML_FUZZ_BYTES,
+    ));
+    let _ = crate::http::xml::parse_versioning_config_xml(clamp(
+        inputs.bucket_versioning_xml,
+        MAX_BUCKET_VERSIONING_XML_BYTES,
+    ));
+    let _ = crate::http::xml::parse_bucket_encryption_xml(clamp(
+        inputs.bucket_encryption_xml,
+        MAX_BUCKET_ENCRYPTION_XML_FUZZ_BYTES,
+    ));
+    let _ = crate::http::xml::parse_tagging_xml(
+        clamp(inputs.bucket_tagging_xml, MAX_TAGGING_XML_BYTES),
+        50,
+    );
+    let _ = crate::http::xml::parse_tagging_xml(
+        clamp(inputs.object_tagging_xml, MAX_TAGGING_XML_BYTES),
+        10,
+    );
+    let _ = crate::http::xml::parse_public_access_block_xml(clamp(
+        inputs.public_access_block_xml,
+        MAX_PUBLIC_ACCESS_BLOCK_XML_BYTES,
+    ));
+    let _ = crate::http::xml::parse_ownership_controls_xml(clamp(
+        inputs.ownership_controls_xml,
+        MAX_OWNERSHIP_CONTROLS_XML_BYTES,
+    ));
+}
+
+#[doc(hidden)]
+pub struct ConditionalFuzzInputs<'a> {
+    pub if_match: &'a str,
+    pub if_none_match: &'a str,
+    pub if_modified_since: &'a str,
+    pub if_unmodified_since: &'a str,
+    pub copy_source_if_match: &'a str,
+    pub copy_source_if_none_match: &'a str,
+    pub copy_source_if_modified_since: &'a str,
+    pub copy_source_if_unmodified_since: &'a str,
+    pub delete_if_match_last_modified_time: &'a str,
+    pub delete_if_match_size: &'a str,
+    pub amz_date: &'a str,
+}
+
+#[doc(hidden)]
+pub fn fuzz_conditional_header_entrypoints(inputs: ConditionalFuzzInputs<'_>) {
+    let _ = crate::http::response::parse_http_date(inputs.if_modified_since);
+    let _ = crate::http::response::parse_http_date(inputs.if_unmodified_since);
+    let _ = crate::http::response::parse_http_date(inputs.copy_source_if_modified_since);
+    let _ = crate::http::response::parse_http_date(inputs.copy_source_if_unmodified_since);
+
+    let mut request = http::Request::new(());
+    *request.method_mut() = http::Method::GET;
+    *request.uri_mut() = "/".parse().expect("static URI is valid");
+
+    let header_values = [
+        ("if-match", inputs.if_match),
+        ("if-none-match", inputs.if_none_match),
+        ("if-modified-since", inputs.if_modified_since),
+        ("if-unmodified-since", inputs.if_unmodified_since),
+        ("x-amz-copy-source-if-match", inputs.copy_source_if_match),
+        (
+            "x-amz-copy-source-if-none-match",
+            inputs.copy_source_if_none_match,
+        ),
+        (
+            "x-amz-copy-source-if-modified-since",
+            inputs.copy_source_if_modified_since,
+        ),
+        (
+            "x-amz-copy-source-if-unmodified-since",
+            inputs.copy_source_if_unmodified_since,
+        ),
+        (
+            "x-amz-if-match-last-modified-time",
+            inputs.delete_if_match_last_modified_time,
+        ),
+        ("x-amz-if-match-size", inputs.delete_if_match_size),
+        ("x-amz-date", inputs.amz_date),
+        ("authorization", "AWS4-HMAC-SHA256 fuzz"),
+    ];
+
+    for (name, value) in header_values {
+        if value.is_empty() {
+            continue;
+        }
+        let Ok(value) = http::HeaderValue::from_str(value) else {
+            continue;
+        };
+        request.headers_mut().append(name, value);
+    }
+
+    let Ok(req) = crate::http::request::S3Request::from_hyper_headers(
+        request.into_parts().0,
+        crate::http::request::TransportSecurity::Tls,
+    ) else {
+        return;
+    };
+
+    let _ = crate::http::enforce_sigv4_time_skew(&req, 1_700_000_000);
+    let _ = crate::http::conditional::read_condition_from_headers(&req);
+    let _ = crate::http::conditional::write_condition_from_headers(&req);
+    let _ = crate::http::conditional::delete_condition_from_headers(&req);
+    let _ = crate::http::conditional::copy_source_condition_from_headers(&req);
 }
 
 #[doc(hidden)]
