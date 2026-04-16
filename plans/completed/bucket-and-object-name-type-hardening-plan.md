@@ -9,8 +9,10 @@ Phases 1, 2, 3, 3a, 4, and 5 are complete.
 What has landed so far:
 
 1. `BucketName` / `ObjectKey` are now strict validated types.
-2. Alternate parse paths such as copy-source and XML/multipart key parsing now
-   return typed values instead of raw bucket/key strings.
+2. Alternate parse paths such as XML/multipart key parsing now return typed
+   values directly, while the copy-source path keeps the low-level raw source
+   bucket for AWS-compatible `NoSuchBucket` mapping and centralizes the real
+   hardened typed boundary in a shared `server-http` helper.
 3. Coordinator request wrappers such as `BucketRequest`, `ObjectRequest`,
    `ObjectVersionRequest`, `MultipartObjectRequest`, `DeleteEntry`, and
    `AppendStreamPartRequest` now carry typed bucket/key values directly.
@@ -48,7 +50,10 @@ What has landed so far:
 13. Phase 5 adds direct type-level construction tests, targeted alternate
     parser regressions, malformed and oversized copy-source coverage, fuzz
     coverage that reaches the real typed copy-source bucket validation path,
-    and AWS-facing compatibility coverage for the new boundary behavior.
+    and AWS-facing compatibility coverage for the new boundary behavior,
+    including the intentional `%00` copy-source divergence where Argmin
+    returns `400 InvalidArgument` even though AWS currently returns
+    `500 InternalError`.
 
 This plan now documents shipped work. `security/codex-23ffb1b` still needs its
 separate follow-up note update to reference the fixing commits.
@@ -241,14 +246,17 @@ Exit criteria:
 3. Storage row loads and other persistence/deserialization paths have one
    explicit, audited rule instead of an unresolved migration placeholder.
 
-## Phase 2: Fix alternate parse paths to return typed values
+## Phase 2: Fix alternate parse paths to preserve a typed hardened boundary
 
-1. Replace `parse_copy_source -> (String, String, Option<String>)` with a typed
-   result, for example a `CopySource` struct containing:
-   - `bucket: BucketName`
-   - `key: ObjectKey`
-   - `version_id: Option<String>` or a more specific type if that work already
-     exists
+1. Replace the old raw alternate-parse boundary with a hardened shared
+   boundary:
+   - low-level parsers may still return raw data where wire-compatible error
+     mapping requires it
+   - but a shared `server-http` helper must centralize the revalidation step
+     before coordinator dispatch
+   - copy-source in particular may keep a raw source bucket at the low-level
+     parser so invalid source buckets still map to `BucketNotFound` /
+     `NoSuchBucket` rather than a generic validation error
 2. Audit all non-routing bucket/key entry points, including:
    - `x-amz-copy-source`
    - XML request bodies containing object keys
@@ -259,8 +267,9 @@ Exit criteria:
 
 Exit criteria:
 
-1. No request parser that yields bucket/key data for core logic returns raw
-   bucket/key strings.
+1. No request path can reach core logic with raw unvalidated bucket/key
+   strings, even if a low-level parser temporarily preserves raw wire values
+   for AWS-compatible error mapping.
 2. The `copy-source` class of bug is structurally impossible.
 
 ## Phase 3: Tighten coordinator-facing request shapes
@@ -421,7 +430,7 @@ Exit criteria:
 4. Add or extend fuzz coverage for parser surfaces that produce typed bucket/key
    values.
 5. Confirm AWS-compat behavior for accepted and rejected edge cases remains the
-   same where intended.
+   same where intended, and document any intentional divergences explicitly.
 
 Exit criteria:
 
@@ -470,7 +479,10 @@ This work is done when all of the following are true:
 1. `BucketName` and `ObjectKey` mean "already validated" everywhere in the
    codebase.
 2. Unvalidated names are represented only as raw wire data before parsing.
-3. `parse_copy_source` and equivalent alternate parsers return typed results.
+3. Alternate parse paths either return typed results directly or flow through a
+   shared hardened `server-http` boundary before coordinator dispatch; the
+   copy-source path keeps a raw source bucket only long enough to preserve the
+   later `BucketNotFound` / `NoSuchBucket` mapping.
 4. Coordinator and PG selection code cannot be reached with oversized or
    otherwise invalid bucket/key values from HTTP requests.
 5. The security bug from `security/codex-23ffb1b` is fixed as part of a broader

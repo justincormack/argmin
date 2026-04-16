@@ -5410,6 +5410,32 @@ mod tests {
     }
 
     #[test]
+    fn parse_copy_source_header_parses_typed_source() {
+        let (bucket, key, version_id) =
+            parse_copy_source_header("/source-bucket/path/to/key?versionId=42").unwrap();
+        assert_eq!(bucket.as_str(), "source-bucket");
+        assert_eq!(key.as_str(), "path/to/key");
+        assert_eq!(version_id, Some(VersionId::from_u64(42)));
+    }
+
+    #[test]
+    fn parse_copy_source_header_maps_invalid_source_bucket_to_bucket_not_found() {
+        match parse_copy_source_header("/BadBucket/key") {
+            Err(ServerError::BucketNotFound { name }) => assert_eq!(name, "BadBucket"),
+            other => panic!("expected BucketNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_copy_source_header_maps_oversized_source_bucket_to_bucket_not_found() {
+        let oversized_bucket = "a".repeat(64);
+        match parse_copy_source_header(&format!("/{oversized_bucket}/key")) {
+            Err(ServerError::BucketNotFound { name }) => assert_eq!(name, oversized_bucket),
+            other => panic!("expected BucketNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn unsupported_sigv2_error_returns_sigv4_required_message_in_eu_central_1() {
         let err = HttpFrontend::unsupported_sigv2_error(Some("AWS AKIA:signature"), "eu-central-1")
             .expect("expected eu-central-1 SigV2 to be rejected");
