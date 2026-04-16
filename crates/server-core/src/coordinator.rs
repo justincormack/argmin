@@ -2184,6 +2184,15 @@ pub struct Requester {
 
 impl Requester {
     #[must_use]
+    pub fn from_auth(auth: &auth::AuthContext) -> Self {
+        Self {
+            account: auth.account.clone(),
+            authorization_profile: auth.authorization_profile,
+        }
+    }
+
+    #[must_use]
+    #[cfg(any(test, feature = "test-utils"))]
     pub const fn anonymous() -> Self {
         Self {
             account: None,
@@ -2192,6 +2201,7 @@ impl Requester {
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn authenticated(account: AccountIdentity) -> Self {
         Self {
             account: Some(account),
@@ -2200,6 +2210,7 @@ impl Requester {
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn from_account(account: Option<&AccountIdentity>) -> Self {
         Self {
             account: account.cloned(),
@@ -2208,6 +2219,7 @@ impl Requester {
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn authenticated_owner_account_admin(account: AccountIdentity) -> Self {
         Self {
             account: Some(account),
@@ -2216,6 +2228,7 @@ impl Requester {
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn from_account_owner_account_admin(account: Option<&AccountIdentity>) -> Self {
         Self {
             account: account.cloned(),
@@ -2224,6 +2237,7 @@ impl Requester {
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn authenticated_with_profile(
         account: AccountIdentity,
         authorization_profile: auth::AuthorizationProfile,
@@ -2235,6 +2249,7 @@ impl Requester {
     }
 
     #[must_use]
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn from_account_with_profile(
         account: Option<&AccountIdentity>,
         authorization_profile: auth::AuthorizationProfile,

@@ -894,10 +894,7 @@ impl HttpFrontend {
     }
 
     fn requester_from_auth(auth: &AuthContext) -> crate::coordinator::Requester {
-        crate::coordinator::Requester::from_account_with_profile(
-            auth.account.as_ref(),
-            auth.authorization_profile,
-        )
+        crate::coordinator::Requester::from_auth(auth)
     }
 
     fn authenticated_account(
