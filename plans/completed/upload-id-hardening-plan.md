@@ -2,7 +2,7 @@
 
 ## Status
 
-In progress.
+Completed.
 
 This is the next identifier-boundary hardening target after the completed
 bucket/object name rewrite.
@@ -300,6 +300,31 @@ Exit criteria:
    query boundaries are exercised under the new typed model.
 6. Decide whether to fold `SessionId` cleanup into this closeout or leave it as
    a smaller internal follow-up.
+
+Current state:
+
+1. Done: `UploadId` construction and persistence loading now have direct tests,
+   including invalid stored-row rejection.
+2. Done: buffered multipart request regressions cover malformed-present main
+   operation `uploadId` behavior for `UploadPart`,
+   `CompleteMultipartUpload`, and `AbortMultipartUpload`, and list-marker
+   coverage exercises malformed `upload-id-marker`.
+3. Done: streaming-path coverage keeps malformed multipart query values at the
+   outer routing seam until the explicit HTTP boundary handles them.
+4. Done: AWS-facing tests now pin invalid-present `uploadId` behavior for
+   `AbortMultipartUpload`, `UploadPart`, `CompleteMultipartUpload`, and
+   `ListParts`, including response shape and auth-precedence behavior.
+5. Done: parser fuzz coverage now exercises the actual multipart query
+   extraction/validation boundaries for:
+   - main multipart `uploadId`
+   - `upload-id-marker`
+   - `UploadPart` query parsing
+6. Done: `SessionId` cleanup was explicitly deferred to the narrower internal
+   follow-up in
+   [plans/session-id-hardening-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/session-id-hardening-plan.md)
+   rather than being folded into this AWS-facing multipart identifier work.
+
+Phase 4 is complete.
 
 Exit criteria:
 
