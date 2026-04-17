@@ -245,6 +245,28 @@ Success criteria:
 - evaluator drift shows up as a small local failure before AWS-backed suites
   run
 
+Current state:
+
+- [x] Extended `crates/auth/tests/bucket_policy_differential.rs` with a bounded
+  Phase 2 request-context matrix.
+- [x] Added a generated exactness check over the supported request-context
+  families so a policy keyed on one field is unaffected by unrelated
+  copy-source, tag, ACL/grant, or SSE/SSE-C request context.
+- [x] Added an explicit `copy-source` plus `metadata-directive` combination
+  matrix so that pair is covered as a joint condition family rather than only
+  incidentally through the general generator.
+- [x] Added a local bucket-vs-object resource applicability matrix over
+  selected representative actions, which pins the current parse/evaluation
+  surface for those modeled rows:
+  - representative object actions accept object-scoped resources and reject
+    bucket-only resources at parse time
+  - representative bucket actions accept bucket resources, require
+    bucket-scoped requests, and reject object-scoped resources at parse time
+- [x] Added an explicit unsupported-condition guard so known unsupported keys
+  like `aws:PrincipalArn`, `aws:SourceVpc`, `aws:SourceVpce`, `aws:SourceIp`,
+  and `s3:VersionId` are rejected by
+  `validate_evaluable_object_conditions()` for evaluable object actions.
+
 ## Phase 3: AWS-Backed Oracle Harness
 
 Add a generated-but-bounded AWS differential harness under `crates/s3-tests`.
