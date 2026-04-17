@@ -1691,16 +1691,17 @@ fn days_to_date(days: i64) -> (i64, u32, u32) {
 pub(crate) fn parse_http_date(s: &str) -> Option<u64> {
     // Format: "Day, DD Mon YYYY HH:MM:SS GMT"
     let s = s.trim();
-    if s.len() < 29 || !s.ends_with("GMT") {
+    let bytes = s.as_bytes();
+    if bytes.len() < 29 || &bytes[bytes.len().checked_sub(3)?..] != b"GMT" {
         return None;
     }
 
-    let day: u32 = s[5..7].parse().ok()?;
-    let month_str = &s[8..11];
-    let year: i64 = s[12..16].parse().ok()?;
-    let hours: u64 = s[17..19].parse().ok()?;
-    let minutes: u64 = s[20..22].parse().ok()?;
-    let seconds: u64 = s[23..25].parse().ok()?;
+    let day: u32 = std::str::from_utf8(bytes.get(5..7)?).ok()?.parse().ok()?;
+    let month_str = std::str::from_utf8(bytes.get(8..11)?).ok()?;
+    let year: i64 = std::str::from_utf8(bytes.get(12..16)?).ok()?.parse().ok()?;
+    let hours: u64 = std::str::from_utf8(bytes.get(17..19)?).ok()?.parse().ok()?;
+    let minutes: u64 = std::str::from_utf8(bytes.get(20..22)?).ok()?.parse().ok()?;
+    let seconds: u64 = std::str::from_utf8(bytes.get(23..25)?).ok()?.parse().ok()?;
 
     let months = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -3156,6 +3157,7 @@ mod tests {
     fn parse_http_date_invalid() {
         assert_eq!(parse_http_date("not a date"), None);
         assert_eq!(parse_http_date(""), None);
+        assert_eq!(parse_http_date("����������������GMT"), None);
     }
 
     #[test]
