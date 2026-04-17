@@ -270,7 +270,7 @@ Success criteria:
 
 Current state:
 
-- in progress
+- complete
 - new invariant-focused coordinator coverage lives in
   `crates/server-core/src/coordinator/multipart_stateful_tests.rs`
 - the first moved regressions now assert explicit lifetime invariants for:
@@ -290,11 +290,17 @@ Current state:
   - a real `CompleteMultipartUpload` versus `AbortMultipartUpload` interleaving
     where complete has already snapshotted state but abort wins before the
     final commit, leaving no visible object or leaked multipart state
+  - lease-gated reclaim retry behavior, including the no-op case for dropping
+    a read-only lease without reclaim metadata and the retry case where the
+    final lease drop re-enqueues work only while durable reclaim metadata still
+    exists
 - the helper layer in that module now supports direct inspection of:
   - active stream sessions
   - pending multipart uploads
   - pending reclaim roots
   - committed multipart part segments for shard-cleanup assertions
+- no additional narrow hook point is currently blocking phase 2's bounded
+  multipart/session trace model
 
 ## Phase 2: Multipart and Session Trace Model
 

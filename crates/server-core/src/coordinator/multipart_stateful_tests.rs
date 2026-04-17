@@ -199,6 +199,19 @@ fn create_upload_with_parts(
     (create.upload_id, complete_parts)
 }
 
+fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
+    let ec_config = EcConfig::default();
+    ReadRuntime {
+        storage_node: Arc::new(SharedStorageNode::open(dir, &[0]).unwrap()),
+        ec_codec: Arc::new(ErasureCodec::new(ec_config).unwrap()),
+        ec_config,
+        pg_topology: PgTopology::new(&[0]).unwrap(),
+        payload_buffer_pool: PayloadBufferPool::new(ec_config),
+        sse_c_validator: None,
+        managed_key_provider: None,
+    }
+}
+
 fn read_all_body(mut body: ReadHandle) -> Result<Vec<u8>, ServerError> {
     let mut out = Vec::new();
     while let Some(chunk) = body.next_chunk(INTERNAL_SEGMENT_SIZE)? {
@@ -1296,4 +1309,140 @@ fn failed_stream_part_finalize_is_scavenged_without_visible_part_or_orphans() {
         "{invariant}: failed finalize should leave no committed multipart part segments"
     );
     assert_segment_shards_deleted(&coord, &staged_segments, invariant, "after scavenging");
+}
+
+#[test]
+fn dropping_a_read_only_payload_lease_does_not_enqueue_reclaim_work() {
+    let dir = test_util::tempdir();
+    let runtime = make_test_read_runtime(dir.path());
+    let invariant =
+        "dropping a read-only payload lease without pending reclaim metadata must not enqueue reclaim work";
+    let generation_id = GenerationId::new(1).unwrap();
+
+    drop(runtime.acquire_object_payload_lease("bucket", "key", generation_id));
+
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waiter_stop = Arc::clone(&stop);
+    let waiter_node = Arc::clone(&runtime.storage_node);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        tx.send(waiter_node.wait_for_reclaim_work(&waiter_stop))
+            .unwrap();
+    });
+
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "{invariant}: unexpected reclaim work appeared after dropping a read-only lease"
+    );
+
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    runtime.storage_node.wake_reclaim_workers();
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(500))
+            .unwrap()
+            .is_none(),
+        "{invariant}: wake-up after stopping should not surface reclaim work"
+    );
+    waiter.join().unwrap();
+}
+
+#[test]
+fn final_payload_lease_drop_retries_only_when_reclaim_metadata_still_exists() {
+    let dir = test_util::tempdir();
+    let runtime = make_test_read_runtime(dir.path());
+    let invariant =
+        "the final payload lease drop retries reclaim exactly while durable reclaim metadata still exists";
+    let generation_id = GenerationId::new(1).unwrap();
+
+    {
+        let meta_pg = runtime
+            .storage_node
+            .get_pg(runtime.pg_topology.object_pg("bucket", "key"))
+            .unwrap();
+        meta_pg
+            .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
+                bucket: trusted_bucket_name("bucket"),
+                key: trusted_object_key("key"),
+                generation_id,
+                ec: EcShape { k: 4, m: 2 },
+                created_at: 1,
+            })
+            .unwrap();
+    }
+
+    let lease = runtime.acquire_object_payload_lease("bucket", "key", generation_id);
+    runtime.enqueue_object_payload_reclaim("bucket", "key", generation_id);
+
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    match runtime.storage_node.wait_for_reclaim_work(&stop) {
+        Some(ReclaimWorkItem::ObjectPayload((bucket, key, queued_generation_id))) => {
+            assert_eq!(bucket, "bucket");
+            assert_eq!(key, "key");
+            assert_eq!(
+                queued_generation_id, generation_id,
+                "{invariant}: initial reclaim item targeted the wrong generation"
+            );
+        }
+        Some(ReclaimWorkItem::BucketDelete(bucket)) => {
+            panic!("{invariant}: expected object reclaim work, got bucket delete for {bucket}")
+        }
+        None => panic!("{invariant}: expected initial reclaim work, got none"),
+    }
+
+    runtime
+        .try_reclaim_object_payload("bucket", "key", generation_id)
+        .unwrap();
+    let meta_pg = runtime
+        .storage_node
+        .get_pg(runtime.pg_topology.object_pg("bucket", "key"))
+        .unwrap();
+    assert!(
+        meta_pg
+            .payload_reclaim_exists(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                generation_id
+            )
+            .unwrap(),
+        "{invariant}: lease-gated reclaim retry should leave durable reclaim metadata in place"
+    );
+    drop(meta_pg);
+
+    drop(lease);
+
+    match runtime.storage_node.wait_for_reclaim_work(&stop) {
+        Some(ReclaimWorkItem::ObjectPayload((bucket, key, queued_generation_id))) => {
+            assert_eq!(bucket, "bucket");
+            assert_eq!(key, "key");
+            assert_eq!(
+                queued_generation_id, generation_id,
+                "{invariant}: retried reclaim item targeted the wrong generation"
+            );
+        }
+        Some(ReclaimWorkItem::BucketDelete(bucket)) => {
+            panic!(
+                "{invariant}: expected retried object reclaim work, got bucket delete for {bucket}"
+            )
+        }
+        None => panic!("{invariant}: expected retried reclaim work after dropping the final lease"),
+    }
+
+    runtime
+        .try_reclaim_object_payload("bucket", "key", generation_id)
+        .unwrap();
+    let meta_pg = runtime
+        .storage_node
+        .get_pg(runtime.pg_topology.object_pg("bucket", "key"))
+        .unwrap();
+    assert!(
+        !meta_pg
+            .payload_reclaim_exists(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                generation_id
+            )
+            .unwrap(),
+        "{invariant}: successful reclaim after the final lease drop should clear durable reclaim metadata"
+    );
 }
