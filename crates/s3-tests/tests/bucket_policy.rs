@@ -1,14 +1,14 @@
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BlockedEncryptionTypes, BucketCannedAcl, BucketLifecycleConfiguration, BucketVersioningStatus,
-    CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule, DefaultRetention,
-    EncryptionType, ExpirationStatus, Grant, LifecycleExpiration, LifecycleRule,
-    LifecycleRuleFilter, ObjectCannedAcl, ObjectLockConfiguration, ObjectLockEnabled,
-    ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership, OwnershipControls,
-    OwnershipControlsRule, Permission, PublicAccessBlockConfiguration, ServerSideEncryption,
-    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
-    Tag, Tagging, VersioningConfiguration,
+    AccessControlPolicy, BlockedEncryptionTypes, BucketCannedAcl, BucketLifecycleConfiguration,
+    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule,
+    DefaultRetention, EncryptionType, ExpirationStatus, Grant, Grantee, LifecycleExpiration,
+    LifecycleRule, LifecycleRuleFilter, ObjectCannedAcl, ObjectLockConfiguration,
+    ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership, Owner,
+    OwnershipControls, OwnershipControlsRule, Permission, PublicAccessBlockConfiguration,
+    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
+    ServerSideEncryptionRule, Tag, Tagging, Type, VersioningConfiguration,
 };
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket,
@@ -7704,6 +7704,87 @@ fn test_bucket_policy_put_bucket_acl_grant_read_condition() {
             "expected READ grant for alternate account, got {:?}",
             owner_view.grants()
         );
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_acl_grant_read_wrong_header_body_mismatch_is_unexpected_content() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+
+        let owner_id = client_canonical_id(client).await;
+        let alt_id = client_canonical_id(alt_client).await;
+        let grant_read_header = format!("id=\"{alt_id}\"");
+        let grant_write_header = format!("id=\"{alt_id}\"");
+        let acl = AccessControlPolicy::builder()
+            .owner(Owner::builder().id(&owner_id).build())
+            .set_grants(Some(vec![
+                Grant::builder()
+                    .grantee(
+                        Grantee::builder()
+                            .r#type(Type::CanonicalUser)
+                            .id(&owner_id)
+                            .build()
+                            .unwrap(),
+                    )
+                    .permission(Permission::FullControl)
+                    .build(),
+                Grant::builder()
+                    .grantee(
+                        Grantee::builder()
+                            .r#type(Type::CanonicalUser)
+                            .id(&alt_id)
+                            .build()
+                            .unwrap(),
+                    )
+                    .permission(Permission::Read)
+                    .build(),
+            ]))
+            .build();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:PutBucketAcl",
+                "Resource": bucket_resource(&bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:x-amz-grant-read": grant_read_header.clone()
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let result = alt_client
+            .put_bucket_acl()
+            .bucket(&bucket)
+            .access_control_policy(acl)
+            .customize()
+            .mutate_request(move |req| {
+                req.headers_mut()
+                    .insert("x-amz-grant-write", grant_write_header.clone());
+            })
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400, "unexpected result: {result:?}");
+        assert_s3_err_code(&result, "UnexpectedContent");
 
         cleanup(&bucket, &[]).await;
     });

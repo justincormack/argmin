@@ -187,6 +187,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::MalformedChunkedBody { reason }
         | ServerError::MalformedTrailerError { reason }
         | ServerError::InvalidTag { reason } => reason.clone(),
+        ServerError::UnexpectedContent => "This request does not support content".to_string(),
         ServerError::KeyTooLongError {
             size,
             max_size_allowed,

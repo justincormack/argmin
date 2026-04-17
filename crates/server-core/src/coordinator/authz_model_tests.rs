@@ -8513,8 +8513,180 @@ mod phase9_harness {
     }
 }
 
+mod phase10_harness {
+    use super::harness::{setup_coordinator, IdentityFixtures};
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum GrantHeaderKind {
+        FullControl,
+        Read,
+        ReadAcp,
+        Write,
+        WriteAcp,
+    }
+
+    impl GrantHeaderKind {
+        pub(super) const ALL: [Self; 5] = [
+            Self::FullControl,
+            Self::Read,
+            Self::ReadAcp,
+            Self::Write,
+            Self::WriteAcp,
+        ];
+
+        pub(super) const fn header_name(self) -> &'static str {
+            match self {
+                Self::FullControl => "s3:x-amz-grant-full-control",
+                Self::Read => "s3:x-amz-grant-read",
+                Self::ReadAcp => "s3:x-amz-grant-read-acp",
+                Self::Write => "s3:x-amz-grant-write",
+                Self::WriteAcp => "s3:x-amz-grant-write-acp",
+            }
+        }
+
+        pub(super) const fn permission(self) -> AclPermission {
+            match self {
+                Self::FullControl => AclPermission::FullControl,
+                Self::Read => AclPermission::Read,
+                Self::ReadAcp => AclPermission::ReadAcp,
+                Self::Write => AclPermission::Write,
+                Self::WriteAcp => AclPermission::WriteAcp,
+            }
+        }
+
+        pub(super) const fn alternate(self) -> Self {
+            match self {
+                Self::FullControl => Self::Read,
+                Self::Read => Self::ReadAcp,
+                Self::ReadAcp => Self::Write,
+                Self::Write => Self::WriteAcp,
+                Self::WriteAcp => Self::FullControl,
+            }
+        }
+
+        pub(super) fn with_policy_context<'a>(
+            self,
+            policy_context: PutObjectPolicyContext<'a>,
+            value: Option<&'a str>,
+        ) -> PutObjectPolicyContext<'a> {
+            match self {
+                Self::FullControl => {
+                    policy_context.with_acl_grant_headers(None, None, None, None, value)
+                }
+                Self::Read => policy_context.with_acl_grant_headers(value, None, None, None, None),
+                Self::ReadAcp => {
+                    policy_context.with_acl_grant_headers(None, None, value, None, None)
+                }
+                Self::Write => policy_context.with_acl_grant_headers(None, value, None, None, None),
+                Self::WriteAcp => {
+                    policy_context.with_acl_grant_headers(None, None, None, value, None)
+                }
+            }
+        }
+    }
+
+    impl fmt::Display for GrantHeaderKind {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::FullControl => f.write_str("grant-full-control"),
+                Self::Read => f.write_str("grant-read"),
+                Self::ReadAcp => f.write_str("grant-read-acp"),
+                Self::Write => f.write_str("grant-write"),
+                Self::WriteAcp => f.write_str("grant-write-acp"),
+            }
+        }
+    }
+
+    pub(super) struct Phase10Harness {
+        _tmp: test_util::TempDir,
+        pub(super) coord: Coordinator,
+        pub(super) fixtures: IdentityFixtures,
+    }
+
+    impl Phase10Harness {
+        pub(super) fn new() -> Self {
+            let tmp = test_util::tempdir();
+            let coord = setup_coordinator(tmp.path());
+            let fixtures = IdentityFixtures::new();
+            Self {
+                _tmp: tmp,
+                coord,
+                fixtures,
+            }
+        }
+    }
+
+    pub(super) fn create_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+    ) -> Result<(), ServerError> {
+        coord.create_bucket_for_owner(fixtures.owner_user.principal(), bucket, false)
+    }
+
+    pub(super) fn cross_account_requester(fixtures: &IdentityFixtures) -> Requester {
+        Requester::authenticated(fixtures.cross_account.clone())
+    }
+
+    pub(super) fn cross_account_grant_header_value(fixtures: &IdentityFixtures) -> String {
+        format!(r#"id="{}""#, fixtures.cross_account.canonical_user_id())
+    }
+
+    pub(super) fn put_bucket_acl_policy(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        statement: &str,
+    ) -> Result<(), ServerError> {
+        let document = format!(r#"{{"Version":"2012-10-17","Statement":[{statement}]}}"#);
+        coord.put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: BucketRequest::new(
+                trusted_bucket_name(bucket),
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            config: &document,
+            confirm_remove_self_bucket_access: false,
+        })
+    }
+
+    pub(super) fn put_canned_acl_private(
+        coord: &Coordinator,
+        bucket: &str,
+        requester: Requester,
+        policy_context: PutObjectPolicyContext<'_>,
+    ) -> Result<(), ServerError> {
+        coord.put_bucket_acl(&PutBucketAclRequest {
+            bucket: BucketRequest::new(trusted_bucket_name(bucket), requester, None),
+            acl: PutBucketAclInput::Canned(BucketAcl::Private),
+            policy_context,
+        })
+    }
+
+    pub(super) fn put_grant_acl(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        requester: Requester,
+        grant: GrantHeaderKind,
+        policy_context: PutObjectPolicyContext<'_>,
+    ) -> Result<(), ServerError> {
+        let acl_grants = AclGrants::new(vec![AclGrant::new(
+            AclGrantee::CanonicalUser(fixtures.cross_account.canonical_user_id().clone()),
+            grant.permission(),
+        )]);
+        coord.put_bucket_acl(&PutBucketAclRequest {
+            bucket: BucketRequest::new(trusted_bucket_name(bucket), requester, None),
+            acl: PutBucketAclInput::Grants(acl_grants),
+            policy_context,
+        })
+    }
+}
+
 use harness::{bucket_name_for, to_existing_outcome, to_missing_outcome, MatrixHarness};
 use model::{Action, MissingScenario, Scenario};
+use phase10_harness::Phase10Harness;
 use phase4_harness::{
     acl_bucket_name_for, to_acl_outcome, to_write_outcome, write_bucket_name_for, Phase4Harness,
 };
@@ -9096,6 +9268,193 @@ fn authz_model_phase9_list_bucket_versions_matrix() {
 #[test]
 fn authz_model_phase9_list_bucket_multipart_uploads_matrix() {
     run_phase9_bucket_matrix(BucketAction::ListBucketMultipartUploads);
+}
+
+#[test]
+fn authz_model_phase10_put_bucket_acl_null_treats_absent_acl_header_as_missing() {
+    let harness = Phase10Harness::new();
+    let bucket = "authz-phase10-bucket-acl-null";
+    phase10_harness::create_bucket(&harness.coord, &harness.fixtures, bucket).unwrap();
+    phase10_harness::put_bucket_acl_policy(
+        &harness.coord,
+        &harness.fixtures,
+        bucket,
+        r#"{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:user/other"},"Action":"s3:PutBucketAcl","Resource":"arn:aws:s3:::authz-phase10-bucket-acl-null"},
+           {"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::444455556666:user/other"},"Action":"s3:PutBucketAcl","Resource":"arn:aws:s3:::authz-phase10-bucket-acl-null","Condition":{"Null":{"s3:x-amz-acl":"true"}}}"#,
+    )
+    .unwrap();
+
+    let requester = phase10_harness::cross_account_requester(&harness.fixtures);
+    let absent = phase10_harness::put_canned_acl_private(
+        &harness.coord,
+        bucket,
+        requester.clone(),
+        PutObjectPolicyContext::default(),
+    );
+    assert!(matches!(absent, Err(ServerError::AccessDenied)));
+
+    let exact = phase10_harness::put_canned_acl_private(
+        &harness.coord,
+        bucket,
+        requester,
+        PutObjectPolicyContext::default().with_default_canned_acl(Some("private")),
+    );
+    assert!(
+        exact.is_ok(),
+        "expected explicit private x-amz-acl to satisfy Null policy: {exact:?}"
+    );
+}
+
+#[test]
+fn authz_model_phase10_put_bucket_acl_string_not_equals_treats_absent_acl_header_as_not_equal() {
+    let harness = Phase10Harness::new();
+    let bucket = "authz-phase10-bucket-acl-sne";
+    phase10_harness::create_bucket(&harness.coord, &harness.fixtures, bucket).unwrap();
+    phase10_harness::put_bucket_acl_policy(
+        &harness.coord,
+        &harness.fixtures,
+        bucket,
+        r#"{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:user/other"},"Action":"s3:PutBucketAcl","Resource":"arn:aws:s3:::authz-phase10-bucket-acl-sne"},
+           {"Effect":"Deny","Principal":{"AWS":"arn:aws:iam::444455556666:user/other"},"Action":"s3:PutBucketAcl","Resource":"arn:aws:s3:::authz-phase10-bucket-acl-sne","Condition":{"StringNotEquals":{"s3:x-amz-acl":"private"}}}"#,
+    )
+    .unwrap();
+
+    let requester = phase10_harness::cross_account_requester(&harness.fixtures);
+    let absent = phase10_harness::put_canned_acl_private(
+        &harness.coord,
+        bucket,
+        requester.clone(),
+        PutObjectPolicyContext::default(),
+    );
+    assert!(matches!(absent, Err(ServerError::AccessDenied)));
+
+    let exact = phase10_harness::put_canned_acl_private(
+        &harness.coord,
+        bucket,
+        requester,
+        PutObjectPolicyContext::default().with_default_canned_acl(Some("private")),
+    );
+    assert!(
+        exact.is_ok(),
+        "expected explicit private x-amz-acl to satisfy StringNotEquals policy: {exact:?}"
+    );
+}
+
+#[test]
+fn authz_model_phase10_put_bucket_acl_grant_header_exactness() {
+    let harness = Phase10Harness::new();
+    let requester = phase10_harness::cross_account_requester(&harness.fixtures);
+    let header_value = phase10_harness::cross_account_grant_header_value(&harness.fixtures);
+
+    for grant in phase10_harness::GrantHeaderKind::ALL {
+        let bucket = format!("authz-phase10-bucket-acl-{grant}");
+        phase10_harness::create_bucket(&harness.coord, &harness.fixtures, &bucket).unwrap();
+        let escaped = header_value.replace('"', "\\\"");
+        phase10_harness::put_bucket_acl_policy(
+            &harness.coord,
+            &harness.fixtures,
+            &bucket,
+            &format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::444455556666:user/other"}},"Action":"s3:PutBucketAcl","Resource":"arn:aws:s3:::{bucket}","Condition":{{"StringEquals":{{"{}":"{}"}}}}}}"#,
+                grant.header_name(),
+                escaped
+            ),
+        )
+        .unwrap();
+
+        let absent = phase10_harness::put_grant_acl(
+            &harness.coord,
+            &harness.fixtures,
+            &bucket,
+            requester.clone(),
+            grant,
+            PutObjectPolicyContext::default(),
+        );
+        assert!(
+            matches!(absent, Err(ServerError::AccessDenied)),
+            "expected missing {grant} header to deny, got {absent:?}"
+        );
+
+        let wrong = phase10_harness::put_grant_acl(
+            &harness.coord,
+            &harness.fixtures,
+            &bucket,
+            requester.clone(),
+            grant,
+            grant.alternate().with_policy_context(
+                PutObjectPolicyContext::default(),
+                Some(header_value.as_str()),
+            ),
+        );
+        assert!(
+            wrong.is_err(),
+            "expected wrong grant header provenance for {grant} to fail, got {wrong:?}"
+        );
+
+        let exact = phase10_harness::put_grant_acl(
+            &harness.coord,
+            &harness.fixtures,
+            &bucket,
+            requester.clone(),
+            grant,
+            grant.with_policy_context(
+                PutObjectPolicyContext::default(),
+                Some(header_value.as_str()),
+            ),
+        );
+        assert!(
+            exact.is_ok(),
+            "expected exact {grant} header to allow PutBucketAcl: {exact:?}"
+        );
+    }
+}
+
+#[test]
+fn authz_model_phase10_put_bucket_acl_xml_body_does_not_synthesize_grant_headers() {
+    let harness = Phase10Harness::new();
+    let bucket = "authz-phase10-bucket-acl-xml";
+    phase10_harness::create_bucket(&harness.coord, &harness.fixtures, bucket).unwrap();
+    let header_value = phase10_harness::cross_account_grant_header_value(&harness.fixtures);
+    let escaped = header_value.replace('"', "\\\"");
+    phase10_harness::put_bucket_acl_policy(
+        &harness.coord,
+        &harness.fixtures,
+        bucket,
+        &format!(
+            r#"{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::444455556666:user/other"}},"Action":"s3:PutBucketAcl","Resource":"arn:aws:s3:::{bucket}","Condition":{{"StringEquals":{{"s3:x-amz-grant-read":"{escaped}"}}}}}}"#
+        ),
+    )
+    .unwrap();
+
+    let requester = phase10_harness::cross_account_requester(&harness.fixtures);
+    let xml_body = phase10_harness::put_grant_acl(
+        &harness.coord,
+        &harness.fixtures,
+        bucket,
+        requester.clone(),
+        phase10_harness::GrantHeaderKind::Read,
+        PutObjectPolicyContext::default(),
+    );
+    assert!(
+        matches!(xml_body, Err(ServerError::AccessDenied)),
+        "expected XML-body grants without original header provenance to deny: {xml_body:?}"
+    );
+
+    let header_request = phase10_harness::put_grant_acl(
+        &harness.coord,
+        &harness.fixtures,
+        bucket,
+        requester,
+        phase10_harness::GrantHeaderKind::Read,
+        phase10_harness::GrantHeaderKind::Read.with_policy_context(
+            PutObjectPolicyContext::default(),
+            Some(header_value.as_str()),
+        ),
+    );
+    assert!(
+        header_request.is_ok(),
+        "expected explicit grant-read header provenance to allow PutBucketAcl: {header_request:?}"
+    );
 }
 
 fn run_existing_matrix(phase: &str, action: Action) {

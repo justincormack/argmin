@@ -56,6 +56,9 @@ pub enum ServerError {
     #[error("invalid argument: {reason}")]
     InvalidArgument { reason: String },
 
+    #[error("unexpected content")]
+    UnexpectedContent,
+
     #[error("invalid URI: {reason}")]
     InvalidURI { reason: String },
 
@@ -280,6 +283,7 @@ impl ServerError {
             Self::NotModified { .. } => "NotModified",
             Self::InvalidRequest { .. } => "InvalidRequest",
             Self::InvalidArgument { .. } => "InvalidArgument",
+            Self::UnexpectedContent => "UnexpectedContent",
             Self::InvalidURI { .. } => "InvalidURI",
             Self::InvalidBucketName { .. } => "InvalidBucketName",
             Self::KeyTooLongError { .. } => "KeyTooLongError",
@@ -367,6 +371,7 @@ impl ServerError {
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
             | Self::InvalidArgument { .. }
+            | Self::UnexpectedContent
             | Self::InvalidURI { .. }
             | Self::InvalidBucketName { .. }
             | Self::KeyTooLongError { .. }
@@ -636,6 +641,14 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_unexpected_content() {
+        assert_eq!(
+            ServerError::UnexpectedContent.s3_error_code(),
+            "UnexpectedContent"
+        );
+    }
+
+    #[test]
     fn s3_error_code_metadata_blob_error() {
         let err = ServerError::MetadataBlobError {
             reason: "corrupt".into(),
@@ -797,6 +810,7 @@ mod tests {
             ServerError::InvalidRequest { reason: "x".into() }.http_status(),
             400
         );
+        assert_eq!(ServerError::UnexpectedContent.http_status(), 400);
         assert_eq!(
             ServerError::ObjectTooLarge { size: 1, max: 0 }.http_status(),
             400

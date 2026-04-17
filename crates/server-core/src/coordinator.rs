@@ -2621,7 +2621,8 @@ impl<'a> PutBucketAclRequest<'a> {
                         reason: "PutBucketAcl canned ACL policy context mismatch".to_string(),
                     });
                 }
-                Ok(PutObjectPolicyContext::default().with_default_canned_acl(expected_canned_acl))
+                Ok(PutObjectPolicyContext::default()
+                    .with_default_canned_acl(policy_context.canned_acl))
             }
             PutBucketAclInput::Grants(acl_grants) => {
                 if policy_context.canned_acl.is_some() {
@@ -24866,14 +24867,18 @@ mod tests {
         )
         .unwrap();
 
-        put_bucket_canned_acl_test(
-            &coord,
-            "bucket",
-            BucketAcl::Private,
-            test_helpers::requester("444455556666"),
-            None,
-        )
-        .unwrap();
+        coord
+            .put_bucket_acl(&PutBucketAclRequest {
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    test_helpers::requester("444455556666"),
+                    None,
+                ),
+                acl: PutBucketAclInput::Canned(BucketAcl::Private),
+                policy_context: PutObjectPolicyContext::default()
+                    .with_default_canned_acl(Some("private")),
+            })
+            .unwrap();
     }
 
     #[test]
@@ -24892,14 +24897,18 @@ mod tests {
         )
         .unwrap();
 
-        put_bucket_canned_acl_test(
-            &coord,
-            "bucket",
-            BucketAcl::Private,
-            test_helpers::requester("444455556666"),
-            None,
-        )
-        .unwrap();
+        coord
+            .put_bucket_acl(&PutBucketAclRequest {
+                bucket: bucket_request_with_expected_owner(
+                    "bucket",
+                    test_helpers::requester("444455556666"),
+                    None,
+                ),
+                acl: PutBucketAclInput::Canned(BucketAcl::Private),
+                policy_context: PutObjectPolicyContext::default()
+                    .with_default_canned_acl(Some("private")),
+            })
+            .unwrap();
 
         let err = coord
             .put_bucket_acl(&PutBucketAclRequest {

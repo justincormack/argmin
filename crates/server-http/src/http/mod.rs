@@ -131,6 +131,10 @@ fn canned_acl_and_header_grants_conflict() -> ServerError {
     }
 }
 
+fn acl_xml_and_header_grants_conflict() -> ServerError {
+    ServerError::UnexpectedContent
+}
+
 fn parse_bucket_name(name: &str) -> Result<BucketName, ServerError> {
     BucketName::try_from(name.to_string()).map_err(|error| ServerError::InvalidBucketName {
         reason: error.to_string(),
@@ -2314,6 +2318,9 @@ impl HttpFrontend {
                     };
                     crate::coordinator::PutBucketAclInput::Canned(acl)
                 } else {
+                    if !req.body.is_empty() && has_acl_grant_headers(req) {
+                        return Err(acl_xml_and_header_grants_conflict());
+                    }
                     crate::coordinator::PutBucketAclInput::Grants(parse_acl_grants(req)?)
                 };
                 let acl_req = crate::coordinator::PutBucketAclRequest {

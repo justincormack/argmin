@@ -1025,7 +1025,7 @@ Current state:
 
 ### Phase 10: Bucket ACL Request-Context Exactness
 
-Status: planned
+Status: complete
 
 Add a narrow request-context matrix for:
 
@@ -1052,6 +1052,29 @@ Acceptance criteria:
 - the recent `PutBucketAcl` conditioned-policy regressions are covered by the
   modeled harness
 - request provenance mismatches fail locally with a concrete scenario diff
+
+Current state:
+
+- Added a focused Phase 10 `PutBucketAcl` request-provenance harness in
+  `crates/server-core/src/coordinator/authz_model_tests.rs`.
+- The local regressions now pin `x-amz-acl` absent-versus-present behavior for
+  canned ACL requests under both `Null` and `StringNotEquals` bucket-policy
+  conditions.
+- The local harness also keeps the five `x-amz-grant-*` headers distinct for
+  `PutBucketAcl`, with absent, wrong-header, and exact-header cases instead of
+  collapsing them into a generic “explicit grants present” state.
+- XML-body bucket ACL updates are now explicitly modeled as provenance-distinct
+  from grant-header requests: matching ACL grants in the parsed body do not
+  synthesize `s3:x-amz-grant-*` policy context.
+- AWS-facing coverage now pins the mixed bucket-ACL shape too: `PutBucketAcl`
+  with an ACL XML body plus any `x-amz-grant-*` header fails as
+  `400 UnexpectedContent`, so request-shape rejection wins before bucket-policy
+  evaluation on that path.
+- The implementation under test was tightened so canned `PutBucketAcl`
+  requests no longer synthesize `s3:x-amz-acl` into policy context when the
+  header was absent on the request; the authz path now validates canned ACL
+  context against the parsed request while preserving only explicit request
+  provenance.
 
 ### Phase 11: Bucket Meta and Discovery Slice
 
