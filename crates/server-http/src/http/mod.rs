@@ -1079,7 +1079,7 @@ impl HttpFrontend {
             }
             S3Operation::GetBucketLocation { bucket } => {
                 let requester = Self::requester_from_auth(auth);
-                let _info = self.coordinator.head_bucket(&bucket_request(
+                self.coordinator.get_bucket_location(&bucket_request(
                     &bucket,
                     requester,
                     expected_bucket_owner,
@@ -5635,7 +5635,7 @@ mod tests {
     }
 
     #[test]
-    fn get_bucket_location_dispatches_through_head_bucket_checks() {
+    fn get_bucket_location_dispatches_through_dedicated_bucket_location_checks() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
         create_test_bucket(&fe.coordinator, "mybucket");

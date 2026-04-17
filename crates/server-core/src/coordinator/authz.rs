@@ -2567,6 +2567,17 @@ impl Coordinator {
         })
     }
 
+    pub(super) fn authorize_get_bucket_location(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedGetBucketLocation, ServerError> {
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::GetBucketLocation,
+        )?;
+        Ok(AuthorizedGetBucketLocation)
+    }
+
     pub(super) fn authorize_list_objects_v2(
         &self,
         req: &ListObjectsV2Request<'_>,

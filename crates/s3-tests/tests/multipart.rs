@@ -5,6 +5,7 @@
 //! AbortMultipartUpload, ListMultipartUploads, ListParts.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
@@ -180,6 +181,27 @@ async fn cleanup(bucket: &str, keys: &[&str]) {
     }
 
     client.delete_bucket().bucket(bucket).send().await.unwrap();
+}
+
+async fn eventually_ok<T, E, F, Fut>(description: &str, mut op: F) -> T
+where
+    E: std::fmt::Debug,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match op().await {
+            Ok(output) => return output,
+            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!("{description} failed unexpectedly: {err:?}"),
+        }
+    }
+
+    unreachable!()
 }
 
 fn expected_raw_list_value(value: &str) -> String {
@@ -1106,6 +1128,84 @@ fn test_abort_completed_multipart_upload_rejects_unrelated_cross_account_request
         assert_eq!(&data[..], b"hello, world!");
 
         cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_owner_can_manage_cross_account_object_writer_multipart_without_policy() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = create_public_write_bucket(client).await;
+        set_object_writer_ownership(&bucket).await;
+        let key = "multipart-cross-account-object-writer-owner-manage";
+
+        let create = eventually_ok(
+            "CreateMultipartUpload by cross-account writer on object-writer bucket",
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = create.upload_id().unwrap().to_string();
+
+        eventually_ok(
+            "UploadPart by cross-account writer on object-writer bucket",
+            || {
+                alt_client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from(vec![b'm'; PART_SIZE]))
+                    .send()
+            },
+        )
+        .await;
+
+        let listed = eventually_ok(
+            "ListParts by bucket owner on cross-account object-writer upload",
+            || {
+                client
+                    .list_parts()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(listed.parts().len(), 1);
+        assert_eq!(listed.parts()[0].part_number(), Some(1));
+
+        eventually_ok(
+            "AbortMultipartUpload by bucket owner on cross-account object-writer upload",
+            || {
+                client
+                    .abort_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+            },
+        )
+        .await;
+
+        let result = client
+            .list_parts()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        assert_s3_err_code(&result, "NoSuchUpload");
+
+        cleanup(&bucket, &[]).await;
     });
 }
 

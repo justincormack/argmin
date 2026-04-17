@@ -6673,6 +6673,779 @@ mod phase7_harness {
     }
 }
 
+mod phase7a_model {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum MultipartWriteAction {
+        BeginStreamPart,
+        CompleteMultipartUpload,
+    }
+
+    impl fmt::Display for MultipartWriteAction {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::BeginStreamPart => f.write_str("BeginStreamPart"),
+                Self::CompleteMultipartUpload => f.write_str("CompleteMultipartUpload"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum MultipartManagementAction {
+        AbortInProgress,
+        AbortCompleted,
+        ListParts,
+    }
+
+    impl fmt::Display for MultipartManagementAction {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::AbortInProgress => f.write_str("AbortMultipartUpload(in-progress)"),
+                Self::AbortCompleted => f.write_str("AbortMultipartUpload(completed)"),
+                Self::ListParts => f.write_str("ListParts"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum MultipartUploadShape {
+        CrossAccountObjectWriter,
+        CrossAccountBucketOwnerEnforced,
+    }
+
+    impl fmt::Display for MultipartUploadShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::CrossAccountObjectWriter => f.write_str("cross-account-object-writer"),
+                Self::CrossAccountBucketOwnerEnforced => {
+                    f.write_str("cross-account-bucket-owner-enforced")
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase7aRequesterShape {
+        Initiator,
+        UploadOwnerExact,
+        BucketOwnerExact,
+        SameAccountStandard,
+        SameAccountAdmin,
+        CrossAccountOther,
+    }
+
+    impl fmt::Display for Phase7aRequesterShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Initiator => f.write_str("initiator"),
+                Self::UploadOwnerExact => f.write_str("upload-owner-exact"),
+                Self::BucketOwnerExact => f.write_str("bucket-owner-exact"),
+                Self::SameAccountStandard => f.write_str("same-account-standard"),
+                Self::SameAccountAdmin => f.write_str("same-account-admin"),
+                Self::CrossAccountOther => f.write_str("cross-account-other"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum MultipartPolicyShape {
+        None,
+        AllowRequesterPutObject,
+    }
+
+    impl fmt::Display for MultipartPolicyShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("no-policy"),
+                Self::AllowRequesterPutObject => f.write_str("allow-requester-put-object"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum MultipartOutcome {
+        Allow,
+        Deny,
+        NoSuchUpload,
+    }
+
+    impl fmt::Display for MultipartOutcome {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Allow => f.write_str("Allow"),
+                Self::Deny => f.write_str("Deny"),
+                Self::NoSuchUpload => f.write_str("NoSuchUpload"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct MultipartWriteScenario {
+        pub(super) name: &'static str,
+        pub(super) action: MultipartWriteAction,
+        pub(super) upload: MultipartUploadShape,
+        pub(super) requester: Phase7aRequesterShape,
+        pub(super) policy: MultipartPolicyShape,
+        pub(super) target_completed_upload: bool,
+        pub(super) expected: MultipartOutcome,
+    }
+
+    impl MultipartWriteScenario {
+        pub(super) fn scenarios() -> Vec<Self> {
+            let mut scenarios = Vec::new();
+            for action in [
+                MultipartWriteAction::BeginStreamPart,
+                MultipartWriteAction::CompleteMultipartUpload,
+            ] {
+                scenarios.extend([
+                    Self {
+                        name: "initiator-owner-needs-putobject-policy-on-private-bucket",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountObjectWriter,
+                        requester: Phase7aRequesterShape::Initiator,
+                        policy: MultipartPolicyShape::None,
+                        target_completed_upload: false,
+                        expected: MultipartOutcome::Deny,
+                    },
+                    Self {
+                        name: "initiator-owner-allowed-with-putobject-policy",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountObjectWriter,
+                        requester: Phase7aRequesterShape::Initiator,
+                        policy: MultipartPolicyShape::AllowRequesterPutObject,
+                        target_completed_upload: false,
+                        expected: MultipartOutcome::Allow,
+                    },
+                    Self {
+                        name: "bucket-owner-exact-can-continue-object-writer-upload-without-policy",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountObjectWriter,
+                        requester: Phase7aRequesterShape::BucketOwnerExact,
+                        policy: MultipartPolicyShape::None,
+                        target_completed_upload: false,
+                        expected: MultipartOutcome::Allow,
+                    },
+                    Self {
+                        name: "same-account-standard-can-continue-with-explicit-putobject-policy",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountObjectWriter,
+                        requester: Phase7aRequesterShape::SameAccountStandard,
+                        policy: MultipartPolicyShape::AllowRequesterPutObject,
+                        target_completed_upload: false,
+                        expected: MultipartOutcome::Allow,
+                    },
+                    Self {
+                        name: "bucket-owner-owned-upload-allows-owner-exact-principal",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountBucketOwnerEnforced,
+                        requester: Phase7aRequesterShape::UploadOwnerExact,
+                        policy: MultipartPolicyShape::None,
+                        target_completed_upload: false,
+                        expected: MultipartOutcome::Allow,
+                    },
+                    Self {
+                        name: "same-account-standard-cannot-continue-others-upload",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountBucketOwnerEnforced,
+                        requester: Phase7aRequesterShape::SameAccountStandard,
+                        policy: MultipartPolicyShape::None,
+                        target_completed_upload: false,
+                        expected: MultipartOutcome::Deny,
+                    },
+                    Self {
+                        name: "same-account-admin-can-continue-bucket-owner-account-upload",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountBucketOwnerEnforced,
+                        requester: Phase7aRequesterShape::SameAccountAdmin,
+                        policy: MultipartPolicyShape::None,
+                        target_completed_upload: false,
+                        expected: MultipartOutcome::Allow,
+                    },
+                    Self {
+                        name: "write-paths-see-completed-upload-as-no-such-upload",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountObjectWriter,
+                        requester: Phase7aRequesterShape::Initiator,
+                        policy: MultipartPolicyShape::AllowRequesterPutObject,
+                        target_completed_upload: true,
+                        expected: MultipartOutcome::NoSuchUpload,
+                    },
+                ]);
+            }
+            scenarios
+        }
+    }
+
+    impl fmt::Display for MultipartWriteScenario {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "name={} action={} upload={} requester={} policy={} completed={}",
+                self.name,
+                self.action,
+                self.upload,
+                self.requester,
+                self.policy,
+                self.target_completed_upload
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct MultipartManagementScenario {
+        pub(super) name: &'static str,
+        pub(super) action: MultipartManagementAction,
+        pub(super) upload: MultipartUploadShape,
+        pub(super) requester: Phase7aRequesterShape,
+        pub(super) policy: MultipartPolicyShape,
+        pub(super) expected: MultipartOutcome,
+    }
+
+    impl MultipartManagementScenario {
+        pub(super) fn scenarios() -> Vec<Self> {
+            let mut scenarios = Vec::new();
+            for action in [
+                MultipartManagementAction::AbortInProgress,
+                MultipartManagementAction::ListParts,
+            ] {
+                scenarios.extend([
+                    Self {
+                        name: "initiator-can-manage-own-upload-without-policy",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountObjectWriter,
+                        requester: Phase7aRequesterShape::Initiator,
+                        policy: MultipartPolicyShape::None,
+                        expected: MultipartOutcome::Allow,
+                    },
+                    Self {
+                        name: "bucket-owner-exact-can-manage-object-writer-upload",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountObjectWriter,
+                        requester: Phase7aRequesterShape::BucketOwnerExact,
+                        policy: MultipartPolicyShape::None,
+                        expected: MultipartOutcome::Allow,
+                    },
+                    Self {
+                        name: "same-account-standard-cannot-manage-object-writer-upload",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountObjectWriter,
+                        requester: Phase7aRequesterShape::SameAccountStandard,
+                        policy: MultipartPolicyShape::None,
+                        expected: MultipartOutcome::Deny,
+                    },
+                    Self {
+                        name: "same-account-admin-can-manage-bucket-owner-account-upload",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountObjectWriter,
+                        requester: Phase7aRequesterShape::SameAccountAdmin,
+                        policy: MultipartPolicyShape::None,
+                        expected: MultipartOutcome::Allow,
+                    },
+                    Self {
+                        name: "putobject-policy-does-not-help-management-only-paths",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountObjectWriter,
+                        requester: Phase7aRequesterShape::CrossAccountOther,
+                        policy: MultipartPolicyShape::AllowRequesterPutObject,
+                        expected: MultipartOutcome::Deny,
+                    },
+                    Self {
+                        name: "bucket-owner-exact-can-manage-bucket-owned-upload",
+                        action,
+                        upload: MultipartUploadShape::CrossAccountBucketOwnerEnforced,
+                        requester: Phase7aRequesterShape::BucketOwnerExact,
+                        policy: MultipartPolicyShape::None,
+                        expected: MultipartOutcome::Allow,
+                    },
+                ]);
+            }
+            scenarios.extend([
+                Self {
+                    name: "completed-abort-allows-initiator",
+                    action: MultipartManagementAction::AbortCompleted,
+                    upload: MultipartUploadShape::CrossAccountObjectWriter,
+                    requester: Phase7aRequesterShape::Initiator,
+                    policy: MultipartPolicyShape::None,
+                    expected: MultipartOutcome::Allow,
+                },
+                Self {
+                    name: "completed-abort-allows-bucket-owner-exact-on-object-writer-upload",
+                    action: MultipartManagementAction::AbortCompleted,
+                    upload: MultipartUploadShape::CrossAccountObjectWriter,
+                    requester: Phase7aRequesterShape::BucketOwnerExact,
+                    policy: MultipartPolicyShape::None,
+                    expected: MultipartOutcome::Allow,
+                },
+                Self {
+                    name: "completed-abort-allows-same-account-admin",
+                    action: MultipartManagementAction::AbortCompleted,
+                    upload: MultipartUploadShape::CrossAccountObjectWriter,
+                    requester: Phase7aRequesterShape::SameAccountAdmin,
+                    policy: MultipartPolicyShape::None,
+                    expected: MultipartOutcome::Allow,
+                },
+                Self {
+                    name: "completed-abort-allows-bucket-owner-exact-when-upload-owner-is-bucket-owner",
+                    action: MultipartManagementAction::AbortCompleted,
+                    upload: MultipartUploadShape::CrossAccountBucketOwnerEnforced,
+                    requester: Phase7aRequesterShape::BucketOwnerExact,
+                    policy: MultipartPolicyShape::None,
+                    expected: MultipartOutcome::Allow,
+                },
+                Self {
+                    name: "completed-abort-still-ignores-putobject-policy",
+                    action: MultipartManagementAction::AbortCompleted,
+                    upload: MultipartUploadShape::CrossAccountObjectWriter,
+                    requester: Phase7aRequesterShape::CrossAccountOther,
+                    policy: MultipartPolicyShape::AllowRequesterPutObject,
+                    expected: MultipartOutcome::Deny,
+                },
+            ]);
+            scenarios
+        }
+    }
+
+    impl fmt::Display for MultipartManagementScenario {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "name={} action={} upload={} requester={} policy={}",
+                self.name, self.action, self.upload, self.requester, self.policy
+            )
+        }
+    }
+}
+
+mod phase7a_harness {
+    use super::harness::{setup_coordinator, IdentityFixtures};
+    use super::phase7a_model::{
+        MultipartManagementAction, MultipartManagementScenario, MultipartOutcome,
+        MultipartPolicyShape, MultipartUploadShape, MultipartWriteAction, MultipartWriteScenario,
+        Phase7aRequesterShape,
+    };
+    use super::*;
+
+    const PHASE7A_KEY: &str = "phase7a-key";
+
+    pub(super) struct Phase7aHarness {
+        _tmp: test_util::TempDir,
+        coord: Coordinator,
+        fixtures: IdentityFixtures,
+        other_cross_account: AccountIdentity,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct Phase7aUploadSpec {
+        upload: MultipartUploadShape,
+        policy_requester: Phase7aRequesterShape,
+        policy: MultipartPolicyShape,
+        complete_upload: bool,
+    }
+
+    impl Phase7aHarness {
+        pub(super) fn new() -> Self {
+            let tmp = test_util::tempdir();
+            let coord = setup_coordinator(tmp.path());
+            let fixtures = IdentityFixtures::new();
+            let other_cross_account =
+                AccountIdentity::from_principal("arn:aws:iam::777788889999:user/other");
+            Self {
+                _tmp: tmp,
+                coord,
+                fixtures,
+                other_cross_account,
+            }
+        }
+
+        pub(super) fn run_write(
+            &self,
+            bucket: &str,
+            scenario: MultipartWriteScenario,
+        ) -> MultipartOutcome {
+            let upload_id = materialize_phase7a_upload(
+                &self.coord,
+                &self.fixtures,
+                &self.other_cross_account,
+                bucket,
+                Phase7aUploadSpec {
+                    upload: scenario.upload,
+                    policy_requester: scenario.requester,
+                    policy: scenario.policy,
+                    complete_upload: scenario.target_completed_upload,
+                },
+            )
+            .unwrap_or_else(|err| {
+                panic!("failed to materialize phase 7A write state for {scenario}: {err:?}");
+            });
+            run_phase7a_write_action(
+                &self.coord,
+                &self.fixtures,
+                &self.other_cross_account,
+                bucket,
+                &upload_id,
+                scenario,
+            )
+        }
+
+        pub(super) fn run_management(
+            &self,
+            bucket: &str,
+            scenario: MultipartManagementScenario,
+        ) -> MultipartOutcome {
+            let completed = scenario.action == MultipartManagementAction::AbortCompleted;
+            let upload_id = materialize_phase7a_upload(
+                &self.coord,
+                &self.fixtures,
+                &self.other_cross_account,
+                bucket,
+                Phase7aUploadSpec {
+                    upload: scenario.upload,
+                    policy_requester: scenario.requester,
+                    policy: scenario.policy,
+                    complete_upload: completed,
+                },
+            )
+            .unwrap_or_else(|err| {
+                panic!("failed to materialize phase 7A management state for {scenario}: {err:?}");
+            });
+            run_phase7a_management_action(
+                &self.coord,
+                &self.fixtures,
+                &self.other_cross_account,
+                bucket,
+                &upload_id,
+                scenario,
+            )
+        }
+    }
+
+    pub(super) fn phase7a_write_bucket_name_for(index: usize) -> String {
+        format!("authz-phase7a-write-{index:05}")
+    }
+
+    pub(super) fn phase7a_management_bucket_name_for(index: usize) -> String {
+        format!("authz-phase7a-manage-{index:05}")
+    }
+
+    fn materialize_phase7a_upload(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        other_cross_account: &AccountIdentity,
+        bucket: &str,
+        spec: Phase7aUploadSpec,
+    ) -> Result<UploadId, ServerError> {
+        create_phase7a_bucket(coord, fixtures, bucket, spec.upload)?;
+        put_phase7a_policy(
+            coord,
+            fixtures,
+            bucket,
+            fixtures.cross_account.principal(),
+            MultipartPolicyShape::AllowRequesterPutObject,
+        )?;
+
+        let initiator = Requester::authenticated(fixtures.cross_account.clone());
+        let created = coord.create_multipart_upload(&CreateMultipartUploadRequest {
+            object: phase7a_object_request(bucket, PHASE7A_KEY, initiator.clone()),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: PutObjectAcl::None.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })?;
+
+        if spec.complete_upload {
+            let uploaded = test_helpers::upload_part(
+                coord,
+                &test_helpers::UploadPartRequest {
+                    upload: phase7a_multipart_object_request(
+                        bucket,
+                        PHASE7A_KEY,
+                        &created.upload_id,
+                        initiator.clone(),
+                    ),
+                    part_number: 1,
+                    data: b"phase7a",
+                    claimed_checksum: None,
+                    sse_customer: None,
+                },
+            )?;
+            coord.complete_multipart_upload(&CompleteMultipartUploadRequest {
+                upload: phase7a_multipart_object_request(
+                    bucket,
+                    PHASE7A_KEY,
+                    &created.upload_id,
+                    initiator,
+                ),
+                parts: &[CompletePart {
+                    part_number: 1,
+                    etag: uploaded.etag,
+                    checksum: None,
+                }],
+                claimed_checksum: None,
+                expected_object_size: None,
+                cond: NO_WRITE,
+                sse_customer: None,
+            })?;
+        }
+
+        match spec.policy {
+            MultipartPolicyShape::None => coord.delete_bucket_policy(&BucketRequest::new(
+                trusted_bucket_name(bucket),
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ))?,
+            MultipartPolicyShape::AllowRequesterPutObject => {
+                let principal = phase7a_requester_principal(
+                    fixtures,
+                    other_cross_account,
+                    spec.upload,
+                    spec.policy_requester,
+                );
+                put_phase7a_policy(coord, fixtures, bucket, principal, spec.policy)?;
+            }
+        }
+
+        Ok(created.upload_id)
+    }
+
+    fn run_phase7a_write_action(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        other_cross_account: &AccountIdentity,
+        bucket: &str,
+        upload_id: &UploadId,
+        scenario: MultipartWriteScenario,
+    ) -> MultipartOutcome {
+        let requester = phase7a_requester(
+            fixtures,
+            other_cross_account,
+            scenario.upload,
+            scenario.requester,
+        );
+        let result = match scenario.action {
+            MultipartWriteAction::BeginStreamPart => coord
+                .authorize_begin_stream_part(&BeginStreamPartRequest {
+                    upload: phase7a_multipart_object_request(
+                        bucket,
+                        PHASE7A_KEY,
+                        upload_id,
+                        requester,
+                    ),
+                    part_number: 1,
+                    policy_context: PutObjectPolicyContext::default(),
+                    sse_customer: None,
+                })
+                .map(|_| ()),
+            MultipartWriteAction::CompleteMultipartUpload => coord
+                .authorize_complete_multipart_upload(&CompleteMultipartUploadRequest {
+                    upload: phase7a_multipart_object_request(
+                        bucket,
+                        PHASE7A_KEY,
+                        upload_id,
+                        requester,
+                    ),
+                    parts: &[],
+                    claimed_checksum: None,
+                    expected_object_size: None,
+                    cond: NO_WRITE,
+                    sse_customer: None,
+                })
+                .map(|_| ()),
+        };
+        classify_phase7a_result(result)
+    }
+
+    fn run_phase7a_management_action(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        other_cross_account: &AccountIdentity,
+        bucket: &str,
+        upload_id: &UploadId,
+        scenario: MultipartManagementScenario,
+    ) -> MultipartOutcome {
+        let requester = phase7a_requester(
+            fixtures,
+            other_cross_account,
+            scenario.upload,
+            scenario.requester,
+        );
+        let result = match scenario.action {
+            MultipartManagementAction::AbortInProgress
+            | MultipartManagementAction::AbortCompleted => coord
+                .authorize_abort_multipart_upload(&phase7a_multipart_object_request(
+                    bucket,
+                    PHASE7A_KEY,
+                    upload_id,
+                    requester,
+                ))
+                .map(|_| ()),
+            MultipartManagementAction::ListParts => coord
+                .authorize_list_parts(&ListPartsRequest {
+                    upload: phase7a_multipart_object_request(
+                        bucket,
+                        PHASE7A_KEY,
+                        upload_id,
+                        requester,
+                    ),
+                    part_number_marker: None,
+                    max_parts: 100,
+                })
+                .map(|_| ()),
+        };
+        classify_phase7a_result(result)
+    }
+
+    fn classify_phase7a_result(result: Result<(), ServerError>) -> MultipartOutcome {
+        match result {
+            Ok(()) => MultipartOutcome::Allow,
+            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
+                MultipartOutcome::Deny
+            }
+            Err(ServerError::NoSuchUpload { .. }) => MultipartOutcome::NoSuchUpload,
+            Err(other) => panic!("unexpected phase 7A result: {other:?}"),
+        }
+    }
+
+    fn create_phase7a_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        upload: MultipartUploadShape,
+    ) -> Result<(), ServerError> {
+        let owner = OwnerIdentity::new(
+            fixtures.owner_user.principal(),
+            fixtures.owner_user.canonical_user_id().clone(),
+        );
+        let grants = Coordinator::bucket_acl_grants_from_flags(&owner, false, false);
+        coord.create_bucket_with_acl_grants(&owner, bucket, grants, false)?;
+        if upload == MultipartUploadShape::CrossAccountBucketOwnerEnforced {
+            coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
+                bucket: BucketRequest::new(
+                    trusted_bucket_name(bucket),
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                config: BucketOwnershipControls {
+                    object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                },
+            })?;
+        }
+        Ok(())
+    }
+
+    fn put_phase7a_policy(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        principal: &str,
+        policy: MultipartPolicyShape,
+    ) -> Result<(), ServerError> {
+        if policy == MultipartPolicyShape::None {
+            return Ok(());
+        }
+        let document = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/{PHASE7A_KEY}"}}]}}"#
+        );
+        coord.put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: BucketRequest::new(
+                trusted_bucket_name(bucket),
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            config: &document,
+            confirm_remove_self_bucket_access: false,
+        })
+    }
+
+    fn phase7a_requester(
+        fixtures: &IdentityFixtures,
+        other_cross_account: &AccountIdentity,
+        upload: MultipartUploadShape,
+        requester: Phase7aRequesterShape,
+    ) -> Requester {
+        match requester {
+            Phase7aRequesterShape::Initiator => {
+                Requester::authenticated(fixtures.cross_account.clone())
+            }
+            Phase7aRequesterShape::UploadOwnerExact => match upload {
+                MultipartUploadShape::CrossAccountObjectWriter => {
+                    Requester::authenticated(fixtures.cross_account.clone())
+                }
+                MultipartUploadShape::CrossAccountBucketOwnerEnforced => {
+                    Requester::authenticated(fixtures.owner_user.clone())
+                }
+            },
+            Phase7aRequesterShape::BucketOwnerExact => {
+                Requester::authenticated(fixtures.owner_user.clone())
+            }
+            Phase7aRequesterShape::SameAccountStandard => {
+                Requester::authenticated(fixtures.same_account_distinct.clone())
+            }
+            Phase7aRequesterShape::SameAccountAdmin => {
+                Requester::authenticated_owner_account_admin(fixtures.same_account_distinct.clone())
+            }
+            Phase7aRequesterShape::CrossAccountOther => {
+                Requester::authenticated(other_cross_account.clone())
+            }
+        }
+    }
+
+    fn phase7a_requester_principal<'a>(
+        fixtures: &'a IdentityFixtures,
+        other_cross_account: &'a AccountIdentity,
+        upload: MultipartUploadShape,
+        requester: Phase7aRequesterShape,
+    ) -> &'a str {
+        match requester {
+            Phase7aRequesterShape::Initiator => fixtures.cross_account.principal(),
+            Phase7aRequesterShape::UploadOwnerExact => match upload {
+                MultipartUploadShape::CrossAccountObjectWriter => {
+                    fixtures.cross_account.principal()
+                }
+                MultipartUploadShape::CrossAccountBucketOwnerEnforced => {
+                    fixtures.owner_user.principal()
+                }
+            },
+            Phase7aRequesterShape::BucketOwnerExact => fixtures.owner_user.principal(),
+            Phase7aRequesterShape::SameAccountStandard
+            | Phase7aRequesterShape::SameAccountAdmin => fixtures.same_account_distinct.principal(),
+            Phase7aRequesterShape::CrossAccountOther => other_cross_account.principal(),
+        }
+    }
+
+    fn phase7a_object_request<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        requester: Requester,
+    ) -> ObjectRequest<'a> {
+        ObjectRequest::new(
+            trusted_bucket_name(bucket),
+            trusted_object_key(key),
+            requester,
+            None,
+        )
+    }
+
+    fn phase7a_multipart_object_request<'a>(
+        bucket: &'a str,
+        key: &'a str,
+        upload_id: &UploadId,
+        requester: Requester,
+    ) -> MultipartObjectRequest<'a> {
+        MultipartObjectRequest::new(
+            trusted_bucket_name(bucket),
+            trusted_object_key(key),
+            upload_id.clone(),
+            requester,
+            None,
+        )
+    }
+}
+
 use harness::{bucket_name_for, to_existing_outcome, to_missing_outcome, MatrixHarness};
 use model::{Action, MissingScenario, Scenario};
 use phase4_harness::{
@@ -6690,6 +7463,10 @@ use phase7_harness::{
     phase7_delete_bucket_name_for, phase7_object_lock_bucket_name_for, Phase7Harness,
 };
 use phase7_model::{DeleteScenario, ObjectLockScenario};
+use phase7a_harness::{
+    phase7a_management_bucket_name_for, phase7a_write_bucket_name_for, Phase7aHarness,
+};
+use phase7a_model::{MultipartManagementScenario, MultipartWriteScenario};
 
 #[test]
 fn authz_model_phase1_get_object_existing_matrix() {
@@ -6890,6 +7667,46 @@ fn authz_model_phase7_delete_matrix() {
         assert_eq!(
             actual, scenario.expected,
             "phase 7 delete mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
+            scenario.expected
+        );
+    }
+}
+
+#[test]
+fn authz_model_phase7a_multipart_write_matrix() {
+    let scenarios = MultipartWriteScenario::scenarios();
+    assert!(
+        !scenarios.is_empty(),
+        "phase 7A multipart write matrix unexpectedly produced no scenarios"
+    );
+    let harness = Phase7aHarness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = phase7a_write_bucket_name_for(index);
+        let actual = harness.run_write(&bucket, scenario);
+        assert_eq!(
+            actual, scenario.expected,
+            "phase 7A multipart write mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
+            scenario.expected
+        );
+    }
+}
+
+#[test]
+fn authz_model_phase7a_multipart_management_matrix() {
+    let scenarios = MultipartManagementScenario::scenarios();
+    assert!(
+        !scenarios.is_empty(),
+        "phase 7A multipart management matrix unexpectedly produced no scenarios"
+    );
+    let harness = Phase7aHarness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = phase7a_management_bucket_name_for(index);
+        let actual = harness.run_management(&bucket, scenario);
+        assert_eq!(
+            actual, scenario.expected,
+            "phase 7A multipart management mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
             scenario.expected
         );
     }

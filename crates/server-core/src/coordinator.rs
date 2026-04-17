@@ -325,6 +325,9 @@ struct AuthorizedGetBucketVersioning {
 }
 
 #[derive(Debug)]
+struct AuthorizedGetBucketLocation;
+
+#[derive(Debug)]
 struct AuthorizedPutBucketObjectLockConfiguration {
     bucket: BucketName,
     config: BucketObjectLockConfig,
@@ -6803,6 +6806,17 @@ impl Coordinator {
         );
         let authorized = self.authorize_get_bucket_versioning(req)?;
         Ok(authorized.state)
+    }
+
+    pub fn get_bucket_location(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_location",
+            "bucket={:?}",
+            req.name
+        );
+        let _authorized = self.authorize_get_bucket_location(req)?;
+        Ok(())
     }
 
     pub fn put_bucket_object_lock_configuration(
@@ -33489,6 +33503,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state, BucketVersioningState::Enabled);
+    }
+
+    #[test]
+    fn get_bucket_location_bucket_policy_allow_applies() {
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("111122223333", "bucket", false)
+            .unwrap();
+        put_bucket_policy_test(
+            &coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetBucketLocation","Resource":"arn:aws:s3:::bucket"}]}"#,
+            test_helpers::requester("111122223333"),
+            None,
+        )
+        .unwrap();
+
+        coord
+            .get_bucket_location(&bucket_request_with_expected_owner(
+                "bucket",
+                test_helpers::requester("444455556666"),
+                None,
+            ))
+            .unwrap();
     }
 
     #[test]

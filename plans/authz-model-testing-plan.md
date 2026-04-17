@@ -846,7 +846,7 @@ Current state:
 
 ### Phase 7A: Object-Scoped Multipart Management Matrix
 
-Status: planned
+Status: complete
 
 Add a bounded multipart-management matrix for:
 
@@ -880,6 +880,31 @@ Acceptance criteria:
 - object-scoped multipart authorization no longer lives only in one-off tests
 - the distinction between multipart write paths and multipart management paths
   is encoded explicitly and cannot collapse accidentally
+
+Current state:
+
+- `server-core` now has a dedicated Phase 7A authz model matrix for
+  object-scoped multipart authorization.
+- The multipart write matrix covers:
+  - `BeginStreamPart` and `CompleteMultipartUpload`
+  - initiator/upload-owner exact callers on private buckets with and without
+    explicit `s3:PutObject` bucket-policy allow
+  - bucket-owner exact principal behavior on both object-writer and
+    bucket-owner-enforced upload ownership shapes, including the object-writer
+    case without any explicit `s3:PutObject` policy allow
+  - same-account `Standard` versus `OwnerAccountAdmin` behavior
+  - the completed-upload `NoSuchUpload` behavior on write paths that only
+    operate on in-progress uploads
+  - the current shipped rule that explicit `s3:PutObject` bucket-policy allow
+    does permit non-initiator write-path continuation
+- The multipart management matrix covers:
+  - `AbortMultipartUpload` on both in-progress and completed upload records
+  - `ListParts` on in-progress uploads
+  - initiator versus upload owner versus bucket-owner exact principal
+  - same-account `Standard` versus `OwnerAccountAdmin`
+  - object-writer versus bucket-owner-enforced ownership shapes
+  - the absence of `s3:PutObject` bucket-policy fallback on management-only
+    paths, including completed-upload abort
 
 ### Phase 8: Request-Context Exactness Matrix
 
@@ -992,13 +1017,14 @@ Important rules to encode:
 
 - `ListBucket` bucket-policy allow is not sufficient for `HeadBucket`
 - `ListBucket` bucket-policy allow is not sufficient for `GetBucketLocation`
-- dedicated `GetBucketLocation` bucket-policy allow is also not sufficient for
+- dedicated `GetBucketLocation` bucket-policy allow is sufficient for
   cross-account `GetBucketLocation` under the current AWS-backed baseline
 
 Acceptance criteria:
 
-- the `HeadBucket` and `GetBucketLocation` policy non-sufficiency cases are
-  encoded in the same framework rather than only in standalone `s3-tests`
+- the `HeadBucket` and `GetBucketLocation` bucket-policy sufficiency and
+  non-sufficiency cases are encoded in the same framework rather than only in
+  standalone `s3-tests`
 - failures print the exact negative scenario that regressed
 
 ### Phase 12: Optional Stateful Expansion

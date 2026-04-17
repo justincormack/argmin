@@ -33,6 +33,14 @@ fn endpoint_is_https() -> bool {
     CTX.endpoint().starts_with("https://")
 }
 
+fn expected_bucket_location_constraint_for_sdk(region: &str) -> Option<&str> {
+    match region {
+        "us-east-1" => Some(""),
+        "eu-west-1" => Some("EU"),
+        other => Some(other),
+    }
+}
+
 fn require_https_endpoint() {
     assert!(
         endpoint_is_https(),
@@ -494,6 +502,66 @@ fn alt_policy_principal() -> serde_json::Value {
 
 fn fixed_nonpublic_principal() -> serde_json::Value {
     json!({ "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) })
+}
+
+fn multipart_put_object_policy_for_alt_and_same_account(
+    bucket: &str,
+    same_account_principal: &str,
+) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Principal": alt_policy_principal(),
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(bucket),
+            },
+            {
+                "Effect": "Allow",
+                "Principal": { "AWS": same_account_principal },
+                "Action": "s3:PutObject",
+                "Resource": bucket_wildcard_resource(bucket),
+            }
+        ],
+    })
+    .to_string()
+}
+
+async fn same_account_exact_principal() -> String {
+    if std::env::var_os("S3_TEST_ENDPOINT").is_none() {
+        return format!("arn:aws:iam::{}:user/limited", CTX.account_id());
+    }
+
+    let root_client = CTX.client();
+    let constrained_client = CTX.require_second_client();
+    let bucket = unique_bucket();
+    s3_tests::create_bucket(root_client, &bucket).await.unwrap();
+    let denied = constrained_client
+        .put_object()
+        .bucket(&bucket)
+        .key("principal-discovery")
+        .body(ByteStream::from_static(b"principal-discovery"))
+        .send()
+        .await;
+    let message = denied
+        .as_ref()
+        .err()
+        .and_then(|err| err.as_service_error())
+        .and_then(ProvideErrorMetadata::message)
+        .unwrap_or_else(|| {
+            panic!("expected AccessDenied message while discovering same-account principal")
+        });
+    let principal = message
+        .strip_prefix("User: ")
+        .and_then(|rest| rest.split(" is not authorized").next())
+        .filter(|principal| principal.starts_with("arn:aws:iam::"))
+        .unwrap_or_else(|| {
+            panic!("failed to parse same-account principal from AccessDenied message: {message}")
+        })
+        .to_string();
+    cleanup_with_client(root_client, &bucket, &[]).await;
+    principal
 }
 
 async fn bucket_policy_status_is_public(client: &aws_sdk_s3::Client, bucket: &str) -> bool {
@@ -6355,6 +6423,275 @@ fn test_bucket_policy_list_parts_initiator_only_requires_put_object() {
 }
 
 #[test]
+fn test_bucket_policy_upload_part_and_complete_allow_same_account_non_initiator_with_put_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let second_client = CTX.require_second_client();
+        let same_account_principal = same_account_exact_principal().await;
+
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "same-account-non-initiator-write";
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(multipart_put_object_policy_for_alt_and_same_account(
+                &bucket,
+                &same_account_principal,
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok_with_retry(
+            "CreateMultipartUpload with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        let uploaded = eventually_ok_with_retry(
+            "UploadPart by same-account non-initiator with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                second_client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from(vec![b'y'; 1024]))
+                    .send()
+            },
+        )
+        .await;
+        let etag = uploaded.e_tag().expect("expected upload part etag");
+
+        eventually_ok_with_retry(
+            "CompleteMultipartUpload by same-account non-initiator with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                second_client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
+                            .build(),
+                    )
+                    .send()
+            },
+        )
+        .await;
+
+        let object = get_object_eventually(client, &bucket, key).await;
+        let body = object.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), vec![b'y'; 1024].as_slice());
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_management_paths_deny_same_account_non_initiator_with_put_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let second_client = CTX.require_second_client();
+        let same_account_principal = same_account_exact_principal().await;
+
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "same-account-non-initiator-manage";
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(multipart_put_object_policy_for_alt_and_same_account(
+                &bucket,
+                &same_account_principal,
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok_with_retry(
+            "CreateMultipartUpload with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        eventually_ok_with_retry(
+            "UploadPart by initiator for management split setup",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from(vec![b'z'; 1024]))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "ListParts by same-account non-initiator with PutObject only",
+            || {
+                second_client
+                    .list_parts()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "AbortMultipartUpload by same-account non-initiator with PutObject only",
+            || {
+                second_client
+                    .abort_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+            },
+        )
+        .await;
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_completed_abort_denies_same_account_non_initiator_with_put_object() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let second_client = CTX.require_second_client();
+        let same_account_principal = same_account_exact_principal().await;
+
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        let key = "same-account-non-initiator-completed-abort";
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(multipart_put_object_policy_for_alt_and_same_account(
+                &bucket,
+                &same_account_principal,
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok_with_retry(
+            "CreateMultipartUpload with PutObject only",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        let uploaded = eventually_ok_with_retry(
+            "UploadPart by initiator for completed abort setup",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from(vec![b'q'; 1024]))
+                    .send()
+            },
+        )
+        .await;
+        let etag = uploaded.e_tag().expect("expected upload part etag");
+
+        eventually_ok_with_retry(
+            "CompleteMultipartUpload by initiator for completed abort setup",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .parts(CompletedPart::builder().part_number(1).e_tag(etag).build())
+                            .build(),
+                    )
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "AbortMultipartUpload on completed upload by same-account non-initiator with PutObject only",
+            || {
+                second_client
+                    .abort_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .send()
+            },
+        )
+        .await;
+
+        let object = get_object_eventually(client, &bucket, key).await;
+        let body = object.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), vec![b'q'; 1024].as_slice());
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_upload_part_copy_copy_source() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
@@ -7412,7 +7749,7 @@ fn test_bucket_policy_head_bucket_list_bucket_policy_is_not_sufficient() {
 }
 
 #[test]
-fn test_bucket_policy_get_bucket_location_bucket_policy_is_not_sufficient() {
+fn test_bucket_policy_get_bucket_location_requires_dedicated_action() {
     s3_tests::run(async {
         let client = CTX.client();
         let alt_client = CTX.alt_client();
@@ -7458,11 +7795,17 @@ fn test_bucket_policy_get_bucket_location_bucket_policy_is_not_sufficient() {
             .await
             .unwrap();
 
-        eventually_access_denied(
-            "GetBucketLocation denied with GetBucketLocation policy",
+        let location = eventually_ok_with_retry(
+            "GetBucketLocation allowed with GetBucketLocation policy",
+            60,
+            std::time::Duration::from_millis(500),
             || alt_client.get_bucket_location().bucket(&bucket).send(),
         )
         .await;
+        assert_eq!(
+            location.location_constraint().map(|v| v.as_str()),
+            expected_bucket_location_constraint_for_sdk(CTX.region())
+        );
 
         cleanup(&bucket, &[]).await;
     });
