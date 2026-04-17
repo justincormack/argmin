@@ -202,6 +202,39 @@ Recommended additions:
 Keep HTTP cleanup regressions in `crates/server-http/src/http` where the
 observable contract is easiest to assert.
 
+## Stage 0: API Hygiene Before Test Expansion
+
+Before adding broader stateful coverage, tighten the streaming-session API
+surface enough that the later tests are exercising the right boundaries rather
+than large public implementation-detail bags.
+
+Focus this stage narrowly on the HTTP/session seam, not on redesigning storage
+or coordinator interfaces that are already typed and reasonably scoped.
+
+Deliver:
+
+- reduce unnecessary `pub` visibility on streaming HTTP/session context and
+  binding types where they do not need to be externally constructed
+- prefer narrow constructors and helper methods over open field bags for the
+  streaming context objects that cross async/blocking boundaries
+- separate raw request provenance from derived/authorized state more clearly
+  where those are currently mixed into a single context type
+- document any remaining intentionally wide test-only or crate-internal seams
+  that Phase 1 will rely on
+
+Non-goals:
+
+- do not redesign the typed storage trait streaming methods
+- do not introduce a new session service abstraction
+- do not broaden this into a general coordinator refactor
+
+Success criteria:
+
+- the main streaming HTTP/session context types expose only the construction and
+  access surface actually needed by production callers
+- later invariant/stateful tests can be written against clear boundaries rather
+  than depending on broad public field access
+
 ## Phase 1: Consolidate Invariants and Deterministic Hook Tests
 
 Deliver:
