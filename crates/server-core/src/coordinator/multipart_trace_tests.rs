@@ -14,6 +14,8 @@ use std::sync::Arc;
 const TRACE_BUCKET: &str = "bucket";
 const TRACE_KEY: &str = "key";
 const TRACE_PART_DATA: &[u8] = b"trace-part";
+const TRACE_TAIL_DATA: &[u8] = b"trace-tail";
+const TRACE_MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 const TRACE_MAX_OPS: usize = 10;
 const NO_READ: &ReadCondition = &ReadCondition {
     if_match: None,
@@ -163,6 +165,32 @@ fn stream_finalize_single_part(
         })
         .unwrap()
         .etag
+}
+
+fn upload_part_test(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    upload_id: &UploadId,
+    part_number: u32,
+    data: &[u8],
+) -> String {
+    test_helpers::upload_part(
+        coord,
+        &test_helpers::UploadPartRequest {
+            upload: multipart_object_request(bucket, key, upload_id, test_requester()),
+            part_number,
+            data,
+            claimed_checksum: None,
+            sse_customer: None,
+        },
+    )
+    .unwrap()
+    .etag
+}
+
+fn make_trace_head_data(fill: u8) -> Vec<u8> {
+    vec![fill; TRACE_MIN_PART_SIZE]
 }
 
 fn read_all_body(mut body: ReadHandle) -> Result<Vec<u8>, ServerError> {
@@ -427,6 +455,186 @@ fn render_same_key_upload_trace(ops: &[SameKeyUploadTraceOp]) -> String {
     rendered
 }
 
+#[derive(Debug, Clone)]
+enum MultipartHeadTailTraceSeed {
+    Choice(u8),
+}
+
+#[derive(Debug, Clone)]
+enum MultipartHeadTailTraceOp {
+    CreateUpload,
+    UploadHeadPart,
+    BeginTailStream,
+    AppendTailData,
+    FinalizeTailPart,
+    CompleteHeadOnly,
+    CompleteHeadAndTail,
+    AbortUpload,
+    AbortTailSession,
+}
+
+impl std::fmt::Display for MultipartHeadTailTraceOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateUpload => write!(f, "create-upload"),
+            Self::UploadHeadPart => write!(f, "upload-head-part"),
+            Self::BeginTailStream => write!(f, "begin-tail-stream"),
+            Self::AppendTailData => write!(f, "append-tail-data"),
+            Self::FinalizeTailPart => write!(f, "finalize-tail-part"),
+            Self::CompleteHeadOnly => write!(f, "complete-head-only"),
+            Self::CompleteHeadAndTail => write!(f, "complete-head-and-tail"),
+            Self::AbortUpload => write!(f, "abort-upload"),
+            Self::AbortTailSession => write!(f, "abort-tail-session"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultipartVisibleObject {
+    HeadOnly(u8),
+    HeadAndTail(u8),
+}
+
+impl MultipartVisibleObject {
+    fn body(self) -> Vec<u8> {
+        match self {
+            Self::HeadOnly(fill) => make_trace_head_data(fill),
+            Self::HeadAndTail(fill) => {
+                let mut out = make_trace_head_data(fill);
+                out.extend_from_slice(TRACE_TAIL_DATA);
+                out
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MultipartHeadTailModel {
+    upload_active: bool,
+    head_committed: bool,
+    head_fill: Option<u8>,
+    tail_session: Option<SessionModelState>,
+    tail_committed: bool,
+    object_visible: Option<MultipartVisibleObject>,
+    next_head_fill: u8,
+}
+
+impl MultipartHeadTailModel {
+    fn new() -> Self {
+        Self {
+            upload_active: false,
+            head_committed: false,
+            head_fill: None,
+            tail_session: None,
+            tail_committed: false,
+            object_visible: None,
+            next_head_fill: 0xA1,
+        }
+    }
+
+    fn legal_ops(&self) -> &'static [MultipartHeadTailTraceOp] {
+        use MultipartHeadTailTraceOp::*;
+        use SessionModelState::*;
+        match (
+            self.upload_active,
+            self.head_committed,
+            self.tail_session,
+            self.tail_committed,
+        ) {
+            (false, false, None, false) => &[CreateUpload],
+            (true, false, None, false) => &[UploadHeadPart, BeginTailStream, AbortUpload],
+            (true, false, None, true) => &[UploadHeadPart, BeginTailStream, AbortUpload],
+            (true, true, None, false) => &[
+                UploadHeadPart,
+                BeginTailStream,
+                CompleteHeadOnly,
+                AbortUpload,
+            ],
+            (true, true, None, true) => &[
+                UploadHeadPart,
+                BeginTailStream,
+                CompleteHeadOnly,
+                CompleteHeadAndTail,
+                AbortUpload,
+            ],
+            (true, false, Some(Empty), false) => &[AppendTailData, AbortTailSession],
+            (true, false, Some(Empty), true) => &[AppendTailData, AbortTailSession],
+            (true, true, Some(Empty), false) => &[AppendTailData, AbortTailSession],
+            (true, true, Some(Empty), true) => &[AppendTailData, AbortTailSession],
+            (true, false, Some(HasData), false) => &[FinalizeTailPart, AbortTailSession],
+            (true, false, Some(HasData), true) => &[FinalizeTailPart, AbortTailSession],
+            (true, true, Some(HasData), false) => &[FinalizeTailPart, AbortTailSession],
+            (true, true, Some(HasData), true) => &[FinalizeTailPart, AbortTailSession],
+            _ => &[CreateUpload],
+        }
+    }
+
+    fn apply(&mut self, op: &MultipartHeadTailTraceOp) {
+        use MultipartHeadTailTraceOp::*;
+        use SessionModelState::*;
+        match op {
+            CreateUpload => {
+                self.upload_active = true;
+                self.head_committed = false;
+                self.head_fill = None;
+                self.tail_session = None;
+                self.tail_committed = false;
+            }
+            UploadHeadPart => {
+                self.head_committed = true;
+                self.head_fill = Some(self.next_head_fill);
+                self.next_head_fill = self.next_head_fill.wrapping_add(1);
+            }
+            BeginTailStream => {
+                self.tail_session = Some(Empty);
+            }
+            AppendTailData => {
+                self.tail_session = Some(HasData);
+            }
+            FinalizeTailPart => {
+                self.tail_session = None;
+                self.tail_committed = true;
+            }
+            CompleteHeadOnly => {
+                let head_fill = self.head_fill.unwrap();
+                self.upload_active = false;
+                self.head_committed = false;
+                self.head_fill = None;
+                self.tail_session = None;
+                self.tail_committed = false;
+                self.object_visible = Some(MultipartVisibleObject::HeadOnly(head_fill));
+            }
+            CompleteHeadAndTail => {
+                let head_fill = self.head_fill.unwrap();
+                self.upload_active = false;
+                self.head_committed = false;
+                self.head_fill = None;
+                self.tail_session = None;
+                self.tail_committed = false;
+                self.object_visible = Some(MultipartVisibleObject::HeadAndTail(head_fill));
+            }
+            AbortUpload => {
+                self.upload_active = false;
+                self.head_committed = false;
+                self.head_fill = None;
+                self.tail_session = None;
+                self.tail_committed = false;
+            }
+            AbortTailSession => {
+                self.tail_session = None;
+            }
+        }
+    }
+}
+
+fn render_multipart_head_tail_trace(ops: &[MultipartHeadTailTraceOp]) -> String {
+    let mut rendered = String::new();
+    for (index, op) in ops.iter().enumerate() {
+        let _ = writeln!(&mut rendered, "{index}: {op}");
+    }
+    rendered
+}
+
 fn same_key_upload_trace_strategy() -> BoxedStrategy<Vec<SameKeyUploadTraceOp>> {
     proptest::collection::vec(
         any::<u8>().prop_map(SameKeyUploadTraceSeed::Choice),
@@ -437,6 +645,26 @@ fn same_key_upload_trace_strategy() -> BoxedStrategy<Vec<SameKeyUploadTraceOp>> 
         let mut ops = Vec::with_capacity(seeds.len());
         for seed in seeds {
             let SameKeyUploadTraceSeed::Choice(choice) = seed;
+            let legal = model.legal_ops();
+            let op = legal[(choice as usize) % legal.len()].clone();
+            model.apply(&op);
+            ops.push(op);
+        }
+        ops
+    })
+    .boxed()
+}
+
+fn multipart_head_tail_trace_strategy() -> BoxedStrategy<Vec<MultipartHeadTailTraceOp>> {
+    proptest::collection::vec(
+        any::<u8>().prop_map(MultipartHeadTailTraceSeed::Choice),
+        0..=TRACE_MAX_OPS,
+    )
+    .prop_map(|seeds| {
+        let mut model = MultipartHeadTailModel::new();
+        let mut ops = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            let MultipartHeadTailTraceSeed::Choice(choice) = seed;
             let legal = model.legal_ops();
             let op = legal[(choice as usize) % legal.len()].clone();
             model.apply(&op);
@@ -489,6 +717,16 @@ struct SameKeyUploadHarness {
     coord: Coordinator,
     uploads: Vec<SameKeyUploadEntry>,
     next_payload_id: u8,
+}
+
+struct MultipartHeadTailHarness {
+    coord: Coordinator,
+    upload_id: Option<UploadId>,
+    tail_session_id: Option<SessionId>,
+    head_etag: Option<String>,
+    head_fill: Option<u8>,
+    tail_etag: Option<String>,
+    next_head_fill: u8,
 }
 
 impl SameKeyUploadHarness {
@@ -620,6 +858,200 @@ impl SameKeyUploadHarness {
             .filter(|upload| upload.key.as_str() == TRACE_KEY)
             .map(|upload| upload.upload_id)
             .collect()
+    }
+}
+
+impl MultipartHeadTailHarness {
+    fn new(coord: Coordinator) -> Self {
+        Self {
+            coord,
+            upload_id: None,
+            tail_session_id: None,
+            head_etag: None,
+            head_fill: None,
+            tail_etag: None,
+            next_head_fill: 0xA1,
+        }
+    }
+
+    fn execute(&mut self, op: &MultipartHeadTailTraceOp) {
+        match op {
+            MultipartHeadTailTraceOp::CreateUpload => {
+                let create = create_basic_multipart_upload(&self.coord, TRACE_BUCKET, TRACE_KEY);
+                self.upload_id = Some(create.upload_id);
+                self.tail_session_id = None;
+                self.head_etag = None;
+                self.head_fill = None;
+                self.tail_etag = None;
+            }
+            MultipartHeadTailTraceOp::UploadHeadPart => {
+                let upload_id = self.upload_id.as_ref().unwrap();
+                let head_fill = self.next_head_fill;
+                self.next_head_fill = self.next_head_fill.wrapping_add(1);
+                self.head_fill = Some(head_fill);
+                self.head_etag = Some(upload_part_test(
+                    &self.coord,
+                    TRACE_BUCKET,
+                    TRACE_KEY,
+                    upload_id,
+                    1,
+                    &make_trace_head_data(head_fill),
+                ));
+            }
+            MultipartHeadTailTraceOp::BeginTailStream => {
+                let upload_id = self.upload_id.as_ref().unwrap();
+                let session =
+                    begin_stream_part_test(&self.coord, TRACE_BUCKET, TRACE_KEY, upload_id, 2)
+                        .unwrap();
+                self.tail_session_id = Some(session.session_id);
+            }
+            MultipartHeadTailTraceOp::AppendTailData => {
+                let session_id = self.tail_session_id.as_ref().unwrap();
+                self.coord
+                    .append_plaintext_stream_segment_for_test(
+                        TRACE_BUCKET,
+                        TRACE_KEY,
+                        session_id,
+                        0,
+                        TRACE_TAIL_DATA,
+                    )
+                    .unwrap();
+            }
+            MultipartHeadTailTraceOp::FinalizeTailPart => {
+                let upload_id = self.upload_id.as_ref().unwrap();
+                let session_id = self.tail_session_id.as_ref().unwrap();
+                self.tail_etag = Some(
+                    self.coord
+                        .finalize_stream_part(FinalizeStreamPartRequest {
+                            upload: multipart_object_request(
+                                TRACE_BUCKET,
+                                TRACE_KEY,
+                                upload_id,
+                                test_requester(),
+                            ),
+                            session_id,
+                            part_number: 2,
+                            crc64: checksum::crc64::checksum(TRACE_TAIL_DATA),
+                            total_size: TRACE_TAIL_DATA.len() as u64,
+                            claimed_checksum: None,
+                            computed_checksum: None,
+                        })
+                        .unwrap()
+                        .etag,
+                );
+                self.tail_session_id = None;
+            }
+            MultipartHeadTailTraceOp::CompleteHeadOnly => {
+                let upload_id = self.upload_id.as_ref().unwrap();
+                let head_etag = self.head_etag.as_ref().unwrap();
+                self.coord
+                    .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                        upload: multipart_object_request(
+                            TRACE_BUCKET,
+                            TRACE_KEY,
+                            upload_id,
+                            test_requester(),
+                        ),
+                        parts: &[CompletePart {
+                            part_number: 1,
+                            etag: head_etag.clone(),
+                            checksum: None,
+                        }],
+                        claimed_checksum: None,
+                        expected_object_size: None,
+                        cond: &WriteCondition::default(),
+                        sse_customer: None,
+                    })
+                    .unwrap();
+                self.upload_id = None;
+                self.tail_session_id = None;
+                self.head_etag = None;
+                self.head_fill = None;
+                self.tail_etag = None;
+            }
+            MultipartHeadTailTraceOp::CompleteHeadAndTail => {
+                let upload_id = self.upload_id.as_ref().unwrap();
+                let head_etag = self.head_etag.as_ref().unwrap();
+                let tail_etag = self.tail_etag.as_ref().unwrap();
+                self.coord
+                    .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                        upload: multipart_object_request(
+                            TRACE_BUCKET,
+                            TRACE_KEY,
+                            upload_id,
+                            test_requester(),
+                        ),
+                        parts: &[
+                            CompletePart {
+                                part_number: 1,
+                                etag: head_etag.clone(),
+                                checksum: None,
+                            },
+                            CompletePart {
+                                part_number: 2,
+                                etag: tail_etag.clone(),
+                                checksum: None,
+                            },
+                        ],
+                        claimed_checksum: None,
+                        expected_object_size: None,
+                        cond: &WriteCondition::default(),
+                        sse_customer: None,
+                    })
+                    .unwrap();
+                self.upload_id = None;
+                self.tail_session_id = None;
+                self.head_etag = None;
+                self.head_fill = None;
+                self.tail_etag = None;
+            }
+            MultipartHeadTailTraceOp::AbortUpload => {
+                let upload_id = self.upload_id.as_ref().unwrap();
+                self.coord
+                    .abort_multipart_upload(&multipart_object_request(
+                        TRACE_BUCKET,
+                        TRACE_KEY,
+                        upload_id,
+                        test_requester(),
+                    ))
+                    .unwrap();
+                self.upload_id = None;
+                self.tail_session_id = None;
+                self.head_etag = None;
+                self.head_fill = None;
+                self.tail_etag = None;
+            }
+            MultipartHeadTailTraceOp::AbortTailSession => {
+                let session_id = self.tail_session_id.as_ref().unwrap();
+                self.coord
+                    .abort_stream_part_session(
+                        &trusted_bucket_name(TRACE_BUCKET),
+                        &trusted_object_key(TRACE_KEY),
+                        session_id,
+                    )
+                    .unwrap();
+                self.tail_session_id = None;
+            }
+        }
+    }
+
+    fn active_session_count(&self) -> usize {
+        let mut count = 0usize;
+        self.coord
+            .pg_topology
+            .for_each_pg(|pg_id| {
+                let pg = self.coord.storage_node.get_pg(pg_id)?;
+                count += pg
+                    .list_all_stream_uploads()?
+                    .into_iter()
+                    .filter(|session| {
+                        session.bucket.as_str() == TRACE_BUCKET && session.key.as_str() == TRACE_KEY
+                    })
+                    .count();
+                Ok::<(), ServerError>(())
+            })
+            .unwrap();
+        count
     }
 }
 
@@ -936,6 +1368,28 @@ proptest! {
     }
 
     #[test]
+    fn prop_multipart_head_tail_trace_matches_model(ops in multipart_head_tail_trace_strategy()) {
+        let trace = render_multipart_head_tail_trace(&ops);
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", TRACE_BUCKET, false)
+            .unwrap();
+        let mut harness = MultipartHeadTailHarness::new(coord);
+        let mut model = MultipartHeadTailModel::new();
+
+        let initial_context = format!("initial state\nfull trace:\n{trace}");
+        assert_multipart_head_tail_trace_matches_model(&harness, &model, &initial_context)?;
+
+        for (index, op) in ops.iter().enumerate() {
+            harness.execute(op);
+            model.apply(op);
+            let step_context = format!("after step {index}: {op}\nfull trace:\n{trace}");
+            assert_multipart_head_tail_trace_matches_model(&harness, &model, &step_context)?;
+        }
+    }
+
+    #[test]
     fn prop_same_key_multipart_upload_set_matches_model(ops in same_key_upload_trace_strategy()) {
         let trace = render_same_key_upload_trace(&ops);
         let tmp = test_util::tempdir();
@@ -956,6 +1410,105 @@ proptest! {
             assert_same_key_upload_trace_matches_model(&harness, &model, &step_context)?;
         }
     }
+}
+
+fn assert_multipart_head_tail_trace_matches_model(
+    harness: &MultipartHeadTailHarness,
+    model: &MultipartHeadTailModel,
+    context: &str,
+) -> TestCaseResult {
+    let pending_ids = harness
+        .coord
+        .list_multipart_uploads(&ListMultipartUploadsRequest {
+            bucket: BucketRequest::new(trusted_bucket_name(TRACE_BUCKET), test_requester(), None),
+            prefix: None,
+            key_marker: None,
+            upload_id_marker: None,
+            max_uploads: u32::MAX,
+        })
+        .unwrap()
+        .uploads;
+    prop_assert_eq!(
+        pending_ids
+            .iter()
+            .filter(|upload| upload.key.as_str() == TRACE_KEY)
+            .count(),
+        usize::from(model.upload_active),
+        "{}",
+        context
+    );
+    prop_assert_eq!(
+        harness.active_session_count(),
+        usize::from(model.tail_session.is_some()),
+        "{}",
+        context
+    );
+
+    if let Some(upload_id) = harness.upload_id.as_ref().filter(|_| model.upload_active) {
+        let parts = harness
+            .coord
+            .list_parts(&ListPartsRequest {
+                upload: multipart_object_request(
+                    TRACE_BUCKET,
+                    TRACE_KEY,
+                    upload_id,
+                    test_requester(),
+                ),
+                part_number_marker: None,
+                max_parts: 100,
+            })
+            .map_err(|err| {
+                TestCaseError::fail(format!(
+                    "{context}\nlist_parts unexpectedly failed: {err:?}"
+                ))
+            })?;
+        let expected_part_numbers = [
+            model.head_committed.then_some(1),
+            model.tail_committed.then_some(2),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        let actual_part_numbers = parts
+            .parts
+            .iter()
+            .map(|part| part.part_number)
+            .collect::<Vec<_>>();
+        prop_assert_eq!(actual_part_numbers, expected_part_numbers, "{}", context);
+    }
+
+    if let Some(visible) = model.object_visible {
+        let result = harness
+            .coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request(TRACE_BUCKET, TRACE_KEY, None, test_requester()),
+                cond: NO_READ,
+            })
+            .map_err(|err| {
+                TestCaseError::fail(format!("{context}\nexpected visible object, got {err:?}"))
+            })?;
+        let body = read_all_body(result.body).map_err(|err| {
+            TestCaseError::fail(format!("{context}\nfailed reading body: {err:?}"))
+        })?;
+        prop_assert_eq!(body, visible.body(), "{}", context);
+    } else {
+        let err = harness
+            .coord
+            .head_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request(TRACE_BUCKET, TRACE_KEY, None, test_requester()),
+                cond: NO_READ,
+            })
+            .unwrap_err();
+        prop_assert!(
+            matches!(err, ServerError::ObjectNotFound { .. }),
+            "{}",
+            context
+        );
+    }
+
+    Ok(())
 }
 
 fn assert_same_key_upload_trace_matches_model(

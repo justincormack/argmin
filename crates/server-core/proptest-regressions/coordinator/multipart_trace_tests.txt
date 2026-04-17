@@ -7,3 +7,4 @@
 cc c86b3855b4a79a209aabb12a2baa0e25c942abe3b3ae0d85c26a3c03761013a2 # shrinks to ops = [CreateUpload, BeginStreamPart, AbortActive]
 cc d9dd5bc2e4e287b8852c6f020051f2e63aaad8ab939d18feb85fc2c2ed7e98be # shrinks to ops = [CreateUpload, BeginStreamPart, AppendData, FinalizePart, BeginStreamPart, CreateUpload]
 cc f0278f81a0fe809e8185f99922cfe853c9a81a24702350a66d19309942de0a07 # shrinks to ops = [CreateUpload, FinalizeCurrentPart, CreateUpload, CompleteOldest, FinalizeCurrentPart, CreateUpload, CompleteCurrent]
+cc 0a89a8c8848994522b222d0d8feadd392e0ce08037b1a4f1984b97065dd23721 # shrinks to ops = [CreateUpload, AbortUpload, CreateUpload, BeginTailStream, AppendTailData, FinalizeTailPart, CreateUpload]

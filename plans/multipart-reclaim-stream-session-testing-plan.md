@@ -357,6 +357,15 @@ Current state:
     general N-upload model yet
   - checks that pending upload ordering, per-upload `ListParts`, and visible
     object winner identity stay aligned with the model after each step
+- a third bounded Phase 2 property now covers real multipart composition for a
+  single upload without widening to arbitrary part sets:
+  - one buffered head part at the AWS minimum non-final part size, with
+    distinct overwrite payloads so same-part winner identity is observable
+  - one streamed tail part with explicit session begin/append/finalize/abort
+  - complete-head-only versus complete-head-and-tail terminal choices
+  - checks that pending upload presence, `ListParts` part-number visibility,
+    active tail-session presence, and visible object body stay aligned with the
+    model after each step
 
 ## Phase 3: Reclaim and Lease Trace Model
 
