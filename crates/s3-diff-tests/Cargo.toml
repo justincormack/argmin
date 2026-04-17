@@ -9,6 +9,8 @@ s3-tests = { path = "../s3-tests" }
 s3-types = { path = "../s3-types" }
 
 [dev-dependencies]
+auth = { path = "../auth" }
 base64 = "0.22"
 checksum = { path = "../checksum", default-features = false }
 ring = "0.17"
+serde_json = "1"

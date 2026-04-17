@@ -1941,6 +1941,7 @@ mod tests {
 
         assert!(policy.requires_request_object_tags_for_action(PolicyAction::PutObject));
         assert!(!policy.requires_request_object_tags_for_action(PolicyAction::GetObject));
+        assert!(!policy.requires_request_object_tags_for_action(PolicyAction::PutObjectTagging));
     }
 
     #[test]

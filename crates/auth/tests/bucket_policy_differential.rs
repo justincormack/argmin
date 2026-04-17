@@ -495,6 +495,170 @@ impl GeneratedRequestAction {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestContextField {
+    ExistingTagClassification,
+    RequestTagTeam,
+    CopySource,
+    MetadataDirective,
+    CannedAcl,
+    ServerSideEncryption,
+    SseCustomerAlgorithm,
+    GrantRead,
+    GrantWrite,
+    GrantReadAcp,
+    GrantWriteAcp,
+    GrantFullControl,
+}
+
+impl RequestContextField {
+    const fn all() -> &'static [Self] {
+        &[
+            Self::ExistingTagClassification,
+            Self::RequestTagTeam,
+            Self::CopySource,
+            Self::MetadataDirective,
+            Self::CannedAcl,
+            Self::ServerSideEncryption,
+            Self::SseCustomerAlgorithm,
+            Self::GrantRead,
+            Self::GrantWrite,
+            Self::GrantReadAcp,
+            Self::GrantWriteAcp,
+            Self::GrantFullControl,
+        ]
+    }
+
+    const fn condition_key(self) -> GeneratedConditionKey {
+        match self {
+            Self::ExistingTagClassification => GeneratedConditionKey::ExistingTagClassification,
+            Self::RequestTagTeam => GeneratedConditionKey::RequestTagTeam,
+            Self::CopySource => GeneratedConditionKey::CopySource,
+            Self::MetadataDirective => GeneratedConditionKey::MetadataDirective,
+            Self::CannedAcl => GeneratedConditionKey::CannedAcl,
+            Self::ServerSideEncryption => GeneratedConditionKey::ServerSideEncryption,
+            Self::SseCustomerAlgorithm => GeneratedConditionKey::SseCustomerAlgorithm,
+            Self::GrantRead => GeneratedConditionKey::GrantRead,
+            Self::GrantWrite => GeneratedConditionKey::GrantWrite,
+            Self::GrantReadAcp => GeneratedConditionKey::GrantReadAcp,
+            Self::GrantWriteAcp => GeneratedConditionKey::GrantWriteAcp,
+            Self::GrantFullControl => GeneratedConditionKey::GrantFullControl,
+        }
+    }
+
+    const fn action(self) -> GeneratedRequestAction {
+        match self {
+            Self::ExistingTagClassification => GeneratedRequestAction::GetObject,
+            Self::RequestTagTeam => GeneratedRequestAction::PutObject,
+            Self::CopySource => GeneratedRequestAction::CopyObject,
+            Self::MetadataDirective => GeneratedRequestAction::CopyObject,
+            Self::CannedAcl => GeneratedRequestAction::PutObject,
+            Self::ServerSideEncryption => GeneratedRequestAction::PutObject,
+            Self::SseCustomerAlgorithm => GeneratedRequestAction::PutObject,
+            Self::GrantRead => GeneratedRequestAction::PutObject,
+            Self::GrantWrite => GeneratedRequestAction::PutObject,
+            Self::GrantReadAcp => GeneratedRequestAction::PutObject,
+            Self::GrantWriteAcp => GeneratedRequestAction::PutObject,
+            Self::GrantFullControl => GeneratedRequestAction::PutObject,
+        }
+    }
+
+    const fn expected_value(self) -> &'static str {
+        match self {
+            Self::ExistingTagClassification => "public",
+            Self::RequestTagTeam => "analytics",
+            Self::CopySource => "bucket/key",
+            Self::MetadataDirective => "COPY",
+            Self::CannedAcl => "private",
+            Self::ServerSideEncryption => "AES256",
+            Self::SseCustomerAlgorithm => "AES256",
+            Self::GrantRead => r#"id="grant-read-canonical""#,
+            Self::GrantWrite => r#"id="grant-write-canonical""#,
+            Self::GrantReadAcp => r#"id="grant-read-acp-canonical""#,
+            Self::GrantWriteAcp => r#"id="grant-write-acp-canonical""#,
+            Self::GrantFullControl => r#"id="grant-full-control-canonical""#,
+        }
+    }
+
+    const fn mismatching_value(self) -> &'static str {
+        match self {
+            Self::ExistingTagClassification => "private",
+            Self::RequestTagTeam => "platform",
+            Self::CopySource => "other-bucket/other-key",
+            Self::MetadataDirective => "REPLACE",
+            Self::CannedAcl => "public-read",
+            Self::ServerSideEncryption => "aws:kms",
+            Self::SseCustomerAlgorithm => "aws:kms",
+            Self::GrantRead => r#"id="someone-else-read""#,
+            Self::GrantWrite => r#"id="someone-else-write""#,
+            Self::GrantReadAcp => r#"id="someone-else-read-acp""#,
+            Self::GrantWriteAcp => r#"id="someone-else-write-acp""#,
+            Self::GrantFullControl => r#"id="someone-else-full-control""#,
+        }
+    }
+
+    fn apply(self, request: &mut GeneratedRequest, value: Option<&str>) {
+        match self {
+            Self::ExistingTagClassification => {
+                request.existing_tags = value
+                    .into_iter()
+                    .map(|value| ("classification".to_string(), value.to_string()))
+                    .collect();
+            }
+            Self::RequestTagTeam => {
+                request.request_tags = value
+                    .into_iter()
+                    .map(|value| ("team".to_string(), value.to_string()))
+                    .collect();
+            }
+            Self::CopySource => request.copy_source = value.map(str::to_string),
+            Self::MetadataDirective => request.metadata_directive = value.map(str::to_string),
+            Self::CannedAcl => request.canned_acl = value.map(str::to_string),
+            Self::ServerSideEncryption => {
+                request.server_side_encryption = value.map(str::to_string);
+            }
+            Self::SseCustomerAlgorithm => {
+                request.sse_customer_algorithm = value.map(str::to_string);
+            }
+            Self::GrantRead => request.grant_read = value.map(str::to_string),
+            Self::GrantWrite => request.grant_write = value.map(str::to_string),
+            Self::GrantReadAcp => request.grant_read_acp = value.map(str::to_string),
+            Self::GrantWriteAcp => request.grant_write_acp = value.map(str::to_string),
+            Self::GrantFullControl => request.grant_full_control = value.map(str::to_string),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldValueState {
+    Missing,
+    Matching,
+    Mismatching,
+}
+
+impl FieldValueState {
+    const fn expected_allows(self) -> bool {
+        matches!(self, Self::Matching)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ObjectResourceScope {
+    ExactObject,
+    BucketWildcard,
+    BucketOnly,
+}
+
+impl ObjectResourceScope {
+    const fn pattern(self) -> GeneratedResourcePattern {
+        match self {
+            Self::ExactObject => GeneratedResourcePattern::ObjectArn(BUCKET, KEY),
+            Self::BucketWildcard => GeneratedResourcePattern::ObjectBucketWildcard(BUCKET),
+            Self::BucketOnly => GeneratedResourcePattern::BucketArn(BUCKET),
+        }
+    }
+}
+
 fn push_optional_request_context(out: &mut String, method: &str, value: Option<&str>) {
     if let Some(value) = value {
         out.push_str(&format!(".{method}(Some({value:?}))"));
@@ -842,6 +1006,83 @@ fn condition_value_strategy() -> impl Strategy<Value = String> {
     ]
 }
 
+fn request_context_field_strategy() -> impl Strategy<Value = RequestContextField> {
+    prop::sample::select(RequestContextField::all().to_vec())
+}
+
+fn request_context_target_and_wrong_field_strategy(
+) -> impl Strategy<Value = (RequestContextField, RequestContextField)> {
+    request_context_field_strategy().prop_flat_map(|target| {
+        let others = RequestContextField::all()
+            .iter()
+            .copied()
+            .filter(|field| *field != target)
+            .collect::<Vec<_>>();
+        prop::sample::select(others).prop_map(move |wrong| (target, wrong))
+    })
+}
+
+fn field_value_state_strategy() -> impl Strategy<Value = FieldValueState> {
+    prop_oneof![
+        Just(FieldValueState::Missing),
+        Just(FieldValueState::Matching),
+        Just(FieldValueState::Mismatching),
+    ]
+}
+
+fn blank_request(action: GeneratedRequestAction) -> GeneratedRequest {
+    GeneratedRequest {
+        action,
+        requester: GeneratedRequester::AltUser,
+        existing_tags: Vec::new(),
+        request_tags: Vec::new(),
+        copy_source: None,
+        metadata_directive: None,
+        canned_acl: None,
+        server_side_encryption: None,
+        sse_customer_algorithm: None,
+        grant_read: None,
+        grant_write: None,
+        grant_read_acp: None,
+        grant_write_acp: None,
+        grant_full_control: None,
+    }
+}
+
+fn apply_state(field: RequestContextField, request: &mut GeneratedRequest, state: FieldValueState) {
+    let value = match state {
+        FieldValueState::Missing => None,
+        FieldValueState::Matching => Some(field.expected_value()),
+        FieldValueState::Mismatching => Some(field.mismatching_value()),
+    };
+    field.apply(request, value);
+}
+
+fn single_condition_policy(
+    field: RequestContextField,
+    resource: GeneratedResourcePattern,
+) -> BucketPolicy {
+    parse_generated_policy(
+        &GeneratedPolicy {
+            statements: vec![GeneratedStatement {
+                effect: GeneratedEffect::Allow,
+                principal: GeneratedPrincipal::Wildcard,
+                actions: vec![GeneratedActionPattern::Literal(
+                    field.action().policy_action().as_str(),
+                )],
+                resources: vec![resource],
+                conditions: vec![GeneratedConditionClause {
+                    operator: GeneratedConditionOperator::StringEquals,
+                    key: field.condition_key(),
+                    values: vec![field.expected_value().to_string()],
+                }],
+            }],
+        },
+        RenderStyle::CompactSingletons,
+    )
+    .expect("single-condition policy parses")
+}
+
 fn dedup_actions(actions: &mut Vec<GeneratedActionPattern>) {
     actions.dedup_by_key(|action| action.as_str());
 }
@@ -913,5 +1154,314 @@ proptest! {
         let original_eval = evaluate_generated(&policy, &case.request);
         let reversed_eval = evaluate_generated(&reversed, &case.request);
         prop_assert_eq!(reversed_eval, original_eval, "statement reordering changed evaluation\noriginal={}\nreversed={}\nrequest={}", case.policy.render(RenderStyle::CompactSingletons), case.policy.reversed().render(RenderStyle::CompactSingletons), case.request.render_builder());
+    }
+
+    #[test]
+    fn bucket_policy_differential_phase2_request_context_exactness_matrix(
+        noise in generated_request_strategy(),
+        (target, wrong) in request_context_target_and_wrong_field_strategy(),
+        target_state in field_value_state_strategy(),
+    ) {
+        let policy = single_condition_policy(target, GeneratedResourcePattern::ObjectBucketWildcard(BUCKET));
+
+        let mut clean = blank_request(target.action());
+        apply_state(target, &mut clean, target_state);
+
+        let mut noisy = noise.clone();
+        noisy.action = target.action();
+        noisy.requester = GeneratedRequester::AltUser;
+        apply_state(target, &mut noisy, target_state);
+        wrong.apply(&mut noisy, Some(wrong.expected_value()));
+
+        let clean_eval = evaluate_generated(&policy, &clean);
+        let noisy_eval = evaluate_generated(&policy, &noisy);
+        let expected = if target_state.expected_allows() {
+            PolicyEvaluation::ExplicitAllow
+        } else {
+            PolicyEvaluation::NoMatch
+        };
+
+        prop_assert_eq!(
+            noisy_eval,
+            clean_eval,
+            "unrelated request-context field changed evaluation\nfield={:?}\nwrong={:?}\nstate={:?}\nclean={}\nnoisy={}",
+            target,
+            wrong,
+            target_state,
+            clean.render_builder(),
+            noisy.render_builder(),
+        );
+        prop_assert_eq!(
+            noisy_eval,
+            expected,
+            "single-field request-context exactness drifted\nfield={:?}\nwrong={:?}\nstate={:?}\nrequest={}",
+            target,
+            wrong,
+            target_state,
+            noisy.render_builder(),
+        );
+    }
+}
+
+#[test]
+fn bucket_policy_differential_phase2_copy_source_and_metadata_directive_matrix() {
+    let policy = parse_generated_policy(
+        &GeneratedPolicy {
+            statements: vec![GeneratedStatement {
+                effect: GeneratedEffect::Allow,
+                principal: GeneratedPrincipal::Wildcard,
+                actions: vec![GeneratedActionPattern::Literal("s3:PutObject")],
+                resources: vec![GeneratedResourcePattern::ObjectBucketWildcard(BUCKET)],
+                conditions: vec![
+                    GeneratedConditionClause {
+                        operator: GeneratedConditionOperator::StringEquals,
+                        key: GeneratedConditionKey::CopySource,
+                        values: vec!["bucket/key".to_string()],
+                    },
+                    GeneratedConditionClause {
+                        operator: GeneratedConditionOperator::StringEquals,
+                        key: GeneratedConditionKey::MetadataDirective,
+                        values: vec!["COPY".to_string()],
+                    },
+                ],
+            }],
+        },
+        RenderStyle::CompactSingletons,
+    )
+    .expect("copy-source/metadata policy parses");
+
+    for resource_scope in [
+        ObjectResourceScope::ExactObject,
+        ObjectResourceScope::BucketWildcard,
+        ObjectResourceScope::BucketOnly,
+    ] {
+        let scoped_policy = parse_generated_policy(
+            &GeneratedPolicy {
+                statements: vec![GeneratedStatement {
+                    effect: GeneratedEffect::Allow,
+                    principal: GeneratedPrincipal::Wildcard,
+                    actions: vec![GeneratedActionPattern::Literal("s3:PutObject")],
+                    resources: vec![resource_scope.pattern()],
+                    conditions: vec![
+                        GeneratedConditionClause {
+                            operator: GeneratedConditionOperator::StringEquals,
+                            key: GeneratedConditionKey::CopySource,
+                            values: vec!["bucket/key".to_string()],
+                        },
+                        GeneratedConditionClause {
+                            operator: GeneratedConditionOperator::StringEquals,
+                            key: GeneratedConditionKey::MetadataDirective,
+                            values: vec!["COPY".to_string()],
+                        },
+                    ],
+                }],
+            },
+            RenderStyle::CompactSingletons,
+        );
+
+        if matches!(resource_scope, ObjectResourceScope::BucketOnly) {
+            assert!(
+                scoped_policy.is_err(),
+                "object action unexpectedly accepted bucket-only resource applicability"
+            );
+            continue;
+        }
+        let scoped_policy = scoped_policy.expect("scoped copy-source/metadata policy parses");
+
+        for copy_source_state in [
+            FieldValueState::Missing,
+            FieldValueState::Matching,
+            FieldValueState::Mismatching,
+        ] {
+            for metadata_state in [
+                FieldValueState::Missing,
+                FieldValueState::Matching,
+                FieldValueState::Mismatching,
+            ] {
+                let mut request = blank_request(GeneratedRequestAction::CopyObject);
+                apply_state(
+                    RequestContextField::CopySource,
+                    &mut request,
+                    copy_source_state,
+                );
+                apply_state(
+                    RequestContextField::MetadataDirective,
+                    &mut request,
+                    metadata_state,
+                );
+
+                let eval = evaluate_generated(&scoped_policy, &request);
+                let expected =
+                    if copy_source_state.expected_allows() && metadata_state.expected_allows() {
+                        PolicyEvaluation::ExplicitAllow
+                    } else {
+                        PolicyEvaluation::NoMatch
+                    };
+
+                assert_eq!(
+                    eval,
+                    expected,
+                    "copy-source/metadata matrix drifted\nresource_scope={resource_scope:?}\ncopy_source_state={copy_source_state:?}\nmetadata_state={metadata_state:?}\nrequest={}",
+                    request.render_builder(),
+                );
+            }
+        }
+    }
+
+    let mut with_unrelated_noise = blank_request(GeneratedRequestAction::CopyObject);
+    apply_state(
+        RequestContextField::CopySource,
+        &mut with_unrelated_noise,
+        FieldValueState::Matching,
+    );
+    apply_state(
+        RequestContextField::MetadataDirective,
+        &mut with_unrelated_noise,
+        FieldValueState::Matching,
+    );
+    RequestContextField::GrantRead.apply(
+        &mut with_unrelated_noise,
+        Some(RequestContextField::GrantRead.expected_value()),
+    );
+    RequestContextField::ServerSideEncryption.apply(
+        &mut with_unrelated_noise,
+        Some(RequestContextField::ServerSideEncryption.expected_value()),
+    );
+    RequestContextField::RequestTagTeam.apply(
+        &mut with_unrelated_noise,
+        Some(RequestContextField::RequestTagTeam.expected_value()),
+    );
+    assert_eq!(
+        evaluate_generated(&policy, &with_unrelated_noise),
+        PolicyEvaluation::ExplicitAllow,
+        "unrelated request context changed copy-source/metadata evaluation\n{}",
+        with_unrelated_noise.render_builder(),
+    );
+}
+
+#[test]
+fn bucket_policy_differential_phase2_bucket_vs_object_resource_applicability_matrix() {
+    let object_actions = [
+        PolicyAction::GetObject,
+        PolicyAction::PutObject,
+        PolicyAction::GetObjectTagging,
+        PolicyAction::PutObjectTagging,
+        PolicyAction::DeleteObject,
+    ];
+    let bucket_actions = [
+        PolicyAction::GetBucketAcl,
+        PolicyAction::PutBucketAcl,
+        PolicyAction::GetBucketVersioning,
+        PolicyAction::ListBucketVersions,
+        PolicyAction::ListBucketMultipartUploads,
+    ];
+
+    for action in object_actions {
+        for resource in [
+            GeneratedResourcePattern::ObjectArn(BUCKET, KEY),
+            GeneratedResourcePattern::ObjectBucketWildcard(BUCKET),
+            GeneratedResourcePattern::BucketArn(BUCKET),
+        ] {
+            let policy = parse_generated_policy(
+                &GeneratedPolicy {
+                    statements: vec![GeneratedStatement {
+                        effect: GeneratedEffect::Allow,
+                        principal: GeneratedPrincipal::Wildcard,
+                        actions: vec![GeneratedActionPattern::Literal(action.as_str())],
+                        resources: vec![resource],
+                        conditions: Vec::new(),
+                    }],
+                },
+                RenderStyle::CompactSingletons,
+            );
+            if matches!(resource, GeneratedResourcePattern::BucketArn(_)) {
+                assert!(
+                    policy.is_err(),
+                    "object action unexpectedly accepted bucket-only resource\naction={action:?}\nresource={:?}",
+                    resource.as_str(),
+                );
+            } else {
+                let policy = policy.expect("object action applicability policy parses");
+                let request = PolicyRequest::new(action, BUCKET, KEY, Some(ALT_USER), None);
+                assert_eq!(
+                    policy.evaluate(&request),
+                    PolicyEvaluation::ExplicitAllow,
+                    "object-action resource applicability drifted\naction={action:?}\nresource={:?}",
+                    resource.as_str(),
+                );
+            }
+        }
+    }
+
+    for action in bucket_actions {
+        for resource in [
+            GeneratedResourcePattern::BucketArn(BUCKET),
+            GeneratedResourcePattern::ObjectBucketWildcard(BUCKET),
+            GeneratedResourcePattern::ObjectArn(BUCKET, KEY),
+        ] {
+            let policy = parse_generated_policy(
+                &GeneratedPolicy {
+                    statements: vec![GeneratedStatement {
+                        effect: GeneratedEffect::Allow,
+                        principal: GeneratedPrincipal::Wildcard,
+                        actions: vec![GeneratedActionPattern::Literal(action.as_str())],
+                        resources: vec![resource],
+                        conditions: Vec::new(),
+                    }],
+                },
+                RenderStyle::CompactSingletons,
+            );
+            if matches!(resource, GeneratedResourcePattern::BucketArn(_)) {
+                let policy = policy.expect("bucket action applicability policy parses");
+                let request = PolicyRequest::for_bucket(action, BUCKET, Some(ALT_USER), None);
+                assert_eq!(
+                    policy.evaluate(&request),
+                    PolicyEvaluation::ExplicitAllow,
+                    "bucket-action resource applicability drifted\naction={action:?}\nresource={:?}",
+                    resource.as_str(),
+                );
+            } else {
+                assert!(
+                    policy.is_err(),
+                    "bucket action unexpectedly accepted object-scoped resource\naction={action:?}\nresource={:?}",
+                    resource.as_str(),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn bucket_policy_differential_phase2_unsupported_condition_keys_are_rejected() {
+    for unsupported_key in [
+        "aws:PrincipalArn",
+        "aws:SourceVpc",
+        "aws:SourceVpce",
+        "aws:SourceIp",
+        "s3:VersionId",
+    ] {
+        let policy = parse_bucket_policy(
+            &serde_json::to_string(&json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": "*",
+                    "Action": "s3:GetObject",
+                    "Resource": "arn:aws:s3:::bucket/*",
+                    "Condition": {
+                        "StringEquals": {
+                            unsupported_key: "irrelevant"
+                        }
+                    }
+                }]
+            }))
+            .expect("serialize unsupported-key policy"),
+        )
+        .expect("unsupported-key policy parses");
+
+        assert!(
+            policy.validate_evaluable_object_conditions().is_err(),
+            "unsupported condition key unexpectedly entered evaluable subset: {unsupported_key}"
+        );
     }
 }

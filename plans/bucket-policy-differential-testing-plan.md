@@ -168,7 +168,7 @@ Keep the layers separate:
 - local generator and metamorphic/differential tests in a dedicated auth test
   module, for example `crates/auth/tests/bucket_policy_differential.rs`
 - AWS-backed oracle coverage in
-  `crates/s3-tests/tests/bucket_policy_differential.rs`
+  `crates/s3-diff-tests/tests/bucket_policy.rs`
 - optional libFuzzer coverage later in `fuzz/fuzz_targets/auth_bucket_policy.rs`
   once the deterministic generator exists
 
@@ -269,7 +269,8 @@ Current state:
 
 ## Phase 3: AWS-Backed Oracle Harness
 
-Add a generated-but-bounded AWS differential harness under `crates/s3-tests`.
+Add a generated-but-bounded AWS-vs-local differential harness under
+`crates/s3-diff-tests`.
 
 Start narrow. The first slice should cover only operations that are easy to
 materialize precisely and already have strong harness support:
@@ -304,6 +305,32 @@ Success criteria:
   family we intentionally enforce
 - Argmin and AWS disagreements minimize into stable regression tests
 
+Current state:
+
+- [ ] Phase 3 is started but not complete.
+- [x] Added an initial AWS-vs-local differential harness at
+  `crates/s3-diff-tests/tests/bucket_policy.rs`.
+- [x] The harness now reuses the existing `s3-tests` fixture and client setup,
+  executes the same scenario against AWS and a local Argmin server, and checks
+  the local `BucketPolicy::evaluate` classification against the observed
+  allow-versus-reject result for selected object-policy condition families:
+  - `s3:ExistingObjectTag/*`
+  - `s3:RequestObjectTag/*`
+  - `s3:x-amz-copy-source`
+  - `s3:x-amz-metadata-directive`
+  - `s3:x-amz-acl`
+  - representative `s3:x-amz-grant-*` coverage via `s3:x-amz-grant-read`
+  - `s3:x-amz-server-side-encryption`
+  - `s3:x-amz-server-side-encryption-customer-algorithm`
+- [x] The Phase 3 harness now includes paired-policy rows that distinguish
+  `ExplicitDeny` from `NoMatch` on the local evaluator side while still
+  comparing the live AWS/local server outcome as allow versus reject.
+- [x] The differential now isolates each scenario in its own bucket/policy
+  surface so AWS oracle rows do not depend on policy replacement convergence
+  across scenarios.
+- [ ] The expanded AWS-backed run still needs to be rechecked end to end before
+  Phase 3 can be marked complete.
+
 ## Phase 4: Fuzz Target and Corpus Promotion
 
 Once the deterministic generator and AWS oracle are stable, add a pure offline
@@ -331,7 +358,7 @@ Minimum validation for each phase:
 2. `cargo test -p auth bucket_policy_differential -- --nocapture`
 3. AWS-backed runs using the existing credentials and guidance in
    `guides/testing.md`, starting with a dedicated
-   `cargo test -p s3-tests --test bucket_policy_differential -- --nocapture`
+   `cargo test -p s3-diff-tests --test bucket_policy -- --nocapture`
 4. optional offline fuzzing with `cargo fuzz run auth_bucket_policy`
 
 ## Success Criteria

@@ -2521,6 +2521,154 @@ fn test_bucket_policy_put_obj_version_tagging_request_object_tag() {
 }
 
 #[test]
+fn test_bucket_policy_put_obj_tagging_request_object_tag_on_pretagged_object() {
+    let _guard = BUCKET_POLICY_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "requesttag-pretagged";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let bootstrap_tags = tagging(vec![tag("security", "bootstrap")]);
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(bootstrap_tags.clone())
+            .send()
+            .await
+            .unwrap();
+
+        let policy = bucket_policy_document(
+            principal,
+            "s3:PutObjectTagging",
+            bucket_wildcard_resource(&bucket),
+            Some(json!({
+                "StringEquals": {
+                    "s3:RequestObjectTag/security": "public"
+                }
+            })),
+        );
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .send()
+            .await
+            .unwrap();
+
+        let stored = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_tag_sets_match_unordered(
+            stored.tag_set(),
+            tagging(vec![tag("security", "public"), tag("foo", "bar")]).tag_set(),
+        );
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_obj_tagging_request_object_tag_single_tag() {
+    let _guard = BUCKET_POLICY_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "requesttag-single";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+
+        let policy = bucket_policy_document(
+            principal,
+            "s3:PutObjectTagging",
+            bucket_wildcard_resource(&bucket),
+            Some(json!({
+                "StringEquals": {
+                    "s3:RequestObjectTag/security": "public"
+                }
+            })),
+        );
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let public_tags = tagging(vec![tag("security", "public")]);
+        alt_client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(public_tags.clone())
+            .send()
+            .await
+            .unwrap();
+
+        let denied = alt_client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(tagging(vec![tag("security", "private")]))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let stored = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_tag_sets_match_unordered(stored.tag_set(), public_tags.tag_set());
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_obj_copy_source() {
     let _guard = BUCKET_POLICY_TEST_GUARD
         .lock()

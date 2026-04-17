@@ -26436,7 +26436,7 @@ mod tests {
     }
 
     #[test]
-    fn bucket_policy_decision_for_put_object_tagging_honors_matching_action() {
+    fn bucket_policy_decision_for_put_object_tagging_honors_inline_request_object_tags() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
         coord
