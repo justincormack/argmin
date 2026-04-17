@@ -3789,6 +3789,7 @@ struct ReclamationTestHooks {
     target: Option<(String, String)>,
     after_multipart_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
     after_multipart_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
+    after_multipart_complete_pre_commit: Option<Arc<dyn Fn() + Send + Sync>>,
     after_object_segments_first_segment: Option<Arc<dyn Fn() + Send + Sync>>,
     after_object_segments_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
 }
@@ -4022,6 +4023,24 @@ fn maybe_run_multipart_delete_metadata_hook(bucket: &str, key: &str) {
         .is_some_and(|(b, k)| b == bucket && k == key)
     {
         if let Some(hook) = hooks.after_multipart_delete_metadata {
+            hook();
+        }
+    }
+}
+
+#[cfg(test)]
+fn maybe_run_multipart_complete_pre_commit_hook(bucket: &str, key: &str) {
+    let hooks = RECLAMATION_TEST_HOOKS
+        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
+        .lock()
+        .unwrap()
+        .clone();
+    if hooks
+        .target
+        .as_ref()
+        .is_some_and(|(b, k)| b == bucket && k == key)
+    {
+        if let Some(hook) = hooks.after_multipart_complete_pre_commit {
             hook();
         }
     }
@@ -13380,6 +13399,12 @@ impl Coordinator {
             })
             .collect();
 
+        drop(meta_pg);
+
+        #[cfg(test)]
+        maybe_run_multipart_complete_pre_commit_hook(bucket.as_str(), key.as_str());
+
+        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
         meta_pg
             .complete_multipart_commit(&upload_id, completion_order, &obj_req, &object_parts)
             .map_err(ServerError::Metadata)?;

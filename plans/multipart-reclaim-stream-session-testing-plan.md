@@ -287,15 +287,14 @@ Current state:
   - failed stream-put and stream-part finalize attempts leaving no visible
     object or committed part, with stale-session scavenging removing the
     abandoned staged shards afterwards
+  - a real `CompleteMultipartUpload` versus `AbortMultipartUpload` interleaving
+    where complete has already snapshotted state but abort wins before the
+    final commit, leaving no visible object or leaked multipart state
 - the helper layer in that module now supports direct inspection of:
   - active stream sessions
   - pending multipart uploads
   - pending reclaim roots
   - committed multipart part segments for shard-cleanup assertions
-- the remaining concrete hook gap for phase 1 is a narrow pause point between
-  `CompleteMultipartUpload`'s validated/snapshotted state and the final storage
-  commit, so the true complete-versus-abort interleaving is still not yet
-  directly expressible
 
 ## Phase 2: Multipart and Session Trace Model
 

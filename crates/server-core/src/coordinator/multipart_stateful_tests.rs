@@ -163,6 +163,42 @@ fn create_basic_multipart_upload(
         .unwrap()
 }
 
+fn create_upload_with_parts(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    parts: &[(u32, &[u8])],
+) -> (UploadId, Vec<CompletePart>) {
+    let create = create_basic_multipart_upload(coord, bucket, key);
+    let complete_parts = parts
+        .iter()
+        .map(|&(part_number, data)| {
+            let result = test_helpers::upload_part(
+                coord,
+                &test_helpers::UploadPartRequest {
+                    upload: multipart_object_request(
+                        bucket,
+                        key,
+                        &create.upload_id,
+                        test_requester(),
+                    ),
+                    part_number,
+                    data,
+                    claimed_checksum: None,
+                    sse_customer: None,
+                },
+            )
+            .unwrap();
+            CompletePart {
+                part_number,
+                etag: result.etag,
+                checksum: None,
+            }
+        })
+        .collect();
+    (create.upload_id, complete_parts)
+}
+
 fn read_all_body(mut body: ReadHandle) -> Result<Vec<u8>, ServerError> {
     let mut out = Vec::new();
     while let Some(chunk) = body.next_chunk(INTERNAL_SEGMENT_SIZE)? {
@@ -372,6 +408,41 @@ fn install_stream_append_race_hooks(
     });
     StreamAppendRaceSync {
         prepared_barrier,
+        _serial_guard: serial,
+        _guard: guard,
+    }
+}
+
+struct MultipartCompletePreCommitRaceSync {
+    reached: Arc<Barrier>,
+    resume: Arc<Barrier>,
+    _serial_guard: MutexGuard<'static, ()>,
+    _guard: ReclamationTestHookGuard,
+}
+
+fn install_multipart_complete_pre_commit_race_hooks(
+    bucket: &str,
+    key: &str,
+) -> MultipartCompletePreCommitRaceSync {
+    let serial = RECLAMATION_TEST_SERIAL
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap();
+    let reached = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let reached_hook = Arc::clone(&reached);
+    let resume_hook = Arc::clone(&resume);
+    let guard = install_reclamation_test_hooks(ReclamationTestHooks {
+        target: Some((bucket.to_string(), key.to_string())),
+        after_multipart_complete_pre_commit: Some(Arc::new(move || {
+            reached_hook.wait();
+            resume_hook.wait();
+        })),
+        ..ReclamationTestHooks::default()
+    });
+    MultipartCompletePreCommitRaceSync {
+        reached,
+        resume,
         _serial_guard: serial,
         _guard: guard,
     }
@@ -961,6 +1032,94 @@ fn completing_multipart_upload_rejects_late_abort_without_state_loss() {
         upload.state,
         UploadState::Completing,
         "{invariant}: late abort should not change the completing terminal state"
+    );
+}
+
+#[test]
+fn abort_wins_over_complete_after_snapshot_without_leaking_multipart_state() {
+    let dir = test_util::tempdir();
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_node = Arc::new(SharedStorageNode::open(dir.path(), &pg_ids).unwrap());
+    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let completer = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let aborter = setup_coordinator_with_shared_storage(storage_node);
+    let invariant =
+        "if abort wins after complete has snapshotted multipart state, the upload is removed without exposing a committed object or leaking multipart state";
+    let state = InvariantHarness::new(&admin);
+
+    admin
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    let (upload_id, parts) = create_upload_with_parts(&admin, "bucket", "key", &[(1, b"part")]);
+
+    let sync = install_multipart_complete_pre_commit_race_hooks("bucket", "key");
+    let upload_id_for_complete = upload_id.clone();
+    let parts_for_complete = parts.clone();
+    let t_complete = std::thread::spawn(move || {
+        completer.complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(
+                "bucket",
+                "key",
+                &upload_id_for_complete,
+                test_requester(),
+            ),
+            parts: &parts_for_complete,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+    });
+
+    sync.reached.wait();
+
+    aborter
+        .abort_multipart_upload(&multipart_object_request(
+            "bucket",
+            "key",
+            &upload_id,
+            test_requester(),
+        ))
+        .unwrap();
+
+    sync.resume.wait();
+    let complete_res = t_complete.join().unwrap();
+    assert!(
+        complete_res.is_err(),
+        "{invariant}: complete should lose once abort deletes the upload, got {complete_res:?}"
+    );
+
+    let err = admin
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request("bucket", "key", None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::ObjectNotFound { .. }),
+        "{invariant}: aborted completion race should not expose a visible object, got {err:?}"
+    );
+
+    let err = admin
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request("bucket", "key", &upload_id, test_requester()),
+            part_number_marker: None,
+            max_parts: 100,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::NoSuchUpload { .. }),
+        "{invariant}: multipart upload should be gone after abort wins, got {err:?}"
+    );
+
+    state.assert_no_pending_multipart_uploads_for("bucket", "key", invariant);
+    state.assert_no_pending_reclaim_roots_for("bucket", "key", invariant);
+    assert!(
+        state
+            .multipart_part_segments("bucket", "key", &upload_id)
+            .is_empty(),
+        "{invariant}: abort winner should leave no committed multipart segment rows"
     );
 }
 
