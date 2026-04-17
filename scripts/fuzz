@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+FUZZ_MANIFEST="${REPO_ROOT}/fuzz/Cargo.toml"
+
+usage() {
+    cat <<'EOF'
+Usage: ./scripts/fuzz [options] [target...]
+
+Run all cargo-fuzz targets, or a selected subset, for a fixed duration each.
+If `fuzz/corpus/<target>` exists, it is passed as the seed corpus.
+
+Options:
+  -t, --time DURATION   Per-target duration. Default: 10m
+  -h, --help            Show this help
+
+Environment:
+  FUZZ_TIME             Default per-target duration if --time is not given
+
+Examples:
+  ./scripts/fuzz
+  ./scripts/fuzz --time 2m
+  ./scripts/fuzz auth_bucket_policy server_http_parsers
+EOF
+}
+
+parse_duration_seconds() {
+    local input="$1"
+    if [[ "$input" =~ ^([0-9]+)([smh]?)$ ]]; then
+        local value="${BASH_REMATCH[1]}"
+        local unit="${BASH_REMATCH[2]}"
+        case "$unit" in
+            ""|"s") printf '%s\n' "$value" ;;
+            "m") printf '%s\n' "$((value * 60))" ;;
+            "h") printf '%s\n' "$((value * 3600))" ;;
+            *) return 1 ;;
+        esac
+        return 0
+    fi
+    return 1
+}
+
+list_targets() {
+    awk -F'"' '
+        /^\[\[bin\]\]/ { in_bin = 1; next }
+        in_bin && /^name = / { print $2; in_bin = 0 }
+    ' "$FUZZ_MANIFEST"
+}
+
+requested_duration="${FUZZ_TIME:-10m}"
+declare -a requested_targets=()
+
+while (($# > 0)); do
+    case "$1" in
+        -t|--time)
+            if (($# < 2)); then
+                echo "missing value for $1" >&2
+                exit 2
+            fi
+            requested_duration="$2"
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            while (($# > 0)); do
+                requested_targets+=("$1")
+                shift
+            done
+            ;;
+        -*)
+            echo "unknown option: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+        *)
+            requested_targets+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if ! duration_seconds="$(parse_duration_seconds "$requested_duration")"; then
+    echo "invalid duration: $requested_duration" >&2
+    echo "expected forms like 30s, 10m, or 1h" >&2
+    exit 2
+fi
+
+mapfile -t all_targets < <(list_targets)
+
+if ((${#all_targets[@]} == 0)); then
+    echo "no fuzz targets found in ${FUZZ_MANIFEST}" >&2
+    exit 1
+fi
+
+declare -a targets=()
+if ((${#requested_targets[@]} == 0)); then
+    targets=("${all_targets[@]}")
+else
+    for requested in "${requested_targets[@]}"; do
+        found=0
+        for target in "${all_targets[@]}"; do
+            if [[ "$target" == "$requested" ]]; then
+                targets+=("$target")
+                found=1
+                break
+            fi
+        done
+        if ((found == 0)); then
+            echo "unknown fuzz target: $requested" >&2
+            echo "available targets:" >&2
+            printf '  %s\n' "${all_targets[@]}" >&2
+            exit 2
+        fi
+    done
+fi
+
+cd "$REPO_ROOT"
+
+echo "Running ${#targets[@]} fuzz target(s) for ${requested_duration} each (${duration_seconds}s)."
+
+for target in "${targets[@]}"; do
+    corpus_dir="${REPO_ROOT}/fuzz/corpus/${target}"
+    cmd=(cargo +nightly fuzz run "$target")
+    if [[ -d "$corpus_dir" ]]; then
+        cmd+=("$corpus_dir")
+    fi
+    cmd+=(-- -max_total_time="${duration_seconds}")
+
+    echo
+    printf '==>'
+    printf ' %q' "${cmd[@]}"
+    printf '\n'
+    "${cmd[@]}"
+done
