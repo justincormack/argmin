@@ -260,7 +260,7 @@ Use this crate for embedded-server behavior that should not require AWS.
 
 Failed AWS-backed runs can leave behind versioned test buckets, delete markers,
 legal holds, or governance-retained objects under the `claude-s3-` prefix. For
-that case, [`scripts/cleanup.sh`](../scripts/cleanup.sh) provides a manual
+that case, [`scripts/cleanup`](../scripts/cleanup) provides a manual
 cleanup pass for leftover test buckets.
 
 It currently:
