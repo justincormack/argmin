@@ -429,6 +429,16 @@ Current state:
 - this already generalizes the existing fixed regressions for:
   - no reclaim work from dropping a read-only lease without durable metadata
   - retry only after the final lease drop while reclaim metadata still exists
+- a second bounded reclaim/lease property now extends that model to two
+  generations on the same key without widening to arbitrary histories:
+  - separate durable reclaim metadata and lease state for an older and newer
+    payload generation
+  - FIFO object-reclaim queue ordering across generations
+  - bucket-delete finalize remaining deduplicated at the bucket level even when
+    multiple generations reclaim successfully
+  - checks after every step that per-generation metadata presence and lease
+    counts stay aligned with the model while worker steps validate the expected
+    queue order
 
 Success criteria:
 
