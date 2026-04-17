@@ -240,8 +240,8 @@ fn authenticate_request_inner<H: HeaderSource + ?Sized>(
         TRACE_TARGET,
         "authenticate_request",
         "method={} path={} has_query={} query_params={} sigv4_query={}",
-        method,
-        path,
+        observability::escaped(method),
+        observability::escaped(path),
         query.has_query(),
         query.param_count(),
         query.has_sigv4_params()
