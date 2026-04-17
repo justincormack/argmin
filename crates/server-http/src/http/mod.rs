@@ -3165,7 +3165,7 @@ impl HttpFrontend {
 
         Ok(StreamingPostContext {
             trace: current_trace_context(),
-            binding: StreamObjectBinding::new(prepared_put.session_id, bucket_name, key),
+            session_id: prepared_put.session_id,
             metadata_blob,
             system_metadata,
             success_status,
@@ -3193,8 +3193,8 @@ impl HttpFrontend {
             TRACE_TARGET,
             "HttpFrontend::finalize_streaming_post_object",
             "bucket={:?} key={:?} bytes={}",
-            ctx.binding.bucket,
-            ctx.binding.key,
+            ctx.bucket(),
+            ctx.key(),
             total_size
         );
         // Validate policy (if present) with the actual uploaded file size.
@@ -3215,13 +3215,13 @@ impl HttpFrontend {
                 .filter(|(k, _)| !k.eq_ignore_ascii_case("key"))
                 .map(|(k, v)| (k.as_str(), v.as_str()))
                 .collect();
-            field_pairs.push(("key", ctx.binding.key.as_str()));
+            field_pairs.push(("key", ctx.key().as_str()));
 
             auth::validate_post_policy(
                 policy_b64,
                 &field_pairs,
                 file_size,
-                ctx.binding.bucket.as_str(),
+                ctx.bucket().as_str(),
                 now,
             )
             .map_err(|e| match &e {
@@ -3253,7 +3253,7 @@ impl HttpFrontend {
 
         let result = self.coordinator.finalize_authorized_stream_put(
             &crate::coordinator::AuthorizedFinalizeStreamPutRequest {
-                session_id: &ctx.binding.session_id,
+                session_id: ctx.session_id(),
                 crc64,
                 total_size,
                 metadata_blob: &ctx.metadata_blob,
@@ -3267,8 +3267,8 @@ impl HttpFrontend {
 
         let mut resp = S3Response::post_object(
             &result,
-            ctx.binding.bucket.as_str(),
-            ctx.binding.key.as_str(),
+            ctx.bucket().as_str(),
+            ctx.key().as_str(),
             ctx.success_status,
             ctx.success_redirect.as_deref(),
             ctx.response_location.as_deref(),
@@ -3289,15 +3289,15 @@ impl HttpFrontend {
             TRACE_TARGET,
             "HttpFrontend::streaming_append_post_segment",
             "bucket={:?} key={:?} segment_index={} bytes={}",
-            ctx.binding.bucket,
-            ctx.binding.key,
+            ctx.bucket(),
+            ctx.key(),
             segment_index,
             data.len()
         );
         self.coordinator.append_stream_put_data(
             ctx.authorized_write.bucket_typed(),
             ctx.authorized_write.key_typed(),
-            &ctx.binding.session_id,
+            ctx.session_id(),
             segment_index,
             data,
             ctx.sse_customer.as_ref(),
@@ -3311,14 +3311,12 @@ impl HttpFrontend {
             TRACE_TARGET,
             "HttpFrontend::abort_streaming_post_object",
             "bucket={:?} key={:?}",
-            ctx.binding.bucket,
-            ctx.binding.key
+            ctx.bucket(),
+            ctx.key()
         );
-        let _ = self.coordinator.abort_stream_put_session(
-            &ctx.binding.bucket,
-            &ctx.binding.key,
-            &ctx.binding.session_id,
-        );
+        let _ =
+            self.coordinator
+                .abort_stream_put_session(ctx.bucket(), ctx.key(), ctx.session_id());
     }
 
     fn merged_streaming_put_metadata_blob(
@@ -3946,7 +3944,7 @@ struct StreamingPutContext {
 /// Context for an in-progress streaming `PostObject`.
 struct StreamingPostContext {
     trace: observability::TraceContext,
-    binding: StreamObjectBinding,
+    session_id: SessionId,
     metadata_blob: crate::metadata_blob::MetadataBlob,
     system_metadata: SystemMetadata,
     success_status: u16,
@@ -4026,6 +4024,20 @@ impl StreamPartBinding {
 }
 
 impl StreamingPutContext {
+    fn bucket(&self) -> &BucketName {
+        self.authorized_write.bucket_typed()
+    }
+
+    fn key(&self) -> &ObjectKey {
+        self.authorized_write.key_typed()
+    }
+}
+
+impl StreamingPostContext {
+    fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
     fn bucket(&self) -> &BucketName {
         self.authorized_write.bucket_typed()
     }

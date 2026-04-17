@@ -235,6 +235,21 @@ Success criteria:
 - later invariant/stateful tests can be written against clear boundaries rather
   than depending on broad public field access
 
+Current state:
+
+- complete
+- `server-http` streaming helper methods are now internal rather than part of a
+  wider helper surface
+- streaming session/binding/checksum helper types are no longer public field
+  bags
+- `StreamingPutContext` and `StreamingPostContext` no longer retain duplicated
+  object identity or unused raw request provenance once authorization has
+  completed
+- async/blocking streaming paths now mostly access object/session/upload state
+  through narrow helper methods instead of open struct layout
+- the typed storage and coordinator stream-session boundaries were left intact,
+  as intended by this stage
+
 ## Phase 1: Consolidate Invariants and Deterministic Hook Tests
 
 Deliver:
