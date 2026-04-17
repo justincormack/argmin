@@ -908,7 +908,7 @@ Current state:
 
 ### Phase 8: Request-Context Exactness Matrix
 
-Status: planned
+Status: complete
 
 Add a narrow request-context matrix shared across the write/copy surfaces for:
 
@@ -938,6 +938,32 @@ Acceptance criteria:
   rediscovered only through AWS-backed tests
 - the recent absent/present `x-amz-acl` and explicit `x-amz-grant-*` baselines
   have corresponding model cases
+
+Current state:
+
+- Added a bounded Phase 8 model harness in
+  `crates/server-core/src/coordinator/authz_model_tests.rs` covering
+  `PutObject`, `CreateMultipartUpload`, `CopyObject`, `PutObjectAcl`, and
+  `PutObjectVersionAcl`.
+- The local matrix now pins absent versus explicit `x-amz-acl=private` for all
+  five request surfaces, so policy-visible ACL headers are no longer allowed to
+  collapse into “default private behavior”.
+- The local matrix also keeps the `x-amz-grant-full-control`,
+  `x-amz-grant-read-acp`, `x-amz-grant-write`, and
+  `x-amz-grant-write-acp` headers distinct on `PutObject`, instead of treating
+  them as a generic “explicit grants present” state.
+- `CopyObject` tagging replacement is now modeled separately from plain copy,
+  and the model pins the existing rule that request object tags require the
+  tagging policy half as well as `s3:PutObject`.
+- The implementation under test was tightened so `PutObject`,
+  `CreateMultipartUpload`, and `CopyObject` no longer synthesize policy-visible
+  ACL headers from structured ACL input when those headers were absent on the
+  request; the authz path now uses only the explicit request context after
+  validating it against the parsed ACL input.
+- AWS-facing coverage in `crates/s3-tests/tests/bucket_policy.rs` now also
+  includes the missing versioned ACL absent/present cases for `Null` and
+  `StringNotEquals` on `s3:x-amz-acl`, in addition to the already-existing
+  current-object ACL and multipart/upload-side exactness coverage.
 
 ### Phase 9: Bucket Action Matrix
 

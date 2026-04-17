@@ -2361,6 +2361,78 @@ impl PutObjectWriteAcl<'_> {
     }
 }
 
+fn authorization_policy_context_for_put_object_write_acl<'a>(
+    operation: &str,
+    acl: &PutObjectWriteAcl<'_>,
+    policy_context: PutObjectPolicyContext<'a>,
+) -> Result<PutObjectPolicyContext<'a>, ServerError> {
+    match acl {
+        PutObjectWriteAcl::None => {
+            if policy_context.canned_acl.is_some() {
+                return Err(ServerError::InvalidArgument {
+                    reason: format!("{operation} policy context cannot include canned ACL"),
+                });
+            }
+            if parse_acl_grants_from_policy_context(policy_context)?.is_some() {
+                return Err(ServerError::InvalidArgument {
+                    reason: format!("{operation} policy context cannot include grant headers"),
+                });
+            }
+            Ok(PutObjectPolicyContext::default())
+        }
+        PutObjectWriteAcl::Canned(acl) => {
+            if policy_context.grant_read.is_some()
+                || policy_context.grant_write.is_some()
+                || policy_context.grant_read_acp.is_some()
+                || policy_context.grant_write_acp.is_some()
+                || policy_context.grant_full_control.is_some()
+            {
+                return Err(ServerError::InvalidArgument {
+                    reason: format!(
+                        "{operation} canned ACL policy context cannot include grant headers"
+                    ),
+                });
+            }
+            let expected_canned_acl = acl.policy_condition_value();
+            if policy_context.canned_acl.is_some()
+                && policy_context.canned_acl != expected_canned_acl
+            {
+                return Err(ServerError::InvalidArgument {
+                    reason: format!("{operation} canned ACL policy context mismatch"),
+                });
+            }
+            Ok(
+                PutObjectPolicyContext::default()
+                    .with_default_canned_acl(policy_context.canned_acl),
+            )
+        }
+        PutObjectWriteAcl::Grants(acl_grants) => {
+            if policy_context.canned_acl.is_some() {
+                return Err(ServerError::InvalidArgument {
+                    reason: format!("{operation} grant policy context cannot include canned ACL"),
+                });
+            }
+            let header_grants = parse_acl_grants_from_policy_context(policy_context)?;
+            if let Some(header_grants) = header_grants {
+                if &header_grants != acl_grants {
+                    return Err(ServerError::InvalidArgument {
+                        reason: format!("{operation} grant policy context mismatch"),
+                    });
+                }
+                Ok(PutObjectPolicyContext::default().with_acl_grant_headers(
+                    policy_context.grant_read,
+                    policy_context.grant_write,
+                    policy_context.grant_read_acp,
+                    policy_context.grant_write_acp,
+                    policy_context.grant_full_control,
+                ))
+            } else {
+                Ok(PutObjectPolicyContext::default())
+            }
+        }
+    }
+}
+
 /// Parsed bucket ACL value relevant to bucket ACL and ownership-control rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BucketAcl {
@@ -2676,7 +2748,8 @@ impl<'a> PutObjectAclRequest<'a> {
                         reason: "PutObjectAcl canned ACL policy context mismatch".to_string(),
                     });
                 }
-                Ok(PutObjectPolicyContext::default().with_default_canned_acl(expected_canned_acl))
+                Ok(PutObjectPolicyContext::default()
+                    .with_default_canned_acl(policy_context.canned_acl))
             }
             PutObjectAclInput::Grants(acl_grants) => {
                 if policy_context.canned_acl.is_some() {
@@ -3282,6 +3355,14 @@ impl<'a> UploadPartCopyRequest<'a> {
 }
 
 impl<'a> PutObjectRequest<'a> {
+    fn authorization_policy_context(&self) -> Result<PutObjectPolicyContext<'a>, ServerError> {
+        authorization_policy_context_for_put_object_write_acl(
+            "PutObject",
+            &self.acl,
+            self.policy_context,
+        )
+    }
+
     fn expected_bucket_owner(&self) -> Option<&str> {
         self.object.expected_bucket_owner()
     }
@@ -3334,29 +3415,35 @@ impl<'a> BeginStreamPartRequest<'a> {
 }
 
 impl<'a> PutObjectRequest<'a> {
-    fn effective_policy_context(&self) -> PutObjectPolicyContext<'a> {
-        let policy_context = self.encryption.with_policy_context(
-            self.policy_context
-                .with_default_canned_acl(self.acl.policy_condition_value()),
-        );
+    fn effective_policy_context(&self) -> Result<PutObjectPolicyContext<'a>, ServerError> {
+        let policy_context = self
+            .encryption
+            .with_policy_context(self.authorization_policy_context()?);
         if policy_context.request_object_tags_xml.is_some() {
-            policy_context
+            Ok(policy_context)
         } else {
-            policy_context.with_request_object_tags_xml(self.tags)
+            Ok(policy_context.with_request_object_tags_xml(self.tags))
         }
     }
 }
 
 impl<'a> CreateMultipartUploadRequest<'a> {
-    fn effective_policy_context(&self) -> PutObjectPolicyContext<'a> {
-        let policy_context = self.encryption.with_policy_context(
-            self.policy_context
-                .with_default_canned_acl(self.acl.policy_condition_value()),
-        );
+    fn authorization_policy_context(&self) -> Result<PutObjectPolicyContext<'a>, ServerError> {
+        authorization_policy_context_for_put_object_write_acl(
+            "CreateMultipartUpload",
+            &self.acl,
+            self.policy_context,
+        )
+    }
+
+    fn effective_policy_context(&self) -> Result<PutObjectPolicyContext<'a>, ServerError> {
+        let policy_context = self
+            .encryption
+            .with_policy_context(self.authorization_policy_context()?);
         if policy_context.request_object_tags_xml.is_some() {
-            policy_context
+            Ok(policy_context)
         } else {
-            policy_context.with_request_object_tags_xml(self.tags)
+            Ok(policy_context.with_request_object_tags_xml(self.tags))
         }
     }
 }
@@ -8378,7 +8465,7 @@ impl Coordinator {
                 req.expected_bucket_owner(),
             ),
             acl: req.acl.clone(),
-            policy_context: req.effective_policy_context(),
+            policy_context: req.effective_policy_context()?,
             object_lock: req.object_lock,
             tags: req.tags,
             encryption: req.encryption,
@@ -13896,7 +13983,10 @@ mod tests {
         };
 
         assert_eq!(
-            request.effective_policy_context().managed_encryption,
+            request
+                .effective_policy_context()
+                .unwrap()
+                .managed_encryption,
             Some(ManagedEncryptionAlgorithm::Aes256)
         );
     }
@@ -13920,7 +14010,7 @@ mod tests {
             encryption: WriteEncryptionRequest::sse_customer(&sse_customer),
         };
 
-        let policy_context = request.effective_policy_context();
+        let policy_context = request.effective_policy_context().unwrap();
         assert_eq!(policy_context.managed_encryption, None);
         assert_eq!(
             policy_context.sse_customer_algorithm,
@@ -13945,7 +14035,10 @@ mod tests {
         };
 
         assert_eq!(
-            request.effective_policy_context().managed_encryption,
+            request
+                .effective_policy_context()
+                .unwrap()
+                .managed_encryption,
             Some(ManagedEncryptionAlgorithm::Aes256)
         );
     }
@@ -26223,7 +26316,8 @@ mod tests {
             &coord,
             &PutObjectRequest {
                 encryption: WriteEncryptionRequest::none(),
-                policy_context: PutObjectPolicyContext::default(),
+                policy_context: PutObjectPolicyContext::default()
+                    .with_default_canned_acl(PutObjectAcl::PublicRead.policy_condition_value()),
                 object_lock: ObjectLockState::default(),
                 object: object_request_with_expected_owner(
                     "bucket",

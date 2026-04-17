@@ -3150,6 +3150,11 @@ impl Coordinator {
         let src_version_id = req.source.version_id;
         let requester = &req.destination.bucket.requester;
         let acl = req.acl.clone();
+        let acl_policy_context = authorization_policy_context_for_put_object_write_acl(
+            "CopyObject",
+            &acl,
+            req.policy_context,
+        )?;
         let copy_source_policy_value = req.source.version_id.map_or_else(
             || format!("{}/{}", req.source.bucket, req.source.key),
             |version_id| {
@@ -3160,7 +3165,6 @@ impl Coordinator {
             },
         );
         let metadata_directive = req.directive.policy_condition_value();
-        let canned_acl = acl.policy_condition_value();
         let request_object_tags_xml = match &req.tagging {
             TaggingDirective::Copy => None,
             TaggingDirective::Replace(tags) => *tags,
@@ -3168,14 +3172,14 @@ impl Coordinator {
         let copy_policy_context = PutObjectPolicyContext::new(
             Some(copy_source_policy_value.as_str()),
             metadata_directive,
-            canned_acl,
+            acl_policy_context.canned_acl,
         )
         .with_acl_grant_headers(
-            req.policy_context.grant_read,
-            req.policy_context.grant_write,
-            req.policy_context.grant_read_acp,
-            req.policy_context.grant_write_acp,
-            req.policy_context.grant_full_control,
+            acl_policy_context.grant_read,
+            acl_policy_context.grant_write,
+            acl_policy_context.grant_read_acp,
+            acl_policy_context.grant_write_acp,
+            acl_policy_context.grant_full_control,
         )
         .with_request_object_tags_xml(request_object_tags_xml);
         let dst_policy_context = req
@@ -3214,7 +3218,7 @@ impl Coordinator {
         req: &CreateMultipartUploadRequest<'_>,
     ) -> Result<AuthorizedCreateMultipartUpload, ServerError> {
         let key = req.object.key();
-        let policy_context = req.effective_policy_context();
+        let policy_context = req.effective_policy_context()?;
         self.with_bucket_write_reservation_for(&req.object, |bucket_info| {
             if req.object.requester().is_anonymous() {
                 return Err(ServerError::AccessDenied);

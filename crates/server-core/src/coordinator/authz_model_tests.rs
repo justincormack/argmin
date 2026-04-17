@@ -5250,28 +5250,28 @@ mod phase6_harness {
                 ));
             }
             CopyPolicyShape::AllowWithGrantReadCondition => {
-                let grant_read = expected_copy_grant_header(fixtures);
+                let grant_read = copy_grant_read_header(fixtures, scenario.context);
                 let grant_read_json = phase6_json_string(grant_read);
                 statements.push(format!(
                     r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringEquals":{{"s3:x-amz-grant-read":{grant_read_json}}}}}}}"#
                 ));
             }
             CopyPolicyShape::AllowWithGrantReadAcpCondition => {
-                let grant_read_acp = expected_copy_grant_header(fixtures);
+                let grant_read_acp = copy_grant_read_acp_header(fixtures, scenario.context);
                 let grant_read_acp_json = phase6_json_string(grant_read_acp);
                 statements.push(format!(
                     r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringEquals":{{"s3:x-amz-grant-read-acp":{grant_read_acp_json}}}}}}}"#
                 ));
             }
             CopyPolicyShape::AllowWithGrantWriteCondition => {
-                let grant_write = expected_copy_grant_header(fixtures);
+                let grant_write = copy_grant_write_header(fixtures, scenario.context);
                 let grant_write_json = phase6_json_string(grant_write);
                 statements.push(format!(
                     r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringEquals":{{"s3:x-amz-grant-write":{grant_write_json}}}}}}}"#
                 ));
             }
             CopyPolicyShape::AllowWithGrantWriteAcpCondition => {
-                let grant_write_acp = expected_copy_grant_header(fixtures);
+                let grant_write_acp = copy_grant_write_acp_header(fixtures, scenario.context);
                 let grant_write_acp_json = phase6_json_string(grant_write_acp);
                 statements.push(format!(
                     r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObject","Resource":"{object_resource}","Condition":{{"StringEquals":{{"s3:x-amz-grant-write-acp":{grant_write_acp_json}}}}}}}"#
@@ -5529,16 +5529,7 @@ mod phase6_harness {
             CopyAclShape::None => PutObjectAcl::None.into(),
             CopyAclShape::CannedPrivate => PutObjectAcl::Private.into(),
             CopyAclShape::CannedPublicRead => PutObjectAcl::PublicRead.into(),
-            CopyAclShape::GrantRead => PutObjectWriteAcl::Grants(AclGrants::new(vec![
-                AclGrant::new(
-                    AclGrantee::CanonicalUser(fixtures.owner_user.canonical_user_id().clone()),
-                    AclPermission::FullControl,
-                ),
-                AclGrant::new(
-                    AclGrantee::CanonicalUser(fixtures.cross_account.canonical_user_id().clone()),
-                    AclPermission::Read,
-                ),
-            ])),
+            CopyAclShape::GrantRead => phase6_acl_grants(fixtures, AclPermission::Read),
             CopyAclShape::GrantReadAcp => phase6_acl_grants(fixtures, AclPermission::ReadAcp),
             CopyAclShape::GrantWrite => phase6_acl_grants(fixtures, AclPermission::Write),
             CopyAclShape::GrantWriteAcp => phase6_acl_grants(fixtures, AclPermission::WriteAcp),
@@ -5553,26 +5544,28 @@ mod phase6_harness {
             .with_acl_grant_headers(
                 match scenario.acl {
                     CopyAclShape::GrantRead => {
-                        Some(copy_grant_read_header(fixtures, scenario.context))
+                        Some(copy_grant_read_header(fixtures, CopyContextShape::Exact))
                     }
                     _ => None,
                 },
                 match scenario.acl {
                     CopyAclShape::GrantWrite => {
-                        Some(copy_grant_write_header(fixtures, scenario.context))
+                        Some(copy_grant_write_header(fixtures, CopyContextShape::Exact))
                     }
                     _ => None,
                 },
                 match scenario.acl {
-                    CopyAclShape::GrantReadAcp => {
-                        Some(copy_grant_read_acp_header(fixtures, scenario.context))
-                    }
+                    CopyAclShape::GrantReadAcp => Some(copy_grant_read_acp_header(
+                        fixtures,
+                        CopyContextShape::Exact,
+                    )),
                     _ => None,
                 },
                 match scenario.acl {
-                    CopyAclShape::GrantWriteAcp => {
-                        Some(copy_grant_write_acp_header(fixtures, scenario.context))
-                    }
+                    CopyAclShape::GrantWriteAcp => Some(copy_grant_write_acp_header(
+                        fixtures,
+                        CopyContextShape::Exact,
+                    )),
                     _ => None,
                 },
                 None,
@@ -5634,12 +5627,6 @@ mod phase6_harness {
         )
     }
 
-    fn expected_copy_grant_header(fixtures: &IdentityFixtures) -> &'static str {
-        Box::leak(
-            format!(r#"id="{}""#, fixtures.cross_account.canonical_user_id()).into_boxed_str(),
-        )
-    }
-
     fn phase6_grant_header(
         context: CopyContextShape,
         mismatch: CopyContextShape,
@@ -5656,16 +5643,10 @@ mod phase6_harness {
         fixtures: &IdentityFixtures,
         permission: AclPermission,
     ) -> PutObjectWriteAcl<'static> {
-        PutObjectWriteAcl::Grants(AclGrants::new(vec![
-            AclGrant::new(
-                AclGrantee::CanonicalUser(fixtures.owner_user.canonical_user_id().clone()),
-                AclPermission::FullControl,
-            ),
-            AclGrant::new(
-                AclGrantee::CanonicalUser(fixtures.cross_account.canonical_user_id().clone()),
-                permission,
-            ),
-        ]))
+        PutObjectWriteAcl::Grants(AclGrants::new(vec![AclGrant::new(
+            AclGrantee::CanonicalUser(fixtures.cross_account.canonical_user_id().clone()),
+            permission,
+        )]))
     }
 
     fn phase6_json_string(value: &str) -> String {
@@ -7446,6 +7427,434 @@ mod phase7a_harness {
     }
 }
 
+mod phase8_harness {
+    use super::harness::{setup_coordinator, IdentityFixtures};
+    use super::*;
+
+    pub(super) const PHASE8_SRC_KEY: &str = "src";
+    pub(super) const PHASE8_DST_KEY: &str = "dst";
+    pub(super) const PHASE8_TAGS_XML: &str =
+        "<Tagging><TagSet><Tag><Key>env</Key><Value>phase8</Value></Tag></TagSet></Tagging>";
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum GrantHeaderKind {
+        FullControl,
+        ReadAcp,
+        Write,
+        WriteAcp,
+    }
+
+    impl GrantHeaderKind {
+        pub(super) const ALL: [Self; 4] = [
+            Self::FullControl,
+            Self::ReadAcp,
+            Self::Write,
+            Self::WriteAcp,
+        ];
+
+        pub(super) const fn policy_key(self) -> &'static str {
+            match self {
+                Self::FullControl => "s3:x-amz-grant-full-control",
+                Self::ReadAcp => "s3:x-amz-grant-read-acp",
+                Self::Write => "s3:x-amz-grant-write",
+                Self::WriteAcp => "s3:x-amz-grant-write-acp",
+            }
+        }
+
+        pub(super) const fn permission(self) -> AclPermission {
+            match self {
+                Self::FullControl => AclPermission::FullControl,
+                Self::ReadAcp => AclPermission::ReadAcp,
+                Self::Write => AclPermission::Write,
+                Self::WriteAcp => AclPermission::WriteAcp,
+            }
+        }
+
+        pub(super) const fn alternate(self) -> Self {
+            match self {
+                Self::FullControl => Self::ReadAcp,
+                Self::ReadAcp => Self::Write,
+                Self::Write => Self::WriteAcp,
+                Self::WriteAcp => Self::FullControl,
+            }
+        }
+
+        pub(super) const fn with_policy_context(
+            self,
+            mut policy_context: PutObjectPolicyContext<'static>,
+            value: Option<&'static str>,
+        ) -> PutObjectPolicyContext<'static> {
+            match self {
+                Self::FullControl => {
+                    policy_context.grant_full_control = value;
+                }
+                Self::ReadAcp => {
+                    policy_context.grant_read_acp = value;
+                }
+                Self::Write => {
+                    policy_context.grant_write = value;
+                }
+                Self::WriteAcp => {
+                    policy_context.grant_write_acp = value;
+                }
+            }
+            policy_context
+        }
+    }
+
+    pub(super) struct Phase8Harness {
+        _tmp: test_util::TempDir,
+        pub(super) coord: Coordinator,
+        pub(super) fixtures: IdentityFixtures,
+    }
+
+    impl Phase8Harness {
+        pub(super) fn new() -> Self {
+            let tmp = test_util::tempdir();
+            let coord = setup_coordinator(tmp.path());
+            let fixtures = IdentityFixtures::new();
+            Self {
+                _tmp: tmp,
+                coord,
+                fixtures,
+            }
+        }
+    }
+
+    pub(super) fn create_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+    ) -> Result<(), ServerError> {
+        let owner = OwnerIdentity::new(
+            fixtures.owner_user.principal(),
+            fixtures.owner_user.canonical_user_id().clone(),
+        );
+        let grants = Coordinator::bucket_acl_grants_from_flags(&owner, false, false);
+        coord
+            .create_bucket_with_acl_grants(&owner, bucket, grants, false)
+            .map(|_| ())
+    }
+
+    pub(super) fn put_private_acl_policy(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        action: &str,
+    ) -> Result<(), ServerError> {
+        let policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"{action}","Resource":"arn:aws:s3:::{bucket}/*","Condition":{{"StringEquals":{{"s3:x-amz-acl":"private"}}}}}}]}}"#,
+            fixtures.cross_account.principal()
+        );
+        coord.put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: BucketRequest::new(
+                trusted_bucket_name(bucket),
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            config: &policy,
+            confirm_remove_self_bucket_access: false,
+        })
+    }
+
+    pub(super) fn put_grant_header_policy(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        action: &str,
+        header_kind: GrantHeaderKind,
+        header_value: &str,
+    ) -> Result<(), ServerError> {
+        let escaped_header_value = header_value.replace('\\', "\\\\").replace('"', "\\\"");
+        let policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"{action}","Resource":"arn:aws:s3:::{bucket}/*","Condition":{{"StringEquals":{{"{}":"{}"}}}}}}]}}"#,
+            fixtures.cross_account.principal(),
+            header_kind.policy_key(),
+            escaped_header_value
+        );
+        coord.put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: BucketRequest::new(
+                trusted_bucket_name(bucket),
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            config: &policy,
+            confirm_remove_self_bucket_access: false,
+        })
+    }
+
+    pub(super) fn put_copy_tagging_policy(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+    ) -> Result<(), ServerError> {
+        let policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/{PHASE8_SRC_KEY}"}},{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":["s3:PutObject","s3:PutObjectTagging"],"Resource":"arn:aws:s3:::{bucket}/{PHASE8_DST_KEY}","Condition":{{"StringEquals":{{"s3:RequestObjectTag/env":"phase8"}}}}}}]}}"#,
+            fixtures.cross_account.principal(),
+            fixtures.cross_account.principal()
+        );
+        coord.put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: BucketRequest::new(
+                trusted_bucket_name(bucket),
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            config: &policy,
+            confirm_remove_self_bucket_access: false,
+        })
+    }
+
+    pub(super) fn put_copy_private_acl_policy(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+    ) -> Result<(), ServerError> {
+        let policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/{PHASE8_SRC_KEY}"}},{{"Effect":"Allow","Principal":{{"AWS":"{}"}},"Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/{PHASE8_DST_KEY}","Condition":{{"StringEquals":{{"s3:x-amz-acl":"private"}}}}}}]}}"#,
+            fixtures.cross_account.principal(),
+            fixtures.cross_account.principal()
+        );
+        coord.put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: BucketRequest::new(
+                trusted_bucket_name(bucket),
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            config: &policy,
+            confirm_remove_self_bucket_access: false,
+        })
+    }
+
+    pub(super) fn cross_account_requester(fixtures: &IdentityFixtures) -> Requester {
+        Requester::authenticated(fixtures.cross_account.clone())
+    }
+
+    pub(super) fn cross_account_grant_header_value(fixtures: &IdentityFixtures) -> &'static str {
+        Box::leak(
+            format!(r#"id="{}""#, fixtures.cross_account.canonical_user_id()).into_boxed_str(),
+        )
+    }
+
+    pub(super) fn put_object_private(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        requester: Requester,
+        policy_context: PutObjectPolicyContext<'static>,
+    ) -> Result<(), ServerError> {
+        test_helpers::put_object(
+            coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context,
+                object_lock: ObjectLockState::default(),
+                object: ObjectRequest::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(key),
+                    requester,
+                    None,
+                ),
+                data: b"phase-8",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: PutObjectAcl::Private.into(),
+            },
+        )
+        .map(|_| ())
+    }
+
+    pub(super) fn create_multipart_upload_private(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        requester: Requester,
+        policy_context: PutObjectPolicyContext<'static>,
+    ) -> Result<(), ServerError> {
+        let created = coord.create_multipart_upload(&CreateMultipartUploadRequest {
+            object: ObjectRequest::new(
+                trusted_bucket_name(bucket),
+                trusted_object_key(key),
+                requester.clone(),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: PutObjectAcl::Private.into(),
+            policy_context,
+            object_lock: ObjectLockState::default(),
+            encryption: WriteEncryptionRequest::none(),
+        })?;
+        coord.abort_multipart_upload(&MultipartObjectRequest::new(
+            trusted_bucket_name(bucket),
+            trusted_object_key(key),
+            created.upload_id,
+            requester,
+            None,
+        ))
+    }
+
+    pub(super) fn put_object_grant(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        key: &str,
+        requester: Requester,
+        grant: GrantHeaderKind,
+        policy_context: PutObjectPolicyContext<'static>,
+    ) -> Result<(), ServerError> {
+        test_helpers::put_object(
+            coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context,
+                object_lock: ObjectLockState::default(),
+                object: ObjectRequest::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(key),
+                    requester,
+                    None,
+                ),
+                data: b"phase-8-grant",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: PutObjectWriteAcl::Grants(AclGrants::new(vec![AclGrant::new(
+                    AclGrantee::CanonicalUser(fixtures.cross_account.canonical_user_id().clone()),
+                    grant.permission(),
+                )])),
+            },
+        )
+        .map(|_| ())
+    }
+
+    pub(super) fn put_acl_private(
+        coord: &Coordinator,
+        bucket: &str,
+        key: &str,
+        version_id: Option<VersionId>,
+        requester: Requester,
+        policy_context: PutObjectPolicyContext<'static>,
+    ) -> Result<(), ServerError> {
+        coord
+            .put_object_acl(&PutObjectAclRequest {
+                object: ObjectVersionRequest::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(key),
+                    version_id,
+                    requester,
+                    None,
+                ),
+                acl: PutObjectAclInput::Canned(PutObjectAcl::Private),
+                policy_context,
+            })
+            .map(|_| ())
+    }
+
+    pub(super) fn copy_object_private(
+        coord: &Coordinator,
+        bucket: &str,
+        requester: Requester,
+        policy_context: PutObjectPolicyContext<'static>,
+    ) -> Result<(), ServerError> {
+        coord
+            .copy_object(&CopyObjectRequest {
+                source: CopySource::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(PHASE8_SRC_KEY),
+                    None,
+                    NO_READ,
+                    None,
+                ),
+                destination: ObjectRequest::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(PHASE8_DST_KEY),
+                    requester,
+                    None,
+                ),
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: TaggingDirective::Copy,
+                acl: PutObjectAcl::Private.into(),
+                policy_context,
+                source_sse_customer: None,
+                destination_encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+            })
+            .map(|_| ())
+    }
+
+    pub(super) fn copy_object_replace_tags(
+        coord: &Coordinator,
+        bucket: &str,
+        requester: Requester,
+        replace_tags: bool,
+    ) -> Result<(), ServerError> {
+        coord
+            .copy_object(&CopyObjectRequest {
+                source: CopySource::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(PHASE8_SRC_KEY),
+                    None,
+                    NO_READ,
+                    None,
+                ),
+                destination: ObjectRequest::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(PHASE8_DST_KEY),
+                    requester,
+                    None,
+                ),
+                dst_condition: NO_WRITE,
+                directive: MetadataDirective::Copy,
+                tagging: if replace_tags {
+                    TaggingDirective::Replace(Some(PHASE8_TAGS_XML))
+                } else {
+                    TaggingDirective::Copy
+                },
+                acl: PutObjectWriteAcl::None,
+                policy_context: PutObjectPolicyContext::default(),
+                source_sse_customer: None,
+                destination_encryption: WriteEncryptionRequest::none(),
+                object_lock: ObjectLockState::default(),
+            })
+            .map(|_| ())
+    }
+
+    pub(super) fn owner_put_source_object(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        key: &str,
+    ) -> Result<VersionId, ServerError> {
+        test_helpers::put_object(
+            coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: ObjectRequest::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(key),
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                data: b"phase-8-owner",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: PutObjectWriteAcl::None,
+            },
+        )
+        .map(|put| put.version_id)
+    }
+}
+
 use harness::{bucket_name_for, to_existing_outcome, to_missing_outcome, MatrixHarness};
 use model::{Action, MissingScenario, Scenario};
 use phase4_harness::{
@@ -7467,6 +7876,7 @@ use phase7a_harness::{
     phase7a_management_bucket_name_for, phase7a_write_bucket_name_for, Phase7aHarness,
 };
 use phase7a_model::{MultipartManagementScenario, MultipartWriteScenario};
+use phase8_harness::Phase8Harness;
 
 #[test]
 fn authz_model_phase1_get_object_existing_matrix() {
@@ -7710,6 +8120,292 @@ fn authz_model_phase7a_multipart_management_matrix() {
             scenario.expected
         );
     }
+}
+
+#[test]
+fn authz_model_phase8_put_object_private_acl_context_exactness() {
+    let harness = Phase8Harness::new();
+    let bucket = "authz-phase8-put-object";
+    phase8_harness::create_bucket(&harness.coord, &harness.fixtures, bucket).unwrap();
+    phase8_harness::put_private_acl_policy(
+        &harness.coord,
+        &harness.fixtures,
+        bucket,
+        "s3:PutObject",
+    )
+    .unwrap();
+
+    let requester = phase8_harness::cross_account_requester(&harness.fixtures);
+    let absent = phase8_harness::put_object_private(
+        &harness.coord,
+        bucket,
+        "absent",
+        requester.clone(),
+        PutObjectPolicyContext::default(),
+    );
+    assert!(matches!(absent, Err(ServerError::AccessDenied)));
+
+    let exact = phase8_harness::put_object_private(
+        &harness.coord,
+        bucket,
+        "exact",
+        requester,
+        PutObjectPolicyContext::default().with_default_canned_acl(Some("private")),
+    );
+    assert!(
+        exact.is_ok(),
+        "expected exact private ACL context to allow PutObject: {exact:?}"
+    );
+}
+
+#[test]
+fn authz_model_phase8_create_multipart_upload_private_acl_context_exactness() {
+    let harness = Phase8Harness::new();
+    let bucket = "authz-phase8-mpu";
+    phase8_harness::create_bucket(&harness.coord, &harness.fixtures, bucket).unwrap();
+    phase8_harness::put_private_acl_policy(
+        &harness.coord,
+        &harness.fixtures,
+        bucket,
+        "s3:PutObject",
+    )
+    .unwrap();
+
+    let requester = phase8_harness::cross_account_requester(&harness.fixtures);
+    let absent = phase8_harness::create_multipart_upload_private(
+        &harness.coord,
+        bucket,
+        "absent",
+        requester.clone(),
+        PutObjectPolicyContext::default(),
+    );
+    assert!(matches!(absent, Err(ServerError::AccessDenied)));
+
+    let exact = phase8_harness::create_multipart_upload_private(
+        &harness.coord,
+        bucket,
+        "exact",
+        requester,
+        PutObjectPolicyContext::default().with_default_canned_acl(Some("private")),
+    );
+    assert!(
+        exact.is_ok(),
+        "expected exact private ACL context to allow CreateMultipartUpload: {exact:?}"
+    );
+}
+
+#[test]
+fn authz_model_phase8_put_object_acl_private_acl_context_exactness() {
+    let harness = Phase8Harness::new();
+    let bucket = "authz-phase8-put-acl";
+    let key = "target";
+    phase8_harness::create_bucket(&harness.coord, &harness.fixtures, bucket).unwrap();
+    phase8_harness::put_private_acl_policy(
+        &harness.coord,
+        &harness.fixtures,
+        bucket,
+        "s3:PutObjectAcl",
+    )
+    .unwrap();
+    phase8_harness::owner_put_source_object(&harness.coord, &harness.fixtures, bucket, key)
+        .unwrap();
+
+    let requester = phase8_harness::cross_account_requester(&harness.fixtures);
+    let absent = phase8_harness::put_acl_private(
+        &harness.coord,
+        bucket,
+        key,
+        None,
+        requester.clone(),
+        PutObjectPolicyContext::default(),
+    );
+    assert!(matches!(absent, Err(ServerError::AccessDenied)));
+
+    let exact = phase8_harness::put_acl_private(
+        &harness.coord,
+        bucket,
+        key,
+        None,
+        requester,
+        PutObjectPolicyContext::default().with_default_canned_acl(Some("private")),
+    );
+    assert!(
+        exact.is_ok(),
+        "expected exact private ACL context to allow PutObjectAcl: {exact:?}"
+    );
+}
+
+#[test]
+fn authz_model_phase8_put_object_version_acl_private_acl_context_exactness() {
+    let harness = Phase8Harness::new();
+    let bucket = "authz-phase8-put-version-acl";
+    let key = "target";
+    phase8_harness::create_bucket(&harness.coord, &harness.fixtures, bucket).unwrap();
+    harness
+        .coord
+        .put_bucket_versioning(&PutBucketVersioningRequest {
+            bucket: BucketRequest::new(
+                trusted_bucket_name(bucket),
+                Requester::authenticated(harness.fixtures.owner_user.clone()),
+                None,
+            ),
+            state: BucketVersioningState::Enabled,
+        })
+        .unwrap();
+    phase8_harness::put_private_acl_policy(
+        &harness.coord,
+        &harness.fixtures,
+        bucket,
+        "s3:PutObjectVersionAcl",
+    )
+    .unwrap();
+    let version_id =
+        phase8_harness::owner_put_source_object(&harness.coord, &harness.fixtures, bucket, key)
+            .unwrap();
+
+    let requester = phase8_harness::cross_account_requester(&harness.fixtures);
+    let absent = phase8_harness::put_acl_private(
+        &harness.coord,
+        bucket,
+        key,
+        Some(version_id),
+        requester.clone(),
+        PutObjectPolicyContext::default(),
+    );
+    assert!(matches!(absent, Err(ServerError::AccessDenied)));
+
+    let exact = phase8_harness::put_acl_private(
+        &harness.coord,
+        bucket,
+        key,
+        Some(version_id),
+        requester,
+        PutObjectPolicyContext::default().with_default_canned_acl(Some("private")),
+    );
+    assert!(
+        exact.is_ok(),
+        "expected exact private ACL context to allow PutObjectVersionAcl: {exact:?}"
+    );
+}
+
+#[test]
+fn authz_model_phase8_copy_object_private_acl_context_exactness() {
+    let harness = Phase8Harness::new();
+    let bucket = "authz-phase8-copy";
+    phase8_harness::create_bucket(&harness.coord, &harness.fixtures, bucket).unwrap();
+    phase8_harness::put_copy_private_acl_policy(&harness.coord, &harness.fixtures, bucket).unwrap();
+    phase8_harness::owner_put_source_object(
+        &harness.coord,
+        &harness.fixtures,
+        bucket,
+        phase8_harness::PHASE8_SRC_KEY,
+    )
+    .unwrap();
+
+    let requester = phase8_harness::cross_account_requester(&harness.fixtures);
+    let absent = phase8_harness::copy_object_private(
+        &harness.coord,
+        bucket,
+        requester.clone(),
+        PutObjectPolicyContext::default(),
+    );
+    assert!(matches!(absent, Err(ServerError::AccessDenied)));
+
+    let exact = phase8_harness::copy_object_private(
+        &harness.coord,
+        bucket,
+        requester,
+        PutObjectPolicyContext::default().with_default_canned_acl(Some("private")),
+    );
+    assert!(
+        exact.is_ok(),
+        "expected exact private ACL context to allow CopyObject: {exact:?}"
+    );
+}
+
+#[test]
+fn authz_model_phase8_put_object_grant_header_exactness() {
+    let harness = Phase8Harness::new();
+    let bucket = "authz-phase8-put-grants";
+    phase8_harness::create_bucket(&harness.coord, &harness.fixtures, bucket).unwrap();
+    let requester = phase8_harness::cross_account_requester(&harness.fixtures);
+    let header_value = phase8_harness::cross_account_grant_header_value(&harness.fixtures);
+
+    for grant in phase8_harness::GrantHeaderKind::ALL {
+        phase8_harness::put_grant_header_policy(
+            &harness.coord,
+            &harness.fixtures,
+            bucket,
+            "s3:PutObject",
+            grant,
+            header_value,
+        )
+        .unwrap();
+
+        let absent = phase8_harness::put_object_grant(
+            &harness.coord,
+            &harness.fixtures,
+            bucket,
+            &format!("absent-{grant:?}"),
+            requester.clone(),
+            grant,
+            PutObjectPolicyContext::default(),
+        );
+        assert!(matches!(absent, Err(ServerError::AccessDenied)));
+
+        let wrong = phase8_harness::put_object_grant(
+            &harness.coord,
+            &harness.fixtures,
+            bucket,
+            &format!("wrong-{grant:?}"),
+            requester.clone(),
+            grant.alternate(),
+            grant
+                .alternate()
+                .with_policy_context(PutObjectPolicyContext::default(), Some(header_value)),
+        );
+        assert!(matches!(wrong, Err(ServerError::AccessDenied)));
+
+        let exact = phase8_harness::put_object_grant(
+            &harness.coord,
+            &harness.fixtures,
+            bucket,
+            &format!("exact-{grant:?}"),
+            requester.clone(),
+            grant,
+            grant.with_policy_context(PutObjectPolicyContext::default(), Some(header_value)),
+        );
+        assert!(
+            exact.is_ok(),
+            "expected exact grant header context to allow PutObject for {grant:?}: {exact:?}"
+        );
+    }
+}
+
+#[test]
+fn authz_model_phase8_copy_object_replace_tags_distinct_from_plain_copy() {
+    let harness = Phase8Harness::new();
+    let bucket = "authz-phase8-copy-tags";
+    phase8_harness::create_bucket(&harness.coord, &harness.fixtures, bucket).unwrap();
+    phase8_harness::put_copy_tagging_policy(&harness.coord, &harness.fixtures, bucket).unwrap();
+    phase8_harness::owner_put_source_object(
+        &harness.coord,
+        &harness.fixtures,
+        bucket,
+        phase8_harness::PHASE8_SRC_KEY,
+    )
+    .unwrap();
+
+    let requester = phase8_harness::cross_account_requester(&harness.fixtures);
+    let plain =
+        phase8_harness::copy_object_replace_tags(&harness.coord, bucket, requester.clone(), false);
+    assert!(matches!(plain, Err(ServerError::AccessDenied)));
+
+    let replace = phase8_harness::copy_object_replace_tags(&harness.coord, bucket, requester, true);
+    assert!(
+        replace.is_ok(),
+        "expected CopyObject tagging replace to satisfy RequestObjectTag policy: {replace:?}"
+    );
 }
 
 fn run_existing_matrix(phase: &str, action: Action) {

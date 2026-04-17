@@ -4677,6 +4677,276 @@ fn test_bucket_policy_put_object_version_acl_cross_account_allow() {
 }
 
 #[test]
+fn test_bucket_policy_put_object_version_acl_null_treats_absent_acl_header_as_missing() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let put = client
+            .put_object()
+            .bucket(&bucket)
+            .key("versioned")
+            .body(ByteStream::from_static(b"versioned-body"))
+            .send()
+            .await
+            .unwrap();
+        let version_id = put
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+
+        let alt_id = client_canonical_id(alt_client).await;
+        let grant_read_header = format!("id=\"{alt_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal.clone(),
+                    "Action": "s3:PutObjectVersionAcl",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": principal,
+                    "Action": "s3:PutObjectVersionAcl",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                    "Condition": {
+                        "Null": {
+                            "s3:x-amz-acl": "true"
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_result_matches(
+            "PutObjectVersionAcl denied when x-amz-acl is absent under Null condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                let grant_read_header = grant_read_header.clone();
+                alt_client
+                    .put_object_acl()
+                    .bucket(&bucket)
+                    .key("versioned")
+                    .version_id(&version_id)
+                    .customize()
+                    .mutate_request(move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-read", grant_read_header.clone());
+                    })
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("AccessDenied")
+                })
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObjectVersionAcl with explicit private ACL under Null condition",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object_acl()
+                    .bucket(&bucket)
+                    .key("versioned")
+                    .version_id(&version_id)
+                    .acl(ObjectCannedAcl::Private)
+                    .send()
+            },
+        )
+        .await;
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("versioned")
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_version_acl_string_not_equals_treats_absent_acl_header_as_not_equal(
+) {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        set_object_writer_ownership(&bucket).await;
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+        let put = client
+            .put_object()
+            .bucket(&bucket)
+            .key("versioned")
+            .body(ByteStream::from_static(b"versioned-body"))
+            .send()
+            .await
+            .unwrap();
+        let version_id = put
+            .version_id()
+            .expect("expected VersionId for versioned object")
+            .to_string();
+
+        let alt_id = client_canonical_id(alt_client).await;
+        let grant_read_header = format!("id=\"{alt_id}\"");
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": principal.clone(),
+                    "Action": "s3:PutObjectVersionAcl",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": principal,
+                    "Action": "s3:PutObjectVersionAcl",
+                    "Resource": bucket_wildcard_resource(&bucket),
+                    "Condition": {
+                        "StringNotEquals": {
+                            "s3:x-amz-acl": "private"
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        eventually_result_matches(
+            "PutObjectVersionAcl denied when x-amz-acl is absent under StringNotEquals",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                let grant_read_header = grant_read_header.clone();
+                alt_client
+                    .put_object_acl()
+                    .bucket(&bucket)
+                    .key("versioned")
+                    .version_id(&version_id)
+                    .customize()
+                    .mutate_request(move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-read", grant_read_header.clone());
+                    })
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("AccessDenied")
+                })
+            },
+        )
+        .await;
+
+        eventually_result_matches(
+            "PutObjectVersionAcl denied when x-amz-acl does not equal private",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object_acl()
+                    .bucket(&bucket)
+                    .key("versioned")
+                    .version_id(&version_id)
+                    .acl(ObjectCannedAcl::BucketOwnerFullControl)
+                    .send()
+            },
+            |result| {
+                result.as_ref().err().is_some_and(|err| {
+                    err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                        && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                            == Some("AccessDenied")
+                })
+            },
+        )
+        .await;
+
+        eventually_ok_with_retry(
+            "PutObjectVersionAcl with x-amz-acl=private under StringNotEquals",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .put_object_acl()
+                    .bucket(&bucket)
+                    .key("versioned")
+                    .version_id(&version_id)
+                    .acl(ObjectCannedAcl::Private)
+                    .send()
+            },
+        )
+        .await;
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key("versioned")
+            .version_id(&version_id)
+            .send()
+            .await
+            .unwrap();
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_object_version_acl_grant_read_condition_applies() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
