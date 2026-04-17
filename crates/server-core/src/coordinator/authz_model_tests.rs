@@ -5715,6 +5715,964 @@ mod phase6_harness {
     }
 }
 
+mod phase7_model {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase7RequesterShape {
+        BucketOwnerStandard,
+        SameAccountStandard,
+        SameAccountAdmin,
+        CrossAccount,
+    }
+
+    impl fmt::Display for Phase7RequesterShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::BucketOwnerStandard => f.write_str("bucket-owner-standard"),
+                Self::SameAccountStandard => f.write_str("same-account-standard"),
+                Self::SameAccountAdmin => f.write_str("same-account-admin"),
+                Self::CrossAccount => f.write_str("cross-account"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ObjectLockActionShape {
+        GetRetention,
+        PutRetention,
+        GetLegalHold,
+        PutLegalHold,
+    }
+
+    impl fmt::Display for ObjectLockActionShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::GetRetention => f.write_str("GetObjectRetention"),
+                Self::PutRetention => f.write_str("PutObjectRetention"),
+                Self::GetLegalHold => f.write_str("GetObjectLegalHold"),
+                Self::PutLegalHold => f.write_str("PutObjectLegalHold"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ObjectLockPolicyShape {
+        None,
+        AllowGetRetention,
+        AllowPutRetention,
+        AllowPutRetentionAndBypass,
+        AllowGetLegalHold,
+        AllowPutLegalHold,
+        DenyBypass,
+    }
+
+    impl fmt::Display for ObjectLockPolicyShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("no-policy"),
+                Self::AllowGetRetention => f.write_str("allow-get-retention"),
+                Self::AllowPutRetention => f.write_str("allow-put-retention"),
+                Self::AllowPutRetentionAndBypass => f.write_str("allow-put-retention-and-bypass"),
+                Self::AllowGetLegalHold => f.write_str("allow-get-legal-hold"),
+                Self::AllowPutLegalHold => f.write_str("allow-put-legal-hold"),
+                Self::DenyBypass => f.write_str("deny-bypass"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ObjectLockRecordShape {
+        None,
+        GovernanceRetention,
+    }
+
+    impl fmt::Display for ObjectLockRecordShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("none"),
+                Self::GovernanceRetention => f.write_str("governance-retention"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ObjectLockOutcome {
+        Allow,
+        Deny,
+        InvalidRequest,
+    }
+
+    impl fmt::Display for ObjectLockOutcome {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Allow => f.write_str("Allow"),
+                Self::Deny => f.write_str("Deny"),
+                Self::InvalidRequest => f.write_str("InvalidRequest"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct ObjectLockScenario {
+        pub(super) name: &'static str,
+        pub(super) action: ObjectLockActionShape,
+        pub(super) requester: Phase7RequesterShape,
+        pub(super) bucket_object_lock_enabled: bool,
+        pub(super) existing_lock_state: ObjectLockRecordShape,
+        pub(super) bypass_governance: bool,
+        pub(super) policy: ObjectLockPolicyShape,
+        pub(super) expected: ObjectLockOutcome,
+    }
+
+    impl ObjectLockScenario {
+        pub(super) fn scenarios() -> Vec<Self> {
+            vec![
+                Self {
+                    name: "same-account-standard-cannot-read-retention",
+                    action: ObjectLockActionShape::GetRetention,
+                    requester: Phase7RequesterShape::SameAccountStandard,
+                    bucket_object_lock_enabled: true,
+                    existing_lock_state: ObjectLockRecordShape::GovernanceRetention,
+                    bypass_governance: false,
+                    policy: ObjectLockPolicyShape::None,
+                    expected: ObjectLockOutcome::Deny,
+                },
+                Self {
+                    name: "same-account-admin-can-read-retention",
+                    action: ObjectLockActionShape::GetRetention,
+                    requester: Phase7RequesterShape::SameAccountAdmin,
+                    bucket_object_lock_enabled: true,
+                    existing_lock_state: ObjectLockRecordShape::GovernanceRetention,
+                    bypass_governance: false,
+                    policy: ObjectLockPolicyShape::None,
+                    expected: ObjectLockOutcome::Allow,
+                },
+                Self {
+                    name: "cross-account-retention-read-needs-policy",
+                    action: ObjectLockActionShape::GetRetention,
+                    requester: Phase7RequesterShape::CrossAccount,
+                    bucket_object_lock_enabled: true,
+                    existing_lock_state: ObjectLockRecordShape::GovernanceRetention,
+                    bypass_governance: false,
+                    policy: ObjectLockPolicyShape::AllowGetRetention,
+                    expected: ObjectLockOutcome::Allow,
+                },
+                Self {
+                    name: "cross-account-legal-hold-read-needs-policy",
+                    action: ObjectLockActionShape::GetLegalHold,
+                    requester: Phase7RequesterShape::CrossAccount,
+                    bucket_object_lock_enabled: true,
+                    existing_lock_state: ObjectLockRecordShape::None,
+                    bypass_governance: false,
+                    policy: ObjectLockPolicyShape::AllowGetLegalHold,
+                    expected: ObjectLockOutcome::Allow,
+                },
+                Self {
+                    name: "cross-account-legal-hold-update-needs-policy",
+                    action: ObjectLockActionShape::PutLegalHold,
+                    requester: Phase7RequesterShape::CrossAccount,
+                    bucket_object_lock_enabled: true,
+                    existing_lock_state: ObjectLockRecordShape::None,
+                    bypass_governance: false,
+                    policy: ObjectLockPolicyShape::AllowPutLegalHold,
+                    expected: ObjectLockOutcome::Allow,
+                },
+                Self {
+                    name: "cross-account-retention-bypass-needs-explicit-bypass-allow",
+                    action: ObjectLockActionShape::PutRetention,
+                    requester: Phase7RequesterShape::CrossAccount,
+                    bucket_object_lock_enabled: true,
+                    existing_lock_state: ObjectLockRecordShape::GovernanceRetention,
+                    bypass_governance: true,
+                    policy: ObjectLockPolicyShape::AllowPutRetention,
+                    expected: ObjectLockOutcome::Deny,
+                },
+                Self {
+                    name: "cross-account-retention-bypass-allowed-with-bypass-policy",
+                    action: ObjectLockActionShape::PutRetention,
+                    requester: Phase7RequesterShape::CrossAccount,
+                    bucket_object_lock_enabled: true,
+                    existing_lock_state: ObjectLockRecordShape::GovernanceRetention,
+                    bypass_governance: true,
+                    policy: ObjectLockPolicyShape::AllowPutRetentionAndBypass,
+                    expected: ObjectLockOutcome::Allow,
+                },
+                Self {
+                    name: "same-account-admin-retention-bypass-allowed-implicitly",
+                    action: ObjectLockActionShape::PutRetention,
+                    requester: Phase7RequesterShape::SameAccountAdmin,
+                    bucket_object_lock_enabled: true,
+                    existing_lock_state: ObjectLockRecordShape::GovernanceRetention,
+                    bypass_governance: true,
+                    policy: ObjectLockPolicyShape::None,
+                    expected: ObjectLockOutcome::Allow,
+                },
+                Self {
+                    name: "same-account-admin-retention-bypass-blocked-by-explicit-deny",
+                    action: ObjectLockActionShape::PutRetention,
+                    requester: Phase7RequesterShape::SameAccountAdmin,
+                    bucket_object_lock_enabled: true,
+                    existing_lock_state: ObjectLockRecordShape::GovernanceRetention,
+                    bypass_governance: true,
+                    policy: ObjectLockPolicyShape::DenyBypass,
+                    expected: ObjectLockOutcome::Deny,
+                },
+                Self {
+                    name: "same-account-admin-plain-bucket-returns-invalid-request",
+                    action: ObjectLockActionShape::GetRetention,
+                    requester: Phase7RequesterShape::SameAccountAdmin,
+                    bucket_object_lock_enabled: false,
+                    existing_lock_state: ObjectLockRecordShape::None,
+                    bypass_governance: false,
+                    policy: ObjectLockPolicyShape::None,
+                    expected: ObjectLockOutcome::InvalidRequest,
+                },
+                Self {
+                    name: "cross-account-plain-bucket-does-not-leak-lock-state",
+                    action: ObjectLockActionShape::GetRetention,
+                    requester: Phase7RequesterShape::CrossAccount,
+                    bucket_object_lock_enabled: false,
+                    existing_lock_state: ObjectLockRecordShape::None,
+                    bypass_governance: false,
+                    policy: ObjectLockPolicyShape::None,
+                    expected: ObjectLockOutcome::Deny,
+                },
+            ]
+        }
+    }
+
+    impl fmt::Display for ObjectLockScenario {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "{} requester={} lock-enabled={} state={} bypass={} policy={}",
+                self.action,
+                self.requester,
+                self.bucket_object_lock_enabled,
+                self.existing_lock_state,
+                self.bypass_governance,
+                self.policy
+            )
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum DeleteTargetShape {
+        CurrentExisting,
+        CurrentMissing,
+        SpecificVersionExisting,
+        SpecificVersionMissing,
+    }
+
+    impl fmt::Display for DeleteTargetShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::CurrentExisting => f.write_str("current-existing"),
+                Self::CurrentMissing => f.write_str("current-missing"),
+                Self::SpecificVersionExisting => f.write_str("specific-version-existing"),
+                Self::SpecificVersionMissing => f.write_str("specific-version-missing"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum DeletePolicyShape {
+        None,
+        AllowDeleteObject,
+        AllowDeleteVersion,
+        AllowDeleteVersionAndBypass,
+        DenyBypass,
+    }
+
+    impl fmt::Display for DeletePolicyShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("no-policy"),
+                Self::AllowDeleteObject => f.write_str("allow-delete-object"),
+                Self::AllowDeleteVersion => f.write_str("allow-delete-version"),
+                Self::AllowDeleteVersionAndBypass => f.write_str("allow-delete-version-and-bypass"),
+                Self::DenyBypass => f.write_str("deny-bypass"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum DeleteObjectLockShape {
+        None,
+        Governance,
+        Compliance,
+        LegalHold,
+    }
+
+    impl fmt::Display for DeleteObjectLockShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("none"),
+                Self::Governance => f.write_str("governance"),
+                Self::Compliance => f.write_str("compliance"),
+                Self::LegalHold => f.write_str("legal-hold"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum DeleteOutcome {
+        Allow,
+        Deny,
+    }
+
+    impl fmt::Display for DeleteOutcome {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Allow => f.write_str("Allow"),
+                Self::Deny => f.write_str("Deny"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct DeleteScenario {
+        pub(super) name: &'static str,
+        pub(super) requester: Phase7RequesterShape,
+        pub(super) target: DeleteTargetShape,
+        pub(super) bucket_object_lock_enabled: bool,
+        pub(super) object_lock: DeleteObjectLockShape,
+        pub(super) bypass_governance: bool,
+        pub(super) policy: DeletePolicyShape,
+        pub(super) expected: DeleteOutcome,
+    }
+
+    impl DeleteScenario {
+        pub(super) fn scenarios() -> Vec<Self> {
+            vec![
+                Self {
+                    name: "current-missing-bypass-header-does-not-need-bypass-permission",
+                    requester: Phase7RequesterShape::CrossAccount,
+                    target: DeleteTargetShape::CurrentMissing,
+                    bucket_object_lock_enabled: true,
+                    object_lock: DeleteObjectLockShape::None,
+                    bypass_governance: true,
+                    policy: DeletePolicyShape::AllowDeleteObject,
+                    expected: DeleteOutcome::Allow,
+                },
+                Self {
+                    name: "current-existing-governance-delete-marker-insert-ignores-bypass-header",
+                    requester: Phase7RequesterShape::BucketOwnerStandard,
+                    target: DeleteTargetShape::CurrentExisting,
+                    bucket_object_lock_enabled: true,
+                    object_lock: DeleteObjectLockShape::Governance,
+                    bypass_governance: true,
+                    policy: DeletePolicyShape::None,
+                    expected: DeleteOutcome::Allow,
+                },
+                Self {
+                    name: "same-account-standard-cannot-version-delete-with-governance-bypass",
+                    requester: Phase7RequesterShape::SameAccountStandard,
+                    target: DeleteTargetShape::SpecificVersionExisting,
+                    bucket_object_lock_enabled: true,
+                    object_lock: DeleteObjectLockShape::Governance,
+                    bypass_governance: true,
+                    policy: DeletePolicyShape::None,
+                    expected: DeleteOutcome::Deny,
+                },
+                Self {
+                    name: "same-account-admin-can-version-delete-with-governance-bypass",
+                    requester: Phase7RequesterShape::SameAccountAdmin,
+                    target: DeleteTargetShape::SpecificVersionExisting,
+                    bucket_object_lock_enabled: true,
+                    object_lock: DeleteObjectLockShape::Governance,
+                    bypass_governance: true,
+                    policy: DeletePolicyShape::None,
+                    expected: DeleteOutcome::Allow,
+                },
+                Self {
+                    name: "same-account-admin-bypass-blocked-by-explicit-deny",
+                    requester: Phase7RequesterShape::SameAccountAdmin,
+                    target: DeleteTargetShape::SpecificVersionExisting,
+                    bucket_object_lock_enabled: true,
+                    object_lock: DeleteObjectLockShape::Governance,
+                    bypass_governance: true,
+                    policy: DeletePolicyShape::DenyBypass,
+                    expected: DeleteOutcome::Deny,
+                },
+                Self {
+                    name: "cross-account-version-delete-with-governance-needs-bypass-allow",
+                    requester: Phase7RequesterShape::CrossAccount,
+                    target: DeleteTargetShape::SpecificVersionExisting,
+                    bucket_object_lock_enabled: true,
+                    object_lock: DeleteObjectLockShape::Governance,
+                    bypass_governance: true,
+                    policy: DeletePolicyShape::AllowDeleteVersion,
+                    expected: DeleteOutcome::Deny,
+                },
+                Self {
+                    name: "cross-account-version-delete-with-governance-allowed-with-bypass-policy",
+                    requester: Phase7RequesterShape::CrossAccount,
+                    target: DeleteTargetShape::SpecificVersionExisting,
+                    bucket_object_lock_enabled: true,
+                    object_lock: DeleteObjectLockShape::Governance,
+                    bypass_governance: true,
+                    policy: DeletePolicyShape::AllowDeleteVersionAndBypass,
+                    expected: DeleteOutcome::Allow,
+                },
+                Self {
+                    name: "missing-version-delete-without-bypass-uses-delete-version-action",
+                    requester: Phase7RequesterShape::CrossAccount,
+                    target: DeleteTargetShape::SpecificVersionMissing,
+                    bucket_object_lock_enabled: true,
+                    object_lock: DeleteObjectLockShape::None,
+                    bypass_governance: false,
+                    policy: DeletePolicyShape::AllowDeleteVersion,
+                    expected: DeleteOutcome::Allow,
+                },
+                Self {
+                    name: "missing-version-delete-with-bypass-needs-bypass-permission",
+                    requester: Phase7RequesterShape::CrossAccount,
+                    target: DeleteTargetShape::SpecificVersionMissing,
+                    bucket_object_lock_enabled: true,
+                    object_lock: DeleteObjectLockShape::None,
+                    bypass_governance: true,
+                    policy: DeletePolicyShape::AllowDeleteVersion,
+                    expected: DeleteOutcome::Deny,
+                },
+                Self {
+                    name: "missing-version-delete-with-bypass-allowed-with-bypass-policy",
+                    requester: Phase7RequesterShape::CrossAccount,
+                    target: DeleteTargetShape::SpecificVersionMissing,
+                    bucket_object_lock_enabled: true,
+                    object_lock: DeleteObjectLockShape::None,
+                    bypass_governance: true,
+                    policy: DeletePolicyShape::AllowDeleteVersionAndBypass,
+                    expected: DeleteOutcome::Allow,
+                },
+                Self {
+                    name: "missing-version-bypass-on-plain-bucket-does-not-need-bypass-permission",
+                    requester: Phase7RequesterShape::CrossAccount,
+                    target: DeleteTargetShape::SpecificVersionMissing,
+                    bucket_object_lock_enabled: false,
+                    object_lock: DeleteObjectLockShape::None,
+                    bypass_governance: true,
+                    policy: DeletePolicyShape::AllowDeleteVersion,
+                    expected: DeleteOutcome::Allow,
+                },
+                Self {
+                    name: "compliance-retention-denies-delete-even-for-admin-bypass",
+                    requester: Phase7RequesterShape::SameAccountAdmin,
+                    target: DeleteTargetShape::SpecificVersionExisting,
+                    bucket_object_lock_enabled: true,
+                    object_lock: DeleteObjectLockShape::Compliance,
+                    bypass_governance: true,
+                    policy: DeletePolicyShape::None,
+                    expected: DeleteOutcome::Deny,
+                },
+                Self {
+                    name: "legal-hold-denies-delete-even-for-admin-bypass",
+                    requester: Phase7RequesterShape::SameAccountAdmin,
+                    target: DeleteTargetShape::SpecificVersionExisting,
+                    bucket_object_lock_enabled: true,
+                    object_lock: DeleteObjectLockShape::LegalHold,
+                    bypass_governance: true,
+                    policy: DeletePolicyShape::None,
+                    expected: DeleteOutcome::Deny,
+                },
+            ]
+        }
+    }
+
+    impl fmt::Display for DeleteScenario {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "Delete target={} requester={} lock={} bypass={} policy={}",
+                self.target, self.requester, self.object_lock, self.bypass_governance, self.policy
+            )
+        }
+    }
+}
+
+mod phase7_harness {
+    use super::harness::{setup_coordinator, IdentityFixtures};
+    use super::phase7_model::{
+        DeleteObjectLockShape, DeleteOutcome, DeletePolicyShape, DeleteScenario, DeleteTargetShape,
+        ObjectLockActionShape, ObjectLockOutcome, ObjectLockPolicyShape, ObjectLockRecordShape,
+        ObjectLockScenario, Phase7RequesterShape,
+    };
+    use super::*;
+
+    const KEY: &str = "phase7-key";
+    const NO_PHASE7_DELETE: &DeleteCondition = &DeleteCondition::None;
+    const NO_PHASE7_PUT_OBJECT_ACL: PutObjectAcl<'static> = PutObjectAcl::None;
+
+    pub(super) struct Phase7Harness {
+        _tmp: test_util::TempDir,
+        coord: Coordinator,
+        fixtures: IdentityFixtures,
+    }
+
+    impl Phase7Harness {
+        pub(super) fn new() -> Self {
+            let tmp = test_util::tempdir();
+            let coord = setup_coordinator(tmp.path());
+            let fixtures = IdentityFixtures::new();
+            Self {
+                _tmp: tmp,
+                coord,
+                fixtures,
+            }
+        }
+
+        pub(super) fn run_object_lock(
+            &self,
+            bucket: &str,
+            scenario: ObjectLockScenario,
+        ) -> ObjectLockOutcome {
+            materialize_object_lock_bucket(&self.coord, &self.fixtures, bucket, scenario)
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "failed to materialize phase 7 object-lock state for {scenario}: {err:?}"
+                    );
+                });
+            run_object_lock_action(&self.coord, &self.fixtures, bucket, scenario)
+        }
+
+        pub(super) fn run_delete(&self, bucket: &str, scenario: DeleteScenario) -> DeleteOutcome {
+            let version_id =
+                materialize_delete_bucket(&self.coord, &self.fixtures, bucket, scenario)
+                    .unwrap_or_else(|err| {
+                        panic!(
+                            "failed to materialize phase 7 delete state for {scenario}: {err:?}"
+                        );
+                    });
+            run_delete_action(&self.coord, &self.fixtures, bucket, scenario, version_id)
+        }
+    }
+
+    pub(super) fn phase7_object_lock_bucket_name_for(index: usize) -> String {
+        format!("authz-phase7-lock-{index:05}")
+    }
+
+    pub(super) fn phase7_delete_bucket_name_for(index: usize) -> String {
+        format!("authz-phase7-delete-{index:05}")
+    }
+
+    fn materialize_object_lock_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: ObjectLockScenario,
+    ) -> Result<(), ServerError> {
+        create_phase7_bucket(coord, fixtures, bucket, scenario.bucket_object_lock_enabled)?;
+        let owner_requester = Requester::authenticated(fixtures.owner_user.clone());
+        let put = test_helpers::put_object(
+            coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: ObjectRequest::new(
+                    trusted_bucket_name(bucket),
+                    trusted_object_key(KEY),
+                    owner_requester.clone(),
+                    None,
+                ),
+                data: b"phase7",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PHASE7_PUT_OBJECT_ACL.into(),
+            },
+        )?;
+
+        apply_object_lock_state(
+            coord,
+            bucket,
+            fixtures,
+            put.version_id,
+            scenario.existing_lock_state,
+        )?;
+        put_phase7_object_lock_policy(coord, fixtures, bucket, scenario.requester, scenario.policy)
+    }
+
+    fn run_object_lock_action(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: ObjectLockScenario,
+    ) -> ObjectLockOutcome {
+        let requester = phase7_requester(fixtures, scenario.requester);
+        let object = ObjectVersionRequest::new(
+            trusted_bucket_name(bucket),
+            trusted_object_key(KEY),
+            None,
+            requester,
+            None,
+        );
+
+        let result = match scenario.action {
+            ObjectLockActionShape::GetRetention => {
+                coord.authorize_get_object_retention(&object).map(|_| ())
+            }
+            ObjectLockActionShape::PutRetention => coord
+                .authorize_put_object_retention(&PutObjectRetentionRequest {
+                    object,
+                    retention: ObjectRetention {
+                        mode: ObjectLockMode::Governance,
+                        retain_until_unix_seconds: Coordinator::current_unix_seconds()
+                            .expect("phase 7 current time")
+                            + 180,
+                    },
+                    bypass_governance: scenario.bypass_governance,
+                })
+                .map(|_| ()),
+            ObjectLockActionShape::GetLegalHold => {
+                coord.authorize_get_object_legal_hold(&object).map(|_| ())
+            }
+            ObjectLockActionShape::PutLegalHold => coord
+                .authorize_put_object_legal_hold(&PutObjectLegalHoldRequest {
+                    object,
+                    legal_hold: LegalHoldStatus::On,
+                })
+                .map(|_| ()),
+        };
+
+        match result {
+            Ok(()) => ObjectLockOutcome::Allow,
+            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
+                ObjectLockOutcome::Deny
+            }
+            Err(ServerError::InvalidRequest { .. }) => ObjectLockOutcome::InvalidRequest,
+            Err(other) => panic!("unexpected phase 7 object-lock result: {other:?}"),
+        }
+    }
+
+    fn materialize_delete_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: DeleteScenario,
+    ) -> Result<Option<VersionId>, ServerError> {
+        create_phase7_bucket(coord, fixtures, bucket, scenario.bucket_object_lock_enabled)?;
+        if matches!(
+            scenario.target,
+            DeleteTargetShape::SpecificVersionExisting | DeleteTargetShape::SpecificVersionMissing
+        ) {
+            coord.put_bucket_versioning(&PutBucketVersioningRequest {
+                bucket: BucketRequest::new(
+                    trusted_bucket_name(bucket),
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                state: BucketVersioningState::Enabled,
+            })?;
+        }
+        let owner_requester = Requester::authenticated(fixtures.owner_user.clone());
+        let version_id = match scenario.target {
+            DeleteTargetShape::CurrentMissing => None,
+            DeleteTargetShape::CurrentExisting
+            | DeleteTargetShape::SpecificVersionExisting
+            | DeleteTargetShape::SpecificVersionMissing => {
+                let put = test_helpers::put_object(
+                    coord,
+                    &PutObjectRequest {
+                        encryption: WriteEncryptionRequest::none(),
+                        policy_context: PutObjectPolicyContext::default(),
+                        object_lock: ObjectLockState::default(),
+                        object: ObjectRequest::new(
+                            trusted_bucket_name(bucket),
+                            trusted_object_key(KEY),
+                            owner_requester.clone(),
+                            None,
+                        ),
+                        data: b"phase7",
+                        metadata: &MetadataBlob::new(),
+                        system_metadata: &SystemMetadata::EMPTY,
+                        tags: None,
+                        cond: NO_WRITE,
+                        acl: NO_PHASE7_PUT_OBJECT_ACL.into(),
+                    },
+                )?;
+                Some(put.version_id)
+            }
+        };
+
+        if let Some(version_id) = version_id {
+            apply_delete_lock_state(coord, bucket, fixtures, version_id, scenario.object_lock)?;
+            if scenario.target == DeleteTargetShape::SpecificVersionMissing {
+                coord.delete_object(&DeleteObjectRequest {
+                    object: ObjectVersionRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(KEY),
+                        Some(version_id),
+                        owner_requester,
+                        None,
+                    ),
+                    bypass_governance: false,
+                    cond: NO_PHASE7_DELETE,
+                })?;
+            }
+        }
+
+        put_phase7_delete_policy(coord, fixtures, bucket, scenario.requester, scenario.policy)?;
+        Ok(version_id)
+    }
+
+    fn run_delete_action(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: DeleteScenario,
+        version_id: Option<VersionId>,
+    ) -> DeleteOutcome {
+        let requester = phase7_requester(fixtures, scenario.requester);
+        let result = coord.authorize_delete_object(&DeleteObjectRequest {
+            object: ObjectVersionRequest::new(
+                trusted_bucket_name(bucket),
+                trusted_object_key(KEY),
+                version_id,
+                requester,
+                None,
+            ),
+            bypass_governance: scenario.bypass_governance,
+            cond: NO_PHASE7_DELETE,
+        });
+
+        match result {
+            Ok(_) => DeleteOutcome::Allow,
+            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
+                DeleteOutcome::Deny
+            }
+            Err(other) => panic!("unexpected phase 7 delete result: {other:?}"),
+        }
+    }
+
+    fn create_phase7_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        object_lock_enabled: bool,
+    ) -> Result<(), ServerError> {
+        coord.create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name(bucket),
+            requester: Requester::authenticated(fixtures.owner_user.clone()),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled,
+        })
+    }
+
+    fn apply_object_lock_state(
+        coord: &Coordinator,
+        bucket: &str,
+        fixtures: &IdentityFixtures,
+        version_id: VersionId,
+        state: ObjectLockRecordShape,
+    ) -> Result<(), ServerError> {
+        if state != ObjectLockRecordShape::GovernanceRetention {
+            return Ok(());
+        }
+
+        coord.put_object_retention(&PutObjectRetentionRequest {
+            object: ObjectVersionRequest::new(
+                trusted_bucket_name(bucket),
+                trusted_object_key(KEY),
+                Some(version_id),
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            retention: ObjectRetention {
+                mode: ObjectLockMode::Governance,
+                retain_until_unix_seconds: Coordinator::current_unix_seconds()? + 3600,
+            },
+            bypass_governance: false,
+        })
+    }
+
+    fn apply_delete_lock_state(
+        coord: &Coordinator,
+        bucket: &str,
+        fixtures: &IdentityFixtures,
+        version_id: VersionId,
+        state: DeleteObjectLockShape,
+    ) -> Result<(), ServerError> {
+        match state {
+            DeleteObjectLockShape::None => Ok(()),
+            DeleteObjectLockShape::Governance | DeleteObjectLockShape::Compliance => coord
+                .put_object_retention(&PutObjectRetentionRequest {
+                    object: ObjectVersionRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(KEY),
+                        Some(version_id),
+                        Requester::authenticated(fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    retention: ObjectRetention {
+                        mode: match state {
+                            DeleteObjectLockShape::Governance => ObjectLockMode::Governance,
+                            DeleteObjectLockShape::Compliance => ObjectLockMode::Compliance,
+                            DeleteObjectLockShape::None | DeleteObjectLockShape::LegalHold => {
+                                unreachable!()
+                            }
+                        },
+                        retain_until_unix_seconds: Coordinator::current_unix_seconds()? + 3600,
+                    },
+                    bypass_governance: false,
+                }),
+            DeleteObjectLockShape::LegalHold => {
+                coord.put_object_legal_hold(&PutObjectLegalHoldRequest {
+                    object: ObjectVersionRequest::new(
+                        trusted_bucket_name(bucket),
+                        trusted_object_key(KEY),
+                        Some(version_id),
+                        Requester::authenticated(fixtures.owner_user.clone()),
+                        None,
+                    ),
+                    legal_hold: LegalHoldStatus::On,
+                })
+            }
+        }
+    }
+
+    fn put_phase7_object_lock_policy(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        requester: Phase7RequesterShape,
+        policy: ObjectLockPolicyShape,
+    ) -> Result<(), ServerError> {
+        let Some(document) =
+            phase7_object_lock_policy_document(fixtures, bucket, requester, policy)
+        else {
+            return Ok(());
+        };
+        coord.put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: BucketRequest::new(
+                trusted_bucket_name(bucket),
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            config: &document,
+            confirm_remove_self_bucket_access: false,
+        })
+    }
+
+    fn put_phase7_delete_policy(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        requester: Phase7RequesterShape,
+        policy: DeletePolicyShape,
+    ) -> Result<(), ServerError> {
+        let Some(document) = phase7_delete_policy_document(fixtures, bucket, requester, policy)
+        else {
+            return Ok(());
+        };
+        coord.put_bucket_policy(&PutBucketPolicyRequest {
+            bucket: BucketRequest::new(
+                trusted_bucket_name(bucket),
+                Requester::authenticated(fixtures.owner_user.clone()),
+                None,
+            ),
+            config: &document,
+            confirm_remove_self_bucket_access: false,
+        })
+    }
+
+    fn phase7_object_lock_policy_document(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        requester: Phase7RequesterShape,
+        policy: ObjectLockPolicyShape,
+    ) -> Option<String> {
+        let principal = phase7_requester_principal(fixtures, requester)?;
+        let resource = format!("arn:aws:s3:::{bucket}/*");
+        let statement = match policy {
+            ObjectLockPolicyShape::None => return None,
+            ObjectLockPolicyShape::AllowGetRetention => format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:GetObjectRetention","Resource":"{resource}"}}"#
+            ),
+            ObjectLockPolicyShape::AllowPutRetention => format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObjectRetention","Resource":"{resource}"}}"#
+            ),
+            ObjectLockPolicyShape::AllowPutRetentionAndBypass => format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":["s3:PutObjectRetention","s3:BypassGovernanceRetention"],"Resource":"{resource}"}}"#
+            ),
+            ObjectLockPolicyShape::AllowGetLegalHold => format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:GetObjectLegalHold","Resource":"{resource}"}}"#
+            ),
+            ObjectLockPolicyShape::AllowPutLegalHold => format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:PutObjectLegalHold","Resource":"{resource}"}}"#
+            ),
+            ObjectLockPolicyShape::DenyBypass => format!(
+                r#"{{"Effect":"Deny","Principal":{{"AWS":"{principal}"}},"Action":"s3:BypassGovernanceRetention","Resource":"{resource}"}}"#
+            ),
+        };
+        Some(format!(
+            r#"{{"Version":"2012-10-17","Statement":[{statement}]}}"#
+        ))
+    }
+
+    fn phase7_delete_policy_document(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        requester: Phase7RequesterShape,
+        policy: DeletePolicyShape,
+    ) -> Option<String> {
+        let principal = phase7_requester_principal(fixtures, requester)?;
+        let resource = format!("arn:aws:s3:::{bucket}/*");
+        let statement = match policy {
+            DeletePolicyShape::None => return None,
+            DeletePolicyShape::AllowDeleteObject => format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:DeleteObject","Resource":"{resource}"}}"#
+            ),
+            DeletePolicyShape::AllowDeleteVersion => format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"s3:DeleteObjectVersion","Resource":"{resource}"}}"#
+            ),
+            DeletePolicyShape::AllowDeleteVersionAndBypass => format!(
+                r#"{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":["s3:DeleteObjectVersion","s3:BypassGovernanceRetention"],"Resource":"{resource}"}}"#
+            ),
+            DeletePolicyShape::DenyBypass => format!(
+                r#"{{"Effect":"Deny","Principal":{{"AWS":"{principal}"}},"Action":"s3:BypassGovernanceRetention","Resource":"{resource}"}}"#
+            ),
+        };
+        Some(format!(
+            r#"{{"Version":"2012-10-17","Statement":[{statement}]}}"#
+        ))
+    }
+
+    fn phase7_requester(fixtures: &IdentityFixtures, shape: Phase7RequesterShape) -> Requester {
+        match shape {
+            Phase7RequesterShape::BucketOwnerStandard => {
+                Requester::authenticated(fixtures.owner_user.clone())
+            }
+            Phase7RequesterShape::SameAccountStandard => {
+                Requester::authenticated(fixtures.same_account_distinct.clone())
+            }
+            Phase7RequesterShape::SameAccountAdmin => {
+                Requester::authenticated_owner_account_admin(fixtures.same_account_distinct.clone())
+            }
+            Phase7RequesterShape::CrossAccount => {
+                Requester::authenticated(fixtures.cross_account.clone())
+            }
+        }
+    }
+
+    fn phase7_requester_principal(
+        fixtures: &IdentityFixtures,
+        shape: Phase7RequesterShape,
+    ) -> Option<&str> {
+        match shape {
+            Phase7RequesterShape::BucketOwnerStandard => Some(fixtures.owner_user.principal()),
+            Phase7RequesterShape::SameAccountStandard | Phase7RequesterShape::SameAccountAdmin => {
+                Some(fixtures.same_account_distinct.principal())
+            }
+            Phase7RequesterShape::CrossAccount => Some(fixtures.cross_account.principal()),
+        }
+    }
+}
+
 use harness::{bucket_name_for, to_existing_outcome, to_missing_outcome, MatrixHarness};
 use model::{Action, MissingScenario, Scenario};
 use phase4_harness::{
@@ -5728,6 +6686,10 @@ use phase6_harness::{
     upload_part_copy_bucket_name_for, Phase6Harness,
 };
 use phase6_model::{CopyObjectScenario, UploadPartCopyScenario};
+use phase7_harness::{
+    phase7_delete_bucket_name_for, phase7_object_lock_bucket_name_for, Phase7Harness,
+};
+use phase7_model::{DeleteScenario, ObjectLockScenario};
 
 #[test]
 fn authz_model_phase1_get_object_existing_matrix() {
@@ -5889,6 +6851,46 @@ fn authz_model_phase6_upload_part_copy_matrix() {
         assert_eq!(
             actual, expected,
             "phase 6 upload-part-copy mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+        );
+    }
+}
+
+#[test]
+fn authz_model_phase7_object_lock_matrix() {
+    let scenarios = ObjectLockScenario::scenarios();
+    assert!(
+        !scenarios.is_empty(),
+        "phase 7 object-lock matrix unexpectedly produced no scenarios"
+    );
+    let harness = Phase7Harness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = phase7_object_lock_bucket_name_for(index);
+        let actual = harness.run_object_lock(&bucket, scenario);
+        assert_eq!(
+            actual, scenario.expected,
+            "phase 7 object-lock mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
+            scenario.expected
+        );
+    }
+}
+
+#[test]
+fn authz_model_phase7_delete_matrix() {
+    let scenarios = DeleteScenario::scenarios();
+    assert!(
+        !scenarios.is_empty(),
+        "phase 7 delete matrix unexpectedly produced no scenarios"
+    );
+    let harness = Phase7Harness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = phase7_delete_bucket_name_for(index);
+        let actual = harness.run_delete(&bucket, scenario);
+        assert_eq!(
+            actual, scenario.expected,
+            "phase 7 delete mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
+            scenario.expected
         );
     }
 }

@@ -753,7 +753,7 @@ Current state:
 
 ### Phase 7: Delete and Object-Lock Matrix
 
-Status: planned
+Status: complete
 
 Add a bounded delete/object-lock matrix for:
 
@@ -808,6 +808,41 @@ Acceptance criteria:
   in dedicated regressions
 - non-version and version-specific delete behavior cannot be accidentally
   collapsed together
+
+Current state:
+
+- `server-core` now has a dedicated Phase 7 authz model matrix for object-lock
+  read/update APIs and delete authorization.
+- The object-lock matrix covers:
+  - same-account `Standard` versus `OwnerAccountAdmin` behavior on
+    object-lock-enabled buckets
+  - narrow cross-account bucket-policy allow for:
+    - `s3:GetObjectRetention`
+    - `s3:PutObjectRetention`
+    - `s3:GetObjectLegalHold`
+    - `s3:PutObjectLegalHold`
+  - `s3:BypassGovernanceRetention` as a separate requirement for governance
+    retention updates that request bypass
+  - explicit bucket-policy deny of bypass for same-account owner-account admin
+  - plain-bucket `InvalidRequest` for authorized callers versus `AccessDenied`
+    for unauthorized callers, so lock configuration is not leaked
+- The delete matrix covers:
+  - current-object delete-marker insertion versus version-specific delete
+  - current-missing versus missing-version authorization
+  - object-lock-enabled versus object-lock-disabled buckets on the
+    version-specific delete path
+  - same-account `Standard` versus `OwnerAccountAdmin` governance-bypass
+    behavior
+  - cross-account bucket-policy allow for:
+    - `s3:DeleteObject`
+    - `s3:DeleteObjectVersion`
+    - `s3:BypassGovernanceRetention`
+  - the missing-version rule that `DeleteObjectVersion` alone is insufficient
+    when the bypass header is present on an object-lock-enabled bucket
+  - the non-version delete path treating the bypass header as irrelevant to the
+    delete-marker authorization decision
+  - compliance-retention and legal-hold delete denial staying distinct from
+    governance-bypass authorization
 
 ### Phase 7A: Object-Scoped Multipart Management Matrix
 
