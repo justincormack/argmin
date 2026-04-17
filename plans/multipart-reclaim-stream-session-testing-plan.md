@@ -355,8 +355,9 @@ Current state:
   - one distinct streamed part payload per upload, plus a live stream-part
     session on the newest upload
   - begin/append/finalize/abort-session on the newest upload and
-    complete/abort on newest versus oldest upload without widening to a
-    general N-upload model yet
+    complete/abort on newest versus oldest upload, including aborting the
+    newest upload while its session remains orphaned until explicit cleanup,
+    without widening to a general N-upload model yet
   - checks that pending upload ordering, active session presence, per-upload
     `ListParts`, and visible object winner identity stay aligned with the
     model after each step
@@ -368,6 +369,8 @@ Current state:
     and distinct refinalize payloads so streamed same-part winner identity is
     observable too
   - complete-head-only versus complete-head-and-tail terminal choices
+  - abort-upload while the tail session is still live, with orphaned session
+    cleanup modeled explicitly afterward
   - checks that pending upload presence, `ListParts` part-number visibility,
     active tail-session presence, and visible object body stay aligned with the
     model after each step

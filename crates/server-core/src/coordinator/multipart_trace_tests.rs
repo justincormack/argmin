@@ -350,10 +350,16 @@ struct SameKeyUploadModelEntry {
     payload: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SameKeySessionState {
+    Active(SessionModelState),
+    Orphan(SessionModelState),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SameKeyUploadModel {
     uploads: Vec<SameKeyUploadModelEntry>,
-    current_session: Option<SessionModelState>,
+    current_session: Option<SameKeySessionState>,
     pending_payload: Option<Vec<u8>>,
     visible_payload: Option<Vec<u8>>,
     next_payload_id: u8,
@@ -371,6 +377,7 @@ impl SameKeyUploadModel {
     }
 
     fn legal_ops(&self) -> &'static [SameKeyUploadTraceOp] {
+        use SameKeySessionState::*;
         use SameKeyUploadTraceOp::*;
         use SessionModelState::*;
         match (
@@ -384,42 +391,60 @@ impl SameKeyUploadModel {
             (v, None) if v.as_slice() == [false] => {
                 &[CreateUpload, BeginCurrentStream, AbortCurrent]
             }
-            (v, Some(Empty)) if v.as_slice() == [false] => {
-                &[AppendCurrentData, AbortCurrentSession]
+            (v, Some(Active(Empty))) if v.as_slice() == [false] => {
+                &[AppendCurrentData, AbortCurrent, AbortCurrentSession]
             }
-            (v, Some(HasData)) if v.as_slice() == [false] => {
-                &[FinalizeCurrentPart, AbortCurrentSession]
+            (v, Some(Active(HasData))) if v.as_slice() == [false] => {
+                &[FinalizeCurrentPart, AbortCurrent, AbortCurrentSession]
             }
             (v, None) if v.as_slice() == [false, false] => {
                 &[BeginCurrentStream, AbortCurrent, AbortOldest]
             }
-            (v, Some(Empty)) if v.as_slice() == [false, false] => {
-                &[AppendCurrentData, AbortCurrentSession, AbortOldest]
-            }
-            (v, Some(HasData)) if v.as_slice() == [false, false] => {
-                &[FinalizeCurrentPart, AbortCurrentSession, AbortOldest]
-            }
+            (v, Some(Active(Empty))) if v.as_slice() == [false, false] => &[
+                AppendCurrentData,
+                AbortCurrent,
+                AbortCurrentSession,
+                AbortOldest,
+            ],
+            (v, Some(Active(HasData))) if v.as_slice() == [false, false] => &[
+                FinalizeCurrentPart,
+                AbortCurrent,
+                AbortCurrentSession,
+                AbortOldest,
+            ],
             (v, None) if v.as_slice() == [false, true] => &[
                 BeginCurrentStream,
                 CompleteCurrent,
                 AbortCurrent,
                 AbortOldest,
             ],
-            (v, Some(Empty)) if v.as_slice() == [false, true] => {
-                &[AppendCurrentData, AbortCurrentSession, AbortOldest]
-            }
-            (v, Some(HasData)) if v.as_slice() == [false, true] => {
-                &[FinalizeCurrentPart, AbortCurrentSession, AbortOldest]
-            }
+            (v, Some(Active(Empty))) if v.as_slice() == [false, true] => &[
+                AppendCurrentData,
+                CompleteCurrent,
+                AbortCurrent,
+                AbortCurrentSession,
+                AbortOldest,
+            ],
+            (v, Some(Active(HasData))) if v.as_slice() == [false, true] => &[
+                FinalizeCurrentPart,
+                AbortCurrent,
+                AbortCurrentSession,
+                AbortOldest,
+            ],
             (v, None) if v.as_slice() == [true] => &[
                 CreateUpload,
                 BeginCurrentStream,
                 CompleteCurrent,
                 AbortCurrent,
             ],
-            (v, Some(Empty)) if v.as_slice() == [true] => &[AppendCurrentData, AbortCurrentSession],
-            (v, Some(HasData)) if v.as_slice() == [true] => {
-                &[FinalizeCurrentPart, AbortCurrentSession]
+            (v, Some(Active(Empty))) if v.as_slice() == [true] => &[
+                AppendCurrentData,
+                CompleteCurrent,
+                AbortCurrent,
+                AbortCurrentSession,
+            ],
+            (v, Some(Active(HasData))) if v.as_slice() == [true] => {
+                &[FinalizeCurrentPart, AbortCurrent, AbortCurrentSession]
             }
             (v, None) if v.as_slice() == [true, false] => &[
                 BeginCurrentStream,
@@ -427,14 +452,16 @@ impl SameKeyUploadModel {
                 CompleteOldest,
                 AbortOldest,
             ],
-            (v, Some(Empty)) if v.as_slice() == [true, false] => &[
+            (v, Some(Active(Empty))) if v.as_slice() == [true, false] => &[
                 AppendCurrentData,
+                AbortCurrent,
                 AbortCurrentSession,
                 CompleteOldest,
                 AbortOldest,
             ],
-            (v, Some(HasData)) if v.as_slice() == [true, false] => &[
+            (v, Some(Active(HasData))) if v.as_slice() == [true, false] => &[
                 FinalizeCurrentPart,
+                AbortCurrent,
                 AbortCurrentSession,
                 CompleteOldest,
                 AbortOldest,
@@ -446,17 +473,46 @@ impl SameKeyUploadModel {
                 CompleteOldest,
                 AbortOldest,
             ],
-            (v, Some(Empty)) if v.as_slice() == [true, true] => &[
+            (v, Some(Active(Empty))) if v.as_slice() == [true, true] => &[
                 AppendCurrentData,
+                AbortCurrent,
                 AbortCurrentSession,
                 CompleteOldest,
                 AbortOldest,
             ],
-            (v, Some(HasData)) if v.as_slice() == [true, true] => &[
+            (v, Some(Active(HasData))) if v.as_slice() == [true, true] => &[
                 FinalizeCurrentPart,
+                AbortCurrent,
                 AbortCurrentSession,
                 CompleteOldest,
                 AbortOldest,
+            ],
+            (v, Some(Orphan(_))) if v.is_empty() => &[AbortCurrentSession],
+            (v, Some(Orphan(_))) if v.as_slice() == [false] => &[AbortCurrent, AbortCurrentSession],
+            (v, Some(Orphan(_))) if v.as_slice() == [true] => {
+                &[CompleteCurrent, AbortCurrent, AbortCurrentSession]
+            }
+            (v, Some(Orphan(_))) if v.as_slice() == [false, false] => {
+                &[AbortCurrent, AbortOldest, AbortCurrentSession]
+            }
+            (v, Some(Orphan(_))) if v.as_slice() == [false, true] => &[
+                CompleteCurrent,
+                AbortCurrent,
+                AbortOldest,
+                AbortCurrentSession,
+            ],
+            (v, Some(Orphan(_))) if v.as_slice() == [true, false] => &[
+                AbortCurrent,
+                CompleteOldest,
+                AbortOldest,
+                AbortCurrentSession,
+            ],
+            (v, Some(Orphan(_))) if v.as_slice() == [true, true] => &[
+                CompleteCurrent,
+                AbortCurrent,
+                CompleteOldest,
+                AbortOldest,
+                AbortCurrentSession,
             ],
             _ => &[CreateUpload],
         }
@@ -476,10 +532,11 @@ impl SameKeyUploadModel {
                 self.pending_payload = None;
             }
             BeginCurrentStream => {
-                self.current_session = Some(SessionModelState::Empty);
+                self.current_session = Some(SameKeySessionState::Active(SessionModelState::Empty));
             }
             AppendCurrentData => {
-                self.current_session = Some(SessionModelState::HasData);
+                self.current_session =
+                    Some(SameKeySessionState::Active(SessionModelState::HasData));
                 self.pending_payload =
                     Some(format!("trace-part-{}", self.next_payload_id).into_bytes());
                 self.next_payload_id = self.next_payload_id.wrapping_add(1);
@@ -503,7 +560,12 @@ impl SameKeyUploadModel {
             }
             AbortCurrent => {
                 self.uploads.pop();
-                self.current_session = None;
+                self.current_session = match self.current_session {
+                    Some(SameKeySessionState::Active(state)) => {
+                        Some(SameKeySessionState::Orphan(state))
+                    }
+                    other => other,
+                };
                 self.pending_payload = None;
             }
             CompleteOldest => {
@@ -578,12 +640,18 @@ impl MultipartVisibleObject {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultipartTailSessionState {
+    Active(SessionModelState),
+    Orphan(SessionModelState),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct MultipartHeadTailModel {
     upload_active: bool,
     head_committed: bool,
     head_fill: Option<u8>,
-    tail_session: Option<SessionModelState>,
+    tail_session: Option<MultipartTailSessionState>,
     tail_committed: bool,
     tail_fill: Option<u8>,
     object_visible: Option<MultipartVisibleObject>,
@@ -608,6 +676,7 @@ impl MultipartHeadTailModel {
 
     fn legal_ops(&self) -> &'static [MultipartHeadTailTraceOp] {
         use MultipartHeadTailTraceOp::*;
+        use MultipartTailSessionState::*;
         use SessionModelState::*;
         match (
             self.upload_active,
@@ -616,6 +685,7 @@ impl MultipartHeadTailModel {
             self.tail_committed,
         ) {
             (false, false, None, false) => &[CreateUpload],
+            (false, false, Some(Orphan(_)), false) => &[AbortTailSession],
             (true, false, None, false) => &[UploadHeadPart, BeginTailStream, AbortUpload],
             (true, false, None, true) => &[UploadHeadPart, BeginTailStream, AbortUpload],
             (true, true, None, false) => &[
@@ -631,14 +701,30 @@ impl MultipartHeadTailModel {
                 CompleteHeadAndTail,
                 AbortUpload,
             ],
-            (true, false, Some(Empty), false) => &[AppendTailData, AbortTailSession],
-            (true, false, Some(Empty), true) => &[AppendTailData, AbortTailSession],
-            (true, true, Some(Empty), false) => &[AppendTailData, AbortTailSession],
-            (true, true, Some(Empty), true) => &[AppendTailData, AbortTailSession],
-            (true, false, Some(HasData), false) => &[FinalizeTailPart, AbortTailSession],
-            (true, false, Some(HasData), true) => &[FinalizeTailPart, AbortTailSession],
-            (true, true, Some(HasData), false) => &[FinalizeTailPart, AbortTailSession],
-            (true, true, Some(HasData), true) => &[FinalizeTailPart, AbortTailSession],
+            (true, false, Some(Active(Empty)), false) => {
+                &[AppendTailData, AbortUpload, AbortTailSession]
+            }
+            (true, false, Some(Active(Empty)), true) => {
+                &[AppendTailData, AbortUpload, AbortTailSession]
+            }
+            (true, true, Some(Active(Empty)), false) => {
+                &[AppendTailData, AbortUpload, AbortTailSession]
+            }
+            (true, true, Some(Active(Empty)), true) => {
+                &[AppendTailData, AbortUpload, AbortTailSession]
+            }
+            (true, false, Some(Active(HasData)), false) => {
+                &[FinalizeTailPart, AbortUpload, AbortTailSession]
+            }
+            (true, false, Some(Active(HasData)), true) => {
+                &[FinalizeTailPart, AbortUpload, AbortTailSession]
+            }
+            (true, true, Some(Active(HasData)), false) => {
+                &[FinalizeTailPart, AbortUpload, AbortTailSession]
+            }
+            (true, true, Some(Active(HasData)), true) => {
+                &[FinalizeTailPart, AbortUpload, AbortTailSession]
+            }
             _ => &[CreateUpload],
         }
     }
@@ -661,10 +747,10 @@ impl MultipartHeadTailModel {
                 self.next_head_fill = self.next_head_fill.wrapping_add(1);
             }
             BeginTailStream => {
-                self.tail_session = Some(Empty);
+                self.tail_session = Some(MultipartTailSessionState::Active(Empty));
             }
             AppendTailData => {
-                self.tail_session = Some(HasData);
+                self.tail_session = Some(MultipartTailSessionState::Active(HasData));
             }
             FinalizeTailPart => {
                 self.tail_session = None;
@@ -698,7 +784,12 @@ impl MultipartHeadTailModel {
                 self.upload_active = false;
                 self.head_committed = false;
                 self.head_fill = None;
-                self.tail_session = None;
+                self.tail_session = match self.tail_session {
+                    Some(MultipartTailSessionState::Active(state)) => {
+                        Some(MultipartTailSessionState::Orphan(state))
+                    }
+                    other => other,
+                };
                 self.tail_committed = false;
                 self.tail_fill = None;
             }
@@ -949,7 +1040,6 @@ impl SameKeyUploadHarness {
                     test_requester(),
                 ));
                 self.uploads.pop();
-                self.current_session_id = None;
                 self.pending_payload = None;
             }
             SameKeyUploadTraceOp::CompleteOldest => {
@@ -1194,7 +1284,6 @@ impl MultipartHeadTailHarness {
                     ))
                     .unwrap();
                 self.upload_id = None;
-                self.tail_session_id = None;
                 self.head_etag = None;
                 self.head_fill = None;
                 self.tail_etag = None;
