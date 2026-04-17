@@ -268,6 +268,24 @@ Success criteria:
 - the existing fixed regressions are re-expressed as stable invariants
 - failures identify the violated invariant, not just the symptom
 
+Current state:
+
+- in progress
+- new invariant-focused coordinator coverage lives in
+  `crates/server-core/src/coordinator/multipart_stateful_tests.rs`
+- the first moved regressions now assert explicit lifetime invariants for:
+  - streamed multipart part reupload displacing prior shards without orphaning
+  - aborting a streamed multipart upload cleaning committed segment rows and
+    shard data
+  - stale-session scavenging removing abandoned session state
+  - stale-session scavenging leaving committed objects and payloads intact
+  - staged stream-put data remaining invisible until finalize succeeds
+- the helper layer in that module now supports direct inspection of:
+  - active stream sessions
+  - pending multipart uploads
+  - pending reclaim roots
+  - committed multipart part segments for shard-cleanup assertions
+
 ## Phase 2: Multipart and Session Trace Model
 
 Deliver:
