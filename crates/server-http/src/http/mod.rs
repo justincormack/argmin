@@ -3510,8 +3510,6 @@ impl HttpFrontend {
 
         Ok(StreamingPutContext {
             trace: current_trace_context(),
-            bucket: authorized_write.bucket_typed().clone(),
-            key: authorized_write.key_typed().clone(),
             metadata_blob,
             system_metadata,
             cond,
@@ -3536,8 +3534,8 @@ impl HttpFrontend {
             TRACE_TARGET,
             "HttpFrontend::start_streaming_put_session",
             "bucket={:?} key={:?}",
-            ctx.bucket,
-            ctx.key
+            ctx.bucket(),
+            ctx.key()
         );
         self.coordinator
             .begin_stream_put_session(&ctx.authorized_write)
@@ -3556,8 +3554,8 @@ impl HttpFrontend {
             TRACE_TARGET,
             "HttpFrontend::streaming_append_segment",
             "bucket={:?} key={:?} segment_index={} bytes={}",
-            ctx.bucket,
-            ctx.key,
+            ctx.bucket(),
+            ctx.key(),
             segment_index,
             data.len()
         );
@@ -3583,8 +3581,8 @@ impl HttpFrontend {
             TRACE_TARGET,
             "HttpFrontend::put_single_segment_object",
             "bucket={:?} key={:?} bytes={} trailer_checksums={}",
-            ctx.bucket,
-            ctx.key,
+            ctx.bucket(),
+            ctx.key(),
             data.len(),
             trailer_checksums.len()
         );
@@ -3624,8 +3622,8 @@ impl HttpFrontend {
             TRACE_TARGET,
             "HttpFrontend::finalize_streaming_put",
             "bucket={:?} key={:?} bytes={} trailer_checksums={}",
-            ctx.bucket,
-            ctx.key,
+            ctx.bucket(),
+            ctx.key(),
             total_size,
             trailer_checksums.len()
         );
@@ -3658,12 +3656,12 @@ impl HttpFrontend {
             TRACE_TARGET,
             "HttpFrontend::abort_streaming_put",
             "bucket={:?} key={:?}",
-            ctx.bucket,
-            ctx.key
+            ctx.bucket(),
+            ctx.key()
         );
         let _ = self
             .coordinator
-            .abort_stream_put_session(&ctx.bucket, &ctx.key, session_id);
+            .abort_stream_put_session(ctx.bucket(), ctx.key(), session_id);
     }
 
     /// Prepare a streaming `UploadPart` session.
@@ -3759,19 +3757,19 @@ impl HttpFrontend {
             TRACE_TARGET,
             "HttpFrontend::streaming_append_part_segment",
             "bucket={:?} key={:?} upload_id={:?} part_number={} segment_index={} bytes={}",
-            ctx.binding.object.bucket,
-            ctx.binding.object.key,
-            ctx.binding.upload_id,
-            ctx.binding.part_number,
+            ctx.bucket(),
+            ctx.key(),
+            ctx.upload_id(),
+            ctx.part_number(),
             segment_index,
             data.len()
         );
         self.coordinator
             .append_stream_part_data(&crate::coordinator::AppendStreamPartRequest {
-                bucket: ctx.binding.object.bucket.clone(),
-                key: ctx.binding.object.key.clone(),
-                session_id: &ctx.binding.object.session_id,
-                part_number: ctx.binding.part_number,
+                bucket: ctx.bucket().clone(),
+                key: ctx.key().clone(),
+                session_id: ctx.session_id(),
+                part_number: ctx.part_number(),
                 segment_index,
                 data,
                 sse_customer: ctx
@@ -3799,10 +3797,10 @@ impl HttpFrontend {
             TRACE_TARGET,
             "HttpFrontend::finalize_streaming_part",
             "bucket={:?} key={:?} upload_id={:?} part_number={} bytes={} trailer_checksums={}",
-            ctx.binding.object.bucket,
-            ctx.binding.object.key,
-            ctx.binding.upload_id,
-            ctx.binding.part_number,
+            ctx.bucket(),
+            ctx.key(),
+            ctx.upload_id(),
+            ctx.part_number(),
             total_size,
             trailer_checksums.len()
         );
@@ -3823,14 +3821,14 @@ impl HttpFrontend {
             .coordinator
             .finalize_stream_part(FinalizeStreamPartRequest {
                 upload: MultipartObjectRequest::new_typed(
-                    ctx.binding.object.bucket.clone(),
-                    ctx.binding.object.key.clone(),
-                    ctx.binding.upload_id.clone(),
+                    ctx.bucket().clone(),
+                    ctx.key().clone(),
+                    ctx.upload_id().clone(),
                     ctx.requester.clone(),
                     ctx.expected_bucket_owner.as_deref(),
                 ),
-                session_id: &ctx.binding.object.session_id,
-                part_number: ctx.binding.part_number,
+                session_id: ctx.session_id(),
+                part_number: ctx.part_number(),
                 crc64,
                 total_size,
                 claimed_checksum: effective_claim,
@@ -3888,16 +3886,14 @@ impl HttpFrontend {
             TRACE_TARGET,
             "HttpFrontend::abort_streaming_part",
             "bucket={:?} key={:?} upload_id={:?} part_number={}",
-            ctx.binding.object.bucket,
-            ctx.binding.object.key,
-            ctx.binding.upload_id,
-            ctx.binding.part_number
+            ctx.bucket(),
+            ctx.key(),
+            ctx.upload_id(),
+            ctx.part_number()
         );
-        let _ = self.coordinator.abort_stream_part_session(
-            &ctx.binding.object.bucket,
-            &ctx.binding.object.key,
-            &ctx.binding.object.session_id,
-        );
+        let _ =
+            self.coordinator
+                .abort_stream_part_session(ctx.bucket(), ctx.key(), ctx.session_id());
     }
 }
 
@@ -3937,8 +3933,6 @@ struct StreamingPartChecksumContract {
 /// Created by `prepare_streaming_put`, used across async/blocking boundaries.
 struct StreamingPutContext {
     trace: observability::TraceContext,
-    bucket: BucketName,
-    key: ObjectKey,
     metadata_blob: crate::metadata_blob::MetadataBlob,
     system_metadata: SystemMetadata,
     cond: crate::conditional::WriteCondition,
@@ -3987,6 +3981,18 @@ impl StreamObjectBinding {
             key,
         }
     }
+
+    fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    fn bucket(&self) -> &BucketName {
+        &self.bucket
+    }
+
+    fn key(&self) -> &ObjectKey {
+        &self.key
+    }
 }
 
 impl StreamPartBinding {
@@ -3996,6 +4002,58 @@ impl StreamPartBinding {
             upload_id,
             part_number,
         }
+    }
+
+    fn session_id(&self) -> &SessionId {
+        self.object.session_id()
+    }
+
+    fn bucket(&self) -> &BucketName {
+        self.object.bucket()
+    }
+
+    fn key(&self) -> &ObjectKey {
+        self.object.key()
+    }
+
+    fn upload_id(&self) -> &UploadId {
+        &self.upload_id
+    }
+
+    fn part_number(&self) -> u32 {
+        self.part_number
+    }
+}
+
+impl StreamingPutContext {
+    fn bucket(&self) -> &BucketName {
+        self.authorized_write.bucket_typed()
+    }
+
+    fn key(&self) -> &ObjectKey {
+        self.authorized_write.key_typed()
+    }
+}
+
+impl StreamingPartContext {
+    fn session_id(&self) -> &SessionId {
+        self.binding.session_id()
+    }
+
+    fn bucket(&self) -> &BucketName {
+        self.binding.bucket()
+    }
+
+    fn key(&self) -> &ObjectKey {
+        self.binding.key()
+    }
+
+    fn upload_id(&self) -> &UploadId {
+        self.binding.upload_id()
+    }
+
+    fn part_number(&self) -> u32 {
+        self.binding.part_number()
     }
 }
 
@@ -8331,7 +8389,7 @@ mod tests {
         let ctx = fe
             .prepare_streaming_put(&req, "mybucket", "mykey", false)
             .unwrap();
-        assert_eq!(ctx.key, "mykey");
+        assert_eq!(ctx.key().as_str(), "mykey");
     }
 
     #[test]

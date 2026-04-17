@@ -1873,8 +1873,8 @@ async fn handle_streaming_put(
         "streaming_put_body_read_complete",
         format_args!(
             "bucket={:?} key={:?} session_id={:?} body_bytes_received={} full_segments_flushed={} buffered_tail_bytes={} data_frames={} frame_wait_us={} decode_us={} ingest_local_us={} append_wait_us={}",
-            ctx.bucket,
-            ctx.key,
+            ctx.bucket(),
+            ctx.key(),
             streaming_put_session_label(session_id.as_ref()),
             total_size,
             segment_index,
@@ -1973,8 +1973,8 @@ async fn handle_streaming_put(
             "streaming_put_direct_ready",
             format_args!(
                 "bucket={:?} key={:?} body_bytes_received={} segment_bytes={} trailer_checksums={}",
-                ctx.bucket,
-                ctx.key,
+                ctx.bucket(),
+                ctx.key(),
                 total_size,
                 buf.len(),
                 trailer_checksums.len()
@@ -2002,8 +2002,8 @@ async fn handle_streaming_put(
             "streaming_put_tail_segment_ready",
             format_args!(
                 "bucket={:?} key={:?} session_id={:?} segment_index={} segment_bytes={} body_bytes_received={}",
-                ctx.bucket,
-                ctx.key,
+                ctx.bucket(),
+                ctx.key(),
                 streaming_put_session_label(session_id.as_ref()),
                 idx,
                 buf.len(),
@@ -2032,8 +2032,8 @@ async fn handle_streaming_put(
         "streaming_put_finalize_ready",
         format_args!(
             "bucket={:?} key={:?} session_id={:?} body_bytes_received={} segment_count={} trailer_checksums={}",
-            ctx.bucket,
-            ctx.key,
+            ctx.bucket(),
+            ctx.key(),
             active_session_id,
             total_size,
             segment_index,
@@ -2047,8 +2047,8 @@ async fn handle_streaming_put(
         "streaming_put_finalize_dispatch",
         format_args!(
             "bucket={:?} key={:?} session_id={:?} body_bytes_received={} segment_count={} trailer_checksums={}",
-            ctx.bucket,
-            ctx.key,
+            ctx.bucket(),
+            ctx.key(),
             active_session_id,
             total_size,
             segment_index,
@@ -2063,7 +2063,10 @@ async fn handle_streaming_put(
             "streaming_put_finalize_worker_start",
             format_args!(
                 "bucket={:?} key={:?} session_id={:?} body_bytes_received={}",
-                ctx_ref.bucket, ctx_ref.key, session_id_for_finalize, total_size
+                ctx_ref.bucket(),
+                ctx_ref.key(),
+                session_id_for_finalize,
+                total_size
             ),
         );
         let frontend = acquire_frontend(&st);
@@ -2072,7 +2075,10 @@ async fn handle_streaming_put(
             "streaming_put_finalize_frontend_acquired",
             format_args!(
                 "bucket={:?} key={:?} session_id={:?} body_bytes_received={}",
-                ctx_ref.bucket, ctx_ref.key, session_id_for_finalize, total_size
+                ctx_ref.bucket(),
+                ctx_ref.key(),
+                session_id_for_finalize,
+                total_size
             ),
         );
         frontend.finalize_streaming_put(
@@ -2155,7 +2161,9 @@ async fn ensure_streaming_put_session(
         "streaming_put_session_start_dispatch",
         format_args!(
             "bucket={:?} key={:?} body_bytes_received={}",
-            ctx.bucket, ctx.key, body_bytes_received
+            ctx.bucket(),
+            ctx.key(),
+            body_bytes_received
         ),
     );
     let ctx_ref = Arc::clone(ctx);
@@ -2165,13 +2173,13 @@ async fn ensure_streaming_put_session(
         emit_streaming_put_event(
             &ctx_ref,
             "streaming_put_session_start_worker",
-            format_args!("bucket={:?} key={:?}", ctx_ref.bucket, ctx_ref.key),
+            format_args!("bucket={:?} key={:?}", ctx_ref.bucket(), ctx_ref.key()),
         );
         let frontend = acquire_frontend(&st);
         emit_streaming_put_event(
             &ctx_ref,
             "streaming_put_session_start_frontend_acquired",
-            format_args!("bucket={:?} key={:?}", ctx_ref.bucket, ctx_ref.key),
+            format_args!("bucket={:?} key={:?}", ctx_ref.bucket(), ctx_ref.key()),
         );
         frontend.start_streaming_put_session(&ctx_ref)
     })
@@ -2183,7 +2191,10 @@ async fn ensure_streaming_put_session(
                 "streaming_put_session_started",
                 format_args!(
                     "bucket={:?} key={:?} session_id={:?} body_bytes_received={}",
-                    ctx.bucket, ctx.key, new_session_id, body_bytes_received
+                    ctx.bucket(),
+                    ctx.key(),
+                    new_session_id,
+                    body_bytes_received
                 ),
             );
             *session_id = Some(new_session_id);
@@ -2213,8 +2224,8 @@ async fn append_streaming_put_buffer(
         "streaming_put_segment_ready",
         format_args!(
             "bucket={:?} key={:?} session_id={:?} segment_index={} segment_bytes={} body_bytes_received={}",
-            ctx.bucket,
-            ctx.key,
+            ctx.bucket(),
+            ctx.key(),
             session_id_value,
             idx,
             flush_data.len(),
@@ -2229,8 +2240,8 @@ async fn append_streaming_put_buffer(
         "streaming_put_append_dispatch",
         format_args!(
             "bucket={:?} key={:?} session_id={:?} segment_index={} segment_bytes={} body_bytes_received={}",
-            ctx.bucket,
-            ctx.key,
+            ctx.bucket(),
+            ctx.key(),
             session_id_value,
             idx,
             flush_data.len(),
@@ -2245,8 +2256,8 @@ async fn append_streaming_put_buffer(
             "streaming_put_append_worker_start",
             format_args!(
                 "bucket={:?} key={:?} session_id={:?} segment_index={} segment_bytes={}",
-                ctx_ref.bucket,
-                ctx_ref.key,
+                ctx_ref.bucket(),
+                ctx_ref.key(),
                 session_id_owned,
                 idx,
                 flush_data.len()
@@ -2258,8 +2269,8 @@ async fn append_streaming_put_buffer(
             "streaming_put_append_frontend_acquired",
             format_args!(
                 "bucket={:?} key={:?} session_id={:?} segment_index={} segment_bytes={}",
-                ctx_ref.bucket,
-                ctx_ref.key,
+                ctx_ref.bucket(),
+                ctx_ref.key(),
                 session_id_owned,
                 idx,
                 flush_data.len()
@@ -2323,8 +2334,8 @@ async fn ingest_streaming_put_payload(
             "streaming_put_body_started",
             format_args!(
                 "bucket={:?} key={:?} session_id={:?} frame_bytes={} body_bytes_received={}",
-                ctx.bucket,
-                ctx.key,
+                ctx.bucket(),
+                ctx.key(),
                 streaming_put_session_label(ingest.session_id.as_ref()),
                 payload.len(),
                 *ingest.total_size
@@ -2531,11 +2542,11 @@ async fn handle_streaming_part(
         "streaming_part_body_read_complete",
         format_args!(
             "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} body_bytes_received={} full_segments_flushed={} buffered_tail_bytes={} data_frames={} frame_wait_us={} decode_us={} ingest_local_us={} append_wait_us={}",
-            ctx.binding.object.bucket,
-            ctx.binding.object.key,
-            ctx.binding.upload_id,
-            ctx.binding.part_number,
-            ctx.binding.object.session_id,
+            ctx.bucket(),
+            ctx.key(),
+            ctx.upload_id(),
+            ctx.part_number(),
+            ctx.session_id(),
             total_size,
             segment_index,
             buf.len(),
@@ -2639,11 +2650,11 @@ async fn handle_streaming_part(
             "streaming_part_tail_segment_ready",
             format_args!(
                 "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} segment_index={} segment_bytes={} body_bytes_received={}",
-                ctx.binding.object.bucket,
-                ctx.binding.object.key,
-                ctx.binding.upload_id,
-                ctx.binding.part_number,
-                ctx.binding.object.session_id,
+                ctx.bucket(),
+                ctx.key(),
+                ctx.upload_id(),
+                ctx.part_number(),
+                ctx.session_id(),
                 idx,
                 buf.len(),
                 total_size
@@ -2656,11 +2667,11 @@ async fn handle_streaming_part(
             "streaming_part_append_dispatch",
             format_args!(
                 "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} segment_index={} segment_bytes={} body_bytes_received={}",
-                ctx.binding.object.bucket,
-                ctx.binding.object.key,
-                ctx.binding.upload_id,
-                ctx.binding.part_number,
-                ctx.binding.object.session_id,
+                ctx.bucket(),
+                ctx.key(),
+                ctx.upload_id(),
+                ctx.part_number(),
+                ctx.session_id(),
                 idx,
                 buf.len(),
                 total_size
@@ -2673,11 +2684,11 @@ async fn handle_streaming_part(
                 "streaming_part_append_worker_start",
                 format_args!(
                     "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} segment_index={} segment_bytes={}",
-                    ctx_ref.binding.object.bucket,
-                    ctx_ref.binding.object.key,
-                    ctx_ref.binding.upload_id,
-                    ctx_ref.binding.part_number,
-                    ctx_ref.binding.object.session_id,
+                    ctx_ref.bucket(),
+                    ctx_ref.key(),
+                    ctx_ref.upload_id(),
+                    ctx_ref.part_number(),
+                    ctx_ref.session_id(),
                     idx,
                     buf.len()
                 ),
@@ -2688,11 +2699,11 @@ async fn handle_streaming_part(
                 "streaming_part_append_frontend_acquired",
                 format_args!(
                     "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} segment_index={} segment_bytes={}",
-                    ctx_ref.binding.object.bucket,
-                    ctx_ref.binding.object.key,
-                    ctx_ref.binding.upload_id,
-                    ctx_ref.binding.part_number,
-                    ctx_ref.binding.object.session_id,
+                    ctx_ref.bucket(),
+                    ctx_ref.key(),
+                    ctx_ref.upload_id(),
+                    ctx_ref.part_number(),
+                    ctx_ref.session_id(),
                     idx,
                     buf.len()
                 ),
@@ -2721,11 +2732,11 @@ async fn handle_streaming_part(
         "streaming_part_finalize_ready",
         format_args!(
             "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} body_bytes_received={} segment_count={} trailer_checksums={}",
-            ctx.binding.object.bucket,
-            ctx.binding.object.key,
-            ctx.binding.upload_id,
-            ctx.binding.part_number,
-            ctx.binding.object.session_id,
+            ctx.bucket(),
+            ctx.key(),
+            ctx.upload_id(),
+            ctx.part_number(),
+            ctx.session_id(),
             total_size,
             segment_index + u32::from(had_tail),
             trailer_checksums.len()
@@ -2738,11 +2749,11 @@ async fn handle_streaming_part(
         "streaming_part_finalize_dispatch",
         format_args!(
             "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} body_bytes_received={} segment_count={} trailer_checksums={}",
-            ctx.binding.object.bucket,
-            ctx.binding.object.key,
-            ctx.binding.upload_id,
-            ctx.binding.part_number,
-            ctx.binding.object.session_id,
+            ctx.bucket(),
+            ctx.key(),
+            ctx.upload_id(),
+            ctx.part_number(),
+            ctx.session_id(),
             total_size,
             segment_index + u32::from(had_tail),
             trailer_checksums.len()
@@ -2755,11 +2766,11 @@ async fn handle_streaming_part(
             "streaming_part_finalize_worker_start",
             format_args!(
                 "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} body_bytes_received={}",
-                ctx_ref.binding.object.bucket,
-                ctx_ref.binding.object.key,
-                ctx_ref.binding.upload_id,
-                ctx_ref.binding.part_number,
-                ctx_ref.binding.object.session_id,
+                ctx_ref.bucket(),
+                ctx_ref.key(),
+                ctx_ref.upload_id(),
+                ctx_ref.part_number(),
+                ctx_ref.session_id(),
                 total_size
             ),
         );
@@ -2769,11 +2780,11 @@ async fn handle_streaming_part(
             "streaming_part_finalize_frontend_acquired",
             format_args!(
                 "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} body_bytes_received={}",
-                ctx_ref.binding.object.bucket,
-                ctx_ref.binding.object.key,
-                ctx_ref.binding.upload_id,
-                ctx_ref.binding.part_number,
-                ctx_ref.binding.object.session_id,
+                ctx_ref.bucket(),
+                ctx_ref.key(),
+                ctx_ref.upload_id(),
+                ctx_ref.part_number(),
+                ctx_ref.session_id(),
                 total_size
             ),
         );
@@ -2869,11 +2880,11 @@ async fn ingest_streaming_part_payload(
             "streaming_part_body_started",
             format_args!(
                 "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} frame_bytes={} body_bytes_received={}",
-                ctx.binding.object.bucket,
-                ctx.binding.object.key,
-                ctx.binding.upload_id,
-                ctx.binding.part_number,
-                ctx.binding.object.session_id,
+                ctx.bucket(),
+                ctx.key(),
+                ctx.upload_id(),
+                ctx.part_number(),
+                ctx.session_id(),
                 payload.len(),
                 *ingest.total_size
             ),
@@ -2902,11 +2913,11 @@ async fn ingest_streaming_part_payload(
             "streaming_part_segment_ready",
             format_args!(
                 "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} segment_index={} segment_bytes={} body_bytes_received={}",
-                ctx.binding.object.bucket,
-                ctx.binding.object.key,
-                ctx.binding.upload_id,
-                ctx.binding.part_number,
-                ctx.binding.object.session_id,
+                ctx.bucket(),
+                ctx.key(),
+                ctx.upload_id(),
+                ctx.part_number(),
+                ctx.session_id(),
                 idx,
                 flush_data.len(),
                 *ingest.total_size
@@ -2921,11 +2932,11 @@ async fn ingest_streaming_part_payload(
             "streaming_part_append_dispatch",
             format_args!(
                 "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} segment_index={} segment_bytes={} body_bytes_received={}",
-                ctx.binding.object.bucket,
-                ctx.binding.object.key,
-                ctx.binding.upload_id,
-                ctx.binding.part_number,
-                ctx.binding.object.session_id,
+                ctx.bucket(),
+                ctx.key(),
+                ctx.upload_id(),
+                ctx.part_number(),
+                ctx.session_id(),
                 idx,
                 flush_data.len(),
                 *ingest.total_size
@@ -2938,11 +2949,11 @@ async fn ingest_streaming_part_payload(
                 "streaming_part_append_worker_start",
                 format_args!(
                     "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} segment_index={} segment_bytes={}",
-                    ctx_ref.binding.object.bucket,
-                    ctx_ref.binding.object.key,
-                    ctx_ref.binding.upload_id,
-                    ctx_ref.binding.part_number,
-                    ctx_ref.binding.object.session_id,
+                    ctx_ref.bucket(),
+                    ctx_ref.key(),
+                    ctx_ref.upload_id(),
+                    ctx_ref.part_number(),
+                    ctx_ref.session_id(),
                     idx,
                     flush_data.len()
                 ),
@@ -2953,11 +2964,11 @@ async fn ingest_streaming_part_payload(
                 "streaming_part_append_frontend_acquired",
                 format_args!(
                     "bucket={:?} key={:?} upload_id={:?} part_number={} session_id={:?} segment_index={} segment_bytes={}",
-                    ctx_ref.binding.object.bucket,
-                    ctx_ref.binding.object.key,
-                    ctx_ref.binding.upload_id,
-                    ctx_ref.binding.part_number,
-                    ctx_ref.binding.object.session_id,
+                    ctx_ref.bucket(),
+                    ctx_ref.key(),
+                    ctx_ref.upload_id(),
+                    ctx_ref.part_number(),
+                    ctx_ref.session_id(),
                     idx,
                     flush_data.len()
                 ),
