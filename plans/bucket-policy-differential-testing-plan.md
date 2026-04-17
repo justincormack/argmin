@@ -201,6 +201,22 @@ Success criteria:
 - failures print a scenario a reviewer can read without replaying a huge fuzz
   input
 
+Current state:
+
+- [x] Added `crates/auth/tests/bucket_policy_differential.rs` as a dedicated
+  local differential test module.
+- [x] The Phase 1 generator stays inside the currently supported evaluable
+  object-policy subset and renders real policy JSON plus a compact
+  `PolicyRequest` builder snippet on failure.
+- [x] The initial offline metamorphic checks now cover:
+  - `normalized_json()` round-trips preserving evaluation
+  - scalar-versus-singleton-array JSON forms preserving evaluation
+  - adding a guaranteed non-matching statement preserving evaluation
+  - equivalent statement expansion preserving evaluation
+  - deny-precedence stability under statement reordering
+- [x] Proptest failure persistence is enabled so minimized evaluator drift is
+  saved as a regression seed under `crates/auth/tests/`.
+
 ## Phase 2: Local Request-Context Differential Matrix
 
 Add a bounded randomized matrix over the request-context fields most likely to
