@@ -14,7 +14,6 @@ use std::sync::Arc;
 const TRACE_BUCKET: &str = "bucket";
 const TRACE_KEY: &str = "key";
 const TRACE_PART_DATA: &[u8] = b"trace-part";
-const TRACE_TAIL_DATA: &[u8] = b"trace-tail";
 const TRACE_MIN_PART_SIZE: usize = 5 * 1024 * 1024;
 const TRACE_MAX_OPS: usize = 10;
 const NO_READ: &ReadCondition = &ReadCondition {
@@ -492,16 +491,16 @@ impl std::fmt::Display for MultipartHeadTailTraceOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MultipartVisibleObject {
     HeadOnly(u8),
-    HeadAndTail(u8),
+    HeadAndTail(u8, u8),
 }
 
 impl MultipartVisibleObject {
     fn body(self) -> Vec<u8> {
         match self {
             Self::HeadOnly(fill) => make_trace_head_data(fill),
-            Self::HeadAndTail(fill) => {
-                let mut out = make_trace_head_data(fill);
-                out.extend_from_slice(TRACE_TAIL_DATA);
+            Self::HeadAndTail(head_fill, tail_fill) => {
+                let mut out = make_trace_head_data(head_fill);
+                out.extend_from_slice(format!("trace-tail-{tail_fill}").as_bytes());
                 out
             }
         }
@@ -515,8 +514,10 @@ struct MultipartHeadTailModel {
     head_fill: Option<u8>,
     tail_session: Option<SessionModelState>,
     tail_committed: bool,
+    tail_fill: Option<u8>,
     object_visible: Option<MultipartVisibleObject>,
     next_head_fill: u8,
+    next_tail_fill: u8,
 }
 
 impl MultipartHeadTailModel {
@@ -527,8 +528,10 @@ impl MultipartHeadTailModel {
             head_fill: None,
             tail_session: None,
             tail_committed: false,
+            tail_fill: None,
             object_visible: None,
             next_head_fill: 0xA1,
+            next_tail_fill: 0xB1,
         }
     }
 
@@ -579,6 +582,7 @@ impl MultipartHeadTailModel {
                 self.head_fill = None;
                 self.tail_session = None;
                 self.tail_committed = false;
+                self.tail_fill = None;
             }
             UploadHeadPart => {
                 self.head_committed = true;
@@ -594,6 +598,8 @@ impl MultipartHeadTailModel {
             FinalizeTailPart => {
                 self.tail_session = None;
                 self.tail_committed = true;
+                self.tail_fill = Some(self.next_tail_fill);
+                self.next_tail_fill = self.next_tail_fill.wrapping_add(1);
             }
             CompleteHeadOnly => {
                 let head_fill = self.head_fill.unwrap();
@@ -602,16 +608,20 @@ impl MultipartHeadTailModel {
                 self.head_fill = None;
                 self.tail_session = None;
                 self.tail_committed = false;
+                self.tail_fill = None;
                 self.object_visible = Some(MultipartVisibleObject::HeadOnly(head_fill));
             }
             CompleteHeadAndTail => {
                 let head_fill = self.head_fill.unwrap();
+                let tail_fill = self.tail_fill.unwrap();
                 self.upload_active = false;
                 self.head_committed = false;
                 self.head_fill = None;
                 self.tail_session = None;
                 self.tail_committed = false;
-                self.object_visible = Some(MultipartVisibleObject::HeadAndTail(head_fill));
+                self.tail_fill = None;
+                self.object_visible =
+                    Some(MultipartVisibleObject::HeadAndTail(head_fill, tail_fill));
             }
             AbortUpload => {
                 self.upload_active = false;
@@ -619,6 +629,7 @@ impl MultipartHeadTailModel {
                 self.head_fill = None;
                 self.tail_session = None;
                 self.tail_committed = false;
+                self.tail_fill = None;
             }
             AbortTailSession => {
                 self.tail_session = None;
@@ -727,6 +738,8 @@ struct MultipartHeadTailHarness {
     head_fill: Option<u8>,
     tail_etag: Option<String>,
     next_head_fill: u8,
+    tail_payload: Option<Vec<u8>>,
+    next_tail_fill: u8,
 }
 
 impl SameKeyUploadHarness {
@@ -871,6 +884,8 @@ impl MultipartHeadTailHarness {
             head_fill: None,
             tail_etag: None,
             next_head_fill: 0xA1,
+            tail_payload: None,
+            next_tail_fill: 0xB1,
         }
     }
 
@@ -883,6 +898,7 @@ impl MultipartHeadTailHarness {
                 self.head_etag = None;
                 self.head_fill = None;
                 self.tail_etag = None;
+                self.tail_payload = None;
             }
             MultipartHeadTailTraceOp::UploadHeadPart => {
                 let upload_id = self.upload_id.as_ref().unwrap();
@@ -907,19 +923,23 @@ impl MultipartHeadTailHarness {
             }
             MultipartHeadTailTraceOp::AppendTailData => {
                 let session_id = self.tail_session_id.as_ref().unwrap();
+                let tail_fill = self.next_tail_fill;
+                let tail_payload = format!("trace-tail-{tail_fill}").into_bytes();
                 self.coord
                     .append_plaintext_stream_segment_for_test(
                         TRACE_BUCKET,
                         TRACE_KEY,
                         session_id,
                         0,
-                        TRACE_TAIL_DATA,
+                        &tail_payload,
                     )
                     .unwrap();
+                self.tail_payload = Some(tail_payload);
             }
             MultipartHeadTailTraceOp::FinalizeTailPart => {
                 let upload_id = self.upload_id.as_ref().unwrap();
                 let session_id = self.tail_session_id.as_ref().unwrap();
+                let tail_payload = self.tail_payload.as_ref().unwrap();
                 self.tail_etag = Some(
                     self.coord
                         .finalize_stream_part(FinalizeStreamPartRequest {
@@ -931,14 +951,15 @@ impl MultipartHeadTailHarness {
                             ),
                             session_id,
                             part_number: 2,
-                            crc64: checksum::crc64::checksum(TRACE_TAIL_DATA),
-                            total_size: TRACE_TAIL_DATA.len() as u64,
+                            crc64: checksum::crc64::checksum(tail_payload),
+                            total_size: tail_payload.len() as u64,
                             claimed_checksum: None,
                             computed_checksum: None,
                         })
                         .unwrap()
                         .etag,
                 );
+                self.next_tail_fill = self.next_tail_fill.wrapping_add(1);
                 self.tail_session_id = None;
             }
             MultipartHeadTailTraceOp::CompleteHeadOnly => {
@@ -968,6 +989,7 @@ impl MultipartHeadTailHarness {
                 self.head_etag = None;
                 self.head_fill = None;
                 self.tail_etag = None;
+                self.tail_payload = None;
             }
             MultipartHeadTailTraceOp::CompleteHeadAndTail => {
                 let upload_id = self.upload_id.as_ref().unwrap();
@@ -1004,6 +1026,7 @@ impl MultipartHeadTailHarness {
                 self.head_etag = None;
                 self.head_fill = None;
                 self.tail_etag = None;
+                self.tail_payload = None;
             }
             MultipartHeadTailTraceOp::AbortUpload => {
                 let upload_id = self.upload_id.as_ref().unwrap();
@@ -1020,6 +1043,7 @@ impl MultipartHeadTailHarness {
                 self.head_etag = None;
                 self.head_fill = None;
                 self.tail_etag = None;
+                self.tail_payload = None;
             }
             MultipartHeadTailTraceOp::AbortTailSession => {
                 let session_id = self.tail_session_id.as_ref().unwrap();
@@ -1031,6 +1055,7 @@ impl MultipartHeadTailHarness {
                     )
                     .unwrap();
                 self.tail_session_id = None;
+                self.tail_payload = None;
             }
         }
     }

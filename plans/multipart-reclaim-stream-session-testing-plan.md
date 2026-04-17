@@ -362,6 +362,8 @@ Current state:
   - one buffered head part at the AWS minimum non-final part size, with
     distinct overwrite payloads so same-part winner identity is observable
   - one streamed tail part with explicit session begin/append/finalize/abort
+    and distinct refinalize payloads so streamed same-part winner identity is
+    observable too
   - complete-head-only versus complete-head-and-tail terminal choices
   - checks that pending upload presence, `ListParts` part-number visibility,
     active tail-session presence, and visible object body stay aligned with the
