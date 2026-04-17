@@ -28,6 +28,9 @@ cargo clippy --all-targets --all-features -- -D warnings
 # Integration coverage.
 ./scripts/coverage
 
+# Sweep all fuzz targets for a fixed time budget each.
+./scripts/fuzz
+
 # Local-only S3 behavior tests.
 cargo test -p s3-local-tests
 
@@ -390,6 +393,11 @@ surfaces called out in the threat model:
 Useful commands:
 
 ```bash
+# Run the checked-in all-target wrapper (10m per target by default).
+./scripts/fuzz
+./scripts/fuzz --time 2m
+./scripts/fuzz auth_bucket_policy server_http_parsers
+
 # List targets.
 cd fuzz
 cargo fuzz list
