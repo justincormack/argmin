@@ -1125,25 +1125,11 @@ Current state:
   and the coordinator regression for dedicated `GetBucketLocation` allow stay
   in place as the external anchor for the modeled rules.
 
-### Phase 12: Optional Stateful Expansion
+### Follow-up
 
-After phases 1-11 are solid, consider a bounded stateful generator using
-`proptest` for short authz traces.
-
-Possible generated operations:
-
-- set ownership controls
-- set public-access-block
-- set or delete narrow bucket policy
-- put object with a constrained ACL shape
-- copy object with constrained destination headers
-- change object ACL
-- update bucket ACL with constrained request context
-- change bucket versioning state
-- delete object or object version with bounded object-lock state
-- read or mutate object tags
-
-This is explicitly follow-up work. Do not start here.
+The optional bounded stateful expansion has been split out into
+`plans/authz-model-stateful-followup-plan.md` so this plan can close at the
+completed fixed-matrix milestone.
 
 ## Model Rules That Must Be Explicit
 
