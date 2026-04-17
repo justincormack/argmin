@@ -139,19 +139,27 @@ Related note:
 
 - [guides/threat_model.md](/home/justin/src/github.com/justincormack/argmin/guides/threat_model.md)
 
-### 6. Requester Pays is not implemented
+### 6. Billing surfaces are not implemented
 
-Requester Pays is a real AWS compatibility gap and is not implemented yet.
+Argmin does not implement AWS billing behavior.
 
-That includes the main wire-visible surface:
+This is broader than one missing header or bucket flag. Matching AWS here would
+require a real billing model with charge attribution, owner-versus-requester
+cost semantics, and the corresponding request / response behavior across the
+affected APIs. That infrastructure is not currently planned.
+
+#### Requester Pays
+
+Requester Pays is therefore also not implemented.
+
+This remains a real AWS compatibility gap, but it does not make sense as a
+standalone feature without the wider billing surface behind it.
+
+The missing wire-visible surface includes:
 
 - bucket requester-pays configuration
 - `x-amz-request-payer: requester`
 - `x-amz-request-charged: requester`
-
-Related note:
-
-- [plans/requester-pays-note.md](/home/justin/src/github.com/justincormack/argmin/plans/requester-pays-note.md)
 
 ### 7. MFA Delete on bucket versioning is not implemented
 
