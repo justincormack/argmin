@@ -12,18 +12,24 @@ targets=(
     "crates/server-http/src"
 )
 
+filter_noise() {
+    grep -Ev \
+        'to_vec\(\)|extend_from_slice|encode\(&digest\[\.\.\]\)|parser\.feed\(&body\[\.\.|let header_bytes = &header_block\[\.\.|let date_short = &date_long\[\.\.8\]|weekdays\[weekday\]'
+}
+
 show_matches() {
     local label=$1
     local pattern=$2
 
     echo
     echo "== $label =="
-    rg -n --color=never "$pattern" "${targets[@]}" || true
+    rg -n --color=never "$pattern" "${targets[@]}" | filter_noise || true
 }
 
 echo "Parser hotspot sweep"
 echo "This is an advisory review helper, not a correctness proof."
 echo "Matches may be safe after prior validation and still require human review."
+echo "Obvious byte-buffer plumbing and generated-string slices are suppressed."
 
 show_matches "byte slicing and split_at" '\[\.\.|split_at\('
 show_matches "split-based parser sites" 'splitn\(|split_once\('
