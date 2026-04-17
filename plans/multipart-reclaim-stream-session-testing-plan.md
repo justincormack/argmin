@@ -329,7 +329,7 @@ Success criteria:
 
 Current state:
 
-- in progress
+- complete
 - new bounded trace coverage lives in
   `crates/server-core/src/coordinator/multipart_trace_tests.rs`
 - the first Phase 2 property is intentionally narrow:
@@ -357,7 +357,12 @@ Current state:
   - begin/append/finalize/abort-session on the newest upload and
     complete/abort on newest versus oldest upload, including aborting the
     newest upload while its session remains orphaned until explicit cleanup,
+    and completing the current upload while a live replacement session exists
+    now also preserving that session as orphaned until explicit cleanup,
     without widening to a general N-upload model yet
+  - duplicate abort replay against the last terminated upload id and duplicate
+    complete replay against the last successfully completed upload id are now
+    included in this same-key trace as inert replays
   - checks that pending upload ordering, active session presence, per-upload
     `ListParts`, and visible object winner identity stay aligned with the
     model after each step
@@ -371,6 +376,9 @@ Current state:
   - complete-head-only versus complete-head-and-tail terminal choices
   - abort-upload while the tail session is still live, with orphaned session
     cleanup modeled explicitly afterward
+  - duplicate abort replay against the last terminated upload id and duplicate
+    complete replay against the last successfully completed composed upload are
+    now included in this head-plus-tail trace too
   - checks that pending upload presence, `ListParts` part-number visibility,
     active tail-session presence, and visible object body stay aligned with the
     model after each step
