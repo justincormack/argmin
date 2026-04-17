@@ -2994,7 +2994,7 @@ impl HttpFrontend {
     /// Prepare a streaming `PostObject` session after multipart field parsing.
     ///
     /// `form_fields` are non-file multipart fields parsed in order.
-    pub fn prepare_streaming_post_object(
+    fn prepare_streaming_post_object(
         &self,
         req: &S3Request,
         bucket: &str,
@@ -3165,13 +3165,7 @@ impl HttpFrontend {
 
         Ok(StreamingPostContext {
             trace: current_trace_context(),
-            binding: StreamObjectBinding {
-                session_id: prepared_put.session_id,
-                bucket: bucket_name,
-                key,
-            },
-            requester,
-            acl_header: field("acl").map(std::string::ToString::to_string),
+            binding: StreamObjectBinding::new(prepared_put.session_id, bucket_name, key),
             metadata_blob,
             system_metadata,
             success_status,
@@ -3181,15 +3175,13 @@ impl HttpFrontend {
             policy_b64: field("policy").map(std::string::ToString::to_string),
             checksum_sha256_b64: field("x-amz-checksum-sha256")
                 .map(std::string::ToString::to_string),
-            tags_xml,
-            managed_encryption,
             sse_customer: sse_customer_request,
             authorized_write: prepared_put.authorized_write,
         })
     }
 
     /// Finalize a streaming `PostObject` session and return a POST response.
-    pub fn finalize_streaming_post_object(
+    fn finalize_streaming_post_object(
         &self,
         ctx: &StreamingPostContext,
         crc64: u64,
@@ -3286,7 +3278,7 @@ impl HttpFrontend {
     }
 
     /// Append a segment to a streaming POST session.
-    pub fn streaming_append_post_segment(
+    fn streaming_append_post_segment(
         &self,
         ctx: &StreamingPostContext,
         segment_index: u32,
@@ -3313,7 +3305,7 @@ impl HttpFrontend {
     }
 
     /// Abort a streaming POST session (best-effort cleanup).
-    pub fn abort_streaming_post_object(&self, ctx: &StreamingPostContext) {
+    fn abort_streaming_post_object(&self, ctx: &StreamingPostContext) {
         let _trace = observability::AttachedTrace::new(ctx.trace.clone());
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3384,7 +3376,7 @@ impl HttpFrontend {
     /// Returns a context struct that the async streaming loop uses to drive
     /// either the direct single-segment fast path or a promoted streaming
     /// session once the body exceeds one internal segment.
-    pub fn prepare_streaming_put(
+    fn prepare_streaming_put(
         &self,
         req: &S3Request,
         bucket: &str,
@@ -3520,25 +3512,13 @@ impl HttpFrontend {
             trace: current_trace_context(),
             bucket: authorized_write.bucket_typed().clone(),
             key: authorized_write.key_typed().clone(),
-            requester,
-            expected_bucket_owner: expected_bucket_owner(req).map(str::to_string),
-            acl_header: req.header("x-amz-acl").map(str::to_string),
-            grant_read_header: req.header("x-amz-grant-read").map(str::to_string),
-            grant_write_header: req.header("x-amz-grant-write").map(str::to_string),
-            grant_read_acp_header: req.header("x-amz-grant-read-acp").map(str::to_string),
-            grant_write_acp_header: req.header("x-amz-grant-write-acp").map(str::to_string),
-            grant_full_control_header: req.header("x-amz-grant-full-control").map(str::to_string),
-            acl_grants,
             metadata_blob,
             system_metadata,
             cond,
-            inline_tags_xml,
-            object_lock,
             checksum: StreamingPutChecksumContract {
                 content_md5,
                 response_headers: ChecksumResponseHeaders(checksum_response),
             },
-            managed_encryption,
             sse_customer: sse_customer_request,
             authorized_write,
             streaming_signing: auth.streaming,
@@ -3547,7 +3527,7 @@ impl HttpFrontend {
 
     /// Start a stream-backed `PutObject` session after the body has exceeded
     /// one internal segment.
-    pub fn start_streaming_put_session(
+    fn start_streaming_put_session(
         &self,
         ctx: &StreamingPutContext,
     ) -> Result<SessionId, ServerError> {
@@ -3564,7 +3544,7 @@ impl HttpFrontend {
     }
 
     /// Append a segment to a streaming session.
-    pub fn streaming_append_segment(
+    fn streaming_append_segment(
         &self,
         ctx: &StreamingPutContext,
         session_id: &SessionId,
@@ -3592,7 +3572,7 @@ impl HttpFrontend {
     }
 
     /// Commit a single-segment `PutObject` without creating a stream session.
-    pub fn put_single_segment_object(
+    fn put_single_segment_object(
         &self,
         ctx: &StreamingPutContext,
         data: &[u8],
@@ -3631,7 +3611,7 @@ impl HttpFrontend {
     /// `trailer_checksums` contains checksum headers extracted from aws-chunked
     /// trailers (e.g. `x-amz-checksum-crc32`). These are merged into the
     /// metadata blob for storage and echoed back in the response.
-    pub fn finalize_streaming_put(
+    fn finalize_streaming_put(
         &self,
         ctx: &StreamingPutContext,
         session_id: &SessionId,
@@ -3672,7 +3652,7 @@ impl HttpFrontend {
     }
 
     /// Abort a streaming session (best-effort cleanup).
-    pub fn abort_streaming_put(&self, ctx: &StreamingPutContext, session_id: &SessionId) {
+    fn abort_streaming_put(&self, ctx: &StreamingPutContext, session_id: &SessionId) {
         let _trace = observability::AttachedTrace::new(ctx.trace.clone());
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3687,7 +3667,7 @@ impl HttpFrontend {
     }
 
     /// Prepare a streaming `UploadPart` session.
-    pub fn prepare_streaming_part(
+    fn prepare_streaming_part(
         &self,
         req: &S3Request,
         bucket: &str,
@@ -3749,15 +3729,11 @@ impl HttpFrontend {
 
         Ok(StreamingPartContext {
             trace: current_trace_context(),
-            binding: StreamPartBinding {
-                object: StreamObjectBinding {
-                    session_id: begin.session_id,
-                    bucket: binding_bucket,
-                    key: binding_key,
-                },
-                upload_id: binding_upload_id,
+            binding: StreamPartBinding::new(
+                StreamObjectBinding::new(begin.session_id, binding_bucket, binding_key),
+                binding_upload_id,
                 part_number,
-            },
+            ),
             requester,
             expected_bucket_owner,
             checksum: StreamingPartChecksumContract {
@@ -3772,7 +3748,7 @@ impl HttpFrontend {
     }
 
     /// Append a segment to a streaming `UploadPart` session.
-    pub fn streaming_append_part_segment(
+    fn streaming_append_part_segment(
         &self,
         ctx: &StreamingPartContext,
         segment_index: u32,
@@ -3810,7 +3786,7 @@ impl HttpFrontend {
     /// `trailer_checksums` contains checksum headers from aws-chunked trailers.
     /// `computed_checksum` is the incrementally computed checksum (algo, bytes).
     #[allow(clippy::too_many_arguments)]
-    pub fn finalize_streaming_part(
+    fn finalize_streaming_part(
         &self,
         ctx: &StreamingPartContext,
         crc64: u64,
@@ -3906,7 +3882,7 @@ impl HttpFrontend {
     }
 
     /// Abort a streaming `UploadPart` session (best-effort cleanup).
-    pub fn abort_streaming_part(&self, ctx: &StreamingPartContext) {
+    fn abort_streaming_part(&self, ctx: &StreamingPartContext) {
         let _trace = observability::AttachedTrace::new(ctx.trace.clone());
         observability::trace_scope!(
             TRACE_TARGET,
@@ -3926,97 +3902,101 @@ impl HttpFrontend {
 }
 
 /// Session binding for a streaming object-scoped upload.
-pub struct StreamObjectBinding {
-    pub session_id: SessionId,
-    pub bucket: BucketName,
-    pub key: ObjectKey,
+struct StreamObjectBinding {
+    session_id: SessionId,
+    bucket: BucketName,
+    key: ObjectKey,
 }
 
 /// Session binding for a streaming multipart-part upload.
-pub struct StreamPartBinding {
-    pub object: StreamObjectBinding,
-    pub upload_id: UploadId,
-    pub part_number: u32,
+struct StreamPartBinding {
+    object: StreamObjectBinding,
+    upload_id: UploadId,
+    part_number: u32,
 }
 
 /// Checksum response headers to echo back on a streaming response.
-pub struct ChecksumResponseHeaders(pub Vec<(String, String)>);
+struct ChecksumResponseHeaders(Vec<(String, String)>);
 
 /// Checksum contract for streaming `PutObject`.
-pub struct StreamingPutChecksumContract {
-    pub content_md5: Option<ContentMd5Claim>,
-    pub response_headers: ChecksumResponseHeaders,
+struct StreamingPutChecksumContract {
+    content_md5: Option<ContentMd5Claim>,
+    response_headers: ChecksumResponseHeaders,
 }
 
 /// Checksum contract for streaming `UploadPart`.
-pub struct StreamingPartChecksumContract {
-    pub content_md5: Option<ContentMd5Claim>,
-    pub upload_checksum_algorithm: Option<ChecksumAlgorithm>,
-    pub claim: Option<ChecksumClaim>,
-    pub response_headers: ChecksumResponseHeaders,
+struct StreamingPartChecksumContract {
+    content_md5: Option<ContentMd5Claim>,
+    upload_checksum_algorithm: Option<ChecksumAlgorithm>,
+    claim: Option<ChecksumClaim>,
+    response_headers: ChecksumResponseHeaders,
 }
 
 /// Context for an in-progress streaming `PutObject`.
 ///
 /// Created by `prepare_streaming_put`, used across async/blocking boundaries.
-pub struct StreamingPutContext {
-    pub trace: observability::TraceContext,
-    pub bucket: BucketName,
-    pub key: ObjectKey,
-    pub requester: crate::coordinator::Requester,
-    pub expected_bucket_owner: Option<String>,
-    pub acl_header: Option<String>,
-    pub grant_read_header: Option<String>,
-    pub grant_write_header: Option<String>,
-    pub grant_read_acp_header: Option<String>,
-    pub grant_write_acp_header: Option<String>,
-    pub grant_full_control_header: Option<String>,
-    pub acl_grants: Option<s3_types::AclGrants>,
-    pub metadata_blob: crate::metadata_blob::MetadataBlob,
-    pub system_metadata: SystemMetadata,
-    pub cond: crate::conditional::WriteCondition,
-    pub inline_tags_xml: Option<String>,
-    pub object_lock: ObjectLockState,
-    pub checksum: StreamingPutChecksumContract,
-    pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
-    pub sse_customer: Option<SseCustomerRequest>,
-    pub authorized_write: AuthorizedPutObjectWrite,
+struct StreamingPutContext {
+    trace: observability::TraceContext,
+    bucket: BucketName,
+    key: ObjectKey,
+    metadata_blob: crate::metadata_blob::MetadataBlob,
+    system_metadata: SystemMetadata,
+    cond: crate::conditional::WriteCondition,
+    checksum: StreamingPutChecksumContract,
+    sse_customer: Option<SseCustomerRequest>,
+    authorized_write: AuthorizedPutObjectWrite,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
-    pub streaming_signing: Option<auth::StreamingSigningContext>,
+    streaming_signing: Option<auth::StreamingSigningContext>,
 }
 
 /// Context for an in-progress streaming `PostObject`.
-pub struct StreamingPostContext {
-    pub trace: observability::TraceContext,
-    pub binding: StreamObjectBinding,
-    pub requester: crate::coordinator::Requester,
-    pub acl_header: Option<String>,
-    pub metadata_blob: crate::metadata_blob::MetadataBlob,
-    pub system_metadata: SystemMetadata,
-    pub success_status: u16,
-    pub success_redirect: Option<String>,
-    pub response_location: Option<String>,
-    pub form_fields: Vec<(String, String)>,
-    pub policy_b64: Option<String>,
-    pub checksum_sha256_b64: Option<String>,
-    pub tags_xml: Option<String>,
-    pub managed_encryption: Option<ManagedEncryptionAlgorithm>,
-    pub sse_customer: Option<SseCustomerRequest>,
-    pub authorized_write: AuthorizedPutObjectWrite,
+struct StreamingPostContext {
+    trace: observability::TraceContext,
+    binding: StreamObjectBinding,
+    metadata_blob: crate::metadata_blob::MetadataBlob,
+    system_metadata: SystemMetadata,
+    success_status: u16,
+    success_redirect: Option<String>,
+    response_location: Option<String>,
+    form_fields: Vec<(String, String)>,
+    policy_b64: Option<String>,
+    checksum_sha256_b64: Option<String>,
+    sse_customer: Option<SseCustomerRequest>,
+    authorized_write: AuthorizedPutObjectWrite,
 }
 
 /// Context for an in-progress streaming `UploadPart`.
 ///
 /// Created by `prepare_streaming_part`, used across async/blocking boundaries.
-pub struct StreamingPartContext {
-    pub trace: observability::TraceContext,
-    pub binding: StreamPartBinding,
-    pub requester: crate::coordinator::Requester,
-    pub expected_bucket_owner: Option<String>,
-    pub checksum: StreamingPartChecksumContract,
-    pub sse_customer: Option<SseCustomerWriteContext>,
+struct StreamingPartContext {
+    trace: observability::TraceContext,
+    binding: StreamPartBinding,
+    requester: crate::coordinator::Requester,
+    expected_bucket_owner: Option<String>,
+    checksum: StreamingPartChecksumContract,
+    sse_customer: Option<SseCustomerWriteContext>,
     /// Signing context for aws-chunked modes, None for unsigned/plain.
-    pub streaming_signing: Option<auth::StreamingSigningContext>,
+    streaming_signing: Option<auth::StreamingSigningContext>,
+}
+
+impl StreamObjectBinding {
+    fn new(session_id: SessionId, bucket: BucketName, key: ObjectKey) -> Self {
+        Self {
+            session_id,
+            bucket,
+            key,
+        }
+    }
+}
+
+impl StreamPartBinding {
+    fn new(object: StreamObjectBinding, upload_id: UploadId, part_number: u32) -> Self {
+        Self {
+            object,
+            upload_id,
+            part_number,
+        }
+    }
 }
 
 fn percent_encode_location_path_segment(value: &str) -> String {
@@ -8352,7 +8332,6 @@ mod tests {
             .prepare_streaming_put(&req, "mybucket", "mykey", false)
             .unwrap();
         assert_eq!(ctx.key, "mykey");
-        assert!(ctx.object_lock.retention.is_some());
     }
 
     #[test]
