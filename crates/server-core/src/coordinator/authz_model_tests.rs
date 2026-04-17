@@ -8684,9 +8684,356 @@ mod phase10_harness {
     }
 }
 
+mod phase11_model {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BucketMetaAction {
+        HeadBucket,
+        GetBucketLocation,
+    }
+
+    impl fmt::Display for BucketMetaAction {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::HeadBucket => f.write_str("HeadBucket"),
+                Self::GetBucketLocation => f.write_str("GetBucketLocation"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BucketMetaAccessShape {
+        Private,
+        PublicRead,
+        GrantRead,
+    }
+
+    impl fmt::Display for BucketMetaAccessShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Private => f.write_str("private"),
+                Self::PublicRead => f.write_str("public-read"),
+                Self::GrantRead => f.write_str("grant-read"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BucketMetaRequesterShape {
+        OwnerExact,
+        SameAccountAdmin,
+        CrossAccount,
+    }
+
+    impl fmt::Display for BucketMetaRequesterShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::OwnerExact => f.write_str("owner-exact"),
+                Self::SameAccountAdmin => f.write_str("same-account-admin"),
+                Self::CrossAccount => f.write_str("cross-account"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BucketMetaPolicyShape {
+        None,
+        AllowListBucket,
+        AllowGetBucketLocation,
+    }
+
+    impl fmt::Display for BucketMetaPolicyShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("no-policy"),
+                Self::AllowListBucket => f.write_str("allow-list-bucket"),
+                Self::AllowGetBucketLocation => f.write_str("allow-get-bucket-location"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BucketMetaOutcome {
+        Allow,
+        Deny,
+    }
+
+    impl fmt::Display for BucketMetaOutcome {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Allow => f.write_str("Allow"),
+                Self::Deny => f.write_str("Deny"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct BucketMetaScenario {
+        pub(super) name: &'static str,
+        pub(super) action: BucketMetaAction,
+        pub(super) access: BucketMetaAccessShape,
+        pub(super) requester: BucketMetaRequesterShape,
+        pub(super) policy: BucketMetaPolicyShape,
+        pub(super) expected: BucketMetaOutcome,
+    }
+
+    impl BucketMetaScenario {
+        pub(super) fn scenarios(action: BucketMetaAction) -> Vec<Self> {
+            use BucketMetaAccessShape as Access;
+            use BucketMetaAction as Action;
+            use BucketMetaOutcome as Outcome;
+            use BucketMetaPolicyShape as Policy;
+            use BucketMetaRequesterShape as Requester;
+
+            match action {
+                Action::HeadBucket => vec![
+                    Self {
+                        name: "owner-exact-retains-private-head-bucket-read-fallback",
+                        action,
+                        access: Access::Private,
+                        requester: Requester::OwnerExact,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "public-read-bucket-still-allows-cross-account-head-bucket",
+                        action,
+                        access: Access::PublicRead,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "grant-read-bucket-still-allows-cross-account-head-bucket",
+                        action,
+                        access: Access::GrantRead,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "list-bucket-policy-still-does-not-grant-head-bucket",
+                        action,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::AllowListBucket,
+                        expected: Outcome::Deny,
+                    },
+                ],
+                Action::GetBucketLocation => vec![
+                    Self {
+                        name: "owner-exact-retains-bucket-location-admin-fallback",
+                        action,
+                        access: Access::Private,
+                        requester: Requester::OwnerExact,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "same-account-admin-retains-bucket-location-admin-fallback",
+                        action,
+                        access: Access::Private,
+                        requester: Requester::SameAccountAdmin,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "cross-account-still-denied-without-dedicated-location-policy",
+                        action,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::None,
+                        expected: Outcome::Deny,
+                    },
+                    Self {
+                        name: "list-bucket-policy-still-does-not-grant-get-bucket-location",
+                        action,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::AllowListBucket,
+                        expected: Outcome::Deny,
+                    },
+                    Self {
+                        name: "dedicated-policy-grants-cross-account-get-bucket-location",
+                        action,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::AllowGetBucketLocation,
+                        expected: Outcome::Allow,
+                    },
+                ],
+            }
+        }
+    }
+
+    impl fmt::Display for BucketMetaScenario {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "name={} action={} access={} requester={} policy={}",
+                self.name, self.action, self.access, self.requester, self.policy
+            )
+        }
+    }
+}
+
+mod phase11_harness {
+    use super::harness::{setup_coordinator, IdentityFixtures};
+    use super::phase11_model::{
+        BucketMetaAccessShape, BucketMetaAction, BucketMetaOutcome, BucketMetaPolicyShape,
+        BucketMetaRequesterShape, BucketMetaScenario,
+    };
+    use super::*;
+
+    pub(super) struct Phase11Harness {
+        _tmp: test_util::TempDir,
+        coord: Coordinator,
+        fixtures: IdentityFixtures,
+    }
+
+    impl Phase11Harness {
+        pub(super) fn new() -> Self {
+            let tmp = test_util::tempdir();
+            let coord = setup_coordinator(tmp.path());
+            let fixtures = IdentityFixtures::new();
+            Self {
+                _tmp: tmp,
+                coord,
+                fixtures,
+            }
+        }
+
+        pub(super) fn run(&self, bucket: &str, scenario: BucketMetaScenario) -> BucketMetaOutcome {
+            materialize_phase11_bucket(&self.coord, &self.fixtures, bucket, scenario)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize phase 11 state for {scenario}: {err:?}");
+                });
+            run_phase11_action(&self.coord, &self.fixtures, bucket, scenario)
+        }
+    }
+
+    pub(super) fn phase11_bucket_name_for(action: BucketMetaAction, index: usize) -> String {
+        let action_slug = match action {
+            BucketMetaAction::HeadBucket => "head-bucket",
+            BucketMetaAction::GetBucketLocation => "get-bucket-location",
+        };
+        format!("authz-phase11-{action_slug}-{index:05}")
+    }
+
+    fn materialize_phase11_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: BucketMetaScenario,
+    ) -> Result<(), ServerError> {
+        let owner = OwnerIdentity::new(
+            fixtures.owner_user.principal(),
+            fixtures.owner_user.canonical_user_id().clone(),
+        );
+        let mut grant_entries = Coordinator::bucket_acl_grants_from_flags(
+            &owner,
+            scenario.access == BucketMetaAccessShape::PublicRead,
+            false,
+        )
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+        if scenario.access == BucketMetaAccessShape::GrantRead {
+            grant_entries.push(AclGrant::new(
+                AclGrantee::CanonicalUser(fixtures.cross_account.canonical_user_id().clone()),
+                AclPermission::Read,
+            ));
+        }
+        let grants = AclGrants::new(grant_entries);
+        coord.create_bucket_with_acl_grants(&owner, bucket, grants, false)?;
+
+        if let Some(policy) = phase11_policy_document(fixtures, bucket, scenario) {
+            coord.put_bucket_policy(&PutBucketPolicyRequest {
+                bucket: BucketRequest::new(
+                    trusted_bucket_name(bucket),
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                config: &policy,
+                confirm_remove_self_bucket_access: false,
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn phase11_policy_document(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: BucketMetaScenario,
+    ) -> Option<String> {
+        let principal = match scenario.requester {
+            BucketMetaRequesterShape::OwnerExact => fixtures.owner_user.principal(),
+            BucketMetaRequesterShape::SameAccountAdmin => {
+                fixtures.same_account_distinct.principal()
+            }
+            BucketMetaRequesterShape::CrossAccount => fixtures.cross_account.principal(),
+        };
+        let action = match scenario.policy {
+            BucketMetaPolicyShape::None => return None,
+            BucketMetaPolicyShape::AllowListBucket => "s3:ListBucket",
+            BucketMetaPolicyShape::AllowGetBucketLocation => "s3:GetBucketLocation",
+        };
+        Some(format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{principal}"}},"Action":"{action}","Resource":"arn:aws:s3:::{bucket}"}}]}}"#
+        ))
+    }
+
+    fn run_phase11_action(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: BucketMetaScenario,
+    ) -> BucketMetaOutcome {
+        let requester = phase11_requester(fixtures, scenario.requester);
+        let bucket_request =
+            BucketRequest::new(trusted_bucket_name(bucket), requester.clone(), None);
+        let result = match scenario.action {
+            BucketMetaAction::HeadBucket => {
+                coord.authorize_head_bucket(&bucket_request).map(|_| ())
+            }
+            BucketMetaAction::GetBucketLocation => coord
+                .authorize_get_bucket_location(&bucket_request)
+                .map(|_| ()),
+        };
+        match result {
+            Ok(()) => BucketMetaOutcome::Allow,
+            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
+                BucketMetaOutcome::Deny
+            }
+            Err(other) => panic!("unexpected phase 11 result for {scenario}: {other:?}"),
+        }
+    }
+
+    fn phase11_requester(
+        fixtures: &IdentityFixtures,
+        shape: BucketMetaRequesterShape,
+    ) -> Requester {
+        match shape {
+            BucketMetaRequesterShape::OwnerExact => {
+                Requester::authenticated(fixtures.owner_user.clone())
+            }
+            BucketMetaRequesterShape::SameAccountAdmin => {
+                Requester::authenticated_owner_account_admin(fixtures.same_account_distinct.clone())
+            }
+            BucketMetaRequesterShape::CrossAccount => {
+                Requester::authenticated(fixtures.cross_account.clone())
+            }
+        }
+    }
+}
+
 use harness::{bucket_name_for, to_existing_outcome, to_missing_outcome, MatrixHarness};
 use model::{Action, MissingScenario, Scenario};
 use phase10_harness::Phase10Harness;
+use phase11_harness::{phase11_bucket_name_for, Phase11Harness};
+use phase11_model::{BucketMetaAction, BucketMetaScenario};
 use phase4_harness::{
     acl_bucket_name_for, to_acl_outcome, to_write_outcome, write_bucket_name_for, Phase4Harness,
 };
@@ -9457,6 +9804,16 @@ fn authz_model_phase10_put_bucket_acl_xml_body_does_not_synthesize_grant_headers
     );
 }
 
+#[test]
+fn authz_model_phase11_head_bucket_matrix() {
+    run_phase11_bucket_meta_matrix(BucketMetaAction::HeadBucket);
+}
+
+#[test]
+fn authz_model_phase11_get_bucket_location_matrix() {
+    run_phase11_bucket_meta_matrix(BucketMetaAction::GetBucketLocation);
+}
+
 fn run_existing_matrix(phase: &str, action: Action) {
     let scenarios = Scenario::existing_scenarios(action);
     assert!(
@@ -9547,6 +9904,25 @@ fn run_phase9_bucket_matrix(action: BucketAction) {
         assert_eq!(
             actual, scenario.expected,
             "phase 9 bucket-action mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
+            scenario.expected
+        );
+    }
+}
+
+fn run_phase11_bucket_meta_matrix(action: BucketMetaAction) {
+    let scenarios = BucketMetaScenario::scenarios(action);
+    assert!(
+        !scenarios.is_empty(),
+        "phase 11 matrix unexpectedly produced no scenarios for {action}"
+    );
+    let harness = Phase11Harness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = phase11_bucket_name_for(action, index);
+        let actual = harness.run(&bucket, scenario);
+        assert_eq!(
+            actual, scenario.expected,
+            "phase 11 bucket-meta mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
             scenario.expected
         );
     }

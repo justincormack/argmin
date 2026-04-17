@@ -1078,7 +1078,7 @@ Current state:
 
 ### Phase 11: Bucket Meta and Discovery Slice
 
-Status: planned
+Status: complete
 
 Add a small bounded slice for:
 
@@ -1102,6 +1102,28 @@ Acceptance criteria:
   non-sufficiency cases are encoded in the same framework rather than only in
   standalone `s3-tests`
 - failures print the exact negative scenario that regressed
+
+Current state:
+
+- [x] `crates/server-core/src/coordinator/authz_model_tests.rs` now has a
+  dedicated bounded Phase 11 matrix for `HeadBucket` and
+  `GetBucketLocation`, rather than leaving these exceptions only in standalone
+  coordinator and `s3-tests` regressions.
+- [x] The `HeadBucket` slice encodes the current read-fallback behavior
+  explicitly:
+  owner-exact private access still works, `public-read` and explicit
+  `READ` grant still allow cross-account `HeadBucket`, and
+  `s3:ListBucket` bucket-policy allow is still not sufficient.
+- [x] The `GetBucketLocation` slice encodes the current admin-or-dedicated
+  policy behavior explicitly:
+  owner-exact and same-account owner-account-admin still succeed without
+  bucket policy, cross-account remains denied without dedicated policy,
+  `s3:ListBucket` remains insufficient, and dedicated
+  `s3:GetBucketLocation` allow remains sufficient cross-account under the
+  AWS-backed baseline.
+- [x] Existing AWS-facing regressions in `crates/s3-tests/tests/bucket_policy.rs`
+  and the coordinator regression for dedicated `GetBucketLocation` allow stay
+  in place as the external anchor for the modeled rules.
 
 ### Phase 12: Optional Stateful Expansion
 
