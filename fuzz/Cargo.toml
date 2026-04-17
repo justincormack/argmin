@@ -36,6 +36,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "auth_bucket_policy"
+path = "fuzz_targets/auth_bucket_policy.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "server_http_parsers"
 path = "fuzz_targets/server_http_parsers.rs"
 test = false

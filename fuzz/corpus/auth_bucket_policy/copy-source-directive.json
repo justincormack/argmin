@@ -1,0 +1,29 @@
+{
+  "policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Principal": "*",
+        "Action": ["s3:PutObject"],
+        "Resource": ["arn:aws:s3:::bucket/*"],
+        "Condition": {
+          "StringLike": {
+            "s3:x-amz-copy-source": "bucket/src/public/*"
+          },
+          "StringEquals": {
+            "s3:x-amz-metadata-directive": "COPY"
+          }
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "PutObject",
+    "principal": "arn:aws:iam::444455556666:user/alt",
+    "bucket": "bucket",
+    "key": "key",
+    "copy_source": "bucket/src/public/file",
+    "metadata_directive": "COPY"
+  }
+}

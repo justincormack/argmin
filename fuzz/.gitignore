@@ -1,4 +1,7 @@
 artifacts
-corpus
+corpus/*
+!corpus/auth_bucket_policy/
+corpus/auth_bucket_policy/*
+!corpus/auth_bucket_policy/*.json
 coverage
 target

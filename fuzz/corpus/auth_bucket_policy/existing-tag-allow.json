@@ -1,0 +1,29 @@
+{
+  "policy": {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Principal": {
+          "AWS": "arn:aws:iam::444455556666:root"
+        },
+        "Action": "s3:GetObjectTagging",
+        "Resource": "arn:aws:s3:::bucket/*",
+        "Condition": {
+          "StringEquals": {
+            "s3:ExistingObjectTag/security": "public"
+          }
+        }
+      }
+    ]
+  },
+  "request": {
+    "action": "GetObjectTagging",
+    "principal": "arn:aws:iam::444455556666:user/alt",
+    "bucket": "bucket",
+    "key": "key",
+    "existing_tags": [
+      ["security", "public"]
+    ]
+  }
+}

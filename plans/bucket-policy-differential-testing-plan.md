@@ -307,7 +307,7 @@ Success criteria:
 
 Current state:
 
-- [ ] Phase 3 is started but not complete.
+- [x] Phase 3 is complete.
 - [x] Added an initial AWS-vs-local differential harness at
   `crates/s3-diff-tests/tests/bucket_policy.rs`.
 - [x] The harness now reuses the existing `s3-tests` fixture and client setup,
@@ -328,8 +328,9 @@ Current state:
 - [x] The differential now isolates each scenario in its own bucket/policy
   surface so AWS oracle rows do not depend on policy replacement convergence
   across scenarios.
-- [ ] The expanded AWS-backed run still needs to be rechecked end to end before
-  Phase 3 can be marked complete.
+- [x] The expanded AWS-backed run has been rechecked end to end, including the
+  sharded `s3-diff-tests` bucket-policy matrix and the added tagging scope
+  probes that were used to narrow harness-versus-semantic mismatches.
 
 ## Phase 4: Fuzz Target and Corpus Promotion
 
@@ -349,6 +350,27 @@ Deliver:
   - equivalent policy encodings preserve meaning
 
 Keep this target evaluator-only. It should not depend on live AWS.
+
+Current state:
+
+- [ ] Phase 4 is started but not complete.
+- [x] Added `fuzz/fuzz_targets/auth_bucket_policy.rs` as an evaluator-only
+  bucket-policy target.
+- [x] The target now exercises the stable local invariants directly through
+  `parse_bucket_policy`, `validate_evaluable_object_conditions`,
+  `normalized_json`, and `BucketPolicy::evaluate`:
+  - normalized JSON round-trips preserve evaluation
+  - singleton-versus-array JSON encodings preserve evaluation
+  - statement expansion across principal/action/resource arrays preserves
+    evaluation
+- [x] Added a small committed corpus under `fuzz/corpus/auth_bucket_policy/`
+  seeded from the current fixed surface:
+  - existing-object-tag allow
+  - `Null` ACL deny
+  - copy-source plus metadata-directive
+  - root-principal plus array-encoded request-tag allow
+- [ ] The corpus still needs promotion of any future AWS mismatches or local
+  minimizations as they are discovered.
 
 ## Validation
 
