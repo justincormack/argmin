@@ -139,33 +139,6 @@ fn begin_stream_part_test<I: MultipartUploadIdArg>(
     })
 }
 
-fn stream_finalize_single_part(
-    coord: &Coordinator,
-    bucket: &str,
-    key: &str,
-    upload_id: &UploadId,
-    data: &[u8],
-) -> String {
-    let session = begin_stream_part_test(coord, bucket, key, upload_id, 1)
-        .unwrap()
-        .session_id;
-    coord
-        .append_plaintext_stream_segment_for_test(bucket, key, &session, 0, data)
-        .unwrap();
-    coord
-        .finalize_stream_part(FinalizeStreamPartRequest {
-            upload: multipart_object_request(bucket, key, upload_id, test_requester()),
-            session_id: &session,
-            part_number: 1,
-            crc64: checksum::crc64::checksum(data),
-            total_size: data.len() as u64,
-            claimed_checksum: None,
-            computed_checksum: None,
-        })
-        .unwrap()
-        .etag
-}
-
 fn upload_part_test(
     coord: &Coordinator,
     bucket: &str,
@@ -345,7 +318,10 @@ enum SameKeyUploadTraceSeed {
 #[derive(Debug, Clone)]
 enum SameKeyUploadTraceOp {
     CreateUpload,
+    BeginCurrentStream,
+    AppendCurrentData,
     FinalizeCurrentPart,
+    AbortCurrentSession,
     CompleteCurrent,
     AbortCurrent,
     CompleteOldest,
@@ -356,7 +332,10 @@ impl std::fmt::Display for SameKeyUploadTraceOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::CreateUpload => write!(f, "create-upload"),
+            Self::BeginCurrentStream => write!(f, "begin-current-stream"),
+            Self::AppendCurrentData => write!(f, "append-current-data"),
             Self::FinalizeCurrentPart => write!(f, "finalize-current-part"),
+            Self::AbortCurrentSession => write!(f, "abort-current-session"),
             Self::CompleteCurrent => write!(f, "complete-current"),
             Self::AbortCurrent => write!(f, "abort-current"),
             Self::CompleteOldest => write!(f, "complete-oldest"),
@@ -374,6 +353,8 @@ struct SameKeyUploadModelEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SameKeyUploadModel {
     uploads: Vec<SameKeyUploadModelEntry>,
+    current_session: Option<SessionModelState>,
+    pending_payload: Option<Vec<u8>>,
     visible_payload: Option<Vec<u8>>,
     next_payload_id: u8,
 }
@@ -382,6 +363,8 @@ impl SameKeyUploadModel {
     fn new() -> Self {
         Self {
             uploads: Vec::new(),
+            current_session: None,
+            pending_payload: None,
             visible_payload: None,
             next_payload_id: 0,
         }
@@ -389,25 +372,92 @@ impl SameKeyUploadModel {
 
     fn legal_ops(&self) -> &'static [SameKeyUploadTraceOp] {
         use SameKeyUploadTraceOp::*;
-        match self
-            .uploads
-            .iter()
-            .map(|entry| entry.part_committed)
-            .collect::<Vec<_>>()
-            .as_slice()
-        {
-            [] => &[CreateUpload],
-            [false] => &[CreateUpload, FinalizeCurrentPart, AbortCurrent],
-            [true] => &[CreateUpload, CompleteCurrent, AbortCurrent],
-            [false, false] => &[FinalizeCurrentPart, AbortCurrent, AbortOldest],
-            [true, false] => &[
-                FinalizeCurrentPart,
+        use SessionModelState::*;
+        match (
+            self.uploads
+                .iter()
+                .map(|entry| entry.part_committed)
+                .collect::<Vec<_>>(),
+            self.current_session,
+        ) {
+            (v, None) if v.is_empty() => &[CreateUpload],
+            (v, None) if v.as_slice() == [false] => {
+                &[CreateUpload, BeginCurrentStream, AbortCurrent]
+            }
+            (v, Some(Empty)) if v.as_slice() == [false] => {
+                &[AppendCurrentData, AbortCurrentSession]
+            }
+            (v, Some(HasData)) if v.as_slice() == [false] => {
+                &[FinalizeCurrentPart, AbortCurrentSession]
+            }
+            (v, None) if v.as_slice() == [false, false] => {
+                &[BeginCurrentStream, AbortCurrent, AbortOldest]
+            }
+            (v, Some(Empty)) if v.as_slice() == [false, false] => {
+                &[AppendCurrentData, AbortCurrentSession, AbortOldest]
+            }
+            (v, Some(HasData)) if v.as_slice() == [false, false] => {
+                &[FinalizeCurrentPart, AbortCurrentSession, AbortOldest]
+            }
+            (v, None) if v.as_slice() == [false, true] => &[
+                BeginCurrentStream,
+                CompleteCurrent,
+                AbortCurrent,
+                AbortOldest,
+            ],
+            (v, Some(Empty)) if v.as_slice() == [false, true] => {
+                &[AppendCurrentData, AbortCurrentSession, AbortOldest]
+            }
+            (v, Some(HasData)) if v.as_slice() == [false, true] => {
+                &[FinalizeCurrentPart, AbortCurrentSession, AbortOldest]
+            }
+            (v, None) if v.as_slice() == [true] => &[
+                CreateUpload,
+                BeginCurrentStream,
+                CompleteCurrent,
+                AbortCurrent,
+            ],
+            (v, Some(Empty)) if v.as_slice() == [true] => &[AppendCurrentData, AbortCurrentSession],
+            (v, Some(HasData)) if v.as_slice() == [true] => {
+                &[FinalizeCurrentPart, AbortCurrentSession]
+            }
+            (v, None) if v.as_slice() == [true, false] => &[
+                BeginCurrentStream,
                 AbortCurrent,
                 CompleteOldest,
                 AbortOldest,
             ],
-            [false, true] => &[CompleteCurrent, AbortCurrent, AbortOldest],
-            [true, true] => &[CompleteCurrent, AbortCurrent, CompleteOldest, AbortOldest],
+            (v, Some(Empty)) if v.as_slice() == [true, false] => &[
+                AppendCurrentData,
+                AbortCurrentSession,
+                CompleteOldest,
+                AbortOldest,
+            ],
+            (v, Some(HasData)) if v.as_slice() == [true, false] => &[
+                FinalizeCurrentPart,
+                AbortCurrentSession,
+                CompleteOldest,
+                AbortOldest,
+            ],
+            (v, None) if v.as_slice() == [true, true] => &[
+                BeginCurrentStream,
+                CompleteCurrent,
+                AbortCurrent,
+                CompleteOldest,
+                AbortOldest,
+            ],
+            (v, Some(Empty)) if v.as_slice() == [true, true] => &[
+                AppendCurrentData,
+                AbortCurrentSession,
+                CompleteOldest,
+                AbortOldest,
+            ],
+            (v, Some(HasData)) if v.as_slice() == [true, true] => &[
+                FinalizeCurrentPart,
+                AbortCurrentSession,
+                CompleteOldest,
+                AbortOldest,
+            ],
             _ => &[CreateUpload],
         }
     }
@@ -422,18 +472,39 @@ impl SameKeyUploadModel {
                     part_committed: false,
                     payload,
                 });
+                self.current_session = None;
+                self.pending_payload = None;
+            }
+            BeginCurrentStream => {
+                self.current_session = Some(SessionModelState::Empty);
+            }
+            AppendCurrentData => {
+                self.current_session = Some(SessionModelState::HasData);
+                self.pending_payload =
+                    Some(format!("trace-part-{}", self.next_payload_id).into_bytes());
+                self.next_payload_id = self.next_payload_id.wrapping_add(1);
             }
             FinalizeCurrentPart => {
                 if let Some(current) = self.uploads.last_mut() {
                     current.part_committed = true;
+                    current.payload = self.pending_payload.take().unwrap();
                 }
+                self.current_session = None;
+            }
+            AbortCurrentSession => {
+                self.current_session = None;
+                self.pending_payload = None;
             }
             CompleteCurrent => {
                 let completed = self.uploads.pop().unwrap();
                 self.visible_payload = Some(completed.payload);
+                self.current_session = None;
+                self.pending_payload = None;
             }
             AbortCurrent => {
                 self.uploads.pop();
+                self.current_session = None;
+                self.pending_payload = None;
             }
             CompleteOldest => {
                 let completed = self.uploads.remove(0);
@@ -728,6 +799,8 @@ struct SameKeyUploadHarness {
     coord: Coordinator,
     uploads: Vec<SameKeyUploadEntry>,
     next_payload_id: u8,
+    current_session_id: Option<SessionId>,
+    pending_payload: Option<Vec<u8>>,
 }
 
 struct MultipartHeadTailHarness {
@@ -748,6 +821,8 @@ impl SameKeyUploadHarness {
             coord,
             uploads: Vec::new(),
             next_payload_id: 0,
+            current_session_id: None,
+            pending_payload: None,
         }
     }
 
@@ -772,16 +847,73 @@ impl SameKeyUploadHarness {
                     part_etag: None,
                     payload,
                 });
+                self.current_session_id = None;
+                self.pending_payload = None;
             }
-            SameKeyUploadTraceOp::FinalizeCurrentPart => {
-                let current = self.uploads.last_mut().unwrap();
-                current.part_etag = Some(stream_finalize_single_part(
+            SameKeyUploadTraceOp::BeginCurrentStream => {
+                let current = self.uploads.last().unwrap();
+                let session = begin_stream_part_test(
                     &self.coord,
                     TRACE_BUCKET,
                     TRACE_KEY,
                     &current.upload_id,
-                    &current.payload,
-                ));
+                    1,
+                )
+                .unwrap();
+                self.current_session_id = Some(session.session_id);
+            }
+            SameKeyUploadTraceOp::AppendCurrentData => {
+                let session_id = self.current_session_id.as_ref().unwrap();
+                let payload = format!("trace-part-{}", self.next_payload_id).into_bytes();
+                self.next_payload_id = self.next_payload_id.wrapping_add(1);
+                self.coord
+                    .append_plaintext_stream_segment_for_test(
+                        TRACE_BUCKET,
+                        TRACE_KEY,
+                        session_id,
+                        0,
+                        &payload,
+                    )
+                    .unwrap();
+                self.pending_payload = Some(payload);
+            }
+            SameKeyUploadTraceOp::FinalizeCurrentPart => {
+                let current = self.uploads.last_mut().unwrap();
+                let session_id = self.current_session_id.as_ref().unwrap();
+                let payload = self.pending_payload.as_ref().unwrap();
+                current.part_etag = Some(
+                    self.coord
+                        .finalize_stream_part(FinalizeStreamPartRequest {
+                            upload: multipart_object_request(
+                                TRACE_BUCKET,
+                                TRACE_KEY,
+                                &current.upload_id,
+                                test_requester(),
+                            ),
+                            session_id,
+                            part_number: 1,
+                            crc64: checksum::crc64::checksum(payload),
+                            total_size: payload.len() as u64,
+                            claimed_checksum: None,
+                            computed_checksum: None,
+                        })
+                        .unwrap()
+                        .etag,
+                );
+                current.payload = self.pending_payload.take().unwrap();
+                self.current_session_id = None;
+            }
+            SameKeyUploadTraceOp::AbortCurrentSession => {
+                let session_id = self.current_session_id.as_ref().unwrap();
+                self.coord
+                    .abort_stream_part_session(
+                        &trusted_bucket_name(TRACE_BUCKET),
+                        &trusted_object_key(TRACE_KEY),
+                        session_id,
+                    )
+                    .unwrap();
+                self.current_session_id = None;
+                self.pending_payload = None;
             }
             SameKeyUploadTraceOp::CompleteCurrent => {
                 let current = self.uploads.last().unwrap();
@@ -805,6 +937,8 @@ impl SameKeyUploadHarness {
                         sse_customer: None,
                     });
                 self.uploads.pop();
+                self.current_session_id = None;
+                self.pending_payload = None;
             }
             SameKeyUploadTraceOp::AbortCurrent => {
                 let current = self.uploads.last().unwrap();
@@ -815,6 +949,8 @@ impl SameKeyUploadHarness {
                     test_requester(),
                 ));
                 self.uploads.pop();
+                self.current_session_id = None;
+                self.pending_payload = None;
             }
             SameKeyUploadTraceOp::CompleteOldest => {
                 let oldest = &self.uploads[0];
@@ -871,6 +1007,25 @@ impl SameKeyUploadHarness {
             .filter(|upload| upload.key.as_str() == TRACE_KEY)
             .map(|upload| upload.upload_id)
             .collect()
+    }
+
+    fn active_session_count(&self) -> usize {
+        let mut count = 0usize;
+        self.coord
+            .pg_topology
+            .for_each_pg(|pg_id| {
+                let pg = self.coord.storage_node.get_pg(pg_id)?;
+                count += pg
+                    .list_all_stream_uploads()?
+                    .into_iter()
+                    .filter(|session| {
+                        session.bucket.as_str() == TRACE_BUCKET && session.key.as_str() == TRACE_KEY
+                    })
+                    .count();
+                Ok::<(), ServerError>(())
+            })
+            .unwrap();
+        count
     }
 }
 
@@ -1554,6 +1709,12 @@ fn assert_same_key_upload_trace_matches_model(
     prop_assert_eq!(
         harness.pending_upload_ids_in_order(),
         expected_ids,
+        "{}",
+        context
+    );
+    prop_assert_eq!(
+        harness.active_session_count(),
+        usize::from(model.current_session.is_some()),
         "{}",
         context
     );

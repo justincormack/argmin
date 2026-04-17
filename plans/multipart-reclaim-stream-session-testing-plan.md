@@ -352,11 +352,14 @@ Current state:
 - a second bounded Phase 2 property now extends the model to the first
   concurrent same-key multipart shape:
   - up to two pending uploads for the same key
-  - one distinct streamed part payload per upload
-  - complete/abort on newest versus oldest upload without widening to a
+  - one distinct streamed part payload per upload, plus a live stream-part
+    session on the newest upload
+  - begin/append/finalize/abort-session on the newest upload and
+    complete/abort on newest versus oldest upload without widening to a
     general N-upload model yet
-  - checks that pending upload ordering, per-upload `ListParts`, and visible
-    object winner identity stay aligned with the model after each step
+  - checks that pending upload ordering, active session presence, per-upload
+    `ListParts`, and visible object winner identity stay aligned with the
+    model after each step
 - a third bounded Phase 2 property now covers real multipart composition for a
   single upload without widening to arbitrary part sets:
   - one buffered head part at the AWS minimum non-final part size, with
