@@ -13771,6 +13771,8 @@ mod authz;
 mod authz_model_tests;
 #[cfg(test)]
 mod multipart_stateful_tests;
+#[cfg(test)]
+mod multipart_trace_tests;
 
 #[cfg(test)]
 #[allow(clippy::useless_conversion)]

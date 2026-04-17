@@ -327,6 +327,29 @@ Success criteria:
 - short generated traces can reproduce multipart/session regressions
 - every failure prints the exact operation sequence and final state mismatch
 
+Current state:
+
+- in progress
+- new bounded trace coverage lives in
+  `crates/server-core/src/coordinator/multipart_trace_tests.rs`
+- the first Phase 2 property is intentionally narrow:
+  - one bucket and one key
+  - one active multipart upload at a time
+  - one streamed part with constant payload bytes
+  - operations covering create, begin-stream-part, append, finalize-part,
+    complete, abort-active, abort-session, duplicate abort against the last
+    upload id, and duplicate complete replay against the last successfully
+    completed upload id
+- the current model checks after every step that:
+  - pending multipart upload presence matches the model
+  - active stream-session presence matches the model
+  - `ListParts` visibility matches whether a part is committed
+  - object visibility matches whether completion has happened
+- the trace now also pins the live-session abort edge:
+  - aborting an upload with a live stream-part session removes the upload
+  - the session remains until explicit session cleanup
+  - no object becomes visible while that orphaned session still exists
+
 ## Phase 3: Reclaim and Lease Trace Model
 
 Deliver:

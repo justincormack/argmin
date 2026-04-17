@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c86b3855b4a79a209aabb12a2baa0e25c942abe3b3ae0d85c26a3c03761013a2 # shrinks to ops = [CreateUpload, BeginStreamPart, AbortActive]
+cc d9dd5bc2e4e287b8852c6f020051f2e63aaad8ab939d18feb85fc2c2ed7e98be # shrinks to ops = [CreateUpload, BeginStreamPart, AppendData, FinalizePart, BeginStreamPart, CreateUpload]
