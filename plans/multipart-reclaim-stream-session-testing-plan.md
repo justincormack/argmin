@@ -280,6 +280,10 @@ Current state:
   - stale-session scavenging removing abandoned session state
   - stale-session scavenging leaving committed objects and payloads intact
   - staged stream-put data remaining invisible until finalize succeeds
+  - duplicate stream-segment append races preserving exactly one staged winner
+    across same-PG and cross-PG interleavings
+  - later multipart management operations failing predictably once an upload is
+    already aborting or completing
 - the helper layer in that module now supports direct inspection of:
   - active stream sessions
   - pending multipart uploads
