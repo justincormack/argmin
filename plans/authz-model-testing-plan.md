@@ -967,7 +967,7 @@ Current state:
 
 ### Phase 9: Bucket Action Matrix
 
-Status: planned
+Status: complete
 
 Add a bounded bucket-action matrix for:
 
@@ -995,6 +995,33 @@ Acceptance criteria:
   by the modeled harness, not only by `s3-tests`
 - the additive fallback behavior for versions and multipart listings is encoded
   explicitly rather than being left as accidental implementation detail
+
+Current state:
+
+- Added a bounded Phase 9 bucket-action model matrix in
+  `crates/server-core/src/coordinator/authz_model_tests.rs` covering
+  `GetBucketAcl`, `PutBucketAcl`, `GetBucketVersioning`,
+  `PutBucketVersioning`, `ListBucketVersions`, and
+  `ListBucketMultipartUploads`.
+- The matrix now pins the dedicated bucket-policy allow path for all six
+  actions, so the recent AWS-backed `s3-tests` coverage is no longer the only
+  place that exercises those cross-account grants.
+- `GetBucketAcl` and `PutBucketAcl` now have explicit modeled fallback cases
+  instead of relying on scattered coordinator regressions:
+  exact-owner fallback, `READ_ACP`/`WRITE_ACP` grant fallback, the
+  bucket-owner-enforced owner-account-admin read fallback, dedicated policy
+  allow, and deny-overrides-fallback.
+- The ACL slice also records the narrower-than-expected `PutBucketAcl` rule:
+  same-account owner-account-admin does not gain a write fallback on a standard
+  bucket without exact-owner or `WRITE_ACP`, while `GetBucketAcl` on a
+  bucket-owner-enforced bucket still uses the owner-account-admin path.
+- `GetBucketVersioning` and `PutBucketVersioning` now explicitly model their
+  owner-account-admin fallback plus dedicated policy allow for cross-account
+  callers.
+- `ListBucketVersions` and `ListBucketMultipartUploads` now explicitly model
+  their additive bucket-read/public-read fallback, dedicated policy allow, and
+  the rule that explicit deny on the dedicated action still overrides the read
+  fallback.
 
 ### Phase 10: Bucket ACL Request-Context Exactness
 

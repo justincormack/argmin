@@ -7855,6 +7855,664 @@ mod phase8_harness {
     }
 }
 
+mod phase9_model {
+    use super::*;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BucketAction {
+        GetBucketAcl,
+        PutBucketAcl,
+        GetBucketVersioning,
+        PutBucketVersioning,
+        ListBucketVersions,
+        ListBucketMultipartUploads,
+    }
+
+    impl fmt::Display for BucketAction {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::GetBucketAcl => f.write_str("GetBucketAcl"),
+                Self::PutBucketAcl => f.write_str("PutBucketAcl"),
+                Self::GetBucketVersioning => f.write_str("GetBucketVersioning"),
+                Self::PutBucketVersioning => f.write_str("PutBucketVersioning"),
+                Self::ListBucketVersions => f.write_str("ListBucketVersions"),
+                Self::ListBucketMultipartUploads => f.write_str("ListBucketMultipartUploads"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BucketOwnershipShape {
+        Standard,
+        BucketOwnerEnforced,
+    }
+
+    impl fmt::Display for BucketOwnershipShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Standard => f.write_str("standard"),
+                Self::BucketOwnerEnforced => f.write_str("bucket-owner-enforced"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BucketAccessShape {
+        Private,
+        PublicRead,
+        GrantRead,
+        GrantReadAcp,
+        GrantWriteAcp,
+    }
+
+    impl fmt::Display for BucketAccessShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Private => f.write_str("private"),
+                Self::PublicRead => f.write_str("public-read"),
+                Self::GrantRead => f.write_str("grant-read"),
+                Self::GrantReadAcp => f.write_str("grant-read-acp"),
+                Self::GrantWriteAcp => f.write_str("grant-write-acp"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BucketRequesterShape {
+        OwnerExact,
+        SameAccountAdmin,
+        CrossAccount,
+    }
+
+    impl fmt::Display for BucketRequesterShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::OwnerExact => f.write_str("owner-exact"),
+                Self::SameAccountAdmin => f.write_str("same-account-admin"),
+                Self::CrossAccount => f.write_str("cross-account"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BucketPolicyShape {
+        None,
+        AllowAction,
+        DenyAction,
+    }
+
+    impl fmt::Display for BucketPolicyShape {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::None => f.write_str("no-policy"),
+                Self::AllowAction => f.write_str("allow-action"),
+                Self::DenyAction => f.write_str("deny-action"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum BucketActionOutcome {
+        Allow,
+        Deny,
+    }
+
+    impl fmt::Display for BucketActionOutcome {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            match self {
+                Self::Allow => f.write_str("Allow"),
+                Self::Deny => f.write_str("Deny"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct BucketActionScenario {
+        pub(super) name: &'static str,
+        pub(super) action: BucketAction,
+        pub(super) ownership: BucketOwnershipShape,
+        pub(super) access: BucketAccessShape,
+        pub(super) requester: BucketRequesterShape,
+        pub(super) policy: BucketPolicyShape,
+        pub(super) expected: BucketActionOutcome,
+    }
+
+    impl BucketActionScenario {
+        pub(super) fn scenarios(action: BucketAction) -> Vec<Self> {
+            use BucketAccessShape as Access;
+            use BucketAction as Action;
+            use BucketActionOutcome as Outcome;
+            use BucketOwnershipShape as Ownership;
+            use BucketPolicyShape as Policy;
+            use BucketRequesterShape as Requester;
+
+            match action {
+                Action::GetBucketAcl => vec![
+                    Self {
+                        name: "owner-exact-retains-bucket-acl-read-fallback",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::OwnerExact,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "cross-account-read-acp-grant-still-allows-read",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::GrantReadAcp,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "same-account-admin-still-reads-acl-on-boe-bucket",
+                        action,
+                        ownership: Ownership::BucketOwnerEnforced,
+                        access: Access::Private,
+                        requester: Requester::SameAccountAdmin,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "explicit-deny-overrides-boe-admin-read-fallback",
+                        action,
+                        ownership: Ownership::BucketOwnerEnforced,
+                        access: Access::Private,
+                        requester: Requester::SameAccountAdmin,
+                        policy: Policy::DenyAction,
+                        expected: Outcome::Deny,
+                    },
+                    Self {
+                        name: "dedicated-policy-can-grant-cross-account-read",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::AllowAction,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "explicit-deny-overrides-read-acp-fallback",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::GrantReadAcp,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::DenyAction,
+                        expected: Outcome::Deny,
+                    },
+                ],
+                Action::PutBucketAcl => vec![
+                    Self {
+                        name: "owner-exact-retains-bucket-acl-write-fallback",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::OwnerExact,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "cross-account-write-acp-grant-still-allows-write",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::GrantWriteAcp,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "same-account-admin-does-not-gain-bucket-acl-write-fallback",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::SameAccountAdmin,
+                        policy: Policy::None,
+                        expected: Outcome::Deny,
+                    },
+                    Self {
+                        name: "dedicated-policy-can-grant-cross-account-write",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::AllowAction,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "explicit-deny-overrides-write-acp-fallback",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::GrantWriteAcp,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::DenyAction,
+                        expected: Outcome::Deny,
+                    },
+                ],
+                Action::GetBucketVersioning => vec![
+                    Self {
+                        name: "owner-exact-retains-versioning-admin-fallback",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::OwnerExact,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "same-account-admin-retains-versioning-admin-fallback",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::SameAccountAdmin,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "cross-account-still-denied-without-dedicated-policy",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::None,
+                        expected: Outcome::Deny,
+                    },
+                    Self {
+                        name: "dedicated-policy-can-grant-cross-account-versioning-read",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::AllowAction,
+                        expected: Outcome::Allow,
+                    },
+                ],
+                Action::PutBucketVersioning => vec![
+                    Self {
+                        name: "owner-exact-retains-versioning-admin-write-fallback",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::OwnerExact,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "same-account-admin-retains-versioning-admin-write-fallback",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::SameAccountAdmin,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "cross-account-still-denied-without-dedicated-write-policy",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::None,
+                        expected: Outcome::Deny,
+                    },
+                    Self {
+                        name: "dedicated-policy-can-grant-cross-account-versioning-write",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::AllowAction,
+                        expected: Outcome::Allow,
+                    },
+                ],
+                Action::ListBucketVersions => vec![
+                    Self {
+                        name: "owner-exact-retains-listing-fallback",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::OwnerExact,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "public-read-bucket-still-allows-cross-account-version-listing",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::PublicRead,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "grant-read-still-allows-cross-account-version-listing",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::GrantRead,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "cross-account-still-denied-on-private-bucket-without-policy",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::None,
+                        expected: Outcome::Deny,
+                    },
+                    Self {
+                        name: "dedicated-policy-can-grant-cross-account-version-listing",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::AllowAction,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "explicit-deny-overrides-public-read-version-listing-fallback",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::PublicRead,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::DenyAction,
+                        expected: Outcome::Deny,
+                    },
+                ],
+                Action::ListBucketMultipartUploads => vec![
+                    Self {
+                        name: "owner-exact-retains-multipart-listing-fallback",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::OwnerExact,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "public-read-bucket-still-allows-cross-account-multipart-listing",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::PublicRead,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "grant-read-still-allows-cross-account-multipart-listing",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::GrantRead,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::None,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name:
+                            "cross-account-still-denied-on-private-bucket-without-multipart-policy",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::None,
+                        expected: Outcome::Deny,
+                    },
+                    Self {
+                        name: "dedicated-policy-can-grant-cross-account-multipart-listing",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::Private,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::AllowAction,
+                        expected: Outcome::Allow,
+                    },
+                    Self {
+                        name: "explicit-deny-overrides-public-read-multipart-listing-fallback",
+                        action,
+                        ownership: Ownership::Standard,
+                        access: Access::PublicRead,
+                        requester: Requester::CrossAccount,
+                        policy: Policy::DenyAction,
+                        expected: Outcome::Deny,
+                    },
+                ],
+            }
+        }
+    }
+
+    impl fmt::Display for BucketActionScenario {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                f,
+                "name={} action={} ownership={} access={} requester={} policy={}",
+                self.name, self.action, self.ownership, self.access, self.requester, self.policy
+            )
+        }
+    }
+}
+
+mod phase9_harness {
+    use super::harness::{setup_coordinator, IdentityFixtures};
+    use super::phase9_model::{
+        BucketAccessShape, BucketAction, BucketActionOutcome, BucketActionScenario,
+        BucketOwnershipShape, BucketPolicyShape, BucketRequesterShape,
+    };
+    use super::*;
+
+    pub(super) struct Phase9Harness {
+        _tmp: test_util::TempDir,
+        coord: Coordinator,
+        fixtures: IdentityFixtures,
+    }
+
+    impl Phase9Harness {
+        pub(super) fn new() -> Self {
+            let tmp = test_util::tempdir();
+            let coord = setup_coordinator(tmp.path());
+            let fixtures = IdentityFixtures::new();
+            Self {
+                _tmp: tmp,
+                coord,
+                fixtures,
+            }
+        }
+
+        pub(super) fn run(
+            &self,
+            bucket: &str,
+            scenario: BucketActionScenario,
+        ) -> BucketActionOutcome {
+            materialize_phase9_bucket(&self.coord, &self.fixtures, bucket, scenario)
+                .unwrap_or_else(|err| {
+                    panic!("failed to materialize phase 9 state for {scenario}: {err:?}");
+                });
+            run_phase9_action(&self.coord, &self.fixtures, bucket, scenario)
+        }
+    }
+
+    pub(super) fn phase9_bucket_name_for(action: BucketAction, index: usize) -> String {
+        let action_slug = match action {
+            BucketAction::GetBucketAcl => "get-bucket-acl",
+            BucketAction::PutBucketAcl => "put-bucket-acl",
+            BucketAction::GetBucketVersioning => "get-bucket-versioning",
+            BucketAction::PutBucketVersioning => "put-bucket-versioning",
+            BucketAction::ListBucketVersions => "list-bucket-versions",
+            BucketAction::ListBucketMultipartUploads => "list-bucket-multipart",
+        };
+        format!("authz-phase9-{action_slug}-{index:05}")
+    }
+
+    fn materialize_phase9_bucket(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: BucketActionScenario,
+    ) -> Result<(), ServerError> {
+        let owner = OwnerIdentity::new(
+            fixtures.owner_user.principal(),
+            fixtures.owner_user.canonical_user_id().clone(),
+        );
+        let mut grant_entries = Coordinator::bucket_acl_grants_from_flags(
+            &owner,
+            scenario.access == BucketAccessShape::PublicRead,
+            false,
+        )
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+        if let Some(permission) = phase9_acl_permission(scenario.access) {
+            grant_entries.push(AclGrant::new(
+                AclGrantee::CanonicalUser(fixtures.cross_account.canonical_user_id().clone()),
+                permission,
+            ));
+        }
+        let grants = AclGrants::new(grant_entries);
+        coord.create_bucket_with_acl_grants(&owner, bucket, grants, false)?;
+
+        if scenario.ownership == BucketOwnershipShape::BucketOwnerEnforced {
+            coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
+                bucket: BucketRequest::new(
+                    trusted_bucket_name(bucket),
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                config: BucketOwnershipControls {
+                    object_ownership: BucketObjectOwnership::BucketOwnerEnforced,
+                },
+            })?;
+        }
+
+        if let Some(policy) = phase9_policy_document(fixtures, bucket, scenario) {
+            coord.put_bucket_policy(&PutBucketPolicyRequest {
+                bucket: BucketRequest::new(
+                    trusted_bucket_name(bucket),
+                    Requester::authenticated(fixtures.owner_user.clone()),
+                    None,
+                ),
+                config: &policy,
+                confirm_remove_self_bucket_access: false,
+            })?;
+        }
+
+        Ok(())
+    }
+
+    fn phase9_acl_permission(access: BucketAccessShape) -> Option<AclPermission> {
+        match access {
+            BucketAccessShape::Private | BucketAccessShape::PublicRead => None,
+            BucketAccessShape::GrantRead => Some(AclPermission::Read),
+            BucketAccessShape::GrantReadAcp => Some(AclPermission::ReadAcp),
+            BucketAccessShape::GrantWriteAcp => Some(AclPermission::WriteAcp),
+        }
+    }
+
+    fn phase9_policy_document(
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: BucketActionScenario,
+    ) -> Option<String> {
+        let principal = match scenario.requester {
+            BucketRequesterShape::OwnerExact => fixtures.owner_user.principal(),
+            BucketRequesterShape::SameAccountAdmin => fixtures.same_account_distinct.principal(),
+            BucketRequesterShape::CrossAccount => fixtures.cross_account.principal(),
+        };
+        let effect = match scenario.policy {
+            BucketPolicyShape::None => return None,
+            BucketPolicyShape::AllowAction => "Allow",
+            BucketPolicyShape::DenyAction => "Deny",
+        };
+        let action = phase9_policy_action_name(scenario.action);
+        Some(format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"{effect}","Principal":{{"AWS":"{principal}"}},"Action":"{action}","Resource":"arn:aws:s3:::{bucket}"}}]}}"#
+        ))
+    }
+
+    fn phase9_policy_action_name(action: BucketAction) -> &'static str {
+        match action {
+            BucketAction::GetBucketAcl => "s3:GetBucketAcl",
+            BucketAction::PutBucketAcl => "s3:PutBucketAcl",
+            BucketAction::GetBucketVersioning => "s3:GetBucketVersioning",
+            BucketAction::PutBucketVersioning => "s3:PutBucketVersioning",
+            BucketAction::ListBucketVersions => "s3:ListBucketVersions",
+            BucketAction::ListBucketMultipartUploads => "s3:ListBucketMultipartUploads",
+        }
+    }
+
+    fn run_phase9_action(
+        coord: &Coordinator,
+        fixtures: &IdentityFixtures,
+        bucket: &str,
+        scenario: BucketActionScenario,
+    ) -> BucketActionOutcome {
+        let requester = phase9_requester(fixtures, scenario.requester);
+        let bucket_request =
+            BucketRequest::new(trusted_bucket_name(bucket), requester.clone(), None);
+        let result = match scenario.action {
+            BucketAction::GetBucketAcl => {
+                coord.authorize_get_bucket_acl(&bucket_request).map(|_| ())
+            }
+            BucketAction::PutBucketAcl => coord
+                .authorize_put_bucket_acl(&PutBucketAclRequest {
+                    bucket: bucket_request,
+                    acl: PutBucketAclInput::Canned(BucketAcl::Private),
+                    policy_context: PutObjectPolicyContext::default(),
+                })
+                .map(|_| ()),
+            BucketAction::GetBucketVersioning => coord
+                .authorize_get_bucket_versioning(&bucket_request)
+                .map(|_| ()),
+            BucketAction::PutBucketVersioning => coord
+                .authorize_put_bucket_versioning(&PutBucketVersioningRequest {
+                    bucket: bucket_request,
+                    state: BucketVersioningState::Enabled,
+                })
+                .map(|_| ()),
+            BucketAction::ListBucketVersions => coord
+                .authorize_list_object_versions(&ListObjectVersionsRequest {
+                    bucket: bucket_request,
+                    prefix: None,
+                    key_marker: None,
+                    version_id_marker: None,
+                    max_keys: 1000,
+                })
+                .map(|_| ()),
+            BucketAction::ListBucketMultipartUploads => coord
+                .authorize_list_multipart_uploads(&ListMultipartUploadsRequest {
+                    bucket: bucket_request,
+                    prefix: None,
+                    key_marker: None,
+                    upload_id_marker: None,
+                    max_uploads: 1000,
+                })
+                .map(|_| ()),
+        };
+        match result {
+            Ok(()) => BucketActionOutcome::Allow,
+            Err(ServerError::AccessDenied | ServerError::AnonymousApiAccessDenied) => {
+                BucketActionOutcome::Deny
+            }
+            Err(other) => panic!("unexpected phase 9 result for {scenario}: {other:?}"),
+        }
+    }
+
+    fn phase9_requester(fixtures: &IdentityFixtures, shape: BucketRequesterShape) -> Requester {
+        match shape {
+            BucketRequesterShape::OwnerExact => {
+                Requester::authenticated(fixtures.owner_user.clone())
+            }
+            BucketRequesterShape::SameAccountAdmin => {
+                Requester::authenticated_owner_account_admin(fixtures.same_account_distinct.clone())
+            }
+            BucketRequesterShape::CrossAccount => {
+                Requester::authenticated(fixtures.cross_account.clone())
+            }
+        }
+    }
+}
+
 use harness::{bucket_name_for, to_existing_outcome, to_missing_outcome, MatrixHarness};
 use model::{Action, MissingScenario, Scenario};
 use phase4_harness::{
@@ -7877,6 +8535,8 @@ use phase7a_harness::{
 };
 use phase7a_model::{MultipartManagementScenario, MultipartWriteScenario};
 use phase8_harness::Phase8Harness;
+use phase9_harness::{phase9_bucket_name_for, Phase9Harness};
+use phase9_model::{BucketAction, BucketActionScenario};
 
 #[test]
 fn authz_model_phase1_get_object_existing_matrix() {
@@ -8408,6 +9068,36 @@ fn authz_model_phase8_copy_object_replace_tags_distinct_from_plain_copy() {
     );
 }
 
+#[test]
+fn authz_model_phase9_get_bucket_acl_matrix() {
+    run_phase9_bucket_matrix(BucketAction::GetBucketAcl);
+}
+
+#[test]
+fn authz_model_phase9_put_bucket_acl_matrix() {
+    run_phase9_bucket_matrix(BucketAction::PutBucketAcl);
+}
+
+#[test]
+fn authz_model_phase9_get_bucket_versioning_matrix() {
+    run_phase9_bucket_matrix(BucketAction::GetBucketVersioning);
+}
+
+#[test]
+fn authz_model_phase9_put_bucket_versioning_matrix() {
+    run_phase9_bucket_matrix(BucketAction::PutBucketVersioning);
+}
+
+#[test]
+fn authz_model_phase9_list_bucket_versions_matrix() {
+    run_phase9_bucket_matrix(BucketAction::ListBucketVersions);
+}
+
+#[test]
+fn authz_model_phase9_list_bucket_multipart_uploads_matrix() {
+    run_phase9_bucket_matrix(BucketAction::ListBucketMultipartUploads);
+}
+
 fn run_existing_matrix(phase: &str, action: Action) {
     let scenarios = Scenario::existing_scenarios(action);
     assert!(
@@ -8480,6 +9170,25 @@ fn run_phase4_acl_matrix(action: AclUpdateAction) {
         assert_eq!(
             actual, expected,
             "phase 4 authz model mismatch\nscenario: {scenario}\nexpected: {expected}\nactual: {actual}"
+        );
+    }
+}
+
+fn run_phase9_bucket_matrix(action: BucketAction) {
+    let scenarios = BucketActionScenario::scenarios(action);
+    assert!(
+        !scenarios.is_empty(),
+        "phase 9 matrix unexpectedly produced no scenarios for {action}"
+    );
+    let harness = Phase9Harness::new();
+
+    for (index, scenario) in scenarios.into_iter().enumerate() {
+        let bucket = phase9_bucket_name_for(action, index);
+        let actual = harness.run(&bucket, scenario);
+        assert_eq!(
+            actual, scenario.expected,
+            "phase 9 bucket-action mismatch\nscenario: {scenario}\nexpected: {}\nactual: {actual}",
+            scenario.expected
         );
     }
 }
