@@ -402,6 +402,34 @@ This phase should complement, not replace,
 That plan is about design hardening; this one is about proving the behavior
 repeatedly under short stateful traces.
 
+Current state:
+
+- in progress
+- a first bounded reclaim/lease trace now lives in
+  `crates/server-core/src/coordinator/multipart_reclaim_trace_tests.rs`
+- the initial property is intentionally narrow:
+  - one bucket, one key, and one payload generation
+  - one optional active payload lease
+  - one durable simple-payload reclaim record
+  - one deduplicated object-reclaim queue slot plus one bucket-delete finalize
+    queue slot
+- operations currently cover:
+  - seeding durable reclaim metadata
+  - acquiring and releasing the payload lease
+  - explicitly enqueueing object reclaim
+  - consuming object reclaim worker steps
+  - consuming bucket-delete finalize worker steps
+  - asserting that no work is queued
+- the current model checks after every step that:
+  - active lease presence matches the live lease count
+  - durable reclaim metadata presence matches the model
+- when explicit worker or no-work observation steps are taken, the
+  worker-visible queue order matches the real storage-node priority
+  (`ObjectPayload` before `BucketDelete`)
+- this already generalizes the existing fixed regressions for:
+  - no reclaim work from dropping a read-only lease without durable metadata
+  - retry only after the final lease drop while reclaim metadata still exists
+
 Success criteria:
 
 - reclaim invariants are covered by generated traces rather than only static

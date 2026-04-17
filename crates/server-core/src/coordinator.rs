@@ -13770,6 +13770,8 @@ mod authz;
 #[cfg(test)]
 mod authz_model_tests;
 #[cfg(test)]
+mod multipart_reclaim_trace_tests;
+#[cfg(test)]
 mod multipart_stateful_tests;
 #[cfg(test)]
 mod multipart_trace_tests;
