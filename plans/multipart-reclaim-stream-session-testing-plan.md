@@ -349,6 +349,14 @@ Current state:
   - aborting an upload with a live stream-part session removes the upload
   - the session remains until explicit session cleanup
   - no object becomes visible while that orphaned session still exists
+- a second bounded Phase 2 property now extends the model to the first
+  concurrent same-key multipart shape:
+  - up to two pending uploads for the same key
+  - one distinct streamed part payload per upload
+  - complete/abort on newest versus oldest upload without widening to a
+    general N-upload model yet
+  - checks that pending upload ids, per-upload `ListParts`, and visible object
+    winner identity stay aligned with the model after each step
 
 ## Phase 3: Reclaim and Lease Trace Model
 

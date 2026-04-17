@@ -138,6 +138,33 @@ fn begin_stream_part_test<I: MultipartUploadIdArg>(
     })
 }
 
+fn stream_finalize_single_part(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    upload_id: &UploadId,
+    data: &[u8],
+) -> String {
+    let session = begin_stream_part_test(coord, bucket, key, upload_id, 1)
+        .unwrap()
+        .session_id;
+    coord
+        .append_plaintext_stream_segment_for_test(bucket, key, &session, 0, data)
+        .unwrap();
+    coord
+        .finalize_stream_part(FinalizeStreamPartRequest {
+            upload: multipart_object_request(bucket, key, upload_id, test_requester()),
+            session_id: &session,
+            part_number: 1,
+            crc64: checksum::crc64::checksum(data),
+            total_size: data.len() as u64,
+            claimed_checksum: None,
+            computed_checksum: None,
+        })
+        .unwrap()
+        .etag
+}
+
 fn read_all_body(mut body: ReadHandle) -> Result<Vec<u8>, ServerError> {
     let mut out = Vec::new();
     while let Some(chunk) = body.next_chunk(INTERNAL_SEGMENT_SIZE)? {
@@ -283,6 +310,138 @@ fn render_trace(ops: &[MultipartTraceOp]) -> String {
     rendered
 }
 
+#[derive(Debug, Clone)]
+enum SameKeyUploadTraceSeed {
+    Choice(u8),
+}
+
+#[derive(Debug, Clone)]
+enum SameKeyUploadTraceOp {
+    CreateUpload,
+    FinalizeCurrentPart,
+    CompleteCurrent,
+    AbortCurrent,
+    CompleteOldest,
+    AbortOldest,
+}
+
+impl std::fmt::Display for SameKeyUploadTraceOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CreateUpload => write!(f, "create-upload"),
+            Self::FinalizeCurrentPart => write!(f, "finalize-current-part"),
+            Self::CompleteCurrent => write!(f, "complete-current"),
+            Self::AbortCurrent => write!(f, "abort-current"),
+            Self::CompleteOldest => write!(f, "complete-oldest"),
+            Self::AbortOldest => write!(f, "abort-oldest"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SameKeyUploadModelEntry {
+    part_committed: bool,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SameKeyUploadModel {
+    uploads: Vec<SameKeyUploadModelEntry>,
+    visible_payload: Option<Vec<u8>>,
+    next_payload_id: u8,
+}
+
+impl SameKeyUploadModel {
+    fn new() -> Self {
+        Self {
+            uploads: Vec::new(),
+            visible_payload: None,
+            next_payload_id: 0,
+        }
+    }
+
+    fn legal_ops(&self) -> &'static [SameKeyUploadTraceOp] {
+        use SameKeyUploadTraceOp::*;
+        match self
+            .uploads
+            .iter()
+            .map(|entry| entry.part_committed)
+            .collect::<Vec<_>>()
+            .as_slice()
+        {
+            [] => &[CreateUpload],
+            [false] => &[CreateUpload, FinalizeCurrentPart, AbortCurrent],
+            [true] => &[CreateUpload, CompleteCurrent, AbortCurrent],
+            [false, false] => &[FinalizeCurrentPart, AbortCurrent, AbortOldest],
+            [true, false] => &[FinalizeCurrentPart, AbortCurrent, CompleteOldest, AbortOldest],
+            [false, true] => &[CompleteCurrent, AbortCurrent, AbortOldest],
+            [true, true] => &[CompleteCurrent, AbortCurrent, CompleteOldest, AbortOldest],
+            _ => &[CreateUpload],
+        }
+    }
+
+    fn apply(&mut self, op: &SameKeyUploadTraceOp) {
+        use SameKeyUploadTraceOp::*;
+        match op {
+            CreateUpload => {
+                let payload = format!("trace-part-{}", self.next_payload_id).into_bytes();
+                self.next_payload_id = self.next_payload_id.wrapping_add(1);
+                self.uploads.push(SameKeyUploadModelEntry {
+                    part_committed: false,
+                    payload,
+                });
+            }
+            FinalizeCurrentPart => {
+                if let Some(current) = self.uploads.last_mut() {
+                    current.part_committed = true;
+                }
+            }
+            CompleteCurrent => {
+                let completed = self.uploads.pop().unwrap();
+                self.visible_payload = Some(completed.payload);
+            }
+            AbortCurrent => {
+                self.uploads.pop();
+            }
+            CompleteOldest => {
+                let completed = self.uploads.remove(0);
+                self.visible_payload = Some(completed.payload);
+            }
+            AbortOldest => {
+                self.uploads.remove(0);
+            }
+        }
+    }
+}
+
+fn render_same_key_upload_trace(ops: &[SameKeyUploadTraceOp]) -> String {
+    let mut rendered = String::new();
+    for (index, op) in ops.iter().enumerate() {
+        let _ = writeln!(&mut rendered, "{index}: {op}");
+    }
+    rendered
+}
+
+fn same_key_upload_trace_strategy() -> BoxedStrategy<Vec<SameKeyUploadTraceOp>> {
+    proptest::collection::vec(
+        any::<u8>().prop_map(SameKeyUploadTraceSeed::Choice),
+        0..=TRACE_MAX_OPS,
+    )
+    .prop_map(|seeds| {
+        let mut model = SameKeyUploadModel::new();
+        let mut ops = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            let SameKeyUploadTraceSeed::Choice(choice) = seed;
+            let legal = model.legal_ops();
+            let op = legal[(choice as usize) % legal.len()].clone();
+            model.apply(&op);
+            ops.push(op);
+        }
+        ops
+    })
+    .boxed()
+}
+
 fn multipart_trace_strategy() -> BoxedStrategy<Vec<MultipartTraceOp>> {
     proptest::collection::vec(
         any::<u8>().prop_map(MultipartTraceSeed::Choice),
@@ -311,6 +470,146 @@ struct MultipartTraceHarness {
     current_session_id: Option<SessionId>,
     last_part_etag: Option<String>,
     last_completed_part_etag: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SameKeyUploadEntry {
+    upload_id: UploadId,
+    part_etag: Option<String>,
+    payload: Vec<u8>,
+}
+
+struct SameKeyUploadHarness {
+    coord: Coordinator,
+    uploads: Vec<SameKeyUploadEntry>,
+    next_payload_id: u8,
+}
+
+impl SameKeyUploadHarness {
+    fn new(coord: Coordinator) -> Self {
+        Self {
+            coord,
+            uploads: Vec::new(),
+            next_payload_id: 0,
+        }
+    }
+
+    fn execute(&mut self, op: &SameKeyUploadTraceOp) {
+        match op {
+            SameKeyUploadTraceOp::CreateUpload => {
+                let create = create_basic_multipart_upload(&self.coord, TRACE_BUCKET, TRACE_KEY);
+                let payload = format!("trace-part-{}", self.next_payload_id).into_bytes();
+                self.next_payload_id = self.next_payload_id.wrapping_add(1);
+                self.uploads.push(SameKeyUploadEntry {
+                    upload_id: create.upload_id,
+                    part_etag: None,
+                    payload,
+                });
+            }
+            SameKeyUploadTraceOp::FinalizeCurrentPart => {
+                let current = self.uploads.last_mut().unwrap();
+                current.part_etag = Some(stream_finalize_single_part(
+                    &self.coord,
+                    TRACE_BUCKET,
+                    TRACE_KEY,
+                    &current.upload_id,
+                    &current.payload,
+                ));
+            }
+            SameKeyUploadTraceOp::CompleteCurrent => {
+                let current = self.uploads.last().unwrap();
+                let _ = self
+                    .coord
+                    .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                        upload: multipart_object_request(
+                            TRACE_BUCKET,
+                            TRACE_KEY,
+                            &current.upload_id,
+                            test_requester(),
+                        ),
+                        parts: &[CompletePart {
+                            part_number: 1,
+                            etag: current.part_etag.clone().unwrap(),
+                            checksum: None,
+                        }],
+                        claimed_checksum: None,
+                        expected_object_size: None,
+                        cond: &WriteCondition::default(),
+                        sse_customer: None,
+                    });
+                self.uploads.pop();
+            }
+            SameKeyUploadTraceOp::AbortCurrent => {
+                let current = self.uploads.last().unwrap();
+                let _ = self.coord.abort_multipart_upload(&multipart_object_request(
+                    TRACE_BUCKET,
+                    TRACE_KEY,
+                    &current.upload_id,
+                    test_requester(),
+                ));
+                self.uploads.pop();
+            }
+            SameKeyUploadTraceOp::CompleteOldest => {
+                let oldest = &self.uploads[0];
+                let _ = self
+                    .coord
+                    .complete_multipart_upload(&CompleteMultipartUploadRequest {
+                        upload: multipart_object_request(
+                            TRACE_BUCKET,
+                            TRACE_KEY,
+                            &oldest.upload_id,
+                            test_requester(),
+                        ),
+                        parts: &[CompletePart {
+                            part_number: 1,
+                            etag: oldest.part_etag.clone().unwrap(),
+                            checksum: None,
+                        }],
+                        claimed_checksum: None,
+                        expected_object_size: None,
+                        cond: &WriteCondition::default(),
+                        sse_customer: None,
+                    });
+                self.uploads.remove(0);
+            }
+            SameKeyUploadTraceOp::AbortOldest => {
+                let oldest = &self.uploads[0];
+                let _ = self.coord.abort_multipart_upload(&multipart_object_request(
+                    TRACE_BUCKET,
+                    TRACE_KEY,
+                    &oldest.upload_id,
+                    test_requester(),
+                ));
+                self.uploads.remove(0);
+            }
+        }
+    }
+
+    fn pending_upload_ids(&self) -> Vec<UploadId> {
+        let mut ids = Vec::new();
+        self.coord
+            .pg_topology
+            .for_each_pg(|pg_id| {
+                let pg = self.coord.storage_node.get_pg(pg_id)?;
+                ids.extend(
+                    pg.list_multipart_uploads(&storage::ListMultipartUploadsReq {
+                        bucket: trusted_bucket_name(TRACE_BUCKET),
+                        prefix: None,
+                        key_marker: None,
+                        upload_id_marker: None,
+                        max_uploads: u32::MAX,
+                    })?
+                    .uploads
+                    .into_iter()
+                    .filter(|upload| upload.key.as_str() == TRACE_KEY)
+                    .map(|upload| upload.upload_id),
+                );
+                Ok::<(), ServerError>(())
+            })
+            .unwrap();
+        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        ids
+    }
 }
 
 impl MultipartTraceHarness {
@@ -624,6 +923,97 @@ proptest! {
             assert_trace_matches_model(&harness, &model, &step_context)?;
         }
     }
+
+    #[test]
+    fn prop_same_key_multipart_upload_set_matches_model(ops in same_key_upload_trace_strategy()) {
+        let trace = render_same_key_upload_trace(&ops);
+        let tmp = test_util::tempdir();
+        let coord = setup_coordinator(tmp.path());
+        coord
+            .create_bucket_for_owner("default-owner", TRACE_BUCKET, false)
+            .unwrap();
+        let mut harness = SameKeyUploadHarness::new(coord);
+        let mut model = SameKeyUploadModel::new();
+
+        let initial_context = format!("initial state\nfull trace:\n{trace}");
+        assert_same_key_upload_trace_matches_model(&harness, &model, &initial_context)?;
+
+        for (index, op) in ops.iter().enumerate() {
+            harness.execute(op);
+            model.apply(op);
+            let step_context = format!("after step {index}: {op}\nfull trace:\n{trace}");
+            assert_same_key_upload_trace_matches_model(&harness, &model, &step_context)?;
+        }
+    }
+}
+
+fn assert_same_key_upload_trace_matches_model(
+    harness: &SameKeyUploadHarness,
+    model: &SameKeyUploadModel,
+    context: &str,
+) -> TestCaseResult {
+    let mut expected_ids: Vec<UploadId> = harness
+        .uploads
+        .iter()
+        .map(|entry| entry.upload_id.clone())
+        .collect();
+    expected_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    prop_assert_eq!(harness.pending_upload_ids(), expected_ids, "{}", context);
+
+    for entry in &harness.uploads {
+        let result = harness.coord.list_parts(&ListPartsRequest {
+            upload: multipart_object_request(
+                TRACE_BUCKET,
+                TRACE_KEY,
+                &entry.upload_id,
+                test_requester(),
+            ),
+            part_number_marker: None,
+            max_parts: 100,
+        });
+        match (&entry.part_etag, result) {
+            (Some(_), Ok(parts)) => prop_assert_eq!(parts.parts.len(), 1, "{}", context),
+            (None, Ok(parts)) => prop_assert!(parts.parts.is_empty(), "{}", context),
+            (_, Err(err)) => {
+                return Err(TestCaseError::fail(format!(
+                    "{context}\nlist_parts unexpectedly failed for pending upload: {err:?}"
+                )));
+            }
+        }
+    }
+
+    if let Some(expected_payload) = &model.visible_payload {
+        let result = harness
+            .coord
+            .get_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request(TRACE_BUCKET, TRACE_KEY, None, test_requester()),
+                cond: NO_READ,
+            })
+            .map_err(|err| {
+                TestCaseError::fail(format!("{context}\nexpected visible object, got {err:?}"))
+            })?;
+        let body = read_all_body(result.body).map_err(|err| {
+            TestCaseError::fail(format!("{context}\nfailed reading body: {err:?}"))
+        })?;
+        prop_assert_eq!(body, expected_payload.as_slice(), "{}", context);
+    } else {
+        let err = harness
+            .coord
+            .head_object(&GetObjectRequest {
+                sse_customer: None,
+                object: object_version_request(TRACE_BUCKET, TRACE_KEY, None, test_requester()),
+                cond: NO_READ,
+            })
+            .unwrap_err();
+        prop_assert!(
+            matches!(err, ServerError::ObjectNotFound { .. }),
+            "{}",
+            context
+        );
+    }
+
+    Ok(())
 }
 
 #[test]
