@@ -355,8 +355,8 @@ Current state:
   - one distinct streamed part payload per upload
   - complete/abort on newest versus oldest upload without widening to a
     general N-upload model yet
-  - checks that pending upload ids, per-upload `ListParts`, and visible object
-    winner identity stay aligned with the model after each step
+  - checks that pending upload ordering, per-upload `ListParts`, and visible
+    object winner identity stay aligned with the model after each step
 
 ## Phase 3: Reclaim and Lease Trace Model
 

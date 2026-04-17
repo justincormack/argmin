@@ -373,7 +373,12 @@ impl SameKeyUploadModel {
             [false] => &[CreateUpload, FinalizeCurrentPart, AbortCurrent],
             [true] => &[CreateUpload, CompleteCurrent, AbortCurrent],
             [false, false] => &[FinalizeCurrentPart, AbortCurrent, AbortOldest],
-            [true, false] => &[FinalizeCurrentPart, AbortCurrent, CompleteOldest, AbortOldest],
+            [true, false] => &[
+                FinalizeCurrentPart,
+                AbortCurrent,
+                CompleteOldest,
+                AbortOldest,
+            ],
             [false, true] => &[CompleteCurrent, AbortCurrent, AbortOldest],
             [true, true] => &[CompleteCurrent, AbortCurrent, CompleteOldest, AbortOldest],
             _ => &[CreateUpload],
@@ -475,6 +480,7 @@ struct MultipartTraceHarness {
 #[derive(Debug, Clone)]
 struct SameKeyUploadEntry {
     upload_id: UploadId,
+    initiated_at: u64,
     part_etag: Option<String>,
     payload: Vec<u8>,
 }
@@ -498,10 +504,20 @@ impl SameKeyUploadHarness {
         match op {
             SameKeyUploadTraceOp::CreateUpload => {
                 let create = create_basic_multipart_upload(&self.coord, TRACE_BUCKET, TRACE_KEY);
+                let meta_pg = self
+                    .coord
+                    .storage_node
+                    .get_pg(self.coord.object_pg_id_for(
+                        &trusted_bucket_name(TRACE_BUCKET),
+                        &trusted_object_key(TRACE_KEY),
+                    ))
+                    .unwrap();
+                let upload = meta_pg.get_multipart_upload(&create.upload_id).unwrap();
                 let payload = format!("trace-part-{}", self.next_payload_id).into_bytes();
                 self.next_payload_id = self.next_payload_id.wrapping_add(1);
                 self.uploads.push(SameKeyUploadEntry {
                     upload_id: create.upload_id,
+                    initiated_at: upload.initiated_at,
                     part_etag: None,
                     payload,
                 });
@@ -585,30 +601,25 @@ impl SameKeyUploadHarness {
         }
     }
 
-    fn pending_upload_ids(&self) -> Vec<UploadId> {
-        let mut ids = Vec::new();
+    fn pending_upload_ids_in_order(&self) -> Vec<UploadId> {
         self.coord
-            .pg_topology
-            .for_each_pg(|pg_id| {
-                let pg = self.coord.storage_node.get_pg(pg_id)?;
-                ids.extend(
-                    pg.list_multipart_uploads(&storage::ListMultipartUploadsReq {
-                        bucket: trusted_bucket_name(TRACE_BUCKET),
-                        prefix: None,
-                        key_marker: None,
-                        upload_id_marker: None,
-                        max_uploads: u32::MAX,
-                    })?
-                    .uploads
-                    .into_iter()
-                    .filter(|upload| upload.key.as_str() == TRACE_KEY)
-                    .map(|upload| upload.upload_id),
-                );
-                Ok::<(), ServerError>(())
+            .list_multipart_uploads(&ListMultipartUploadsRequest {
+                bucket: BucketRequest::new(
+                    trusted_bucket_name(TRACE_BUCKET),
+                    test_requester(),
+                    None,
+                ),
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: u32::MAX,
             })
-            .unwrap();
-        ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-        ids
+            .unwrap()
+            .uploads
+            .into_iter()
+            .filter(|upload| upload.key.as_str() == TRACE_KEY)
+            .map(|upload| upload.upload_id)
+            .collect()
     }
 }
 
@@ -952,13 +963,22 @@ fn assert_same_key_upload_trace_matches_model(
     model: &SameKeyUploadModel,
     context: &str,
 ) -> TestCaseResult {
-    let mut expected_ids: Vec<UploadId> = harness
-        .uploads
-        .iter()
-        .map(|entry| entry.upload_id.clone())
+    let mut expected_entries = harness.uploads.clone();
+    expected_entries.sort_by(|a, b| {
+        a.initiated_at
+            .cmp(&b.initiated_at)
+            .then(a.upload_id.cmp(&b.upload_id))
+    });
+    let expected_ids: Vec<UploadId> = expected_entries
+        .into_iter()
+        .map(|entry| entry.upload_id)
         .collect();
-    expected_ids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-    prop_assert_eq!(harness.pending_upload_ids(), expected_ids, "{}", context);
+    prop_assert_eq!(
+        harness.pending_upload_ids_in_order(),
+        expected_ids,
+        "{}",
+        context
+    );
 
     for entry in &harness.uploads {
         let result = harness.coord.list_parts(&ListPartsRequest {
