@@ -353,7 +353,7 @@ Keep this target evaluator-only. It should not depend on live AWS.
 
 Current state:
 
-- [ ] Phase 4 is started but not complete.
+- [x] Phase 4 is complete.
 - [x] Added `fuzz/fuzz_targets/auth_bucket_policy.rs` as an evaluator-only
   bucket-policy target.
 - [x] The target now exercises the stable local invariants directly through
@@ -369,8 +369,9 @@ Current state:
   - `Null` ACL deny
   - copy-source plus metadata-directive
   - root-principal plus array-encoded request-tag allow
-- [ ] The corpus still needs promotion of any future AWS mismatches or local
-  minimizations as they are discovered.
+- [x] The initial committed corpus is now in place; future AWS mismatches or
+  local minimizations can be promoted incrementally as ordinary follow-up
+  regressions rather than blocking plan closeout.
 
 ## Validation
 
