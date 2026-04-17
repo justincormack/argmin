@@ -404,7 +404,7 @@ repeatedly under short stateful traces.
 
 Current state:
 
-- in progress
+- complete
 - a first bounded reclaim/lease trace now lives in
   `crates/server-core/src/coordinator/multipart_reclaim_trace_tests.rs`
 - the initial property is intentionally narrow:
@@ -436,9 +436,30 @@ Current state:
   - FIFO object-reclaim queue ordering across generations
   - bucket-delete finalize remaining deduplicated at the bucket level even when
     multiple generations reclaim successfully
+  - explicit deleting-bucket finalization steps, including the real behavior
+    where bucket-delete work follows the current bucket reclaim root and can
+    enqueue only that next generation’s object reclaim before the bucket itself
+    can disappear
   - checks after every step that per-generation metadata presence and lease
     counts stay aligned with the model while worker steps validate the expected
     queue order
+- a third bounded reclaim/lease property now covers cross-key bucket-root
+  ordering without widening to arbitrary object sets:
+  - two keys in the same bucket with one payload generation each
+  - independent lease state and durable reclaim metadata per key
+  - bucket-delete finalization following the real `key ASC` reclaim-root order
+    across keys
+  - object-reclaim worker steps validating the expected per-key dequeue order
+    while post-step assertions keep metadata presence, lease counts, and bucket
+    existence aligned with the model
+- a fourth bounded reclaim/lease property now varies the reclaim root kind for
+  one key and one generation:
+  - `simple_payload_reclaims`
+  - `object_segments_reclaims`
+  - `multipart_reclaims`
+  - the model checks that lease-gating, background object reclaim, and inert
+    bucket-delete follow-on work behave the same across all three durable
+    reclaim surfaces
 
 Success criteria:
 

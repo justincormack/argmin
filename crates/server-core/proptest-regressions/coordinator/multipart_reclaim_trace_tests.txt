@@ -5,3 +5,6 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 1b9ecf610e60931929234b8546469b063a7973c871e2077e96bea082d6d1c232 # shrinks to ops = [SeedMetadata, AcquireLease, ReleaseLease, WorkerObjectStep, SeedMetadata, EnqueueObjectReclaim, WorkerBucketDeleteStep]
+cc 87c6a20e714c76d96343a11f09cbefc533b84f7064a428e2276a5e639f0ce12b # shrinks to ops = [SeedBucketDelete]
+cc 5a155b2b545cf6f951c0802cb9ca7828c57cbcb2ea5ce5f585918a209d4d16c1 # shrinks to ops = [SeedOldMetadata, SeedNewMetadata, AcquireOldLease, SeedBucketDelete, WorkerBucketDeleteStep, WorkerObjectStep, SeedNewMetadata]
+cc 7d9f214f80d8e4e72b73901bcb5f2a85224b5ccc4296867e3f3a1253da439dc5 # shrinks to ops = [SeedOldMetadata, SeedNewMetadata, EnqueueOldReclaim, WorkerObjectStep, WorkerBucketDeleteStep, WorkerObjectStep]

@@ -6,10 +6,16 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use storage::{PgMetadataStore, ReclaimWorkItem, SharedStorageNode, SimplePayloadReclaimRecord};
+use storage::{
+    MultipartReclaimPartRecord, MultipartReclaimRecord, ObjectSegmentsReclaimRecord,
+    ObjectSegmentsReclaimSegmentRecord, PgMetadataStore, ReclaimWorkItem, SharedStorageNode,
+    SimplePayloadReclaimRecord,
+};
 
 const TRACE_BUCKET: &str = "bucket";
 const TRACE_KEY: &str = "key";
+const TRACE_KEY_A: &str = "a";
+const TRACE_KEY_B: &str = "b";
 const TRACE_MAX_OPS: usize = 12;
 
 fn trace_generation_id() -> GenerationId {
@@ -33,8 +39,40 @@ fn make_test_read_runtime(dir: &Path) -> ReadRuntime {
     }
 }
 
+fn seed_deleting_bucket(runtime: &ReadRuntime) {
+    let bucket_pg = runtime
+        .storage_node
+        .get_pg(
+            runtime
+                .pg_topology
+                .bucket_pg_for(&trusted_bucket_name(TRACE_BUCKET)),
+        )
+        .unwrap();
+    bucket_pg
+        .create_bucket(
+            &trusted_bucket_name(TRACE_BUCKET),
+            "default-owner",
+            &CanonicalUserId::from_principal("default-owner"),
+            &AclGrants::default(),
+            false,
+            false,
+        )
+        .unwrap();
+    bucket_pg
+        .begin_bucket_write_drain(&trusted_bucket_name(TRACE_BUCKET))
+        .unwrap();
+    bucket_pg
+        .mark_bucket_deleting(&trusted_bucket_name(TRACE_BUCKET))
+        .unwrap();
+}
+
 #[derive(Debug, Clone)]
 enum ReclaimTraceSeed {
+    Choice(u8),
+}
+
+#[derive(Debug, Clone)]
+enum ReclaimKindTraceSeed {
     Choice(u8),
 }
 
@@ -53,9 +91,44 @@ impl TraceGeneration {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraceKey {
+    A,
+    B,
+}
+
+impl TraceKey {
+    fn key(self) -> &'static str {
+        match self {
+            Self::A => TRACE_KEY_A,
+            Self::B => TRACE_KEY_B,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraceReclaimKind {
+    Simple,
+    Segments,
+    Multipart,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReclaimTraceOp {
     SeedMetadata,
+    AcquireLease,
+    ReleaseLease,
+    EnqueueObjectReclaim,
+    WorkerObjectStep,
+    WorkerBucketDeleteStep,
+    ExpectNoWork,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReclaimKindTraceOp {
+    SeedSimpleMetadata,
+    SeedSegmentsMetadata,
+    SeedMultipartMetadata,
     AcquireLease,
     ReleaseLease,
     EnqueueObjectReclaim,
@@ -78,9 +151,33 @@ impl std::fmt::Display for ReclaimTraceOp {
     }
 }
 
+impl std::fmt::Display for ReclaimKindTraceOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SeedSimpleMetadata => write!(f, "seed-simple-metadata"),
+            Self::SeedSegmentsMetadata => write!(f, "seed-segments-metadata"),
+            Self::SeedMultipartMetadata => write!(f, "seed-multipart-metadata"),
+            Self::AcquireLease => write!(f, "acquire-lease"),
+            Self::ReleaseLease => write!(f, "release-lease"),
+            Self::EnqueueObjectReclaim => write!(f, "enqueue-object-reclaim"),
+            Self::WorkerObjectStep => write!(f, "worker-object-step"),
+            Self::WorkerBucketDeleteStep => write!(f, "worker-bucket-delete-step"),
+            Self::ExpectNoWork => write!(f, "expect-no-work"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReclaimTraceModel {
     metadata_exists: bool,
+    lease_held: bool,
+    object_work_queued: bool,
+    bucket_delete_queued: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReclaimKindTraceModel {
+    reclaim_kind: Option<TraceReclaimKind>,
     lease_held: bool,
     object_work_queued: bool,
     bucket_delete_queued: bool,
@@ -155,6 +252,71 @@ impl ReclaimTraceModel {
     }
 }
 
+impl ReclaimKindTraceModel {
+    fn new() -> Self {
+        Self {
+            reclaim_kind: None,
+            lease_held: false,
+            object_work_queued: false,
+            bucket_delete_queued: false,
+        }
+    }
+
+    fn legal_ops(&self) -> Vec<ReclaimKindTraceOp> {
+        use ReclaimKindTraceOp::*;
+        let mut ops = Vec::new();
+        if self.reclaim_kind.is_none() {
+            ops.push(SeedSimpleMetadata);
+            ops.push(SeedSegmentsMetadata);
+            ops.push(SeedMultipartMetadata);
+        }
+        if self.lease_held {
+            ops.push(ReleaseLease);
+        } else {
+            ops.push(AcquireLease);
+        }
+        if self.reclaim_kind.is_some() {
+            ops.push(EnqueueObjectReclaim);
+        }
+        if self.object_work_queued {
+            ops.push(WorkerObjectStep);
+        }
+        if self.bucket_delete_queued && !self.object_work_queued {
+            ops.push(WorkerBucketDeleteStep);
+        }
+        if !self.object_work_queued && !self.bucket_delete_queued {
+            ops.push(ExpectNoWork);
+        }
+        ops
+    }
+
+    fn apply(&mut self, op: &ReclaimKindTraceOp) {
+        use ReclaimKindTraceOp::*;
+        match op {
+            SeedSimpleMetadata => self.reclaim_kind = Some(TraceReclaimKind::Simple),
+            SeedSegmentsMetadata => self.reclaim_kind = Some(TraceReclaimKind::Segments),
+            SeedMultipartMetadata => self.reclaim_kind = Some(TraceReclaimKind::Multipart),
+            AcquireLease => self.lease_held = true,
+            ReleaseLease => {
+                self.lease_held = false;
+                if self.reclaim_kind.is_some() {
+                    self.object_work_queued = true;
+                }
+            }
+            EnqueueObjectReclaim => self.object_work_queued = true,
+            WorkerObjectStep => {
+                self.object_work_queued = false;
+                if self.reclaim_kind.is_some() && !self.lease_held {
+                    self.reclaim_kind = None;
+                    self.bucket_delete_queued = true;
+                }
+            }
+            WorkerBucketDeleteStep => self.bucket_delete_queued = false,
+            ExpectNoWork => {}
+        }
+    }
+}
+
 fn reclaim_trace_strategy() -> BoxedStrategy<Vec<ReclaimTraceOp>> {
     proptest::collection::vec(
         any::<u8>().prop_map(ReclaimTraceSeed::Choice),
@@ -175,13 +337,39 @@ fn reclaim_trace_strategy() -> BoxedStrategy<Vec<ReclaimTraceOp>> {
     .boxed()
 }
 
+fn reclaim_kind_trace_strategy() -> BoxedStrategy<Vec<ReclaimKindTraceOp>> {
+    proptest::collection::vec(
+        any::<u8>().prop_map(ReclaimKindTraceSeed::Choice),
+        0..=TRACE_MAX_OPS,
+    )
+    .prop_map(|seeds| {
+        let mut model = ReclaimKindTraceModel::new();
+        let mut ops = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            let ReclaimKindTraceSeed::Choice(choice) = seed;
+            let legal = model.legal_ops();
+            let op = legal[(choice as usize) % legal.len()].clone();
+            model.apply(&op);
+            ops.push(op);
+        }
+        ops
+    })
+    .boxed()
+}
+
 #[derive(Debug, Clone)]
 enum TwoGenerationReclaimTraceSeed {
     Choice(u8),
 }
 
+#[derive(Debug, Clone)]
+enum TwoKeyReclaimTraceSeed {
+    Choice(u8),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TwoGenerationReclaimTraceOp {
+    SeedBucketDelete,
     SeedOldMetadata,
     SeedNewMetadata,
     AcquireOldLease,
@@ -195,9 +383,26 @@ enum TwoGenerationReclaimTraceOp {
     ExpectNoWork,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TwoKeyReclaimTraceOp {
+    SeedBucketDelete,
+    SeedKeyAMetadata,
+    SeedKeyBMetadata,
+    AcquireKeyALease,
+    ReleaseKeyALease,
+    AcquireKeyBLease,
+    ReleaseKeyBLease,
+    EnqueueKeyAReclaim,
+    EnqueueKeyBReclaim,
+    WorkerObjectStep,
+    WorkerBucketDeleteStep,
+    ExpectNoWork,
+}
+
 impl std::fmt::Display for TwoGenerationReclaimTraceOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::SeedBucketDelete => write!(f, "seed-bucket-delete"),
             Self::SeedOldMetadata => write!(f, "seed-old-metadata"),
             Self::SeedNewMetadata => write!(f, "seed-new-metadata"),
             Self::AcquireOldLease => write!(f, "acquire-old-lease"),
@@ -213,8 +418,29 @@ impl std::fmt::Display for TwoGenerationReclaimTraceOp {
     }
 }
 
+impl std::fmt::Display for TwoKeyReclaimTraceOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SeedBucketDelete => write!(f, "seed-bucket-delete"),
+            Self::SeedKeyAMetadata => write!(f, "seed-key-a-metadata"),
+            Self::SeedKeyBMetadata => write!(f, "seed-key-b-metadata"),
+            Self::AcquireKeyALease => write!(f, "acquire-key-a-lease"),
+            Self::ReleaseKeyALease => write!(f, "release-key-a-lease"),
+            Self::AcquireKeyBLease => write!(f, "acquire-key-b-lease"),
+            Self::ReleaseKeyBLease => write!(f, "release-key-b-lease"),
+            Self::EnqueueKeyAReclaim => write!(f, "enqueue-key-a-reclaim"),
+            Self::EnqueueKeyBReclaim => write!(f, "enqueue-key-b-reclaim"),
+            Self::WorkerObjectStep => write!(f, "worker-object-step"),
+            Self::WorkerBucketDeleteStep => write!(f, "worker-bucket-delete-step"),
+            Self::ExpectNoWork => write!(f, "expect-no-work"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TwoGenerationReclaimTraceModel {
+    bucket_exists: bool,
+    bucket_deleting: bool,
     old_metadata_exists: bool,
     new_metadata_exists: bool,
     old_lease_held: bool,
@@ -223,9 +449,23 @@ struct TwoGenerationReclaimTraceModel {
     bucket_delete_queued: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TwoKeyReclaimTraceModel {
+    bucket_exists: bool,
+    bucket_deleting: bool,
+    key_a_metadata_exists: bool,
+    key_b_metadata_exists: bool,
+    key_a_lease_held: bool,
+    key_b_lease_held: bool,
+    object_queue: Vec<TraceKey>,
+    bucket_delete_queued: bool,
+}
+
 impl TwoGenerationReclaimTraceModel {
     fn new() -> Self {
         Self {
+            bucket_exists: false,
+            bucket_deleting: false,
             old_metadata_exists: false,
             new_metadata_exists: false,
             old_lease_held: false,
@@ -238,6 +478,9 @@ impl TwoGenerationReclaimTraceModel {
     fn legal_ops(&self) -> Vec<TwoGenerationReclaimTraceOp> {
         use TwoGenerationReclaimTraceOp::*;
         let mut ops = Vec::new();
+        if !self.bucket_exists && !self.bucket_delete_queued {
+            ops.push(SeedBucketDelete);
+        }
         if !self.old_metadata_exists {
             ops.push(SeedOldMetadata);
         }
@@ -278,9 +521,24 @@ impl TwoGenerationReclaimTraceModel {
         }
     }
 
+    fn current_bucket_root(&self) -> Option<TraceGeneration> {
+        if self.old_metadata_exists {
+            Some(TraceGeneration::Old)
+        } else if self.new_metadata_exists {
+            Some(TraceGeneration::New)
+        } else {
+            None
+        }
+    }
+
     fn apply(&mut self, op: &TwoGenerationReclaimTraceOp) {
         use TwoGenerationReclaimTraceOp::*;
         match op {
+            SeedBucketDelete => {
+                self.bucket_exists = true;
+                self.bucket_deleting = true;
+                self.bucket_delete_queued = true;
+            }
             SeedOldMetadata => self.old_metadata_exists = true,
             SeedNewMetadata => self.new_metadata_exists = true,
             AcquireOldLease => self.old_lease_held = true,
@@ -313,7 +571,165 @@ impl TwoGenerationReclaimTraceModel {
                     _ => {}
                 }
             }
-            WorkerBucketDeleteStep => self.bucket_delete_queued = false,
+            WorkerBucketDeleteStep => {
+                self.bucket_delete_queued = false;
+                if self.bucket_deleting {
+                    match self.current_bucket_root() {
+                        Some(TraceGeneration::Old) if !self.old_lease_held => {
+                            self.enqueue_generation(TraceGeneration::Old);
+                        }
+                        Some(TraceGeneration::New) if !self.new_lease_held => {
+                            self.enqueue_generation(TraceGeneration::New);
+                        }
+                        _ => {}
+                    }
+                    if !self.old_metadata_exists
+                        && !self.new_metadata_exists
+                        && !self.old_lease_held
+                        && !self.new_lease_held
+                    {
+                        self.bucket_exists = false;
+                        self.bucket_deleting = false;
+                    }
+                }
+            }
+            ExpectNoWork => {}
+        }
+    }
+}
+
+impl TwoKeyReclaimTraceModel {
+    fn new() -> Self {
+        Self {
+            bucket_exists: false,
+            bucket_deleting: false,
+            key_a_metadata_exists: false,
+            key_b_metadata_exists: false,
+            key_a_lease_held: false,
+            key_b_lease_held: false,
+            object_queue: Vec::new(),
+            bucket_delete_queued: false,
+        }
+    }
+
+    fn legal_ops(&self) -> Vec<TwoKeyReclaimTraceOp> {
+        use TwoKeyReclaimTraceOp::*;
+        let mut ops = Vec::new();
+        if !self.bucket_exists && !self.bucket_delete_queued {
+            ops.push(SeedBucketDelete);
+        }
+        if !self.key_a_metadata_exists {
+            ops.push(SeedKeyAMetadata);
+        }
+        if !self.key_b_metadata_exists {
+            ops.push(SeedKeyBMetadata);
+        }
+        if self.key_a_lease_held {
+            ops.push(ReleaseKeyALease);
+        } else {
+            ops.push(AcquireKeyALease);
+        }
+        if self.key_b_lease_held {
+            ops.push(ReleaseKeyBLease);
+        } else {
+            ops.push(AcquireKeyBLease);
+        }
+        if self.key_a_metadata_exists {
+            ops.push(EnqueueKeyAReclaim);
+        }
+        if self.key_b_metadata_exists {
+            ops.push(EnqueueKeyBReclaim);
+        }
+        if !self.object_queue.is_empty() {
+            ops.push(WorkerObjectStep);
+        }
+        if self.bucket_delete_queued && self.object_queue.is_empty() {
+            ops.push(WorkerBucketDeleteStep);
+        }
+        if self.object_queue.is_empty() && !self.bucket_delete_queued {
+            ops.push(ExpectNoWork);
+        }
+        ops
+    }
+
+    fn enqueue_key(&mut self, key: TraceKey) {
+        if !self.object_queue.contains(&key) {
+            self.object_queue.push(key);
+        }
+    }
+
+    fn current_bucket_root(&self) -> Option<TraceKey> {
+        if self.key_a_metadata_exists {
+            Some(TraceKey::A)
+        } else if self.key_b_metadata_exists {
+            Some(TraceKey::B)
+        } else {
+            None
+        }
+    }
+
+    fn apply(&mut self, op: &TwoKeyReclaimTraceOp) {
+        use TwoKeyReclaimTraceOp::*;
+        match op {
+            SeedBucketDelete => {
+                self.bucket_exists = true;
+                self.bucket_deleting = true;
+                self.bucket_delete_queued = true;
+            }
+            SeedKeyAMetadata => self.key_a_metadata_exists = true,
+            SeedKeyBMetadata => self.key_b_metadata_exists = true,
+            AcquireKeyALease => self.key_a_lease_held = true,
+            ReleaseKeyALease => {
+                self.key_a_lease_held = false;
+                if self.key_a_metadata_exists {
+                    self.enqueue_key(TraceKey::A);
+                }
+            }
+            AcquireKeyBLease => self.key_b_lease_held = true,
+            ReleaseKeyBLease => {
+                self.key_b_lease_held = false;
+                if self.key_b_metadata_exists {
+                    self.enqueue_key(TraceKey::B);
+                }
+            }
+            EnqueueKeyAReclaim => self.enqueue_key(TraceKey::A),
+            EnqueueKeyBReclaim => self.enqueue_key(TraceKey::B),
+            WorkerObjectStep => {
+                let key = self.object_queue.remove(0);
+                match key {
+                    TraceKey::A if self.key_a_metadata_exists && !self.key_a_lease_held => {
+                        self.key_a_metadata_exists = false;
+                        self.bucket_delete_queued = true;
+                    }
+                    TraceKey::B if self.key_b_metadata_exists && !self.key_b_lease_held => {
+                        self.key_b_metadata_exists = false;
+                        self.bucket_delete_queued = true;
+                    }
+                    _ => {}
+                }
+            }
+            WorkerBucketDeleteStep => {
+                self.bucket_delete_queued = false;
+                if self.bucket_deleting {
+                    match self.current_bucket_root() {
+                        Some(TraceKey::A) if !self.key_a_lease_held => {
+                            self.enqueue_key(TraceKey::A)
+                        }
+                        Some(TraceKey::B) if !self.key_b_lease_held => {
+                            self.enqueue_key(TraceKey::B)
+                        }
+                        _ => {}
+                    }
+                    if !self.key_a_metadata_exists
+                        && !self.key_b_metadata_exists
+                        && !self.key_a_lease_held
+                        && !self.key_b_lease_held
+                    {
+                        self.bucket_exists = false;
+                        self.bucket_deleting = false;
+                    }
+                }
+            }
             ExpectNoWork => {}
         }
     }
@@ -339,7 +755,32 @@ fn two_generation_reclaim_trace_strategy() -> BoxedStrategy<Vec<TwoGenerationRec
     .boxed()
 }
 
+fn two_key_reclaim_trace_strategy() -> BoxedStrategy<Vec<TwoKeyReclaimTraceOp>> {
+    proptest::collection::vec(
+        any::<u8>().prop_map(TwoKeyReclaimTraceSeed::Choice),
+        0..=TRACE_MAX_OPS,
+    )
+    .prop_map(|seeds| {
+        let mut model = TwoKeyReclaimTraceModel::new();
+        let mut ops = Vec::with_capacity(seeds.len());
+        for seed in seeds {
+            let TwoKeyReclaimTraceSeed::Choice(choice) = seed;
+            let legal = model.legal_ops();
+            let op = legal[(choice as usize) % legal.len()].clone();
+            model.apply(&op);
+            ops.push(op);
+        }
+        ops
+    })
+    .boxed()
+}
+
 struct ReclaimTraceHarness {
+    runtime: ReadRuntime,
+    lease: Option<PayloadLease>,
+}
+
+struct ReclaimKindTraceHarness {
     runtime: ReadRuntime,
     lease: Option<PayloadLease>,
 }
@@ -501,10 +942,233 @@ impl ReclaimTraceHarness {
     }
 }
 
+impl ReclaimKindTraceHarness {
+    fn new(runtime: ReadRuntime) -> Self {
+        Self {
+            runtime,
+            lease: None,
+        }
+    }
+
+    fn execute(&mut self, op: &ReclaimKindTraceOp) -> TestCaseResult {
+        use ReclaimKindTraceOp::*;
+        match op {
+            SeedSimpleMetadata => self.seed_simple_metadata()?,
+            SeedSegmentsMetadata => self.seed_segments_metadata()?,
+            SeedMultipartMetadata => self.seed_multipart_metadata()?,
+            AcquireLease => {
+                self.lease = Some(self.runtime.acquire_object_payload_lease(
+                    TRACE_BUCKET,
+                    TRACE_KEY,
+                    trace_generation_id(),
+                ));
+            }
+            ReleaseLease => drop(self.lease.take().unwrap()),
+            EnqueueObjectReclaim => {
+                self.runtime.enqueue_object_payload_reclaim(
+                    TRACE_BUCKET,
+                    TRACE_KEY,
+                    trace_generation_id(),
+                );
+            }
+            WorkerObjectStep => {
+                let work = self.take_next_work()?;
+                match work {
+                    Some(ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)))
+                        if bucket == trusted_bucket_name(TRACE_BUCKET)
+                            && key == trusted_object_key(TRACE_KEY)
+                            && generation_id == trace_generation_id() => {}
+                    Some(ReclaimWorkItem::BucketDelete(_)) => {
+                        return Err(TestCaseError::fail(
+                            "expected object reclaim work item, got bucket delete",
+                        ))
+                    }
+                    None => {
+                        return Err(TestCaseError::fail(
+                            "expected object reclaim work item, got none",
+                        ))
+                    }
+                    Some(ReclaimWorkItem::ObjectPayload(_)) => {
+                        return Err(TestCaseError::fail(
+                            "expected object reclaim work item for the trace generation",
+                        ))
+                    }
+                }
+                self.runtime
+                    .try_reclaim_object_payload(TRACE_BUCKET, TRACE_KEY, trace_generation_id())
+                    .map_err(|err| {
+                        TestCaseError::fail(format!(
+                            "try_reclaim_object_payload failed unexpectedly: {err:?}"
+                        ))
+                    })?;
+            }
+            WorkerBucketDeleteStep => {
+                let work = self.take_next_work()?;
+                match work {
+                    Some(ReclaimWorkItem::BucketDelete(bucket))
+                        if bucket == trusted_bucket_name(TRACE_BUCKET) => {}
+                    Some(ReclaimWorkItem::ObjectPayload(_)) => {
+                        return Err(TestCaseError::fail(
+                            "expected bucket delete finalize work item, got object reclaim",
+                        ))
+                    }
+                    None => {
+                        return Err(TestCaseError::fail(
+                            "expected bucket delete finalize work item, got none",
+                        ))
+                    }
+                    Some(ReclaimWorkItem::BucketDelete(_)) => {
+                        return Err(TestCaseError::fail(
+                            "expected bucket delete finalize work item for the trace bucket",
+                        ))
+                    }
+                }
+            }
+            ExpectNoWork => {
+                if self.take_next_work()?.is_some() {
+                    return Err(TestCaseError::fail("expected no queued reclaim work"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn seed_simple_metadata(&self) -> TestCaseResult {
+        let meta_pg = self
+            .runtime
+            .storage_node
+            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, TRACE_KEY))
+            .map_err(|err| TestCaseError::fail(format!("get_pg failed: {err:?}")))?;
+        meta_pg
+            .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
+                bucket: trusted_bucket_name(TRACE_BUCKET),
+                key: trusted_object_key(TRACE_KEY),
+                generation_id: trace_generation_id(),
+                ec: EcShape { k: 4, m: 2 },
+                created_at: 1,
+            })
+            .map_err(|err| {
+                TestCaseError::fail(format!("put_simple_payload_reclaim failed: {err:?}"))
+            })?;
+        Ok(())
+    }
+
+    fn seed_segments_metadata(&self) -> TestCaseResult {
+        let meta_pg = self
+            .runtime
+            .storage_node
+            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, TRACE_KEY))
+            .map_err(|err| TestCaseError::fail(format!("get_pg failed: {err:?}")))?;
+        meta_pg
+            .put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
+                bucket: trusted_bucket_name(TRACE_BUCKET),
+                key: trusted_object_key(TRACE_KEY),
+                generation_id: trace_generation_id(),
+                created_at: 1,
+                segments: vec![ObjectSegmentsReclaimSegmentRecord {
+                    segment_index: 0,
+                    segment_okh: object_key_hash(TRACE_BUCKET, TRACE_KEY),
+                    segment_vid: trace_generation_id(),
+                    shard_pg_id: self.runtime.pg_topology.shard_pg(
+                        TRACE_BUCKET,
+                        TRACE_KEY,
+                        trace_generation_id().get(),
+                    ),
+                    ec: EcShape { k: 4, m: 2 },
+                }],
+            })
+            .map_err(|err| {
+                TestCaseError::fail(format!("put_object_segments_reclaim failed: {err:?}"))
+            })?;
+        Ok(())
+    }
+
+    fn seed_multipart_metadata(&self) -> TestCaseResult {
+        let meta_pg = self
+            .runtime
+            .storage_node
+            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, TRACE_KEY))
+            .map_err(|err| TestCaseError::fail(format!("get_pg failed: {err:?}")))?;
+        meta_pg
+            .put_multipart_reclaim(&MultipartReclaimRecord {
+                bucket: trusted_bucket_name(TRACE_BUCKET),
+                key: trusted_object_key(TRACE_KEY),
+                generation_id: trace_generation_id(),
+                created_at: 1,
+                parts: vec![MultipartReclaimPartRecord::ShardSet {
+                    part_number: 1,
+                    part_okh: object_key_hash(TRACE_BUCKET, TRACE_KEY),
+                    part_vid: trace_generation_id(),
+                    shard_pg_id: self.runtime.pg_topology.shard_pg(
+                        TRACE_BUCKET,
+                        TRACE_KEY,
+                        trace_generation_id().get(),
+                    ),
+                    ec: EcShape { k: 4, m: 2 },
+                }],
+            })
+            .map_err(|err| TestCaseError::fail(format!("put_multipart_reclaim failed: {err:?}")))?;
+        Ok(())
+    }
+
+    fn metadata_exists(&self) -> bool {
+        let meta_pg = self
+            .runtime
+            .storage_node
+            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, TRACE_KEY))
+            .unwrap();
+        PgMetadataStore::payload_reclaim_exists(
+            &*meta_pg,
+            &trusted_bucket_name(TRACE_BUCKET),
+            &trusted_object_key(TRACE_KEY),
+            trace_generation_id(),
+        )
+        .unwrap()
+    }
+
+    fn lease_count(&self) -> usize {
+        self.runtime.storage_node.object_payload_lease_count(
+            &trusted_bucket_name(TRACE_BUCKET),
+            &trusted_object_key(TRACE_KEY),
+            trace_generation_id(),
+        )
+    }
+
+    fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let waiter_stop = Arc::clone(&stop);
+        let waiter_node = Arc::clone(&self.runtime.storage_node);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            tx.send(waiter_node.wait_for_reclaim_work(&waiter_stop))
+                .unwrap();
+        });
+        let result = match rx.recv_timeout(std::time::Duration::from_millis(25)) {
+            Ok(work) => work,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(err) => {
+                return Err(TestCaseError::fail(format!(
+                    "failed waiting for reclaim work: {err:?}"
+                )))
+            }
+        };
+        stop.store(true, Ordering::SeqCst);
+        self.runtime.storage_node.wake_reclaim_workers();
+        waiter.join().unwrap();
+        Ok(result)
+    }
+}
+
 struct TwoGenerationReclaimTraceHarness {
     runtime: ReadRuntime,
     old_lease: Option<PayloadLease>,
     new_lease: Option<PayloadLease>,
+}
+
+struct TwoKeyReclaimTraceHarness {
+    runtime: ReadRuntime,
+    key_a_lease: Option<PayloadLease>,
+    key_b_lease: Option<PayloadLease>,
 }
 
 impl TwoGenerationReclaimTraceHarness {
@@ -519,6 +1183,12 @@ impl TwoGenerationReclaimTraceHarness {
     fn execute(&mut self, op: &TwoGenerationReclaimTraceOp) -> TestCaseResult {
         use TwoGenerationReclaimTraceOp::*;
         match op {
+            SeedBucketDelete => {
+                seed_deleting_bucket(&self.runtime);
+                self.runtime
+                    .storage_node
+                    .enqueue_bucket_delete_finalize(&trusted_bucket_name(TRACE_BUCKET));
+            }
             SeedOldMetadata => self.seed_metadata_for(TraceGeneration::Old)?,
             SeedNewMetadata => self.seed_metadata_for(TraceGeneration::New)?,
             AcquireOldLease => {
@@ -569,6 +1239,13 @@ impl TwoGenerationReclaimTraceHarness {
                         ))
                     }
                 }
+                self.runtime
+                    .try_finalize_bucket_delete_for(&trusted_bucket_name(TRACE_BUCKET))
+                    .map_err(|err| {
+                        TestCaseError::fail(format!(
+                            "try_finalize_bucket_delete_for failed unexpectedly: {err:?}"
+                        ))
+                    })?;
             }
             ExpectNoWork => {
                 if self.take_next_work()?.is_some() {
@@ -697,6 +1374,237 @@ impl TwoGenerationReclaimTraceHarness {
         waiter.join().unwrap();
         Ok(result)
     }
+
+    fn bucket_exists(&self) -> bool {
+        let bucket_pg = self
+            .runtime
+            .storage_node
+            .get_pg(
+                self.runtime
+                    .pg_topology
+                    .bucket_pg_for(&trusted_bucket_name(TRACE_BUCKET)),
+            )
+            .unwrap();
+        PgMetadataStore::head_bucket_raw(&*bucket_pg, &trusted_bucket_name(TRACE_BUCKET)).is_ok()
+    }
+}
+
+impl TwoKeyReclaimTraceHarness {
+    fn new(runtime: ReadRuntime) -> Self {
+        Self {
+            runtime,
+            key_a_lease: None,
+            key_b_lease: None,
+        }
+    }
+
+    fn execute(&mut self, op: &TwoKeyReclaimTraceOp) -> TestCaseResult {
+        use TwoKeyReclaimTraceOp::*;
+        match op {
+            SeedBucketDelete => {
+                seed_deleting_bucket(&self.runtime);
+                self.runtime
+                    .storage_node
+                    .enqueue_bucket_delete_finalize(&trusted_bucket_name(TRACE_BUCKET));
+            }
+            SeedKeyAMetadata => self.seed_metadata_for(TraceKey::A)?,
+            SeedKeyBMetadata => self.seed_metadata_for(TraceKey::B)?,
+            AcquireKeyALease => {
+                self.key_a_lease = Some(self.runtime.acquire_object_payload_lease(
+                    TRACE_BUCKET,
+                    TRACE_KEY_A,
+                    trace_generation_id(),
+                ));
+            }
+            ReleaseKeyALease => drop(self.key_a_lease.take().unwrap()),
+            AcquireKeyBLease => {
+                self.key_b_lease = Some(self.runtime.acquire_object_payload_lease(
+                    TRACE_BUCKET,
+                    TRACE_KEY_B,
+                    trace_generation_id(),
+                ));
+            }
+            ReleaseKeyBLease => drop(self.key_b_lease.take().unwrap()),
+            EnqueueKeyAReclaim => self.runtime.enqueue_object_payload_reclaim(
+                TRACE_BUCKET,
+                TRACE_KEY_A,
+                trace_generation_id(),
+            ),
+            EnqueueKeyBReclaim => self.runtime.enqueue_object_payload_reclaim(
+                TRACE_BUCKET,
+                TRACE_KEY_B,
+                trace_generation_id(),
+            ),
+            WorkerObjectStep => unreachable!("use execute_worker_object_step with model head"),
+            WorkerBucketDeleteStep => {
+                let work = self.take_next_work()?;
+                match work {
+                    Some(ReclaimWorkItem::BucketDelete(bucket))
+                        if bucket == trusted_bucket_name(TRACE_BUCKET) => {}
+                    Some(ReclaimWorkItem::ObjectPayload(_)) => {
+                        return Err(TestCaseError::fail(
+                            "expected bucket delete finalize work item, got object reclaim",
+                        ))
+                    }
+                    None => {
+                        return Err(TestCaseError::fail(
+                            "expected bucket delete finalize work item, got none",
+                        ))
+                    }
+                    Some(ReclaimWorkItem::BucketDelete(_)) => {
+                        return Err(TestCaseError::fail(
+                            "expected bucket delete finalize work item for the trace bucket",
+                        ))
+                    }
+                }
+                self.runtime
+                    .try_finalize_bucket_delete_for(&trusted_bucket_name(TRACE_BUCKET))
+                    .map_err(|err| {
+                        TestCaseError::fail(format!(
+                            "try_finalize_bucket_delete_for failed unexpectedly: {err:?}"
+                        ))
+                    })?;
+            }
+            ExpectNoWork => {
+                if self.take_next_work()?.is_some() {
+                    return Err(TestCaseError::fail("expected no queued reclaim work"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_worker_object_step(&mut self, expected: TraceKey) -> TestCaseResult {
+        let work = self.take_next_work()?;
+        let actual = self.expected_key_from_queue_step(work)?;
+        prop_assert_eq!(
+            actual,
+            expected,
+            "worker dequeued object reclaim key out of bucket-root order"
+        );
+        self.runtime
+            .try_reclaim_object_payload(TRACE_BUCKET, expected.key(), trace_generation_id())
+            .map_err(|err| {
+                TestCaseError::fail(format!(
+                    "try_reclaim_object_payload failed unexpectedly: {err:?}"
+                ))
+            })?;
+        Ok(())
+    }
+
+    fn seed_metadata_for(&self, key: TraceKey) -> TestCaseResult {
+        let meta_pg = self
+            .runtime
+            .storage_node
+            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, key.key()))
+            .map_err(|err| TestCaseError::fail(format!("get_pg failed: {err:?}")))?;
+        meta_pg
+            .put_simple_payload_reclaim(&SimplePayloadReclaimRecord {
+                bucket: trusted_bucket_name(TRACE_BUCKET),
+                key: trusted_object_key(key.key()),
+                generation_id: trace_generation_id(),
+                ec: EcShape { k: 4, m: 2 },
+                created_at: match key {
+                    TraceKey::A => 1,
+                    TraceKey::B => 2,
+                },
+            })
+            .map_err(|err| {
+                TestCaseError::fail(format!("put_simple_payload_reclaim failed: {err:?}"))
+            })?;
+        Ok(())
+    }
+
+    fn expected_key_from_queue_step(
+        &self,
+        work: Option<ReclaimWorkItem>,
+    ) -> Result<TraceKey, TestCaseError> {
+        match work {
+            Some(ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)))
+                if bucket == trusted_bucket_name(TRACE_BUCKET)
+                    && key == trusted_object_key(TRACE_KEY_A)
+                    && generation_id == trace_generation_id() =>
+            {
+                Ok(TraceKey::A)
+            }
+            Some(ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)))
+                if bucket == trusted_bucket_name(TRACE_BUCKET)
+                    && key == trusted_object_key(TRACE_KEY_B)
+                    && generation_id == trace_generation_id() =>
+            {
+                Ok(TraceKey::B)
+            }
+            Some(ReclaimWorkItem::ObjectPayload(_)) => Err(TestCaseError::fail(
+                "expected object reclaim work item for a traced key",
+            )),
+            Some(ReclaimWorkItem::BucketDelete(_)) => Err(TestCaseError::fail(
+                "expected object reclaim work item, got bucket delete",
+            )),
+            None => Err(TestCaseError::fail(
+                "expected object reclaim work item, got none",
+            )),
+        }
+    }
+
+    fn metadata_exists(&self, key: TraceKey) -> bool {
+        let meta_pg = self
+            .runtime
+            .storage_node
+            .get_pg(self.runtime.pg_topology.object_pg(TRACE_BUCKET, key.key()))
+            .unwrap();
+        PgMetadataStore::payload_reclaim_exists(
+            &*meta_pg,
+            &trusted_bucket_name(TRACE_BUCKET),
+            &trusted_object_key(key.key()),
+            trace_generation_id(),
+        )
+        .unwrap()
+    }
+
+    fn lease_count(&self, key: TraceKey) -> usize {
+        self.runtime.storage_node.object_payload_lease_count(
+            &trusted_bucket_name(TRACE_BUCKET),
+            &trusted_object_key(key.key()),
+            trace_generation_id(),
+        )
+    }
+
+    fn take_next_work(&self) -> Result<Option<ReclaimWorkItem>, TestCaseError> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let waiter_stop = Arc::clone(&stop);
+        let waiter_node = Arc::clone(&self.runtime.storage_node);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            tx.send(waiter_node.wait_for_reclaim_work(&waiter_stop))
+                .unwrap();
+        });
+        let result = match rx.recv_timeout(std::time::Duration::from_millis(25)) {
+            Ok(work) => work,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+            Err(err) => {
+                return Err(TestCaseError::fail(format!(
+                    "failed waiting for reclaim work: {err:?}"
+                )))
+            }
+        };
+        stop.store(true, Ordering::SeqCst);
+        self.runtime.storage_node.wake_reclaim_workers();
+        waiter.join().unwrap();
+        Ok(result)
+    }
+
+    fn bucket_exists(&self) -> bool {
+        let bucket_pg = self
+            .runtime
+            .storage_node
+            .get_pg(
+                self.runtime
+                    .pg_topology
+                    .bucket_pg_for(&trusted_bucket_name(TRACE_BUCKET)),
+            )
+            .unwrap();
+        PgMetadataStore::head_bucket_raw(&*bucket_pg, &trusted_bucket_name(TRACE_BUCKET)).is_ok()
+    }
 }
 
 fn render_reclaim_trace(ops: &[ReclaimTraceOp]) -> String {
@@ -707,7 +1615,23 @@ fn render_reclaim_trace(ops: &[ReclaimTraceOp]) -> String {
     rendered
 }
 
+fn render_reclaim_kind_trace(ops: &[ReclaimKindTraceOp]) -> String {
+    let mut rendered = String::new();
+    for (index, op) in ops.iter().enumerate() {
+        let _ = writeln!(&mut rendered, "{index}: {op}");
+    }
+    rendered
+}
+
 fn render_two_generation_reclaim_trace(ops: &[TwoGenerationReclaimTraceOp]) -> String {
+    let mut rendered = String::new();
+    for (index, op) in ops.iter().enumerate() {
+        let _ = writeln!(&mut rendered, "{index}: {op}");
+    }
+    rendered
+}
+
+fn render_two_key_reclaim_trace(ops: &[TwoKeyReclaimTraceOp]) -> String {
     let mut rendered = String::new();
     for (index, op) in ops.iter().enumerate() {
         let _ = writeln!(&mut rendered, "{index}: {op}");
@@ -735,11 +1659,32 @@ fn assert_reclaim_trace_matches_model(
     Ok(())
 }
 
+fn assert_reclaim_kind_trace_matches_model(
+    harness: &ReclaimKindTraceHarness,
+    model: &ReclaimKindTraceModel,
+    context: &str,
+) -> TestCaseResult {
+    prop_assert_eq!(
+        harness.metadata_exists(),
+        model.reclaim_kind.is_some(),
+        "{}",
+        context
+    );
+    prop_assert_eq!(
+        harness.lease_count(),
+        usize::from(model.lease_held),
+        "{}",
+        context
+    );
+    Ok(())
+}
+
 fn assert_two_generation_reclaim_trace_matches_model(
     harness: &TwoGenerationReclaimTraceHarness,
     model: &TwoGenerationReclaimTraceModel,
     context: &str,
 ) -> TestCaseResult {
+    prop_assert_eq!(harness.bucket_exists(), model.bucket_exists, "{}", context);
     prop_assert_eq!(
         harness.metadata_exists(TraceGeneration::Old),
         model.old_metadata_exists,
@@ -761,6 +1706,39 @@ fn assert_two_generation_reclaim_trace_matches_model(
     prop_assert_eq!(
         harness.lease_count(TraceGeneration::New),
         usize::from(model.new_lease_held),
+        "{}",
+        context
+    );
+    Ok(())
+}
+
+fn assert_two_key_reclaim_trace_matches_model(
+    harness: &TwoKeyReclaimTraceHarness,
+    model: &TwoKeyReclaimTraceModel,
+    context: &str,
+) -> TestCaseResult {
+    prop_assert_eq!(harness.bucket_exists(), model.bucket_exists, "{}", context);
+    prop_assert_eq!(
+        harness.metadata_exists(TraceKey::A),
+        model.key_a_metadata_exists,
+        "{}",
+        context
+    );
+    prop_assert_eq!(
+        harness.metadata_exists(TraceKey::B),
+        model.key_b_metadata_exists,
+        "{}",
+        context
+    );
+    prop_assert_eq!(
+        harness.lease_count(TraceKey::A),
+        usize::from(model.key_a_lease_held),
+        "{}",
+        context
+    );
+    prop_assert_eq!(
+        harness.lease_count(TraceKey::B),
+        usize::from(model.key_b_lease_held),
         "{}",
         context
     );
@@ -789,6 +1767,24 @@ proptest! {
     }
 
     #[test]
+    fn prop_reclaim_kind_trace_matches_model(ops in reclaim_kind_trace_strategy()) {
+        let tmp = test_util::tempdir();
+        let runtime = make_test_read_runtime(tmp.path());
+        let mut harness = ReclaimKindTraceHarness::new(runtime);
+        let mut model = ReclaimKindTraceModel::new();
+
+        for (index, op) in ops.iter().enumerate() {
+            let context = format!(
+                "after step {index}: {op}\nfull trace:\n{}",
+                render_reclaim_kind_trace(&ops[..=index]),
+            );
+            harness.execute(op)?;
+            model.apply(op);
+            assert_reclaim_kind_trace_matches_model(&harness, &model, &context)?;
+        }
+    }
+
+    #[test]
     fn prop_two_generation_reclaim_queue_trace_matches_model(
         ops in two_generation_reclaim_trace_strategy()
     ) {
@@ -813,6 +1809,34 @@ proptest! {
             }
             model.apply(op);
             assert_two_generation_reclaim_trace_matches_model(&harness, &model, &context)?;
+        }
+    }
+
+    #[test]
+    fn prop_two_key_reclaim_queue_trace_matches_model(
+        ops in two_key_reclaim_trace_strategy()
+    ) {
+        let tmp = test_util::tempdir();
+        let runtime = make_test_read_runtime(tmp.path());
+        let mut harness = TwoKeyReclaimTraceHarness::new(runtime);
+        let mut model = TwoKeyReclaimTraceModel::new();
+
+        for (index, op) in ops.iter().enumerate() {
+            let context = format!(
+                "after step {index}: {op}\nfull trace:\n{}",
+                render_two_key_reclaim_trace(&ops[..=index]),
+            );
+            if matches!(op, TwoKeyReclaimTraceOp::WorkerObjectStep) {
+                let expected = *model
+                    .object_queue
+                    .first()
+                    .expect("legal worker step must have queued object work");
+                harness.execute_worker_object_step(expected)?;
+            } else {
+                harness.execute(op)?;
+            }
+            model.apply(op);
+            assert_two_key_reclaim_trace_matches_model(&harness, &model, &context)?;
         }
     }
 }
