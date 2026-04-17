@@ -1,0 +1,49 @@
+#!/bin/env bash
+
+set -euo pipefail
+
+if ! command -v rg >/dev/null 2>&1; then
+    echo "error: rg is required for scripts/check-log-hotspots" >&2
+    exit 1
+fi
+
+targets=(
+    "crates/auth/src"
+    "crates/server-http/src"
+    "crates/server-core/src"
+    "crates/storage/src"
+    "crates/argmin-s3/src"
+)
+
+show_matches() {
+    local label=$1
+    local pattern=$2
+
+    echo
+    echo "== $label =="
+    rg -n --color=never "$pattern" "${targets[@]}" || true
+}
+
+show_multiline_matches() {
+    local label=$1
+    local pattern=$2
+
+    echo
+    echo "== $label =="
+    rg -n --color=never --multiline --multiline-dotall --pcre2 "$pattern" "${targets[@]}" || true
+}
+
+echo "Log hotspot sweep"
+echo "This is an advisory review helper, not a correctness proof."
+echo "Matches may be safe after prior escaping/redaction and still require human review."
+
+log_site_pattern='(trace_scope!|event_in_context|tracing::(debug|info|warn|error|trace)!|(^|[^[:alnum:]_])(debug|info|warn|error|trace)!\()'
+suspicious_name_pattern='(bucket|bucket_name|key|object_key|authorization|credential|signature|token|header|header_value|query|query_param|copy_source|upload_id|session_id|amz_|x_amz_)'
+
+show_multiline_matches \
+    "log/trace call sites with suspicious identifiers nearby" \
+    "${log_site_pattern}[\\s\\S]{0,400}${suspicious_name_pattern}"
+
+show_multiline_matches \
+    "log/trace call sites already using observability wrappers" \
+    "${log_site_pattern}[\\s\\S]{0,400}observability::(escaped|redacted)\\("
