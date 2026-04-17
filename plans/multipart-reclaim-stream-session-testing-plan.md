@@ -284,11 +284,18 @@ Current state:
     across same-PG and cross-PG interleavings
   - later multipart management operations failing predictably once an upload is
     already aborting or completing
+  - failed stream-put and stream-part finalize attempts leaving no visible
+    object or committed part, with stale-session scavenging removing the
+    abandoned staged shards afterwards
 - the helper layer in that module now supports direct inspection of:
   - active stream sessions
   - pending multipart uploads
   - pending reclaim roots
   - committed multipart part segments for shard-cleanup assertions
+- the remaining concrete hook gap for phase 1 is a narrow pause point between
+  `CompleteMultipartUpload`'s validated/snapshotted state and the final storage
+  commit, so the true complete-versus-abort interleaving is still not yet
+  directly expressible
 
 ## Phase 2: Multipart and Session Trace Model
 

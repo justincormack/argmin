@@ -45234,44 +45234,6 @@ mod tests {
     }
 
     #[test]
-    fn stream_put_total_size_mismatch_rejected() {
-        let dir = test_util::tempdir();
-        let coord = setup_coordinator(dir.path());
-        coord
-            .create_bucket_for_owner("default-owner", "bucket", false)
-            .unwrap();
-
-        let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
-        coord
-            .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"hello")
-            .unwrap();
-
-        // Finalize with wrong total_size.
-        let crc = checksum::crc64::checksum(b"hello");
-        let metadata = MetadataBlob::new();
-        let err = coord
-            .finalize_stream_put(&FinalizeStreamPutRequest {
-                object: object_request("bucket", "key", test_requester()),
-                session_id: &session_id,
-                crc64: crc,
-                total_size: 999, // wrong — actual is 5
-                metadata_blob: &metadata,
-                system_metadata: &SystemMetadata::EMPTY,
-                write_encryption: ActiveWriteEncryptionRef::None,
-                tags: None,
-                cond: &WriteCondition::default(),
-                acl: NO_PUT_OBJECT_ACL.into(),
-                policy_context: PutObjectPolicyContext::default(),
-                requested_object_lock: ObjectLockState::default(),
-            })
-            .unwrap_err();
-        assert!(
-            matches!(err, ServerError::InvalidRequest { .. }),
-            "expected InvalidRequest for total_size mismatch, got {err:?}"
-        );
-    }
-
-    #[test]
     fn stream_append_accepts_upload_part_session() {
         // append_stream_segment accepts both PutObject and UploadPart sessions.
         let dir = test_util::tempdir();

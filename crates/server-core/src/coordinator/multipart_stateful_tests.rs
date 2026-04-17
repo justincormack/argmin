@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Barrier, MutexGuard};
 use storage::{
     MultipartPartSegmentRecord, MultipartUploadRecord, PayloadReclaimRoot, PgMetadataStore,
-    StreamUploadRecord,
+    StreamUploadRecord, StreamUploadSegmentRecord,
 };
 
 const NO_READ: &ReadCondition = &ReadCondition {
@@ -274,6 +274,17 @@ impl<'a> InvariantHarness<'a> {
         meta_pg.get_multipart_upload(upload_id).unwrap()
     }
 
+    fn stream_segments(
+        &self,
+        bucket: &str,
+        key: &str,
+        session_id: &SessionId,
+    ) -> Vec<StreamUploadSegmentRecord> {
+        let meta_pg_id = self.coord.object_pg_id(bucket, key);
+        let meta_pg = self.coord.storage_node.get_pg(meta_pg_id).unwrap();
+        meta_pg.list_stream_segments(session_id).unwrap()
+    }
+
     fn assert_no_active_stream_sessions_for(&self, bucket: &str, key: &str, invariant: &str) {
         let sessions = self.active_stream_sessions_for(bucket, key);
         assert!(
@@ -296,6 +307,44 @@ impl<'a> InvariantHarness<'a> {
             roots.is_empty(),
             "{invariant}: expected no pending reclaim roots for {bucket}/{key}, found {roots:?}"
         );
+    }
+}
+
+fn assert_segment_shards_exist(
+    coord: &Coordinator,
+    segments: &[StreamUploadSegmentRecord],
+    invariant: &str,
+    phase: &str,
+) {
+    for segment in segments {
+        let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
+        let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
+        for i in 0..total_shards {
+            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
+            assert!(
+                shard_pg.read_shard(&shard_key).is_ok(),
+                "{invariant}: shard {i} should exist {phase}"
+            );
+        }
+    }
+}
+
+fn assert_segment_shards_deleted(
+    coord: &Coordinator,
+    segments: &[StreamUploadSegmentRecord],
+    invariant: &str,
+    phase: &str,
+) {
+    for segment in segments {
+        let shard_pg = coord.storage_node.get_pg(segment.shard_pg_id).unwrap();
+        let total_shards = usize::from(segment.ec_k) + usize::from(segment.ec_m);
+        for i in 0..total_shards {
+            let shard_key = ShardKey::new(&segment.segment_okh, segment.segment_vid.get(), i as u8);
+            assert!(
+                shard_pg.read_shard(&shard_key).is_err(),
+                "{invariant}: shard {i} should be deleted {phase}"
+            );
+        }
     }
 }
 
@@ -913,4 +962,179 @@ fn completing_multipart_upload_rejects_late_abort_without_state_loss() {
         UploadState::Completing,
         "{invariant}: late abort should not change the completing terminal state"
     );
+}
+
+#[test]
+fn failed_stream_put_finalize_is_scavenged_without_visibility_or_orphans() {
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator(dir.path());
+    let invariant =
+        "a failed stream-put finalize leaves no visible object, and stale-session scavenging removes the abandoned staged shards";
+    let state = InvariantHarness::new(&coord);
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let session_id = begin_stream_put_test(&coord, "bucket", "key").unwrap();
+    coord
+        .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"hello")
+        .unwrap();
+
+    let staged_segments = state.stream_segments("bucket", "key", &session_id);
+    assert_eq!(
+        staged_segments.len(),
+        1,
+        "{invariant}: expected one staged segment before finalize failure"
+    );
+    assert_segment_shards_exist(
+        &coord,
+        &staged_segments,
+        invariant,
+        "before finalize failure",
+    );
+
+    let err = coord
+        .finalize_stream_put(&FinalizeStreamPutRequest {
+            object: object_request("bucket", "key", test_requester()),
+            session_id: &session_id,
+            crc64: checksum::crc64::checksum(b"hello"),
+            total_size: 999,
+            metadata_blob: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            write_encryption: ActiveWriteEncryptionRef::None,
+            tags: None,
+            cond: &WriteCondition::default(),
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            requested_object_lock: ObjectLockState::default(),
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::InvalidRequest { .. }),
+        "{invariant}: expected InvalidRequest from failed finalize, got {err:?}"
+    );
+
+    let err = coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request("bucket", "key", None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::ObjectNotFound { .. }),
+        "{invariant}: failed finalize should not make the object visible, got {err:?}"
+    );
+
+    let sessions = state.active_stream_sessions_for("bucket", "key");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "{invariant}: failed finalize should leave exactly one stale session to scavenge"
+    );
+    state.assert_no_pending_reclaim_roots_for("bucket", "key", invariant);
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let count = coord.scavenge_stale_sessions(1);
+    assert_eq!(
+        count, 1,
+        "{invariant}: expected stale-session scavenging to clean the failed finalize session"
+    );
+
+    state.assert_no_active_stream_sessions_for("bucket", "key", invariant);
+    state.assert_no_pending_reclaim_roots_for("bucket", "key", invariant);
+    assert_segment_shards_deleted(&coord, &staged_segments, invariant, "after scavenging");
+}
+
+#[test]
+fn failed_stream_part_finalize_is_scavenged_without_visible_part_or_orphans() {
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator(dir.path());
+    let invariant =
+        "a failed stream-part finalize leaves no visible multipart part, and stale-session scavenging removes the abandoned staged shards";
+    let state = InvariantHarness::new(&coord);
+
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let mpu = create_basic_multipart_upload(&coord, "bucket", "key");
+    let session_id = begin_stream_part_test(&coord, "bucket", "key", &mpu.upload_id, 1)
+        .unwrap()
+        .session_id;
+    coord
+        .append_plaintext_stream_segment_for_test("bucket", "key", &session_id, 0, b"part-data")
+        .unwrap();
+
+    let staged_segments = state.stream_segments("bucket", "key", &session_id);
+    assert_eq!(
+        staged_segments.len(),
+        1,
+        "{invariant}: expected one staged multipart segment before finalize failure"
+    );
+    assert_segment_shards_exist(
+        &coord,
+        &staged_segments,
+        invariant,
+        "before finalize failure",
+    );
+
+    let err = coord
+        .finalize_stream_part(FinalizeStreamPartRequest {
+            upload: multipart_object_request("bucket", "key", &mpu.upload_id, test_requester()),
+            session_id: &session_id,
+            part_number: 1,
+            crc64: checksum::crc64::checksum(b"part-data"),
+            total_size: 999,
+            claimed_checksum: None,
+            computed_checksum: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::InvalidRequest { .. }),
+        "{invariant}: expected InvalidRequest from failed stream-part finalize, got {err:?}"
+    );
+
+    let parts = coord
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request("bucket", "key", &mpu.upload_id, test_requester()),
+            part_number_marker: None,
+            max_parts: 100,
+        })
+        .unwrap();
+    assert!(
+        parts.parts.is_empty(),
+        "{invariant}: failed finalize should not expose a committed multipart part"
+    );
+
+    let upload = state.multipart_upload("bucket", "key", &mpu.upload_id);
+    assert_eq!(
+        upload.state,
+        UploadState::InProgress,
+        "{invariant}: failed part finalize should not change the multipart upload state"
+    );
+
+    let sessions = state.active_stream_sessions_for("bucket", "key");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "{invariant}: failed part finalize should leave exactly one stale session to scavenge"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let count = coord.scavenge_stale_sessions(1);
+    assert_eq!(
+        count, 1,
+        "{invariant}: expected stale-session scavenging to clean the failed stream-part session"
+    );
+
+    state.assert_no_active_stream_sessions_for("bucket", "key", invariant);
+    assert!(
+        state
+            .multipart_part_segments("bucket", "key", &mpu.upload_id)
+            .is_empty(),
+        "{invariant}: failed finalize should leave no committed multipart part segments"
+    );
+    assert_segment_shards_deleted(&coord, &staged_segments, invariant, "after scavenging");
 }
