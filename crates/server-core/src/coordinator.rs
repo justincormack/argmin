@@ -17,7 +17,11 @@ use s3_types::{
 };
 use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
+use storage::ObjectEncryption;
+#[cfg(test)]
 use storage::ObjectLockState;
+#[cfg(test)]
+use storage::PutLiveObjectReq;
 #[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
 use storage::{
@@ -25,14 +29,10 @@ use storage::{
     BucketState, CommitMultipartReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape,
     EffectiveBucketEncryptionConfig, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
     ListPartsReq, ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord,
-    OwnerIdentity, PublicAccessBlockConfig, SerializedMetadataBlob, SerializedSystemMetadataBlob,
+    MultipartUploadRecord, ObjectKey, ObjectLayout, ObjectPartRecord, OwnerIdentity,
+    PublicAccessBlockConfig, SerializedMetadataBlob, SerializedSystemMetadataBlob,
     SerializedTagSet, SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadState,
     StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
-};
-#[cfg(test)]
-use storage::{
-    PutLiveObjectReq,
 };
 
 use self::authz::CachedBucketPolicy;
@@ -71,9 +71,7 @@ pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
 use crate::conditional::DeleteCondition;
 #[cfg(test)]
 use crate::conditional::ReadCondition;
-use crate::conditional::{
-    check_copy_source_conditions, check_read_conditions, check_write_conditions, WriteCondition,
-};
+use crate::conditional::{check_read_conditions, check_write_conditions, WriteCondition};
 use crate::error::ServerError;
 #[cfg(test)]
 use crate::range::ByteRange;

@@ -1,4 +1,20 @@
-use super::*;
+use checksum::MultipartChecksumConfig;
+use storage::traits::PgMetadataStore;
+use storage::{ObjectEncryption, ObjectLayout, SerializedTagSet, StoredObject, UploadState};
+
+#[cfg(test)]
+use super::maybe_run_multipart_snapshot_hook;
+use super::{
+    segment_payloads_from_object_segments, AuthorizedCopyObject,
+    AuthorizedFinalizeStreamPutRequest, AuthorizedMultipartPartWrite, AuthorizedUploadPartCopy,
+    AuthorizedWriteTags, BeginStreamPartResult, ChecksumClaim, Coordinator, CopyObjectRequest,
+    CopyObjectResult, FinalizeStreamPartRequest, LockedReadObject, MetadataDirective,
+    MultipartObjectRequest, ReadHandle, ReadObjectContext, StreamingChecksumAccumulator,
+    TaggingDirective, UploadPartCopyRequest, UploadPartCopyResult, WriteEncryptionRequest,
+    INTERNAL_SEGMENT_SIZE, MAX_OBJECT_SIZE, TRACE_TARGET,
+};
+use crate::conditional::check_copy_source_conditions;
+use crate::error::ServerError;
 
 impl Coordinator {
     /// Copy an object from one location to another.
