@@ -7,7 +7,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[test]
 fn lock_mutex_unpoisoned_recovers_after_panic() {
@@ -2064,7 +2064,8 @@ fn delete_object_eventually_reclaims_simple_shards() {
         ))
         .unwrap();
 
-    wait_for_shard_set_deletion(&coord, shard_pg_id, &okh, generation_id, ec);
+    reclaim_object_payload(&coord, "bucket", "key", generation_id);
+    assert_shard_set_deleted(&coord, shard_pg_id, &okh, generation_id, ec);
 }
 
 #[test]
@@ -2490,40 +2491,6 @@ fn corrupt_shard_on_disk(
     assert!(!data.is_empty(), "shard file is empty");
     data[0] ^= 0xFF;
     std::fs::write(&path, &data).unwrap();
-}
-
-fn wait_until(description: &str, timeout: Duration, mut predicate: impl FnMut() -> bool) {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if predicate() {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {description}"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
-}
-
-fn wait_for_shard_set_deletion(
-    coord: &Coordinator,
-    shard_pg_id: u32,
-    okh: &[u8; 16],
-    generation_id: GenerationId,
-    ec: EcShape,
-) {
-    wait_until("shard-set reclaim", Duration::from_secs(3), || -> bool {
-        coord.storage_node.wake_reclaim_workers();
-        let pg = coord.storage_node.get_pg(shard_pg_id).unwrap();
-        (0..(ec.k as usize + ec.m as usize)).all(|i| {
-            let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
-            matches!(
-                pg.stat_shard(&shard_key),
-                Err(storage::StoreError::NotFound)
-            )
-        })
-    });
 }
 
 // ── EC fault injection tests ────────────────────────────────────

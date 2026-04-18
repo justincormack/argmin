@@ -5,7 +5,7 @@ use crate::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider, SSE_C_CUSTO
 use std::path::Path;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub(crate) const NO_READ: &ReadCondition = &ReadCondition {
     if_match: None,
@@ -336,32 +336,36 @@ pub(crate) fn find_key_with_object_pg_eq_bucket_pg(
     panic!("failed to find a key with object_pg_id == bucket_pg_id");
 }
 
-pub(crate) fn wait_for_shard_set_deletion(
+pub(crate) fn reclaim_object_payload(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    generation_id: GenerationId,
+) {
+    coord
+        .read_runtime()
+        .try_reclaim_object_payload(bucket, key, generation_id)
+        .unwrap();
+}
+
+pub(crate) fn assert_shard_set_deleted(
     coord: &Coordinator,
     shard_pg_id: u32,
     okh: &[u8; 16],
     generation_id: GenerationId,
     ec: EcShape,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        coord.storage_node.wake_reclaim_workers();
-        let pg = coord.storage_node.get_pg(shard_pg_id).unwrap();
-        if (0..(ec.k as usize + ec.m as usize)).all(|i| {
+    let pg = coord.storage_node.get_pg(shard_pg_id).unwrap();
+    assert!(
+        (0..(ec.k as usize + ec.m as usize)).all(|i| {
             let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
             matches!(
                 pg.stat_shard(&shard_key),
                 Err(storage::StoreError::NotFound)
             )
-        }) {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for shard-set reclaim"
-        );
-        thread::sleep(Duration::from_millis(5));
-    }
+        }),
+        "expected shard-set to be reclaimed for generation {generation_id:?}"
+    );
 }
 
 pub(crate) fn begin_stream_part_test<I: MultipartUploadIdArg>(

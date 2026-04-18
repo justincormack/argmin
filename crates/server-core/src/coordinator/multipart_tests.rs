@@ -2214,15 +2214,26 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
         })
         .unwrap();
 
-    let parts_to_reclaim = {
+    let (generation_id, parts_to_reclaim) = {
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        pg.get_object_parts(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            result.version_id,
-        )
-        .unwrap()
+        let generation_id = match pg
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .unwrap()
+        {
+            StoredObject::Live(record) => record.generation_id,
+            other @ StoredObject::DeleteMarker(_) => {
+                panic!("expected live multipart object, got {other:?}")
+            }
+        };
+        let parts = pg
+            .get_object_parts(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                result.version_id,
+            )
+            .unwrap();
+        (generation_id, parts)
     };
 
     coord
@@ -2236,8 +2247,9 @@ fn delete_multipart_object_eventually_reclaims_part_shards() {
         ))
         .unwrap();
 
+    reclaim_object_payload(&coord, "bucket", "key", generation_id);
     for part in parts_to_reclaim {
-        wait_for_shard_set_deletion(
+        assert_shard_set_deleted(
             &coord,
             part.shard_pg_id,
             &part.part_okh,
@@ -6569,15 +6581,26 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
         })
         .unwrap();
 
-    let segments = {
+    let (generation_id, segments) = {
         let meta_pg_id = coord.object_pg_id("bucket", "key");
         let pg = coord.storage_node.get_pg(meta_pg_id).unwrap();
-        pg.get_object_segments(
-            &trusted_bucket_name("bucket"),
-            &trusted_object_key("key"),
-            result.version_id,
-        )
-        .unwrap()
+        let generation_id = match pg
+            .get_object_meta(&trusted_bucket_name("bucket"), &trusted_object_key("key"))
+            .unwrap()
+        {
+            StoredObject::Live(record) => record.generation_id,
+            other @ StoredObject::DeleteMarker(_) => {
+                panic!("expected live streamed object, got {other:?}")
+            }
+        };
+        let segments = pg
+            .get_object_segments(
+                &trusted_bucket_name("bucket"),
+                &trusted_object_key("key"),
+                result.version_id,
+            )
+            .unwrap();
+        (generation_id, segments)
     };
 
     coord
@@ -6591,8 +6614,9 @@ fn stream_put_delete_eventually_reclaims_segment_shards() {
         ))
         .unwrap();
 
+    reclaim_object_payload(&coord, "bucket", "key", generation_id);
     for segment in segments {
-        wait_for_shard_set_deletion(
+        assert_shard_set_deleted(
             &coord,
             segment.shard_pg_id,
             &segment.segment_okh,
