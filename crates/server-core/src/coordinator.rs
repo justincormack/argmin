@@ -47,6 +47,9 @@ use self::lifecycle::CachedBucketLifecycle;
 use self::object_state::{SnapshottedMultipartPart, StaleObjectPayload};
 #[cfg(test)]
 use self::payload::encode_parity_scratch_len;
+use self::payload::{
+    EncodeScratchPool, PayloadBufferPool, PooledPayloadBuffer, SharedPayloadBuffer,
+};
 use self::pg_guards::{BucketObjectPgGuards, LockedReadObject, ObjectPgGuards, TwoPgGuards};
 use self::read_core::{
     segment_payloads_from_object_segments, MultipartReader, PayloadLease, ReadObjectContext,
@@ -165,39 +168,6 @@ const LIFECYCLE_SWEEP_INTERVAL_MILLIS: u64 = 1000;
 /// Prevents unbounded memory when delimiter causes u32::MAX per-PG limits.
 const MAX_LIST_RECORDS: usize = 100_000;
 const S3_MAX_LIST_KEYS: u32 = 1_000;
-
-#[derive(Debug)]
-struct PayloadBufferPool {
-    default_capacity: usize,
-    max_cached: usize,
-    cached: Mutex<Vec<Vec<u8>>>,
-    #[cfg(test)]
-    allocations: std::sync::atomic::AtomicUsize,
-}
-
-struct PooledPayloadBuffer {
-    pool: Arc<PayloadBufferPool>,
-    buf: Option<Vec<u8>>,
-}
-
-#[derive(Debug)]
-struct SharedPayloadBuffer {
-    pool: Option<Arc<PayloadBufferPool>>,
-    buf: Vec<u8>,
-}
-
-struct EncodeScratchPool {
-    scratch_len: usize,
-    max_cached: usize,
-    cached: Mutex<Vec<Vec<u8>>>,
-    #[cfg(test)]
-    allocations: std::sync::atomic::AtomicUsize,
-}
-
-struct EncodeScratch<'a> {
-    pool: &'a EncodeScratchPool,
-    buf: Option<Vec<u8>>,
-}
 
 struct WrittenShard {
     key: ShardKey,

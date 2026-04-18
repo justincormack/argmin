@@ -1,5 +1,38 @@
 use super::*;
 
+#[derive(Debug)]
+pub(super) struct PayloadBufferPool {
+    default_capacity: usize,
+    max_cached: usize,
+    cached: Mutex<Vec<Vec<u8>>>,
+    #[cfg(test)]
+    allocations: std::sync::atomic::AtomicUsize,
+}
+
+pub(super) struct PooledPayloadBuffer {
+    pool: Arc<PayloadBufferPool>,
+    buf: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+pub(super) struct SharedPayloadBuffer {
+    pool: Option<Arc<PayloadBufferPool>>,
+    buf: Vec<u8>,
+}
+
+pub(super) struct EncodeScratchPool {
+    scratch_len: usize,
+    max_cached: usize,
+    cached: Mutex<Vec<Vec<u8>>>,
+    #[cfg(test)]
+    allocations: std::sync::atomic::AtomicUsize,
+}
+
+pub(super) struct EncodeScratch<'a> {
+    pool: &'a EncodeScratchPool,
+    buf: Option<Vec<u8>>,
+}
+
 impl ReadChunk {
     pub(super) fn from_vec(data: Vec<u8>) -> Self {
         let len = data.len();
