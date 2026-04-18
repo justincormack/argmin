@@ -44,7 +44,7 @@ pub use self::authz_types::{
 };
 use self::authz_types::{AuthorizedPutObjectWriteAcl, ValidatedBucket};
 use self::lifecycle::CachedBucketLifecycle;
-use self::object_state::{SnapshottedMultipartPart, StaleObjectPayload};
+use self::object_state::StaleObjectPayload;
 #[cfg(test)]
 use self::payload::encode_parity_scratch_len;
 use self::payload::{
@@ -68,11 +68,15 @@ use self::runtime::{LifecycleSweeper, ReclaimSweeper};
 #[cfg(test)]
 use self::test_hooks::*;
 pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
+#[cfg(test)]
+use crate::conditional::ReadCondition;
 use crate::conditional::{
     check_copy_source_conditions, check_delete_conditions, check_read_conditions,
-    check_write_conditions, DeleteCondition, ReadCondition, WriteCondition,
+    check_write_conditions, DeleteCondition, WriteCondition,
 };
 use crate::error::ServerError;
+#[cfg(test)]
+use crate::range::ByteRange;
 pub use storage::BucketObjectOwnership;
 
 fn lock_mutex_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -142,7 +146,6 @@ fn write_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::metadata_blob::MetadataBlob;
 use crate::pg::{object_key_hash, part_key_hash, stream_segment_key_hash, PgTopology};
-use crate::range::ByteRange;
 use crate::sse::{
     decrypt_managed_encryption_checksum, decrypt_managed_encryption_segment,
     decrypt_sse_customer_checksum, decrypt_sse_customer_segment, prepare_managed_encryption_write,
