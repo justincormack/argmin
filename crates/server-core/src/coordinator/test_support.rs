@@ -284,3 +284,551 @@ pub(crate) fn begin_stream_put_with_authorized_request_test<'a>(
     })?;
     coord.begin_stream_put_session(&authorized)
 }
+
+pub(crate) fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), ServerError> {
+    coord.delete_bucket(&bucket_request_with_expected_owner(
+        name,
+        test_requester(),
+        None,
+    ))
+}
+
+pub(crate) fn bucket_request_with_expected_owner<'a>(
+    name: &'a str,
+    requester: Requester,
+    expected_bucket_owner: Option<&'a str>,
+) -> BucketRequest<'a> {
+    BucketRequest::new(trusted_bucket_name(name), requester, expected_bucket_owner)
+}
+
+pub(crate) fn put_bucket_config_request_with_expected_owner<'a>(
+    name: &'a str,
+    config: &'a str,
+    requester: Requester,
+    expected_bucket_owner: Option<&'a str>,
+) -> PutBucketConfigRequest<'a> {
+    PutBucketConfigRequest {
+        bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+        config,
+    }
+}
+
+pub(crate) fn put_bucket_policy_request_with_expected_owner<'a>(
+    name: &'a str,
+    config: &'a str,
+    confirm_remove_self_bucket_access: bool,
+    requester: Requester,
+    expected_bucket_owner: Option<&'a str>,
+) -> PutBucketPolicyRequest<'a> {
+    PutBucketPolicyRequest {
+        bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+        config,
+        confirm_remove_self_bucket_access,
+    }
+}
+
+pub(crate) trait MultipartUploadIdArg {
+    fn into_test_upload_id(self) -> UploadId;
+}
+
+impl MultipartUploadIdArg for &str {
+    fn into_test_upload_id(self) -> UploadId {
+        UploadId::try_from(self).unwrap_or_else(|_| trusted_upload_id(self))
+    }
+}
+
+impl MultipartUploadIdArg for &UploadId {
+    fn into_test_upload_id(self) -> UploadId {
+        self.clone()
+    }
+}
+
+impl MultipartUploadIdArg for String {
+    fn into_test_upload_id(self) -> UploadId {
+        UploadId::try_from(self.clone()).unwrap_or_else(|_| trusted_upload_id(&self))
+    }
+}
+
+impl MultipartUploadIdArg for &String {
+    fn into_test_upload_id(self) -> UploadId {
+        UploadId::try_from(self.as_str()).unwrap_or_else(|_| trusted_upload_id(self))
+    }
+}
+
+pub(crate) fn multipart_object_request<'a, I: MultipartUploadIdArg>(
+    bucket: &'a str,
+    key: &'a str,
+    upload_id: I,
+    requester: Requester,
+) -> MultipartObjectRequest<'a> {
+    multipart_object_request_with_expected_owner(bucket, key, upload_id, requester, None)
+}
+
+pub(crate) fn multipart_object_request_with_expected_owner<'a, I: MultipartUploadIdArg>(
+    bucket: &'a str,
+    key: &'a str,
+    upload_id: I,
+    requester: Requester,
+    expected_bucket_owner: Option<&'a str>,
+) -> MultipartObjectRequest<'a> {
+    MultipartObjectRequest::new(
+        trusted_bucket_name(bucket),
+        trusted_object_key(key),
+        upload_id.into_test_upload_id(),
+        requester,
+        expected_bucket_owner,
+    )
+}
+
+pub(crate) fn copy_source<'a>(
+    bucket: &'a str,
+    key: &'a str,
+    version_id: Option<VersionId>,
+) -> CopySource<'a> {
+    copy_source_with_condition_and_expected_owner(bucket, key, version_id, NO_READ, None)
+}
+
+pub(crate) fn copy_source_with_condition_and_expected_owner<'a>(
+    bucket: &'a str,
+    key: &'a str,
+    version_id: Option<VersionId>,
+    condition: &'a ReadCondition,
+    expected_bucket_owner: Option<&'a str>,
+) -> CopySource<'a> {
+    CopySource {
+        bucket: trusted_bucket_name(bucket),
+        key: trusted_object_key(key),
+        version_id,
+        condition,
+        expected_bucket_owner,
+    }
+}
+
+pub(crate) fn delete_object_request<'a>(
+    bucket: &'a str,
+    key: &'a str,
+    version_id: Option<VersionId>,
+    requester: Requester,
+    bypass_governance: bool,
+    cond: &'a DeleteCondition,
+) -> DeleteObjectRequest<'a> {
+    delete_object_request_with_expected_owner(
+        bucket,
+        key,
+        version_id,
+        requester,
+        None,
+        bypass_governance,
+        cond,
+    )
+}
+
+pub(crate) fn delete_object_request_with_expected_owner<'a>(
+    bucket: &'a str,
+    key: &'a str,
+    version_id: Option<VersionId>,
+    requester: Requester,
+    expected_bucket_owner: Option<&'a str>,
+    bypass_governance: bool,
+    cond: &'a DeleteCondition,
+) -> DeleteObjectRequest<'a> {
+    DeleteObjectRequest {
+        object: object_version_request_with_expected_owner(
+            bucket,
+            key,
+            version_id,
+            requester,
+            expected_bucket_owner,
+        ),
+        bypass_governance,
+        cond,
+    }
+}
+
+pub(crate) fn put_bucket_versioning_test(
+    coord: &Coordinator,
+    name: &str,
+    state: BucketVersioningState,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<(), ServerError> {
+    coord.put_bucket_versioning(&PutBucketVersioningRequest {
+        bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+        state,
+    })
+}
+
+pub(crate) fn get_bucket_versioning_test(
+    coord: &Coordinator,
+    name: &str,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<BucketVersioningState, ServerError> {
+    coord.get_bucket_versioning(&bucket_request_with_expected_owner(
+        name,
+        requester,
+        expected_bucket_owner,
+    ))
+}
+
+pub(crate) fn put_bucket_object_lock_configuration_test(
+    coord: &Coordinator,
+    name: &str,
+    config: BucketObjectLockConfigurationUpdate,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<(), ServerError> {
+    coord.put_bucket_object_lock_configuration(&PutBucketObjectLockConfigurationRequest {
+        bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+        config,
+    })
+}
+
+pub(crate) fn get_bucket_object_lock_configuration_test(
+    coord: &Coordinator,
+    name: &str,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<BucketObjectLockConfig, ServerError> {
+    coord.get_bucket_object_lock_configuration(&bucket_request_with_expected_owner(
+        name,
+        requester,
+        expected_bucket_owner,
+    ))
+}
+
+pub(crate) fn put_bucket_encryption_test(
+    coord: &Coordinator,
+    name: &str,
+    config: BucketEncryptionConfig,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<(), ServerError> {
+    coord.put_bucket_encryption(&PutBucketEncryptionRequest {
+        bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+        config,
+    })
+}
+
+pub(crate) fn get_bucket_encryption_test(
+    coord: &Coordinator,
+    name: &str,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<EffectiveBucketEncryptionConfig, ServerError> {
+    coord.get_bucket_encryption(&bucket_request_with_expected_owner(
+        name,
+        requester,
+        expected_bucket_owner,
+    ))
+}
+
+pub(crate) fn put_bucket_policy_test(
+    coord: &Coordinator,
+    name: &str,
+    policy: &str,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<(), ServerError> {
+    coord.put_bucket_policy(&put_bucket_policy_request_with_expected_owner(
+        name,
+        policy,
+        false,
+        requester,
+        expected_bucket_owner,
+    ))
+}
+
+pub(crate) fn put_bucket_lifecycle_test(
+    coord: &Coordinator,
+    name: &str,
+    config: &str,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<(), ServerError> {
+    coord.put_bucket_lifecycle(&put_bucket_config_request_with_expected_owner(
+        name,
+        config,
+        requester,
+        expected_bucket_owner,
+    ))
+}
+
+pub(crate) fn parse_test_public_access_block_config(config: &str) -> PublicAccessBlockConfig {
+    PublicAccessBlockConfig {
+        block_public_acls: config.contains("<BlockPublicAcls>true</BlockPublicAcls>"),
+        ignore_public_acls: config.contains("<IgnorePublicAcls>true</IgnorePublicAcls>"),
+        block_public_policy: config.contains("<BlockPublicPolicy>true</BlockPublicPolicy>"),
+        restrict_public_buckets: config
+            .contains("<RestrictPublicBuckets>true</RestrictPublicBuckets>"),
+    }
+}
+
+pub(crate) fn put_bucket_public_access_block_test(
+    coord: &Coordinator,
+    name: &str,
+    config: &str,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<(), ServerError> {
+    coord.put_bucket_public_access_block(&PutBucketPublicAccessBlockRequest {
+        bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+        config: parse_test_public_access_block_config(config),
+    })
+}
+
+pub(crate) fn parse_test_ownership_controls(config: &str) -> BucketOwnershipControls {
+    let object_ownership =
+        if config.contains("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>") {
+            BucketObjectOwnership::BucketOwnerEnforced
+        } else if config.contains("<ObjectOwnership>BucketOwnerPreferred</ObjectOwnership>") {
+            BucketObjectOwnership::BucketOwnerPreferred
+        } else if config.contains("<ObjectOwnership>ObjectWriter</ObjectOwnership>") {
+            BucketObjectOwnership::ObjectWriter
+        } else {
+            panic!("unknown ownership controls test config: {config}");
+        };
+    BucketOwnershipControls { object_ownership }
+}
+
+pub(crate) fn put_bucket_ownership_controls_test(
+    coord: &Coordinator,
+    name: &str,
+    config: &str,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<(), ServerError> {
+    coord.put_bucket_ownership_controls(&PutBucketOwnershipControlsRequest {
+        bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+        config: parse_test_ownership_controls(config),
+    })
+}
+
+pub(crate) fn get_bucket_ownership_controls_test(
+    coord: &Coordinator,
+    name: &str,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<Option<BucketOwnershipControls>, ServerError> {
+    coord.get_bucket_ownership_controls(&bucket_request_with_expected_owner(
+        name,
+        requester,
+        expected_bucket_owner,
+    ))
+}
+
+pub(crate) fn put_bucket_acl_test(
+    coord: &Coordinator,
+    name: &str,
+    acl_grants: AclGrants,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<(), ServerError> {
+    coord.put_bucket_acl(&PutBucketAclRequest {
+        bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+        acl: PutBucketAclInput::Grants(acl_grants),
+        policy_context: PutObjectPolicyContext::default(),
+    })
+}
+
+pub(crate) fn put_bucket_canned_acl_test(
+    coord: &Coordinator,
+    name: &str,
+    acl: BucketAcl,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<(), ServerError> {
+    coord.put_bucket_acl(&PutBucketAclRequest {
+        bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+        acl: PutBucketAclInput::Canned(acl),
+        policy_context: PutObjectPolicyContext::default(),
+    })
+}
+
+pub(crate) fn get_bucket_acl_test(
+    coord: &Coordinator,
+    name: &str,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<GetBucketAclResult, ServerError> {
+    coord.get_bucket_acl(&bucket_request_with_expected_owner(
+        name,
+        requester,
+        expected_bucket_owner,
+    ))
+}
+
+pub(crate) fn put_object_tags_test(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    version_id: Option<VersionId>,
+    tags: &str,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<(), ServerError> {
+    coord.put_object_tags(&PutObjectTagsRequest {
+        object: object_version_request_with_expected_owner(
+            bucket,
+            key,
+            version_id,
+            requester,
+            expected_bucket_owner,
+        ),
+        tags,
+    })
+}
+
+pub(crate) fn get_object_tags_test(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    version_id: Option<VersionId>,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<Option<String>, ServerError> {
+    coord.get_object_tags(&object_version_request_with_expected_owner(
+        bucket,
+        key,
+        version_id,
+        requester,
+        expected_bucket_owner,
+    ))
+}
+
+pub(crate) fn put_object_retention_test(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    version_id: Option<VersionId>,
+    retention: ObjectRetention,
+    bypass_governance: bool,
+    requester: Requester,
+) -> Result<(), ServerError> {
+    coord.put_object_retention(&PutObjectRetentionRequest {
+        object: object_version_request(bucket, key, version_id, requester),
+        retention,
+        bypass_governance,
+    })
+}
+
+pub(crate) fn get_object_retention_test(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    version_id: Option<VersionId>,
+    requester: Requester,
+) -> Result<Option<ObjectRetention>, ServerError> {
+    coord.get_object_retention(&object_version_request(bucket, key, version_id, requester))
+}
+
+pub(crate) fn put_object_legal_hold_test(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    version_id: Option<VersionId>,
+    legal_hold: LegalHoldStatus,
+    requester: Requester,
+) -> Result<(), ServerError> {
+    coord.put_object_legal_hold(&PutObjectLegalHoldRequest {
+        object: object_version_request(bucket, key, version_id, requester),
+        legal_hold,
+    })
+}
+
+pub(crate) fn get_object_legal_hold_test(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    version_id: Option<VersionId>,
+    requester: Requester,
+) -> Result<Option<LegalHoldStatus>, ServerError> {
+    coord.get_object_legal_hold(&object_version_request(bucket, key, version_id, requester))
+}
+
+pub(crate) fn put_object_acl_test(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    version_id: Option<VersionId>,
+    acl_grants: AclGrants,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<VersionId, ServerError> {
+    coord.put_object_acl(&PutObjectAclRequest {
+        object: object_version_request_with_expected_owner(
+            bucket,
+            key,
+            version_id,
+            requester,
+            expected_bucket_owner,
+        ),
+        acl: PutObjectAclInput::Grants(acl_grants),
+        policy_context: PutObjectPolicyContext::default(),
+    })
+}
+
+pub(crate) fn put_object_canned_acl_test(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    version_id: Option<VersionId>,
+    acl: PutObjectAcl<'_>,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<VersionId, ServerError> {
+    coord.put_object_acl(&PutObjectAclRequest {
+        object: object_version_request_with_expected_owner(
+            bucket,
+            key,
+            version_id,
+            requester,
+            expected_bucket_owner,
+        ),
+        acl: PutObjectAclInput::Canned(acl),
+        policy_context: PutObjectPolicyContext::default()
+            .with_default_canned_acl(acl.policy_condition_value()),
+    })
+}
+
+pub(crate) fn get_object_acl_test(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    version_id: Option<VersionId>,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<GetObjectAclResult, ServerError> {
+    coord.get_object_acl(&object_version_request_with_expected_owner(
+        bucket,
+        key,
+        version_id,
+        requester,
+        expected_bucket_owner,
+    ))
+}
+
+pub(crate) fn create_bucket_for_owner_with_flags(
+    coord: &Coordinator,
+    owner_principal: &str,
+    owner_canonical_id: &CanonicalUserId,
+    name: &str,
+    public_read: bool,
+    public_write: bool,
+    object_lock_enabled: bool,
+) -> Result<(), ServerError> {
+    let owner = OwnerIdentity::new(owner_principal, owner_canonical_id.clone());
+    let acl_grants = Coordinator::bucket_acl_grants_from_flags(&owner, public_read, public_write);
+    coord.create_bucket_with_acl_grants(&owner, name, acl_grants, object_lock_enabled)?;
+    Ok(())
+}
+
+pub(crate) fn grants_contain(
+    acl_grants: &AclGrants,
+    grantee: &AclGrantee,
+    permission: AclPermission,
+) -> bool {
+    acl_grants
+        .iter()
+        .any(|grant| grant.grantee() == grantee && grant.permission() == permission)
+}
