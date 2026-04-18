@@ -1,0 +1,239 @@
+#!/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+core_math_log="$repo_root/tmp/core-math/src/binary64/log/log.c"
+helper_dir=""
+
+if [[ ! -f "$core_math_log" ]]; then
+    echo "error: expected local core-math checkout at tmp/core-math" >&2
+    exit 1
+fi
+
+if ! command -v cc >/dev/null 2>&1; then
+    echo "error: cc is required" >&2
+    exit 1
+fi
+
+if ! command -v rustc >/dev/null 2>&1; then
+    echo "error: rustc is required" >&2
+    exit 1
+fi
+
+usage() {
+    cat <<'EOF'
+usage:
+  scripts/placement-log-core-math emit-fixed-corpus <output.tsv>
+  scripts/placement-log-core-math check-corpus <input.tsv>
+
+The fixed corpus is placement-specific:
+- boundary values in the Unit53 domain
+- values around powers of two
+- one known libm/core-math mismatch in the placement domain
+- a small deterministic random sample
+EOF
+}
+
+build_helpers() {
+    helper_dir="$(mktemp -d)"
+    cargo build -p placement --lib >/dev/null
+
+    local libm_rlib
+    libm_rlib="$(find "$repo_root/target/debug/deps" -name 'liblibm-*.rlib' | head -n 1)"
+    if [[ -z "$libm_rlib" ]]; then
+        echo "error: failed to locate built libm rlib under target/debug/deps" >&2
+        exit 1
+    fi
+
+    cat > "$helper_dir/cm_log_main.c" <<'EOF'
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+double cr_log(double x);
+
+int main(int argc, char **argv) {
+  if (argc != 2) {
+    fprintf(stderr, "usage: %s <numerator>\n", argv[0]);
+    return 2;
+  }
+
+  char *end = NULL;
+  unsigned long long numerator = strtoull(argv[1], &end, 10);
+  if (end == argv[1] || *end != '\0') {
+    fprintf(stderr, "invalid numerator: %s\n", argv[1]);
+    return 2;
+  }
+
+  union {
+    uint64_t u;
+    double f;
+  } result = {.f = cr_log((double) numerator / (double) (1ull << 53))};
+
+  printf("%016llx\n", (unsigned long long) result.u);
+  return 0;
+}
+EOF
+
+    cc -O2 -std=c99 -I "$repo_root/tmp/core-math/src/binary64/log" \
+        "$helper_dir/cm_log_main.c" \
+        "$repo_root/tmp/core-math/src/binary64/log/log.c" \
+        -lm \
+        -o "$helper_dir/cm_log"
+
+    cat > "$helper_dir/placement_log_main.rs" <<EOF
+#[path = "$repo_root/crates/placement/src/deterministic_log.rs"]
+mod deterministic_log;
+
+use deterministic_log::{deterministic_log_u53, Unit53};
+use std::env;
+
+fn main() {
+    let numerator = env::args()
+        .nth(1)
+        .expect("numerator arg")
+        .parse::<u64>()
+        .expect("valid numerator");
+    let hash = (numerator - 1) << 11;
+    let value = deterministic_log_u53(Unit53::from_hash(hash));
+    println!("{:016x}", value.to_bits());
+}
+EOF
+
+    rustc --edition=2021 "$helper_dir/placement_log_main.rs" \
+        --extern "libm=$libm_rlib" \
+        -L "dependency=$repo_root/target/debug/deps" \
+        -o "$helper_dir/placement_log"
+
+    PLACEMENT_LOG_HELPER_DIR="$helper_dir"
+    export PLACEMENT_LOG_HELPER_DIR
+}
+
+cleanup() {
+    if [[ -n "$helper_dir" && -d "$helper_dir" ]]; then
+        rm -rf "$helper_dir"
+    fi
+}
+
+emit_fixed_corpus() {
+    local output=$1
+
+    python3 - "$PLACEMENT_LOG_HELPER_DIR/cm_log" "$output" <<'PY'
+import random
+import struct
+import subprocess
+import sys
+
+cm_log = sys.argv[1]
+output = sys.argv[2]
+
+nums = [
+    1,
+    2,
+    3,
+    4,
+    5,
+    7,
+    8,
+    15,
+    16,
+    17,
+    (1 << 26) - 1,
+    1 << 26,
+    (1 << 26) + 1,
+    (1 << 52) - 1,
+    1 << 52,
+    (1 << 52) + 1,
+    (1 << 53) - 3,
+    (1 << 53) - 2,
+    (1 << 53) - 1,
+    1 << 53,
+    8031363715860096,
+]
+
+random.seed(0)
+nums.extend(random.randrange(1, 1 << 53) for _ in range(10))
+
+seen = set()
+ordered = []
+for n in nums:
+    if n not in seen:
+        seen.add(n)
+        ordered.append(n)
+
+with open(output, "w", encoding="ascii") as fh:
+    fh.write("# numerator\tinput_bits\tcore_math_log_bits\n")
+    for numerator in ordered:
+        x = numerator / float(1 << 53)
+        input_bits = struct.unpack(">Q", struct.pack(">d", x))[0]
+        expected_bits = subprocess.check_output(
+            [cm_log, str(numerator)],
+            text=True,
+        ).strip()
+        fh.write(f"{numerator}\t{input_bits:016x}\t{expected_bits}\n")
+PY
+}
+
+check_corpus() {
+    local input=$1
+
+    python3 - "$PLACEMENT_LOG_HELPER_DIR/placement_log" "$input" <<'PY'
+import subprocess
+import sys
+
+placement_log = sys.argv[1]
+input_path = sys.argv[2]
+
+mismatches = []
+
+with open(input_path, "r", encoding="ascii") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        numerator_s, input_bits, expected_bits = line.rstrip("\n").split("\t")
+        actual_bits = subprocess.check_output(
+            [placement_log, numerator_s],
+            text=True,
+        ).strip()
+        if actual_bits != expected_bits:
+            mismatches.append((numerator_s, input_bits, expected_bits, actual_bits))
+
+if mismatches:
+    print("placement deterministic_log_u53 mismatches against core-math:")
+    for numerator_s, input_bits, expected_bits, actual_bits in mismatches:
+        print(
+            f"  numerator={numerator_s} input_bits={input_bits} "
+            f"expected={expected_bits} actual={actual_bits}"
+        )
+    sys.exit(1)
+
+print(f"all corpus values matched core-math ({input_path})")
+PY
+}
+
+main() {
+    if [[ $# -ne 2 ]]; then
+        usage >&2
+        exit 2
+    fi
+
+    trap cleanup EXIT
+
+    build_helpers
+
+    case "$1" in
+        emit-fixed-corpus)
+            emit_fixed_corpus "$2"
+            ;;
+        check-corpus)
+            check_corpus "$2"
+            ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+}
+
+main "$@"
