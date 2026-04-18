@@ -48,7 +48,7 @@ use self::object_state::{SnapshottedMultipartPart, StaleObjectPayload};
 #[cfg(test)]
 use self::payload::encode_parity_scratch_len;
 use self::pg_guards::{BucketObjectPgGuards, LockedReadObject, ObjectPgGuards, TwoPgGuards};
-use self::request_support::authorization_policy_context_for_put_object_write_acl;
+use self::request_types::authorization_policy_context_for_put_object_write_acl;
 pub use self::request_types::*;
 use self::request_types::{
     AuthorizedWriteTags, BucketCreateOutcome, BucketScopedAuthorizationRequest,
@@ -790,7 +790,6 @@ mod put;
 mod read;
 #[cfg(test)]
 mod read_tests;
-mod request_support;
 mod request_types;
 mod response_types;
 mod runtime;
