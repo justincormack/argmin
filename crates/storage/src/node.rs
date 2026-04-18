@@ -16,6 +16,7 @@ use crate::types::{BucketFastPathInfo, BucketName, GenerationId, ObjectKey, Shar
 
 const TRACE_TARGET: &str = "storage";
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
+const LOCK_WAIT_EVENT_THRESHOLD_US: u128 = 1_000;
 
 fn read_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|err| err.into_inner())
@@ -32,28 +33,11 @@ struct PgDataPaths {
 
 pub struct BucketLockGuard<'a> {
     guard: MutexGuard<'a, ()>,
-    bucket: BucketName,
-    stripe: usize,
-    acquired_at: Instant,
-    trace: Option<observability::TraceContext>,
 }
 
 impl Drop for BucketLockGuard<'_> {
     fn drop(&mut self) {
         let _ = &self.guard;
-        if let Some(trace) = &self.trace {
-            let _ = observability::event_in_context(
-                trace,
-                TRACE_TARGET,
-                "bucket_lock_released",
-                Some(format_args!(
-                    "bucket={:?} stripe={} hold_us={}",
-                    self.bucket,
-                    self.stripe,
-                    self.acquired_at.elapsed().as_micros()
-                )),
-            );
-        }
     }
 }
 
@@ -282,25 +266,21 @@ impl SharedStorageNode {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let wait_us = wait_started_at.elapsed().as_micros();
-        let acquired_at = Instant::now();
-        if let Some(trace) = &trace {
-            let _ = observability::event_in_context(
-                trace,
-                TRACE_TARGET,
-                "bucket_lock_acquired",
-                Some(format_args!(
-                    "bucket={:?} stripe={} wait_us={}",
-                    bucket, idx, wait_us
-                )),
-            );
+        if wait_us >= LOCK_WAIT_EVENT_THRESHOLD_US {
+            if let Some(trace) = &trace {
+                let _ = observability::event_in_context(
+                    trace,
+                    TRACE_TARGET,
+                    "bucket_lock_wait_exceeded",
+                    Some(format_args!(
+                        "bucket={:?} stripe={} wait_us={}",
+                        bucket, idx, wait_us
+                    )),
+                );
+            }
         }
-        BucketLockGuard {
-            guard,
-            bucket: bucket.clone(),
-            stripe: idx,
-            acquired_at,
-            trace,
-        }
+        let _ = trace;
+        BucketLockGuard { guard }
     }
 
     /// Lock a bucket-scoped stripe mutex used to serialize multipart
@@ -319,25 +299,21 @@ impl SharedStorageNode {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let wait_us = wait_started_at.elapsed().as_micros();
-        let acquired_at = Instant::now();
-        if let Some(trace) = &trace {
-            let _ = observability::event_in_context(
-                trace,
-                TRACE_TARGET,
-                "multipart_completion_bucket_lock_acquired",
-                Some(format_args!(
-                    "bucket={:?} stripe={} wait_us={}",
-                    bucket, idx, wait_us
-                )),
-            );
+        if wait_us >= LOCK_WAIT_EVENT_THRESHOLD_US {
+            if let Some(trace) = &trace {
+                let _ = observability::event_in_context(
+                    trace,
+                    TRACE_TARGET,
+                    "multipart_completion_bucket_lock_wait_exceeded",
+                    Some(format_args!(
+                        "bucket={:?} stripe={} wait_us={}",
+                        bucket, idx, wait_us
+                    )),
+                );
+            }
         }
-        BucketLockGuard {
-            guard,
-            bucket: bucket.clone(),
-            stripe: idx,
-            acquired_at,
-            trace,
-        }
+        let _ = trace;
+        BucketLockGuard { guard }
     }
 
     /// Lock and return a guard for the given PG.
