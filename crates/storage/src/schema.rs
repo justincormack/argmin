@@ -420,6 +420,7 @@ ON bucket_subresources (kind, bucket_name) WHERE body IS NOT NULL";
 const PG_PRAGMAS: &str = "\
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
+PRAGMA temp_store=MEMORY;
 PRAGMA foreign_keys=ON;
 ";
 

@@ -395,6 +395,19 @@ fn make_pg_store() -> (test_util::TempDir, crate::PgStore) {
 }
 
 #[test]
+fn file_pg_store_uses_in_memory_temp_store() {
+    let (_dir, store) = make_pg_store();
+    let temp_store: i64 = store
+        .connection()
+        .query_row("PRAGMA temp_store", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        temp_store, 2,
+        "PgStore connections must keep SQLite temp storage in memory"
+    );
+}
+
+#[test]
 fn file_metadata_put_get_delete() {
     let (_dir, store) = make_pg_store();
     metadata_put_get_delete(&store);
