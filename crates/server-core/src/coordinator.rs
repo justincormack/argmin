@@ -7,13 +7,13 @@ use checksum::{
 };
 use ec::{EcConfig, ErasureCodec};
 use s3_types::{
-    aws_account_id_from_principal, parse_account_regional_bucket_name, AccountIdentity, AclGrant,
-    AclGrantee, AclGrants, AclPermission, BucketNamespace, BucketVersioningState, CanonicalUserId,
-    StoredLegalHoldStatus, VersionId,
+    aws_account_id_from_principal, AclGrant, AclGrantee, AclGrants, AclPermission,
+    BucketVersioningState, CanonicalUserId, StoredLegalHoldStatus, VersionId,
 };
 #[cfg(test)]
-use s3_types::{
-    LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention, RetentionPeriod,
+pub(crate) use s3_types::{
+    AccountIdentity, BucketNamespace, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode,
+    ObjectRetention, RetentionPeriod,
 };
 use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
@@ -24,12 +24,13 @@ use storage::ObjectLockState;
 use storage::PutLiveObjectReq;
 #[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
+#[cfg(test)]
+use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig, ObjectLayout};
 use storage::{
-    BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
-    BucketState, CommitMultipartReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape,
-    EffectiveBucketEncryptionConfig, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListPartsReq, ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartUploadRecord, ObjectKey, ObjectLayout, ObjectPartRecord, OwnerIdentity,
+    BucketName, BucketObjectLockConfig, BucketOwnershipControls, BucketState, CommitMultipartReq,
+    CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, GenerationId,
+    ListMultipartUploadsReq, ListPartsReq, ManagedEncryptionAlgorithm, MultipartPartRecord,
+    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectPartRecord, OwnerIdentity,
     PublicAccessBlockConfig, SerializedMetadataBlob, SerializedSystemMetadataBlob,
     SerializedTagSet, SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadState,
     StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
@@ -71,7 +72,7 @@ pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
 use crate::conditional::DeleteCondition;
 #[cfg(test)]
 use crate::conditional::ReadCondition;
-use crate::conditional::{check_read_conditions, check_write_conditions, WriteCondition};
+use crate::conditional::{check_write_conditions, WriteCondition};
 use crate::error::ServerError;
 #[cfg(test)]
 use crate::range::ByteRange;

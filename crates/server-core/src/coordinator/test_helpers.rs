@@ -1,4 +1,5 @@
 use super::*;
+use s3_types::AccountIdentity;
 
 /// Request for an UploadPart operation (test-only convenience wrapper).
 #[derive(Debug)]
