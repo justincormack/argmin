@@ -4,6 +4,8 @@ use crate::conditional::{DeleteCondition, ReadCondition, WriteCondition};
 use crate::sse::{ManagedWrappingKeyConfig, StaticManagedKeyProvider, SSE_C_CUSTOMER_KEY_LEN};
 use std::path::Path;
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub(crate) const NO_READ: &ReadCondition = &ReadCondition {
     if_match: None,
@@ -283,6 +285,222 @@ pub(crate) fn begin_stream_put_with_authorized_request_test<'a>(
         encryption,
     })?;
     coord.begin_stream_put_session(&authorized)
+}
+
+pub(crate) fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {
+    for _ in 0..200 {
+        if matches!(
+            coord.unchecked_active_bucket_summary(name),
+            Err(ServerError::BucketNotFound { .. })
+        ) {
+            let bucket_pg = coord.get_bucket_pg(name).unwrap();
+            if bucket_pg
+                .head_bucket_raw(&trusted_bucket_name(name))
+                .is_err()
+            {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    panic!("bucket {name} was not fully removed");
+}
+
+pub(crate) fn find_key_with_object_pg_ne_bucket_pg(
+    coord: &Coordinator,
+    bucket: &str,
+    prefix: &str,
+) -> String {
+    let bucket_pg_id = coord.bucket_pg_id(bucket);
+    for suffix in 0..1024 {
+        let key = format!("{prefix}-{suffix}");
+        if coord.object_pg_id(bucket, &key) != bucket_pg_id {
+            return key;
+        }
+    }
+    panic!("failed to find a key with object_pg_id != bucket_pg_id");
+}
+
+pub(crate) fn find_key_with_object_pg_eq_bucket_pg(
+    coord: &Coordinator,
+    bucket: &str,
+    prefix: &str,
+) -> String {
+    let bucket_pg_id = coord.bucket_pg_id(bucket);
+    for suffix in 0..1024 {
+        let key = format!("{prefix}-{suffix}");
+        if coord.object_pg_id(bucket, &key) == bucket_pg_id {
+            return key;
+        }
+    }
+    panic!("failed to find a key with object_pg_id == bucket_pg_id");
+}
+
+pub(crate) fn wait_for_shard_set_deletion(
+    coord: &Coordinator,
+    shard_pg_id: u32,
+    okh: &[u8; 16],
+    generation_id: GenerationId,
+    ec: EcShape,
+) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let pg = coord.storage_node.get_pg(shard_pg_id).unwrap();
+        if (0..(ec.k as usize + ec.m as usize)).all(|i| {
+            let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);
+            matches!(
+                pg.stat_shard(&shard_key),
+                Err(storage::StoreError::NotFound)
+            )
+        }) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for shard-set reclaim"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+pub(crate) fn begin_stream_part_test<I: MultipartUploadIdArg>(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    upload_id: I,
+    part_number: u32,
+) -> Result<BeginStreamPartResult, ServerError> {
+    coord.begin_stream_part(&BeginStreamPartRequest {
+        upload: multipart_object_request(bucket, key, upload_id, test_requester()),
+        part_number,
+        policy_context: PutObjectPolicyContext::default(),
+        sse_customer: None,
+    })
+}
+
+pub(crate) fn create_upload_with_parts(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    part_data: &[(u32, &[u8])],
+) -> (UploadId, Vec<CompletePart>) {
+    let metadata = MetadataBlob::new();
+    let create = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request(bucket, key, test_requester()),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+    let mut complete_parts = Vec::new();
+    for &(part_number, data) in part_data {
+        let result = test_helpers::upload_part(
+            coord,
+            &test_helpers::UploadPartRequest {
+                upload: multipart_object_request(bucket, key, &create.upload_id, test_requester()),
+                part_number,
+                data,
+                claimed_checksum: None,
+                sse_customer: None,
+            },
+        )
+        .unwrap();
+        complete_parts.push(CompletePart {
+            part_number,
+            etag: result.etag,
+            checksum: None,
+        });
+    }
+    (create.upload_id, complete_parts)
+}
+
+pub(crate) const MIN_PART: usize = 5 * 1024 * 1024;
+
+fn make_part(fill: u8, size: usize) -> Vec<u8> {
+    vec![fill; size]
+}
+
+pub(crate) fn create_completed_multipart_with_streamed_tail(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+) -> (CompleteMultipartUploadResult, Vec<u8>) {
+    let metadata = MetadataBlob::new();
+    let create = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request(bucket, key, test_requester()),
+            metadata: &metadata,
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let part1 = make_part(0xAA, MIN_PART);
+    let part1_result = test_helpers::upload_part(
+        coord,
+        &test_helpers::UploadPartRequest {
+            upload: multipart_object_request(bucket, key, &create.upload_id, test_requester()),
+            part_number: 1,
+            data: &part1,
+            claimed_checksum: None,
+            sse_customer: None,
+        },
+    )
+    .unwrap();
+
+    let session = begin_stream_part_test(coord, bucket, key, &create.upload_id, 2).unwrap();
+    let part2 = b"streamed-tail-data".to_vec();
+    coord
+        .append_plaintext_stream_segment_for_test(bucket, key, &session.session_id, 0, &part2)
+        .unwrap();
+    let part2_crc = checksum::crc64::checksum(&part2);
+    let part2_result = coord
+        .finalize_stream_part(FinalizeStreamPartRequest {
+            upload: multipart_object_request(bucket, key, &create.upload_id, test_requester()),
+            session_id: &session.session_id,
+            part_number: 2,
+            crc64: part2_crc,
+            total_size: part2.len() as u64,
+            claimed_checksum: None,
+            computed_checksum: None,
+        })
+        .unwrap();
+
+    let complete = coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(bucket, key, &create.upload_id, test_requester()),
+            parts: &[
+                CompletePart {
+                    part_number: 1,
+                    etag: part1_result.etag,
+                    checksum: None,
+                },
+                CompletePart {
+                    part_number: 2,
+                    etag: part2_result.etag,
+                    checksum: None,
+                },
+            ],
+            sse_customer: None,
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+        })
+        .unwrap();
+
+    let expected = [part1, part2].concat();
+    (complete, expected)
 }
 
 pub(crate) fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), ServerError> {
