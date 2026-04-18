@@ -1,5 +1,37 @@
 use super::*;
 
+#[derive(Debug, Clone)]
+pub(super) struct SnapshottedMultipartPart {
+    pub(super) record: ObjectPartRecord,
+    pub(super) object_offset_start: usize,
+    pub(super) segments: Vec<SegmentPayloadRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) enum StaleObjectPayload {
+    Segments {
+        generation_id: GenerationId,
+        segments: Vec<ObjectSegmentRecord>,
+    },
+    Multipart {
+        generation_id: GenerationId,
+        parts: Vec<ObjectPartRecord>,
+        streaming_segments: Vec<MultipartPartSegmentRecord>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DeletedLiveObjectKind {
+    Segments,
+    Multipart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DeletedLiveObjectReclaim {
+    pub(super) generation_id: GenerationId,
+    pub(super) kind: DeletedLiveObjectKind,
+}
+
 impl Coordinator {
     pub(super) fn prepare_put_commit_locked(
         &self,

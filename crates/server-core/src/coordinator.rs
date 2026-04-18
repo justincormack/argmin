@@ -37,14 +37,17 @@ use storage::{
     UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
 };
 
+use self::authz::CachedBucketPolicy;
 use self::authz_results::*;
 pub use self::authz_types::{
     ActiveWriteEncryption, ActiveWriteEncryptionRef, AuthorizedPutObjectWrite,
 };
 use self::authz_types::{AuthorizedPutObjectWriteAcl, ValidatedBucket};
-use self::internal_types::*;
+use self::lifecycle::CachedBucketLifecycle;
+use self::object_state::{SnapshottedMultipartPart, StaleObjectPayload};
 #[cfg(test)]
 use self::payload::encode_parity_scratch_len;
+use self::pg_guards::{BucketObjectPgGuards, LockedReadObject, ObjectPgGuards, TwoPgGuards};
 use self::request_support::authorization_policy_context_for_put_object_write_acl;
 pub use self::request_types::*;
 use self::request_types::{
@@ -53,6 +56,7 @@ use self::request_types::{
 };
 pub use self::response_types::*;
 use self::response_types::{DeleteMarkerLifecycleExpiration, NoncurrentLifecycleExpiration};
+use self::runtime::{LifecycleSweeper, ReclaimSweeper};
 #[cfg(test)]
 use self::test_hooks::*;
 pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
@@ -765,7 +769,6 @@ mod copy;
 mod core_tests;
 mod delete;
 mod infra;
-mod internal_types;
 mod lifecycle;
 mod listing;
 mod multipart;
@@ -782,6 +785,7 @@ mod object_state;
 #[cfg(test)]
 mod object_state_tests;
 mod payload;
+mod pg_guards;
 mod put;
 mod read;
 #[cfg(test)]

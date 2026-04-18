@@ -3,6 +3,27 @@ use super::*;
 static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<LifecycleSweeper>>>> =
     OnceLock::new();
 
+/// The coordinator ties together EC, storage, and metadata.
+pub(super) struct ReclaimSweeper {
+    pub(super) storage_node: Arc<SharedStorageNode>,
+    pub(super) stop: Arc<AtomicBool>,
+    pub(super) handle: Option<JoinHandle<()>>,
+}
+
+pub(super) struct LifecycleSweeper {
+    pub(super) stop: Arc<AtomicBool>,
+    pub(super) handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct LifecycleSweepStats {
+    pub(super) scanned_buckets: u64,
+    pub(super) expired_current_objects: u64,
+    pub(super) expired_noncurrent_versions: u64,
+    pub(super) expired_delete_markers: u64,
+    pub(super) aborted_multipart_uploads: u64,
+}
+
 impl Drop for ReclaimSweeper {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);

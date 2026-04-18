@@ -1,3 +1,5 @@
+#[cfg(test)]
+use super::runtime::LifecycleSweepStats;
 use super::*;
 
 impl Coordinator {

@@ -58,6 +58,20 @@ enum ObjectPolicyTarget<'a> {
     MissingKey(&'a str),
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct CachedBucketPolicy {
+    pub(super) generation: u64,
+    pub(super) policy: Arc<auth::BucketPolicy>,
+}
+
+pub(super) enum ObjectAclAuthorization<'a> {
+    ReadWithPolicy(auth::PolicyAction),
+    WriteWithPolicy {
+        action: auth::PolicyAction,
+        policy_context: PutObjectPolicyContext<'a>,
+    },
+}
+
 impl Coordinator {
     pub(super) fn requester_can_bucket_admin(requester: &Requester, owner_principal: &str) -> bool {
         requester.principal_opt() == Some(owner_principal)

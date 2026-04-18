@@ -1,5 +1,11 @@
 use super::*;
 
+#[derive(Debug, Clone)]
+pub(super) struct CachedBucketLifecycle {
+    pub(super) generation: u64,
+    pub(super) config: Arc<BucketLifecycleConfiguration>,
+}
+
 impl Coordinator {
     pub(super) fn cached_bucket_lifecycle(
         &self,
