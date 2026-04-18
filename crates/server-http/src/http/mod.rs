@@ -57,6 +57,7 @@ use tokio::sync::{mpsc, OwnedSemaphorePermit};
 
 const TRACE_TARGET: &str = "server_http";
 const S3_MAX_LIST_KEYS: u32 = 1_000;
+const SLOW_REQUEST_EVENT_THRESHOLD_US: u128 = 5_000_000;
 
 fn current_trace_context() -> observability::TraceContext {
     observability::current_context().unwrap_or_else(observability::TraceContext::new_request)
@@ -462,6 +463,41 @@ impl ResponseBodyTrace {
         self.meta.context.clone()
     }
 
+    fn elapsed_lifetime_us(&self) -> u128 {
+        self.meta.started_at.elapsed().as_micros()
+    }
+
+    fn emit_slow_request_if_needed(&self, outcome: &'static str, error_code: Option<&str>) {
+        let lifetime_us = self.elapsed_lifetime_us();
+        if lifetime_us < SLOW_REQUEST_EVENT_THRESHOLD_US {
+            return;
+        }
+
+        let error_suffix = error_code
+            .map(|code| format!(" error_code={code}"))
+            .unwrap_or_default();
+        let _ = observability::event_in_context(
+            &self.meta.context,
+            TRACE_TARGET,
+            "slow_request",
+            Some(format_args!(
+                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} outcome={}{}",
+                self.status_code,
+                self.meta.method,
+                self.meta.path,
+                self.meta.query.has_query(),
+                self.meta.query.param_count(),
+                self.meta.query.has_sigv4_params(),
+                self.streaming,
+                self.body_len,
+                self.bytes_sent,
+                lifetime_us,
+                outcome,
+                error_suffix
+            )),
+        );
+    }
+
     fn record_bytes(&mut self, len: usize) {
         self.bytes_sent += len as u64;
     }
@@ -471,6 +507,7 @@ impl ResponseBodyTrace {
             return;
         }
         self.terminal_event_emitted = true;
+        self.emit_slow_request_if_needed(outcome, None);
         let _ = observability::event_in_context(
             &self.meta.context,
             TRACE_TARGET,
@@ -486,7 +523,7 @@ impl ResponseBodyTrace {
                 self.streaming,
                 self.body_len,
                 self.bytes_sent,
-                self.meta.started_at.elapsed().as_micros(),
+                self.elapsed_lifetime_us(),
                 outcome
             )),
         );
@@ -497,6 +534,7 @@ impl ResponseBodyTrace {
             return;
         }
         self.terminal_event_emitted = true;
+        self.emit_slow_request_if_needed("error", Some(err.s3_error_code()));
         let _ = observability::event_in_context(
             &self.meta.context,
             TRACE_TARGET,
@@ -512,7 +550,7 @@ impl ResponseBodyTrace {
                 self.streaming,
                 self.body_len,
                 self.bytes_sent,
-                self.meta.started_at.elapsed().as_micros(),
+                self.elapsed_lifetime_us(),
                 err.s3_error_code()
             )),
         );

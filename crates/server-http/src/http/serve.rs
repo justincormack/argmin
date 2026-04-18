@@ -29,6 +29,7 @@ use crate::error::ServerError;
 use server_core::metadata_blob::USER_METADATA_SIZE_LIMIT;
 use storage::{BucketName, SessionId};
 
+#[cfg(feature = "deep-tracing")]
 const TRACE_TARGET: &str = "server_http";
 const MAX_STREAMING_POST_PART_HEADER_BYTES: usize = 8 * 1024;
 const MAX_STREAMING_POST_NON_FILE_FORM_BYTES: usize = MAX_BUFFERED_CONTROL_BODY_SIZE;
@@ -491,13 +492,16 @@ async fn handle(
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
     let response_trace = crate::http::ResponseTraceMeta::new(trace.clone(), &method, &path, &query);
+    #[cfg(feature = "deep-tracing")]
     let query_summary = observability::query_summary(&query);
+    #[cfg(feature = "deep-tracing")]
     let range_suffix = req
         .headers()
         .get(http::header::RANGE)
         .and_then(|value| value.to_str().ok())
         .map(|value| format!(" raw_range={}", observability::escaped(value)))
         .unwrap_or_default();
+    #[cfg(feature = "deep-tracing")]
     let _ = observability::event_in_context(
         &trace,
         TRACE_TARGET,
