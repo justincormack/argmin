@@ -1,3 +1,10 @@
+// Restricted-domain Rust port of CORE-MATH binary64 log for placement scoring.
+//
+// Relevant upstream references:
+// - project home: https://core-math.gitlabpages.inria.fr/
+// - current upstream log.c: https://gitlab.inria.fr/core-math/core-math/-/blob/master/src/binary64/log/log.c
+// - pinned source revision for this port:
+//   https://gitlab.inria.fr/core-math/core-math/-/tree/782ad8f8831bc7b2676f2a97648881f80bf9d750/src/binary64/log
 #[path = "deterministic_log_tables.rs"]
 mod tables;
 

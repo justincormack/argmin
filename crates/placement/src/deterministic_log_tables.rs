@@ -1,4 +1,8 @@
-// Generated from tmp/core-math/src/binary64/log/{log.c,dint.h}.
+// Generated from CORE-MATH binary64 log tables:
+// - project home: https://core-math.gitlabpages.inria.fr/
+// - current upstream log.c: https://gitlab.inria.fr/core-math/core-math/-/blob/master/src/binary64/log/log.c
+// - pinned source revision for this file:
+//   https://gitlab.inria.fr/core-math/core-math/-/tree/782ad8f8831bc7b2676f2a97648881f80bf9d750/src/binary64/log
 // Keep this file in sync with the placement deterministic log port.
 #![allow(dead_code)]
 
