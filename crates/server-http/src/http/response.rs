@@ -1713,9 +1713,11 @@ pub(crate) fn parse_http_date(s: &str) -> Option<u64> {
         return None;
     }
 
-    #[allow(clippy::cast_sign_loss)]
-    let secs =
-        date_to_days(year, month, day) as u64 * 86400 + hours * 3600 + minutes * 60 + seconds;
+    let days = date_to_days(year, month, day);
+    if days < 0 {
+        return None;
+    }
+    let secs = days as u64 * 86400 + hours * 3600 + minutes * 60 + seconds;
     Some(secs * 1000)
 }
 
@@ -3151,6 +3153,11 @@ mod tests {
     fn parse_http_date_round_trip_epoch() {
         let formatted = format_http_date(0);
         assert_eq!(parse_http_date(&formatted), Some(0));
+    }
+
+    #[test]
+    fn parse_http_date_rejects_pre_epoch_date() {
+        assert_eq!(parse_http_date("Wed, 31 Dec 1969 23:59:59 GMT"), None);
     }
 
     #[test]

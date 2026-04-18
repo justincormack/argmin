@@ -13777,7 +13777,6 @@ mod multipart_stateful_tests;
 mod multipart_trace_tests;
 
 #[cfg(test)]
-#[allow(clippy::useless_conversion)]
 mod tests {
     use super::test_helpers::{self, UploadPartRequest};
     use super::*;
