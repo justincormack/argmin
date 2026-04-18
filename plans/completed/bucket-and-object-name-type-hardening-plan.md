@@ -494,7 +494,7 @@ This work is done when all of the following are true:
 
 ## Related Plans
 
-1. `plans/parser-hardening-plan.md`
+1. `plans/completed/parser-hardening-plan.md`
    - complementary, but narrower
    - focused on parser safety patterns generally
 2. `plans/completed/interface-types-and-illegal-states.md`

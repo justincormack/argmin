@@ -317,7 +317,7 @@ Priority gaps to wire in:
 - multipart/reclaim/session stateful coverage from
   `plans/completed/multipart-reclaim-stream-session-testing-plan.md`
 - parser hardening regressions and fuzz-corpus promotions from
-  `plans/parser-hardening-plan.md`
+  `plans/completed/parser-hardening-plan.md`
 
 This phase is where the security suite becomes useful rather than just tidy.
 

@@ -1,5 +1,21 @@
 # Request Parser Hardening Plan
 
+## Status
+
+Completed.
+
+Implemented in:
+
+- `05c8412` `auth: start request parser hardening`
+- `c937a53` `auth: harden shared sigv4 parser helpers`
+- `d6c9fe2` `server-http: harden upload part query parsing`
+- `71c3a59` `server-http: finish parser hardening sweep`
+- `e3b43ee` `fuzz: add parser hardening targets`
+
+This plan's original scope is complete. Any further parser work should be
+tracked as new maintenance or feature-specific plans rather than extending this
+one.
+
 ## Scope
 
 This plan tracks a small, generic hardening pass over request parsing at the
@@ -222,6 +238,9 @@ Success criteria:
   tests
 - any newly discovered parser panic or pathological-work case feeds back into
   the shared helper set and regression suite
+
+Phase 4 status:
+- completed for the original parser-hardening scope
 
 Current progress:
 - added a `cargo-fuzz` harness under `fuzz/`

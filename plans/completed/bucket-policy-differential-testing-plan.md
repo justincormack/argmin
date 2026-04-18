@@ -15,7 +15,7 @@ In scope:
 
 Out of scope:
 - generic request-parser fuzzing, which is already tracked in
-  `plans/parser-hardening-plan.md`
+  `plans/completed/parser-hardening-plan.md`
 - unsupported bucket-policy condition keys or IAM language expansion
 - replacing the coordinator-level authz model in
   `plans/authz-model-testing-plan.md`
