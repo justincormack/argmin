@@ -1,6 +1,7 @@
 pub mod cluster;
 pub mod config;
 pub mod constraint;
+mod deterministic_log;
 mod hash;
 mod placer;
 pub mod topology;

@@ -1,4 +1,5 @@
 use crate::cluster::NodeId;
+use crate::deterministic_log::{deterministic_log_u53, Unit53};
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 
 /// Fixed secrets for placement hashing. Using a constant seed gives stable,
@@ -30,19 +31,17 @@ fn hash_key_node(key: &[u8], node_id: NodeId) -> u64 {
 
 /// Compute the HRW score for a given key and node.
 ///
-/// Score = -libm::log(U) / weight, where U is a uniform random variable on (0, 1]
+/// Score = -log(U) / weight, where U is a uniform random variable on `[2^-53, 1]`
 /// derived from hash(key || node_id_bytes).
 ///
 /// Lower score = preferred. Weight must be > 0.0 (caller ensures this).
 ///
-/// Uses libm::log (pure-Rust musl port) for bit-identical results across all
-/// IEEE 754 platforms, supporting mixed ARM64/AMD64 deployments.
+/// The log input is restricted to the placement-owned `Unit53` domain rather
+/// than an arbitrary `f64`.
 pub(crate) fn score(key: &[u8], node_id: NodeId, weight: f64) -> f64 {
     let h = hash_key_node(key, node_id);
-    // Map h to (0, 1]: minimum is 1/2^53, maximum is 1.0
-    // h >> 11 is in [0, 2^53 - 1]; adding 1 gives [1, 2^53]; no overflow.
-    let u = ((h >> 11) + 1) as f64 / (1u64 << 53) as f64;
-    -libm::log(u) / weight
+    let u = Unit53::from_hash(h);
+    -deterministic_log_u53(u) / weight
 }
 
 #[cfg(test)]
