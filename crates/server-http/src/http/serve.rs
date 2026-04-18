@@ -2143,6 +2143,13 @@ fn emit_streaming_put_event(
     name: &'static str,
     fields: std::fmt::Arguments<'_>,
 ) {
+    #[cfg(not(feature = "deep-tracing"))]
+    {
+        let _ = (ctx, name, fields);
+        return;
+    }
+
+    #[cfg(feature = "deep-tracing")]
     let _ = observability::event_in_context(&ctx.trace, TRACE_TARGET, name, Some(fields));
 }
 
@@ -2841,6 +2848,13 @@ fn emit_streaming_part_event(
     name: &'static str,
     fields: std::fmt::Arguments<'_>,
 ) {
+    #[cfg(not(feature = "deep-tracing"))]
+    {
+        let _ = (ctx, name, fields);
+        return;
+    }
+
+    #[cfg(feature = "deep-tracing")]
     let _ = observability::event_in_context(&ctx.trace, TRACE_TARGET, name, Some(fields));
 }
 

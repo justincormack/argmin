@@ -1280,6 +1280,7 @@ impl SegmentPayloadRecord {
     }
 }
 
+#[cfg_attr(not(feature = "deep-tracing"), allow(dead_code))]
 #[derive(Debug, Clone)]
 struct SegmentSliceRecord {
     payload: SegmentPayloadRecord,
@@ -1317,6 +1318,7 @@ struct SegmentListReader {
     sse_customer_request: Option<SseCustomerRequest>,
 }
 
+#[cfg_attr(not(feature = "deep-tracing"), allow(dead_code))]
 #[derive(Debug, Clone)]
 struct SnapshottedMultipartPartRange {
     layout: MultipartPartReadLayout,
@@ -5431,6 +5433,7 @@ impl SegmentListReader {
             }
 
             let slice = self.segments[self.next_segment_index].clone();
+            #[cfg(feature = "deep-tracing")]
             if let Some(trace) = observability::current_context() {
                 let read_object_offset_start =
                     slice.segment_object_offset_start + slice.start_offset;
@@ -5546,6 +5549,7 @@ impl MultipartReader {
 
             let part = self.parts[self.next_part_index].clone();
             self.next_part_index += 1;
+            #[cfg(feature = "deep-tracing")]
             if let Some(trace) = observability::current_context() {
                 let _ = observability::event_in_context(
                     &trace,
@@ -8914,12 +8918,23 @@ impl Coordinator {
         segment_index: u32,
         data_len: usize,
     ) {
+        #[cfg(not(feature = "deep-tracing"))]
+        {
+            let _ = (target, bucket, key, session_id, segment_index, data_len);
+            return;
+        }
+
+        #[cfg(feature = "deep-tracing")]
         let Some(trace) = observability::current_context() else {
             return;
         };
+        #[cfg(feature = "deep-tracing")]
         let segment_offset_start = u64::from(segment_index) * INTERNAL_SEGMENT_SIZE as u64;
+        #[cfg(feature = "deep-tracing")]
         let segment_offset_len = data_len as u64;
+        #[cfg(feature = "deep-tracing")]
         let segment_offset_end_exclusive = segment_offset_start + segment_offset_len;
+        #[cfg(feature = "deep-tracing")]
         match target {
             StreamUploadTarget::PutObject => {
                 let _ = observability::event_in_context(
@@ -11788,6 +11803,7 @@ impl Coordinator {
         let (user_start, user_end) = match range.resolve(record.size) {
             Some(resolved) => resolved,
             None => {
+                #[cfg(feature = "deep-tracing")]
                 if let Some(trace) = observability::current_context() {
                     let _ = observability::event_in_context(
                         &trace,
@@ -11804,6 +11820,7 @@ impl Coordinator {
                 });
             }
         };
+        #[cfg(feature = "deep-tracing")]
         if let Some(trace) = observability::current_context() {
             let _ = observability::event_in_context(
                 &trace,
@@ -13179,6 +13196,7 @@ impl Coordinator {
                 });
             }
         }
+        #[cfg(feature = "deep-tracing")]
         if let Some(trace) = observability::current_context() {
             let _ = observability::event_in_context(
                 &trace,

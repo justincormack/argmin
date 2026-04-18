@@ -443,7 +443,6 @@ struct ResponseBodyTrace {
     body_len: u64,
     bytes_sent: u64,
     streaming: bool,
-    first_chunk_emitted: bool,
     terminal_event_emitted: bool,
 }
 
@@ -455,7 +454,6 @@ impl ResponseBodyTrace {
             body_len,
             bytes_sent: 0,
             streaming,
-            first_chunk_emitted: false,
             terminal_event_emitted: false,
         }
     }
@@ -464,35 +462,7 @@ impl ResponseBodyTrace {
         self.meta.context.clone()
     }
 
-    fn emit_first_chunk(&mut self, len: usize) {
-        if self.first_chunk_emitted {
-            return;
-        }
-        self.first_chunk_emitted = true;
-        let _ = observability::event_in_context(
-            &self.meta.context,
-            TRACE_TARGET,
-            "response_first_chunk",
-            Some(format_args!(
-                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} first_chunk_len={} lifetime_us={}",
-                self.status_code,
-                self.meta.method,
-                self.meta.path,
-                self.meta.query.has_query(),
-                self.meta.query.param_count(),
-                self.meta.query.has_sigv4_params(),
-                self.streaming,
-                self.body_len,
-                len,
-                self.meta.started_at.elapsed().as_micros()
-            )),
-        );
-    }
-
     fn record_bytes(&mut self, len: usize) {
-        if len > 0 {
-            self.emit_first_chunk(len);
-        }
         self.bytes_sent += len as u64;
     }
 
@@ -1371,6 +1341,7 @@ impl HttpFrontend {
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
                 let requester = Self::requester_from_auth(auth);
+                #[cfg(feature = "deep-tracing")]
                 let trace = current_trace_context();
                 if let Some(pn_str) = req.query_param_lossy("partNumber") {
                     if req.header("range").is_some() {
@@ -1381,6 +1352,7 @@ impl HttpFrontend {
                         });
                     }
                     let part_number = request::parse_part_number(pn_str.as_ref())?;
+                    #[cfg(feature = "deep-tracing")]
                     let _ = observability::event_in_context(
                         &trace,
                         TRACE_TARGET,
@@ -1420,6 +1392,7 @@ impl HttpFrontend {
                 } else if let Some(range_header) = req.header("range") {
                     match crate::range::ByteRange::parse(range_header) {
                         Ok(byte_range) => {
+                            #[cfg(feature = "deep-tracing")]
                             let _ = observability::event_in_context(
                                 &trace,
                                 TRACE_TARGET,
@@ -1458,6 +1431,7 @@ impl HttpFrontend {
                             }
                         }
                         Err(_) => {
+                            #[cfg(feature = "deep-tracing")]
                             let _ = observability::event_in_context(
                                 &trace,
                                 TRACE_TARGET,
@@ -1551,9 +1525,11 @@ impl HttpFrontend {
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
                 let requester = Self::requester_from_auth(auth);
+                #[cfg(feature = "deep-tracing")]
                 let trace = current_trace_context();
                 if let Some(pn_str) = req.query_param_lossy("partNumber") {
                     let part_number = request::parse_part_number(pn_str.as_ref())?;
+                    #[cfg(feature = "deep-tracing")]
                     let _ = observability::event_in_context(
                         &trace,
                         TRACE_TARGET,
