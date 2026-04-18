@@ -2263,7 +2263,7 @@ impl Coordinator {
     ) -> Result<AuthorizedPutBucketPolicy, ServerError> {
         let bucket_info = self.checked_active_bucket_summary_for(
             req.bucket.name_typed(),
-            req.bucket.expected_bucket_owner,
+            req.bucket.expected_bucket_owner(),
         )?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_bucket_policy_action_with_bucket_policy(
@@ -2315,7 +2315,7 @@ impl Coordinator {
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
         let bucket_info =
-            self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner)?;
+            self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_bucket_policy_action_with_bucket_policy(
             &req.requester,
@@ -2337,7 +2337,7 @@ impl Coordinator {
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
         let bucket_info =
-            self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner)?;
+            self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
         if !Self::requester_can_bucket_policy_action_with_bucket_policy(
             &req.requester,
