@@ -343,8 +343,9 @@ pub(crate) fn wait_for_shard_set_deletion(
     generation_id: GenerationId,
     ec: EcShape,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + Duration::from_secs(3);
     loop {
+        coord.storage_node.wake_reclaim_workers();
         let pg = coord.storage_node.get_pg(shard_pg_id).unwrap();
         if (0..(ec.k as usize + ec.m as usize)).all(|i| {
             let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);

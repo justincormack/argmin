@@ -60,7 +60,7 @@ use self::request_types::authorization_policy_context_for_put_object_write_acl;
 pub use self::request_types::*;
 use self::request_types::{
     AuthorizedWriteTags, BucketCreateOutcome, BucketScopedAuthorizationRequest,
-    BucketScopedRequest, ExpectedBucketOwnerRequest, PreparedPutCommit, PutCommitRequest,
+    BucketScopedRequest, PreparedPutCommit, PutCommitRequest,
 };
 pub use self::response_types::*;
 use self::response_types::{DeleteMarkerLifecycleExpiration, NoncurrentLifecycleExpiration};

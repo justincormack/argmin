@@ -1,4 +1,23 @@
-use super::*;
+use std::sync::{Arc, MutexGuard};
+
+use auth::BucketPolicy;
+use checksum::MultipartChecksumConfig;
+
+use super::authz_types::{ActiveWriteEncryption, AuthorizedPutObjectWrite, ValidatedBucket};
+use super::pg_guards::{LockedReadObject, ObjectPgGuards};
+use super::request_types::{CreateBucketAcl, Requester};
+use super::response_types::{BucketSummary, GetBucketAclResult, GetObjectAclResult};
+use crate::sse::SseCustomerWriteContext;
+use s3_types::{
+    AclGrants, BucketVersioningState, CanonicalUserId, LegalHoldStatus, ObjectRetention,
+    StoredLegalHoldStatus, VersionId,
+};
+use storage::BucketObjectOwnership;
+use storage::{
+    BucketEncryptionConfig, BucketLifecycleConfiguration, BucketName, BucketObjectLockConfig,
+    BucketOwnershipControls, EffectiveBucketEncryptionConfig, MultipartUploadRecord, ObjectKey,
+    ObjectLockState, OwnerIdentity, PublicAccessBlockConfig, StoredObject, UploadId,
+};
 
 #[derive(Debug)]
 pub(super) struct AuthorizedBucketSubresourcePut {
@@ -40,7 +59,7 @@ pub(super) struct AuthorizedPutBucketOwnershipControls {
 pub(super) struct AuthorizedPutBucketPolicy {
     pub(super) bucket: BucketName,
     pub(super) body: String,
-    pub(super) parsed_policy: Arc<auth::BucketPolicy>,
+    pub(super) parsed_policy: Arc<BucketPolicy>,
     pub(super) policy_is_public: bool,
 }
 
@@ -184,7 +203,7 @@ pub(super) struct AuthorizedObjectRead<'a> {
 
 pub(super) struct LoadedObjectState<'a> {
     pub(super) bucket_info: ValidatedBucket,
-    pub(super) bucket_policy: Option<Arc<auth::BucketPolicy>>,
+    pub(super) bucket_policy: Option<Arc<BucketPolicy>>,
     pub(super) locked: LockedReadObject<'a>,
 }
 

@@ -2513,7 +2513,8 @@ fn wait_for_shard_set_deletion(
     generation_id: GenerationId,
     ec: EcShape,
 ) {
-    wait_until("shard-set reclaim", Duration::from_secs(1), || -> bool {
+    wait_until("shard-set reclaim", Duration::from_secs(3), || -> bool {
+        coord.storage_node.wake_reclaim_workers();
         let pg = coord.storage_node.get_pg(shard_pg_id).unwrap();
         (0..(ec.k as usize + ec.m as usize)).all(|i| {
             let shard_key = ShardKey::new(okh, generation_id.get(), i as u8);

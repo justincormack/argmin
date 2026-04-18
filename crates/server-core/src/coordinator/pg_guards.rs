@@ -1,4 +1,6 @@
-use super::*;
+use std::sync::MutexGuard;
+
+use storage::StoredObject;
 
 /// PG guards held while an object metadata snapshot is live.
 ///
