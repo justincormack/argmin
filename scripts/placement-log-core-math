@@ -37,15 +37,6 @@ EOF
 
 build_helpers() {
     helper_dir="$(mktemp -d)"
-    cargo build -p placement --lib >/dev/null
-
-    local libm_rlib
-    libm_rlib="$(find "$repo_root/target/debug/deps" -name 'liblibm-*.rlib' | head -n 1)"
-    if [[ -z "$libm_rlib" ]]; then
-        echo "error: failed to locate built libm rlib under target/debug/deps" >&2
-        exit 1
-    fi
-
     cat > "$helper_dir/cm_log_main.c" <<'EOF'
 #include <stdint.h>
 #include <stdio.h>
@@ -101,10 +92,7 @@ fn main() {
 }
 EOF
 
-    rustc --edition=2021 "$helper_dir/placement_log_main.rs" \
-        --extern "libm=$libm_rlib" \
-        -L "dependency=$repo_root/target/debug/deps" \
-        -o "$helper_dir/placement_log"
+    rustc --edition=2021 "$helper_dir/placement_log_main.rs" -o "$helper_dir/placement_log"
 
     PLACEMENT_LOG_HELPER_DIR="$helper_dir"
     export PLACEMENT_LOG_HELPER_DIR
