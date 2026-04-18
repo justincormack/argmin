@@ -2216,6 +2216,7 @@ pub fn list_object_versions_xml(
     xml
 }
 
+#[allow(clippy::format_push_string)]
 fn encode_url_listing_value(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     for byte in value.bytes() {
@@ -2244,6 +2245,7 @@ fn encode_list_versions_value(value: &str, encoding_type: Option<&str>) -> Strin
     }
 }
 
+#[allow(clippy::format_push_string)]
 fn xml_escape_list_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -3458,6 +3460,7 @@ pub fn is_valid_object_attribute(name: &str) -> bool {
 /// `etag` should be the quoted `ETag` string (quotes will be stripped).
 /// `checksum_entries` are the `x-amz-checksum-*` metadata entries.
 #[must_use]
+#[allow(clippy::format_push_string)]
 pub fn get_object_attributes_xml(
     requested: &[&str],
     etag: &str,
@@ -3702,6 +3705,7 @@ pub fn complete_multipart_upload_xml(
 
 /// Format a `ListMultipartUploadsResult` XML response.
 #[must_use]
+#[allow(clippy::format_push_string)]
 pub fn list_multipart_uploads_xml(
     bucket: &str,
     prefix: Option<&str>,
@@ -3792,6 +3796,7 @@ pub fn list_multipart_uploads_xml(
 
 /// Format a `ListPartsResult` XML response.
 #[must_use]
+#[allow(clippy::format_push_string)]
 pub fn list_parts_xml(
     bucket: &str,
     key: &str,
@@ -5481,6 +5486,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_push_string)]
     fn parse_tagging_xml_too_many() {
         let mut xml = String::from("<Tagging><TagSet>");
         for i in 0..11 {
@@ -6680,6 +6686,7 @@ mod tests {
     // ── Parse CompleteMultipartUpload edge cases ─────────────────────
 
     #[test]
+    #[allow(clippy::format_push_string)]
     fn parse_complete_multipart_many_parts() {
         let mut xml = String::from("<CompleteMultipartUpload>");
         for i in 1..=100 {
@@ -6726,6 +6733,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_push_string)]
     fn ceph_cleanup_workflow() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());
@@ -6859,6 +6867,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_push_string)]
     fn ceph_cleanup_workflow_paginated() {
         let tmp = test_util::tempdir();
         let coord = setup_coordinator(tmp.path());

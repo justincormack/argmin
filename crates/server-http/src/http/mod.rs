@@ -5397,6 +5397,7 @@ mod tests {
         parse_bucket_name(name).unwrap()
     }
 
+    #[allow(clippy::format_collect)]
     fn hex_lower(bytes: &[u8]) -> String {
         bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
@@ -6582,6 +6583,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_push_string)]
     fn put_bucket_policy_rejects_normalized_policy_over_20kb() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
@@ -8471,6 +8473,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::format_push_string)]
     fn complete_multipart_multiple_checksum_headers_rejected() {
         let tmp = test_util::tempdir();
         let fe = setup_frontend(tmp.path());
@@ -9428,6 +9431,7 @@ mod tests {
     // ── GET ?partNumber=N tests ─────────────────────────────────────
 
     /// Helper: do a full multipart upload through the live streaming coordinator path.
+    #[allow(clippy::format_push_string)]
     fn do_multipart_upload(
         fe: &HttpFrontend,
         bucket: &str,

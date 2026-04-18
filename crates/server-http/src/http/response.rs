@@ -37,6 +37,7 @@ pub fn format_version_id(version_id: VersionId) -> String {
 /// and spaces become underscores.
 ///
 /// Reference: <https://docs.aws.amazon.com/AmazonS3/latest/userguide/UsingMetadata.html>
+#[allow(clippy::format_push_string)]
 fn rfc2047_encode(value: &str) -> String {
     let mut encoded = String::from("=?UTF-8?Q?");
     for byte in value.bytes() {

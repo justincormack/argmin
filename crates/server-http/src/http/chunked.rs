@@ -248,6 +248,7 @@ fn verify_chunk_signature(
 /// ```
 /// where `canonical_trailers` is the sorted non-signature trailer headers, each as
 /// `key:value\n`.
+#[allow(clippy::format_collect)]
 fn verify_trailer_signature(
     ctx: &StreamingSigningContext,
     prev_sig: &str,

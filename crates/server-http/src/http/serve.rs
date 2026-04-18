@@ -3505,6 +3505,7 @@ mod tests {
         hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), data)
     }
 
+    #[allow(clippy::format_collect)]
     fn hex_encode(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{:02x}", b)).collect()
     }

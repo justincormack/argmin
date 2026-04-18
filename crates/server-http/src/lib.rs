@@ -3,8 +3,6 @@
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
     clippy::doc_markdown,
-    clippy::format_collect,
-    clippy::format_push_string,
     clippy::items_after_statements,
     clippy::manual_let_else,
     clippy::match_same_arms,
