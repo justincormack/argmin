@@ -466,7 +466,7 @@ impl ResponseBodyTrace {
         self.bytes_sent += len as u64;
     }
 
-    fn emit_complete(&mut self) {
+    fn emit_finish(&mut self, outcome: &'static str) {
         if self.terminal_event_emitted {
             return;
         }
@@ -474,9 +474,9 @@ impl ResponseBodyTrace {
         let _ = observability::event_in_context(
             &self.meta.context,
             TRACE_TARGET,
-            "response_body_complete",
+            "request_finish",
             Some(format_args!(
-                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={}",
+                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} outcome={}",
                 self.status_code,
                 self.meta.method,
                 self.meta.path,
@@ -486,7 +486,8 @@ impl ResponseBodyTrace {
                 self.streaming,
                 self.body_len,
                 self.bytes_sent,
-                self.meta.started_at.elapsed().as_micros()
+                self.meta.started_at.elapsed().as_micros(),
+                outcome
             )),
         );
     }
@@ -499,9 +500,9 @@ impl ResponseBodyTrace {
         let _ = observability::event_in_context(
             &self.meta.context,
             TRACE_TARGET,
-            "response_body_error",
+            "request_error",
             Some(format_args!(
-                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} error_code={}",
+                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} stage=response_body error_code={}",
                 self.status_code,
                 self.meta.method,
                 self.meta.path,
@@ -513,31 +514,6 @@ impl ResponseBodyTrace {
                 self.bytes_sent,
                 self.meta.started_at.elapsed().as_micros(),
                 err.s3_error_code()
-            )),
-        );
-    }
-
-    fn emit_dropped(&mut self) {
-        if self.terminal_event_emitted {
-            return;
-        }
-        self.terminal_event_emitted = true;
-        let _ = observability::event_in_context(
-            &self.meta.context,
-            TRACE_TARGET,
-            "response_body_dropped",
-            Some(format_args!(
-                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={}",
-                self.status_code,
-                self.meta.method,
-                self.meta.path,
-                self.meta.query.has_query(),
-                self.meta.query.param_count(),
-                self.meta.query.has_sigv4_params(),
-                self.streaming,
-                self.body_len,
-                self.bytes_sent,
-                self.meta.started_at.elapsed().as_micros()
             )),
         );
     }
@@ -622,7 +598,7 @@ impl Body for S3HyperBody {
                 }
                 _ => {
                     if let Some(trace) = this.trace.as_mut() {
-                        trace.emit_complete();
+                        trace.emit_finish("complete");
                     }
                     Poll::Ready(None)
                 }
@@ -642,7 +618,7 @@ impl Body for S3HyperBody {
                 }
                 Poll::Ready(None) => {
                     if let Some(trace) = this.trace.as_mut() {
-                        trace.emit_complete();
+                        trace.emit_finish("complete");
                     }
                     Poll::Ready(None)
                 }
@@ -676,9 +652,9 @@ impl Drop for S3HyperBody {
             return;
         }
         if trace.bytes_sent == trace.body_len {
-            trace.emit_complete();
+            trace.emit_finish("complete");
         } else {
-            trace.emit_dropped();
+            trace.emit_finish("dropped");
         }
     }
 }
