@@ -315,7 +315,7 @@ Priority gaps to wire in:
 - bucket-policy local generator/differential coverage from
   `plans/bucket-policy-differential-testing-plan.md`
 - multipart/reclaim/session stateful coverage from
-  `plans/multipart-reclaim-stream-session-testing-plan.md`
+  `plans/completed/multipart-reclaim-stream-session-testing-plan.md`
 - parser hardening regressions and fuzz-corpus promotions from
   `plans/parser-hardening-plan.md`
 

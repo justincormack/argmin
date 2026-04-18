@@ -2154,3 +2154,177 @@ fn completing_current_upload_with_live_replacement_stream_session_leaves_orphan_
         "explicit cleanup should remove the orphaned replacement session"
     );
 }
+
+#[test]
+fn completing_current_same_key_upload_publishes_payload_and_clears_pending_state() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", TRACE_BUCKET, false)
+        .unwrap();
+
+    let mut harness = SameKeyUploadHarness::new(coord);
+    harness.execute(&SameKeyUploadTraceOp::CreateUpload);
+    harness.execute(&SameKeyUploadTraceOp::BeginCurrentStream);
+    harness.execute(&SameKeyUploadTraceOp::AppendCurrentData);
+    harness.execute(&SameKeyUploadTraceOp::FinalizeCurrentPart);
+
+    let upload_id = harness.uploads.last().unwrap().upload_id.clone();
+    let payload = harness.uploads.last().unwrap().payload.clone();
+
+    harness.execute(&SameKeyUploadTraceOp::CompleteCurrent);
+
+    assert_eq!(
+        harness.pending_upload_ids_in_order().len(),
+        0,
+        "completing the only pending upload should leave no pending multipart uploads"
+    );
+    assert_eq!(
+        harness.active_session_count(),
+        0,
+        "completing without a replacement session should leave no active stream sessions"
+    );
+
+    let err = harness
+        .coord
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request(TRACE_BUCKET, TRACE_KEY, &upload_id, test_requester()),
+            part_number_marker: None,
+            max_parts: 100,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::NoSuchUpload { .. }),
+        "completed upload should no longer be listable as a pending multipart upload"
+    );
+
+    let result = harness
+        .coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request(TRACE_BUCKET, TRACE_KEY, None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let body = read_all_body(result.body).unwrap();
+    assert_eq!(
+        body, payload,
+        "completing the current upload should publish its finalized part payload"
+    );
+}
+
+#[test]
+fn completing_newer_same_key_upload_overwrites_older_visible_payload_and_clears_pending_state() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", TRACE_BUCKET, false)
+        .unwrap();
+
+    let oldest_create = create_basic_multipart_upload(&coord, TRACE_BUCKET, TRACE_KEY);
+    let oldest_payload = b"oldest-visible-payload".to_vec();
+    let oldest_etag = upload_part_test(
+        &coord,
+        TRACE_BUCKET,
+        TRACE_KEY,
+        &oldest_create.upload_id,
+        1,
+        &oldest_payload,
+    );
+
+    let current_create = create_basic_multipart_upload(&coord, TRACE_BUCKET, TRACE_KEY);
+    let current_payload = b"current-visible-payload".to_vec();
+    let current_etag = upload_part_test(
+        &coord,
+        TRACE_BUCKET,
+        TRACE_KEY,
+        &current_create.upload_id,
+        1,
+        &current_payload,
+    );
+
+    coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(
+                TRACE_BUCKET,
+                TRACE_KEY,
+                &oldest_create.upload_id,
+                test_requester(),
+            ),
+            parts: &[CompletePart {
+                part_number: 1,
+                etag: oldest_etag,
+                checksum: None,
+            }],
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+
+    let oldest_result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request(TRACE_BUCKET, TRACE_KEY, None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let oldest_body = read_all_body(oldest_result.body).unwrap();
+    assert_eq!(
+        oldest_body, oldest_payload,
+        "completing the older upload first should publish its payload"
+    );
+
+    coord
+        .complete_multipart_upload(&CompleteMultipartUploadRequest {
+            upload: multipart_object_request(
+                TRACE_BUCKET,
+                TRACE_KEY,
+                &current_create.upload_id,
+                test_requester(),
+            ),
+            parts: &[CompletePart {
+                part_number: 1,
+                etag: current_etag,
+                checksum: None,
+            }],
+            claimed_checksum: None,
+            expected_object_size: None,
+            cond: &WriteCondition::default(),
+            sse_customer: None,
+        })
+        .unwrap();
+
+    let current_result = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request(TRACE_BUCKET, TRACE_KEY, None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let current_body = read_all_body(current_result.body).unwrap();
+    assert_eq!(
+        current_body, current_payload,
+        "completing the newer upload should overwrite the visible object with its payload"
+    );
+
+    let uploads = coord
+        .list_multipart_uploads(&ListMultipartUploadsRequest {
+            bucket: BucketRequest::new(trusted_bucket_name(TRACE_BUCKET), test_requester(), None),
+            prefix: None,
+            key_marker: None,
+            upload_id_marker: None,
+            max_uploads: u32::MAX,
+        })
+        .unwrap()
+        .uploads;
+    assert_eq!(
+        uploads
+            .iter()
+            .filter(|upload| upload.key.as_str() == TRACE_KEY)
+            .count(),
+        0,
+        "completing both same-key uploads should leave no pending multipart uploads"
+    );
+}

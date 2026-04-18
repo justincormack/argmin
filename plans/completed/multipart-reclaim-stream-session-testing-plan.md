@@ -500,15 +500,23 @@ Success criteria:
 
 Current state:
 
-- in progress
-- promotion has started first, before any new concurrency helper:
-  - a same-key multipart/session shrink is being promoted into a named
-    deterministic regression around completing an upload while a live
-    replacement stream session still exists
-  - reclaim/bucket-delete shrinks are being promoted into named deterministic
-    regressions around inert stale bucket-delete follow-on work and
-    current-root advancement from an older generation to a newer generation
-- no loom-style helper has been added
+- complete on the promotion-first path, with no new concurrency helper needed
+- promoted deterministic regressions now directly cover:
+  - completing an upload while a live replacement stream session still exists,
+    with the replacement session left orphaned until explicit cleanup
+  - completing the current same-key upload and publishing its payload while
+    clearing pending multipart state
+  - completing the older and then newer same-key uploads, with the newer
+    completion overwriting visible object state and leaving no pending uploads
+  - object reclaim work taking priority over stale bucket-delete follow-on work
+  - deleting-bucket finalization advancing from an older generation root to a
+    newer generation root
+  - deleting-bucket finalization not skipping an older generation root that is
+    still lease-blocked
+  - deleting an empty bucket without any follow-on reclaim work
+- no loom-style helper was added because the promoted regressions and existing
+  Phase 3 traces left no concrete remaining interleaving risk that justified a
+  new concurrency-specific dependency or helper
 
 ## Validation
 
