@@ -31,7 +31,63 @@ telemetry. We still need a small amount of in-process observability for:
 
 ## Status
 
-Not started.
+In progress.
+
+Completed:
+
+- deep tracing is behind the non-default `deep-tracing` cargo feature and no
+  longer part of the default production build path
+- production/local docs now treat deep tracing as local/test-only
+- the always-on production event surface has been reduced to:
+  - `request_finish`
+  - `request_error`
+  - `slow_request`
+  - `bucket_lock_wait_exceeded`
+  - `multipart_completion_bucket_lock_wait_exceeded`
+- dense request/stream/layout observability is now `deep-tracing` only
+- `crates/observability` now provides small helper APIs for the remaining
+  production events
+- `crates/observability` now maintains a minimal in-process metrics snapshot
+  with:
+  - `inflight_requests`
+  - `request_finish_total`
+  - `request_error_total`
+  - `slow_request_total`
+  - `bucket_lock_wait_exceeded_total`
+  - `multipart_completion_bucket_lock_wait_exceeded_total`
+
+Remaining:
+
+- choose how to expose `metrics_snapshot()` for explicit local ops/debugging
+- run the eBPF/OpenTelemetry profiling pilot in staging
+- remove or demote the remaining dense `trace_scope!` callsites in
+  coordinator/storage/auth paths that are still compiled for local deep tracing
+
+## Current State
+
+The code is already much closer to the target state than the original plan
+assumed.
+
+### Production path today
+
+- deep tracing is off by default and not documented as a production mechanism
+- always-on semantic telemetry is limited to request summaries, slow-request
+  summaries, and thresholded lock-wait summaries
+- the production event formatting and metric increments are centralized in
+  `crates/observability`
+
+### Local-only deep tracing today
+
+- dense request/stream/layout detail remains available only behind the
+  non-default `deep-tracing` feature
+- this is intended for local debugging and tests, not production deployments
+
+### Main gap to close next
+
+- production-safe local visibility into the new metric snapshot
+- production profiling via eBPF/OpenTelemetry
+- further cleanup of remaining dense tracing callsites now that the production
+  event surface is stable
 
 ## Goals
 
@@ -65,30 +121,33 @@ We should end up with three distinct layers:
    An explicitly local-only diagnostic mode for narrow investigations. This is
    not a production observability mechanism.
 
-## Current Hot-Path Observability Surface
+## Current Observability Concentration
 
-The current system is concentrated in a few files and should be reduced there
-first:
+The remaining observability code is still concentrated in a few files. Some of
+this is now production summary telemetry, and some is local-only deep tracing
+that still needs further cleanup.
 
 - `crates/observability/src/lib.rs`
-  - trace sink setup
+  - trace sink setup for local deep tracing
   - request-local trace stack
   - `TraceScope`
-  - `event_in_context`
+  - production summary-event helpers and metrics snapshot
 - `crates/server-http/src/http/serve.rs`
-  - request start events
-  - streaming PUT and UploadPart lifecycle events
+  - request summary emission
+  - slow-request summaries
+  - local-only streaming PUT and UploadPart detail
 - `crates/server-http/src/http/mod.rs`
-  - response body lifecycle events
+  - request terminal summary emission
+  - in-flight request guard lifetime handling
 - `crates/server-core/src/coordinator.rs`
-  - broad operation-level span coverage across many S3 paths
+  - broad operation-level local trace coverage across many S3 paths
   - read-path tracing such as `ReadHandle::next_chunk`
 - `crates/storage/src/node.rs`
-  - bucket lock wait/acquire timing
+  - thresholded bucket lock wait summaries
 - `crates/storage/src/pg_store.rs`
-  - dense storage-layer span coverage
+  - dense storage-layer local trace coverage
 - `crates/auth/src/request.rs` and `crates/auth/src/post.rs`
-  - request auth trace scopes
+  - auth trace scopes still primarily useful only for local deep tracing
 
 ## Keep vs Remove
 
@@ -96,13 +155,16 @@ first:
 
 These still provide value that profiling cannot:
 
-- request start and request finish summary
+- request finish summary
+- request transport/body error summary
 - response status, total latency, and body size summary
-- auth rejection summaries with stable error classes
 - slow-request summaries
 - lock wait summaries when a threshold is exceeded
+- cheap in-process counters/gauges for inflight request count and key abnormal
+  event totals
 - queue-pressure or background-work delay summaries when a threshold is exceeded
-- streaming upload summary events at session start/finish/failure, not per chunk
+- auth rejection summaries with stable error classes if they prove necessary in
+  production
 
 ### Remove or demote out of production
 
@@ -118,6 +180,8 @@ These should not remain as always-on production instrumentation:
 
 The current deep tracing code is not suitable for production. The first step is
 to make that true in the build and runtime model, not just in guidance.
+
+Status: completed in commits `af23fa0` and `3e8ab11`.
 
 ### Work
 
@@ -140,7 +204,10 @@ to make that true in the build and runtime model, not just in guidance.
 ## Phase 2: Profiling Pilot
 
 Stand up eBPF/OpenTelemetry profiling next, so we have production-appropriate
-performance visibility while slimming the remaining in-process telemetry.
+performance visibility while we finish removing the remaining dense local trace
+coverage.
+
+Status: not started.
 
 ### Work
 
@@ -168,16 +235,18 @@ performance visibility while slimming the remaining in-process telemetry.
 
 Before editing code, define the events that remain allowed in production.
 
+Status: mostly completed in commits `e83680a`, `0af4140`, `b2224ed`, and
+`f78d191`.
+
 ### Required Event Types
 
-- `request_start`
 - `request_finish`
 - `request_error`
-- `auth_failure`
 - `slow_request`
 - `lock_wait_exceeded`
-- `background_queue_delay_exceeded`
-- `streaming_upload_summary`
+- optional future additions if needed:
+  - `auth_failure`
+  - `background_queue_delay_exceeded`
 
 ### Event Rules
 
@@ -189,8 +258,10 @@ Before editing code, define the events that remain allowed in production.
 
 ## Phase 4: Refactor the In-Process Observability Crate
 
-Reduce `crates/observability` from a general tracing system to a minimal event
-and formatting layer.
+Reduce `crates/observability` from a general tracing system to a minimal event,
+formatting, and metric layer.
+
+Status: mostly completed in commit `2249c45`.
 
 ### Work
 
@@ -206,16 +277,35 @@ and formatting layer.
    - slow requests
    - lock waits
    - queue delays
-5. Keep the remaining crate focused on production-safe summary telemetry.
+5. Add minimal counters/gauges for the production telemetry surface.
+6. Keep the remaining crate focused on production-safe summary telemetry.
 
 ### Notes
 
 This phase does not need a new production dependency. We can keep the reduced
 crate internal and small.
 
+Completed in this phase:
+
+- summary helper APIs now exist for request finish/error, slow requests, and
+  thresholded lock waits
+- minimal production-safe counters/gauges now exist
+
+Remaining work in this phase:
+
+- decide whether to expose `metrics_snapshot()` via a local debug endpoint,
+  periodic dump, or another explicit local-only path
+- add queue-delay helpers only if/when we introduce queue-pressure summaries
+
 ## Phase 5: Remove Dense Hot-Path Instrumentation
 
-Delete or demote the highest-volume callsites first.
+Delete or demote the highest-volume callsites first. The production event
+surface has already been reduced; this phase is now about shrinking the
+remaining dense local-only trace coverage.
+
+Status: in progress. Event-surface reductions landed in commits `e83680a`,
+`0af4140`, `b2224ed`, and `f78d191`, but many dense `trace_scope!` callsites
+still exist in coordinator/storage/auth code.
 
 ### First removals
 
@@ -232,13 +322,14 @@ Delete or demote the highest-volume callsites first.
 ### Convert to summaries
 
 - `crates/server-http/src/http/serve.rs`
-  - keep `request_start`
-  - add `request_finish` and `slow_request`
-  - collapse streaming PUT and UploadPart events into per-request summaries
+  - `request_start` is now `deep-tracing` only
+  - `request_finish`, `request_error`, and `slow_request` remain always-on
+  - streaming PUT and UploadPart detail events are now `deep-tracing` only
 - `crates/server-http/src/http/mod.rs`
-  - keep response lifecycle only as summarized outcome data
+  - response lifecycle has been collapsed to request-level summaries
 - `crates/storage/src/node.rs`
   - keep lock wait reporting only above threshold
+  - lock acquire/release chatter has been removed
 
 ### Validation
 
@@ -251,6 +342,9 @@ Delete or demote the highest-volume callsites first.
 
 The existing deep tracing may still be useful locally. If so, keep it only as a
 deliberate debug path with a clearly different contract.
+
+Status: effectively completed for now. Deep tracing remains available only via
+the non-default feature and local/test docs.
 
 ### Options
 
@@ -267,6 +361,7 @@ production migration.
 ### Code validation
 
 - unit tests for any new summary/threshold helpers in `crates/observability`
+- unit tests for the minimal metrics snapshot / guard behavior
 - integration tests proving request summaries remain correctly escaped/redacted
 - regression tests for slow-request and lock-wait event thresholds
 
@@ -278,19 +373,17 @@ production migration.
 
 ### Operational rollout
 
-1. gate deep tracing out of production builds
-2. staging profiler pilot
-3. canary profiler rollout
-4. remove dense production trace callsites
+1. choose a local-only exposure path for the metrics snapshot
+2. stage the profiler pilot
+3. canary the profiler rollout if the staging results are good
+4. remove remaining dense production-adjacent trace callsites
 5. keep local deep tracing temporarily if still useful
 6. reassess whether the remaining internal observability crate can be reduced
    further
 
 ## Recommended Order
 
-1. gate deep tracing behind a non-default feature immediately
+1. choose how to expose local metrics snapshots
 2. pilot eBPF/OpenTelemetry profiling in staging
-3. define and document the minimal semantic event set
-4. slim `crates/observability` to summary-oriented production telemetry
-5. remove dense hot-path spans from coordinator, storage, and auth
-6. retain or delete local deep tracing based on actual remaining value
+3. remove remaining dense hot-path spans from coordinator, storage, and auth
+4. retain or delete local deep tracing based on actual remaining value
