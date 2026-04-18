@@ -1,4 +1,18 @@
-use super::*;
+use s3_types::VersionId;
+#[cfg(test)]
+use storage::ObjectLayout;
+use storage::StoredObject;
+
+#[cfg(test)]
+use super::{
+    maybe_run_multipart_delete_metadata_hook, maybe_run_object_segments_delete_metadata_hook,
+};
+use super::{
+    AuthorizedDeleteObject, Coordinator, DeleteError, DeleteObjectRequest, DeleteObjectResult,
+    DeleteObjectsRequest, DeleteObjectsResult, DeletedObject, LockedReadObject, TRACE_TARGET,
+};
+use crate::conditional::{check_delete_conditions, DeleteCondition};
+use crate::error::ServerError;
 
 impl Coordinator {
     fn apply_authorized_delete_object(

@@ -1,4 +1,15 @@
-use super::*;
+use s3_types::{
+    AclGrants, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention,
+    RetentionPeriod, StoredLegalHoldStatus, VersionId,
+};
+use storage::{BucketName, ObjectKey, ObjectLockState};
+
+use super::{
+    AuthorizedPutObjectAclUpdate, BucketSummary, Coordinator, GetObjectAclResult,
+    ObjectVersionRequest, PutObjectAclInput, PutObjectAclRequest, PutObjectLegalHoldRequest,
+    PutObjectRetentionRequest, PutObjectTagsRequest, TRACE_TARGET,
+};
+use crate::error::ServerError;
 
 impl Coordinator {
     fn persist_locked_object_acl(

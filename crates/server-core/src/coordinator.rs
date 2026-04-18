@@ -9,10 +9,15 @@ use ec::{EcConfig, ErasureCodec};
 use s3_types::{
     aws_account_id_from_principal, parse_account_regional_bucket_name, AccountIdentity, AclGrant,
     AclGrantee, AclGrants, AclPermission, BucketNamespace, BucketVersioningState, CanonicalUserId,
-    LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention, RetentionPeriod,
     StoredLegalHoldStatus, VersionId,
 };
+#[cfg(test)]
+use s3_types::{
+    LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention, RetentionPeriod,
+};
 use storage::traits::{PgMetadataStore, ShardStore};
+#[cfg(test)]
+use storage::ObjectLockState;
 #[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
 use storage::{
@@ -22,13 +27,13 @@ use storage::{
     ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, LiveObjectRecord,
     ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
     MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectLockState,
-    ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PublicAccessBlockConfig, PutDeleteMarkerReq,
-    PutLiveObjectReq, PutObjectReq, SerializedMetadataBlob, SerializedSystemMetadataBlob,
-    SerializedTagSet, SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadRecord,
-    StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
-    UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord,
+    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
+    OwnerIdentity, PublicAccessBlockConfig, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq,
+    SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey,
+    SharedStorageNode, StoredObject, StreamUploadRecord, StreamUploadSegmentRecord,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET,
+    UPLOAD_ID_LEN,
 };
 
 use self::authz::CachedBucketPolicy;
@@ -64,10 +69,11 @@ use self::runtime::{LifecycleSweeper, ReclaimSweeper};
 use self::test_hooks::*;
 pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
 #[cfg(test)]
+use crate::conditional::DeleteCondition;
+#[cfg(test)]
 use crate::conditional::ReadCondition;
 use crate::conditional::{
-    check_copy_source_conditions, check_delete_conditions, check_read_conditions,
-    check_write_conditions, DeleteCondition, WriteCondition,
+    check_copy_source_conditions, check_read_conditions, check_write_conditions, WriteCondition,
 };
 use crate::error::ServerError;
 #[cfg(test)]
