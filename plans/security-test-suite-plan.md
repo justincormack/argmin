@@ -1,5 +1,18 @@
 # Security Test Suite Plan
 
+## Status
+
+Not started.
+
+Prerequisite security-hardening plans that this plan was originally waiting on
+have now largely completed. This plan should treat them as input sources for
+existing coverage, not as still-active dependencies:
+
+- `plans/completed/authz-model-testing-plan.md`
+- `plans/completed/bucket-policy-differential-testing-plan.md`
+- `plans/completed/multipart-reclaim-stream-session-testing-plan.md`
+- `plans/completed/parser-hardening-plan.md`
+
 ## Scope
 
 This plan defines a separate security-focused local test suite and reporting
@@ -78,6 +91,10 @@ deterministic tests today, and where are the remaining gaps?”
   - parser fuzzing under `fuzz/`
 - security findings live under `security/`
 - the threat model is documented in `guides/threat_model.md`
+- there is not yet a dedicated local security runner such as
+  `scripts/security-tests`
+- there is not yet a checked-in security matrix guide such as
+  `guides/security-testing.md`
 - there is no single checked-in map from:
   - threat-model surface
   - past security finding
@@ -306,18 +323,23 @@ Success criteria:
 
 ## Phase 3: Fill the Known Local Gaps
 
-Use the security suite to absorb outputs from the active security plans rather
-than inventing a disconnected new body of tests.
+Use the security suite to absorb outputs from completed and ongoing
+security-focused work rather than inventing a disconnected new body of tests.
 
 Priority gaps to wire in:
 
-- authz model coverage from `plans/authz-model-testing-plan.md`
+- authz model coverage from
+  `plans/completed/authz-model-testing-plan.md`
 - bucket-policy local generator/differential coverage from
-  `plans/bucket-policy-differential-testing-plan.md`
+  `plans/completed/bucket-policy-differential-testing-plan.md`
 - multipart/reclaim/session stateful coverage from
   `plans/completed/multipart-reclaim-stream-session-testing-plan.md`
 - parser hardening regressions and fuzz-corpus promotions from
   `plans/completed/parser-hardening-plan.md`
+
+Those areas are no longer blocked on their original plans finishing. The work
+here is to inventory the tests they already added and group them into a single
+local security-oriented entry point and matrix.
 
 This phase is where the security suite becomes useful rather than just tidy.
 
