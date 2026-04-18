@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+usage() {
+    cat <<'EOF'
+Usage: ./scripts/security-tests [group...]
+
+Run the local deterministic security-focused test groups.
+If no group is given, `fast` is used.
+
+Groups:
+  fast       High-signal local checks for normal development
+  authn      SigV4 header/presigned/POST authentication coverage
+  authz      Authorization, bucket-policy, and anonymous-access coverage
+  parser     Request/parser/front-door hardening coverage
+  stateful   Multipart, reclaim, and stream-session lifetime coverage
+  transport  HTTP-only transport and secure-transport-sensitive coverage
+  all        The full local security suite
+  list       Print the available groups
+  help       Show this help
+
+Examples:
+  ./scripts/security-tests
+  ./scripts/security-tests authz stateful
+  ./scripts/security-tests all
+EOF
+}
+
+run_cmd() {
+    local label="$1"
+    shift
+
+    echo
+    echo "== $label =="
+    printf '+'
+    printf ' %q' "$@"
+    printf '\n'
+    "$@"
+}
+
+run_fast() {
+    run_cmd "auth crate" cargo test -p auth
+    run_cmd "server-core authz model" cargo test -p server-core authz_model_
+    run_cmd "server-core multipart stateful" cargo test -p server-core multipart_stateful_tests
+    run_cmd "server-http request parsing" cargo test -p server-http http::request::tests::
+    run_cmd "server-http chunked decoding" cargo test -p server-http http::chunked::tests::
+}
+
+run_authn() {
+    run_cmd "auth crate" cargo test -p auth
+    run_cmd "s3-http-tests presigned" cargo test -p s3-http-tests --test presigned
+    run_cmd "s3-http-tests post object" cargo test -p s3-http-tests --test post_object
+}
+
+run_authz() {
+    run_cmd "server-core authz model" cargo test -p server-core authz_model_
+    run_cmd "auth bucket-policy differential" cargo test -p auth --test bucket_policy_differential
+    run_cmd "s3-local-tests anonymous/public access" cargo test -p s3-local-tests --test bucket_anon
+}
+
+run_parser() {
+    run_cmd "auth parser-focused tests" cargo test -p auth parse_
+    run_cmd "auth percent-decode coverage" cargo test -p auth percent_decode
+    run_cmd "server-http request parsing" cargo test -p server-http http::request::tests::
+    run_cmd "server-http multipart parsing" cargo test -p server-http http::multipart::tests::
+    run_cmd "server-http chunked decoding" cargo test -p server-http http::chunked::tests::
+    run_cmd "server-http xml parsing" cargo test -p server-http http::xml::tests::parse_
+}
+
+run_stateful() {
+    run_cmd "server-core multipart stateful" cargo test -p server-core multipart_stateful_tests
+    run_cmd "server-core multipart trace" cargo test -p server-core multipart_trace_tests
+    run_cmd "server-core reclaim trace" cargo test -p server-core multipart_reclaim_trace_tests
+    run_cmd "s3-local-tests lifecycle" cargo test -p s3-local-tests --test lifecycle
+}
+
+run_transport() {
+    run_cmd "s3-http-tests" cargo test -p s3-http-tests
+    run_cmd "server-http conditional transport behavior" cargo test -p server-http http::conditional::tests::
+}
+
+run_all() {
+    run_cmd "auth crate" cargo test -p auth
+    run_cmd "server-core authz model" cargo test -p server-core authz_model_
+    run_cmd "server-core multipart stateful" cargo test -p server-core multipart_stateful_tests
+    run_cmd "server-core multipart trace" cargo test -p server-core multipart_trace_tests
+    run_cmd "server-core reclaim trace" cargo test -p server-core multipart_reclaim_trace_tests
+    run_cmd "server-http" cargo test -p server-http
+    run_cmd "s3-http-tests" cargo test -p s3-http-tests
+    run_cmd "s3-local-tests" cargo test -p s3-local-tests
+}
+
+run_group() {
+    case "$1" in
+        fast) run_fast ;;
+        authn) run_authn ;;
+        authz) run_authz ;;
+        parser) run_parser ;;
+        stateful) run_stateful ;;
+        transport) run_transport ;;
+        all) run_all ;;
+        list)
+            printf '%s\n' fast authn authz parser stateful transport all
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        *)
+            echo "unknown group: $1" >&2
+            usage >&2
+            exit 2
+            ;;
+    esac
+}
+
+if (($# == 0)); then
+    set -- fast
+fi
+
+for group in "$@"; do
+    run_group "$group"
+done

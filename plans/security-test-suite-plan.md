@@ -2,7 +2,7 @@
 
 ## Status
 
-Not started.
+In progress.
 
 Prerequisite security-hardening plans that this plan was originally waiting on
 have now largely completed. This plan should treat them as input sources for
@@ -12,6 +12,17 @@ existing coverage, not as still-active dependencies:
 - `plans/completed/bucket-policy-differential-testing-plan.md`
 - `plans/completed/multipart-reclaim-stream-session-testing-plan.md`
 - `plans/completed/parser-hardening-plan.md`
+
+Initial work now landed:
+
+- `scripts/security-tests` exists as the first local deterministic runner
+- `guides/security-testing.md` exists as the first checked-in surface matrix
+
+Still not started:
+
+- CI wiring
+- per-surface reporting beyond the simple runner output
+- a full finding-by-finding inventory for every file under `security/`
 
 ## Scope
 
@@ -91,10 +102,8 @@ deterministic tests today, and where are the remaining gaps?”
   - parser fuzzing under `fuzz/`
 - security findings live under `security/`
 - the threat model is documented in `guides/threat_model.md`
-- there is not yet a dedicated local security runner such as
-  `scripts/security-tests`
-- there is not yet a checked-in security matrix guide such as
-  `guides/security-testing.md`
+- `scripts/security-tests` now provides the first local security-focused runner
+- `guides/security-testing.md` now provides the first checked-in surface matrix
 - there is no single checked-in map from:
   - threat-model surface
   - past security finding
@@ -276,6 +285,8 @@ For each area, explicitly identify whether current coverage is:
 
 ## Phase 1: Inventory and Matrix
 
+Status: in progress.
+
 Deliver:
 
 - add `plans/security-test-suite-plan.md` and then implement the matrix in a
@@ -295,6 +306,8 @@ Success criteria:
   gap
 
 ## Phase 2: Local Security Runner
+
+Status: in progress.
 
 Deliver:
 
