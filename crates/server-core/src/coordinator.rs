@@ -1,7 +1,5 @@
 /// Coordinator: orchestrates S3 operations across EC, storage, and metadata layers.
 use std::collections::HashMap;
-#[cfg(test)]
-use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use checksum::{
@@ -18,11 +16,10 @@ use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
 use storage::{
-    BucketEncryptionConfig, BucketLifecycleConfiguration, BucketName, BucketObjectLockConfig,
-    BucketOwnershipControls, BucketState, CommitMultipartReq, CommitStreamPutReq,
-    CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, EffectiveBucketEncryptionConfig,
-    GenerationId, LifecycleDate, LifecycleExpiration, LifecycleRule, LifecycleRuleStatus,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq, LiveObjectRecord,
+    BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
+    BucketState, CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq,
+    CreateStreamUploadReq, EcShape, EffectiveBucketEncryptionConfig, GenerationId,
+    ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, LiveObjectRecord,
     ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
     MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
     MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectLockState,

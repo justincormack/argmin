@@ -2,6 +2,7 @@ use super::test_helpers::{self, UploadPartRequest};
 use super::test_support::*;
 use super::*;
 use crate::conditional::DeleteCondition;
+use storage::{BucketLifecycleConfiguration, LifecycleExpiration, LifecycleRuleStatus};
 
 fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), ServerError> {
     coord.delete_bucket(&bucket_request_with_expected_owner(
