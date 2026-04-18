@@ -53,6 +53,7 @@ use self::request_types::{
 };
 pub use self::response_types::*;
 use self::response_types::{DeleteMarkerLifecycleExpiration, NoncurrentLifecycleExpiration};
+use self::runtime_support::*;
 pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
 use crate::conditional::{
     check_copy_source_conditions, check_delete_conditions, check_read_conditions,
@@ -633,58 +634,6 @@ const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 /// Maximum number of parts in a multipart upload (matches AWS S3).
 const MAX_PARTS: usize = 10_000;
 
-#[cfg(test)]
-#[derive(Default, Clone)]
-struct ReclamationTestHooks {
-    target: Option<(String, String)>,
-    after_multipart_snapshot: Option<Arc<dyn Fn() + Send + Sync>>,
-    after_multipart_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
-    after_multipart_complete_pre_commit: Option<Arc<dyn Fn() + Send + Sync>>,
-    after_object_segments_first_segment: Option<Arc<dyn Fn() + Send + Sync>>,
-    after_object_segments_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
-}
-
-#[cfg(test)]
-static RECLAMATION_TEST_HOOKS: OnceLock<Mutex<ReclamationTestHooks>> = OnceLock::new();
-#[cfg(test)]
-static RECLAMATION_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
-#[cfg(test)]
-#[derive(Default, Clone)]
-struct StreamAppendTestHooks {
-    target: Option<(String, u32)>,
-    after_prepare: Option<Arc<dyn Fn() + Send + Sync>>,
-}
-#[cfg(test)]
-static STREAM_APPEND_TEST_HOOKS: OnceLock<Mutex<StreamAppendTestHooks>> = OnceLock::new();
-#[cfg(test)]
-static STREAM_APPEND_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
-static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<LifecycleSweeper>>>> =
-    OnceLock::new();
-
-#[cfg(test)]
-struct ReclamationTestHookGuard;
-
-#[cfg(test)]
-impl Drop for ReclamationTestHookGuard {
-    fn drop(&mut self) {
-        let hooks =
-            RECLAMATION_TEST_HOOKS.get_or_init(|| Mutex::new(ReclamationTestHooks::default()));
-        *hooks.lock().unwrap() = ReclamationTestHooks::default();
-    }
-}
-
-#[cfg(test)]
-struct StreamAppendTestHookGuard;
-
-#[cfg(test)]
-impl Drop for StreamAppendTestHookGuard {
-    fn drop(&mut self) {
-        let hooks =
-            STREAM_APPEND_TEST_HOOKS.get_or_init(|| Mutex::new(StreamAppendTestHooks::default()));
-        *hooks.lock().unwrap() = StreamAppendTestHooks::default();
-    }
-}
-
 pub struct Coordinator {
     storage_node: Arc<SharedStorageNode>,
     bucket_policy_cache: RwLock<HashMap<BucketName, CachedBucketPolicy>>,
@@ -699,129 +648,6 @@ pub struct Coordinator {
     managed_key_provider: Option<StaticManagedKeyProvider>,
     _reclaim_sweeper: ReclaimSweeper,
     _lifecycle_sweeper: Arc<LifecycleSweeper>,
-}
-
-#[cfg(test)]
-fn install_reclamation_test_hooks(hooks: ReclamationTestHooks) -> ReclamationTestHookGuard {
-    let slot = RECLAMATION_TEST_HOOKS.get_or_init(|| Mutex::new(ReclamationTestHooks::default()));
-    *slot.lock().unwrap() = hooks;
-    ReclamationTestHookGuard
-}
-
-#[cfg(test)]
-fn install_stream_append_test_hooks(hooks: StreamAppendTestHooks) -> StreamAppendTestHookGuard {
-    let slot =
-        STREAM_APPEND_TEST_HOOKS.get_or_init(|| Mutex::new(StreamAppendTestHooks::default()));
-    *slot.lock().unwrap() = hooks;
-    StreamAppendTestHookGuard
-}
-
-#[cfg(test)]
-fn maybe_run_multipart_snapshot_hook(bucket: &str, key: &str) {
-    let hooks = RECLAMATION_TEST_HOOKS
-        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks
-        .target
-        .as_ref()
-        .is_some_and(|(b, k)| b == bucket && k == key)
-    {
-        if let Some(hook) = hooks.after_multipart_snapshot {
-            hook();
-        }
-    }
-}
-
-#[cfg(test)]
-fn maybe_run_multipart_delete_metadata_hook(bucket: &str, key: &str) {
-    let hooks = RECLAMATION_TEST_HOOKS
-        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks
-        .target
-        .as_ref()
-        .is_some_and(|(b, k)| b == bucket && k == key)
-    {
-        if let Some(hook) = hooks.after_multipart_delete_metadata {
-            hook();
-        }
-    }
-}
-
-#[cfg(test)]
-fn maybe_run_multipart_complete_pre_commit_hook(bucket: &str, key: &str) {
-    let hooks = RECLAMATION_TEST_HOOKS
-        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks
-        .target
-        .as_ref()
-        .is_some_and(|(b, k)| b == bucket && k == key)
-    {
-        if let Some(hook) = hooks.after_multipart_complete_pre_commit {
-            hook();
-        }
-    }
-}
-
-#[cfg(test)]
-fn maybe_run_stream_append_prepare_hook(session_id: &SessionId, segment_index: u32) {
-    let hooks = STREAM_APPEND_TEST_HOOKS
-        .get_or_init(|| Mutex::new(StreamAppendTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks
-        .target
-        .as_ref()
-        .is_some_and(|(session, index)| session == session_id && *index == segment_index)
-    {
-        if let Some(hook) = hooks.after_prepare {
-            hook();
-        }
-    }
-}
-
-#[cfg(test)]
-fn maybe_run_object_segments_first_segment_hook(bucket: &str, key: &str) {
-    let hooks = RECLAMATION_TEST_HOOKS
-        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks
-        .target
-        .as_ref()
-        .is_some_and(|(b, k)| b == bucket && k == key)
-    {
-        if let Some(hook) = hooks.after_object_segments_first_segment {
-            hook();
-        }
-    }
-}
-
-#[cfg(test)]
-fn maybe_run_object_segments_delete_metadata_hook(bucket: &str, key: &str) {
-    let hooks = RECLAMATION_TEST_HOOKS
-        .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
-        .lock()
-        .unwrap()
-        .clone();
-    if hooks
-        .target
-        .as_ref()
-        .is_some_and(|(b, k)| b == bucket && k == key)
-    {
-        if let Some(hook) = hooks.after_object_segments_delete_metadata {
-            hook();
-        }
-    }
 }
 
 impl Coordinator {
@@ -951,6 +777,7 @@ mod request_support;
 mod request_types;
 mod response_types;
 mod runtime;
+mod runtime_support;
 mod streaming;
 
 #[cfg(test)]
