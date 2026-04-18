@@ -1,6 +1,8 @@
 use super::*;
 use s3_types::AccountIdentity;
 
+use crate::sse::SseCustomerRequest;
+
 /// Request for an UploadPart operation (test-only convenience wrapper).
 #[derive(Debug)]
 pub struct UploadPartRequest<'a> {

@@ -6,15 +6,17 @@ use checksum::{ChecksumAlgorithm, RawChecksum};
 #[cfg(test)]
 use checksum::{ChecksumType, MultipartChecksumConfig};
 use ec::{EcConfig, ErasureCodec};
-use s3_types::{
-    aws_account_id_from_principal, AclGrant, AclGrantee, AclGrants, AclPermission,
-    BucketVersioningState, CanonicalUserId, StoredLegalHoldStatus, VersionId,
-};
 #[cfg(test)]
 pub(crate) use s3_types::{
     AccountIdentity, BucketNamespace, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode,
     ObjectRetention, RetentionPeriod,
 };
+#[cfg(test)]
+use s3_types::{
+    AclGrant, AclGrantee, AclGrants, AclPermission, BucketVersioningState, CanonicalUserId,
+    StoredLegalHoldStatus, VersionId,
+};
+#[cfg(test)]
 use storage::traits::PgMetadataStore;
 #[cfg(test)]
 use storage::traits::ShardStore;
@@ -28,15 +30,12 @@ use storage::PutLiveObjectReq;
 use storage::SimplePayloadReclaimRecord;
 #[cfg(test)]
 use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig, ObjectLayout};
-use storage::{
-    BucketName, BucketObjectLockConfig, BucketOwnershipControls, BucketState,
-    ManagedEncryptionAlgorithm, MultipartUploadRecord, ObjectKey, OwnerIdentity,
-    PublicAccessBlockConfig, ShardKey, SharedStorageNode, StoredObject, UploadState,
-};
+use storage::{BucketName, ObjectKey, ShardKey, SharedStorageNode};
 #[cfg(test)]
 use storage::{
-    CreateStreamUploadReq, EcShape, GenerationId, SessionId, StreamUploadTarget, UploadId,
-    UPLOAD_ID_LEN,
+    BucketObjectLockConfig, BucketOwnershipControls, BucketState, CreateStreamUploadReq, EcShape,
+    GenerationId, ManagedEncryptionAlgorithm, OwnerIdentity, PublicAccessBlockConfig, SessionId,
+    StoredObject, StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_LEN,
 };
 
 use self::authz::CachedBucketPolicy;
@@ -44,7 +43,6 @@ use self::authz_results::*;
 pub use self::authz_types::{
     ActiveWriteEncryption, ActiveWriteEncryptionRef, AuthorizedPutObjectWrite,
 };
-use self::authz_types::{AuthorizedPutObjectWriteAcl, ValidatedBucket};
 use self::lifecycle::CachedBucketLifecycle;
 #[cfg(test)]
 use self::payload::encode_parity_scratch_len;
@@ -58,11 +56,9 @@ use self::read_core::{
 #[cfg(test)]
 use self::read_core::{PayloadLease, ReadRuntime, SegmentListReader};
 pub use self::read_core::{ReadChunk, ReadHandle};
-use self::request_types::authorization_policy_context_for_put_object_write_acl;
 pub use self::request_types::*;
 use self::request_types::{
-    AuthorizedWriteTags, BucketCreateOutcome, BucketScopedAuthorizationRequest, PreparedPutCommit,
-    PutCommitRequest,
+    AuthorizedWriteTags, BucketCreateOutcome, PreparedPutCommit, PutCommitRequest,
 };
 pub use self::response_types::*;
 use self::response_types::{DeleteMarkerLifecycleExpiration, NoncurrentLifecycleExpiration};
@@ -79,6 +75,8 @@ use crate::conditional::WriteCondition;
 use crate::error::ServerError;
 #[cfg(test)]
 use crate::range::ByteRange;
+#[cfg(test)]
+use crate::sse::SseCustomerRequest;
 pub use storage::BucketObjectOwnership;
 #[cfg(test)]
 use storage::ReclaimWorkItem;
@@ -156,10 +154,7 @@ use crate::pg::object_key_hash;
 use crate::pg::PgTopology;
 #[cfg(test)]
 use crate::sse::SSE_C_SEGMENT_TAG_LEN;
-use crate::sse::{
-    SseCustomerRequest, SseCustomerSegmentScope, SseCustomerValidatorConfig,
-    StaticManagedKeyProvider,
-};
+use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 #[cfg(test)]
 use crate::system_metadata::SystemMetadata;
 
