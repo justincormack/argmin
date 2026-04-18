@@ -22,18 +22,17 @@ use storage::ObjectLockState;
 use storage::SimplePayloadReclaimRecord;
 use storage::{
     BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
-    BucketState, CommitMultipartReq, CommitStreamPutReq, CreateMultipartUploadReq,
-    CreateStreamUploadReq, EcShape, EffectiveBucketEncryptionConfig, GenerationId,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, LiveObjectRecord,
-    ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+    BucketState, CommitMultipartReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape,
+    EffectiveBucketEncryptionConfig, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
+    ListPartsReq, ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
     MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectPartRecord,
-    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
-    OwnerIdentity, PublicAccessBlockConfig, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq,
-    SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey,
-    SharedStorageNode, StoredObject, StreamUploadRecord, StreamUploadSegmentRecord,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET,
-    UPLOAD_ID_LEN,
+    OwnerIdentity, PublicAccessBlockConfig, SerializedMetadataBlob, SerializedSystemMetadataBlob,
+    SerializedTagSet, SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadState,
+    StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
+};
+#[cfg(test)]
+use storage::{
+    PutLiveObjectReq,
 };
 
 use self::authz::CachedBucketPolicy;
@@ -147,17 +146,16 @@ fn write_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     lock.write().unwrap_or_else(|err| err.into_inner())
 }
 use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
+#[cfg(test)]
 use crate::metadata_blob::MetadataBlob;
 #[cfg(test)]
 use crate::pg::object_key_hash;
-use crate::pg::{part_key_hash, stream_segment_key_hash, PgTopology};
+use crate::pg::{part_key_hash, PgTopology};
+#[cfg(test)]
+use crate::sse::SSE_C_SEGMENT_TAG_LEN;
 use crate::sse::{
-    decrypt_managed_encryption_checksum, decrypt_sse_customer_checksum,
-    prepare_managed_encryption_write, prepare_sse_customer_write, resume_managed_encryption_write,
-    resume_sse_customer_write, validate_sse_customer_read, ManagedEncryptionWriteContext,
-    SseCustomerRequest, SseCustomerResponseHeaders, SseCustomerSegmentScope,
-    SseCustomerValidatorConfig, SseCustomerWriteContext, StaticManagedKeyProvider,
-    SSE_C_SEGMENT_TAG_LEN,
+    SseCustomerRequest, SseCustomerSegmentScope, SseCustomerValidatorConfig,
+    StaticManagedKeyProvider,
 };
 use crate::system_metadata::SystemMetadata;
 
