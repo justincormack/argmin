@@ -8,6 +8,13 @@ name = "server_http"
 path = "src/lib.rs"
 
 [features]
+deep-tracing = [
+    "auth/deep-tracing",
+    "ec/deep-tracing",
+    "observability/deep-tracing",
+    "server-core/deep-tracing",
+    "storage/deep-tracing",
+]
 
 [dependencies]
 auth = { path = "../auth" }

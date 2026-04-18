@@ -3,6 +3,9 @@ name = "auth"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+deep-tracing = ["observability/deep-tracing"]
+
 [dependencies]
 base64 = "0.22"
 observability = { path = "../observability" }

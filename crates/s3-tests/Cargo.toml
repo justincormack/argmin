@@ -4,6 +4,16 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+deep-tracing = [
+    "auth/deep-tracing",
+    "ec/deep-tracing",
+    "observability/deep-tracing",
+    "server-core/deep-tracing",
+    "server_http/deep-tracing",
+    "storage/deep-tracing",
+]
+
 [dependencies]
 # Server (for local TestServer)
 server_http = { package = "server-http", path = "../server-http", default-features = false }

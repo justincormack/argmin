@@ -4,5 +4,8 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[features]
+deep-tracing = ["s3-tests/deep-tracing"]
+
 [dependencies]
 s3-tests = { path = "../s3-tests" }

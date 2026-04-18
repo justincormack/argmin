@@ -18,6 +18,12 @@ thiserror = "2"
 
 [features]
 test-utils = []
+deep-tracing = [
+    "auth/deep-tracing",
+    "ec/deep-tracing",
+    "observability/deep-tracing",
+    "storage/deep-tracing",
+]
 
 [dev-dependencies]
 proptest = "1"

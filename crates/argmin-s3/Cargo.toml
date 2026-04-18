@@ -8,6 +8,13 @@ name = "argmin-s3"
 path = "src/main.rs"
 
 [features]
+deep-tracing = [
+    "auth/deep-tracing",
+    "ec/deep-tracing",
+    "server-core/deep-tracing",
+    "server-http/deep-tracing",
+    "storage/deep-tracing",
+]
 
 [dependencies]
 auth = { path = "../auth" }

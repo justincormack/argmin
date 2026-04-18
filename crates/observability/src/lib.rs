@@ -7,7 +7,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "deep-tracing")]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceContext {
@@ -427,6 +429,7 @@ pub fn current_context() -> Option<TraceContext> {
     TRACE_STATE.with(|slot| slot.borrow().as_ref().map(|state| state.context.clone()))
 }
 
+#[cfg(feature = "deep-tracing")]
 pub struct TraceScope {
     target: &'static str,
     name: &'static str,
@@ -435,6 +438,10 @@ pub struct TraceScope {
     context: Option<TraceContext>,
 }
 
+#[cfg(not(feature = "deep-tracing"))]
+pub struct TraceScope;
+
+#[cfg(feature = "deep-tracing")]
 impl TraceScope {
     #[must_use]
     pub fn new(
@@ -502,6 +509,21 @@ impl TraceScope {
     }
 }
 
+#[cfg(not(feature = "deep-tracing"))]
+impl TraceScope {
+    #[must_use]
+    #[inline]
+    pub fn new(
+        target: &'static str,
+        name: &'static str,
+        fields: Option<fmt::Arguments<'_>>,
+    ) -> Self {
+        let _ = (target, name, fields);
+        Self
+    }
+}
+
+#[cfg(feature = "deep-tracing")]
 impl Drop for TraceScope {
     fn drop(&mut self) {
         let Some(context) = self.context.as_ref() else {

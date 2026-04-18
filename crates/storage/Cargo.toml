@@ -3,6 +3,9 @@ name = "storage"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+deep-tracing = ["observability/deep-tracing"]
+
 [dependencies]
 checksum = { path = "../checksum", default-features = false }
 observability = { path = "../observability" }
