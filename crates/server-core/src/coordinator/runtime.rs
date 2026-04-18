@@ -1,4 +1,35 @@
-use super::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::thread::JoinHandle;
+
+use ec::{EcConfig, ErasureCodec};
+use s3_types::BucketVersioningState;
+use storage::traits::{PgMetadataStore, ShardStore};
+use storage::{
+    BucketInfo, BucketLifecycleConfiguration, BucketName, BucketState, EcShape, GenerationId,
+    ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq,
+    MultipartPartSegmentRecord, MultipartReclaimPartRecord, ObjectEncryption, ObjectKey,
+    OwnerIdentity, ShardKey, SharedStorageNode, StoredObject, UploadId, UploadState, VersionId,
+};
+
+use super::payload::{PooledPayloadBuffer, SharedPayloadBuffer};
+use super::read_core::{
+    MultipartReader, PayloadLease, ReadChunk, ReadRuntime, SegmentListReader, SegmentPayloadRecord,
+};
+#[cfg(test)]
+use super::test_hooks::maybe_run_object_segments_first_segment_hook;
+#[cfg(feature = "deep-tracing")]
+use super::TRACE_TARGET;
+use super::{lock_mutex_unpoisoned, Coordinator, LIFECYCLE_SWEEP_INTERVAL_MILLIS};
+#[cfg(test)]
+use super::{trusted_bucket_name, trusted_object_key};
+use crate::error::ServerError;
+use crate::pg::object_key_hash;
+use crate::sse::{
+    decrypt_managed_encryption_segment, decrypt_sse_customer_segment, SseCustomerRequest,
+    SseCustomerSegmentScope,
+};
 
 static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<Mutex<HashMap<usize, Weak<LifecycleSweeper>>>> =
     OnceLock::new();
@@ -49,7 +80,8 @@ impl LifecycleSweeper {
         runtime: ReadRuntime,
     ) -> Result<Arc<Self>, ServerError> {
         let registry = LIFECYCLE_SWEEPER_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut registry = lock_mutex_unpoisoned(registry);
+        let mut registry: std::sync::MutexGuard<'_, HashMap<usize, Weak<LifecycleSweeper>>> =
+            lock_mutex_unpoisoned(registry);
         registry.retain(|_, sweeper| sweeper.upgrade().is_some());
 
         let key = Arc::as_ptr(storage_node) as usize;

@@ -1,10 +1,8 @@
 /// Coordinator: orchestrates S3 operations across EC, storage, and metadata layers.
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{
-    Arc, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak,
-};
-use std::thread::JoinHandle;
+use std::collections::HashMap;
+#[cfg(test)]
+use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use checksum::{
     ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksumConfig, RawChecksum,
@@ -20,19 +18,18 @@ use storage::traits::{PgMetadataStore, ShardStore};
 #[cfg(test)]
 use storage::SimplePayloadReclaimRecord;
 use storage::{
-    BucketEncryptionConfig, BucketFastPathInfo, BucketInfo, BucketLifecycleConfiguration,
-    BucketName, BucketObjectLockConfig, BucketOwnershipControls, BucketState, CommitMultipartReq,
-    CommitStreamPutReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape,
-    EffectiveBucketEncryptionConfig, GenerationId, LifecycleDate, LifecycleExpiration,
-    LifecycleRule, LifecycleRuleStatus, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListObjectsReq, ListPartsReq, LiveObjectRecord, ManagedEncryptionAlgorithm,
-    MultipartPartRecord, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, MultipartUploadRecord,
-    ObjectEncryption, ObjectKey, ObjectLayout, ObjectLockState, ObjectPartRecord,
-    ObjectSegmentRecord, ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord,
-    OwnerIdentity, PublicAccessBlockConfig, PutDeleteMarkerReq, PutLiveObjectReq, PutObjectReq,
-    ReclaimWorkItem, SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet,
-    SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadRecord,
+    BucketEncryptionConfig, BucketLifecycleConfiguration, BucketName, BucketObjectLockConfig,
+    BucketOwnershipControls, BucketState, CommitMultipartReq, CommitStreamPutReq,
+    CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, EffectiveBucketEncryptionConfig,
+    GenerationId, LifecycleDate, LifecycleExpiration, LifecycleRule, LifecycleRuleStatus,
+    ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq, LiveObjectRecord,
+    ManagedEncryptionAlgorithm, MultipartPartRecord, MultipartPartSegmentRecord,
+    MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+    MultipartUploadRecord, ObjectEncryption, ObjectKey, ObjectLayout, ObjectLockState,
+    ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
+    ObjectSegmentsReclaimSegmentRecord, OwnerIdentity, PublicAccessBlockConfig, PutDeleteMarkerReq,
+    PutLiveObjectReq, PutObjectReq, SerializedMetadataBlob, SerializedSystemMetadataBlob,
+    SerializedTagSet, SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadRecord,
     StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
     UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
 };
@@ -47,20 +44,21 @@ use self::lifecycle::CachedBucketLifecycle;
 use self::object_state::StaleObjectPayload;
 #[cfg(test)]
 use self::payload::encode_parity_scratch_len;
-use self::payload::{
-    EncodeScratchPool, PayloadBufferPool, PooledPayloadBuffer, SharedPayloadBuffer,
-};
-use self::pg_guards::{BucketObjectPgGuards, LockedReadObject, ObjectPgGuards, TwoPgGuards};
+#[cfg(test)]
+use self::payload::SharedPayloadBuffer;
+use self::payload::{EncodeScratchPool, PayloadBufferPool};
+use self::pg_guards::{LockedReadObject, ObjectPgGuards};
 use self::read_core::{
-    segment_payloads_from_object_segments, MultipartReader, PayloadLease, ReadObjectContext,
-    ReadRuntime, SegmentListReader, SegmentPayloadRecord,
+    segment_payloads_from_object_segments, ReadObjectContext, SegmentPayloadRecord,
 };
+#[cfg(test)]
+use self::read_core::{PayloadLease, ReadRuntime, SegmentListReader};
 pub use self::read_core::{ReadChunk, ReadHandle};
 use self::request_types::authorization_policy_context_for_put_object_write_acl;
 pub use self::request_types::*;
 use self::request_types::{
-    AuthorizedWriteTags, BucketCreateOutcome, BucketScopedAuthorizationRequest,
-    BucketScopedRequest, PreparedPutCommit, PutCommitRequest,
+    AuthorizedWriteTags, BucketCreateOutcome, BucketScopedAuthorizationRequest, PreparedPutCommit,
+    PutCommitRequest,
 };
 pub use self::response_types::*;
 use self::response_types::{DeleteMarkerLifecycleExpiration, NoncurrentLifecycleExpiration};
@@ -78,6 +76,8 @@ use crate::error::ServerError;
 #[cfg(test)]
 use crate::range::ByteRange;
 pub use storage::BucketObjectOwnership;
+#[cfg(test)]
+use storage::ReclaimWorkItem;
 
 fn lock_mutex_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
@@ -145,14 +145,16 @@ fn write_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 }
 use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
 use crate::metadata_blob::MetadataBlob;
-use crate::pg::{object_key_hash, part_key_hash, stream_segment_key_hash, PgTopology};
+#[cfg(test)]
+use crate::pg::object_key_hash;
+use crate::pg::{part_key_hash, stream_segment_key_hash, PgTopology};
 use crate::sse::{
-    decrypt_managed_encryption_checksum, decrypt_managed_encryption_segment,
-    decrypt_sse_customer_checksum, decrypt_sse_customer_segment, prepare_managed_encryption_write,
-    prepare_sse_customer_write, resume_managed_encryption_write, resume_sse_customer_write,
-    validate_sse_customer_read, ManagedEncryptionWriteContext, SseCustomerRequest,
-    SseCustomerResponseHeaders, SseCustomerSegmentScope, SseCustomerValidatorConfig,
-    SseCustomerWriteContext, StaticManagedKeyProvider, SSE_C_SEGMENT_TAG_LEN,
+    decrypt_managed_encryption_checksum, decrypt_sse_customer_checksum,
+    prepare_managed_encryption_write, prepare_sse_customer_write, resume_managed_encryption_write,
+    resume_sse_customer_write, validate_sse_customer_read, ManagedEncryptionWriteContext,
+    SseCustomerRequest, SseCustomerResponseHeaders, SseCustomerSegmentScope,
+    SseCustomerValidatorConfig, SseCustomerWriteContext, StaticManagedKeyProvider,
+    SSE_C_SEGMENT_TAG_LEN,
 };
 use crate::system_metadata::SystemMetadata;
 
