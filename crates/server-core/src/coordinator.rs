@@ -53,7 +53,8 @@ use self::request_types::{
 };
 pub use self::response_types::*;
 use self::response_types::{DeleteMarkerLifecycleExpiration, NoncurrentLifecycleExpiration};
-use self::runtime_support::*;
+#[cfg(test)]
+use self::test_hooks::*;
 pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
 use crate::conditional::{
     check_copy_source_conditions, check_delete_conditions, check_read_conditions,
@@ -789,7 +790,8 @@ mod request_support;
 mod request_types;
 mod response_types;
 mod runtime;
-mod runtime_support;
 mod streaming;
+#[cfg(test)]
+mod test_hooks;
 #[cfg(test)]
 mod test_support;

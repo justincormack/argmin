@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(test)]
 #[derive(Default, Clone)]
 pub(super) struct ReclamationTestHooks {
     pub(super) target: Option<(String, String)>,
@@ -11,32 +10,21 @@ pub(super) struct ReclamationTestHooks {
     pub(super) after_object_segments_delete_metadata: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
-#[cfg(test)]
 pub(super) static RECLAMATION_TEST_HOOKS: OnceLock<Mutex<ReclamationTestHooks>> = OnceLock::new();
-#[cfg(test)]
 pub(super) static RECLAMATION_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
-#[cfg(test)]
 #[derive(Default, Clone)]
 pub(super) struct StreamAppendTestHooks {
     pub(super) target: Option<(String, u32)>,
     pub(super) after_prepare: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
-#[cfg(test)]
 pub(super) static STREAM_APPEND_TEST_HOOKS: OnceLock<Mutex<StreamAppendTestHooks>> =
     OnceLock::new();
-#[cfg(test)]
 pub(super) static STREAM_APPEND_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
 
-pub(super) static LIFECYCLE_SWEEPER_REGISTRY: OnceLock<
-    Mutex<HashMap<usize, Weak<LifecycleSweeper>>>,
-> = OnceLock::new();
-
-#[cfg(test)]
 pub(super) struct ReclamationTestHookGuard;
 
-#[cfg(test)]
 impl Drop for ReclamationTestHookGuard {
     fn drop(&mut self) {
         let hooks =
@@ -45,10 +33,8 @@ impl Drop for ReclamationTestHookGuard {
     }
 }
 
-#[cfg(test)]
 pub(super) struct StreamAppendTestHookGuard;
 
-#[cfg(test)]
 impl Drop for StreamAppendTestHookGuard {
     fn drop(&mut self) {
         let hooks =
@@ -57,7 +43,6 @@ impl Drop for StreamAppendTestHookGuard {
     }
 }
 
-#[cfg(test)]
 pub(super) fn install_reclamation_test_hooks(
     hooks: ReclamationTestHooks,
 ) -> ReclamationTestHookGuard {
@@ -66,7 +51,6 @@ pub(super) fn install_reclamation_test_hooks(
     ReclamationTestHookGuard
 }
 
-#[cfg(test)]
 pub(super) fn install_stream_append_test_hooks(
     hooks: StreamAppendTestHooks,
 ) -> StreamAppendTestHookGuard {
@@ -76,7 +60,6 @@ pub(super) fn install_stream_append_test_hooks(
     StreamAppendTestHookGuard
 }
 
-#[cfg(test)]
 pub(super) fn maybe_run_multipart_snapshot_hook(bucket: &str, key: &str) {
     let hooks = RECLAMATION_TEST_HOOKS
         .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
@@ -94,7 +77,6 @@ pub(super) fn maybe_run_multipart_snapshot_hook(bucket: &str, key: &str) {
     }
 }
 
-#[cfg(test)]
 pub(super) fn maybe_run_multipart_delete_metadata_hook(bucket: &str, key: &str) {
     let hooks = RECLAMATION_TEST_HOOKS
         .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
@@ -112,7 +94,6 @@ pub(super) fn maybe_run_multipart_delete_metadata_hook(bucket: &str, key: &str) 
     }
 }
 
-#[cfg(test)]
 pub(super) fn maybe_run_multipart_complete_pre_commit_hook(bucket: &str, key: &str) {
     let hooks = RECLAMATION_TEST_HOOKS
         .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
@@ -130,7 +111,6 @@ pub(super) fn maybe_run_multipart_complete_pre_commit_hook(bucket: &str, key: &s
     }
 }
 
-#[cfg(test)]
 pub(super) fn maybe_run_stream_append_prepare_hook(session_id: &SessionId, segment_index: u32) {
     let hooks = STREAM_APPEND_TEST_HOOKS
         .get_or_init(|| Mutex::new(StreamAppendTestHooks::default()))
@@ -148,7 +128,6 @@ pub(super) fn maybe_run_stream_append_prepare_hook(session_id: &SessionId, segme
     }
 }
 
-#[cfg(test)]
 pub(super) fn maybe_run_object_segments_first_segment_hook(bucket: &str, key: &str) {
     let hooks = RECLAMATION_TEST_HOOKS
         .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
@@ -166,7 +145,6 @@ pub(super) fn maybe_run_object_segments_first_segment_hook(bucket: &str, key: &s
     }
 }
 
-#[cfg(test)]
 pub(super) fn maybe_run_object_segments_delete_metadata_hook(bucket: &str, key: &str) {
     let hooks = RECLAMATION_TEST_HOOKS
         .get_or_init(|| Mutex::new(ReclamationTestHooks::default()))
