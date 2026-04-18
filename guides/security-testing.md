@@ -79,9 +79,7 @@ including invalid and stale findings.
 
 ## Current Residual Gaps
 
-- CI wiring is still pending; this remains a local-only runner and guide.
-- Some boundedness regressions, such as specific listing caps, are documented
-  as exact `cargo test` commands in the finding inventory rather than exposed
-  as their own named runner groups.
+- CI wiring is intentionally deferred; this remains a local-only runner and
+  guide.
 - Per-surface reporting is still just the sectioned output from
   `./scripts/security-tests`; there is not yet a dedicated report wrapper.

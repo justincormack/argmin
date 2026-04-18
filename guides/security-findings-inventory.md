@@ -2,8 +2,7 @@
 
 This is the checked-in one-row-per-finding map for every file under
 `security/`. The local path column is the durable local regression entry point
-or the current explicit local command when a finding is not yet wrapped by a
-named `./scripts/security-tests` group.
+for the current local security suite.
 
 ## Request Parsing, Boundedness, and Transport
 
@@ -20,8 +19,8 @@ named `./scripts/security-tests` group.
 | `security/codex-30ada09` Unvalidated response-* overrides can inject response headers | fixed | `./scripts/security-tests transport` | Covered by response override sanitization tests. |
 | `security/codex-36005f5` Unvalidated response override headers can panic hyper responses | fixed | `./scripts/security-tests transport` | Covered by response header validation regressions. |
 | `security/codex-e190b29` Duplicate Content-Length header in GetObjectPart responses | fixed | `./scripts/security-tests transport` | Covered by `s3_response_to_hyper_` regression tests. |
-| `security/codex-195d31f` ListObjectVersions lacks record cap, enabling memory DoS | fixed | `cargo test -p server-core list_object_versions_clamps_oversized_max_keys` and `cargo test -p server-http list_object_versions_` | The bounded result-set behavior is covered locally, but not yet wrapped in a named runner group. |
-| `security/codex-2551b28` Delimiter listing now fetches unbounded rows, enabling DoS | fixed | `cargo test -p server-core list_objects_delimiter_` | The delimiter listing cap regression is covered locally, but not yet wrapped in a named runner group. |
+| `security/codex-195d31f` ListObjectVersions lacks record cap, enabling memory DoS | fixed | `./scripts/security-tests parser` | Covered by server-http and server-core bounded listing regressions. |
+| `security/codex-2551b28` Delimiter listing now fetches unbounded rows, enabling DoS | fixed | `./scripts/security-tests parser` | Covered by bounded delimiter-listing regressions. |
 
 ## Authentication, Authorization, Ownership, and Bucket Policy
 

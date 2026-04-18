@@ -2,7 +2,7 @@
 
 ## Status
 
-In progress.
+Completed for the intended local deterministic scope.
 
 Prerequisite security-hardening plans that this plan was originally waiting on
 have now largely completed. This plan should treat them as input sources for
@@ -22,10 +22,10 @@ Initial work now landed:
 - the runner now has dedicated `lifecycle`, `redaction`, and `integrity`
   groups in addition to the earlier auth/parser/stateful surfaces
 
-Still not started:
+Remaining optional follow-on:
 
-- CI wiring
-- per-surface reporting beyond the simple runner output
+- a small report wrapper beyond the sectioned `scripts/security-tests` output
+- CI wiring, if the project later decides it wants a separate CI signal
 
 ## Scope
 
@@ -342,7 +342,7 @@ Success criteria:
 Use the security suite to absorb outputs from completed and ongoing
 security-focused work rather than inventing a disconnected new body of tests.
 
-Status: in progress.
+Status: completed.
 
 Priority gaps to wire in:
 
@@ -368,31 +368,21 @@ Success criteria:
 - new security work automatically updates the suite rather than living only in
   one crate’s ad hoc tests
 
-## Phase 4: Reporting and CI Wiring
+## Phase 4: Optional Reporting Follow-On
 
 Deliver:
 
-- a dedicated CI job for the local security suite
-- clear separation in CI between:
-  - integration coverage
-  - local security suite
-  - AWS compatibility/oracle checks
-  - fuzzing or longer-running robustness jobs
+- a small wrapper such as `scripts/security-report` if sectioned
+  `scripts/security-tests` output stops being sufficient
 - per-surface reporting or sectioned logs so failures are attributable to a
   security area, not just a raw crate test command
 
 Do not turn this into a percentage target.
 
-A simple first CI shape is enough:
-
-- one job runs `scripts/security-tests`
-- one job runs `./scripts/coverage`
-- AWS-backed and fuzz jobs remain separate
-
 Success criteria:
 
-- the project has a visible local security signal separate from coverage
-- failures are attributable to a threat-model surface
+- the project keeps a visible local security signal separate from coverage
+- failures remain attributable to a threat-model surface
 
 ## Validation
 
@@ -413,11 +403,11 @@ When implemented, validation should include:
 - `./scripts/coverage` remains focused on local integration coverage instead of
   becoming the only security signal
 - AWS, diff, and fuzz jobs remain separate and clearly labeled for the
-  questions they answer
+  questions they answer when they are run
 
 ## Recommended Order
 
 1. build the matrix
 2. add the local runner
 3. wire in the active security-focused plans
-4. add CI reporting once the suite is stable
+4. add a report wrapper later only if sectioned runner output stops being enough

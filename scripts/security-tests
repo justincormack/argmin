@@ -70,9 +70,12 @@ run_parser() {
     run_cmd "auth percent-decode coverage" cargo test -p auth percent_decode
     run_cmd "server-http request parsing" cargo test -p server-http http::request::tests::
     run_cmd "server-http delete-objects parsing" cargo test -p server-http parse_delete_objects_
+    run_cmd "server-http list-object-versions bounds" cargo test -p server-http list_object_versions_
     run_cmd "server-http multipart parsing" cargo test -p server-http http::multipart::tests::
     run_cmd "server-http chunked decoding" cargo test -p server-http http::chunked::tests::
     run_cmd "server-http xml parsing" cargo test -p server-http http::xml::tests::parse_
+    run_cmd "server-core list-object-versions bounds" cargo test -p server-core list_object_versions_clamps_oversized_max_keys
+    run_cmd "server-core delimiter listing bounds" cargo test -p server-core list_objects_delimiter_
 }
 
 run_stateful() {
