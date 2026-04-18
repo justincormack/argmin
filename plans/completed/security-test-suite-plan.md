@@ -292,7 +292,7 @@ Status: completed.
 
 Deliver:
 
-- add `plans/security-test-suite-plan.md` and then implement the matrix in a
+- add `plans/completed/security-test-suite-plan.md` and then implement the matrix in a
   checked-in guide
 - map each threat-model surface from `guides/threat_model.md` to existing test
   locations and commands

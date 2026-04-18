@@ -176,7 +176,7 @@ higher-level regression in `server-http`, `s3-local-tests`, or another
 integration harness where the externally visible contract is easiest to assert.
 
 These promotions should feed the dedicated local security suite proposed in
-`plans/security-test-suite-plan.md`.
+`plans/completed/security-test-suite-plan.md`.
 
 They should not be driven primarily by whether a path moves the
 `./scripts/coverage` number.
@@ -527,7 +527,7 @@ Each phase should add runnable coverage with straightforward entry points:
 2. targeted `cargo test -p server-http ... -- --nocapture` runs for HTTP-level
    cleanup regressions
 3. inclusion in the dedicated local security suite once
-   `plans/security-test-suite-plan.md` is implemented
+   `plans/completed/security-test-suite-plan.md` is implemented
 4. optional `./scripts/coverage` checks only when a promoted local integration
    test naturally affects the `s3-tests` coverage signal
 
