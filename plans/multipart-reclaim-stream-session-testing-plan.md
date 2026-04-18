@@ -471,17 +471,44 @@ Success criteria:
 
 Deliver:
 
-- loom-style micro-models only for the smallest synchronization units that
-  still lack trustworthy coverage
-- promotion of the highest-value trace failures into HTTP or local integration
-  regressions where they affect user-visible behavior
+- promotion first:
+  - convert a small number of the highest-value saved shrink cases from
+    `crates/server-core/proptest-regressions/coordinator/multipart_trace_tests.txt`
+    and
+    `crates/server-core/proptest-regressions/coordinator/multipart_reclaim_trace_tests.txt`
+    into named deterministic regressions
+  - prefer local coordinator/invariant regressions over broader new modeling
+    when a shrink already captures the behavior clearly
+- at most one loom-style micro-model unless promotion still leaves a real
+  synchronization concern:
+  - the default candidate is the smallest lease-count / reclaim-worker handoff
+    that could still hide an interleaving bug
+  - only add a second micro-model if the first one proves valuable or still
+    leaves distrust
+- do not widen back out to new broad trace families in this phase
+- only promote to HTTP-level coverage when the trace failure clearly maps to a
+  user-visible contract
 
 Success criteria:
 
+- 2-4 promoted deterministic regressions land before any new concurrency helper
+  is introduced
 - there is a clear reason for every added concurrency-specific helper or
   dependency
-- important lifetime regressions are represented in both low-level and
-  externally observable coverage where appropriate
+- if a loom-style helper is added at all, it is tiny, local, and justified by
+  a concrete remaining interleaving risk
+
+Current state:
+
+- in progress
+- promotion has started first, before any new concurrency helper:
+  - a same-key multipart/session shrink is being promoted into a named
+    deterministic regression around completing an upload while a live
+    replacement stream session still exists
+  - reclaim/bucket-delete shrinks are being promoted into named deterministic
+    regressions around inert stale bucket-delete follow-on work and
+    current-root advancement from an older generation to a newer generation
+- no loom-style helper has been added
 
 ## Validation
 

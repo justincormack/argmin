@@ -2075,3 +2075,82 @@ fn abort_active_upload_with_live_stream_part_session_removes_upload_and_requires
         .unwrap();
     assert_eq!(harness.active_session_count(), 0);
 }
+
+#[test]
+fn completing_current_upload_with_live_replacement_stream_session_leaves_orphan_until_cleanup() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", TRACE_BUCKET, false)
+        .unwrap();
+
+    let mut harness = SameKeyUploadHarness::new(coord);
+    harness.execute(&SameKeyUploadTraceOp::CreateUpload);
+    harness.execute(&SameKeyUploadTraceOp::BeginCurrentStream);
+    harness.execute(&SameKeyUploadTraceOp::AppendCurrentData);
+    harness.execute(&SameKeyUploadTraceOp::FinalizeCurrentPart);
+
+    let completed_upload_id = harness.uploads.last().unwrap().upload_id.clone();
+    let completed_payload = harness.uploads.last().unwrap().payload.clone();
+
+    harness.execute(&SameKeyUploadTraceOp::BeginCurrentStream);
+    let replacement_session_id = harness.current_session_id.clone().unwrap();
+    harness.execute(&SameKeyUploadTraceOp::CompleteCurrent);
+
+    assert_eq!(
+        harness.pending_upload_ids_in_order().len(),
+        0,
+        "completing the upload should remove it from the pending upload set"
+    );
+    assert_eq!(
+        harness.active_session_count(),
+        1,
+        "the live replacement session should remain orphaned until explicit cleanup"
+    );
+
+    let parts_err = harness
+        .coord
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request(
+                TRACE_BUCKET,
+                TRACE_KEY,
+                &completed_upload_id,
+                test_requester(),
+            ),
+            part_number_marker: None,
+            max_parts: 100,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(parts_err, ServerError::NoSuchUpload { .. }),
+        "completed upload should no longer be listable as a pending multipart upload"
+    );
+
+    let result = harness
+        .coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request(TRACE_BUCKET, TRACE_KEY, None, test_requester()),
+            cond: NO_READ,
+        })
+        .unwrap();
+    let body = read_all_body(result.body).unwrap();
+    assert_eq!(
+        body, completed_payload,
+        "completing the upload should still publish the committed payload"
+    );
+
+    harness
+        .coord
+        .abort_stream_part_session(
+            &trusted_bucket_name(TRACE_BUCKET),
+            &trusted_object_key(TRACE_KEY),
+            &replacement_session_id,
+        )
+        .unwrap();
+    assert_eq!(
+        harness.active_session_count(),
+        0,
+        "explicit cleanup should remove the orphaned replacement session"
+    );
+}

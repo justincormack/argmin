@@ -1840,3 +1840,125 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn object_reclaim_work_takes_priority_over_stale_bucket_delete_follow_on() {
+    let tmp = test_util::tempdir();
+    let runtime = make_test_read_runtime(tmp.path());
+    let mut harness = ReclaimTraceHarness::new(runtime);
+
+    harness.execute(&ReclaimTraceOp::SeedMetadata).unwrap();
+    harness.execute(&ReclaimTraceOp::AcquireLease).unwrap();
+    harness.execute(&ReclaimTraceOp::ReleaseLease).unwrap();
+    harness.execute(&ReclaimTraceOp::WorkerObjectStep).unwrap();
+    harness.execute(&ReclaimTraceOp::SeedMetadata).unwrap();
+    harness
+        .execute(&ReclaimTraceOp::EnqueueObjectReclaim)
+        .unwrap();
+
+    match harness.take_next_work().unwrap() {
+        Some(ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)))
+            if bucket == trusted_bucket_name(TRACE_BUCKET)
+                && key == trusted_object_key(TRACE_KEY)
+                && generation_id == trace_generation_id() => {}
+        Some(ReclaimWorkItem::BucketDelete(bucket)) => panic!(
+            "new object reclaim work must outrank stale bucket-delete follow-on, got bucket delete for {bucket}"
+        ),
+        None => panic!("expected object reclaim work after reseeding metadata"),
+        Some(ReclaimWorkItem::ObjectPayload(_)) => {
+            panic!("expected object reclaim work for the traced generation")
+        }
+    }
+}
+
+#[test]
+fn deleting_bucket_finalize_advances_from_old_generation_to_new_generation_root() {
+    let tmp = test_util::tempdir();
+    let runtime = make_test_read_runtime(tmp.path());
+    let mut harness = TwoGenerationReclaimTraceHarness::new(runtime);
+
+    harness
+        .execute(&TwoGenerationReclaimTraceOp::SeedOldMetadata)
+        .unwrap();
+    harness
+        .execute(&TwoGenerationReclaimTraceOp::SeedNewMetadata)
+        .unwrap();
+    harness
+        .execute(&TwoGenerationReclaimTraceOp::SeedBucketDelete)
+        .unwrap();
+    harness
+        .execute(&TwoGenerationReclaimTraceOp::EnqueueOldReclaim)
+        .unwrap();
+    harness
+        .execute_worker_object_step(TraceGeneration::Old)
+        .unwrap();
+
+    assert!(
+        !harness.metadata_exists(TraceGeneration::Old),
+        "reclaiming the old generation should clear its durable reclaim metadata"
+    );
+    assert!(
+        harness.metadata_exists(TraceGeneration::New),
+        "the newer generation should still be present before bucket-delete finalize advances the root"
+    );
+
+    harness
+        .execute(&TwoGenerationReclaimTraceOp::WorkerBucketDeleteStep)
+        .unwrap();
+
+    match harness.take_next_work().unwrap() {
+        Some(ReclaimWorkItem::ObjectPayload((bucket, key, generation_id)))
+            if bucket == trusted_bucket_name(TRACE_BUCKET)
+                && key == trusted_object_key(TRACE_KEY)
+                && generation_id == trace_generation_id_new() => {}
+        Some(ReclaimWorkItem::ObjectPayload((_bucket, _key, generation_id))) => panic!(
+            "bucket-delete finalize should advance to the new generation root, got generation {generation_id:?}"
+        ),
+        Some(ReclaimWorkItem::BucketDelete(bucket)) => panic!(
+            "expected advanced object reclaim work for the new generation, got bucket delete for {bucket}"
+        ),
+        None => panic!("expected bucket-delete finalize to enqueue reclaim for the new generation root"),
+    }
+
+    harness
+        .runtime
+        .try_reclaim_object_payload(TRACE_BUCKET, TRACE_KEY, trace_generation_id_new())
+        .unwrap();
+    assert!(
+        !harness.metadata_exists(TraceGeneration::New),
+        "reclaiming the advanced new-generation root should clear its durable metadata"
+    );
+}
+
+#[test]
+fn bucket_delete_finalize_does_not_skip_a_lease_blocked_older_generation_root() {
+    let tmp = test_util::tempdir();
+    let runtime = make_test_read_runtime(tmp.path());
+    let mut harness = TwoGenerationReclaimTraceHarness::new(runtime);
+
+    harness
+        .execute(&TwoGenerationReclaimTraceOp::SeedOldMetadata)
+        .unwrap();
+    harness
+        .execute(&TwoGenerationReclaimTraceOp::SeedNewMetadata)
+        .unwrap();
+    harness
+        .execute(&TwoGenerationReclaimTraceOp::AcquireOldLease)
+        .unwrap();
+    harness
+        .execute(&TwoGenerationReclaimTraceOp::SeedBucketDelete)
+        .unwrap();
+    harness
+        .execute(&TwoGenerationReclaimTraceOp::WorkerBucketDeleteStep)
+        .unwrap();
+
+    assert!(harness.bucket_exists());
+    assert!(harness.metadata_exists(TraceGeneration::Old));
+    assert!(harness.metadata_exists(TraceGeneration::New));
+    assert_eq!(harness.lease_count(TraceGeneration::Old), 1);
+    assert_eq!(harness.lease_count(TraceGeneration::New), 0);
+    assert!(
+        harness.take_next_work().unwrap().is_none(),
+        "bucket delete finalize must not enqueue newer-generation reclaim while the current older root is still lease-blocked"
+    );
+}
