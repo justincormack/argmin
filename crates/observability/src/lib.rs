@@ -64,6 +64,12 @@ enum TraceSink {
 
 static TRACE_SINK: OnceLock<TraceSink> = OnceLock::new();
 static TRACE_SINK_OVERRIDE: OnceLock<TraceSink> = OnceLock::new();
+static INFLIGHT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static REQUEST_FINISH_TOTAL: AtomicU64 = AtomicU64::new(0);
+static REQUEST_ERROR_TOTAL: AtomicU64 = AtomicU64::new(0);
+static SLOW_REQUEST_TOTAL: AtomicU64 = AtomicU64::new(0);
+static BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
+static MULTIPART_COMPLETION_BUCKET_LOCK_WAIT_EXCEEDED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 const TRACE_FILE_QUEUE_CAPACITY: usize = 16_384;
 const TRACE_FILE_IDLE_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
@@ -344,6 +350,189 @@ impl QuerySummary {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestSummary<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    pub query: QuerySummary,
+    pub status_code: u16,
+    pub streaming: bool,
+    pub body_len: u64,
+    pub bytes_sent: u64,
+    pub lifetime_us: u128,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub inflight_requests: u64,
+    pub request_finish_total: u64,
+    pub request_error_total: u64,
+    pub slow_request_total: u64,
+    pub bucket_lock_wait_exceeded_total: u64,
+    pub multipart_completion_bucket_lock_wait_exceeded_total: u64,
+}
+
+pub struct InflightRequestsGuard {
+    active: bool,
+}
+
+impl Drop for InflightRequestsGuard {
+    fn drop(&mut self) {
+        if self.active {
+            INFLIGHT_REQUESTS.fetch_sub(1, Ordering::Relaxed);
+            self.active = false;
+        }
+    }
+}
+
+#[must_use]
+pub fn inflight_requests_guard() -> InflightRequestsGuard {
+    INFLIGHT_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    InflightRequestsGuard { active: true }
+}
+
+#[must_use]
+pub fn metrics_snapshot() -> MetricsSnapshot {
+    MetricsSnapshot {
+        inflight_requests: INFLIGHT_REQUESTS.load(Ordering::Relaxed),
+        request_finish_total: REQUEST_FINISH_TOTAL.load(Ordering::Relaxed),
+        request_error_total: REQUEST_ERROR_TOTAL.load(Ordering::Relaxed),
+        slow_request_total: SLOW_REQUEST_TOTAL.load(Ordering::Relaxed),
+        bucket_lock_wait_exceeded_total: BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.load(Ordering::Relaxed),
+        multipart_completion_bucket_lock_wait_exceeded_total:
+            MULTIPART_COMPLETION_BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.load(Ordering::Relaxed),
+    }
+}
+
+pub fn emit_request_finish(
+    context: &TraceContext,
+    target: &'static str,
+    summary: RequestSummary<'_>,
+    outcome: &'static str,
+) -> bool {
+    REQUEST_FINISH_TOTAL.fetch_add(1, Ordering::Relaxed);
+    event_in_context(
+        context,
+        target,
+        "request_finish",
+        Some(format_args!(
+            "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} outcome={}",
+            summary.status_code,
+            summary.method,
+            summary.path,
+            summary.query.has_query(),
+            summary.query.param_count(),
+            summary.query.has_sigv4_params(),
+            summary.streaming,
+            summary.body_len,
+            summary.bytes_sent,
+            summary.lifetime_us,
+            outcome
+        )),
+    )
+}
+
+pub fn emit_request_error(
+    context: &TraceContext,
+    target: &'static str,
+    summary: RequestSummary<'_>,
+    stage: &'static str,
+    error_code: &str,
+) -> bool {
+    REQUEST_ERROR_TOTAL.fetch_add(1, Ordering::Relaxed);
+    event_in_context(
+        context,
+        target,
+        "request_error",
+        Some(format_args!(
+            "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} stage={} error_code={}",
+            summary.status_code,
+            summary.method,
+            summary.path,
+            summary.query.has_query(),
+            summary.query.param_count(),
+            summary.query.has_sigv4_params(),
+            summary.streaming,
+            summary.body_len,
+            summary.bytes_sent,
+            summary.lifetime_us,
+            stage,
+            error_code
+        )),
+    )
+}
+
+pub fn emit_slow_request(
+    context: &TraceContext,
+    target: &'static str,
+    summary: RequestSummary<'_>,
+    outcome: &'static str,
+    error_code: Option<&str>,
+) -> bool {
+    SLOW_REQUEST_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let error_suffix = error_code
+        .map(|code| format!(" error_code={code}"))
+        .unwrap_or_default();
+    event_in_context(
+        context,
+        target,
+        "slow_request",
+        Some(format_args!(
+            "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} outcome={}{}",
+            summary.status_code,
+            summary.method,
+            summary.path,
+            summary.query.has_query(),
+            summary.query.param_count(),
+            summary.query.has_sigv4_params(),
+            summary.streaming,
+            summary.body_len,
+            summary.bytes_sent,
+            summary.lifetime_us,
+            outcome,
+            error_suffix
+        )),
+    )
+}
+
+pub fn emit_bucket_lock_wait_exceeded<T: fmt::Debug>(
+    context: &TraceContext,
+    target: &'static str,
+    bucket: &T,
+    stripe: usize,
+    wait_us: u128,
+) -> bool {
+    BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    event_in_context(
+        context,
+        target,
+        "bucket_lock_wait_exceeded",
+        Some(format_args!(
+            "bucket={:?} stripe={} wait_us={}",
+            bucket, stripe, wait_us
+        )),
+    )
+}
+
+pub fn emit_multipart_completion_bucket_lock_wait_exceeded<T: fmt::Debug>(
+    context: &TraceContext,
+    target: &'static str,
+    bucket: &T,
+    stripe: usize,
+    wait_us: u128,
+) -> bool {
+    MULTIPART_COMPLETION_BUCKET_LOCK_WAIT_EXCEEDED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    event_in_context(
+        context,
+        target,
+        "multipart_completion_bucket_lock_wait_exceeded",
+        Some(format_args!(
+            "bucket={:?} stripe={} wait_us={}",
+            bucket, stripe, wait_us
+        )),
+    )
+}
+
 pub fn configure(enabled: bool, filter: Option<&str>, file_path: Option<&str>) -> bool {
     TRACE_CONFIG_OVERRIDE
         .set(TraceConfig {
@@ -597,6 +786,9 @@ macro_rules! trace_scope {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static METRICS_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn escaped_renders_debug_style_one_line_output() {
@@ -639,5 +831,61 @@ mod tests {
         assert!(ordinary.has_query());
         assert_eq!(ordinary.param_count(), 2);
         assert!(!ordinary.has_sigv4_params());
+    }
+
+    #[test]
+    fn inflight_requests_guard_updates_snapshot() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let before = metrics_snapshot();
+        {
+            let inflight_guard = inflight_requests_guard();
+            let during = metrics_snapshot();
+            assert_eq!(during.inflight_requests, before.inflight_requests + 1);
+            drop(inflight_guard);
+        }
+        let after = metrics_snapshot();
+        assert_eq!(after.inflight_requests, before.inflight_requests);
+    }
+
+    #[test]
+    fn helper_emitters_increment_metrics_even_when_tracing_is_disabled() {
+        let _guard = METRICS_TEST_MUTEX.lock().unwrap();
+        let before = metrics_snapshot();
+        let ctx = TraceContext::new_request();
+        let summary = RequestSummary {
+            method: "GET",
+            path: "/bucket/key",
+            query: query_summary("partNumber=1"),
+            status_code: 206,
+            streaming: true,
+            body_len: 123,
+            bytes_sent: 64,
+            lifetime_us: 42,
+        };
+
+        emit_request_finish(&ctx, "server_http", summary, "complete");
+        emit_request_error(
+            &ctx,
+            "server_http",
+            summary,
+            "response_body",
+            "InternalError",
+        );
+        emit_slow_request(&ctx, "server_http", summary, "error", Some("InternalError"));
+        emit_bucket_lock_wait_exceeded(&ctx, "storage", &"bucket", 3, 1_500);
+        emit_multipart_completion_bucket_lock_wait_exceeded(&ctx, "storage", &"bucket", 7, 2_500);
+
+        let after = metrics_snapshot();
+        assert_eq!(after.request_finish_total, before.request_finish_total + 1);
+        assert_eq!(after.request_error_total, before.request_error_total + 1);
+        assert_eq!(after.slow_request_total, before.slow_request_total + 1);
+        assert_eq!(
+            after.bucket_lock_wait_exceeded_total,
+            before.bucket_lock_wait_exceeded_total + 1
+        );
+        assert_eq!(
+            after.multipart_completion_bucket_lock_wait_exceeded_total,
+            before.multipart_completion_bucket_lock_wait_exceeded_total + 1
+        );
     }
 }

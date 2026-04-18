@@ -268,14 +268,12 @@ impl SharedStorageNode {
         let wait_us = wait_started_at.elapsed().as_micros();
         if wait_us >= LOCK_WAIT_EVENT_THRESHOLD_US {
             if let Some(trace) = &trace {
-                let _ = observability::event_in_context(
+                let _ = observability::emit_bucket_lock_wait_exceeded(
                     trace,
                     TRACE_TARGET,
-                    "bucket_lock_wait_exceeded",
-                    Some(format_args!(
-                        "bucket={:?} stripe={} wait_us={}",
-                        bucket, idx, wait_us
-                    )),
+                    bucket,
+                    idx,
+                    wait_us,
                 );
             }
         }
@@ -301,14 +299,12 @@ impl SharedStorageNode {
         let wait_us = wait_started_at.elapsed().as_micros();
         if wait_us >= LOCK_WAIT_EVENT_THRESHOLD_US {
             if let Some(trace) = &trace {
-                let _ = observability::event_in_context(
+                let _ = observability::emit_multipart_completion_bucket_lock_wait_exceeded(
                     trace,
                     TRACE_TARGET,
-                    "multipart_completion_bucket_lock_wait_exceeded",
-                    Some(format_args!(
-                        "bucket={:?} stripe={} wait_us={}",
-                        bucket, idx, wait_us
-                    )),
+                    bucket,
+                    idx,
+                    wait_us,
                 );
             }
         }

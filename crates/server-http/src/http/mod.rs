@@ -467,34 +467,30 @@ impl ResponseBodyTrace {
         self.meta.started_at.elapsed().as_micros()
     }
 
+    fn request_summary(&self) -> observability::RequestSummary<'_> {
+        observability::RequestSummary {
+            method: &self.meta.method,
+            path: &self.meta.path,
+            query: self.meta.query,
+            status_code: self.status_code,
+            streaming: self.streaming,
+            body_len: self.body_len,
+            bytes_sent: self.bytes_sent,
+            lifetime_us: self.elapsed_lifetime_us(),
+        }
+    }
+
     fn emit_slow_request_if_needed(&self, outcome: &'static str, error_code: Option<&str>) {
-        let lifetime_us = self.elapsed_lifetime_us();
-        if lifetime_us < SLOW_REQUEST_EVENT_THRESHOLD_US {
+        let summary = self.request_summary();
+        if summary.lifetime_us < SLOW_REQUEST_EVENT_THRESHOLD_US {
             return;
         }
-
-        let error_suffix = error_code
-            .map(|code| format!(" error_code={code}"))
-            .unwrap_or_default();
-        let _ = observability::event_in_context(
+        let _ = observability::emit_slow_request(
             &self.meta.context,
             TRACE_TARGET,
-            "slow_request",
-            Some(format_args!(
-                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} outcome={}{}",
-                self.status_code,
-                self.meta.method,
-                self.meta.path,
-                self.meta.query.has_query(),
-                self.meta.query.param_count(),
-                self.meta.query.has_sigv4_params(),
-                self.streaming,
-                self.body_len,
-                self.bytes_sent,
-                lifetime_us,
-                outcome,
-                error_suffix
-            )),
+            summary,
+            outcome,
+            error_code,
         );
     }
 
@@ -508,24 +504,11 @@ impl ResponseBodyTrace {
         }
         self.terminal_event_emitted = true;
         self.emit_slow_request_if_needed(outcome, None);
-        let _ = observability::event_in_context(
+        let _ = observability::emit_request_finish(
             &self.meta.context,
             TRACE_TARGET,
-            "request_finish",
-            Some(format_args!(
-                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} outcome={}",
-                self.status_code,
-                self.meta.method,
-                self.meta.path,
-                self.meta.query.has_query(),
-                self.meta.query.param_count(),
-                self.meta.query.has_sigv4_params(),
-                self.streaming,
-                self.body_len,
-                self.bytes_sent,
-                self.elapsed_lifetime_us(),
-                outcome
-            )),
+            self.request_summary(),
+            outcome,
         );
     }
 
@@ -535,24 +518,12 @@ impl ResponseBodyTrace {
         }
         self.terminal_event_emitted = true;
         self.emit_slow_request_if_needed("error", Some(err.s3_error_code()));
-        let _ = observability::event_in_context(
+        let _ = observability::emit_request_error(
             &self.meta.context,
             TRACE_TARGET,
-            "request_error",
-            Some(format_args!(
-                "status={} method={} path={:?} has_query={} query_params={} sigv4_query={} streaming={} body_len={} bytes_sent={} lifetime_us={} stage=response_body error_code={}",
-                self.status_code,
-                self.meta.method,
-                self.meta.path,
-                self.meta.query.has_query(),
-                self.meta.query.param_count(),
-                self.meta.query.has_sigv4_params(),
-                self.streaming,
-                self.body_len,
-                self.bytes_sent,
-                self.elapsed_lifetime_us(),
-                err.s3_error_code()
-            )),
+            self.request_summary(),
+            "response_body",
+            err.s3_error_code(),
         );
     }
 }
@@ -560,6 +531,7 @@ impl ResponseBodyTrace {
 pub struct S3HyperBody {
     state: S3HyperBodyState,
     trace: Option<ResponseBodyTrace>,
+    _inflight_requests_guard: Option<observability::InflightRequestsGuard>,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -567,11 +539,13 @@ impl S3HyperBody {
     fn buffered(
         body: Vec<u8>,
         permit: Option<OwnedSemaphorePermit>,
+        inflight_requests_guard: Option<observability::InflightRequestsGuard>,
         trace: ResponseBodyTrace,
     ) -> Self {
         Self {
             state: S3HyperBodyState::Buffered(Some(Bytes::from(body))),
             trace: Some(trace),
+            _inflight_requests_guard: inflight_requests_guard,
             _permit: permit,
         }
     }
@@ -579,6 +553,7 @@ impl S3HyperBody {
     fn streaming(
         body: crate::coordinator::ReadHandle,
         permit: Option<OwnedSemaphorePermit>,
+        inflight_requests_guard: Option<observability::InflightRequestsGuard>,
         read_chunk_size: usize,
         trace: ResponseBodyTrace,
     ) -> Self {
@@ -612,6 +587,7 @@ impl S3HyperBody {
         Self {
             state: S3HyperBodyState::Streaming(rx),
             trace: Some(trace),
+            _inflight_requests_guard: inflight_requests_guard,
             _permit: permit,
         }
     }
@@ -4111,7 +4087,15 @@ pub fn s3_response_to_hyper(
             .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
         let trace =
             ResponseBodyTrace::new(trace_meta, resp.status_code, resp.body.len() as u64, false);
-        let mut response = http::Response::new(S3HyperBody::buffered(resp.body, permit, trace));
+        let inflight_requests_guard = permit
+            .as_ref()
+            .map(|_| observability::inflight_requests_guard());
+        let mut response = http::Response::new(S3HyperBody::buffered(
+            resp.body,
+            permit,
+            inflight_requests_guard,
+            trace,
+        ));
         *response.status_mut() = status;
         for (name, value) in resp.headers {
             if let (Ok(name), Ok(value)) = (
@@ -4173,9 +4157,18 @@ pub fn s3_response_to_hyper(
         body_len,
         resp.stream.is_some(),
     );
+    let inflight_requests_guard = permit
+        .as_ref()
+        .map(|_| observability::inflight_requests_guard());
     let body = match resp.stream {
-        Some(stream) => S3HyperBody::streaming(stream, permit, stream_read_chunk_size, trace),
-        None => S3HyperBody::buffered(resp.body, permit, trace),
+        Some(stream) => S3HyperBody::streaming(
+            stream,
+            permit,
+            inflight_requests_guard,
+            stream_read_chunk_size,
+            trace,
+        ),
+        None => S3HyperBody::buffered(resp.body, permit, inflight_requests_guard, trace),
     };
     let mut response = http::Response::new(body);
     *response.status_mut() = status;
