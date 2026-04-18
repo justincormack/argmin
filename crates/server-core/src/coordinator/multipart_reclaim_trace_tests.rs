@@ -1962,3 +1962,26 @@ fn bucket_delete_finalize_does_not_skip_a_lease_blocked_older_generation_root() 
         "bucket delete finalize must not enqueue newer-generation reclaim while the current older root is still lease-blocked"
     );
 }
+
+#[test]
+fn deleting_empty_bucket_finalize_removes_bucket_without_follow_on_reclaim() {
+    let tmp = test_util::tempdir();
+    let runtime = make_test_read_runtime(tmp.path());
+    let mut harness = TwoGenerationReclaimTraceHarness::new(runtime);
+
+    harness
+        .execute(&TwoGenerationReclaimTraceOp::SeedBucketDelete)
+        .unwrap();
+    harness
+        .execute(&TwoGenerationReclaimTraceOp::WorkerBucketDeleteStep)
+        .unwrap();
+
+    assert!(
+        !harness.bucket_exists(),
+        "finalizing delete for an otherwise empty deleting bucket should remove the bucket immediately"
+    );
+    assert!(
+        harness.take_next_work().unwrap().is_none(),
+        "empty deleting bucket finalize should not enqueue any follow-on reclaim work"
+    );
+}
