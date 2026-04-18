@@ -42,6 +42,7 @@ pub use self::authz_types::{
     ActiveWriteEncryption, ActiveWriteEncryptionRef, AuthorizedPutObjectWrite,
 };
 use self::authz_types::{AuthorizedPutObjectWriteAcl, ValidatedBucket};
+use self::internal_types::*;
 #[cfg(test)]
 use self::payload::encode_parity_scratch_len;
 use self::request_support::authorization_policy_context_for_put_object_write_acl;
@@ -632,120 +633,6 @@ const MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 /// Maximum number of parts in a multipart upload (matches AWS S3).
 const MAX_PARTS: usize = 10_000;
 
-/// PG guards held while an object metadata snapshot is live.
-///
-/// Read-side payload access relies on generation-scoped leases, so current
-/// object read paths only need the metadata PG guard.
-struct ObjectPgGuards<'a> {
-    meta: MutexGuard<'a, storage::PgStore>,
-}
-
-impl<'a> ObjectPgGuards<'a> {
-    fn new(meta: MutexGuard<'a, storage::PgStore>) -> Self {
-        Self { meta }
-    }
-
-    fn meta(&self) -> &storage::PgStore {
-        &self.meta
-    }
-}
-
-/// Ordered bucket/object PG guards for mixed metadata loads.
-///
-/// The underlying storage helper acquires the physical PG mutexes in ascending
-/// PG ID order, but returns them in logical bucket/object order so call sites
-/// cannot accidentally swap roles.
-struct BucketObjectPgGuards<'a> {
-    bucket: MutexGuard<'a, storage::PgStore>,
-    object: Option<MutexGuard<'a, storage::PgStore>>,
-}
-
-impl<'a> BucketObjectPgGuards<'a> {
-    fn new(
-        bucket: MutexGuard<'a, storage::PgStore>,
-        object: Option<MutexGuard<'a, storage::PgStore>>,
-    ) -> Self {
-        Self { bucket, object }
-    }
-
-    fn bucket(&self) -> &storage::PgStore {
-        &self.bucket
-    }
-
-    fn object(&self) -> &storage::PgStore {
-        match self.object.as_ref() {
-            Some(object) => object,
-            None => &self.bucket,
-        }
-    }
-
-    fn into_object_guards(self) -> ObjectPgGuards<'a> {
-        let Self { bucket, object } = self;
-        match object {
-            Some(object) => ObjectPgGuards::new(object),
-            None => ObjectPgGuards::new(bucket),
-        }
-    }
-}
-
-/// Ordered metadata/shard PG guards for object write publication.
-///
-/// The helper keeps logical meta/shard roles explicit even when both roles map
-/// to the same physical PG.
-struct TwoPgGuards<'a> {
-    meta: MutexGuard<'a, storage::PgStore>,
-    shard: Option<MutexGuard<'a, storage::PgStore>>,
-}
-
-impl<'a> TwoPgGuards<'a> {
-    fn new(
-        meta: MutexGuard<'a, storage::PgStore>,
-        shard: Option<MutexGuard<'a, storage::PgStore>>,
-    ) -> Self {
-        Self { meta, shard }
-    }
-
-    fn same_pg(&self) -> bool {
-        self.shard.is_none()
-    }
-
-    fn meta(&self) -> &storage::PgStore {
-        &self.meta
-    }
-
-    fn shard(&self) -> &storage::PgStore {
-        match self.shard.as_ref() {
-            Some(shard) => shard,
-            None => &self.meta,
-        }
-    }
-}
-
-struct LockedReadObject<'a> {
-    record: StoredObject,
-    pgs: ObjectPgGuards<'a>,
-}
-
-#[derive(Debug, Clone)]
-struct SnapshottedMultipartPart {
-    record: ObjectPartRecord,
-    object_offset_start: usize,
-    segments: Vec<SegmentPayloadRecord>,
-}
-
-#[derive(Debug, Clone)]
-enum StaleObjectPayload {
-    Segments {
-        generation_id: GenerationId,
-        segments: Vec<ObjectSegmentRecord>,
-    },
-    Multipart {
-        generation_id: GenerationId,
-        parts: Vec<ObjectPartRecord>,
-        streaming_segments: Vec<MultipartPartSegmentRecord>,
-    },
-}
-
 #[cfg(test)]
 #[derive(Default, Clone)]
 struct ReclamationTestHooks {
@@ -796,59 +683,6 @@ impl Drop for StreamAppendTestHookGuard {
             STREAM_APPEND_TEST_HOOKS.get_or_init(|| Mutex::new(StreamAppendTestHooks::default()));
         *hooks.lock().unwrap() = StreamAppendTestHooks::default();
     }
-}
-
-/// The coordinator ties together EC, storage, and metadata.
-struct ReclaimSweeper {
-    storage_node: Arc<SharedStorageNode>,
-    stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
-}
-
-struct LifecycleSweeper {
-    stop: Arc<AtomicBool>,
-    handle: Mutex<Option<JoinHandle<()>>>,
-}
-
-#[derive(Debug, Clone)]
-struct CachedBucketPolicy {
-    generation: u64,
-    policy: Arc<auth::BucketPolicy>,
-}
-
-#[derive(Debug, Clone)]
-struct CachedBucketLifecycle {
-    generation: u64,
-    config: Arc<BucketLifecycleConfiguration>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LifecycleSweepStats {
-    scanned_buckets: u64,
-    expired_current_objects: u64,
-    expired_noncurrent_versions: u64,
-    expired_delete_markers: u64,
-    aborted_multipart_uploads: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeletedLiveObjectKind {
-    Segments,
-    Multipart,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DeletedLiveObjectReclaim {
-    generation_id: GenerationId,
-    kind: DeletedLiveObjectKind,
-}
-
-enum ObjectAclAuthorization<'a> {
-    ReadWithPolicy(auth::PolicyAction),
-    WriteWithPolicy {
-        action: auth::PolicyAction,
-        policy_context: PutObjectPolicyContext<'a>,
-    },
 }
 
 pub struct Coordinator {
@@ -1098,6 +932,7 @@ mod bucket;
 mod copy;
 mod delete;
 mod infra;
+mod internal_types;
 mod lifecycle;
 mod listing;
 mod multipart;
