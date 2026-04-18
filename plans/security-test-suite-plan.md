@@ -16,13 +16,16 @@ existing coverage, not as still-active dependencies:
 Initial work now landed:
 
 - `scripts/security-tests` exists as the first local deterministic runner
-- `guides/security-testing.md` exists as the first checked-in surface matrix
+- `guides/security-testing.md` exists as the checked-in surface matrix
+- `guides/security-findings-inventory.md` now maps every file under
+  `security/` to a local regression path or explicit invalid/stale status
+- the runner now has dedicated `lifecycle`, `redaction`, and `integrity`
+  groups in addition to the earlier auth/parser/stateful surfaces
 
 Still not started:
 
 - CI wiring
 - per-surface reporting beyond the simple runner output
-- a full finding-by-finding inventory for every file under `security/`
 
 ## Scope
 
@@ -104,13 +107,13 @@ deterministic tests today, and where are the remaining gaps?”
 - the threat model is documented in `guides/threat_model.md`
 - `scripts/security-tests` now provides the first local security-focused runner
 - `guides/security-testing.md` now provides the first checked-in surface matrix
-- there is no single checked-in map from:
-  - threat-model surface
+- `guides/security-findings-inventory.md` now provides the checked-in
+  per-finding map from:
   - past security finding
   - local deterministic regression coverage
-  - AWS-oracle coverage
-  - fuzz/property/stateful coverage
-  - open gap or active plan
+  - explicit invalid/stale status where applicable
+- there is still no dedicated report wrapper beyond the sectioned output from
+  `scripts/security-tests`
 
 ## Goals
 
@@ -285,7 +288,7 @@ For each area, explicitly identify whether current coverage is:
 
 ## Phase 1: Inventory and Matrix
 
-Status: in progress.
+Status: completed.
 
 Deliver:
 
@@ -307,7 +310,7 @@ Success criteria:
 
 ## Phase 2: Local Security Runner
 
-Status: in progress.
+Status: completed.
 
 Deliver:
 
@@ -338,6 +341,8 @@ Success criteria:
 
 Use the security suite to absorb outputs from completed and ongoing
 security-focused work rather than inventing a disconnected new body of tests.
+
+Status: in progress.
 
 Priority gaps to wire in:
 

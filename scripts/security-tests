@@ -18,7 +18,10 @@ Groups:
   authz      Authorization, bucket-policy, and anonymous-access coverage
   parser     Request/parser/front-door hardening coverage
   stateful   Multipart, reclaim, and stream-session lifetime coverage
+  lifecycle  Object Lock, retention, legal-hold, and lifecycle coverage
   transport  HTTP-only transport and secure-transport-sensitive coverage
+  redaction  Secret redaction and error sanitization coverage
+  integrity  Storage and checksum integrity coverage
   all        The full local security suite
   list       Print the available groups
   help       Show this help
@@ -66,6 +69,7 @@ run_parser() {
     run_cmd "auth parser-focused tests" cargo test -p auth parse_
     run_cmd "auth percent-decode coverage" cargo test -p auth percent_decode
     run_cmd "server-http request parsing" cargo test -p server-http http::request::tests::
+    run_cmd "server-http delete-objects parsing" cargo test -p server-http parse_delete_objects_
     run_cmd "server-http multipart parsing" cargo test -p server-http http::multipart::tests::
     run_cmd "server-http chunked decoding" cargo test -p server-http http::chunked::tests::
     run_cmd "server-http xml parsing" cargo test -p server-http http::xml::tests::parse_
@@ -78,17 +82,47 @@ run_stateful() {
     run_cmd "s3-local-tests lifecycle" cargo test -p s3-local-tests --test lifecycle
 }
 
+run_lifecycle() {
+    run_cmd "server-core object-lock authz matrix" cargo test -p server-core authz_model_phase7_object_lock_matrix
+    run_cmd "server-core object-lock and retention" cargo test -p server-core object_lock
+    run_cmd "server-core lifecycle behavior" cargo test -p server-core lifecycle_
+    run_cmd "s3-local-tests lifecycle" cargo test -p s3-local-tests --test lifecycle
+}
+
 run_transport() {
     run_cmd "s3-http-tests" cargo test -p s3-http-tests
     run_cmd "server-http conditional transport behavior" cargo test -p server-http http::conditional::tests::
+    run_cmd "server-http response override handling" cargo test -p server-http response_overrides_
+    run_cmd "server-http response header validation" cargo test -p server-http s3_response_to_hyper_
+}
+
+run_redaction() {
+    run_cmd "observability redaction primitives" cargo test -p observability
+    run_cmd "auth secret redaction" cargo test -p auth redacts
+    run_cmd "server-core secret redaction" cargo test -p server-core redacts
+    run_cmd "storage debug redaction" cargo test -p storage debug_redacts
+    run_cmd "server-http error sanitization" cargo test -p server-http sanitized
+}
+
+run_integrity() {
+    run_cmd "checksum crate" cargo test -p checksum
+    run_cmd "storage integrity" cargo test -p storage integrity
+    run_cmd "storage checksum metadata" cargo test -p storage checksum
+    run_cmd "server-core checksum paths" cargo test -p server-core checksum_
 }
 
 run_all() {
     run_cmd "auth crate" cargo test -p auth
+    run_cmd "auth bucket-policy differential" cargo test -p auth --test bucket_policy_differential
     run_cmd "server-core authz model" cargo test -p server-core authz_model_
     run_cmd "server-core multipart stateful" cargo test -p server-core multipart_stateful_tests
     run_cmd "server-core multipart trace" cargo test -p server-core multipart_trace_tests
     run_cmd "server-core reclaim trace" cargo test -p server-core multipart_reclaim_trace_tests
+    run_cmd "server-core object-lock and retention" cargo test -p server-core object_lock
+    run_cmd "server-core lifecycle behavior" cargo test -p server-core lifecycle_
+    run_cmd "observability redaction primitives" cargo test -p observability
+    run_cmd "storage integrity" cargo test -p storage integrity
+    run_cmd "storage checksum metadata" cargo test -p storage checksum
     run_cmd "server-http" cargo test -p server-http
     run_cmd "s3-http-tests" cargo test -p s3-http-tests
     run_cmd "s3-local-tests" cargo test -p s3-local-tests
@@ -101,10 +135,13 @@ run_group() {
         authz) run_authz ;;
         parser) run_parser ;;
         stateful) run_stateful ;;
+        lifecycle) run_lifecycle ;;
         transport) run_transport ;;
+        redaction) run_redaction ;;
+        integrity) run_integrity ;;
         all) run_all ;;
         list)
-            printf '%s\n' fast authn authz parser stateful transport all
+            printf '%s\n' fast authn authz parser stateful lifecycle transport redaction integrity all
             ;;
         help|-h|--help)
             usage
