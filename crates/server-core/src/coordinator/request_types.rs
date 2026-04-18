@@ -653,6 +653,15 @@ pub struct GetObjectAttributesRequest<'a> {
 }
 
 /// Request for a CompleteMultipartUpload operation.
+#[derive(Debug, Clone)]
+pub struct CompletePart {
+    pub part_number: u32,
+    pub etag: String,
+    /// Per-part checksum from the request XML.
+    pub checksum: Option<ChecksumClaim>,
+}
+
+/// Request for a CompleteMultipartUpload operation.
 #[derive(Debug)]
 pub struct CompleteMultipartUploadRequest<'a> {
     pub upload: MultipartObjectRequest<'a>,
