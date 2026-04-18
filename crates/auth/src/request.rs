@@ -169,62 +169,13 @@ impl HeaderSource for [(String, String)] {
     }
 }
 
-/// Authenticate a request and return identity context.
+/// Authenticate a SigV4 request and return identity context.
 ///
-/// Phase 1 behavior: header-based SigV4 only.
+/// Pass `Some(region)` for normal request authentication.
+/// Pass `None` only when a higher-level caller will validate the SigV4 region
+/// after authentication, such as bucket-aware endpoint routing.
 #[allow(clippy::too_many_arguments)]
 pub fn authenticate_request<H: HeaderSource + ?Sized>(
-    method: &str,
-    path: &str,
-    query_string: &str,
-    headers: &H,
-    body: &[u8],
-    store: &CredentialStore,
-    expected_region: &str,
-    expected_service: &str,
-    now_epoch_secs: u64,
-) -> Result<AuthContext, AuthError> {
-    authenticate_request_inner(
-        method,
-        path,
-        query_string,
-        headers,
-        body,
-        store,
-        Some(expected_region),
-        expected_service,
-        now_epoch_secs,
-    )
-}
-
-/// Authenticate a request while deferring SigV4 region validation to a
-/// higher-level bucket-aware caller.
-#[allow(clippy::too_many_arguments)]
-pub fn authenticate_request_allow_wrong_region<H: HeaderSource + ?Sized>(
-    method: &str,
-    path: &str,
-    query_string: &str,
-    headers: &H,
-    body: &[u8],
-    store: &CredentialStore,
-    expected_service: &str,
-    now_epoch_secs: u64,
-) -> Result<AuthContext, AuthError> {
-    authenticate_request_inner(
-        method,
-        path,
-        query_string,
-        headers,
-        body,
-        store,
-        None,
-        expected_service,
-        now_epoch_secs,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn authenticate_request_inner<H: HeaderSource + ?Sized>(
     method: &str,
     path: &str,
     query_string: &str,
@@ -726,7 +677,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -741,8 +692,18 @@ mod tests {
     fn authenticate_missing_auth_header() {
         let store = example_store();
         let headers = [("host", "examplebucket.s3.amazonaws.com")];
-        let err = authenticate_request("GET", "/", "", &headers, b"", &store, "us-east-1", "s3", 0)
-            .unwrap_err();
+        let err = authenticate_request(
+            "GET",
+            "/",
+            "",
+            &headers,
+            b"",
+            &store,
+            Some("us-east-1"),
+            "s3",
+            0,
+        )
+        .unwrap_err();
         assert!(matches!(err, AuthError::MissingAuth));
     }
 
@@ -753,8 +714,18 @@ mod tests {
             ("host", "examplebucket.s3.amazonaws.com"),
             ("x-amz-date", "20130524T000000Z"),
         ];
-        let err = authenticate_request("GET", "/", "", &headers, b"", &store, "us-east-1", "s3", 0)
-            .unwrap_err();
+        let err = authenticate_request(
+            "GET",
+            "/",
+            "",
+            &headers,
+            b"",
+            &store,
+            Some("us-east-1"),
+            "s3",
+            0,
+        )
+        .unwrap_err();
         assert!(matches!(err, AuthError::AccessDenied));
     }
 
@@ -797,7 +768,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             parse_amz_date("20240201T120500Z").unwrap(),
         )
@@ -852,7 +823,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             parse_amz_date("20240201T120500Z").unwrap(),
         )
@@ -899,7 +870,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             parse_amz_date("20240201T120500Z").unwrap(),
         )
@@ -918,7 +889,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -943,7 +914,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             parse_amz_date("20240201T120500Z").unwrap(),
         )
@@ -979,7 +950,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1013,7 +984,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             10,
         )
@@ -1027,8 +998,18 @@ mod tests {
     fn authenticate_empty_auth_header() {
         let store = example_store();
         let headers = [("authorization", "   "), ("host", "example.com")];
-        let err = authenticate_request("GET", "/", "", &headers, b"", &store, "us-east-1", "s3", 0)
-            .unwrap_err();
+        let err = authenticate_request(
+            "GET",
+            "/",
+            "",
+            &headers,
+            b"",
+            &store,
+            Some("us-east-1"),
+            "s3",
+            0,
+        )
+        .unwrap_err();
         assert!(matches!(err, AuthError::AccessDenied));
     }
 
@@ -1046,7 +1027,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1073,7 +1054,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1098,7 +1079,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1123,7 +1104,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1148,7 +1129,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1175,7 +1156,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1202,7 +1183,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1229,7 +1210,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1256,7 +1237,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1283,7 +1264,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1310,7 +1291,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1337,7 +1318,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1359,7 +1340,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1384,7 +1365,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1409,7 +1390,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1434,7 +1415,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1470,7 +1451,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1492,7 +1473,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1762,7 +1743,7 @@ mod tests {
             &headers_with_auth,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1828,7 +1809,7 @@ mod tests {
             &headers_with_auth,
             body,
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1886,7 +1867,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             parse_amz_date("20240201T120500Z").unwrap(),
         )
@@ -1917,7 +1898,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1948,7 +1929,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             200,
         )
@@ -1971,7 +1952,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -1994,7 +1975,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -2017,7 +1998,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -2045,7 +2026,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -2070,7 +2051,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )
@@ -2095,7 +2076,7 @@ mod tests {
             &headers,
             b"",
             &store,
-            "us-east-1",
+            Some("us-east-1"),
             "s3",
             0,
         )

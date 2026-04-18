@@ -14,10 +14,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use auth::{
-    authenticate_request, authenticate_request_allow_wrong_region, AuthContext, AuthMode,
-    CredentialStore,
-};
+use auth::{authenticate_request, AuthContext, AuthMode, CredentialStore};
 use bytes::Bytes;
 use hyper::body::{Body, Frame, SizeHint};
 
@@ -2695,13 +2692,14 @@ impl HttpFrontend {
         enforce_sigv4_time_skew(req, now)?;
 
         let auth_result = if defer_region_check {
-            authenticate_request_allow_wrong_region(
+            authenticate_request(
                 req.method.as_str(),
                 req.path(),
                 req.query_string(),
                 &req.header_source(),
                 &req.body,
                 &self.credentials,
+                None,
                 "s3",
                 now,
             )
@@ -2713,7 +2711,7 @@ impl HttpFrontend {
                 &req.header_source(),
                 &req.body,
                 &self.credentials,
-                self.coordinator.region(),
+                Some(self.coordinator.region()),
                 "s3",
                 now,
             )
