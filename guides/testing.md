@@ -38,6 +38,54 @@ cargo test -p s3-local-tests
 cargo test -p s3-diff-tests --test response_shape
 ```
 
+## Local Deep Tracing
+
+Deep tracing is now a non-default local/test-only facility. Production builds
+must not rely on it.
+
+The tracing code is compiled only when the relevant crate is built with the
+`deep-tracing` cargo feature. That means:
+
+- the normal production build command does not include deep tracing
+- local tests can opt in with `--features deep-tracing`
+- standalone local debugging can opt in explicitly when needed
+
+### Local `s3-tests` tracing
+
+For local embedded-server runs, enable the feature and then use the trace
+environment variables:
+
+| Variable | Description |
+|---|---|
+| `S3_TEST_TRACE` | Enables tracing for the local embedded test server |
+| `S3_TEST_TRACE_FILTER` | Sets `ARGMIN_TRACE_FILTER` for the local embedded test server |
+| `S3_TEST_TRACE_FILE` | Sets `ARGMIN_TRACE_FILE` directly |
+| `S3_TEST_TRACE_DIR` | Writes one trace file per test binary as `<dir>/<binary>.trace` |
+
+Example:
+
+```bash
+S3_TEST_TRACE=1 \
+S3_TEST_TRACE_FILTER=server_http,auth,server_core,storage,ec \
+S3_TEST_TRACE_DIR=/tmp/s3-test-traces \
+cargo test -p s3-tests --features deep-tracing --no-fail-fast
+```
+
+### Standalone local server tracing
+
+Use this only for local debugging, not production deployment:
+
+```bash
+ARGMIN_ACCOUNT_ID=111122223333 \
+ARGMIN_ACCESS_KEY_ID=admin \
+ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
+ARGMIN_SSE_S3_WRAPPING_KEY='<base64-encoded-32-byte-secret>' \
+ARGMIN_TRACE=1 \
+ARGMIN_TRACE_FILTER=server_http,auth,server_core,storage,ec \
+ARGMIN_TRACE_FILE=/tmp/argmin.trace \
+cargo run -p argmin-s3 --features deep-tracing --release
+```
+
 ## AWS-backed `s3-tests`
 
 This repo uses `crates/s3-tests` for AWS compatibility checks. External runs

@@ -42,9 +42,6 @@ The server is configured via environment variables:
 | `ARGMIN_MAX_CONNECTIONS` | `512` | Max concurrent TCP connections |
 | `ARGMIN_MAX_INFLIGHT_REQUESTS` | `32` | Max concurrent in-flight requests |
 | `ARGMIN_STREAM_READ_CHUNK_SIZE` | `8388608` | HTTP streaming read chunk size |
-| `ARGMIN_TRACE` | `0` | Enable local tracing when truthy |
-| `ARGMIN_TRACE_FILTER` | *(all targets)* | Comma-separated trace target filter |
-| `ARGMIN_TRACE_FILE` | *(stderr)* | Write trace lines to a file instead of stderr |
 
 If both `ARGMIN_TLS_CERT_PATH` and `ARGMIN_TLS_KEY_PATH` are set, the server
 accepts direct HTTPS on `ARGMIN_LISTEN_ADDR`. Both variables must be set
@@ -88,19 +85,6 @@ ARGMIN_ACCOUNT_ID=111122223333 \
 ARGMIN_ACCESS_KEY_ID=admin \
 ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
 ARGMIN_SSE_S3_WRAPPING_KEY='<base64-encoded-32-byte-secret>' \
-  ./target/release/argmin-s3
-```
-
-Enable tracing:
-
-```bash
-ARGMIN_ACCOUNT_ID=111122223333 \
-ARGMIN_ACCESS_KEY_ID=admin \
-ARGMIN_SECRET_ACCESS_KEY=useasecuresecretkey \
-ARGMIN_SSE_S3_WRAPPING_KEY='<base64-encoded-32-byte-secret>' \
-ARGMIN_TRACE=1 \
-ARGMIN_TRACE_FILTER=server_http,auth,server_core,storage,ec \
-ARGMIN_TRACE_FILE=/tmp/argmin.trace \
   ./target/release/argmin-s3
 ```
 
@@ -223,24 +207,6 @@ positive throughput failures on slower remote endpoints.
 
 Full AWS environment setup, including the committed IAM policy, required
 account-level S3 Block Public Access settings, the separate HTTP-only
-`s3-http-tests` crate, and the local-only `s3-local-tests` crate, is
-documented in
+`s3-http-tests` crate, the local-only `s3-local-tests` crate, and local
+deep-tracing instructions are documented in
 [`guides/testing.md`](guides/testing.md).
-
-For local `s3-tests`, the embedded test server also supports trace helpers:
-
-| Variable | Description |
-|---|---|
-| `S3_TEST_TRACE` | Enables tracing for the local embedded test server |
-| `S3_TEST_TRACE_FILTER` | Sets `ARGMIN_TRACE_FILTER` for the local embedded test server |
-| `S3_TEST_TRACE_FILE` | Sets `ARGMIN_TRACE_FILE` directly |
-| `S3_TEST_TRACE_DIR` | Writes one trace file per test binary as `<dir>/<binary>.trace` |
-
-Example:
-
-```bash
-S3_TEST_TRACE=1 \
-S3_TEST_TRACE_FILTER=server_http,auth,server_core,storage,ec \
-S3_TEST_TRACE_DIR=/tmp/s3-test-traces \
-cargo test -p s3-tests --no-fail-fast
-```
