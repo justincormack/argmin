@@ -2,9 +2,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use checksum::{
-    ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksumConfig, RawChecksum,
-};
+use checksum::{ChecksumAlgorithm, RawChecksum};
+#[cfg(test)]
+use checksum::{ChecksumType, MultipartChecksumConfig};
 use ec::{EcConfig, ErasureCodec};
 use s3_types::{
     aws_account_id_from_principal, AclGrant, AclGrantee, AclGrants, AclPermission,
@@ -15,7 +15,9 @@ pub(crate) use s3_types::{
     AccountIdentity, BucketNamespace, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode,
     ObjectRetention, RetentionPeriod,
 };
-use storage::traits::{PgMetadataStore, ShardStore};
+use storage::traits::PgMetadataStore;
+#[cfg(test)]
+use storage::traits::ShardStore;
 #[cfg(test)]
 use storage::ObjectEncryption;
 #[cfg(test)]
@@ -27,13 +29,14 @@ use storage::SimplePayloadReclaimRecord;
 #[cfg(test)]
 use storage::{BucketEncryptionConfig, EffectiveBucketEncryptionConfig, ObjectLayout};
 use storage::{
-    BucketName, BucketObjectLockConfig, BucketOwnershipControls, BucketState, CommitMultipartReq,
-    CreateMultipartUploadReq, CreateStreamUploadReq, EcShape, GenerationId,
-    ListMultipartUploadsReq, ListPartsReq, ManagedEncryptionAlgorithm, MultipartPartRecord,
-    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectPartRecord, OwnerIdentity,
-    PublicAccessBlockConfig, SerializedMetadataBlob, SerializedSystemMetadataBlob,
-    SerializedTagSet, SessionId, ShardKey, SharedStorageNode, StoredObject, StreamUploadState,
-    StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
+    BucketName, BucketObjectLockConfig, BucketOwnershipControls, BucketState,
+    ManagedEncryptionAlgorithm, MultipartUploadRecord, ObjectKey, OwnerIdentity,
+    PublicAccessBlockConfig, ShardKey, SharedStorageNode, StoredObject, UploadState,
+};
+#[cfg(test)]
+use storage::{
+    CreateStreamUploadReq, EcShape, GenerationId, SessionId, StreamUploadTarget, UploadId,
+    UPLOAD_ID_LEN,
 };
 
 use self::authz::CachedBucketPolicy;
@@ -43,7 +46,6 @@ pub use self::authz_types::{
 };
 use self::authz_types::{AuthorizedPutObjectWriteAcl, ValidatedBucket};
 use self::lifecycle::CachedBucketLifecycle;
-use self::object_state::StaleObjectPayload;
 #[cfg(test)]
 use self::payload::encode_parity_scratch_len;
 #[cfg(test)]
@@ -72,7 +74,8 @@ pub use crate::checksum_claim::{ChecksumClaim, EncodedChecksumClaim};
 use crate::conditional::DeleteCondition;
 #[cfg(test)]
 use crate::conditional::ReadCondition;
-use crate::conditional::{check_write_conditions, WriteCondition};
+#[cfg(test)]
+use crate::conditional::WriteCondition;
 use crate::error::ServerError;
 #[cfg(test)]
 use crate::range::ByteRange;
@@ -144,18 +147,20 @@ fn read_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
 fn write_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     lock.write().unwrap_or_else(|err| err.into_inner())
 }
-use crate::etag::{compute_multipart_etag, crc64_to_etag_bytes, etag_bytes_to_crc64, format_etag};
+#[cfg(test)]
+use crate::etag::format_etag;
 #[cfg(test)]
 use crate::metadata_blob::MetadataBlob;
 #[cfg(test)]
 use crate::pg::object_key_hash;
-use crate::pg::{part_key_hash, PgTopology};
+use crate::pg::PgTopology;
 #[cfg(test)]
 use crate::sse::SSE_C_SEGMENT_TAG_LEN;
 use crate::sse::{
     SseCustomerRequest, SseCustomerSegmentScope, SseCustomerValidatorConfig,
     StaticManagedKeyProvider,
 };
+#[cfg(test)]
 use crate::system_metadata::SystemMetadata;
 
 const TRACE_TARGET: &str = "server_core";
