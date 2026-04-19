@@ -1,5 +1,8 @@
 use checksum::{ChecksumAlgorithm, ChecksumType};
-use s3_types::WebsiteRedirectLocation;
+use s3_types::{
+    CacheControl, ContentDisposition, ContentEncoding, ContentLanguage, ContentType, Expires,
+    WebsiteRedirectLocation,
+};
 
 use crate::error::ServerError;
 
@@ -59,12 +62,12 @@ impl ObjectChecksumMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SystemMetadata {
-    content_type: Option<String>,
-    content_encoding: Option<String>,
-    cache_control: Option<String>,
-    content_disposition: Option<String>,
-    content_language: Option<String>,
-    expires: Option<String>,
+    content_type: Option<ContentType>,
+    content_encoding: Option<ContentEncoding>,
+    cache_control: Option<CacheControl>,
+    content_disposition: Option<ContentDisposition>,
+    content_language: Option<ContentLanguage>,
+    expires: Option<Expires>,
     checksum: Option<ObjectChecksumMetadata>,
     website_redirect_location: Option<WebsiteRedirectLocation>,
 }
@@ -149,12 +152,35 @@ impl SystemMetadata {
                 }
             }
             match lower.as_str() {
-                "content-type" => out.content_type = Some(value.to_string()),
-                "content-encoding" => out.content_encoding = Some(value.to_string()),
-                "cache-control" => out.cache_control = Some(value.to_string()),
-                "content-disposition" => out.content_disposition = Some(value.to_string()),
-                "content-language" => out.content_language = Some(value.to_string()),
-                "expires" => out.expires = Some(value.to_string()),
+                "content-type" => {
+                    out.content_type =
+                        Some(ContentType::new(value).expect("header size checks must bound value"));
+                }
+                "content-encoding" => {
+                    out.content_encoding = Some(
+                        ContentEncoding::new(value).expect("header size checks must bound value"),
+                    );
+                }
+                "cache-control" => {
+                    out.cache_control = Some(
+                        CacheControl::new(value).expect("header size checks must bound value"),
+                    );
+                }
+                "content-disposition" => {
+                    out.content_disposition = Some(
+                        ContentDisposition::new(value)
+                            .expect("header size checks must bound value"),
+                    );
+                }
+                "content-language" => {
+                    out.content_language = Some(
+                        ContentLanguage::new(value).expect("header size checks must bound value"),
+                    );
+                }
+                "expires" => {
+                    out.expires =
+                        Some(Expires::new(value).expect("header size checks must bound value"));
+                }
                 "x-amz-website-redirect-location" => {
                     out.website_redirect_location =
                         Some(WebsiteRedirectLocation::new(value).map_err(|err| {
@@ -191,12 +217,39 @@ impl SystemMetadata {
         let mut out = Self::new();
         for (k, v) in pairs {
             match *k {
-                "content-type" => out.content_type = Some((*v).to_string()),
-                "content-encoding" => out.content_encoding = Some((*v).to_string()),
-                "cache-control" => out.cache_control = Some((*v).to_string()),
-                "content-disposition" => out.content_disposition = Some((*v).to_string()),
-                "content-language" => out.content_language = Some((*v).to_string()),
-                "expires" => out.expires = Some((*v).to_string()),
+                "content-type" => {
+                    out.content_type = Some(
+                        ContentType::new(*v).expect("trusted system metadata pairs must be valid"),
+                    );
+                }
+                "content-encoding" => {
+                    out.content_encoding = Some(
+                        ContentEncoding::new(*v)
+                            .expect("trusted system metadata pairs must be valid"),
+                    );
+                }
+                "cache-control" => {
+                    out.cache_control = Some(
+                        CacheControl::new(*v).expect("trusted system metadata pairs must be valid"),
+                    );
+                }
+                "content-disposition" => {
+                    out.content_disposition = Some(
+                        ContentDisposition::new(*v)
+                            .expect("trusted system metadata pairs must be valid"),
+                    );
+                }
+                "content-language" => {
+                    out.content_language = Some(
+                        ContentLanguage::new(*v)
+                            .expect("trusted system metadata pairs must be valid"),
+                    );
+                }
+                "expires" => {
+                    out.expires = Some(
+                        Expires::new(*v).expect("trusted system metadata pairs must be valid"),
+                    );
+                }
                 "x-amz-website-redirect-location" => {
                     out.website_redirect_location = Some(
                         WebsiteRedirectLocation::new(*v)
@@ -226,33 +279,33 @@ impl SystemMetadata {
     }
 
     #[must_use]
-    pub fn content_type(&self) -> Option<&str> {
-        self.content_type.as_deref()
+    pub fn content_type(&self) -> Option<&ContentType> {
+        self.content_type.as_ref()
     }
 
     #[must_use]
-    pub fn content_encoding(&self) -> Option<&str> {
-        self.content_encoding.as_deref()
+    pub fn content_encoding(&self) -> Option<&ContentEncoding> {
+        self.content_encoding.as_ref()
     }
 
     #[must_use]
-    pub fn cache_control(&self) -> Option<&str> {
-        self.cache_control.as_deref()
+    pub fn cache_control(&self) -> Option<&CacheControl> {
+        self.cache_control.as_ref()
     }
 
     #[must_use]
-    pub fn content_disposition(&self) -> Option<&str> {
-        self.content_disposition.as_deref()
+    pub fn content_disposition(&self) -> Option<&ContentDisposition> {
+        self.content_disposition.as_ref()
     }
 
     #[must_use]
-    pub fn content_language(&self) -> Option<&str> {
-        self.content_language.as_deref()
+    pub fn content_language(&self) -> Option<&ContentLanguage> {
+        self.content_language.as_ref()
     }
 
     #[must_use]
-    pub fn expires(&self) -> Option<&str> {
-        self.expires.as_deref()
+    pub fn expires(&self) -> Option<&Expires> {
+        self.expires.as_ref()
     }
 
     #[must_use]
@@ -303,15 +356,23 @@ impl SystemMetadata {
         let Some(encoding) = self.content_encoding.as_ref() else {
             return;
         };
-        let filtered: Vec<&str> = encoding
-            .split(',')
-            .map(str::trim)
+        let original = encoding.as_str();
+        let parts: Vec<&str> = original.split(',').map(str::trim).collect();
+        let filtered: Vec<&str> = parts
+            .iter()
+            .copied()
             .filter(|part| !part.eq_ignore_ascii_case("aws-chunked"))
             .collect();
+        if filtered.len() == parts.len() {
+            return;
+        }
         if filtered.is_empty() {
             self.content_encoding = None;
         } else {
-            self.content_encoding = Some(filtered.join(", "));
+            self.content_encoding = Some(
+                ContentEncoding::new(filtered.join(", "))
+                    .expect("filtered content-encoding must stay valid"),
+            );
         }
     }
 
@@ -406,12 +467,14 @@ impl SystemMetadata {
         out.extend_from_slice(&flags.to_le_bytes());
 
         for value in [
-            self.content_type.as_deref(),
-            self.content_encoding.as_deref(),
-            self.cache_control.as_deref(),
-            self.content_disposition.as_deref(),
-            self.content_language.as_deref(),
-            self.expires.as_deref(),
+            self.content_type.as_ref().map(ContentType::as_str),
+            self.content_encoding.as_ref().map(ContentEncoding::as_str),
+            self.cache_control.as_ref().map(CacheControl::as_str),
+            self.content_disposition
+                .as_ref()
+                .map(ContentDisposition::as_str),
+            self.content_language.as_ref().map(ContentLanguage::as_str),
+            self.expires.as_ref().map(Expires::as_str),
             self.website_redirect_location
                 .as_ref()
                 .map(WebsiteRedirectLocation::as_str),
@@ -484,32 +547,65 @@ impl SystemMetadata {
         }
 
         let content_type = if flags & CONTENT_TYPE_BIT != 0 {
-            Some(read_system_string(data, &mut pos, "content-type")?)
+            Some(
+                ContentType::new(read_system_string(data, &mut pos, "content-type")?).map_err(
+                    |err| ServerError::MetadataBlobError {
+                        reason: format!("invalid content-type metadata: {err}"),
+                    },
+                )?,
+            )
         } else {
             None
         };
         let content_encoding = if flags & CONTENT_ENCODING_BIT != 0 {
-            Some(read_system_string(data, &mut pos, "content-encoding")?)
+            Some(
+                ContentEncoding::new(read_system_string(data, &mut pos, "content-encoding")?)
+                    .map_err(|err| ServerError::MetadataBlobError {
+                        reason: format!("invalid content-encoding metadata: {err}"),
+                    })?,
+            )
         } else {
             None
         };
         let cache_control = if flags & CACHE_CONTROL_BIT != 0 {
-            Some(read_system_string(data, &mut pos, "cache-control")?)
+            Some(
+                CacheControl::new(read_system_string(data, &mut pos, "cache-control")?).map_err(
+                    |err| ServerError::MetadataBlobError {
+                        reason: format!("invalid cache-control metadata: {err}"),
+                    },
+                )?,
+            )
         } else {
             None
         };
         let content_disposition = if flags & CONTENT_DISPOSITION_BIT != 0 {
-            Some(read_system_string(data, &mut pos, "content-disposition")?)
+            Some(
+                ContentDisposition::new(read_system_string(data, &mut pos, "content-disposition")?)
+                    .map_err(|err| ServerError::MetadataBlobError {
+                        reason: format!("invalid content-disposition metadata: {err}"),
+                    })?,
+            )
         } else {
             None
         };
         let content_language = if flags & CONTENT_LANGUAGE_BIT != 0 {
-            Some(read_system_string(data, &mut pos, "content-language")?)
+            Some(
+                ContentLanguage::new(read_system_string(data, &mut pos, "content-language")?)
+                    .map_err(|err| ServerError::MetadataBlobError {
+                        reason: format!("invalid content-language metadata: {err}"),
+                    })?,
+            )
         } else {
             None
         };
         let expires = if flags & EXPIRES_BIT != 0 {
-            Some(read_system_string(data, &mut pos, "expires")?)
+            Some(
+                Expires::new(read_system_string(data, &mut pos, "expires")?).map_err(|err| {
+                    ServerError::MetadataBlobError {
+                        reason: format!("invalid expires metadata: {err}"),
+                    }
+                })?,
+            )
         } else {
             None
         };
@@ -590,8 +686,14 @@ mod tests {
             ("X-Amz-Checksum-Type", "FULL_OBJECT"),
         ])
         .unwrap();
-        assert_eq!(metadata.content_type(), Some("text/plain"));
-        assert_eq!(metadata.cache_control(), Some("no-cache"));
+        assert_eq!(
+            metadata.content_type().map(ContentType::as_str),
+            Some("text/plain")
+        );
+        assert_eq!(
+            metadata.cache_control().map(CacheControl::as_str),
+            Some("no-cache")
+        );
         assert_eq!(
             metadata
                 .website_redirect_location()
@@ -607,8 +709,8 @@ mod tests {
     #[test]
     fn round_trip() {
         let mut metadata = SystemMetadata::new();
-        metadata.content_type = Some("text/plain".to_string());
-        metadata.content_encoding = Some("gzip".to_string());
+        metadata.content_type = Some(ContentType::new("text/plain").unwrap());
+        metadata.content_encoding = Some(ContentEncoding::new("gzip").unwrap());
         metadata.website_redirect_location =
             Some(WebsiteRedirectLocation::new("/docs/start.html").unwrap());
         metadata.set_checksum(
@@ -626,14 +728,22 @@ mod tests {
         let mut metadata =
             SystemMetadata::from_headers(&[("Content-Encoding", "gzip, aws-chunked")]).unwrap();
         metadata.strip_aws_chunked_content_encoding();
-        assert_eq!(metadata.content_encoding(), Some("gzip"));
+        assert_eq!(
+            metadata.content_encoding().map(ContentEncoding::as_str),
+            Some("gzip")
+        );
     }
 
     #[test]
     fn from_headers_accepts_system_metadata_at_limit() {
         let value = "v".repeat(SYSTEM_METADATA_SIZE_LIMIT - "content-disposition".len());
         let metadata = SystemMetadata::from_headers(&[("Content-Disposition", &value)]).unwrap();
-        assert_eq!(metadata.content_disposition(), Some(value.as_str()));
+        assert_eq!(
+            metadata
+                .content_disposition()
+                .map(ContentDisposition::as_str),
+            Some(value.as_str())
+        );
     }
 
     #[test]

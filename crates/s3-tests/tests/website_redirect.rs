@@ -8,6 +8,9 @@ use s3_tests::{
     sigv4_post_fields_for_credentials, unique_bucket, CTX,
 };
 
+const SYSTEM_METADATA_SIZE_LIMIT: usize = 2 * 1024;
+const WEBSITE_REDIRECT_HEADER_NAME: &str = "x-amz-website-redirect-location";
+
 fn aws_conformance_mode() -> bool {
     std::env::var_os("S3_TEST_ENDPOINT").is_some()
 }
@@ -125,6 +128,45 @@ fn assert_raw_s3_error_code(response: &s3_tests::RawResponse, status: u16, code:
     );
 }
 
+fn assert_raw_metadata_too_large(response: &s3_tests::RawResponse, expected_size: usize) {
+    assert_raw_s3_error_code(response, 400, "MetadataTooLarge");
+    assert!(
+        response.body.contains(
+            "<Message>Your metadata headers exceed the maximum allowed metadata size</Message>"
+        ),
+        "expected MetadataTooLarge message, got: {}",
+        response.body
+    );
+    assert!(
+        response
+            .body
+            .contains(&format!("<Size>{expected_size}</Size>")),
+        "expected Size={expected_size}, got: {}",
+        response.body
+    );
+    assert!(
+        response
+            .body
+            .contains("<MaxSizeAllowed>2048</MaxSizeAllowed>"),
+        "expected MaxSizeAllowed=2048, got: {}",
+        response.body
+    );
+}
+
+fn redirect_value_with_len(len: usize) -> String {
+    assert!(len >= 1, "redirect length must allow leading slash");
+    format!("/{}", "r".repeat(len - 1))
+}
+
+fn put_object_with_raw_headers(
+    bucket: &str,
+    key: &str,
+    headers: Vec<(String, String)>,
+) -> s3_tests::RawResponse {
+    let url = object_url(CTX.endpoint(), bucket, key, None);
+    s3_tests::send_signed_request("PUT", &url, b"redirect-boundary-body", headers)
+}
+
 #[test]
 fn test_put_object_website_redirect_round_trips_on_head_and_get() {
     s3_tests::run(async {
@@ -235,6 +277,124 @@ fn test_put_object_website_redirect_unsupported_scheme_rejected() {
             .send()
             .await;
         assert!(head.is_err(), "invalid redirect should not create object");
+
+        cleanup_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_put_object_website_redirect_exact_2k_with_header_name_is_accepted() {
+    s3_tests::run(async {
+        if skip_without_external_endpoint() {
+            return;
+        }
+
+        let bucket = setup_bucket().await;
+        let key = "redirect-2k-exact";
+        let redirect_len = SYSTEM_METADATA_SIZE_LIMIT - WEBSITE_REDIRECT_HEADER_NAME.len();
+        let redirect = redirect_value_with_len(redirect_len);
+
+        let response = put_object_with_raw_headers(
+            &bucket,
+            key,
+            vec![(WEBSITE_REDIRECT_HEADER_NAME.to_string(), redirect.clone())],
+        );
+        assert_eq!(
+            response.status, 200,
+            "unexpected response body: {}",
+            response.body
+        );
+
+        let head = CTX
+            .client()
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(head.website_redirect_location(), Some(redirect.as_str()));
+
+        cleanup_object_and_bucket(&bucket, key).await;
+    });
+}
+
+#[test]
+fn test_put_object_website_redirect_lengths_over_aggregate_limit_are_rejected() {
+    s3_tests::run(async {
+        if skip_without_external_endpoint() {
+            return;
+        }
+
+        let bucket = setup_bucket().await;
+
+        for redirect_len in [
+            SYSTEM_METADATA_SIZE_LIMIT - WEBSITE_REDIRECT_HEADER_NAME.len() + 1,
+            SYSTEM_METADATA_SIZE_LIMIT,
+            SYSTEM_METADATA_SIZE_LIMIT + 1,
+        ] {
+            let expected_size = WEBSITE_REDIRECT_HEADER_NAME.len() + redirect_len;
+            let key = format!("redirect-over-limit-{redirect_len}");
+            let redirect = redirect_value_with_len(redirect_len);
+            let response = put_object_with_raw_headers(
+                &bucket,
+                &key,
+                vec![(WEBSITE_REDIRECT_HEADER_NAME.to_string(), redirect)],
+            );
+            assert_raw_metadata_too_large(&response, expected_size);
+
+            let head = CTX
+                .client()
+                .head_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await;
+            assert!(
+                head.is_err(),
+                "over-limit redirect should not create object"
+            );
+        }
+
+        cleanup_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_put_object_website_redirect_exact_2k_plus_small_system_header_is_rejected() {
+    s3_tests::run(async {
+        if skip_without_external_endpoint() {
+            return;
+        }
+
+        let bucket = setup_bucket().await;
+        let key = "redirect-plus-cache-control";
+        let redirect_len = SYSTEM_METADATA_SIZE_LIMIT - WEBSITE_REDIRECT_HEADER_NAME.len();
+        let redirect = redirect_value_with_len(redirect_len);
+
+        let response = put_object_with_raw_headers(
+            &bucket,
+            key,
+            vec![
+                (WEBSITE_REDIRECT_HEADER_NAME.to_string(), redirect),
+                ("cache-control".to_string(), "x".to_string()),
+            ],
+        );
+        let expected_size =
+            WEBSITE_REDIRECT_HEADER_NAME.len() + redirect_len + "cache-control".len() + "x".len();
+        assert_raw_metadata_too_large(&response, expected_size);
+
+        let head = CTX
+            .client()
+            .head_object()
+            .bucket(&bucket)
+            .key(key)
+            .send()
+            .await;
+        assert!(
+            head.is_err(),
+            "aggregate over-limit request should not create object"
+        );
 
         cleanup_bucket(&bucket).await;
     });

@@ -786,7 +786,10 @@ fn copy_object_metadata_copy_directive() {
             cond: NO_READ,
         })
         .unwrap();
-    assert_eq!(obj.system_metadata.content_type(), Some("image/png"));
+    assert_eq!(
+        obj.system_metadata.content_type().map(|v| v.as_str()),
+        Some("image/png")
+    );
     assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
 }
 
@@ -864,7 +867,10 @@ fn copy_object_metadata_replace_directive() {
         })
         .unwrap();
     assert_eq!(obj.body.read_all().unwrap(), b"data");
-    assert_eq!(obj.system_metadata.content_type(), Some("text/html"));
+    assert_eq!(
+        obj.system_metadata.content_type().map(|v| v.as_str()),
+        Some("text/html")
+    );
     assert_eq!(obj.metadata.get("x-amz-meta-version"), Some("2"));
     // Old metadata should be gone
     assert_eq!(obj.metadata.get("x-amz-meta-author"), None);
@@ -941,7 +947,10 @@ fn copy_object_same_key_replace_metadata() {
         })
         .unwrap();
     assert_eq!(obj.body.read_all().unwrap(), b"data");
-    assert_eq!(obj.system_metadata.content_type(), Some("application/json"));
+    assert_eq!(
+        obj.system_metadata.content_type().map(|v| v.as_str()),
+        Some("application/json")
+    );
 }
 
 #[test]
@@ -1663,7 +1672,10 @@ fn copy_object_cross_bucket() {
         })
         .unwrap();
     assert_eq!(obj.body.read_all().unwrap(), b"cross bucket data");
-    assert_eq!(obj.system_metadata.content_type(), Some("text/plain"));
+    assert_eq!(
+        obj.system_metadata.content_type().map(|v| v.as_str()),
+        Some("text/plain")
+    );
 
     // Source should still exist
     let src = coord

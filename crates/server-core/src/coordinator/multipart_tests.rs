@@ -1189,7 +1189,10 @@ fn create_multipart_upload_preserves_metadata() {
     assert_eq!(blob.get("x-amz-meta-author"), Some("test"));
     let stored_system =
         SystemMetadata::deserialize(record.system_metadata_blob.as_slice()).unwrap();
-    assert_eq!(stored_system.content_type(), Some("image/png"));
+    assert_eq!(
+        stored_system.content_type().map(|v| v.as_str()),
+        Some("image/png")
+    );
 }
 
 #[test]

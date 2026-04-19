@@ -648,24 +648,24 @@ impl S3Response {
 
     fn apply_system_metadata_headers(mut self, metadata: &SystemMetadata) -> Self {
         if let Some(content_type) = metadata.content_type() {
-            self = self.header("Content-Type", content_type);
+            self = self.header("Content-Type", content_type.as_str());
         } else {
             self = self.header("Content-Type", "application/octet-stream");
         }
         if let Some(content_encoding) = metadata.content_encoding() {
-            self = self.header("Content-Encoding", content_encoding);
+            self = self.header("Content-Encoding", content_encoding.as_str());
         }
         if let Some(cache_control) = metadata.cache_control() {
-            self = self.header("Cache-Control", cache_control);
+            self = self.header("Cache-Control", cache_control.as_str());
         }
         if let Some(content_disposition) = metadata.content_disposition() {
-            self = self.header("Content-Disposition", content_disposition);
+            self = self.header("Content-Disposition", content_disposition.as_str());
         }
         if let Some(content_language) = metadata.content_language() {
-            self = self.header("Content-Language", content_language);
+            self = self.header("Content-Language", content_language.as_str());
         }
         if let Some(expires) = metadata.expires() {
-            self = self.header("Expires", expires);
+            self = self.header("Expires", expires.as_str());
         }
         self
     }

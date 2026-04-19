@@ -16,6 +16,12 @@ pub const WEBSITE_REDIRECT_LOCATION_HEADER_NAME: &str = "x-amz-website-redirect-
 /// 2 KiB system-metadata budget once the header name itself is accounted for.
 pub const MAX_WEBSITE_REDIRECT_LOCATION_LEN: usize =
     2 * 1024 - WEBSITE_REDIRECT_LOCATION_HEADER_NAME.len();
+pub const MAX_CONTENT_TYPE_LEN: usize = 2 * 1024 - "content-type".len();
+pub const MAX_CONTENT_ENCODING_LEN: usize = 2 * 1024 - "content-encoding".len();
+pub const MAX_CACHE_CONTROL_LEN: usize = 2 * 1024 - "cache-control".len();
+pub const MAX_CONTENT_DISPOSITION_LEN: usize = 2 * 1024 - "content-disposition".len();
+pub const MAX_CONTENT_LANGUAGE_LEN: usize = 2 * 1024 - "content-language".len();
+pub const MAX_EXPIRES_LEN: usize = 2 * 1024 - "expires".len();
 
 /// AWS account IDs are 12 decimal digits.
 pub const AWS_ACCOUNT_ID_LEN: usize = 12;
@@ -100,6 +106,127 @@ pub fn aws_account_id_from_principal(principal: &str) -> Option<&str> {
     let _resource = parts.next()?;
     is_valid_aws_account_id(account_id).then_some(account_id)
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredHeaderValueValidationError {
+    InvalidLength { length: usize },
+    InvalidHeaderBytes,
+}
+
+fn validate_stored_header_value(
+    value: &str,
+    max_len: usize,
+) -> Result<(), StoredHeaderValueValidationError> {
+    if value.len() > max_len {
+        return Err(StoredHeaderValueValidationError::InvalidLength {
+            length: value.len(),
+        });
+    }
+    if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return Err(StoredHeaderValueValidationError::InvalidHeaderBytes);
+    }
+    Ok(())
+}
+
+macro_rules! bounded_system_metadata_value {
+    ($name:ident, $error:ident, $header_name:literal, $max_len:ident) => {
+        #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+        pub enum $error {
+            #[error(
+                                "{field_name} value must be at most {max} bytes, got {length}",
+                                field_name = $header_name
+                            )]
+            InvalidLength { length: usize, max: usize },
+            #[error("{field_name} value contains invalid header bytes", field_name = $header_name)]
+            InvalidHeaderBytes,
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn new(value: impl Into<String>) -> Result<Self, $error> {
+                let value = value.into();
+                match validate_stored_header_value(&value, $max_len) {
+                    Ok(()) => Ok(Self(value)),
+                    Err(StoredHeaderValueValidationError::InvalidLength { length }) => {
+                        Err($error::InvalidLength {
+                            length,
+                            max: $max_len,
+                        })
+                    }
+                    Err(StoredHeaderValueValidationError::InvalidHeaderBytes) => {
+                        Err($error::InvalidHeaderBytes)
+                    }
+                }
+            }
+
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+
+            #[must_use]
+            pub fn into_string(self) -> String {
+                self.0
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = $error;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl TryFrom<&str> for $name {
+            type Error = $error;
+
+            fn try_from(value: &str) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+    };
+}
+
+bounded_system_metadata_value!(
+    ContentType,
+    ContentTypeError,
+    "content-type",
+    MAX_CONTENT_TYPE_LEN
+);
+bounded_system_metadata_value!(
+    ContentEncoding,
+    ContentEncodingError,
+    "content-encoding",
+    MAX_CONTENT_ENCODING_LEN
+);
+bounded_system_metadata_value!(
+    CacheControl,
+    CacheControlError,
+    "cache-control",
+    MAX_CACHE_CONTROL_LEN
+);
+bounded_system_metadata_value!(
+    ContentDisposition,
+    ContentDispositionError,
+    "content-disposition",
+    MAX_CONTENT_DISPOSITION_LEN
+);
+bounded_system_metadata_value!(
+    ContentLanguage,
+    ContentLanguageError,
+    "content-language",
+    MAX_CONTENT_LANGUAGE_LEN
+);
+bounded_system_metadata_value!(Expires, ExpiresError, "expires", MAX_EXPIRES_LEN);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WebsiteRedirectLocationError {
@@ -809,11 +936,12 @@ mod tests {
         aws_account_id_from_principal, bucket_location_constraint, is_legacy_create_bucket_region,
         is_valid_aws_account_id, parse_account_regional_bucket_name, requires_sigv4,
         supports_legacy_sigv2, AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission,
-        BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, LegalHoldStatus,
-        MAX_WEBSITE_REDIRECT_LOCATION_LEN, ObjectLockDefaultRetention, ObjectLockMode,
-        ObjectLockState, ObjectRetention, RetentionPeriod, StoredLegalHoldStatus, VersionId,
-        WebsiteRedirectLocation, WebsiteRedirectLocationError,
-        ANONYMOUS_UPLOAD_CANONICAL_USER_ID, CANONICAL_USER_ID_LEN,
+        BucketObjectLockConfig, BucketVersioningState, CacheControl, CanonicalUserId,
+        ContentEncoding, ContentType, Expires, LegalHoldStatus, ObjectLockDefaultRetention,
+        ObjectLockMode, ObjectLockState, ObjectRetention, RetentionPeriod, StoredLegalHoldStatus,
+        VersionId, WebsiteRedirectLocation, WebsiteRedirectLocationError,
+        ANONYMOUS_UPLOAD_CANONICAL_USER_ID, CANONICAL_USER_ID_LEN, MAX_CONTENT_TYPE_LEN,
+        MAX_WEBSITE_REDIRECT_LOCATION_LEN,
     };
 
     #[test]
@@ -1041,6 +1169,30 @@ mod tests {
             "reader",
         );
         assert_eq!(account.account_id(), Some("111122223333"));
+    }
+
+    #[test]
+    fn content_type_accepts_empty_and_regular_values() {
+        assert_eq!(ContentType::new("").unwrap().as_str(), "");
+        assert_eq!(
+            ContentType::new("text/plain").unwrap().as_str(),
+            "text/plain"
+        );
+    }
+
+    #[test]
+    fn content_type_rejects_oversized_values() {
+        let err = ContentType::new("t".repeat(MAX_CONTENT_TYPE_LEN + 1)).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("content-type value must be at most"));
+    }
+
+    #[test]
+    fn stored_http_header_values_reject_invalid_header_bytes() {
+        assert!(ContentEncoding::new("gzip\nbr").is_err());
+        assert!(CacheControl::new("max-age=60\x7f").is_err());
+        assert!(Expires::new("Wed, 21 Oct 2015 07:28:00 GMT\n").is_err());
     }
 
     #[test]

@@ -1753,7 +1753,10 @@ fn put_get_object() {
         .unwrap();
     assert_eq!(obj.body.read_all().unwrap(), b"Hello, world!");
     assert_eq!(obj.size, 13);
-    assert_eq!(obj.system_metadata.content_type(), Some("text/plain"));
+    assert_eq!(
+        obj.system_metadata.content_type().map(|v| v.as_str()),
+        Some("text/plain")
+    );
 }
 
 #[test]
@@ -1804,7 +1807,10 @@ fn put_get_with_metadata() {
         })
         .unwrap();
     assert_eq!(obj.body.read_all().unwrap(), b"{}");
-    assert_eq!(obj.system_metadata.content_type(), Some("application/json"));
+    assert_eq!(
+        obj.system_metadata.content_type().map(|v| v.as_str()),
+        Some("application/json")
+    );
     assert_eq!(obj.metadata.get("x-amz-meta-author"), Some("alice"));
     assert_eq!(obj.metadata.get("x-amz-meta-version"), Some("42"));
 }
@@ -1851,7 +1857,10 @@ fn head_object() {
         })
         .unwrap();
     assert_eq!(head.size, 4);
-    assert_eq!(head.system_metadata.content_type(), Some("text/plain"));
+    assert_eq!(
+        head.system_metadata.content_type().map(|v| v.as_str()),
+        Some("text/plain")
+    );
 }
 
 #[test]
