@@ -279,23 +279,21 @@ impl MetadataBlob {
     /// Build a metadata blob from raw key-value pairs without header filtering.
     /// Unlike `from_headers`, this does not filter by STORED_HEADERS or
     /// lowercase keys — pairs are stored exactly as given.
-    pub fn from_pairs(pairs: &[(&str, &str)]) -> Self {
-        Self {
-            entries: pairs
-                .iter()
-                .map(|(k, v)| {
-                    let lower = k.to_ascii_lowercase();
-                    assert!(
-                        lower.starts_with("x-amz-meta-"),
-                        "MetadataBlob only accepts x-amz-meta-* keys"
-                    );
-                    MetadataEntry {
-                        key: lower,
-                        value: v.to_string(),
-                    }
-                })
-                .collect(),
+    pub fn from_pairs(pairs: &[(&str, &str)]) -> Result<Self, ServerError> {
+        let mut entries = Vec::with_capacity(pairs.len());
+        for (k, v) in pairs {
+            let lower = k.to_ascii_lowercase();
+            if !lower.starts_with("x-amz-meta-") {
+                return Err(ServerError::InvalidRequest {
+                    reason: "MetadataBlob only accepts x-amz-meta-* keys".to_string(),
+                });
+            }
+            entries.push(MetadataEntry {
+                key: lower,
+                value: v.to_string(),
+            });
         }
+        Ok(Self { entries })
     }
 
     /// Return the number of entries.

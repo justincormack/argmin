@@ -142,33 +142,22 @@ impl SystemMetadata {
             }
             match lower.as_str() {
                 "content-type" => {
-                    out.content_type =
-                        Some(ContentType::new(value).expect("header size checks must bound value"));
+                    out.content_type = Some(parse_system_metadata_value(&lower, value)?);
                 }
                 "content-encoding" => {
-                    out.content_encoding = Some(
-                        ContentEncoding::new(value).expect("header size checks must bound value"),
-                    );
+                    out.content_encoding = Some(parse_system_metadata_value(&lower, value)?);
                 }
                 "cache-control" => {
-                    out.cache_control = Some(
-                        CacheControl::new(value).expect("header size checks must bound value"),
-                    );
+                    out.cache_control = Some(parse_system_metadata_value(&lower, value)?);
                 }
                 "content-disposition" => {
-                    out.content_disposition = Some(
-                        ContentDisposition::new(value)
-                            .expect("header size checks must bound value"),
-                    );
+                    out.content_disposition = Some(parse_system_metadata_value(&lower, value)?);
                 }
                 "content-language" => {
-                    out.content_language = Some(
-                        ContentLanguage::new(value).expect("header size checks must bound value"),
-                    );
+                    out.content_language = Some(parse_system_metadata_value(&lower, value)?);
                 }
                 "expires" => {
-                    out.expires =
-                        Some(Expires::new(value).expect("header size checks must bound value"));
+                    out.expires = Some(parse_system_metadata_value(&lower, value)?);
                 }
                 "x-amz-website-redirect-location" => {
                     out.website_redirect_location =
@@ -201,70 +190,8 @@ impl SystemMetadata {
         Ok(out)
     }
 
-    #[must_use]
-    pub fn from_pairs(pairs: &[(&str, &str)]) -> Self {
-        let mut out = Self::new();
-        for (k, v) in pairs {
-            match *k {
-                "content-type" => {
-                    out.content_type = Some(
-                        ContentType::new(*v).expect("trusted system metadata pairs must be valid"),
-                    );
-                }
-                "content-encoding" => {
-                    out.content_encoding = Some(
-                        ContentEncoding::new(*v)
-                            .expect("trusted system metadata pairs must be valid"),
-                    );
-                }
-                "cache-control" => {
-                    out.cache_control = Some(
-                        CacheControl::new(*v).expect("trusted system metadata pairs must be valid"),
-                    );
-                }
-                "content-disposition" => {
-                    out.content_disposition = Some(
-                        ContentDisposition::new(*v)
-                            .expect("trusted system metadata pairs must be valid"),
-                    );
-                }
-                "content-language" => {
-                    out.content_language = Some(
-                        ContentLanguage::new(*v)
-                            .expect("trusted system metadata pairs must be valid"),
-                    );
-                }
-                "expires" => {
-                    out.expires = Some(
-                        Expires::new(*v).expect("trusted system metadata pairs must be valid"),
-                    );
-                }
-                "x-amz-website-redirect-location" => {
-                    out.website_redirect_location = Some(
-                        WebsiteRedirectLocation::new(*v)
-                            .expect("trusted system metadata pairs must be valid"),
-                    );
-                }
-                "x-amz-checksum-type" => {
-                    if let Some(ref mut checksum) = out.checksum {
-                        checksum.checksum_type = ChecksumType::parse(v);
-                    }
-                }
-                key if key.starts_with("x-amz-checksum-") => {
-                    if let Some(algo) = checksum_algorithm_from_header_name(key) {
-                        out.checksum = Some(ObjectChecksumMetadata::new(
-                            algo,
-                            out.checksum
-                                .as_ref()
-                                .and_then(ObjectChecksumMetadata::checksum_type),
-                            (*v).to_string(),
-                        ));
-                    }
-                }
-                _ => {}
-            }
-        }
-        out
+    pub fn from_pairs(pairs: &[(&str, &str)]) -> Result<Self, ServerError> {
+        Self::from_header_iter(pairs.iter().copied())
     }
 
     #[must_use]
@@ -674,6 +601,16 @@ impl SystemMetadata {
             website_redirect_location,
         })
     }
+}
+
+fn parse_system_metadata_value<T, E>(header_name: &str, value: &str) -> Result<T, ServerError>
+where
+    T: TryFrom<String, Error = E>,
+    E: std::fmt::Display,
+{
+    T::try_from(value.to_string()).map_err(|err| ServerError::InvalidRequest {
+        reason: format!("system metadata value for '{header_name}' is invalid: {err}"),
+    })
 }
 
 #[cfg(test)]
