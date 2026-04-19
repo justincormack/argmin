@@ -755,7 +755,7 @@ impl Coordinator {
         self.cache_bucket_lifecycle(
             &authorized.bucket,
             info.bucket_lifecycle_generation,
-            Arc::clone(&authorized.parsed_config),
+            Arc::new(authorized.parsed_config),
         );
         Ok(())
     }

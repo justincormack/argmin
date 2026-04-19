@@ -2520,24 +2520,21 @@ impl Coordinator {
             &req.bucket,
             auth::PolicyAction::PutLifecycleConfiguration,
         )?;
-        let parsed_config = Arc::new(
-            s3_types::parse_lifecycle_configuration_xml(req.config.as_bytes()).map_err(
-                |error| match error {
-                    LifecycleConfigError::MalformedXml { reason } => {
-                        ServerError::MalformedXML { reason }
-                    }
-                    LifecycleConfigError::InvalidRequest { reason } => {
-                        ServerError::InvalidRequest { reason }
-                    }
-                    LifecycleConfigError::InvalidArgument { reason } => {
-                        ServerError::InvalidArgument { reason }
-                    }
-                    LifecycleConfigError::NotImplemented { feature } => {
-                        ServerError::NotImplemented { feature }
-                    }
-                },
-            )?,
-        );
+        let parsed_config = s3_types::parse_lifecycle_configuration_xml(req.config.as_bytes())
+            .map_err(|error| match error {
+                LifecycleConfigError::MalformedXml { reason } => {
+                    ServerError::MalformedXML { reason }
+                }
+                LifecycleConfigError::InvalidRequest { reason } => {
+                    ServerError::InvalidRequest { reason }
+                }
+                LifecycleConfigError::InvalidArgument { reason } => {
+                    ServerError::InvalidArgument { reason }
+                }
+                LifecycleConfigError::NotImplemented { feature } => {
+                    ServerError::NotImplemented { feature }
+                }
+            })?;
         Ok(AuthorizedPutBucketLifecycle {
             bucket: req.bucket.name_typed().clone(),
             body: req.config.to_string(),

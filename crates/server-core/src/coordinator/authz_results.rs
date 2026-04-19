@@ -67,7 +67,7 @@ pub(super) struct AuthorizedPutBucketPolicy {
 pub(super) struct AuthorizedPutBucketLifecycle {
     pub(super) bucket: BucketName,
     pub(super) body: String,
-    pub(super) parsed_config: Arc<BucketLifecycleConfiguration>,
+    pub(super) parsed_config: BucketLifecycleConfiguration,
 }
 
 #[derive(Debug)]
