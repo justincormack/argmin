@@ -515,6 +515,15 @@ impl S3Response {
                 );
                 Self::new(400).chunked_xml_body(body)
             }
+            ServerError::InvalidRedirectLocation { .. } => {
+                let body = xml::error_xml_with_host_id(
+                    err.s3_error_code(),
+                    &client_error_message(err),
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
             ServerError::KeyTooLongError {
                 size,
                 max_size_allowed,
@@ -531,6 +540,7 @@ impl S3Response {
                     *size,
                     *max_size_allowed,
                     Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
                 );
                 Self::new(400).chunked_xml_body(body)
             }
@@ -674,7 +684,7 @@ impl S3Response {
         if let Some(content_type) = metadata.content_type() {
             self = self.header("Content-Type", content_type.as_str());
         } else {
-            self = self.header("Content-Type", "application/octet-stream");
+            self = self.header("Content-Type", "binary/octet-stream");
         }
         if let Some(content_encoding) = metadata.content_encoding() {
             self = self.header("Content-Encoding", content_encoding.as_str());
@@ -2092,7 +2102,7 @@ mod tests {
         let resp = S3Response::get_object(result, None);
         assert_eq!(
             find_header(&resp, "Content-Type"),
-            Some("application/octet-stream")
+            Some("binary/octet-stream")
         );
     }
 
@@ -2338,7 +2348,7 @@ mod tests {
         let resp = S3Response::head_object(&result, None);
         assert_eq!(
             find_header(&resp, "Content-Type"),
-            Some("application/octet-stream")
+            Some("binary/octet-stream")
         );
     }
 
@@ -3041,6 +3051,35 @@ mod tests {
             "<Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message>"
         ));
         assert!(body.contains("<UploadId>abc</UploadId>"));
+    }
+
+    #[test]
+    fn invalid_redirect_location_error_response_uses_host_id_without_resource() {
+        let err = ServerError::InvalidRedirectLocation {
+            reason: "The website redirect location must have a prefix of 'http://' or 'https://' or '/'.".to_string(),
+        };
+        let resp = S3Response::error(&err, "/bucket/key");
+        assert_eq!(resp.status_code, 400);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("<Code>InvalidRedirectLocation</Code>"));
+        assert!(body.contains("<HostId>"));
+        assert!(!body.contains("<Resource>"));
+    }
+
+    #[test]
+    fn metadata_too_large_detailed_error_response_includes_host_id() {
+        let err = ServerError::MetadataTooLargeDetailed {
+            size: 2049,
+            max_size_allowed: 2048,
+        };
+        let resp = S3Response::error(&err, "/bucket/key");
+        assert_eq!(resp.status_code, 400);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("<Code>MetadataTooLarge</Code>"));
+        assert!(body.contains("<Size>2049</Size>"));
+        assert!(body.contains("<MaxSizeAllowed>2048</MaxSizeAllowed>"));
+        assert!(body.contains("<HostId>"));
+        assert!(!body.contains("<Resource>"));
     }
 
     #[test]

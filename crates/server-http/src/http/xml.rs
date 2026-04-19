@@ -188,6 +188,7 @@ pub fn metadata_too_large_error_xml(
     size: usize,
     max_size_allowed: usize,
     request_id: &str,
+    host_id: &str,
 ) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -197,10 +198,12 @@ pub fn metadata_too_large_error_xml(
          <Size>{}</Size>\
          <MaxSizeAllowed>{}</MaxSizeAllowed>\
          <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
          </Error>",
         size,
         max_size_allowed,
         xml_escape(request_id),
+        xml_escape(host_id),
     )
 }
 

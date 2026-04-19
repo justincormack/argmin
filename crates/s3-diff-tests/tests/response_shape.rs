@@ -38,6 +38,8 @@ const IGNORE_VALUE_RESPONSE_HEADERS: &[&str] = &["last-modified"];
 // See plans/completed/sse-c-encryption-plan.md and plans/completed/territory-map.md.
 const KNOWN_ETAG_DIVERGENCE_HEADERS: &[&str] = &["etag"];
 const AWS_MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
+const SYSTEM_METADATA_SIZE_LIMIT: usize = 2 * 1024;
+const WEBSITE_REDIRECT_HEADER_NAME: &str = "x-amz-website-redirect-location";
 
 struct ComparisonEnv {
     external_client: Client,
@@ -581,6 +583,11 @@ fn normalize_location_header(value: &str) -> String {
     format!("{scheme}://<authority>{}", &rest[path_start..])
 }
 
+fn redirect_value_with_len(len: usize) -> String {
+    assert!(len >= 1, "redirect length must allow a leading slash");
+    format!("/{}", "r".repeat(len - 1))
+}
+
 fn xml_text_unescape(text: &str) -> String {
     text.replace("&quot;", "\"")
         .replace("&apos;", "'")
@@ -901,6 +908,278 @@ fn test_put_get_head_object_response_shape_matches_aws() {
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
         delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_object_website_redirect_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-redirect-object.txt";
+        let redirect = "/docs/landing.html";
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            None,
+            b"redirect-body",
+            [(WEBSITE_REDIRECT_HEADER_NAME, redirect)],
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            None,
+            b"redirect-body",
+            [(WEBSITE_REDIRECT_HEADER_NAME, redirect)],
+        );
+        assert_response_shape_matches(
+            "PutObjectWebsiteRedirect",
+            &aws_put,
+            &local_put,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
+        );
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_shape_matches(
+            "GetObjectWebsiteRedirect",
+            &aws_get,
+            &local_get,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
+        );
+        assert_eq!(
+            response_header_value(&aws_get, WEBSITE_REDIRECT_HEADER_NAME),
+            Some(redirect)
+        );
+        assert_eq!(
+            response_header_value(&local_get, WEBSITE_REDIRECT_HEADER_NAME),
+            Some(redirect)
+        );
+
+        let aws_head = env.send_external(
+            "HEAD",
+            &external_bucket,
+            key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_head = env.send_local(
+            "HEAD",
+            &local_bucket,
+            key,
+            None,
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        assert_response_shape_matches(
+            "HeadObjectWebsiteRedirect",
+            &aws_head,
+            &local_head,
+            KNOWN_ETAG_DIVERGENCE_HEADERS,
+            &[],
+        );
+        assert_eq!(
+            response_header_value(&aws_head, WEBSITE_REDIRECT_HEADER_NAME),
+            Some(redirect)
+        );
+        assert_eq!(
+            response_header_value(&local_head, WEBSITE_REDIRECT_HEADER_NAME),
+            Some(redirect)
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_object_website_redirect_invalid_value_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-invalid-redirect.txt";
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            None,
+            b"invalid-redirect-body",
+            [(WEBSITE_REDIRECT_HEADER_NAME, "docs/landing.html")],
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            None,
+            b"invalid-redirect-body",
+            [(WEBSITE_REDIRECT_HEADER_NAME, "docs/landing.html")],
+        );
+        assert_xml_response_shape_matches(
+            "PutObjectInvalidWebsiteRedirect",
+            &aws_put,
+            &local_put,
+            &[],
+            &[],
+            &["RequestId", "HostId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_object_website_redirect_metadata_too_large_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-redirect-metadata-too-large.txt";
+        let redirect_len = SYSTEM_METADATA_SIZE_LIMIT - WEBSITE_REDIRECT_HEADER_NAME.len() + 1;
+        let redirect = redirect_value_with_len(redirect_len);
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            None,
+            b"redirect-too-large-body",
+            [(WEBSITE_REDIRECT_HEADER_NAME, redirect.as_str())],
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            None,
+            b"redirect-too-large-body",
+            [(WEBSITE_REDIRECT_HEADER_NAME, redirect.as_str())],
+        );
+        assert_xml_response_shape_matches(
+            "PutObjectWebsiteRedirectMetadataTooLarge",
+            &aws_put,
+            &local_put,
+            &[],
+            &[],
+            &["RequestId", "HostId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_object_system_metadata_headers_round_trip_raw_values_match_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let cases = [
+            ("Cache-Control", "max-age=60,private"),
+            ("Content-Disposition", "attachment;filename=\"report.pdf\""),
+            ("Content-Encoding", "gzip,br"),
+            ("Content-Language", "en-US,fr-CA"),
+            ("Content-Type", "text/plain;charset=utf-8"),
+            ("Expires", "Mon, 15 Jan 2024 12:30:45 GMT"),
+        ];
+
+        for (index, (header_name, header_value)) in cases.iter().enumerate() {
+            let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+            let key = format!("raw-header-roundtrip-{index}");
+
+            let aws_put = env.send_external(
+                "PUT",
+                &external_bucket,
+                &key,
+                None,
+                b"header-roundtrip-body",
+                [(*header_name, *header_value)],
+            );
+            let local_put = env.send_local(
+                "PUT",
+                &local_bucket,
+                &key,
+                None,
+                b"header-roundtrip-body",
+                [(*header_name, *header_value)],
+            );
+            assert_response_shape_matches(
+                &format!("PutObjectRawSystemMetadata[{header_name}]"),
+                &aws_put,
+                &local_put,
+                KNOWN_ETAG_DIVERGENCE_HEADERS,
+                &[],
+            );
+
+            let aws_head = env.send_external(
+                "HEAD",
+                &external_bucket,
+                &key,
+                None,
+                b"",
+                std::iter::empty::<(&str, &str)>(),
+            );
+            let local_head = env.send_local(
+                "HEAD",
+                &local_bucket,
+                &key,
+                None,
+                b"",
+                std::iter::empty::<(&str, &str)>(),
+            );
+            assert_response_shape_matches(
+                &format!("HeadObjectRawSystemMetadata[{header_name}]"),
+                &aws_head,
+                &local_head,
+                KNOWN_ETAG_DIVERGENCE_HEADERS,
+                &[],
+            );
+            assert_eq!(
+                response_header_value(&aws_head, header_name),
+                Some(*header_value),
+                "AWS {header_name} should round-trip exactly"
+            );
+            assert_eq!(
+                response_header_value(&local_head, header_name),
+                Some(*header_value),
+                "local {header_name} should round-trip exactly"
+            );
+
+            delete_all_and_bucket(
+                &env.external_client,
+                &external_bucket,
+                std::slice::from_ref(&key),
+            )
+            .await;
+            delete_all_and_bucket(&env.local_client, &local_bucket, std::slice::from_ref(&key))
+                .await;
+        }
     });
 }
 
