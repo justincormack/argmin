@@ -341,28 +341,44 @@ impl SystemMetadata {
         self.checksum = None;
     }
 
-    pub fn strip_aws_chunked_content_encoding(&mut self) {
+    pub fn strip_aws_chunked_content_encoding(&mut self) -> Result<(), ServerError> {
         let Some(encoding) = self.content_encoding.as_ref() else {
-            return;
+            return Ok(());
         };
         let original = encoding.as_str();
-        let parts: Vec<&str> = original.split(',').map(str::trim).collect();
+        let parts: Vec<&str> = original.split(',').collect();
         let filtered: Vec<&str> = parts
             .iter()
             .copied()
-            .filter(|part| !part.eq_ignore_ascii_case("aws-chunked"))
+            .filter(|part| !part.trim().eq_ignore_ascii_case("aws-chunked"))
             .collect();
         if filtered.len() == parts.len() {
-            return;
+            return Ok(());
         }
         if filtered.is_empty() {
             self.content_encoding = None;
         } else {
-            self.content_encoding = Some(
-                ContentEncoding::new(filtered.join(", "))
-                    .expect("filtered content-encoding must stay valid"),
-            );
+            let mut normalized = String::new();
+            for (index, part) in filtered.iter().enumerate() {
+                if index != 0 {
+                    normalized.push(',');
+                }
+                if index == 0 {
+                    normalized.push_str(part.trim_start_matches(' '));
+                } else {
+                    normalized.push_str(part);
+                }
+            }
+            let normalized = normalized.trim_end_matches(' ').to_owned();
+            self.content_encoding = Some(ContentEncoding::new(normalized).map_err(|err| {
+                ServerError::InternalError {
+                    reason: format!(
+                        "failed to normalize content-encoding after stripping aws-chunked: {err}"
+                    ),
+                }
+            })?);
         }
+        Ok(())
     }
 
     pub fn merge_from(&mut self, other: &Self) {
@@ -716,10 +732,45 @@ mod tests {
     fn strip_aws_chunked_content_encoding_removes_transport_token() {
         let mut metadata =
             SystemMetadata::from_headers(&[("Content-Encoding", "gzip, aws-chunked")]).unwrap();
-        metadata.strip_aws_chunked_content_encoding();
+        metadata.strip_aws_chunked_content_encoding().unwrap();
         assert_eq!(
             metadata.content_encoding().map(ContentEncoding::as_str),
             Some("gzip")
+        );
+    }
+
+    #[test]
+    fn strip_aws_chunked_content_encoding_preserves_remaining_spacing() {
+        let mut metadata =
+            SystemMetadata::from_headers(&[("Content-Encoding", "gzip, aws-chunked, br")]).unwrap();
+        metadata.strip_aws_chunked_content_encoding().unwrap();
+        assert_eq!(
+            metadata.content_encoding().map(ContentEncoding::as_str),
+            Some("gzip, br")
+        );
+    }
+
+    #[test]
+    fn strip_aws_chunked_content_encoding_does_not_expand_without_spaces() {
+        let mut metadata =
+            SystemMetadata::from_headers(&[("Content-Encoding", "gzip,aws-chunked,br")]).unwrap();
+        metadata.strip_aws_chunked_content_encoding().unwrap();
+        assert_eq!(
+            metadata.content_encoding().map(ContentEncoding::as_str),
+            Some("gzip,br")
+        );
+    }
+
+    #[test]
+    fn strip_aws_chunked_content_encoding_handles_leading_token_without_panic() {
+        let long_token = "x".repeat(2030);
+        let header_value = format!("aws-chunked,{long_token}");
+        let mut metadata =
+            SystemMetadata::from_headers(&[("Content-Encoding", header_value.as_str())]).unwrap();
+        metadata.strip_aws_chunked_content_encoding().unwrap();
+        assert_eq!(
+            metadata.content_encoding().map(ContentEncoding::as_str),
+            Some(long_token.as_str())
         );
     }
 

@@ -3476,7 +3476,7 @@ impl HttpFrontend {
         let (metadata_blob, mut system_metadata) =
             parse_request_metadata(request_headers.iter().copied())?;
         if uses_aws_chunked_transport {
-            system_metadata.strip_aws_chunked_content_encoding();
+            system_metadata.strip_aws_chunked_content_encoding()?;
         }
         let cond = write_condition_from_headers(req)?;
         let acl_grants = parse_acl_grants_headers(req)?;
