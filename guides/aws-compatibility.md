@@ -108,18 +108,20 @@ Related notes:
 
 ### 4. Bucket website support is only partial
 
-Argmin has only partial website-related support today.
+Argmin now supports the REST object-metadata surface for
+`x-amz-website-redirect-location` / `WebsiteRedirectLocation`, including
+request parsing, persistence, readback, copy, multipart, POST, and the
+corresponding AWS error shapes.
 
-Known gaps here include:
+The remaining website-related gaps are:
 
-- object-level website redirect metadata such as
-  `x-amz-website-redirect-location` / `WebsiteRedirectLocation`
 - bucket website configuration APIs such as `PutBucketWebsite`,
   `GetBucketWebsite`, and `DeleteBucketWebsite`
 - broader website-endpoint hosting behavior
 
-In practice, treat bucket website hosting as unsupported except for the pieces
-that are already covered by tests.
+In practice, treat bucket website hosting as unsupported. The implemented
+piece here is limited to object redirect metadata on the normal S3 REST
+endpoint, not the website endpoint or bucket website configuration APIs.
 
 Related note:
 
