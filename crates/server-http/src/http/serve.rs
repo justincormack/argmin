@@ -2155,7 +2155,6 @@ fn emit_streaming_put_event(
     #[cfg(not(feature = "deep-tracing"))]
     {
         let _ = (ctx, name, fields);
-        return;
     }
 
     #[cfg(feature = "deep-tracing")]
@@ -2860,7 +2859,6 @@ fn emit_streaming_part_event(
     #[cfg(not(feature = "deep-tracing"))]
     {
         let _ = (ctx, name, fields);
-        return;
     }
 
     #[cfg(feature = "deep-tracing")]

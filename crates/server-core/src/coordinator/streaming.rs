@@ -374,7 +374,6 @@ impl Coordinator {
         #[cfg(not(feature = "deep-tracing"))]
         {
             let _ = (target, bucket, key, session_id, segment_index, data_len);
-            return;
         }
 
         #[cfg(feature = "deep-tracing")]
