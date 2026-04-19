@@ -413,6 +413,7 @@ fn copy_object_explicit_sse_s3_destination_preserves_managed_encryption() {
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
 
     let sse_customer = test_sse_customer_request();
     test_helpers::put_object(
@@ -490,6 +491,7 @@ fn copy_object_explicit_sse_c_destination_requires_customer_headers() {
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
 
     test_helpers::put_object(
         &coord,
@@ -4730,6 +4732,7 @@ fn sse_c_put_object_rejected_when_bucket_blocks_sse_c() {
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
     put_bucket_encryption_test(
         &coord,
         "bucket",
@@ -4839,6 +4842,7 @@ fn sse_c_upload_part_rejected_when_bucket_blocks_sse_c() {
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
 
     let sse_customer = test_sse_customer_request();
     let upload = coord

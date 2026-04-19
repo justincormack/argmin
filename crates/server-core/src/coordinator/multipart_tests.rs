@@ -5170,6 +5170,7 @@ fn complete_multipart_sse_c_checksum_requires_headers() {
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
 
     let sse_customer = test_sse_customer_request();
     let create = coord
@@ -5322,6 +5323,7 @@ fn sse_c_checksum_metadata_is_not_stored_in_cleartext() {
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
 
     let sse_customer = test_sse_customer_request();
     let metadata = MetadataBlob::from_headers(&[("x-amz-meta-owner", "alice")]).unwrap();
@@ -5642,6 +5644,7 @@ fn finalize_stream_put_rejects_mismatched_sse_c_write_context() {
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
 
     let sse_customer = test_sse_customer_request();
     let session_id = begin_stream_put_with_authorized_request_test(
@@ -5807,6 +5810,7 @@ fn sse_c_multipart_parts_with_same_plaintext_use_distinct_nonce_scopes() {
     coord
         .create_bucket_for_owner("default-owner", "bucket", false)
         .unwrap();
+    enable_bucket_sse_c_test(&coord, "bucket", test_requester(), None).unwrap();
 
     let sse_customer = test_sse_customer_request();
     let upload = coord

@@ -733,6 +733,24 @@ pub(crate) fn put_bucket_encryption_test(
     })
 }
 
+pub(crate) fn enable_bucket_sse_c_test(
+    coord: &Coordinator,
+    name: &str,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<(), ServerError> {
+    put_bucket_encryption_test(
+        coord,
+        name,
+        BucketEncryptionConfig {
+            default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
+            sse_c_blocked: false,
+        },
+        requester,
+        expected_bucket_owner,
+    )
+}
+
 pub(crate) fn get_bucket_encryption_test(
     coord: &Coordinator,
     name: &str,
