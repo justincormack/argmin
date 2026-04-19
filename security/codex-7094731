@@ -1,0 +1,57 @@
+Panic possible when stripping aws-chunked Content-Encoding
+Link: https://chatgpt.com/codex/cloud/security/findings/502e4a4c6124819182e80542c0225da9?sev=&repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 7094731
+Author: justin@specialbusservice.com
+Created: 19/04/2026, 11:38:28
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Summary
+This report was valid when filed against commit `7094731` (`Type all stored system metadata values`).
+
+That change introduced typed `ContentEncoding` storage with a maximum-length check in `s3-types`, and `SystemMetadata::strip_aws_chunked_content_encoding` rebuilt the header with `", "` and used `ContentEncoding::new(...).expect(...)`. A client could supply a valid near-limit `Content-Encoding`, have it expand during rebuild, fail revalidation, and hit the `expect` panic.
+
+Two later changes altered the state:
+
+- Commit `bf85822` (`Move metadata size validation to HTTP boundary`) removed per-value maximum-length validation from the stored metadata types in [`crates/s3-types/src/lib.rs`](/home/justin/src/github.com/justincormack/argmin/crates/s3-types/src/lib.rs:98), which made the specific length-growth reproduction from this report no longer valid on `main`.
+- Commit `2802c9f` (`Harden aws-chunked content-encoding stripping`) removed the panic boundary entirely in [`crates/server-core/src/system_metadata.rs`](/home/justin/src/github.com/justincormack/argmin/crates/server-core/src/system_metadata.rs:344) and propagated errors normally from the HTTP layer in [`crates/server-http/src/http/mod.rs`](/home/justin/src/github.com/justincormack/argmin/crates/server-http/src/http/mod.rs:3478).
+
+Current status: the original finding was valid at introduction time, later became stale because the triggering max-length invariant was removed, and is now fully hardened because `strip_aws_chunked_content_encoding` no longer panics.
+
+# Validation
+## Historical validation
+- Commit `7094731` introduced typed `ContentEncoding` values with per-value max-length validation and the `expect`-based rebuild path.
+- At that point, the reported reproduction was valid: the rebuilt value could grow because the helper normalized with `", "`, `ContentEncoding::new(...)` could fail on length, and the `expect` would panic.
+
+## Current validation
+- Commit `bf85822` removed the stored-value max-length validation, leaving only header-byte validation in [`crates/s3-types/src/lib.rs`](/home/justin/src/github.com/justincormack/argmin/crates/s3-types/src/lib.rs:103). That means the exact `InvalidLength` panic described in the original report is no longer reproducible on current `main`.
+- Commit `2802c9f` changed `strip_aws_chunked_content_encoding` to return `Result<(), ServerError>` and removed `expect` entirely in [`crates/server-core/src/system_metadata.rs`](/home/justin/src/github.com/justincormack/argmin/crates/server-core/src/system_metadata.rs:344).
+- The HTTP request path now propagates that result normally in [`crates/server-http/src/http/mod.rs`](/home/justin/src/github.com/justincormack/argmin/crates/server-http/src/http/mod.rs:3478).
+- Regression coverage was added in `server-core` for:
+  - normal `aws-chunked` stripping
+  - preserving existing spacing shape as much as possible
+  - comma-only forms such as `gzip,aws-chunked,br`
+  - leading `aws-chunked` with a long remaining token
+
+# Evidence
+- Introduction: commit `7094731` (`Type all stored system metadata values`)
+  - added typed stored metadata values in [`crates/s3-types/src/lib.rs`](/home/justin/src/github.com/justincormack/argmin/crates/s3-types/src/lib.rs)
+  - changed [`crates/server-core/src/system_metadata.rs`](/home/justin/src/github.com/justincormack/argmin/crates/server-core/src/system_metadata.rs) to rebuild and revalidate `Content-Encoding`
+- Trigger became stale: commit `bf85822` (`Move metadata size validation to HTTP boundary`)
+  - removed stored-value max-length validation, leaving only invalid-header-byte checks in [`crates/s3-types/src/lib.rs:103`](/home/justin/src/github.com/justincormack/argmin/crates/s3-types/src/lib.rs:103)
+- Final hardening: commit `2802c9f` (`Harden aws-chunked content-encoding stripping`)
+  - `strip_aws_chunked_content_encoding` now returns `Result<(), ServerError>` and no longer uses `expect` in [`crates/server-core/src/system_metadata.rs:344`](/home/justin/src/github.com/justincormack/argmin/crates/server-core/src/system_metadata.rs:344)
+  - the streaming PUT path propagates the result in [`crates/server-http/src/http/mod.rs:3478`](/home/justin/src/github.com/justincormack/argmin/crates/server-http/src/http/mod.rs:3478)
+
+# Resolution
+Resolved by commit `2802c9f` (`Harden aws-chunked content-encoding stripping`).
+
+Notes:
+- The report remains historically valid against commit `7094731`.
+- The exact `InvalidLength` reproduction became stale after `bf85822` moved aggregate size enforcement to the HTTP boundary and removed per-value maximum-length validation from stored metadata types.
+- The code has now been hardened anyway so this path does not panic even if future validation rules change again.
