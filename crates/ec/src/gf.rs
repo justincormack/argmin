@@ -888,7 +888,6 @@ mod x86_64_avx512 {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[cfg(target_arch = "x86_64")]
 mod x86_64_avx2 {
     use super::{
         write_with_coeff, xor_with_coeff, xor_with_slice, GF_NIBBLE_TABLES, MAX_TOTAL_SHARDS,
