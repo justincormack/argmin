@@ -846,6 +846,14 @@ impl HttpFrontend {
             }
             Err(err) => Err(err),
         };
+        let add_bucket_region_for_token_error = actual_cors_bucket.is_some()
+            && matches!(
+                &result,
+                Err(ServerError::Auth(auth::AuthError::InvalidToken))
+                    | Err(ServerError::Auth(
+                        auth::AuthError::UnexpectedSecurityToken { .. }
+                    ))
+            );
 
         let mut resp = {
             observability::trace_scope!(
@@ -873,6 +881,17 @@ impl HttpFrontend {
                 Err(err) => S3Response::error_with_ids(&err, s3req.path(), wire_ids),
             }
         };
+        if add_bucket_region_for_token_error
+            && !resp
+                .headers
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("x-amz-bucket-region"))
+        {
+            resp.headers.push((
+                "x-amz-bucket-region".to_string(),
+                self.coordinator.region().to_string(),
+            ));
+        }
 
         // CORS response headers on actual (non-preflight) requests.
         if let Some(origin) = s3req.header("origin") {

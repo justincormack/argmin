@@ -326,6 +326,62 @@ fn test_get_object_ifunmodifiedsince_failed() {
     });
 }
 
+#[test]
+fn test_get_object_ifmatch_ignores_ifunmodifiedsince_when_etag_matches() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let etag = put_object(&bucket, "obj", b"hello").await;
+
+        let resp = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_match(&etag)
+            .if_unmodified_since(DateTime::from_secs(0))
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"hello");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_get_object_ifnonematch_ignores_ifmodifiedsince_when_etag_differs() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "obj", b"hello").await;
+
+        let head = CTX
+            .client()
+            .head_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let last_modified = *head.last_modified().unwrap();
+
+        let resp = CTX
+            .client()
+            .get_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_none_match("\"0000000000000000\"")
+            .if_modified_since(last_modified)
+            .send()
+            .await
+            .unwrap();
+        let data = resp.body.collect().await.unwrap().into_bytes();
+        assert_eq!(&data[..], b"hello");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
 // ── HEAD If-Match / If-None-Match ───────────────────────────────────────
 
 #[test]
@@ -405,6 +461,60 @@ fn test_head_object_ifnonematch_failed() {
             .send()
             .await;
         assert!(result.is_err(), "expected 304 NotModified");
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_head_object_ifmatch_ignores_ifunmodifiedsince_when_etag_matches() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        let etag = put_object(&bucket, "obj", b"hello").await;
+
+        let resp = CTX
+            .client()
+            .head_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_match(&etag)
+            .if_unmodified_since(DateTime::from_secs(0))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.e_tag().is_some());
+
+        cleanup(&bucket, &["obj"]).await;
+    });
+}
+
+#[test]
+fn test_head_object_ifnonematch_ignores_ifmodifiedsince_when_etag_differs() {
+    s3_tests::run(async {
+        let bucket = setup_bucket().await;
+        put_object(&bucket, "obj", b"hello").await;
+
+        let head = CTX
+            .client()
+            .head_object()
+            .bucket(&bucket)
+            .key("obj")
+            .send()
+            .await
+            .unwrap();
+        let last_modified = *head.last_modified().unwrap();
+
+        let resp = CTX
+            .client()
+            .head_object()
+            .bucket(&bucket)
+            .key("obj")
+            .if_none_match("\"0000000000000000\"")
+            .if_modified_since(last_modified)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.e_tag().is_some());
 
         cleanup(&bucket, &["obj"]).await;
     });

@@ -176,6 +176,14 @@ fn object_url(endpoint: &str, bucket: &str, key: &str, query: Option<&str>) -> S
     }
 }
 
+fn alternate_region(region: &str) -> &str {
+    if region == "us-east-1" {
+        "us-west-2"
+    } else {
+        "us-east-1"
+    }
+}
+
 fn send_anonymous_get(
     endpoint: &str,
     tls_ca_pem: Option<&[u8]>,
@@ -1417,6 +1425,99 @@ fn test_list_objects_v2_no_such_bucket_error_shape_matches_aws() {
             COMMON_PRESENCE_ONLY_HEADERS,
             &["RequestId", "HostId"],
         );
+    });
+}
+
+#[test]
+fn test_sigv4_wrong_region_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let wrong_region = alternate_region(&env.external_region);
+        let aws_error = send_signed_request_with_credentials(
+            "GET",
+            &object_url(CTX.endpoint(), &external_bucket, "", None),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+            SignedRequestCredentials {
+                access_key: CTX.access_key(),
+                secret_key: CTX.secret_key(),
+                region: wrong_region,
+                tls_ca_pem: None,
+            },
+        );
+        let local_error = send_signed_request_with_credentials(
+            "GET",
+            &object_url(env.local_server.endpoint(), &local_bucket, "", None),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+            SignedRequestCredentials {
+                access_key: s3_tests::server::TEST_ACCESS_KEY,
+                secret_key: s3_tests::server::TEST_SECRET_KEY,
+                region: wrong_region,
+                tls_ca_pem: env.local_server.tls_ca_pem(),
+            },
+        );
+        assert_xml_response_shape_matches(
+            "SigV4WrongRegion",
+            &aws_error,
+            &local_error,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_sigv4_invalid_token_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let aws_error = send_signed_request_with_credentials(
+            "GET",
+            &object_url(CTX.endpoint(), &external_bucket, "", None),
+            b"",
+            [("x-amz-security-token", "bad-token-causes-400")],
+            SignedRequestCredentials {
+                access_key: CTX.access_key(),
+                secret_key: CTX.secret_key(),
+                region: &env.external_region,
+                tls_ca_pem: None,
+            },
+        );
+        let local_error = send_signed_request_with_credentials(
+            "GET",
+            &object_url(env.local_server.endpoint(), &local_bucket, "", None),
+            b"",
+            [("x-amz-security-token", "bad-token-causes-400")],
+            SignedRequestCredentials {
+                access_key: s3_tests::server::TEST_ACCESS_KEY,
+                secret_key: s3_tests::server::TEST_SECRET_KEY,
+                region: &env.external_region,
+                tls_ca_pem: env.local_server.tls_ca_pem(),
+            },
+        );
+        assert_xml_response_shape_matches(
+            "SigV4InvalidToken",
+            &aws_error,
+            &local_error,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
     });
 }
 

@@ -212,8 +212,8 @@ pub fn metadata_too_large_error_xml(
 pub fn error_xml_with_region(
     code: &str,
     message: &str,
-    resource: &str,
     request_id: &str,
+    host_id: &str,
     region: &str,
 ) -> String {
     format!(
@@ -222,14 +222,14 @@ pub fn error_xml_with_region(
          <Code>{}</Code>\
          <Message>{}</Message>\
          <Region>{}</Region>\
-         <Resource>{}</Resource>\
          <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
          </Error>",
         xml_escape(code),
         xml_escape(message),
         xml_escape(region),
-        xml_escape(resource),
         xml_escape(request_id),
+        xml_escape(host_id),
     )
 }
 

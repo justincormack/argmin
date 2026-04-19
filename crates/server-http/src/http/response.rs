@@ -522,8 +522,8 @@ impl S3Response {
                 let body = xml::error_xml_with_region(
                     "AuthorizationHeaderMalformed",
                     &client_error_message(err),
-                    resource,
                     request_id,
+                    host_id,
                     expected_region,
                 );
                 Self::new(400)
@@ -2741,6 +2741,8 @@ mod tests {
         assert!(body.contains("<Code>AuthorizationHeaderMalformed</Code>"));
         assert!(body.contains("<Region>us-west-2</Region>"));
         assert!(body.contains("expecting 'us-west-2'"));
+        assert!(body.contains("<HostId>"));
+        assert!(!body.contains("<Resource>"));
     }
 
     #[test]
