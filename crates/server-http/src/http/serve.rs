@@ -935,12 +935,17 @@ impl StreamingPostFieldBudget {
         }
 
         if is_streaming_post_metadata_field(name) {
-            self.metadata_bytes = self
-                .metadata_bytes
-                .checked_add(field_bytes)
-                .ok_or(ServerError::MetadataTooLarge)?;
+            self.metadata_bytes = self.metadata_bytes.checked_add(field_bytes).ok_or(
+                ServerError::MetadataTooLargeDetailed {
+                    size: usize::MAX,
+                    max_size_allowed: USER_METADATA_SIZE_LIMIT,
+                },
+            )?;
             if self.metadata_bytes > USER_METADATA_SIZE_LIMIT {
-                return Err(ServerError::MetadataTooLarge);
+                return Err(ServerError::MetadataTooLargeDetailed {
+                    size: self.metadata_bytes,
+                    max_size_allowed: USER_METADATA_SIZE_LIMIT,
+                });
             }
         }
 
@@ -4143,7 +4148,13 @@ mod tests {
         budget.record(name, &value).unwrap();
 
         let err = budget.record(name, "x").unwrap_err();
-        assert!(matches!(err, ServerError::MetadataTooLarge));
+        assert!(matches!(
+            err,
+            ServerError::MetadataTooLargeDetailed {
+                max_size_allowed: USER_METADATA_SIZE_LIMIT,
+                ..
+            }
+        ));
     }
 
     #[test]

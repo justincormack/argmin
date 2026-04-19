@@ -181,6 +181,8 @@ pub enum WebsiteRedirectLocationError {
     Empty,
     #[error("website redirect location contains invalid header bytes")]
     InvalidHeaderBytes,
+    #[error("website redirect location must have a prefix of 'http://' or 'https://' or '/'")]
+    InvalidPrefix,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -194,6 +196,12 @@ impl WebsiteRedirectLocation {
         }
         if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
             return Err(WebsiteRedirectLocationError::InvalidHeaderBytes);
+        }
+        if !value.starts_with('/')
+            && !value.starts_with("http://")
+            && !value.starts_with("https://")
+        {
+            return Err(WebsiteRedirectLocationError::InvalidPrefix);
         }
         Ok(Self(value))
     }
@@ -1154,6 +1162,18 @@ mod tests {
         assert!(matches!(
             WebsiteRedirectLocation::new("https://example.com/\nnext"),
             Err(WebsiteRedirectLocationError::InvalidHeaderBytes)
+        ));
+    }
+
+    #[test]
+    fn website_redirect_location_rejects_missing_supported_prefix() {
+        assert!(matches!(
+            WebsiteRedirectLocation::new("docs/index.html"),
+            Err(WebsiteRedirectLocationError::InvalidPrefix)
+        ));
+        assert!(matches!(
+            WebsiteRedirectLocation::new("ftp://example.com/out"),
+            Err(WebsiteRedirectLocationError::InvalidPrefix)
         ));
     }
 

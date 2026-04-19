@@ -99,7 +99,8 @@ impl Coordinator {
             if matches!(
                 directive,
                 MetadataDirective::Copy | MetadataDirective::CopyExplicit
-            ) && same_key_same_bucket
+            ) && req.website_redirect_location.is_none()
+                && same_key_same_bucket
                 && encryption_attrs_unchanged
             {
                 return Err(ServerError::InvalidRequest {
@@ -217,6 +218,15 @@ impl Coordinator {
                 ..
             } => (*new_system_metadata).clone(),
         };
+        if matches!(
+            directive,
+            MetadataDirective::Copy | MetadataDirective::CopyExplicit
+        ) {
+            system_metadata.clear_website_redirect_location();
+            if let Some(redirect) = &req.website_redirect_location {
+                system_metadata.set_website_redirect_location(redirect.clone());
+            }
+        }
         let committed_tags = match &req.tagging {
             TaggingDirective::Copy => src_tags,
             TaggingDirective::Replace(tags) => tags.map(SerializedTagSet::from),

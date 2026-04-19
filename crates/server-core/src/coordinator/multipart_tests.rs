@@ -4096,6 +4096,7 @@ fn copy_multipart_source() {
             ),
             dst_condition: &WriteCondition::default(),
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -4425,6 +4426,7 @@ fn copy_multipart_source_zero_byte() {
             destination: object_request_with_expected_owner("dst", "key", test_requester(), None),
             dst_condition: &WriteCondition::default(),
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),

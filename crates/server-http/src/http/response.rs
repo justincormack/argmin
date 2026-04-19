@@ -139,6 +139,7 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::Auth(auth::AuthError::AccessDenied)
         | ServerError::AccessDenied
         | ServerError::BlockPublicPolicyAccessDenied { .. } => "Access Denied".to_string(),
+        ServerError::PostPolicyAccessDenied { reason } => reason.clone(),
         ServerError::Auth(auth::AuthError::MalformedAuth) => {
             "malformed Authorization header".to_string()
         }
@@ -180,6 +181,7 @@ fn client_error_message(err: &ServerError) -> String {
         ),
         ServerError::InvalidRequest { reason }
         | ServerError::InvalidArgument { reason }
+        | ServerError::InvalidRedirectLocation { reason }
         | ServerError::InvalidURI { reason }
         | ServerError::InvalidBucketName { reason }
         | ServerError::MalformedPolicy { reason }
@@ -197,7 +199,9 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::ObjectTooLarge { size, max } => {
             format!("object too large: {size} bytes (max {max})")
         }
-        ServerError::MetadataTooLarge => "metadata too large".to_string(),
+        ServerError::MetadataTooLarge | ServerError::MetadataTooLargeDetailed { .. } => {
+            "Your metadata headers exceed the maximum allowed metadata size".to_string()
+        }
         ServerError::RequestHeaderSectionTooLarge => {
             "The request header and query parameters used to make the request exceed the maximum allowed size.".to_string()
         }
@@ -519,6 +523,26 @@ impl S3Response {
                     xml::key_too_long_error_xml(*size, *max_size_allowed, Self::TEST_REQUEST_ID);
                 Self::new(400).chunked_xml_body(body)
             }
+            ServerError::MetadataTooLargeDetailed {
+                size,
+                max_size_allowed,
+            } => {
+                let body = xml::metadata_too_large_error_xml(
+                    *size,
+                    *max_size_allowed,
+                    Self::TEST_REQUEST_ID,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::PostPolicyAccessDenied { reason } => {
+                let body = xml::error_xml_with_host_id(
+                    "AccessDenied",
+                    reason,
+                    Self::TEST_REQUEST_ID,
+                    Self::TEST_HOST_ID,
+                );
+                Self::new(403).chunked_xml_body(body)
+            }
             ServerError::NoSuchUpload { upload_id } => {
                 let body = xml::no_such_upload_error_xml(upload_id, Self::TEST_REQUEST_ID);
                 Self::new(404).chunked_xml_body(body)
@@ -666,6 +690,9 @@ impl S3Response {
         }
         if let Some(expires) = metadata.expires() {
             self = self.header("Expires", expires.as_str());
+        }
+        if let Some(redirect) = metadata.website_redirect_location() {
+            self = self.header("x-amz-website-redirect-location", redirect.as_str());
         }
         self
     }
@@ -2128,6 +2155,32 @@ mod tests {
     }
 
     #[test]
+    fn get_object_emits_website_redirect_location_header() {
+        let result = GetObjectResult {
+            sse_customer: None,
+            body: ReadHandle::from_buffered_bytes(vec![]),
+            metadata: MetadataBlob::new(),
+            system_metadata: system_metadata(&[(
+                "x-amz-website-redirect-location",
+                "/docs/get.html",
+            )]),
+            object_lock: s3_types::ObjectLockState::default(),
+            etag: "\"e\"".into(),
+            size: 0,
+            last_modified: 0,
+            version_id: VersionId::Null,
+            tags: None,
+            managed_encryption: None,
+            lifecycle_expiration: None,
+        };
+        let resp = S3Response::get_object(result, None);
+        assert_eq!(
+            find_header(&resp, "x-amz-website-redirect-location"),
+            Some("/docs/get.html")
+        );
+    }
+
+    #[test]
     fn get_object_checksum_type_with_checksum_mode_enabled() {
         let result = GetObjectResult {
             sse_customer: None,
@@ -2309,6 +2362,31 @@ mod tests {
         let resp = S3Response::head_object(&result, None);
         assert_eq!(find_header(&resp, "Content-Encoding"), Some("br"));
         assert_eq!(find_header(&resp, "Cache-Control"), Some("no-cache"));
+    }
+
+    #[test]
+    fn head_object_emits_website_redirect_location_header() {
+        let result = HeadObjectResult {
+            sse_customer: None,
+            metadata: MetadataBlob::new(),
+            system_metadata: system_metadata(&[(
+                "x-amz-website-redirect-location",
+                "/docs/head.html",
+            )]),
+            object_lock: s3_types::ObjectLockState::default(),
+            etag: "\"e\"".into(),
+            size: 10,
+            last_modified: 0,
+            version_id: VersionId::Null,
+            tags: None,
+            managed_encryption: None,
+            lifecycle_expiration: None,
+        };
+        let resp = S3Response::head_object(&result, None);
+        assert_eq!(
+            find_header(&resp, "x-amz-website-redirect-location"),
+            Some("/docs/head.html")
+        );
     }
 
     #[test]

@@ -56,6 +56,9 @@ pub enum ServerError {
     #[error("invalid argument: {reason}")]
     InvalidArgument { reason: String },
 
+    #[error("invalid redirect location: {reason}")]
+    InvalidRedirectLocation { reason: String },
+
     #[error("unexpected content")]
     UnexpectedContent,
 
@@ -84,6 +87,12 @@ pub enum ServerError {
 
     #[error("metadata too large")]
     MetadataTooLarge,
+
+    #[error("metadata too large: {size} bytes (max {max_size_allowed})")]
+    MetadataTooLargeDetailed {
+        size: usize,
+        max_size_allowed: usize,
+    },
 
     #[error("request header section too large")]
     RequestHeaderSectionTooLarge,
@@ -172,6 +181,9 @@ pub enum ServerError {
 
     #[error("access denied")]
     AccessDenied,
+
+    #[error("post policy access denied: {reason}")]
+    PostPolicyAccessDenied { reason: String },
 
     #[error("block public policy access denied for requester {requester_principal} on {bucket}")]
     BlockPublicPolicyAccessDenied {
@@ -283,6 +295,7 @@ impl ServerError {
             Self::NotModified { .. } => "NotModified",
             Self::InvalidRequest { .. } => "InvalidRequest",
             Self::InvalidArgument { .. } => "InvalidArgument",
+            Self::InvalidRedirectLocation { .. } => "InvalidRedirectLocation",
             Self::UnexpectedContent => "UnexpectedContent",
             Self::InvalidURI { .. } => "InvalidURI",
             Self::InvalidBucketName { .. } => "InvalidBucketName",
@@ -290,7 +303,7 @@ impl ServerError {
             Self::InvalidBucketNamespace { .. } => "InvalidBucketNamespace",
             Self::MetadataBlobError { .. } => "InternalError",
             Self::ObjectTooLarge { .. } => "EntityTooLarge",
-            Self::MetadataTooLarge => "MetadataTooLarge",
+            Self::MetadataTooLarge | Self::MetadataTooLargeDetailed { .. } => "MetadataTooLarge",
             Self::RequestHeaderSectionTooLarge => "RequestHeaderSectionTooLarge",
             Self::MaxMessageLengthExceeded { .. } => "MaxMessageLengthExceeded",
             Self::MethodNotAllowed | Self::HeadDeleteMarkerMethodNotAllowed { .. } => {
@@ -321,6 +334,7 @@ impl ServerError {
             Self::AccessControlListNotSupported => "AccessControlListNotSupported",
             Self::InvalidBucketAclWithObjectOwnership => "InvalidBucketAclWithObjectOwnership",
             Self::AccessDenied
+            | Self::PostPolicyAccessDenied { .. }
             | Self::BlockPublicPolicyAccessDenied { .. }
             | Self::AnonymousApiAccessDenied => "AccessDenied",
             Self::NoSuchUpload { .. } => "NoSuchUpload",
@@ -371,6 +385,7 @@ impl ServerError {
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
             | Self::InvalidArgument { .. }
+            | Self::InvalidRedirectLocation { .. }
             | Self::UnexpectedContent
             | Self::InvalidURI { .. }
             | Self::InvalidBucketName { .. }
@@ -404,6 +419,7 @@ impl ServerError {
             | Self::MalformedTrailerError { .. } => 400,
             Self::MissingContentLength => 411,
             Self::AccessDenied
+            | Self::PostPolicyAccessDenied { .. }
             | Self::BlockPublicPolicyAccessDenied { .. }
             | Self::AnonymousApiAccessDenied => 403,
             Self::NoSuchUpload { .. } => 404,
@@ -414,6 +430,7 @@ impl ServerError {
             Self::InternalError { .. } => 500,
             Self::ObjectTooLarge { .. }
             | Self::MetadataTooLarge
+            | Self::MetadataTooLargeDetailed { .. }
             | Self::RequestHeaderSectionTooLarge => 400,
             Self::MethodNotAllowed | Self::HeadDeleteMarkerMethodNotAllowed { .. } => 405,
             Self::InvalidRange { .. } => 416,
@@ -641,6 +658,14 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_invalid_redirect_location() {
+        let err = ServerError::InvalidRedirectLocation {
+            reason: "bad redirect".into(),
+        };
+        assert_eq!(err.s3_error_code(), "InvalidRedirectLocation");
+    }
+
+    #[test]
     fn s3_error_code_unexpected_content() {
         assert_eq!(
             ServerError::UnexpectedContent.s3_error_code(),
@@ -669,6 +694,14 @@ mod tests {
     fn s3_error_code_metadata_too_large() {
         assert_eq!(
             ServerError::MetadataTooLarge.s3_error_code(),
+            "MetadataTooLarge"
+        );
+        assert_eq!(
+            ServerError::MetadataTooLargeDetailed {
+                size: 2049,
+                max_size_allowed: 2048,
+            }
+            .s3_error_code(),
             "MetadataTooLarge"
         );
     }
@@ -810,12 +843,24 @@ mod tests {
             ServerError::InvalidRequest { reason: "x".into() }.http_status(),
             400
         );
+        assert_eq!(
+            ServerError::InvalidRedirectLocation { reason: "x".into() }.http_status(),
+            400
+        );
         assert_eq!(ServerError::UnexpectedContent.http_status(), 400);
         assert_eq!(
             ServerError::ObjectTooLarge { size: 1, max: 0 }.http_status(),
             400
         );
         assert_eq!(ServerError::MetadataTooLarge.http_status(), 400);
+        assert_eq!(
+            ServerError::MetadataTooLargeDetailed {
+                size: 2049,
+                max_size_allowed: 2048,
+            }
+            .http_status(),
+            400
+        );
         assert_eq!(ServerError::RequestHeaderSectionTooLarge.http_status(), 400);
         assert_eq!(
             ServerError::MalformedPolicy {
@@ -823,6 +868,17 @@ mod tests {
             }
             .http_status(),
             400
+        );
+    }
+
+    #[test]
+    fn http_status_post_policy_access_denied_403() {
+        assert_eq!(
+            ServerError::PostPolicyAccessDenied {
+                reason: "field denied".into(),
+            }
+            .http_status(),
+            403
         );
     }
 

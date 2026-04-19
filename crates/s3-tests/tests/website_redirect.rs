@@ -11,22 +11,6 @@ use s3_tests::{
 const SYSTEM_METADATA_SIZE_LIMIT: usize = 2 * 1024;
 const WEBSITE_REDIRECT_HEADER_NAME: &str = "x-amz-website-redirect-location";
 
-fn aws_conformance_mode() -> bool {
-    std::env::var_os("S3_TEST_ENDPOINT").is_some()
-}
-
-fn skip_without_external_endpoint() -> bool {
-    if aws_conformance_mode() {
-        false
-    } else {
-        eprintln!(
-            "skipping website_redirect Phase 1 conformance test in embedded-server mode; \
-             these tests are intended to map AWS REST behavior before Argmin implements it"
-        );
-        true
-    }
-}
-
 async fn setup_bucket() -> String {
     let bucket = unique_bucket();
     s3_tests::create_bucket(CTX.client(), &bucket)
@@ -170,10 +154,6 @@ fn put_object_with_raw_headers(
 #[test]
 fn test_put_object_website_redirect_round_trips_on_head_and_get() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "put-redirect";
         let redirect = "/docs/landing.html";
@@ -217,10 +197,6 @@ fn test_put_object_website_redirect_round_trips_on_head_and_get() {
 #[test]
 fn test_put_object_website_redirect_without_leading_slash_rejected() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "invalid-relative";
         let url = object_url(CTX.endpoint(), &bucket, key, None);
@@ -250,10 +226,6 @@ fn test_put_object_website_redirect_without_leading_slash_rejected() {
 #[test]
 fn test_put_object_website_redirect_unsupported_scheme_rejected() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "invalid-scheme";
 
@@ -285,10 +257,6 @@ fn test_put_object_website_redirect_unsupported_scheme_rejected() {
 #[test]
 fn test_put_object_website_redirect_exact_2k_with_header_name_is_accepted() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "redirect-2k-exact";
         let redirect_len = SYSTEM_METADATA_SIZE_LIMIT - WEBSITE_REDIRECT_HEADER_NAME.len();
@@ -322,10 +290,6 @@ fn test_put_object_website_redirect_exact_2k_with_header_name_is_accepted() {
 #[test]
 fn test_put_object_website_redirect_lengths_over_aggregate_limit_are_rejected() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
 
         for redirect_len in [
@@ -363,10 +327,6 @@ fn test_put_object_website_redirect_lengths_over_aggregate_limit_are_rejected() 
 #[test]
 fn test_put_object_website_redirect_exact_2k_plus_small_system_header_is_rejected() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "redirect-plus-cache-control";
         let redirect_len = SYSTEM_METADATA_SIZE_LIMIT - WEBSITE_REDIRECT_HEADER_NAME.len();
@@ -403,10 +363,6 @@ fn test_put_object_website_redirect_exact_2k_plus_small_system_header_is_rejecte
 #[test]
 fn test_copy_object_does_not_copy_redirect_without_explicit_header() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let src_key = "copy-src";
         let dst_key = "copy-dst";
@@ -466,10 +422,6 @@ fn test_copy_object_does_not_copy_redirect_without_explicit_header() {
 #[test]
 fn test_copy_object_explicit_redirect_persists_on_destination() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let src_key = "copy-src-explicit";
         let dst_key = "copy-dst-explicit";
@@ -520,10 +472,6 @@ fn test_copy_object_explicit_redirect_persists_on_destination() {
 #[test]
 fn test_copy_object_same_key_redirect_only_change_is_allowed() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "copy-same-key-redirect";
 
@@ -566,10 +514,6 @@ fn test_copy_object_same_key_redirect_only_change_is_allowed() {
 #[test]
 fn test_copy_object_same_key_with_explicit_same_redirect_is_allowed() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "copy-same-key-no-change";
         let redirect = "/docs/original.html";
@@ -613,10 +557,6 @@ fn test_copy_object_same_key_with_explicit_same_redirect_is_allowed() {
 #[test]
 fn test_multipart_upload_redirect_persists_from_initiation() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "multipart-redirect";
         let redirect = "/docs/multipart.html";
@@ -646,10 +586,6 @@ fn test_multipart_upload_redirect_persists_from_initiation() {
 #[test]
 fn test_multipart_upload_without_redirect_remains_absent() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "multipart-no-redirect";
 
@@ -673,10 +609,6 @@ fn test_multipart_upload_without_redirect_remains_absent() {
 #[test]
 fn test_post_object_website_redirect_persists() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "post-redirect";
         let redirect = "/docs/post-landing.html";
@@ -722,10 +654,6 @@ fn test_post_object_website_redirect_persists() {
 #[test]
 fn test_post_object_website_redirect_policy_missing_field_is_rejected() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "post-redirect-policy-missing";
 
@@ -777,10 +705,6 @@ fn test_post_object_website_redirect_policy_missing_field_is_rejected() {
 #[test]
 fn test_post_object_website_redirect_policy_mismatch_is_rejected() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_bucket().await;
         let key = "post-redirect-policy-mismatch";
 
@@ -834,10 +758,6 @@ fn test_post_object_website_redirect_policy_mismatch_is_rejected() {
 #[test]
 fn test_versioned_objects_surface_redirect_metadata_per_version() {
     s3_tests::run(async {
-        if skip_without_external_endpoint() {
-            return;
-        }
-
         let bucket = setup_versioned_bucket().await;
         let key = "versioned-redirect";
 

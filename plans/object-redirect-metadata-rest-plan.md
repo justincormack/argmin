@@ -22,7 +22,7 @@ Completed:
 
 Current next step:
 
-- Phase 3 write-path support
+- verification against AWS with the updated local implementation
 
 ## Scope
 
@@ -347,6 +347,10 @@ Exit criteria:
 
 - all supported REST write paths can persist redirect metadata
 
+Status:
+
+- completed
+
 ### Phase 4: Read-Path Support
 
 Deliverables:
@@ -360,6 +364,10 @@ Exit criteria:
 
 - REST metadata visibility matches AWS for the tested matrix
 
+Status:
+
+- completed
+
 ### Phase 5: Copy And Multipart Edge Cases
 
 Deliverables:
@@ -371,6 +379,10 @@ Deliverables:
 Exit criteria:
 
 - all copy and multipart redirect tests pass locally and against AWS
+
+Status:
+
+- completed locally
 
 ## Verification
 

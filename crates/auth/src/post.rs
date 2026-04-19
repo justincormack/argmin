@@ -83,8 +83,11 @@ pub enum PostPolicyError {
     Malformed(&'static str),
     #[error("policy expired")]
     Expired,
-    #[error("policy condition failed: {0}")]
-    ConditionFailed(&'static str),
+    #[error("policy condition failed: {condition}")]
+    ConditionFailed {
+        condition: &'static str,
+        field: Option<String>,
+    },
 }
 
 /// Validate a POST policy document.
@@ -148,7 +151,10 @@ pub fn validate_post_policy(
                 if key == "bucket" {
                     covered_fields.insert("bucket".to_string());
                     if bucket != expected {
-                        return Err(PostPolicyError::ConditionFailed("bucket"));
+                        return Err(PostPolicyError::ConditionFailed {
+                            condition: "bucket",
+                            field: None,
+                        });
                     }
                 } else {
                     // Form field condition keys are case-insensitive
@@ -156,7 +162,10 @@ pub fn validate_post_policy(
                     covered_fields.insert(field_name.clone());
                     let form_val = find_field(form_fields, &field_name);
                     if form_val != Some(expected) {
-                        return Err(PostPolicyError::ConditionFailed("exact match"));
+                        return Err(PostPolicyError::ConditionFailed {
+                            condition: "exact match",
+                            field: Some(field_name),
+                        });
                     }
                 }
             }
@@ -189,7 +198,10 @@ pub fn validate_post_policy(
                     covered_fields.insert(field_name.clone());
                     let form_val = find_field(form_fields, &field_name).unwrap_or("");
                     if !form_val.starts_with(prefix) {
-                        return Err(PostPolicyError::ConditionFailed("starts-with"));
+                        return Err(PostPolicyError::ConditionFailed {
+                            condition: "starts-with",
+                            field: Some(field_name),
+                        });
                     }
                 } else if op.eq_ignore_ascii_case("eq") {
                     let field_ref = arr[1]
@@ -207,7 +219,10 @@ pub fn validate_post_policy(
                     covered_fields.insert(field_name.clone());
                     let form_val = find_field(form_fields, &field_name);
                     if form_val != Some(expected) {
-                        return Err(PostPolicyError::ConditionFailed("eq"));
+                        return Err(PostPolicyError::ConditionFailed {
+                            condition: "eq",
+                            field: Some(field_name),
+                        });
                     }
                 } else if op == "content-length-range" {
                     // Reject negative values (as_i64 check) and non-integer values
@@ -226,7 +241,10 @@ pub fn validate_post_policy(
                     let max = max_i as u64;
                     let size = file_size as u64;
                     if size < min || size > max {
-                        return Err(PostPolicyError::ConditionFailed("content-length-range"));
+                        return Err(PostPolicyError::ConditionFailed {
+                            condition: "content-length-range",
+                            field: None,
+                        });
                     }
                 }
             }
@@ -243,9 +261,10 @@ pub fn validate_post_policy(
             f if f.starts_with("x-ignore-") => {}
             _ => {
                 if !covered_fields.contains(&lower) {
-                    return Err(PostPolicyError::ConditionFailed(
-                        "form field not covered by policy",
-                    ));
+                    return Err(PostPolicyError::ConditionFailed {
+                        condition: "form field not covered by policy",
+                        field: Some(lower),
+                    });
                 }
             }
         }
@@ -484,7 +503,7 @@ mod tests {
         ];
         let err = validate_post_policy(&policy_b64, &form_fields, 0, "my-bucket", 0).unwrap_err();
         assert!(
-            matches!(err, PostPolicyError::ConditionFailed(_)),
+            matches!(err, PostPolicyError::ConditionFailed { .. }),
             "expected ConditionFailed, got {:?}",
             err
         );
@@ -602,7 +621,13 @@ mod tests {
     fn policy_bucket_mismatch() {
         let b64 = future_policy_b64(&[serde_json::json!({"bucket": "other"})]);
         let err = validate_post_policy(&b64, &[], 0, "my-bucket", 0).unwrap_err();
-        assert!(matches!(err, PostPolicyError::ConditionFailed("bucket")));
+        assert!(matches!(
+            err,
+            PostPolicyError::ConditionFailed {
+                condition: "bucket",
+                field: None
+            }
+        ));
     }
 
     #[test]
@@ -615,7 +640,10 @@ mod tests {
         let err = validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap_err();
         assert!(matches!(
             err,
-            PostPolicyError::ConditionFailed("exact match")
+            PostPolicyError::ConditionFailed {
+                condition: "exact match",
+                ..
+            }
         ));
     }
 
@@ -629,7 +657,10 @@ mod tests {
         let err = validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap_err();
         assert!(matches!(
             err,
-            PostPolicyError::ConditionFailed("exact match")
+            PostPolicyError::ConditionFailed {
+                condition: "exact match",
+                ..
+            }
         ));
     }
 
@@ -655,7 +686,10 @@ mod tests {
         let err = validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap_err();
         assert!(matches!(
             err,
-            PostPolicyError::ConditionFailed("starts-with")
+            PostPolicyError::ConditionFailed {
+                condition: "starts-with",
+                ..
+            }
         ));
     }
 
@@ -738,7 +772,13 @@ mod tests {
         ]);
         let form_fields = vec![("key", "wrong")];
         let err = validate_post_policy(&b64, &form_fields, 0, "b", 0).unwrap_err();
-        assert!(matches!(err, PostPolicyError::ConditionFailed("eq")));
+        assert!(matches!(
+            err,
+            PostPolicyError::ConditionFailed {
+                condition: "eq",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -800,7 +840,10 @@ mod tests {
         let err = validate_post_policy(&b64, &[], 50, "b", 0).unwrap_err();
         assert!(matches!(
             err,
-            PostPolicyError::ConditionFailed("content-length-range")
+            PostPolicyError::ConditionFailed {
+                condition: "content-length-range",
+                field: None
+            }
         ));
     }
 
@@ -813,7 +856,10 @@ mod tests {
         let err = validate_post_policy(&b64, &[], 200, "b", 0).unwrap_err();
         assert!(matches!(
             err,
-            PostPolicyError::ConditionFailed("content-length-range")
+            PostPolicyError::ConditionFailed {
+                condition: "content-length-range",
+                field: None
+            }
         ));
     }
 

@@ -46,7 +46,8 @@ use response::S3Response;
 use router::{route, S3Operation};
 use s3_types::{
     requires_sigv4, BucketLifecycleConfiguration, BucketNamespace, LegalHoldStatus, ObjectLockMode,
-    ObjectLockState, ObjectRetention, StoredLegalHoldStatus, VersionId,
+    ObjectLockState, ObjectRetention, StoredLegalHoldStatus, VersionId, WebsiteRedirectLocation,
+    WebsiteRedirectLocationError, WEBSITE_REDIRECT_LOCATION_HEADER_NAME,
 };
 use server_core::sse::{
     SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
@@ -59,6 +60,8 @@ const TRACE_TARGET: &str = "server_http";
 const S3_MAX_LIST_KEYS: u32 = 1_000;
 const SLOW_REQUEST_EVENT_THRESHOLD_US: u128 = 5_000_000;
 const SYSTEM_METADATA_SIZE_LIMIT: usize = 2 * 1024;
+const INVALID_REDIRECT_LOCATION_MESSAGE: &str =
+    "The website redirect location must have a prefix of 'http://' or 'https://' or '/'.";
 
 fn current_trace_context() -> observability::TraceContext {
     observability::current_context().unwrap_or_else(observability::TraceContext::new_request)
@@ -287,6 +290,16 @@ fn validate_write_request_header_section_size(headers: &[(&str, &str)]) -> Resul
     Ok(())
 }
 
+fn parse_website_redirect_location(value: &str) -> Result<WebsiteRedirectLocation, ServerError> {
+    WebsiteRedirectLocation::new(value).map_err(|err| match err {
+        WebsiteRedirectLocationError::Empty
+        | WebsiteRedirectLocationError::InvalidHeaderBytes
+        | WebsiteRedirectLocationError::InvalidPrefix => ServerError::InvalidRedirectLocation {
+            reason: INVALID_REDIRECT_LOCATION_MESSAGE.to_string(),
+        },
+    })
+}
+
 fn parse_request_metadata<'a, I>(headers: I) -> Result<(MetadataBlob, SystemMetadata), ServerError>
 where
     I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -296,21 +309,36 @@ where
     let mut total_system_metadata_size = 0usize;
     for (name, value) in &headers {
         let lower = name.to_ascii_lowercase();
+        if lower == WEBSITE_REDIRECT_LOCATION_HEADER_NAME {
+            let _ = parse_website_redirect_location(value)?;
+        }
         if lower.starts_with("x-amz-meta-") {
             total_user_metadata_size = total_user_metadata_size
                 .checked_add(lower.len())
                 .and_then(|size| size.checked_add(value.len()))
-                .ok_or(ServerError::MetadataTooLarge)?;
+                .ok_or(ServerError::MetadataTooLargeDetailed {
+                    size: usize::MAX,
+                    max_size_allowed: USER_METADATA_SIZE_LIMIT,
+                })?;
             if total_user_metadata_size > USER_METADATA_SIZE_LIMIT {
-                return Err(ServerError::MetadataTooLarge);
+                return Err(ServerError::MetadataTooLargeDetailed {
+                    size: total_user_metadata_size,
+                    max_size_allowed: USER_METADATA_SIZE_LIMIT,
+                });
             }
         } else if is_system_metadata_header_name(&lower) {
             total_system_metadata_size = total_system_metadata_size
                 .checked_add(lower.len())
                 .and_then(|size| size.checked_add(value.len()))
-                .ok_or(ServerError::MetadataTooLarge)?;
+                .ok_or(ServerError::MetadataTooLargeDetailed {
+                    size: usize::MAX,
+                    max_size_allowed: SYSTEM_METADATA_SIZE_LIMIT,
+                })?;
             if total_system_metadata_size > SYSTEM_METADATA_SIZE_LIMIT {
-                return Err(ServerError::MetadataTooLarge);
+                return Err(ServerError::MetadataTooLargeDetailed {
+                    size: total_system_metadata_size,
+                    max_size_allowed: SYSTEM_METADATA_SIZE_LIMIT,
+                });
             }
         }
     }
@@ -1174,6 +1202,10 @@ impl HttpFrontend {
                     let dst_cond = write_condition_from_headers(req)?;
                     let request_headers: Vec<(&str, &str)> = req.header_iter().collect();
                     validate_write_request_header_section_size(&request_headers)?;
+                    let website_redirect_location = req
+                        .header(WEBSITE_REDIRECT_LOCATION_HEADER_NAME)
+                        .map(parse_website_redirect_location)
+                        .transpose()?;
                     // Parse metadata and checksum algorithm at the HTTP boundary
                     // so the coordinator never sees raw headers.
                     let replace_metadata;
@@ -1263,6 +1295,7 @@ impl HttpFrontend {
                         )?,
                         dst_condition: &dst_cond,
                         directive,
+                        website_redirect_location,
                         tagging,
                         acl,
                         policy_context,
@@ -3073,6 +3106,7 @@ impl HttpFrontend {
             "content-encoding",
             "content-language",
             "expires",
+            WEBSITE_REDIRECT_LOCATION_HEADER_NAME,
         ] {
             if let Some(val) = field(name) {
                 header_pairs.push((name.to_string(), val.to_string()));
@@ -3217,13 +3251,19 @@ impl HttpFrontend {
                     reason: e.to_string(),
                 },
                 // content-length-range violations → 400
-                auth::PostPolicyError::ConditionFailed("content-length-range") => {
-                    ServerError::InvalidRequest {
-                        reason: e.to_string(),
-                    }
-                }
+                auth::PostPolicyError::ConditionFailed {
+                    condition: "content-length-range",
+                    ..
+                } => ServerError::InvalidRequest {
+                    reason: e.to_string(),
+                },
                 // Other condition failures and expiration → 403
-                auth::PostPolicyError::Expired | auth::PostPolicyError::ConditionFailed(_) => {
+                auth::PostPolicyError::ConditionFailed {
+                    field: Some(field), ..
+                } => ServerError::PostPolicyAccessDenied {
+                    reason: format!("Access denied by POST policy condition on field '{field}'"),
+                },
+                auth::PostPolicyError::Expired | auth::PostPolicyError::ConditionFailed { .. } => {
                     ServerError::Auth(auth::AuthError::AccessDenied)
                 }
             })?;
@@ -5531,7 +5571,13 @@ mod tests {
         let value = "m".repeat(USER_METADATA_SIZE_LIMIT - key.len() + 1);
 
         let err = parse_request_metadata([(key, value.as_str())]).unwrap_err();
-        assert!(matches!(err, ServerError::MetadataTooLarge));
+        assert!(matches!(
+            err,
+            ServerError::MetadataTooLargeDetailed {
+                max_size_allowed: USER_METADATA_SIZE_LIMIT,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -5555,7 +5601,13 @@ mod tests {
         let value = "v".repeat(SYSTEM_METADATA_SIZE_LIMIT - "content-disposition".len() + 1);
 
         let err = parse_request_metadata([("content-disposition", value.as_str())]).unwrap_err();
-        assert!(matches!(err, ServerError::MetadataTooLarge));
+        assert!(matches!(
+            err,
+            ServerError::MetadataTooLargeDetailed {
+                max_size_allowed: SYSTEM_METADATA_SIZE_LIMIT,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -5568,7 +5620,31 @@ mod tests {
             ("cache-control", "x"),
         ])
         .unwrap_err();
-        assert!(matches!(err, ServerError::MetadataTooLarge));
+        assert!(matches!(
+            err,
+            ServerError::MetadataTooLargeDetailed {
+                max_size_allowed: SYSTEM_METADATA_SIZE_LIMIT,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_request_metadata_rejects_redirect_without_supported_prefix() {
+        let err =
+            parse_request_metadata([(WEBSITE_REDIRECT_LOCATION_HEADER_NAME, "docs/landing.html")])
+                .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRedirectLocation { .. }));
+    }
+
+    #[test]
+    fn parse_request_metadata_rejects_redirect_with_unsupported_scheme() {
+        let err = parse_request_metadata([(
+            WEBSITE_REDIRECT_LOCATION_HEADER_NAME,
+            "ftp://example.com/out",
+        )])
+        .unwrap_err();
+        assert!(matches!(err, ServerError::InvalidRedirectLocation { .. }));
     }
 
     #[test]

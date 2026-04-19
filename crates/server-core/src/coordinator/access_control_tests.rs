@@ -1456,6 +1456,7 @@ fn copy_object_bucket_policy_copy_source_controls_access() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: PutObjectAcl::None.into(),
@@ -1479,6 +1480,7 @@ fn copy_object_bucket_policy_copy_source_controls_access() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: PutObjectAcl::None.into(),
@@ -1516,6 +1518,7 @@ fn copy_object_bucket_policy_copy_source_controls_access() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: PutObjectAcl::None.into(),
@@ -1611,6 +1614,7 @@ fn copy_object_bucket_policy_requires_explicit_copy_metadata_directive() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::CopyExplicit,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: PutObjectAcl::None.into(),
@@ -1632,6 +1636,7 @@ fn copy_object_bucket_policy_requires_explicit_copy_metadata_directive() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: PutObjectAcl::None.into(),

@@ -5325,6 +5325,7 @@ mod phase6_harness {
                 destination: phase6_object_request(dst_bucket, DST_KEY, requester),
                 dst_condition: NO_WRITE,
                 directive,
+                website_redirect_location: None,
                 tagging,
                 acl: copy_acl(fixtures, scenario.acl),
                 policy_context: copy_policy_context(fixtures, scenario),
@@ -7778,6 +7779,7 @@ mod phase8_harness {
                 ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                website_redirect_location: None,
                 tagging: TaggingDirective::Copy,
                 acl: PutObjectAcl::Private.into(),
                 policy_context,
@@ -7811,6 +7813,7 @@ mod phase8_harness {
                 ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                website_redirect_location: None,
                 tagging: if replace_tags {
                     TaggingDirective::Replace(Some(PHASE8_TAGS_XML))
                 } else {

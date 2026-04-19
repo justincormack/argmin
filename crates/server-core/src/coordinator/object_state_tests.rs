@@ -172,6 +172,7 @@ fn copy_object_basic() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -197,6 +198,212 @@ fn copy_object_basic() {
         })
         .unwrap();
     assert_eq!(obj.body.read_all().unwrap(), b"hello copy");
+}
+
+#[test]
+fn copy_object_does_not_copy_website_redirect_without_explicit_override() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data: b"hello copy",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::from_headers(&[
+                ("Content-Type", "text/plain"),
+                ("x-amz-website-redirect-location", "/docs/source.html"),
+            ])
+            .unwrap(),
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("bucket", "src", None),
+            destination: object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap();
+
+    let obj = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "dst",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(obj.body.read_all().unwrap(), b"hello copy");
+    assert_eq!(obj.system_metadata.website_redirect_location(), None);
+}
+
+#[test]
+fn copy_object_explicit_website_redirect_override_persists() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "src", test_requester(), None),
+            data: b"hello copy",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::from_headers(&[("Content-Type", "text/plain")])
+                .unwrap(),
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("bucket", "src", None),
+            destination: object_request_with_expected_owner(
+                "bucket",
+                "dst",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: Some(
+                s3_types::WebsiteRedirectLocation::new("/docs/destination.html").unwrap(),
+            ),
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap();
+
+    let obj = coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "dst",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(
+        obj.system_metadata
+            .website_redirect_location()
+            .map(|value| value.as_str()),
+        Some("/docs/destination.html")
+    );
+}
+
+#[test]
+fn copy_object_same_key_explicit_website_redirect_override_is_allowed() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            data: b"same-key-body",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    coord
+        .copy_object(&CopyObjectRequest {
+            source: copy_source("bucket", "key", None),
+            destination: object_request_with_expected_owner(
+                "bucket",
+                "key",
+                test_requester(),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: Some(
+                s3_types::WebsiteRedirectLocation::new("/docs/changed.html").unwrap(),
+            ),
+            tagging: TaggingDirective::Copy,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            policy_context: PutObjectPolicyContext::default(),
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+        })
+        .unwrap();
+
+    let obj = coord
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                "key",
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(
+        obj.system_metadata
+            .website_redirect_location()
+            .map(|value| value.as_str()),
+        Some("/docs/changed.html")
+    );
 }
 
 #[test]
@@ -236,6 +443,7 @@ fn copy_object_explicit_sse_s3_destination_preserves_managed_encryption() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
             acl: NO_PUT_OBJECT_ACL.into(),
             policy_context: PutObjectPolicyContext::default(),
@@ -312,6 +520,7 @@ fn copy_object_explicit_sse_c_destination_requires_customer_headers() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
             acl: NO_PUT_OBJECT_ACL.into(),
             policy_context: PutObjectPolicyContext::default(),
@@ -404,6 +613,7 @@ fn copy_object_rejects_private_source_read_for_non_owner() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -466,6 +676,7 @@ fn copy_object_rejects_bucket_owner_copying_private_object_owned_by_other_princi
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -563,6 +774,7 @@ fn copy_object_allows_grantee_with_full_control_on_bucket_and_source_object() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -650,6 +862,7 @@ fn copy_object_rejects_acl_on_bucket_owner_enforced_bucket() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: PutObjectAcl::PublicRead.into(),
@@ -708,6 +921,7 @@ fn copy_object_rejects_public_acl_when_block_public_acls_enabled() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: PutObjectAcl::PublicRead.into(),
@@ -763,6 +977,7 @@ fn copy_object_metadata_copy_directive() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -843,6 +1058,7 @@ fn copy_object_metadata_replace_directive() {
                 system_metadata: &new_system_metadata,
                 checksum_algorithm: None,
             },
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -923,6 +1139,7 @@ fn copy_object_same_key_replace_metadata() {
                 system_metadata: &new_system_metadata,
                 checksum_algorithm: None,
             },
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -992,6 +1209,7 @@ fn copy_object_tagging_copy_preserves_source_tags() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -1055,6 +1273,7 @@ fn copy_object_commits_authorized_acl_and_trusted_copied_tags() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
             acl: PutObjectAcl::PublicRead.into(),
             policy_context: PutObjectPolicyContext::default(),
@@ -1122,6 +1341,7 @@ fn copy_object_tagging_replace_overwrites_source_tags() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Replace(Some(dst_tags)),
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -1197,6 +1417,7 @@ fn copy_object_replace_strips_unverified_inline_checksum_and_applies_default_che
                 system_metadata: &new_system_metadata,
                 checksum_algorithm: None,
             },
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -1278,6 +1499,7 @@ fn copy_object_replace_recomputes_checksum_from_algorithm() {
                 system_metadata: &new_system_metadata,
                 checksum_algorithm: Some(ChecksumAlgorithm::Crc32c),
             },
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -1342,6 +1564,7 @@ fn copy_object_source_not_found() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -1390,6 +1613,7 @@ fn copy_object_dest_bucket_not_found() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -1444,6 +1668,7 @@ fn copy_object_source_if_match_fails() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -1511,6 +1736,7 @@ fn copy_object_dest_if_none_match_prevents_overwrite() {
             ),
             dst_condition: &dst_cond,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -1578,6 +1804,7 @@ fn copy_object_dest_if_match_allows_update() {
             ),
             dst_condition: &dst_cond,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -1648,6 +1875,7 @@ fn copy_object_cross_bucket() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),
@@ -3566,6 +3794,7 @@ fn copy_object_with_object_lock_to_plain_bucket_rejects_before_reading_source() 
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: PutObjectAcl::None.into(),
@@ -5046,6 +5275,7 @@ fn copy_object_is_consistent_during_concurrent_overwrite() {
                 ),
                 dst_condition: NO_WRITE,
                 directive: MetadataDirective::Copy,
+                website_redirect_location: None,
                 tagging: TaggingDirective::Copy,
 
                 acl: NO_PUT_OBJECT_ACL.into(),
@@ -5730,6 +5960,7 @@ fn copy_object_survives_source_metadata_delete_mid_read() {
             ),
             dst_condition: NO_WRITE,
             directive: MetadataDirective::Copy,
+            website_redirect_location: None,
             tagging: TaggingDirective::Copy,
 
             acl: NO_PUT_OBJECT_ACL.into(),

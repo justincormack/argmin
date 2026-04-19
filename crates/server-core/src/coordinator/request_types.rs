@@ -12,7 +12,7 @@ use crate::system_metadata::SystemMetadata;
 use s3_types::{
     AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission, BucketNamespace,
     BucketVersioningState, CanonicalUserId, LegalHoldStatus, ObjectLockDefaultRetention,
-    ObjectRetention, VersionId,
+    ObjectRetention, VersionId, WebsiteRedirectLocation,
 };
 use storage::{
     BucketEncryptionConfig, BucketName, BucketObjectOwnership, BucketOwnershipControls,
@@ -166,6 +166,7 @@ pub struct CopyObjectRequest<'a> {
     pub destination: ObjectRequest<'a>,
     pub dst_condition: &'a WriteCondition,
     pub directive: MetadataDirective<'a>,
+    pub website_redirect_location: Option<WebsiteRedirectLocation>,
     pub tagging: TaggingDirective<'a>,
     pub acl: PutObjectWriteAcl<'a>,
     pub policy_context: PutObjectPolicyContext<'a>,

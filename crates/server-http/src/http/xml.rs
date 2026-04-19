@@ -182,6 +182,28 @@ pub fn key_too_long_error_xml(size: usize, max_size_allowed: usize, request_id: 
     )
 }
 
+/// Format an S3 `MetadataTooLarge` error response.
+#[must_use]
+pub fn metadata_too_large_error_xml(
+    size: usize,
+    max_size_allowed: usize,
+    request_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>MetadataTooLarge</Code>\
+         <Message>Your metadata headers exceed the maximum allowed metadata size</Message>\
+         <Size>{}</Size>\
+         <MaxSizeAllowed>{}</MaxSizeAllowed>\
+         <RequestId>{}</RequestId>\
+         </Error>",
+        size,
+        max_size_allowed,
+        xml_escape(request_id),
+    )
+}
+
 /// Format an S3 error response XML with an extra `<Region>` element.
 #[must_use]
 pub fn error_xml_with_region(
