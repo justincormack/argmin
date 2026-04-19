@@ -1901,7 +1901,10 @@ impl BucketEncryptionConfig {
                 Some(value) => value,
                 None => ManagedEncryptionAlgorithm::Aes256,
             },
-            sse_c_blocked: self.sse_c_blocked,
+            sse_c_blocked: match self.default_encryption {
+                Some(_) => self.sse_c_blocked,
+                None => true,
+            },
         }
     }
 }
@@ -1917,7 +1920,7 @@ impl Default for EffectiveBucketEncryptionConfig {
     fn default() -> Self {
         Self {
             default_encryption: ManagedEncryptionAlgorithm::Aes256,
-            sse_c_blocked: false,
+            sse_c_blocked: true,
         }
     }
 }

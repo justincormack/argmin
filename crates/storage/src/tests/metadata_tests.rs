@@ -908,7 +908,10 @@ fn file_bucket_metadata_config_roundtrip() {
 
     assert_eq!(
         store.get_bucket_encryption(&bucket_name("bucket")).unwrap(),
-        BucketEncryptionConfig::default()
+        BucketEncryptionConfig {
+            default_encryption: None,
+            sse_c_blocked: true,
+        }
     );
 
     store
@@ -940,6 +943,13 @@ fn file_bucket_metadata_config_roundtrip() {
     assert_eq!(
         store.get_bucket_encryption(&bucket_name("bucket")).unwrap(),
         BucketEncryptionConfig::default()
+    );
+    assert!(
+        store
+            .head_bucket(&bucket_name("bucket"))
+            .unwrap()
+            .encryption
+            .sse_c_blocked
     );
 
     store

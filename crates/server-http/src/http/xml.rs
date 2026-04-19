@@ -2005,7 +2005,7 @@ pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig
             feature: "KMS bucket encryption configuration".to_string(),
         });
     }
-    let default_encryption = if apply_default_seen {
+    let mut default_encryption = if apply_default_seen {
         match sse_algorithm.as_deref().map(str::trim) {
             Some("AES256") => Some(ManagedEncryptionAlgorithm::Aes256),
             Some(other) => {
@@ -2044,6 +2044,10 @@ pub fn parse_bucket_encryption_xml(data: &[u8]) -> Result<BucketEncryptionConfig
             });
         }
     };
+
+    if matches!(encryption_types.as_slice(), ["NONE"]) && default_encryption.is_none() {
+        default_encryption = Some(ManagedEncryptionAlgorithm::Aes256);
+    }
 
     Ok(BucketEncryptionConfig {
         default_encryption,
@@ -5273,7 +5277,7 @@ mod tests {
 
         let unblocked_xml = get_bucket_encryption_xml(
             BucketEncryptionConfig {
-                default_encryption: None,
+                default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
                 sse_c_blocked: false,
             }
             .effective(),
@@ -5281,6 +5285,27 @@ mod tests {
         assert!(!unblocked_xml.contains("<EncryptionType>"));
         assert!(unblocked_xml.contains("<SSEAlgorithm>AES256</SSEAlgorithm>"));
         assert!(unblocked_xml.contains("<BucketKeyEnabled>false</BucketKeyEnabled>"));
+    }
+
+    #[test]
+    fn parse_bucket_encryption_none_normalizes_to_explicit_aes256() {
+        let xml = br#"
+            <ServerSideEncryptionConfiguration>
+              <Rule>
+                <BlockedEncryptionTypes>
+                  <EncryptionType>NONE</EncryptionType>
+                </BlockedEncryptionTypes>
+              </Rule>
+            </ServerSideEncryptionConfiguration>
+        "#;
+        let parsed = parse_bucket_encryption_xml(xml).unwrap();
+        assert_eq!(
+            parsed,
+            BucketEncryptionConfig {
+                default_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
+                sse_c_blocked: false,
+            }
+        );
     }
 
     // ── CORS XML ─────────────────────────────────────────────────────

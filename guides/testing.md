@@ -362,12 +362,11 @@ If you change `S3_TEST_BUCKET_PREFIX`, update the policy resource ARNs to
 match.
 
 AWS announced on April 6, 2026 that SSE-C is being disabled by default for new
-buckets, and later for selected existing buckets, as the rollout reaches each
-Region. The external SSE-C fixtures now call `PutBucketEncryption` with
-`BlockedEncryptionTypes = NONE` after bucket creation so those tests remain
-stable across mixed rollout states. We do not yet assert the new
-default-blocked behavior in AWS-backed tests because the rollout is temporally
-and regionally variable.
+buckets, with `PutBucketEncryption` and `BlockedEncryptionTypes = NONE`
+required to re-enable it. The external SSE-C fixtures call that configuration
+after bucket creation so their positive SSE-C coverage remains stable while the
+default-blocked behavior is asserted separately in AWS-backed bucket-encryption
+tests.
 
 If AWS-backed object-lock tests fail immediately with `AccessDenied` on
 `PutBucketObjectLockConfiguration`, re-attach the committed policy after

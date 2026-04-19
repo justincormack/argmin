@@ -192,10 +192,10 @@ async fn wait_for_bucket_sse_c_enabled(client: &Client, bucket: &str) {
 
 /// Explicitly allow SSE-C on a bucket.
 ///
-/// AWS announced on April 6, 2026 that new buckets in rolled-out Regions may
-/// block SSE-C by default until `PutBucketEncryption` sets
-/// `BlockedEncryptionTypes = NONE`. External SSE-C fixtures use this helper so
-/// they remain stable throughout the rollout.
+/// AWS now disables SSE-C by default on new buckets until
+/// `PutBucketEncryption` sets `BlockedEncryptionTypes = NONE`. External SSE-C
+/// fixtures use this helper so their positive-path coverage stays focused on
+/// SSE-C behavior rather than bucket-default gating.
 pub async fn enable_bucket_sse_c(client: &Client, bucket: &str) {
     client
         .put_bucket_encryption()
