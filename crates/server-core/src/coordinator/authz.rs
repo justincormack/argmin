@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use s3_types::{
     aws_account_id_from_principal, AclGrant, AclGrantee, AclGrants, AclPermission,
-    BucketVersioningState, CanonicalUserId, StoredLegalHoldStatus, VersionId,
+    BucketVersioningState, CanonicalUserId, LifecycleConfigError, StoredLegalHoldStatus, VersionId,
 };
 use storage::traits::PgMetadataStore;
 use storage::{
@@ -2521,22 +2521,22 @@ impl Coordinator {
             auth::PolicyAction::PutLifecycleConfiguration,
         )?;
         let parsed_config = Arc::new(
-            storage::parse_lifecycle_configuration_xml(req.config.as_bytes()).map_err(|error| {
-                match error {
-                    storage::LifecycleConfigError::MalformedXml { reason } => {
+            s3_types::parse_lifecycle_configuration_xml(req.config.as_bytes()).map_err(
+                |error| match error {
+                    LifecycleConfigError::MalformedXml { reason } => {
                         ServerError::MalformedXML { reason }
                     }
-                    storage::LifecycleConfigError::InvalidRequest { reason } => {
+                    LifecycleConfigError::InvalidRequest { reason } => {
                         ServerError::InvalidRequest { reason }
                     }
-                    storage::LifecycleConfigError::InvalidArgument { reason } => {
+                    LifecycleConfigError::InvalidArgument { reason } => {
                         ServerError::InvalidArgument { reason }
                     }
-                    storage::LifecycleConfigError::NotImplemented { feature } => {
+                    LifecycleConfigError::NotImplemented { feature } => {
                         ServerError::NotImplemented { feature }
                     }
-                }
-            })?,
+                },
+            )?,
         );
         Ok(AuthorizedPutBucketLifecycle {
             bucket: req.bucket.name_typed().clone(),

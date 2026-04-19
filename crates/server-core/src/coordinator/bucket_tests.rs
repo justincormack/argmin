@@ -2,7 +2,10 @@ use super::test_helpers::{self, UploadPartRequest};
 use super::test_support::*;
 use super::*;
 use crate::conditional::DeleteCondition;
-use storage::{BucketLifecycleConfiguration, LifecycleExpiration, LifecycleRuleStatus};
+use s3_types::{
+    AbortIncompleteMultipartUpload, BucketLifecycleConfiguration, LifecycleExpiration,
+    LifecycleRule, LifecycleRuleFilter, LifecycleRuleStatus, LifecycleTag,
+};
 
 fn delete_bucket_test(coord: &Coordinator, name: &str) -> Result<(), ServerError> {
     coord.delete_bucket(&bucket_request_with_expected_owner(
@@ -1095,12 +1098,12 @@ fn bucket_lifecycle_round_trips() {
 fn evaluate_current_object_lifecycle_expiration_selects_earliest_matching_rule() {
     let config = BucketLifecycleConfiguration {
         rules: vec![
-            storage::LifecycleRule {
+            LifecycleRule {
                 id: Some("later".to_string()),
                 status: LifecycleRuleStatus::Enabled,
-                filter: storage::LifecycleRuleFilter {
+                filter: LifecycleRuleFilter {
                     prefix: Some("logs/".to_string()),
-                    ..storage::LifecycleRuleFilter::default()
+                    ..LifecycleRuleFilter::default()
                 },
                 expiration: Some(LifecycleExpiration::Days(
                     std::num::NonZeroU32::new(30).unwrap(),
@@ -1108,12 +1111,12 @@ fn evaluate_current_object_lifecycle_expiration_selects_earliest_matching_rule()
                 noncurrent_version_expiration: None,
                 abort_incomplete_multipart_upload: None,
             },
-            storage::LifecycleRule {
+            LifecycleRule {
                 id: Some("earlier".to_string()),
                 status: LifecycleRuleStatus::Enabled,
-                filter: storage::LifecycleRuleFilter {
+                filter: LifecycleRuleFilter {
                     prefix: Some("logs/".to_string()),
-                    tags: vec![storage::LifecycleTag {
+                    tags: vec![LifecycleTag {
                         key: "env".to_string(),
                         value: "prod".to_string(),
                     }],
@@ -1200,12 +1203,12 @@ fn requested_version_is_current_live_requires_implicit_current_request() {
 fn evaluate_multipart_lifecycle_abort_headers_matches_prefix_rule() {
     let config = BucketLifecycleConfiguration {
         rules: vec![
-            storage::LifecycleRule {
+            LifecycleRule {
                 id: Some("skip-tagged".to_string()),
                 status: LifecycleRuleStatus::Enabled,
-                filter: storage::LifecycleRuleFilter {
+                filter: LifecycleRuleFilter {
                     prefix: Some("uploads/".to_string()),
-                    tags: vec![storage::LifecycleTag {
+                    tags: vec![LifecycleTag {
                         key: "env".to_string(),
                         value: "prod".to_string(),
                     }],
@@ -1215,20 +1218,20 @@ fn evaluate_multipart_lifecycle_abort_headers_matches_prefix_rule() {
                 },
                 expiration: None,
                 noncurrent_version_expiration: None,
-                abort_incomplete_multipart_upload: Some(storage::AbortIncompleteMultipartUpload {
+                abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUpload {
                     days_after_initiation: std::num::NonZeroU32::new(2).unwrap(),
                 }),
             },
-            storage::LifecycleRule {
+            LifecycleRule {
                 id: Some("abort-prefix".to_string()),
                 status: LifecycleRuleStatus::Enabled,
-                filter: storage::LifecycleRuleFilter {
+                filter: LifecycleRuleFilter {
                     prefix: Some("uploads/".to_string()),
-                    ..storage::LifecycleRuleFilter::default()
+                    ..LifecycleRuleFilter::default()
                 },
                 expiration: None,
                 noncurrent_version_expiration: None,
-                abort_incomplete_multipart_upload: Some(storage::AbortIncompleteMultipartUpload {
+                abort_incomplete_multipart_upload: Some(AbortIncompleteMultipartUpload {
                     days_after_initiation: std::num::NonZeroU32::new(7).unwrap(),
                 }),
             },

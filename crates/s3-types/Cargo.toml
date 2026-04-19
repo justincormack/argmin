@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 ring = "0.17"
+thiserror = "2"
 
 [lib]
 name = "s3_types"

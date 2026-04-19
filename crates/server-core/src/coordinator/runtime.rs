@@ -4,13 +4,13 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::thread::JoinHandle;
 
 use ec::{EcConfig, ErasureCodec};
-use s3_types::BucketVersioningState;
+use s3_types::{BucketLifecycleConfiguration, BucketVersioningState};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
-    BucketInfo, BucketLifecycleConfiguration, BucketName, BucketState, EcShape, GenerationId,
-    ListMultipartUploadsReq, ListObjectVersionsReq, ListObjectsReq, ListPartsReq,
-    MultipartPartSegmentRecord, MultipartReclaimPartRecord, ObjectEncryption, ObjectKey,
-    OwnerIdentity, ShardKey, SharedStorageNode, StoredObject, UploadId, UploadState, VersionId,
+    BucketInfo, BucketName, BucketState, EcShape, GenerationId, ListMultipartUploadsReq,
+    ListObjectVersionsReq, ListObjectsReq, ListPartsReq, MultipartPartSegmentRecord,
+    MultipartReclaimPartRecord, ObjectEncryption, ObjectKey, OwnerIdentity, ShardKey,
+    SharedStorageNode, StoredObject, UploadId, UploadState, VersionId,
 };
 
 use super::payload::{PooledPayloadBuffer, SharedPayloadBuffer};
@@ -198,7 +198,7 @@ impl ReadRuntime {
 
         raw_config
             .map(|config_xml| {
-                storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(
+                s3_types::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(
                     |error| ServerError::InternalError {
                         reason: format!(
                             "stored lifecycle configuration for {} failed to parse at sweep time: {error}",

@@ -45,8 +45,8 @@ use request::{S3Request, TransportSecurity};
 use response::S3Response;
 use router::{route, S3Operation};
 use s3_types::{
-    requires_sigv4, BucketNamespace, LegalHoldStatus, ObjectLockMode, ObjectLockState,
-    ObjectRetention, StoredLegalHoldStatus, VersionId,
+    requires_sigv4, BucketLifecycleConfiguration, BucketNamespace, LegalHoldStatus, ObjectLockMode,
+    ObjectLockState, ObjectRetention, StoredLegalHoldStatus, VersionId,
 };
 use server_core::sse::{
     SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
@@ -302,8 +302,8 @@ fn parse_version_id(req: &S3Request) -> Result<Option<VersionId>, ServerError> {
 }
 
 fn ensure_lifecycle_rule_ids(
-    mut config: storage::BucketLifecycleConfiguration,
-) -> Result<storage::BucketLifecycleConfiguration, ServerError> {
+    mut config: BucketLifecycleConfiguration,
+) -> Result<BucketLifecycleConfiguration, ServerError> {
     for rule in &mut config.rules {
         if rule.id.is_none() {
             rule.id = Some(generate_lifecycle_rule_id()?);

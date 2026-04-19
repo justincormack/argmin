@@ -9,14 +9,14 @@ use super::request_types::{CreateBucketAcl, Requester};
 use super::response_types::{BucketSummary, GetBucketAclResult, GetObjectAclResult};
 use crate::sse::SseCustomerWriteContext;
 use s3_types::{
-    AclGrants, BucketVersioningState, CanonicalUserId, LegalHoldStatus, ObjectRetention,
-    StoredLegalHoldStatus, VersionId,
+    AclGrants, BucketLifecycleConfiguration, BucketVersioningState, CanonicalUserId,
+    LegalHoldStatus, ObjectRetention, StoredLegalHoldStatus, VersionId,
 };
 use storage::BucketObjectOwnership;
 use storage::{
-    BucketEncryptionConfig, BucketLifecycleConfiguration, BucketName, BucketObjectLockConfig,
-    BucketOwnershipControls, EffectiveBucketEncryptionConfig, MultipartUploadRecord, ObjectKey,
-    ObjectLockState, OwnerIdentity, PublicAccessBlockConfig, StoredObject, UploadId,
+    BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
+    EffectiveBucketEncryptionConfig, MultipartUploadRecord, ObjectKey, ObjectLockState,
+    OwnerIdentity, PublicAccessBlockConfig, StoredObject, UploadId,
 };
 
 #[derive(Debug)]

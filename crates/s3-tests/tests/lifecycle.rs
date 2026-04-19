@@ -1192,9 +1192,9 @@ fn test_bucket_lifecycle_raw_get_returns_canonical_xml() {
             </LifecycleConfiguration>
         "#;
 
-        let parsed = storage::parse_lifecycle_configuration_xml(body)
+        let parsed = s3_types::parse_lifecycle_configuration_xml(body)
             .expect("test lifecycle XML should parse");
-        let expected = storage::render_lifecycle_configuration_xml(&parsed);
+        let expected = s3_types::render_lifecycle_configuration_xml(&parsed);
 
         let url = format!("{}/{}?lifecycle", CTX.endpoint(), bucket);
         let put = send_signed_request("PUT", &url, body, [content_md5_header(body)]);

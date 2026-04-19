@@ -3,6 +3,10 @@
 use std::fmt::Write;
 use std::num::{NonZeroU32, NonZeroU64};
 
+pub mod lifecycle;
+
+pub use lifecycle::*;
+
 /// Maximum supported principal string length stored in metadata.
 pub const MAX_PRINCIPAL_LEN: usize = 256;
 

@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use s3_types::VersionId;
-use storage::{
-    BucketLifecycleConfiguration, BucketName, LifecycleDate, LifecycleExpiration, LifecycleRule,
-    LifecycleRuleStatus, StoredObject,
+use s3_types::{
+    BucketLifecycleConfiguration, LifecycleDate, LifecycleExpiration, LifecycleRule,
+    LifecycleRuleStatus, VersionId,
 };
+use storage::{BucketName, StoredObject};
 
 use super::{
     read_rwlock_unpoisoned, write_rwlock_unpoisoned, BucketSummary, Coordinator,
@@ -42,7 +42,7 @@ impl Coordinator {
         let raw_config = self.load_authorized_bucket_subresource(&authorized)?;
         let parsed_config = match raw_config {
             Some(config_xml) => Arc::new(
-                storage::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(
+                s3_types::parse_lifecycle_configuration_xml(config_xml.as_bytes()).map_err(
                     |error| ServerError::InternalError {
                         reason: format!(
                             "stored lifecycle configuration for {} failed to parse at request time: {error}",

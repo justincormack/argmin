@@ -10,15 +10,16 @@ use quick_xml::{escape::unescape, events::Event, Reader};
 #[cfg(test)]
 use s3_types::VersionId;
 use s3_types::{
-    AclGrant, AclGrantee, AclGrants, AclPermission, BucketObjectLockConfig, BucketVersioningState,
-    CanonicalUserId, LegalHoldStatus, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention,
+    AclGrant, AclGrantee, AclGrants, AclPermission, BucketLifecycleConfiguration,
+    BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, LegalHoldStatus,
+    LifecycleConfigError, ObjectLockDefaultRetention, ObjectLockMode, ObjectRetention,
     RetentionPeriod,
 };
 use server_core::system_metadata::SystemMetadata;
 use storage::{
-    BucketEncryptionConfig, BucketLifecycleConfiguration, BucketObjectOwnership,
-    BucketOwnershipControls, EffectiveBucketEncryptionConfig, ManagedEncryptionAlgorithm,
-    ObjectKey, PublicAccessBlockConfig,
+    BucketEncryptionConfig, BucketObjectOwnership, BucketOwnershipControls,
+    EffectiveBucketEncryptionConfig, ManagedEncryptionAlgorithm, ObjectKey,
+    PublicAccessBlockConfig,
 };
 
 use super::response::format_version_id;
@@ -2055,25 +2056,17 @@ pub fn parse_bucket_lifecycle_configuration_xml(
     const MAX_LIFECYCLE_CONFIGURATION_BYTES: usize = 2 * 1024 * 1024;
 
     ensure_xml_body_size(data, MAX_LIFECYCLE_CONFIGURATION_BYTES)?;
-    storage::parse_lifecycle_configuration_xml(data).map_err(|error| match error {
-        storage::LifecycleConfigError::MalformedXml { reason } => {
-            ServerError::MalformedXML { reason }
-        }
-        storage::LifecycleConfigError::InvalidRequest { reason } => {
-            ServerError::InvalidRequest { reason }
-        }
-        storage::LifecycleConfigError::InvalidArgument { reason } => {
-            ServerError::InvalidArgument { reason }
-        }
-        storage::LifecycleConfigError::NotImplemented { feature } => {
-            ServerError::NotImplemented { feature }
-        }
+    s3_types::parse_lifecycle_configuration_xml(data).map_err(|error| match error {
+        LifecycleConfigError::MalformedXml { reason } => ServerError::MalformedXML { reason },
+        LifecycleConfigError::InvalidRequest { reason } => ServerError::InvalidRequest { reason },
+        LifecycleConfigError::InvalidArgument { reason } => ServerError::InvalidArgument { reason },
+        LifecycleConfigError::NotImplemented { feature } => ServerError::NotImplemented { feature },
     })
 }
 
 #[must_use]
 pub fn get_bucket_lifecycle_configuration_xml(config: &BucketLifecycleConfiguration) -> String {
-    storage::render_lifecycle_configuration_xml(config)
+    s3_types::render_lifecycle_configuration_xml(config)
 }
 
 /// Format a `ListVersionsResult` XML response.
