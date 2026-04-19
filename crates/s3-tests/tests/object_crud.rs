@@ -584,6 +584,39 @@ fn signed_put_with_content_encoding(bucket: &str, key: &str, body: &[u8], conten
     );
 }
 
+fn response_header(headers: &[(String, String)], name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(header_name, _)| header_name.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.clone())
+}
+
+fn signed_put_with_header(
+    bucket: &str,
+    key: &str,
+    body: &[u8],
+    header_name: &str,
+    header_value: &str,
+) {
+    let url = format!("{}/{bucket}/{key}", CTX.endpoint());
+    let response = send_signed_request(
+        "PUT",
+        &url,
+        body,
+        vec![(header_name.to_string(), header_value.to_string())],
+    );
+    assert_eq!(
+        response.status, 200,
+        "PUT {header_name} should succeed, got {} body: {}",
+        response.status, response.body
+    );
+}
+
+fn signed_head(bucket: &str, key: &str) -> s3_tests::RawResponse {
+    let url = format!("{}/{bucket}/{key}", CTX.endpoint());
+    send_signed_request("HEAD", &url, b"", Vec::<(String, String)>::new())
+}
+
 // ── PutObject / GetObject basic ──────────────────────────────────────
 
 #[test]
@@ -1604,6 +1637,44 @@ fn test_object_write_cache_control() {
             .await
             .unwrap();
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_object_system_metadata_headers_round_trip_raw_values() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_bucket().await;
+        let cases = [
+            ("Cache-Control", "max-age=60,private"),
+            ("Content-Disposition", "attachment;filename=\"report.pdf\""),
+            ("Content-Encoding", "gzip,br"),
+            ("Content-Language", "en-US,fr-CA"),
+            ("Content-Type", "text/plain;charset=utf-8"),
+            ("Expires", "Mon, 15 Jan 2024 12:30:45 GMT"),
+        ];
+        let mut keys = Vec::with_capacity(cases.len());
+
+        for (index, (header_name, header_value)) in cases.iter().enumerate() {
+            let key = format!("raw-header-roundtrip-{index}");
+            signed_put_with_header(&bucket, &key, b"data", header_name, header_value);
+
+            let response = signed_head(&bucket, &key);
+            assert_eq!(
+                response.status, 200,
+                "HEAD for {header_name} should succeed, got body: {}",
+                response.body
+            );
+            assert_eq!(
+                response_header(&response.headers, header_name),
+                Some((*header_value).to_string()),
+                "expected {header_name} to round-trip exactly"
+            );
+
+            keys.push(key);
+        }
+
+        delete_all_and_bucket(client, &bucket, &keys).await;
     });
 }
 

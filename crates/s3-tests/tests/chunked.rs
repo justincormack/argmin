@@ -283,6 +283,44 @@ impl ChunkedPutContext {
     }
 }
 
+async fn put_signed_chunked_with_content_encoding(
+    ctx: &ChunkedPutContext,
+    bucket: &str,
+    key: &str,
+    data: &[u8],
+    content_encoding: &str,
+) {
+    let path = format!("/{bucket}/{key}");
+    let content_sha256 = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
+    let sign = ctx.streaming_signer().sign(&StreamingSignRequest {
+        method: "PUT",
+        path: &path,
+        content_sha256,
+        decoded_content_length: data.len(),
+        content_encoding,
+        extra_signed_headers: &[],
+    });
+    let wire = build_signed_chunked_body(&sign, data);
+    let agent = build_test_agent(&ctx.endpoint, None, std::time::Duration::from_secs(30));
+    let url = format!("{}{}", ctx.endpoint, path);
+    let mut resp = agent
+        .put(&url)
+        .header("Authorization", &sign.authorization)
+        .header("x-amz-date", &sign.amz_date)
+        .header("x-amz-content-sha256", content_sha256)
+        .header("content-encoding", content_encoding)
+        .header("x-amz-decoded-content-length", data.len().to_string())
+        .header("content-length", wire.len().to_string())
+        .send(&wire[..])
+        .expect("transport error");
+    let status = resp.status().as_u16();
+    let body_str = resp.body_mut().read_to_string().unwrap_or_default();
+    assert_eq!(
+        status, 200,
+        "PUT failed for content-encoding {content_encoding:?} ({status}): {body_str}"
+    );
+}
+
 /// Sign a streaming request with custom control over which headers are signed.
 ///
 /// `skip_content_encoding`: if true, omit `content-encoding` from signed headers.
@@ -800,34 +838,14 @@ fn test_signed_chunked_put_with_gzip_content_encoding() {
         s3_tests::create_bucket(&ctx.client, &bucket).await.unwrap();
 
         let data = b"hello from signed chunked gzip";
-        let path = format!("/{}/signed-chunked-gzip", bucket);
-        let content_sha256 = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD";
-
-        let sign = ctx.streaming_signer().sign(&StreamingSignRequest {
-            method: "PUT",
-            path: &path,
-            content_sha256,
-            decoded_content_length: data.len(),
-            content_encoding: "gzip",
-            extra_signed_headers: &[],
-        });
-        let wire = build_signed_chunked_body(&sign, data);
-        let agent = build_test_agent(&ctx.endpoint, None, std::time::Duration::from_secs(30));
-
-        let url = format!("{}{}", ctx.endpoint, path);
-        let mut resp = agent
-            .put(&url)
-            .header("Authorization", &sign.authorization)
-            .header("x-amz-date", &sign.amz_date)
-            .header("x-amz-content-sha256", content_sha256)
-            .header("content-encoding", "gzip")
-            .header("x-amz-decoded-content-length", data.len().to_string())
-            .header("content-length", wire.len().to_string())
-            .send(&wire[..])
-            .expect("transport error");
-        let status = resp.status().as_u16();
-        let body_str = resp.body_mut().read_to_string().unwrap_or_default();
-        assert_eq!(status, 200, "PUT failed ({}): {}", status, body_str);
+        put_signed_chunked_with_content_encoding(
+            &ctx,
+            &bucket,
+            "signed-chunked-gzip",
+            data,
+            "gzip",
+        )
+        .await;
 
         let get_resp = ctx
             .client
@@ -858,6 +876,79 @@ fn test_signed_chunked_put_with_gzip_content_encoding() {
             .key("signed-chunked-gzip")
             .send()
             .await;
+        ctx.client
+            .delete_bucket()
+            .bucket(&bucket)
+            .send()
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn test_signed_chunked_put_strips_aws_chunked_content_encoding_variants() {
+    s3_tests::run(async {
+        let ctx = chunked_put_context_for_content_encoding_case().await;
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(&ctx.client, &bucket).await.unwrap();
+        let data = b"hello from signed chunked content-encoding variants";
+        let cases = [
+            ("aws-chunked,gzip", "gzip"),
+            ("aws-chunked, gzip", "gzip"),
+            ("gzip,aws-chunked", "gzip"),
+            ("gzip, aws-chunked", "gzip"),
+            ("gzip,aws-chunked,br", "gzip,br"),
+            ("gzip, aws-chunked, br", "gzip, br"),
+        ];
+        let mut keys = Vec::with_capacity(cases.len());
+
+        for (index, (content_encoding, expected)) in cases.iter().enumerate() {
+            let key = format!("signed-chunked-ce-variant-{index}");
+            put_signed_chunked_with_content_encoding(&ctx, &bucket, &key, data, content_encoding)
+                .await;
+
+            let get_resp = ctx
+                .client
+                .get_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                get_resp.content_encoding(),
+                Some(*expected),
+                "GET content-encoding mismatch for input {content_encoding:?}"
+            );
+            let got = get_resp.body.collect().await.unwrap().into_bytes().to_vec();
+            assert_eq!(got, data, "body mismatch for input {content_encoding:?}");
+
+            let head = ctx
+                .client
+                .head_object()
+                .bucket(&bucket)
+                .key(&key)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                head.content_encoding(),
+                Some(*expected),
+                "HEAD content-encoding mismatch for input {content_encoding:?}"
+            );
+
+            keys.push(key);
+        }
+
+        for key in &keys {
+            let _ = ctx
+                .client
+                .delete_object()
+                .bucket(&bucket)
+                .key(key)
+                .send()
+                .await;
+        }
         ctx.client
             .delete_bucket()
             .bucket(&bucket)
