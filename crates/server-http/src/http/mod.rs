@@ -360,8 +360,9 @@ where
             let _ = parse_website_redirect_location(value)?;
         }
         if lower.starts_with("x-amz-meta-") {
+            let user_key_len = lower.trim_start_matches("x-amz-meta-").len();
             total_user_metadata_size = total_user_metadata_size
-                .checked_add(lower.len())
+                .checked_add(user_key_len)
                 .and_then(|size| size.checked_add(value.len()))
                 .ok_or(ServerError::MetadataTooLargeDetailed {
                     size: usize::MAX,
@@ -2565,26 +2566,50 @@ impl HttpFrontend {
                     } else {
                         None
                     };
-                let result = self.coordinator.upload_part_copy(&UploadPartCopyRequest {
-                    source: CopySource::new(
-                        src_bucket,
-                        src_key,
-                        src_version_id,
-                        &src_cond,
-                        expected_source_bucket_owner(req),
-                    ),
-                    upload: multipart_object_request(
-                        &bucket,
-                        &key,
-                        upload_id,
-                        requester,
-                        expected_bucket_owner,
-                    )?,
-                    part_number,
-                    copy_source_range,
-                    source_sse_customer: source_sse_customer.as_ref(),
-                    sse_customer: sse_customer.as_ref(),
-                })?;
+                let result = self
+                    .coordinator
+                    .upload_part_copy(&UploadPartCopyRequest {
+                        source: CopySource::new(
+                            src_bucket,
+                            src_key,
+                            src_version_id,
+                            &src_cond,
+                            expected_source_bucket_owner(req),
+                        ),
+                        upload: multipart_object_request(
+                            &bucket,
+                            &key,
+                            upload_id,
+                            requester,
+                            expected_bucket_owner,
+                        )?,
+                        part_number,
+                        copy_source_range,
+                        source_sse_customer: source_sse_customer.as_ref(),
+                        sse_customer: sse_customer.as_ref(),
+                    })
+                    .map_err(|err| match err {
+                        ServerError::PreconditionFailed => {
+                            let condition = if req.header("x-amz-copy-source-if-match").is_some() {
+                                "x-amz-copy-source-If-Match"
+                            } else if req.header("x-amz-copy-source-if-none-match").is_some() {
+                                "x-amz-copy-source-If-None-Match"
+                            } else if req.header("x-amz-copy-source-if-modified-since").is_some() {
+                                "x-amz-copy-source-If-Modified-Since"
+                            } else if req
+                                .header("x-amz-copy-source-if-unmodified-since")
+                                .is_some()
+                            {
+                                "x-amz-copy-source-If-Unmodified-Since"
+                            } else {
+                                return ServerError::PreconditionFailed;
+                            };
+                            ServerError::UploadPartCopyPreconditionFailed {
+                                condition: condition.to_string(),
+                            }
+                        }
+                        other => other,
+                    })?;
                 Ok(S3Response::upload_part_copy(
                     &result.etag,
                     result.last_modified,
@@ -2596,7 +2621,18 @@ impl HttpFrontend {
                 reject_managed_encryption_read_headers(req)?;
                 let upload_id =
                     parse_required_upload_id(req.query_param_lossy("uploadId").as_deref())?;
-                let parts = xml::parse_complete_multipart_upload_xml(&req.body)?;
+                let upload_id_text = upload_id.as_str().to_string();
+                let wire_ids = WireResponseIds::new(
+                    current_trace_context().request_id(),
+                    self.host_id.clone(),
+                );
+                let parts = match xml::parse_complete_multipart_upload_xml(&req.body) {
+                    Ok(parts) => parts,
+                    Err(ServerError::MalformedXML { .. }) => {
+                        return Ok(S3Response::complete_multipart_malformed_xml(&wire_ids));
+                    }
+                    Err(err) => return Err(err),
+                };
                 let cond = write_condition_from_headers(req)?;
                 // Extract object-level checksum claim from request headers as a raw
                 // string. CompleteMultipartUpload checksums may be composite ("base64-N"),
@@ -2614,7 +2650,7 @@ impl HttpFrontend {
                     .transpose()?;
                 let sse_customer = parse_sse_customer_request(req)?;
                 let requester = Self::requester_from_auth(auth);
-                let result = self.coordinator.complete_multipart_upload(
+                let result = match self.coordinator.complete_multipart_upload(
                     &crate::coordinator::CompleteMultipartUploadRequest {
                         upload: multipart_object_request(
                             &bucket,
@@ -2629,7 +2665,53 @@ impl HttpFrontend {
                         cond: &cond,
                         sse_customer: sse_customer.as_ref(),
                     },
-                )?;
+                ) {
+                    Ok(result) => result,
+                    Err(ServerError::NoSuchUpload { .. }) => {
+                        return Ok(S3Response::complete_multipart_no_such_upload(
+                            &upload_id_text,
+                            &wire_ids,
+                        ));
+                    }
+                    Err(ServerError::InvalidPart { part_number }) => {
+                        let etag = parts
+                            .iter()
+                            .find(|part| part.part_number == part_number)
+                            .map(|part| part.etag.as_str())
+                            .unwrap_or("");
+                        return Ok(S3Response::complete_multipart_invalid_part(
+                            &upload_id_text,
+                            part_number,
+                            etag,
+                            &wire_ids,
+                        ));
+                    }
+                    Err(ServerError::InvalidPartOrder) => {
+                        return Ok(S3Response::complete_multipart_invalid_part_order(
+                            &upload_id_text,
+                            &wire_ids,
+                        ));
+                    }
+                    Err(ServerError::EntityTooSmall {
+                        part_number,
+                        size,
+                        min,
+                    }) => {
+                        let etag = parts
+                            .iter()
+                            .find(|part| part.part_number == part_number)
+                            .map(|part| part.etag.as_str())
+                            .unwrap_or("");
+                        return Ok(S3Response::complete_multipart_entity_too_small(
+                            size,
+                            min,
+                            part_number,
+                            etag,
+                            &wire_ids,
+                        ));
+                    }
+                    Err(err) => return Err(err),
+                };
                 Ok(S3Response::complete_multipart_upload(
                     bucket.as_str(),
                     &key,
@@ -4579,25 +4661,13 @@ fn require_complete_sse_customer_fields<'a>(
         return Ok(None);
     }
     if algorithm.is_none() {
-        return Err(ServerError::InvalidArgument {
-            reason:
-                "Requests specifying Server Side Encryption with Customer provided keys must provide a valid encryption algorithm."
-                    .to_string(),
-        });
+        return Err(ServerError::MissingSseCustomerAlgorithm);
     }
     if customer_key.is_none() {
-        return Err(ServerError::InvalidArgument {
-            reason:
-                "Requests specifying Server Side Encryption with Customer provided keys must provide an appropriate secret key."
-                    .to_string(),
-        });
+        return Err(ServerError::MissingSseCustomerKey);
     }
     if customer_key_md5.is_none() {
-        return Err(ServerError::InvalidArgument {
-            reason:
-                "Requests specifying Server Side Encryption with Customer provided keys must provide the client calculated MD5 of the secret key."
-                    .to_string(),
-        });
+        return Err(ServerError::MissingSseCustomerKeyMd5);
     }
     Ok(Some((
         algorithm.expect("checked above"),
@@ -4951,7 +5021,9 @@ fn validate_checksum_headers(req: &S3Request, verify_body: bool) -> Result<(), S
                     _ => continue,
                 };
                 if claimed != actual_b64 {
-                    return Err(ServerError::BadDigest);
+                    return Err(ServerError::ChecksumDigestMismatch {
+                        algorithm: algo.to_string(),
+                    });
                 }
             }
         }
@@ -5687,7 +5759,7 @@ mod tests {
     #[test]
     fn parse_request_metadata_accepts_user_metadata_at_limit() {
         let key = "x-amz-meta-limit";
-        let value = "m".repeat(USER_METADATA_SIZE_LIMIT - key.len());
+        let value = "m".repeat(USER_METADATA_SIZE_LIMIT - "limit".len());
 
         let (metadata, system_metadata) = parse_request_metadata([(key, value.as_str())]).unwrap();
 
@@ -5698,7 +5770,7 @@ mod tests {
     #[test]
     fn parse_request_metadata_rejects_user_metadata_over_limit() {
         let key = "x-amz-meta-limit";
-        let value = "m".repeat(USER_METADATA_SIZE_LIMIT - key.len() + 1);
+        let value = "m".repeat(USER_METADATA_SIZE_LIMIT - "limit".len() + 1);
 
         let err = parse_request_metadata([(key, value.as_str())]).unwrap_err();
         assert!(matches!(
@@ -9004,8 +9076,14 @@ mod tests {
             key: "k".to_string(),
         };
         match fe.dispatch_routed(&req, &test_auth(), op) {
-            Err(ServerError::InvalidRequest { .. }) => {}
-            Err(e) => panic!("expected InvalidRequest, got {e:?}"),
+            Err(ServerError::CompleteMultipartMissingPartChecksum {
+                algorithm,
+                part_number,
+            }) => {
+                assert_eq!(algorithm, "crc32");
+                assert_eq!(part_number, 1);
+            }
+            Err(e) => panic!("expected CompleteMultipartMissingPartChecksum, got {e:?}"),
             Ok(_) => panic!("expected error, got Ok"),
         }
     }

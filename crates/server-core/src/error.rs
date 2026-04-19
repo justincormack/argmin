@@ -124,11 +124,23 @@ pub enum ServerError {
     #[error("bad digest")]
     BadDigest,
 
+    #[error("checksum digest mismatch for {algorithm}")]
+    ChecksumDigestMismatch { algorithm: String },
+
     #[error("invalid digest")]
     InvalidDigest,
 
     #[error("The calculated MD5 hash of the key did not match the hash that was provided.")]
     InvalidSseCustomerKeyMd5,
+
+    #[error("Requests specifying Server Side Encryption with Customer provided keys must provide a valid encryption algorithm.")]
+    MissingSseCustomerAlgorithm,
+
+    #[error("Requests specifying Server Side Encryption with Customer provided keys must provide an appropriate secret key.")]
+    MissingSseCustomerKey,
+
+    #[error("Requests specifying Server Side Encryption with Customer provided keys must provide the client calculated MD5 of the secret key.")]
+    MissingSseCustomerKeyMd5,
 
     #[error("invalid encryption algorithm: {value}")]
     InvalidEncryptionAlgorithmError { value: String },
@@ -191,6 +203,13 @@ pub enum ServerError {
         bucket: String,
     },
 
+    #[error("SSE-C blocked access denied for requester {requester_principal} action {action} resource {resource}")]
+    SseCBlockedAccessDenied {
+        requester_principal: String,
+        action: String,
+        resource: String,
+    },
+
     #[error("anonymous users cannot invoke this API")]
     AnonymousApiAccessDenied,
 
@@ -202,6 +221,23 @@ pub enum ServerError {
 
     #[error("invalid part order")]
     InvalidPartOrder,
+
+    #[error(
+        "complete multipart missing per-part checksum for part {part_number} using {algorithm}"
+    )]
+    CompleteMultipartMissingPartChecksum { algorithm: String, part_number: u32 },
+
+    #[error("complete multipart checksum header {header_name} is invalid")]
+    CompleteMultipartChecksumHeaderInvalid { header_name: String },
+
+    #[error("upload part copy source range invalid: {range_header} for source size {source_size}")]
+    UploadPartCopyInvalidRange {
+        range_header: String,
+        source_size: u64,
+    },
+
+    #[error("upload part copy precondition failed for {condition}")]
+    UploadPartCopyPreconditionFailed { condition: String },
 
     #[error("entity too small: part {part_number} is {size} bytes (min {min})")]
     EntityTooSmall {
@@ -311,9 +347,12 @@ impl ServerError {
             }
             Self::InvalidRange { .. } => "InvalidRange",
             Self::SlowDown => "SlowDown",
-            Self::BadDigest => "BadDigest",
+            Self::BadDigest | Self::ChecksumDigestMismatch { .. } => "BadDigest",
             Self::InvalidDigest => "InvalidDigest",
-            Self::InvalidSseCustomerKeyMd5 => "InvalidArgument",
+            Self::InvalidSseCustomerKeyMd5
+            | Self::MissingSseCustomerAlgorithm
+            | Self::MissingSseCustomerKey
+            | Self::MissingSseCustomerKeyMd5 => "InvalidArgument",
             Self::InvalidEncryptionAlgorithmError { .. } => "InvalidEncryptionAlgorithmError",
             Self::InvalidChunkSize { .. } => "InvalidChunkSizeError",
             Self::NoSuchCorsConfiguration { .. } => "NoSuchCORSConfiguration",
@@ -336,10 +375,15 @@ impl ServerError {
             Self::AccessDenied
             | Self::PostPolicyAccessDenied { .. }
             | Self::BlockPublicPolicyAccessDenied { .. }
+            | Self::SseCBlockedAccessDenied { .. }
             | Self::AnonymousApiAccessDenied => "AccessDenied",
             Self::NoSuchUpload { .. } => "NoSuchUpload",
             Self::InvalidPart { .. } => "InvalidPart",
             Self::InvalidPartOrder => "InvalidPartOrder",
+            Self::CompleteMultipartMissingPartChecksum { .. }
+            | Self::CompleteMultipartChecksumHeaderInvalid { .. } => "InvalidRequest",
+            Self::UploadPartCopyInvalidRange { .. } => "InvalidArgument",
+            Self::UploadPartCopyPreconditionFailed { .. } => "PreconditionFailed",
             Self::EntityTooSmall { .. } => "EntityTooSmall",
             Self::MalformedXML { .. } => "MalformedXML",
             Self::IllegalVersioningConfiguration { .. } => {
@@ -393,8 +437,15 @@ impl ServerError {
             | Self::InvalidBucketNamespace { .. }
             | Self::MaxMessageLengthExceeded { .. }
             | Self::BadDigest
+            | Self::ChecksumDigestMismatch { .. }
             | Self::InvalidDigest
             | Self::InvalidSseCustomerKeyMd5
+            | Self::MissingSseCustomerAlgorithm
+            | Self::MissingSseCustomerKey
+            | Self::MissingSseCustomerKeyMd5
+            | Self::CompleteMultipartMissingPartChecksum { .. }
+            | Self::CompleteMultipartChecksumHeaderInvalid { .. }
+            | Self::UploadPartCopyInvalidRange { .. }
             | Self::InvalidEncryptionAlgorithmError { .. } => 400,
             Self::InvalidChunkSize { .. } => 403,
             Self::NoSuchCorsConfiguration { .. } => 404,
@@ -421,6 +472,7 @@ impl ServerError {
             Self::AccessDenied
             | Self::PostPolicyAccessDenied { .. }
             | Self::BlockPublicPolicyAccessDenied { .. }
+            | Self::SseCBlockedAccessDenied { .. }
             | Self::AnonymousApiAccessDenied => 403,
             Self::NoSuchUpload { .. } => 404,
             Self::InvalidPart { .. } | Self::InvalidPartOrder | Self::EntityTooSmall { .. } => 400,
@@ -434,7 +486,7 @@ impl ServerError {
             | Self::RequestHeaderSectionTooLarge => 400,
             Self::MethodNotAllowed | Self::HeadDeleteMarkerMethodNotAllowed { .. } => 405,
             Self::InvalidRange { .. } => 416,
-            Self::PreconditionFailed => 412,
+            Self::PreconditionFailed | Self::UploadPartCopyPreconditionFailed { .. } => 412,
             Self::NotModified { .. } => 304,
             Self::SlowDown => 503,
             _ => 500,

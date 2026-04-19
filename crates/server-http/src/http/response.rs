@@ -171,6 +171,14 @@ fn client_error_message(err: &ServerError) -> String {
         | ServerError::Auth(auth::AuthError::AccessDenied)
         | ServerError::AccessDenied
         | ServerError::BlockPublicPolicyAccessDenied { .. } => "Access Denied".to_string(),
+        ServerError::SseCBlockedAccessDenied {
+            requester_principal,
+            action,
+            resource,
+        } => format!(
+            "User: {} is not authorized to perform: {} on resource: \"{}\" because this bucket has blocked upload requests that specify Server Side Encryption with Customer provided keys (SSE-C). Please specify a different server-side encryption type.",
+            requester_principal, action, resource
+        ),
         ServerError::PostPolicyAccessDenied { reason } => reason.clone(),
         ServerError::Auth(auth::AuthError::MalformedAuth) => {
             "malformed Authorization header".to_string()
@@ -235,7 +243,7 @@ fn client_error_message(err: &ServerError) -> String {
             "Your metadata headers exceed the maximum allowed metadata size".to_string()
         }
         ServerError::RequestHeaderSectionTooLarge => {
-            "The request header and query parameters used to make the request exceed the maximum allowed size.".to_string()
+            "Your request header section exceeds the maximum allowed size.".to_string()
         }
         ServerError::MaxMessageLengthExceeded { .. } => "Your request was too big.".to_string(),
         ServerError::MethodNotAllowed => "method not allowed".to_string(),
@@ -247,9 +255,24 @@ fn client_error_message(err: &ServerError) -> String {
         ServerError::NotModified { .. } => "not modified".to_string(),
         ServerError::SlowDown => "please reduce your request rate".to_string(),
         ServerError::BadDigest => "bad digest".to_string(),
+        ServerError::ChecksumDigestMismatch { algorithm } => {
+            format!("The {algorithm} you specified did not match the calculated checksum.")
+        }
         ServerError::InvalidDigest => "invalid digest".to_string(),
         ServerError::InvalidSseCustomerKeyMd5 => {
             "The calculated MD5 hash of the key did not match the hash that was provided."
+                .to_string()
+        }
+        ServerError::MissingSseCustomerAlgorithm => {
+            "Requests specifying Server Side Encryption with Customer provided keys must provide a valid encryption algorithm."
+                .to_string()
+        }
+        ServerError::MissingSseCustomerKey => {
+            "Requests specifying Server Side Encryption with Customer provided keys must provide an appropriate secret key."
+                .to_string()
+        }
+        ServerError::MissingSseCustomerKeyMd5 => {
+            "Requests specifying Server Side Encryption with Customer provided keys must provide the client calculated MD5 of the secret key."
                 .to_string()
         }
         ServerError::InvalidEncryptionAlgorithmError { .. } => {
@@ -303,6 +326,23 @@ fn client_error_message(err: &ServerError) -> String {
             size,
             min,
         } => format!("entity too small: part {part_number} is {size} bytes (min {min})"),
+        ServerError::CompleteMultipartMissingPartChecksum {
+            algorithm,
+            part_number,
+        } => format!(
+            "The upload was created using a {algorithm} checksum. The complete request must include the checksum for each part. It was missing for part {part_number} in the request."
+        ),
+        ServerError::CompleteMultipartChecksumHeaderInvalid { header_name } => {
+            format!("Value for {header_name} header is invalid.")
+        }
+        ServerError::UploadPartCopyInvalidRange {
+            source_size, ..
+        } => {
+            format!("Range specified is not valid for source object of size: {source_size}")
+        }
+        ServerError::UploadPartCopyPreconditionFailed { .. } => {
+            "At least one of the pre-conditions you specified did not hold".to_string()
+        }
         ServerError::NotImplemented { feature } => feature.clone(),
         ServerError::HeaderNotImplemented { .. } => {
             "A header you provided implies functionality that is not implemented".to_string()
@@ -371,6 +411,21 @@ impl S3Response {
                     ),
                     request_id,
                     host_id,
+                );
+                Self::new(403).chunked_xml_body(body)
+            }
+            ServerError::SseCBlockedAccessDenied { .. } => {
+                let body = format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                     <Error>\
+                     <Code>AccessDenied</Code>\
+                     <Message>{}</Message>\
+                     <RequestId>{}</RequestId>\
+                     <HostId>{}</HostId>\
+                     </Error>",
+                    xml::xml_escape_text(&client_error_message(err)),
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
                 );
                 Self::new(403).chunked_xml_body(body)
             }
@@ -478,19 +533,20 @@ impl S3Response {
                     xml::query_parameter_not_implemented_xml(query_parameter, resource, request_id);
                 Self::new(501).chunked_xml_body(body)
             }
-            ServerError::InvalidSseCustomerKeyMd5 => {
+            ServerError::InvalidSseCustomerKeyMd5
+            | ServerError::MissingSseCustomerAlgorithm
+            | ServerError::MissingSseCustomerKey
+            | ServerError::MissingSseCustomerKeyMd5 => {
                 let body = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
                      <Error>\
                      <Code>InvalidArgument</Code>\
                      <Message>{}</Message>\
                      <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
-                     <Resource>{}</Resource>\
                      <RequestId>{}</RequestId>\
                      <HostId>{}</HostId>\
                     </Error>",
-                    xml::xml_escape(&client_error_message(err)),
-                    xml::xml_escape(resource),
+                    xml::xml_escape_text(&client_error_message(err)),
                     xml::xml_escape(request_id),
                     xml::xml_escape(host_id),
                 );
@@ -504,13 +560,11 @@ impl S3Response {
                      <Message>{}</Message>\
                      <ArgumentName>x-amz-server-side-encryption</ArgumentName>\
                      <ArgumentValue>{}</ArgumentValue>\
-                     <Resource>{}</Resource>\
                      <RequestId>{}</RequestId>\
                      <HostId>{}</HostId>\
                      </Error>",
-                    xml::xml_escape(&client_error_message(err)),
+                    xml::xml_escape_text(&client_error_message(err)),
                     xml::xml_escape(value),
-                    xml::xml_escape(resource),
                     xml::xml_escape(request_id),
                     xml::xml_escape(host_id),
                 );
@@ -569,13 +623,77 @@ impl S3Response {
                 );
                 Self::new(400).chunked_xml_body(body)
             }
+            ServerError::RequestHeaderSectionTooLarge => {
+                let body = xml::request_header_section_too_large_error_xml(
+                    super::MAX_WRITE_REQUEST_HEADER_SECTION_SIZE,
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::ChecksumDigestMismatch { .. } => {
+                let body = xml::error_xml_with_host_id(
+                    "BadDigest",
+                    &client_error_message(err),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
             ServerError::PostPolicyAccessDenied { reason } => {
                 let body = xml::error_xml_with_host_id("AccessDenied", reason, request_id, host_id);
                 Self::new(403).chunked_xml_body(body)
             }
             ServerError::NoSuchUpload { upload_id } => {
-                let body = xml::no_such_upload_error_xml(upload_id, request_id);
+                let body = xml::no_such_upload_error_xml(upload_id, request_id, host_id);
                 Self::new(404).chunked_xml_body(body)
+            }
+            ServerError::MalformedXML { .. } => {
+                let body = xml::error_xml_with_host_id(
+                    err.s3_error_code(),
+                    &client_error_message(err),
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::CompleteMultipartMissingPartChecksum {
+                algorithm,
+                part_number,
+            } => {
+                let body = xml::complete_multipart_missing_part_checksum_error_xml(
+                    algorithm,
+                    *part_number,
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::CompleteMultipartChecksumHeaderInvalid { header_name } => {
+                let body = xml::complete_multipart_checksum_header_invalid_error_xml(
+                    header_name,
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::UploadPartCopyInvalidRange {
+                range_header,
+                source_size,
+            } => {
+                let body = xml::upload_part_copy_invalid_range_error_xml(
+                    range_header,
+                    *source_size,
+                    request_id,
+                    host_id,
+                );
+                Self::new(400).chunked_xml_body(body)
+            }
+            ServerError::UploadPartCopyPreconditionFailed { condition } => {
+                let body = xml::upload_part_copy_precondition_failed_error_xml(
+                    condition, request_id, host_id,
+                );
+                Self::new(412).chunked_xml_body(body)
             }
             _ => {
                 let body = xml::error_xml(
@@ -1626,6 +1744,79 @@ impl S3Response {
         }
         resp.apply_lifecycle_expiration_header(result.lifecycle_expiration.as_ref())
             .apply_managed_encryption_headers(result.managed_encryption)
+    }
+
+    /// Build a complete-multipart `MalformedXML` response.
+    #[must_use]
+    pub fn complete_multipart_malformed_xml(wire_ids: &WireResponseIds) -> Self {
+        let body = xml::complete_multipart_malformed_xml_error_xml(
+            wire_ids.request_id(),
+            wire_ids.host_id(),
+        );
+        Self::new(400).chunked_xml_body(body)
+    }
+
+    /// Build a complete-multipart `NoSuchUpload` response.
+    #[must_use]
+    pub fn complete_multipart_no_such_upload(upload_id: &str, wire_ids: &WireResponseIds) -> Self {
+        let body = xml::complete_multipart_no_such_upload_error_xml(
+            upload_id,
+            wire_ids.request_id(),
+            wire_ids.host_id(),
+        );
+        Self::new(404).chunked_xml_body(body)
+    }
+
+    /// Build a complete-multipart `InvalidPart` response.
+    #[must_use]
+    pub fn complete_multipart_invalid_part(
+        upload_id: &str,
+        part_number: u32,
+        etag: &str,
+        wire_ids: &WireResponseIds,
+    ) -> Self {
+        let body = xml::complete_multipart_invalid_part_error_xml(
+            upload_id,
+            part_number,
+            etag,
+            wire_ids.request_id(),
+            wire_ids.host_id(),
+        );
+        Self::new(400).chunked_xml_body(body)
+    }
+
+    /// Build a complete-multipart `InvalidPartOrder` response.
+    #[must_use]
+    pub fn complete_multipart_invalid_part_order(
+        upload_id: &str,
+        wire_ids: &WireResponseIds,
+    ) -> Self {
+        let body = xml::complete_multipart_invalid_part_order_error_xml(
+            upload_id,
+            wire_ids.request_id(),
+            wire_ids.host_id(),
+        );
+        Self::new(400).chunked_xml_body(body)
+    }
+
+    /// Build a complete-multipart `EntityTooSmall` response.
+    #[must_use]
+    pub fn complete_multipart_entity_too_small(
+        proposed_size: u64,
+        min_size_allowed: u64,
+        part_number: u32,
+        etag: &str,
+        wire_ids: &WireResponseIds,
+    ) -> Self {
+        let body = xml::complete_multipart_entity_too_small_error_xml(
+            proposed_size,
+            min_size_allowed,
+            part_number,
+            etag,
+            wire_ids.request_id(),
+            wire_ids.host_id(),
+        );
+        Self::new(400).chunked_xml_body(body)
     }
 
     /// Build a response for `AbortMultipartUpload` (204 No Content).
@@ -3168,6 +3359,32 @@ mod tests {
         assert_eq!(find_header(&resp, "Content-Length"), None);
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("AccessDenied"));
+    }
+
+    #[test]
+    fn invalid_sse_customer_key_md5_omits_resource() {
+        let err = ServerError::InvalidSseCustomerKeyMd5;
+        let wire_ids = WireResponseIds::new("2VG1X5NNMZ52HKC0", TEST_HOST_ID);
+        let resp = S3Response::error_with_ids(&err, "/bucket/key", &wire_ids);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("<ArgumentName>x-amz-server-side-encryption</ArgumentName>"));
+        assert!(!body.contains("<Resource>"));
+        assert!(body.contains("<HostId>host-id</HostId>"));
+    }
+
+    #[test]
+    fn sse_c_blocked_access_denied_uses_detailed_message() {
+        let err = ServerError::SseCBlockedAccessDenied {
+            requester_principal: "arn:aws:iam::111122223333:user/test".to_string(),
+            action: "s3:PutObject".to_string(),
+            resource: "arn:aws:s3:::bucket/key".to_string(),
+        };
+        let wire_ids = WireResponseIds::new("2VG1X5NNMZ52HKC0", TEST_HOST_ID);
+        let resp = S3Response::error_with_ids(&err, "/bucket/key", &wire_ids);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("because this bucket has blocked upload requests"));
+        assert!(body.contains("arn:aws:s3:::bucket/key"));
+        assert!(body.contains("arn:aws:iam::111122223333:user/test"));
     }
 
     #[test]

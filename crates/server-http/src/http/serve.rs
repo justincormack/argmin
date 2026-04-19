@@ -129,6 +129,16 @@ impl TrailingChecksumHasher {
         let cksum = self.finalize_raw();
         base64::engine::general_purpose::STANDARD.encode(cksum.bytes())
     }
+
+    fn aws_algorithm_name(&self) -> &'static str {
+        match self {
+            Self::Crc32(_) => "CRC32",
+            Self::Crc32c(_) => "CRC32C",
+            Self::Crc64(_) => "CRC64NVME",
+            Self::Sha256(_) => "SHA256",
+            Self::Sha1(_) => "SHA1",
+        }
+    }
 }
 
 /// Identifies which streaming write operation a request maps to.
@@ -1993,12 +2003,13 @@ async fn handle_streaming_put(
 
     // Validate checksum against incrementally computed value.
     if let Some(th) = trailing_hasher {
+        let algorithm = th.aws_algorithm_name().to_string();
         let actual_b64 = th.finalize_b64();
         if let Some(ref claimed) = inline_checksum_claim {
             // Inline checksum header: verify against streamed body.
             if *claimed != actual_b64 {
                 abort_streaming(&state, &ctx, session_id.clone()).await;
-                return error_response(&ServerError::BadDigest);
+                return error_response(&ServerError::ChecksumDigestMismatch { algorithm });
             }
         } else {
             // Trailing checksum: exactly one trailer expected.
@@ -2006,7 +2017,7 @@ async fn handle_streaming_put(
                 1 => {
                     if trailer_checksums[0].1 != actual_b64 {
                         abort_streaming(&state, &ctx, session_id.clone()).await;
-                        return error_response(&ServerError::BadDigest);
+                        return error_response(&ServerError::ChecksumDigestMismatch { algorithm });
                     }
                 }
                 0 => {} // No checksum trailer in body — nothing to validate.
@@ -2689,13 +2700,14 @@ async fn handle_streaming_part(
     // Keep the computed RawChecksum for passing to finalization.
     let computed_checksum = if let Some(th) = trailing_hasher {
         use base64::Engine;
+        let algorithm = th.aws_algorithm_name().to_string();
         let cksum = th.finalize_raw();
         let actual_b64 = base64::engine::general_purpose::STANDARD.encode(cksum.bytes());
         if let Some(ref claimed) = inline_checksum_claim {
             // Inline checksum header: verify against streamed body.
             if *claimed != actual_b64 {
                 abort_streaming_part_ctx(&state, &ctx).await;
-                return error_response(&ServerError::BadDigest);
+                return error_response(&ServerError::ChecksumDigestMismatch { algorithm });
             }
         } else {
             // Trailing checksum: validate if present.
@@ -2703,7 +2715,7 @@ async fn handle_streaming_part(
                 1 => {
                     if trailer_checksums[0].1 != actual_b64 {
                         abort_streaming_part_ctx(&state, &ctx).await;
-                        return error_response(&ServerError::BadDigest);
+                        return error_response(&ServerError::ChecksumDigestMismatch { algorithm });
                     }
                 }
                 0 => {}

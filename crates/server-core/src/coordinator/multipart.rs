@@ -316,12 +316,9 @@ impl Coordinator {
             if let (Some(upload_algo), Some(ChecksumType::Composite), None) =
                 (checksum_algo, checksum_type, cp.checksum.as_ref())
             {
-                return Err(ServerError::InvalidRequest {
-                    reason: format!(
-                        "The upload was created using a {} checksum. The complete request must include the checksum for each part. It was missing for part {} in the request.",
-                        upload_algo.as_str(),
-                        cp.part_number
-                    ),
+                return Err(ServerError::CompleteMultipartMissingPartChecksum {
+                    algorithm: upload_algo.as_str().to_ascii_lowercase(),
+                    part_number: cp.part_number,
                 });
             }
             let part = match meta_pg.get_multipart_part(&upload_id, cp.part_number) {
@@ -576,8 +573,15 @@ impl Coordinator {
             }
             if let Some(ref computed) = checksum_value {
                 if computed != claimed.encoded_value() {
-                    return Err(ServerError::InvalidRequest {
-                        reason: "checksum mismatch".to_string(),
+                    let header_name = match claimed.algorithm() {
+                        ChecksumAlgorithm::Crc32 => "x-amz-checksum-crc32",
+                        ChecksumAlgorithm::Crc32c => "x-amz-checksum-crc32c",
+                        ChecksumAlgorithm::Crc64nvme => "x-amz-checksum-crc64nvme",
+                        ChecksumAlgorithm::Sha1 => "x-amz-checksum-sha1",
+                        ChecksumAlgorithm::Sha256 => "x-amz-checksum-sha256",
+                    };
+                    return Err(ServerError::CompleteMultipartChecksumHeaderInvalid {
+                        header_name: header_name.to_string(),
                     });
                 }
             }

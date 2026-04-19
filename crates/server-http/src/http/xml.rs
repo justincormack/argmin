@@ -90,6 +90,28 @@ pub fn error_xml_with_host_id(
     )
 }
 
+/// Format an S3 `RequestHeaderSectionTooLarge` error response.
+#[must_use]
+pub fn request_header_section_too_large_error_xml(
+    max_size_allowed: usize,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <Error>\
+         <Code>RequestHeaderSectionTooLarge</Code>\
+         <Message>Your request header section exceeds the maximum allowed size.</Message>\
+         <MaxSizeAllowed>{}</MaxSizeAllowed>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        max_size_allowed,
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
 /// Format an S3 `NoSuchBucket` error response.
 #[must_use]
 pub fn no_such_bucket_error_xml(bucket_name: &str, request_id: &str, host_id: &str) -> String {
@@ -128,7 +150,7 @@ pub fn no_such_key_error_xml(key: &str, request_id: &str, host_id: &str) -> Stri
 
 /// Format a NoSuchUpload error response XML.
 #[must_use]
-pub fn no_such_upload_error_xml(upload_id: &str, request_id: &str) -> String {
+pub fn no_such_upload_error_xml(upload_id: &str, request_id: &str, host_id: &str) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <Error>\
@@ -136,9 +158,218 @@ pub fn no_such_upload_error_xml(upload_id: &str, request_id: &str) -> String {
          <Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message>\
          <UploadId>{}</UploadId>\
          <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
          </Error>",
         xml_escape(upload_id),
         xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+fn multipart_error_etag(etag: &str) -> &str {
+    etag.strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(etag)
+}
+
+/// Format a complete-multipart `NoSuchUpload` error response XML.
+#[must_use]
+pub fn complete_multipart_no_such_upload_error_xml(
+    upload_id: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<Error>\
+         <Code>NoSuchUpload</Code>\
+         <Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message>\
+         <UploadId>{}</UploadId>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(upload_id),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format a complete-multipart `MalformedXML` error response XML.
+#[must_use]
+pub fn complete_multipart_malformed_xml_error_xml(request_id: &str, host_id: &str) -> String {
+    format!(
+        "<Error>\
+         <Code>MalformedXML</Code>\
+         <Message>The XML you provided was not well-formed or did not validate against our published schema</Message>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format a complete-multipart `InvalidPart` error response XML.
+#[must_use]
+pub fn complete_multipart_invalid_part_error_xml(
+    upload_id: &str,
+    part_number: u32,
+    etag: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<Error>\
+         <Code>InvalidPart</Code>\
+         <Message>One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.</Message>\
+         <UploadId>{}</UploadId>\
+         <PartNumber>{}</PartNumber>\
+         <ETag>{}</ETag>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(upload_id),
+        part_number,
+        xml_escape(multipart_error_etag(etag)),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format a complete-multipart `InvalidPartOrder` error response XML.
+#[must_use]
+pub fn complete_multipart_invalid_part_order_error_xml(
+    upload_id: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<Error>\
+         <Code>InvalidPartOrder</Code>\
+         <Message>The list of parts was not in ascending order. Parts must be ordered by part number.</Message>\
+         <UploadId>{}</UploadId>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape(upload_id),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format a complete-multipart `EntityTooSmall` error response XML.
+#[must_use]
+pub fn complete_multipart_entity_too_small_error_xml(
+    proposed_size: u64,
+    min_size_allowed: u64,
+    part_number: u32,
+    etag: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<Error>\
+         <Code>EntityTooSmall</Code>\
+         <Message>Your proposed upload is smaller than the minimum allowed size</Message>\
+         <ProposedSize>{}</ProposedSize>\
+         <MinSizeAllowed>{}</MinSizeAllowed>\
+         <PartNumber>{}</PartNumber>\
+         <ETag>{}</ETag>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        proposed_size,
+        min_size_allowed,
+        part_number,
+        xml_escape(multipart_error_etag(etag)),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format a complete-multipart missing-part-checksum error response.
+#[must_use]
+pub fn complete_multipart_missing_part_checksum_error_xml(
+    algorithm: &str,
+    part_number: u32,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<Error>\
+         <Code>InvalidRequest</Code>\
+         <Message>The upload was created using a {} checksum. The complete request must include the checksum for each part. It was missing for part {} in the request.</Message>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape_text(algorithm),
+        part_number,
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format a complete-multipart invalid checksum-header error response.
+#[must_use]
+pub fn complete_multipart_checksum_header_invalid_error_xml(
+    header_name: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<Error>\
+         <Code>InvalidRequest</Code>\
+         <Message>Value for {} header is invalid.</Message>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape_text(header_name),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format an UploadPartCopy invalid range error response.
+#[must_use]
+pub fn upload_part_copy_invalid_range_error_xml(
+    range_header: &str,
+    source_size: u64,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<Error>\
+         <Code>InvalidArgument</Code>\
+         <Message>Range specified is not valid for source object of size: {}</Message>\
+         <ArgumentName>x-amz-copy-source-range</ArgumentName>\
+         <ArgumentValue>{}</ArgumentValue>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        source_size,
+        xml_escape(range_header),
+        xml_escape(request_id),
+        xml_escape(host_id),
+    )
+}
+
+/// Format an UploadPartCopy precondition-failed error response.
+#[must_use]
+pub fn upload_part_copy_precondition_failed_error_xml(
+    condition: &str,
+    request_id: &str,
+    host_id: &str,
+) -> String {
+    format!(
+        "<Error>\
+         <Code>PreconditionFailed</Code>\
+         <Message>At least one of the pre-conditions you specified did not hold</Message>\
+         <Condition>{}</Condition>\
+         <RequestId>{}</RequestId>\
+         <HostId>{}</HostId>\
+         </Error>",
+        xml_escape_text(condition),
+        xml_escape(request_id),
+        xml_escape(host_id),
     )
 }
 
@@ -2341,6 +2572,19 @@ pub fn xml_escape(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+pub fn xml_escape_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
             _ => out.push(c),
         }
     }
@@ -6684,38 +6928,56 @@ mod tests {
 
     #[test]
     fn error_xml_no_such_upload() {
-        let xml = no_such_upload_error_xml("abc", "req-1");
+        let xml = no_such_upload_error_xml("abc", "req-1", "host-1");
         assert!(xml.contains("<Code>NoSuchUpload</Code>"));
         assert!(xml.contains(
             "<Message>The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.</Message>"
         ));
         assert!(xml.contains("<UploadId>abc</UploadId>"));
+        assert!(xml.contains("<HostId>host-1</HostId>"));
     }
 
     #[test]
     fn error_xml_invalid_part() {
-        let xml = error_xml(
-            "InvalidPart",
-            "invalid part: part 3",
-            "/bucket/key",
+        let xml = complete_multipart_invalid_part_error_xml(
+            "upload-1",
+            3,
+            "\"etag-1\"",
             "req-1",
+            "host-1",
         );
         assert!(xml.contains("<Code>InvalidPart</Code>"));
+        assert!(xml.contains("<UploadId>upload-1</UploadId>"));
+        assert!(xml.contains("<PartNumber>3</PartNumber>"));
+        assert!(xml.contains("<ETag>etag-1</ETag>"));
     }
 
     #[test]
     fn error_xml_invalid_part_order() {
-        let xml = error_xml(
-            "InvalidPartOrder",
-            "invalid part order",
-            "/bucket/key",
-            "req-1",
-        );
+        let xml = complete_multipart_invalid_part_order_error_xml("upload-1", "req-1", "host-1");
         assert!(xml.contains("<Code>InvalidPartOrder</Code>"));
+        assert!(xml.contains("<UploadId>upload-1</UploadId>"));
     }
 
     #[test]
     fn error_xml_entity_too_small() {
+        let xml = complete_multipart_entity_too_small_error_xml(
+            100,
+            5242880,
+            1,
+            "\"etag-1\"",
+            "req-1",
+            "host-1",
+        );
+        assert!(xml.contains("<Code>EntityTooSmall</Code>"));
+        assert!(xml.contains("<ProposedSize>100</ProposedSize>"));
+        assert!(xml.contains("<MinSizeAllowed>5242880</MinSizeAllowed>"));
+        assert!(xml.contains("<PartNumber>1</PartNumber>"));
+        assert!(xml.contains("<ETag>etag-1</ETag>"));
+    }
+
+    #[test]
+    fn generic_error_xml_entity_too_small() {
         let xml = error_xml(
             "EntityTooSmall",
             "entity too small: part 1 is 100 bytes (min 5242880)",

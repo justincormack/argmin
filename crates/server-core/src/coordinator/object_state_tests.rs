@@ -4762,7 +4762,7 @@ fn sse_c_put_object_rejected_when_bucket_blocks_sse_c() {
         },
     )
     .unwrap_err();
-    assert!(matches!(err, ServerError::AccessDenied));
+    assert!(matches!(err, ServerError::SseCBlockedAccessDenied { .. }));
 }
 
 #[test]
@@ -4832,7 +4832,7 @@ fn sse_c_stream_put_rejected_when_bucket_blocks_sse_c() {
         ObjectLockState::default(),
     )
     .unwrap_err();
-    assert!(matches!(err, ServerError::AccessDenied));
+    assert!(matches!(err, ServerError::SseCBlockedAccessDenied { .. }));
 }
 
 #[test]

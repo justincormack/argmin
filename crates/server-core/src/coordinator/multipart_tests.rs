@@ -2496,7 +2496,10 @@ fn complete_multipart_upload_empty_part_list() {
             sse_customer: None,
         })
         .unwrap_err();
-    assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    assert!(matches!(
+        err,
+        ServerError::InvalidRequest { reason } if reason == "part list must not be empty"
+    ));
 }
 
 #[test]
@@ -4962,7 +4965,13 @@ fn complete_multipart_composite_rejects_missing_part_checksum_elements() {
         })
         .unwrap_err();
 
-    assert!(matches!(err, ServerError::InvalidRequest { .. }));
+    assert!(matches!(
+        err,
+        ServerError::CompleteMultipartMissingPartChecksum {
+            algorithm,
+            part_number: 1,
+        } if algorithm == "sha256"
+    ));
 }
 
 #[test]
@@ -5228,8 +5237,12 @@ fn complete_multipart_sse_c_checksum_requires_headers() {
         })
         .unwrap_err();
     assert!(
-        matches!(err, ServerError::InvalidRequest { .. }),
-        "expected InvalidRequest when SSE-C checksum finalize omits headers, got {err:?}"
+        matches!(
+            err,
+            ServerError::CompleteMultipartChecksumHeaderInvalid { ref header_name }
+            if header_name == "x-amz-checksum-sha256"
+        ),
+        "expected CompleteMultipartChecksumHeaderInvalid when SSE-C checksum finalize omits headers, got {err:?}"
     );
 }
 

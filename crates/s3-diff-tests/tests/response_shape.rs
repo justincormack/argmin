@@ -19,10 +19,10 @@ use s3_tests::{
         Client,
     },
     build_client_with_ca, build_test_agent, cleanup_versioned_bucket, content_md5_header,
-    delete_all_and_bucket, post_object_raw_to_test_endpoint_with_headers,
-    put_bucket_lifecycle_with_md5, send_signed_request_with_credentials,
-    sigv4_post_fields_for_credentials, unique_bucket, RawResponse, SignedRequestCredentials,
-    TestServer, CTX,
+    create_bucket_with_sse_c_enabled, delete_all_and_bucket,
+    post_object_raw_to_test_endpoint_with_headers, put_bucket_lifecycle_with_md5,
+    send_signed_request_with_credentials, sigv4_post_fields_for_credentials, sse_c_header_values,
+    test_sse_c_key, unique_bucket, RawResponse, SignedRequestCredentials, TestServer, CTX,
 };
 use s3_types::is_legacy_create_bucket_region;
 
@@ -227,6 +227,26 @@ async fn create_bucket_in_region(client: &Client, bucket: &str, region: &str) {
         );
     }
     request.send().await.expect("create bucket");
+}
+
+async fn create_sse_c_enabled_bucket_pair(env: &ComparisonEnv) -> (String, String) {
+    let external_bucket = unique_bucket();
+    let local_bucket = external_bucket.clone();
+    create_bucket_with_sse_c_enabled(&env.external_client, &external_bucket)
+        .await
+        .expect("create external SSE-C-enabled bucket");
+    create_bucket_with_sse_c_enabled(&env.local_client, &local_bucket)
+        .await
+        .expect("create local SSE-C-enabled bucket");
+    (external_bucket, local_bucket)
+}
+
+fn sse_c_headers<'a>(key_b64: &'a str, key_md5_b64: &'a str) -> [(&'a str, &'a str); 3] {
+    [
+        ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        ("x-amz-server-side-encryption-customer-key", key_b64),
+        ("x-amz-server-side-encryption-customer-key-md5", key_md5_b64),
+    ]
 }
 
 async fn create_object_lock_bucket_in_region(client: &Client, bucket: &str, region: &str) {
@@ -469,6 +489,22 @@ fn extract_xml_text(body: &str, tag: &str) -> Option<String> {
     Some(body[start..end].to_string())
 }
 
+fn replace_xml_text(body: &str, tag: &str, replacement: &str) -> String {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let Some(start) = body.find(&start_tag) else {
+        return body.to_string();
+    };
+    let content_start = start + start_tag.len();
+    let Some(relative_end) = body[content_start..].find(&end_tag) else {
+        return body.to_string();
+    };
+    let end = content_start + relative_end;
+    let mut out = body.to_string();
+    out.replace_range(content_start..end, replacement);
+    out
+}
+
 fn assert_response_id_shapes(operation: &str, response: &RawResponse) {
     if let Some(request_id) = response_header_value(response, REQUEST_ID_HEADER_NAME) {
         assert!(
@@ -528,6 +564,18 @@ fn normalize_xml_text_tags(body: &str, tags: &[&str]) -> String {
         }
     }
     normalized
+}
+
+fn normalize_sse_c_blocked_access_denied_message(body: &str) -> String {
+    let Some(message) = extract_xml_text(body, "Message") else {
+        return body.to_string();
+    };
+    const MARKER: &str = " is not authorized to perform: s3:PutObject on resource: \"";
+    let Some(marker_index) = message.find(MARKER) else {
+        return body.to_string();
+    };
+    let normalized_message = format!("User: <principal>{}", &message[marker_index..]);
+    replace_xml_text(body, "Message", &normalized_message)
 }
 
 fn assert_xml_response_shape_matches(
@@ -763,6 +811,44 @@ async fn create_multipart_upload_pair(
         .expect("local upload id")
         .to_string();
     (external_upload_id, local_upload_id)
+}
+
+async fn upload_part_pair(
+    env: &ComparisonEnv,
+    buckets: (&str, &str),
+    key: &str,
+    upload_ids: (&str, &str),
+    part_number: i32,
+    body: &[u8],
+) -> (String, String) {
+    let (external_bucket, local_bucket) = buckets;
+    let (external_upload_id, local_upload_id) = upload_ids;
+    let aws_upload = env
+        .external_client
+        .upload_part()
+        .bucket(external_bucket)
+        .key(key)
+        .upload_id(external_upload_id)
+        .part_number(part_number)
+        .body(ByteStream::from(body.to_vec()))
+        .send()
+        .await
+        .expect("upload external part");
+    let local_upload = env
+        .local_client
+        .upload_part()
+        .bucket(local_bucket)
+        .key(key)
+        .upload_id(local_upload_id)
+        .part_number(part_number)
+        .body(ByteStream::from(body.to_vec()))
+        .send()
+        .await
+        .expect("upload local part");
+    (
+        aws_upload.e_tag().expect("external part etag").to_string(),
+        local_upload.e_tag().expect("local part etag").to_string(),
+    )
 }
 
 async fn create_completed_multipart_pair(
@@ -1129,8 +1215,8 @@ fn test_object_website_redirect_invalid_value_error_shape_matches_aws() {
             &["RequestId", "HostId"],
         );
 
-        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
-        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
     });
 }
 
@@ -1170,8 +1256,167 @@ fn test_object_website_redirect_metadata_too_large_error_shape_matches_aws() {
             &["RequestId", "HostId"],
         );
 
-        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
-        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_put_object_user_metadata_too_large_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-user-metadata-too-large.txt";
+        let oversized = "m".repeat(3000);
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            None,
+            b"",
+            [("x-amz-meta-mint-test", oversized.as_str())],
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            None,
+            b"",
+            [("x-amz-meta-mint-test", oversized.as_str())],
+        );
+        assert_xml_response_shape_matches(
+            "PutObjectUserMetadataTooLarge",
+            &aws_put,
+            &local_put,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_put_object_system_metadata_too_large_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-system-metadata-too-large.txt";
+        let oversized = "d".repeat(3000);
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            None,
+            b"",
+            [("Content-Disposition", oversized.as_str())],
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            None,
+            b"",
+            [("Content-Disposition", oversized.as_str())],
+        );
+        assert_xml_response_shape_matches(
+            "PutObjectSystemMetadataTooLarge",
+            &aws_put,
+            &local_put,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_put_object_request_header_section_too_large_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-request-header-section-too-large.txt";
+        let padding = "p".repeat(9000);
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            None,
+            b"",
+            [("x-test-padding", padding.as_str())],
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            None,
+            b"",
+            [("x-test-padding", padding.as_str())],
+        );
+        assert_xml_response_shape_matches(
+            "PutObjectRequestHeaderSectionTooLarge",
+            &aws_put,
+            &local_put,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_put_object_bad_inline_checksum_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-bad-inline-checksum.txt";
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            None,
+            b"hello streaming checksum",
+            [("x-amz-checksum-crc32", "AAAA/w==")],
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            None,
+            b"hello streaming checksum",
+            [("x-amz-checksum-crc32", "AAAA/w==")],
+        );
+        assert_xml_response_shape_matches(
+            "PutObjectBadInlineChecksum",
+            &aws_put,
+            &local_put,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
     });
 }
 
@@ -1952,6 +2197,361 @@ fn test_get_bucket_encryption_response_shape_matches_aws() {
             COMMON_TRANSPORT_IGNORED_HEADERS,
             COMMON_PRESENCE_ONLY_HEADERS,
             &[],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_get_bucket_encryption_default_blocks_sse_c_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+
+        let aws_get = env.send_external(
+            "GET",
+            &external_bucket,
+            "",
+            Some("encryption="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+        let local_get = env.send_local(
+            "GET",
+            &local_bucket,
+            "",
+            Some("encryption="),
+            b"",
+            std::iter::empty::<(&str, &str)>(),
+        );
+
+        assert_xml_response_shape_matches(
+            "GetBucketEncryptionDefaultBlocksSseC",
+            &aws_get,
+            &local_get,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &[],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_put_object_sse_c_blocked_by_default_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-sse-c-blocked-by-default.txt";
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            None,
+            b"secret",
+            [
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                (
+                    "x-amz-server-side-encryption-customer-key",
+                    key_b64.as_str(),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.as_str(),
+                ),
+            ],
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            None,
+            b"secret",
+            [
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                (
+                    "x-amz-server-side-encryption-customer-key",
+                    key_b64.as_str(),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.as_str(),
+                ),
+            ],
+        );
+
+        assert_response_id_shapes("PutObjectSseCBlockedByDefault", &aws_put);
+        assert_response_id_shapes("PutObjectSseCBlockedByDefault", &local_put);
+        assert_response_headers_match(
+            "PutObjectSseCBlockedByDefault",
+            &aws_put,
+            &local_put,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+        );
+        // The AWS-backed run uses the real caller ARN, while the embedded server uses the
+        // local test principal for the same request shape.
+        assert_eq!(
+            normalize_sse_c_blocked_access_denied_message(&normalize_xml_text_tags(
+                &local_put.body,
+                &["RequestId", "HostId"],
+            )),
+            normalize_sse_c_blocked_access_denied_message(&normalize_xml_text_tags(
+                &aws_put.body,
+                &["RequestId", "HostId"],
+            )),
+            "PutObjectSseCBlockedByDefault: normalized XML body mismatch\naws body: {}\nlocal body: {}",
+            aws_put.body,
+            local_put.body,
+        );
+        assert_xml_error_ids_match_headers("PutObjectSseCBlockedByDefault", &aws_put);
+        assert_xml_error_ids_match_headers("PutObjectSseCBlockedByDefault", &local_put);
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_put_object_sse_c_missing_key_md5_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = create_sse_c_enabled_bucket_pair(&env).await;
+        let key = "shape-sse-c-missing-key-md5.txt";
+        let customer_key = test_sse_c_key();
+        let (key_b64, _) = sse_c_header_values(&customer_key);
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            None,
+            b"secret",
+            [
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                (
+                    "x-amz-server-side-encryption-customer-key",
+                    key_b64.as_str(),
+                ),
+            ],
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            None,
+            b"secret",
+            [
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                (
+                    "x-amz-server-side-encryption-customer-key",
+                    key_b64.as_str(),
+                ),
+            ],
+        );
+
+        assert_xml_response_shape_matches(
+            "PutObjectSseCMissingKeyMd5",
+            &aws_put,
+            &local_put,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_put_object_sse_c_enabled_response_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = create_sse_c_enabled_bucket_pair(&env).await;
+        let key = "shape-sse-c-enabled.txt";
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            None,
+            b"secret",
+            sse_c_headers(key_b64.as_str(), key_md5_b64.as_str()),
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            None,
+            b"secret",
+            sse_c_headers(key_b64.as_str(), key_md5_b64.as_str()),
+        );
+
+        assert_response_shape_matches(
+            "PutObjectSseCEnabled",
+            &aws_put,
+            &local_put,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            &["etag"],
+        );
+
+        let aws_head = env.send_external(
+            "HEAD",
+            &external_bucket,
+            key,
+            None,
+            b"",
+            sse_c_headers(key_b64.as_str(), key_md5_b64.as_str()),
+        );
+        let local_head = env.send_local(
+            "HEAD",
+            &local_bucket,
+            key,
+            None,
+            b"",
+            sse_c_headers(key_b64.as_str(), key_md5_b64.as_str()),
+        );
+
+        assert_response_headers_match(
+            "HeadObjectSseCEnabled",
+            &aws_head,
+            &local_head,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            &["etag", "last-modified", "x-amz-version-id"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_put_object_sse_c_missing_key_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = create_sse_c_enabled_bucket_pair(&env).await;
+        let key = "shape-sse-c-missing-key.txt";
+        let customer_key = test_sse_c_key();
+        let (_, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            None,
+            b"secret",
+            [
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.as_str(),
+                ),
+            ],
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            None,
+            b"secret",
+            [
+                ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.as_str(),
+                ),
+            ],
+        );
+
+        assert_xml_response_shape_matches(
+            "PutObjectSseCMissingKey",
+            &aws_put,
+            &local_put,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_put_object_sse_c_wrong_algorithm_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = create_sse_c_enabled_bucket_pair(&env).await;
+        let key = "shape-sse-c-wrong-algorithm.txt";
+        let customer_key = test_sse_c_key();
+        let (key_b64, key_md5_b64) = sse_c_header_values(&customer_key);
+
+        let aws_put = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            None,
+            b"secret",
+            [
+                ("x-amz-server-side-encryption-customer-algorithm", "aws:kms"),
+                (
+                    "x-amz-server-side-encryption-customer-key",
+                    key_b64.as_str(),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.as_str(),
+                ),
+            ],
+        );
+        let local_put = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            None,
+            b"secret",
+            [
+                ("x-amz-server-side-encryption-customer-algorithm", "aws:kms"),
+                (
+                    "x-amz-server-side-encryption-customer-key",
+                    key_b64.as_str(),
+                ),
+                (
+                    "x-amz-server-side-encryption-customer-key-md5",
+                    key_md5_b64.as_str(),
+                ),
+            ],
+        );
+
+        assert_xml_response_shape_matches(
+            "PutObjectSseCWrongAlgorithm",
+            &aws_put,
+            &local_put,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId"],
         );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
@@ -3161,6 +3761,706 @@ fn test_upload_part_copy_response_shape_matches_aws() {
             &[src_key.to_string(), dst_key.to_string()],
         )
         .await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_no_such_upload_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-complete-no-such-upload.txt";
+        let (external_upload_id, local_upload_id) =
+            create_multipart_upload_pair(&env, &external_bucket, &local_bucket, key, vec![]).await;
+
+        env.external_client
+            .abort_multipart_upload()
+            .bucket(&external_bucket)
+            .key(key)
+            .upload_id(&external_upload_id)
+            .send()
+            .await
+            .expect("abort external upload");
+        env.local_client
+            .abort_multipart_upload()
+            .bucket(&local_bucket)
+            .key(key)
+            .upload_id(&local_upload_id)
+            .send()
+            .await
+            .expect("abort local upload");
+
+        let complete_body = concat!(
+            "<CompleteMultipartUpload>",
+            "<Part><PartNumber>1</PartNumber><ETag>\"ffffffffffffffff\"</ETag></Part>",
+            "</CompleteMultipartUpload>",
+        );
+        let aws_complete = env.send_external(
+            "POST",
+            &external_bucket,
+            key,
+            Some(&format!("uploadId={external_upload_id}")),
+            complete_body.as_bytes(),
+            [("Content-Type", "application/xml")],
+        );
+        let local_complete = env.send_local(
+            "POST",
+            &local_bucket,
+            key,
+            Some(&format!("uploadId={local_upload_id}")),
+            complete_body.as_bytes(),
+            [("Content-Type", "application/xml")],
+        );
+        assert_xml_response_shape_matches(
+            "CompleteMultipartNoSuchUpload",
+            &aws_complete,
+            &local_complete,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId", "UploadId"],
+        );
+
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_invalid_part_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-complete-invalid-part.txt";
+        let (external_upload_id, local_upload_id) =
+            create_multipart_upload_pair(&env, &external_bucket, &local_bucket, key, vec![]).await;
+
+        let _ = upload_part_pair(
+            &env,
+            (&external_bucket, &local_bucket),
+            key,
+            (&external_upload_id, &local_upload_id),
+            1,
+            &[0u8; 256],
+        )
+        .await;
+
+        let complete_body = concat!(
+            "<CompleteMultipartUpload>",
+            "<Part><PartNumber>1</PartNumber><ETag>\"ffffffffffffffff\"</ETag></Part>",
+            "</CompleteMultipartUpload>",
+        );
+        let aws_complete = env.send_external(
+            "POST",
+            &external_bucket,
+            key,
+            Some(&format!("uploadId={external_upload_id}")),
+            complete_body.as_bytes(),
+            [("Content-Type", "application/xml")],
+        );
+        let local_complete = env.send_local(
+            "POST",
+            &local_bucket,
+            key,
+            Some(&format!("uploadId={local_upload_id}")),
+            complete_body.as_bytes(),
+            [("Content-Type", "application/xml")],
+        );
+        assert_xml_response_shape_matches(
+            "CompleteMultipartInvalidPart",
+            &aws_complete,
+            &local_complete,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId", "UploadId", "PartNumber"],
+        );
+
+        env.external_client
+            .abort_multipart_upload()
+            .bucket(&external_bucket)
+            .key(key)
+            .upload_id(&external_upload_id)
+            .send()
+            .await
+            .expect("abort external upload after invalid part");
+        env.local_client
+            .abort_multipart_upload()
+            .bucket(&local_bucket)
+            .key(key)
+            .upload_id(&local_upload_id)
+            .send()
+            .await
+            .expect("abort local upload after invalid part");
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_invalid_part_order_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-complete-invalid-order.txt";
+        let (external_upload_id, local_upload_id) =
+            create_multipart_upload_pair(&env, &external_bucket, &local_bucket, key, vec![]).await;
+
+        let large_part = vec![b'a'; AWS_MIN_MULTIPART_PART_SIZE];
+        let (external_etag_1, local_etag_1) = upload_part_pair(
+            &env,
+            (&external_bucket, &local_bucket),
+            key,
+            (&external_upload_id, &local_upload_id),
+            1,
+            &large_part,
+        )
+        .await;
+        let (external_etag_2, local_etag_2) = upload_part_pair(
+            &env,
+            (&external_bucket, &local_bucket),
+            key,
+            (&external_upload_id, &local_upload_id),
+            2,
+            &[b'b'; 256],
+        )
+        .await;
+
+        let aws_complete_body = format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>2</PartNumber><ETag>{external_etag_2}</ETag></Part>\
+             <Part><PartNumber>1</PartNumber><ETag>{external_etag_1}</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let local_complete_body = format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>2</PartNumber><ETag>{local_etag_2}</ETag></Part>\
+             <Part><PartNumber>1</PartNumber><ETag>{local_etag_1}</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let aws_complete = env.send_external(
+            "POST",
+            &external_bucket,
+            key,
+            Some(&format!("uploadId={external_upload_id}")),
+            aws_complete_body.as_bytes(),
+            [("Content-Type", "application/xml")],
+        );
+        let local_complete = env.send_local(
+            "POST",
+            &local_bucket,
+            key,
+            Some(&format!("uploadId={local_upload_id}")),
+            local_complete_body.as_bytes(),
+            [("Content-Type", "application/xml")],
+        );
+        assert_xml_response_shape_matches(
+            "CompleteMultipartInvalidPartOrder",
+            &aws_complete,
+            &local_complete,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId", "UploadId"],
+        );
+
+        env.external_client
+            .abort_multipart_upload()
+            .bucket(&external_bucket)
+            .key(key)
+            .upload_id(&external_upload_id)
+            .send()
+            .await
+            .expect("abort external upload after invalid order");
+        env.local_client
+            .abort_multipart_upload()
+            .bucket(&local_bucket)
+            .key(key)
+            .upload_id(&local_upload_id)
+            .send()
+            .await
+            .expect("abort local upload after invalid order");
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_entity_too_small_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-complete-entity-too-small.txt";
+        let (external_upload_id, local_upload_id) =
+            create_multipart_upload_pair(&env, &external_bucket, &local_bucket, key, vec![]).await;
+
+        let (external_etag_1, local_etag_1) = upload_part_pair(
+            &env,
+            (&external_bucket, &local_bucket),
+            key,
+            (&external_upload_id, &local_upload_id),
+            1,
+            &[0u8; 100],
+        )
+        .await;
+        let (external_etag_2, local_etag_2) = upload_part_pair(
+            &env,
+            (&external_bucket, &local_bucket),
+            key,
+            (&external_upload_id, &local_upload_id),
+            2,
+            &[0u8; 100],
+        )
+        .await;
+
+        let aws_complete_body = format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>{external_etag_1}</ETag></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>{external_etag_2}</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let local_complete_body = format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>{local_etag_1}</ETag></Part>\
+             <Part><PartNumber>2</PartNumber><ETag>{local_etag_2}</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let aws_complete = env.send_external(
+            "POST",
+            &external_bucket,
+            key,
+            Some(&format!("uploadId={external_upload_id}")),
+            aws_complete_body.as_bytes(),
+            [("Content-Type", "application/xml")],
+        );
+        let local_complete = env.send_local(
+            "POST",
+            &local_bucket,
+            key,
+            Some(&format!("uploadId={local_upload_id}")),
+            local_complete_body.as_bytes(),
+            [("Content-Type", "application/xml")],
+        );
+        assert_xml_response_shape_matches(
+            "CompleteMultipartEntityTooSmall",
+            &aws_complete,
+            &local_complete,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId", "ETag"],
+        );
+
+        env.external_client
+            .abort_multipart_upload()
+            .bucket(&external_bucket)
+            .key(key)
+            .upload_id(&external_upload_id)
+            .send()
+            .await
+            .expect("abort external upload after entity too small");
+        env.local_client
+            .abort_multipart_upload()
+            .bucket(&local_bucket)
+            .key(key)
+            .upload_id(&local_upload_id)
+            .send()
+            .await
+            .expect("abort local upload after entity too small");
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_upload_part_copy_invalid_range_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let src_key = "shape-upload-part-copy-invalid-range-src.txt";
+        let dst_key = "shape-upload-part-copy-invalid-range-dst.txt";
+
+        put_object_pair(
+            &env,
+            &external_bucket,
+            &local_bucket,
+            src_key,
+            &[b'Z'; 1000],
+        )
+        .await;
+        let (external_upload_id, local_upload_id) =
+            create_multipart_upload_pair(&env, &external_bucket, &local_bucket, dst_key, vec![])
+                .await;
+
+        let aws_copy = env.send_external(
+            "PUT",
+            &external_bucket,
+            dst_key,
+            Some(&format!("partNumber=1&uploadId={external_upload_id}")),
+            b"",
+            [
+                ("x-amz-copy-source", format!("{external_bucket}/{src_key}")),
+                ("x-amz-copy-source-range", "bytes=0-9999".to_string()),
+            ],
+        );
+        let local_copy = env.send_local(
+            "PUT",
+            &local_bucket,
+            dst_key,
+            Some(&format!("partNumber=1&uploadId={local_upload_id}")),
+            b"",
+            [
+                ("x-amz-copy-source", format!("{local_bucket}/{src_key}")),
+                ("x-amz-copy-source-range", "bytes=0-9999".to_string()),
+            ],
+        );
+        assert_xml_response_shape_matches(
+            "UploadPartCopyInvalidRange",
+            &aws_copy,
+            &local_copy,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId"],
+        );
+
+        env.external_client
+            .abort_multipart_upload()
+            .bucket(&external_bucket)
+            .key(dst_key)
+            .upload_id(&external_upload_id)
+            .send()
+            .await
+            .expect("abort external invalid-range upload");
+        env.local_client
+            .abort_multipart_upload()
+            .bucket(&local_bucket)
+            .key(dst_key)
+            .upload_id(&local_upload_id)
+            .send()
+            .await
+            .expect("abort local invalid-range upload");
+        delete_all_and_bucket(
+            &env.external_client,
+            &external_bucket,
+            &[src_key.to_string()],
+        )
+        .await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[src_key.to_string()]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_checksum_mismatch_error_shape_matches_aws() {
+    s3_tests::run(async {
+        use base64::Engine;
+
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-complete-checksum-mismatch.txt";
+        let create_headers = vec![("x-amz-checksum-algorithm", "SHA256")];
+        let (external_upload_id, local_upload_id) = create_multipart_upload_pair(
+            &env,
+            &external_bucket,
+            &local_bucket,
+            key,
+            create_headers,
+        )
+        .await;
+
+        let part_body = b"checksum mismatch multipart part";
+        let part_checksum = base64::engine::general_purpose::STANDARD
+            .encode(ring::digest::digest(&ring::digest::SHA256, part_body).as_ref());
+        let aws_upload = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            Some(&format!("partNumber=1&uploadId={external_upload_id}")),
+            part_body,
+            [("x-amz-checksum-sha256", part_checksum.as_str())],
+        );
+        let local_upload = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            Some(&format!("partNumber=1&uploadId={local_upload_id}")),
+            part_body,
+            [("x-amz-checksum-sha256", part_checksum.as_str())],
+        );
+        assert_eq!(
+            aws_upload.status, 200,
+            "aws upload part failed: {aws_upload:?}"
+        );
+        assert_eq!(
+            local_upload.status, 200,
+            "local upload part failed: {local_upload:?}"
+        );
+
+        let external_etag =
+            response_header_value(&aws_upload, "etag").expect("external checksum part etag");
+        let local_etag =
+            response_header_value(&local_upload, "etag").expect("local checksum part etag");
+        let aws_complete_body = format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>{external_etag}</ETag>\
+             <ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let local_complete_body = format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>{local_etag}</ETag>\
+             <ChecksumSHA256>{part_checksum}</ChecksumSHA256></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let aws_complete = env.send_external(
+            "POST",
+            &external_bucket,
+            key,
+            Some(&format!("uploadId={external_upload_id}")),
+            aws_complete_body.as_bytes(),
+            [
+                ("Content-Type", "application/xml"),
+                ("x-amz-checksum-sha256", "bad"),
+            ],
+        );
+        let local_complete = env.send_local(
+            "POST",
+            &local_bucket,
+            key,
+            Some(&format!("uploadId={local_upload_id}")),
+            local_complete_body.as_bytes(),
+            [
+                ("Content-Type", "application/xml"),
+                ("x-amz-checksum-sha256", "bad"),
+            ],
+        );
+        assert_xml_response_shape_matches(
+            "CompleteMultipartChecksumMismatch",
+            &aws_complete,
+            &local_complete,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId"],
+        );
+
+        env.external_client
+            .abort_multipart_upload()
+            .bucket(&external_bucket)
+            .key(key)
+            .upload_id(&external_upload_id)
+            .send()
+            .await
+            .expect("abort external upload after checksum mismatch");
+        env.local_client
+            .abort_multipart_upload()
+            .bucket(&local_bucket)
+            .key(key)
+            .upload_id(&local_upload_id)
+            .send()
+            .await
+            .expect("abort local upload after checksum mismatch");
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_complete_multipart_missing_part_checksum_error_shape_matches_aws() {
+    s3_tests::run(async {
+        use base64::Engine;
+
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let key = "shape-complete-missing-part-checksum.txt";
+        let create_headers = vec![("x-amz-checksum-algorithm", "SHA256")];
+        let (external_upload_id, local_upload_id) = create_multipart_upload_pair(
+            &env,
+            &external_bucket,
+            &local_bucket,
+            key,
+            create_headers,
+        )
+        .await;
+
+        let part_body = b"missing part checksum multipart part";
+        let part_checksum = base64::engine::general_purpose::STANDARD
+            .encode(ring::digest::digest(&ring::digest::SHA256, part_body).as_ref());
+        let aws_upload = env.send_external(
+            "PUT",
+            &external_bucket,
+            key,
+            Some(&format!("partNumber=1&uploadId={external_upload_id}")),
+            part_body,
+            [("x-amz-checksum-sha256", part_checksum.as_str())],
+        );
+        let local_upload = env.send_local(
+            "PUT",
+            &local_bucket,
+            key,
+            Some(&format!("partNumber=1&uploadId={local_upload_id}")),
+            part_body,
+            [("x-amz-checksum-sha256", part_checksum.as_str())],
+        );
+        assert_eq!(
+            aws_upload.status, 200,
+            "aws upload part failed: {aws_upload:?}"
+        );
+        assert_eq!(
+            local_upload.status, 200,
+            "local upload part failed: {local_upload:?}"
+        );
+
+        let external_etag =
+            response_header_value(&aws_upload, "etag").expect("external checksum part etag");
+        let local_etag =
+            response_header_value(&local_upload, "etag").expect("local checksum part etag");
+        let aws_complete_body = format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>{external_etag}</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let local_complete_body = format!(
+            "<CompleteMultipartUpload>\
+             <Part><PartNumber>1</PartNumber><ETag>{local_etag}</ETag></Part>\
+             </CompleteMultipartUpload>"
+        );
+        let aws_complete = env.send_external(
+            "POST",
+            &external_bucket,
+            key,
+            Some(&format!("uploadId={external_upload_id}")),
+            aws_complete_body.as_bytes(),
+            [("Content-Type", "application/xml")],
+        );
+        let local_complete = env.send_local(
+            "POST",
+            &local_bucket,
+            key,
+            Some(&format!("uploadId={local_upload_id}")),
+            local_complete_body.as_bytes(),
+            [("Content-Type", "application/xml")],
+        );
+        assert_xml_response_shape_matches(
+            "CompleteMultipartMissingPartChecksum",
+            &aws_complete,
+            &local_complete,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId"],
+        );
+
+        env.external_client
+            .abort_multipart_upload()
+            .bucket(&external_bucket)
+            .key(key)
+            .upload_id(&external_upload_id)
+            .send()
+            .await
+            .expect("abort external upload after missing part checksum");
+        env.local_client
+            .abort_multipart_upload()
+            .bucket(&local_bucket)
+            .key(key)
+            .upload_id(&local_upload_id)
+            .send()
+            .await
+            .expect("abort local upload after missing part checksum");
+        delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_upload_part_copy_source_if_match_failed_error_shape_matches_aws() {
+    s3_tests::run(async {
+        let Some(env) = ComparisonEnv::setup().await else {
+            return;
+        };
+        let (external_bucket, local_bucket) = env.create_bucket_pair().await;
+        let src_key = "shape-upload-part-copy-if-match-src.txt";
+        let dst_key = "shape-upload-part-copy-if-match-dst.txt";
+
+        put_object_pair(
+            &env,
+            &external_bucket,
+            &local_bucket,
+            src_key,
+            b"copy-source-body",
+        )
+        .await;
+        let (external_upload_id, local_upload_id) =
+            create_multipart_upload_pair(&env, &external_bucket, &local_bucket, dst_key, vec![])
+                .await;
+
+        let aws_copy = env.send_external(
+            "PUT",
+            &external_bucket,
+            dst_key,
+            Some(&format!("partNumber=1&uploadId={external_upload_id}")),
+            b"",
+            [
+                ("x-amz-copy-source", format!("{external_bucket}/{src_key}")),
+                (
+                    "x-amz-copy-source-if-match",
+                    "\"0000000000000000\"".to_string(),
+                ),
+            ],
+        );
+        let local_copy = env.send_local(
+            "PUT",
+            &local_bucket,
+            dst_key,
+            Some(&format!("partNumber=1&uploadId={local_upload_id}")),
+            b"",
+            [
+                ("x-amz-copy-source", format!("{local_bucket}/{src_key}")),
+                (
+                    "x-amz-copy-source-if-match",
+                    "\"0000000000000000\"".to_string(),
+                ),
+            ],
+        );
+        assert_xml_response_shape_matches(
+            "UploadPartCopySourceIfMatchFailed",
+            &aws_copy,
+            &local_copy,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &["RequestId", "HostId"],
+        );
+
+        env.external_client
+            .abort_multipart_upload()
+            .bucket(&external_bucket)
+            .key(dst_key)
+            .upload_id(&external_upload_id)
+            .send()
+            .await
+            .expect("abort external if-match upload");
+        env.local_client
+            .abort_multipart_upload()
+            .bucket(&local_bucket)
+            .key(dst_key)
+            .upload_id(&local_upload_id)
+            .send()
+            .await
+            .expect("abort local if-match upload");
+        delete_all_and_bucket(
+            &env.external_client,
+            &external_bucket,
+            &[src_key.to_string()],
+        )
+        .await;
+        delete_all_and_bucket(&env.local_client, &local_bucket, &[src_key.to_string()]).await;
     });
 }
 

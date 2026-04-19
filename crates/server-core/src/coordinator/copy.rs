@@ -423,12 +423,11 @@ impl Coordinator {
 
             let source_size = src_record.size;
 
-            if let Some((_, end)) = copy_source_range {
+            if let Some((start, end)) = copy_source_range {
                 if end >= source_size {
-                    return Err(ServerError::InvalidArgument {
-                        reason: format!(
-                            "Range specified is not valid for source object of size: {source_size}"
-                        ),
+                    return Err(ServerError::UploadPartCopyInvalidRange {
+                        range_header: format!("bytes={start}-{end}"),
+                        source_size,
                     });
                 }
             }

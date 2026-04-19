@@ -2988,7 +2988,16 @@ impl Coordinator {
                 return Err(ServerError::AccessDenied);
             }
             let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
-            Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
+            if write_encryption.is_sse_customer() && bucket_info.encryption.sse_c_blocked {
+                return Err(ServerError::SseCBlockedAccessDenied {
+                    requester_principal: Self::requester_principal_required(
+                        req.object.requester(),
+                    )?
+                    .to_string(),
+                    action: "s3:PutObject".to_string(),
+                    resource: format!("arn:aws:s3:::{}/{}", bucket_info.name, key),
+                });
+            }
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
             Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
             Ok(AuthorizedPutObjectWrite {
