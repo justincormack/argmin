@@ -167,7 +167,7 @@ pub fn object_key_hash(bucket: &str, key: &str) -> [u8; 16] {
 /// `segment_okh = SHA-256("segment/" + session_id + "/" + segment_index)[:16]`
 pub fn stream_segment_key_hash(session_id: &SessionId, segment_index: u32) -> [u8; 16] {
     use ring::digest;
-    let input = format!("segment/{session_id}/{segment_index}");
+    let input = format!("segment/{}/{segment_index}", session_id.as_str());
     let hash = digest::digest(&digest::SHA256, input.as_bytes());
     let mut result = [0u8; 16];
     result.copy_from_slice(&hash.as_ref()[..16]);

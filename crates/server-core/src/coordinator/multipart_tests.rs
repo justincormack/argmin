@@ -7038,9 +7038,16 @@ fn stream_segment_cleanup_only_deletes_matching_segment_vid() {
     let segment_okh = crate::pg::stream_segment_key_hash(&session_id, 0);
     let winner_vid = GenerationId::new(1).unwrap();
     let loser_vid = GenerationId::new(2).unwrap();
-    let winner_pg_id =
-        coord.shard_pg_id_raw(&format!("segment/{session_id}"), "0", winner_vid.get());
-    let loser_pg_id = coord.shard_pg_id_raw(&format!("segment/{session_id}"), "0", loser_vid.get());
+    let winner_pg_id = coord.shard_pg_id_raw(
+        &format!("segment/{}", session_id.as_str()),
+        "0",
+        winner_vid.get(),
+    );
+    let loser_pg_id = coord.shard_pg_id_raw(
+        &format!("segment/{}", session_id.as_str()),
+        "0",
+        loser_vid.get(),
+    );
     let winner_shards = coord
         .write_segment_shards(winner_pg_id, &segment_okh, winner_vid, b"winner-data")
         .unwrap();

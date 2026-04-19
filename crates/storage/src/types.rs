@@ -372,12 +372,104 @@ validated_string_newtype!(
     validate_upload_id
 );
 
-validated_string_newtype!(
-    /// Streaming upload session identifier.
-    SessionId,
-    SessionIdError,
-    validate_session_id
-);
+/// Streaming upload session identifier.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionId(String);
+
+impl SessionId {
+    pub fn new(s: impl Into<String>) -> Result<Self, SessionIdError> {
+        let s = s.into();
+        validate_session_id(&s)?;
+        Ok(Self(s))
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&observability::escaped(&self.0), f)
+    }
+}
+
+impl TryFrom<String> for SessionId {
+    type Error = SessionIdError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for SessionId {
+    type Error = SessionIdError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl std::str::FromStr for SessionId {
+    type Err = SessionIdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::try_from(s)
+    }
+}
+
+impl PartialEq<str> for SessionId {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for SessionId {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<SessionId> for str {
+    fn eq(&self, other: &SessionId) -> bool {
+        self == other.as_str()
+    }
+}
+
+impl PartialEq<SessionId> for &str {
+    fn eq(&self, other: &SessionId) -> bool {
+        *self == other.as_str()
+    }
+}
+
+impl PartialEq<String> for SessionId {
+    fn eq(&self, other: &String) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<SessionId> for String {
+    fn eq(&self, other: &SessionId) -> bool {
+        *self == other.0
+    }
+}
+
+impl rusqlite::types::ToSql for SessionId {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        self.0.to_sql()
+    }
+}
+
+impl rusqlite::types::FromSql for SessionId {
+    fn column_result(value: rusqlite::types::ValueRef<'_>) -> rusqlite::types::FromSqlResult<Self> {
+        let value = String::column_result(value)?;
+        Self::try_from(value).map_err(|error| rusqlite::types::FromSqlError::Other(Box::new(error)))
+    }
+}
 
 /// Serialized user metadata blob.
 #[derive(Clone, PartialEq, Eq, Default)]

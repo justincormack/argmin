@@ -134,7 +134,7 @@ impl Coordinator {
             let segment_okh = stream_segment_key_hash(&transient_segment_id, segment_index);
             let segment_vid = GenerationId::MIN;
             let shard_pg_id = self.shard_pg_id_raw(
-                &format!("segment/{transient_segment_id}"),
+                &format!("segment/{}", transient_segment_id.as_str()),
                 &segment_index.to_string(),
                 segment_vid.get(),
             );

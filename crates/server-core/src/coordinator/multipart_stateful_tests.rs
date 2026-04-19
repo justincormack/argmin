@@ -414,7 +414,7 @@ fn install_stream_append_race_hooks(
     let prepared_barrier = Arc::new(Barrier::new(3));
     let prepared_barrier_hook = Arc::clone(&prepared_barrier);
     let guard = install_stream_append_test_hooks(StreamAppendTestHooks {
-        target: Some((session_id.to_string(), segment_index)),
+        target: Some((session_id.as_str().to_owned(), segment_index)),
         after_prepare: Some(Arc::new(move || {
             prepared_barrier_hook.wait();
         })),
@@ -471,8 +471,10 @@ fn begin_stream_put_with_segment_path(
         let key = format!("{key_prefix}-{suffix}");
         let session_id = begin_stream_put_test(coord, bucket, &key).unwrap();
         let meta_pg_id = coord.object_pg_id(bucket, &key);
-        let first_vid_pg = coord.shard_pg_id_raw(&format!("segment/{session_id}"), "0", 1);
-        let second_vid_pg = coord.shard_pg_id_raw(&format!("segment/{session_id}"), "0", 2);
+        let first_vid_pg =
+            coord.shard_pg_id_raw(&format!("segment/{}", session_id.as_str()), "0", 1);
+        let second_vid_pg =
+            coord.shard_pg_id_raw(&format!("segment/{}", session_id.as_str()), "0", 2);
         let has_cross_pg = first_vid_pg != meta_pg_id || second_vid_pg != meta_pg_id;
         if has_cross_pg == require_cross_pg {
             return (key, session_id);
@@ -502,8 +504,8 @@ fn run_stream_duplicate_segment_race_invariant_test(pg_count: u32, require_cross
     let (key, session_id) =
         begin_stream_put_with_segment_path(&admin, "bucket", "stream-race", require_cross_pg);
     let meta_pg_id = admin.object_pg_id("bucket", &key);
-    let first_vid_pg = admin.shard_pg_id_raw(&format!("segment/{session_id}"), "0", 1);
-    let second_vid_pg = admin.shard_pg_id_raw(&format!("segment/{session_id}"), "0", 2);
+    let first_vid_pg = admin.shard_pg_id_raw(&format!("segment/{}", session_id.as_str()), "0", 1);
+    let second_vid_pg = admin.shard_pg_id_raw(&format!("segment/{}", session_id.as_str()), "0", 2);
     if require_cross_pg {
         assert!(
             first_vid_pg != meta_pg_id || second_vid_pg != meta_pg_id,

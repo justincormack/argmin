@@ -598,7 +598,7 @@ impl Coordinator {
                 .allocate_stream_segment_vid(session_id)
                 .map_err(ServerError::Metadata)?;
             let shard_pg_id = self.shard_pg_id_raw(
-                &format!("segment/{session_id}"),
+                &format!("segment/{}", session_id.as_str()),
                 &segment_index.to_string(),
                 segment_vid.get(),
             );
