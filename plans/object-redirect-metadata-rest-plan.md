@@ -1,5 +1,24 @@
 # Object Redirect Metadata REST Plan
 
+## Status
+
+Completed:
+
+- Phase 1 AWS conformance tests landed in
+  [website_redirect.rs](/home/justin/src/github.com/justincormack/argmin/crates/s3-tests/tests/website_redirect.rs)
+- the initial AWS behavior matrix now covers:
+  - `PutObject`
+  - `HeadObject`
+  - `GetObject`
+  - `CopyObject`
+  - `CreateMultipartUpload` to completed object persistence
+  - `POST Object`
+  - versioned `HEAD` / `GET`
+
+Current next step:
+
+- Phase 2 typed metadata plumbing
+
 ## Scope
 
 This plan covers AWS-compatible support for object-level website redirect
@@ -95,9 +114,10 @@ We need AWS-backed tests for:
 - same-key self-copy legality:
   changing redirect metadata alone should make an otherwise-illegal self-copy
   request legal
-- same-key self-copy illegality:
-  if redirect metadata and all other relevant attributes are unchanged, the
-  request should still fail with AWS-compatible behavior
+- explicit same-value redirect header semantics:
+  determine whether an explicit
+  `x-amz-website-redirect-location` header with the same stored value still
+  counts as a meaningful self-copy change
 
 ### Multipart semantics
 
@@ -144,7 +164,8 @@ as implementation-driven tests.
 - explicit redirect metadata on destination persists
 - `MetadataDirective=COPY` does not implicitly copy redirect metadata
 - redirect-only self-copy succeeds
-- identical self-copy still fails
+- explicit same-value redirect header behavior is pinned to observed AWS
+  behavior
 
 3. `CreateMultipartUpload` + `UploadPart` + `CompleteMultipartUpload`
 - redirect metadata set at initiation persists to final object
@@ -170,6 +191,15 @@ Use AWS as the oracle wherever docs are ambiguous.
 
 If an observed AWS behavior contradicts our initial assumptions, the tests win
 and the plan should be updated.
+
+Observed Phase 1 AWS behavior already discovered:
+
+- invalid redirect values return `InvalidRedirectLocation`, not
+  `InvalidArgument`
+- on same-key `CopyObject`, explicitly sending
+  `x-amz-website-redirect-location` with the same stored value is accepted by
+  AWS and should be treated as a meaningful request difference for
+  compatibility purposes
 
 ## Implementation Shape
 
@@ -276,6 +306,10 @@ Exit criteria:
 
 - we have a stable AWS-backed behavior matrix for REST object redirect metadata
 - the remaining unknowns are minimal and explicitly documented in the test file
+
+Status:
+
+- completed
 
 ### Phase 2: Typed Metadata Plumbing
 
