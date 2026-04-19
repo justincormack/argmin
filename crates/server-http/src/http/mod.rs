@@ -11,6 +11,7 @@ pub mod xml;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -42,7 +43,7 @@ use conditional::{
 };
 use md5_legacy::Digest;
 use request::{S3Request, TransportSecurity};
-use response::S3Response;
+use response::{S3Response, WireResponseIds};
 use router::{route, S3Operation};
 use s3_types::{
     requires_sigv4, BucketLifecycleConfiguration, BucketNamespace, LegalHoldStatus, ObjectLockMode,
@@ -62,9 +63,55 @@ const SLOW_REQUEST_EVENT_THRESHOLD_US: u128 = 5_000_000;
 const SYSTEM_METADATA_SIZE_LIMIT: usize = 2 * 1024;
 const INVALID_REDIRECT_LOCATION_MESSAGE: &str =
     "The website redirect location must have a prefix of 'http://' or 'https://' or '/'.";
+const REQUEST_ID_ALPHABET: &[u8; 36] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const AWS_SERVER_HEADER_VALUE: &str = "AmazonS3";
+
+pub(crate) fn new_request_trace_context() -> observability::TraceContext {
+    use ring::rand::SecureRandom;
+
+    let rng = ring::rand::SystemRandom::new();
+    let mut trace_bytes = [0u8; 16];
+    rng.fill(&mut trace_bytes)
+        .expect("system randomness is available");
+
+    let mut request_id = String::with_capacity(16);
+    let mut random_bytes = [0u8; 32];
+    while request_id.len() < 16 {
+        rng.fill(&mut random_bytes)
+            .expect("system randomness is available");
+        for byte in random_bytes {
+            if byte < 252 {
+                request_id.push(REQUEST_ID_ALPHABET[(byte % 36) as usize] as char);
+                if request_id.len() == 16 {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut trace_id = String::with_capacity(32);
+    for byte in trace_bytes {
+        use std::fmt::Write;
+        let _ = write!(trace_id, "{byte:02x}");
+    }
+
+    observability::TraceContext::from_ids(trace_id, request_id)
+}
+
+#[must_use]
+pub fn new_host_id() -> String {
+    use base64::Engine as _;
+    use ring::rand::SecureRandom;
+
+    let rng = ring::rand::SystemRandom::new();
+    let mut bytes = [0u8; 32];
+    rng.fill(&mut bytes)
+        .expect("system randomness is available");
+    base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
+}
 
 fn current_trace_context() -> observability::TraceContext {
-    observability::current_context().unwrap_or_else(observability::TraceContext::new_request)
+    observability::current_context().unwrap_or_else(new_request_trace_context)
 }
 
 /// Parse versionId query parameter from an S3 request.
@@ -454,6 +501,7 @@ fn reject_directory_bucket_only_object_features(req: &S3Request) -> Result<(), S
 pub struct HttpFrontend {
     pub coordinator: Coordinator,
     pub credentials: CredentialStore,
+    pub host_id: Arc<str>,
 }
 
 enum S3HyperBodyState {
@@ -464,6 +512,7 @@ enum S3HyperBodyState {
 #[derive(Clone)]
 pub struct ResponseTraceMeta {
     context: observability::TraceContext,
+    host_id: Arc<str>,
     method: String,
     path: String,
     query: observability::QuerySummary,
@@ -474,6 +523,7 @@ impl ResponseTraceMeta {
     #[must_use]
     pub fn new(
         context: observability::TraceContext,
+        host_id: Arc<str>,
         method: impl Into<String>,
         path: impl Into<String>,
         query: impl Into<String>,
@@ -481,6 +531,7 @@ impl ResponseTraceMeta {
         let query = query.into();
         Self {
             context,
+            host_id,
             method: method.into(),
             path: path.into(),
             query: observability::query_summary(&query),
@@ -730,7 +781,7 @@ impl HttpFrontend {
     /// The caller (serve layer) is responsible for parsing the HTTP request into
     /// an `S3Request` and converting the `S3Response` back to an HTTP response.
     #[must_use]
-    pub fn handle_s3_request(&self, s3req: &S3Request) -> S3Response {
+    pub fn handle_s3_request(&self, s3req: &S3Request, wire_ids: &WireResponseIds) -> S3Response {
         let query = observability::query_summary(s3req.query_string());
         observability::trace_scope!(
             TRACE_TARGET,
@@ -756,13 +807,13 @@ impl HttpFrontend {
             );
             match route(s3req.method.as_str(), s3req.path(), s3req.query_string()) {
                 Ok(op) => op,
-                Err(err) => return S3Response::error(&err, s3req.path()),
+                Err(err) => return S3Response::error_with_ids(&err, s3req.path(), wire_ids),
             }
         };
 
         // OPTIONS (preflight CORS) bypasses authentication.
         if let S3Operation::OptionsRequest { ref bucket, .. } = operation {
-            return self.handle_options_request(s3req, bucket);
+            return self.handle_options_request(s3req, bucket, wire_ids);
         }
 
         let actual_cors_bucket = operation.bucket_name().cloned();
@@ -810,14 +861,16 @@ impl HttpFrontend {
                     ref etag,
                     last_modified,
                 }) => S3Response::not_modified(etag, last_modified),
-                Err(ServerError::PreconditionFailed) => S3Response::precondition_failed(),
+                Err(ServerError::PreconditionFailed) => {
+                    S3Response::precondition_failed_with_ids(wire_ids)
+                }
                 Err(ref err @ ServerError::DeleteMarkerHit { .. }) => {
-                    let mut resp = S3Response::error(err, s3req.path());
+                    let mut resp = S3Response::error_with_ids(err, s3req.path(), wire_ids);
                     resp.headers
                         .push(("x-amz-delete-marker".to_string(), "true".to_string()));
                     resp
                 }
-                Err(err) => S3Response::error(&err, s3req.path()),
+                Err(err) => S3Response::error_with_ids(&err, s3req.path(), wire_ids),
             }
         };
 
@@ -840,23 +893,29 @@ impl HttpFrontend {
     }
 
     /// Handle an OPTIONS (CORS preflight) request. No auth required.
-    fn handle_options_request(&self, req: &S3Request, bucket: &BucketName) -> S3Response {
+    fn handle_options_request(
+        &self,
+        req: &S3Request,
+        bucket: &BucketName,
+        wire_ids: &WireResponseIds,
+    ) -> S3Response {
         let origin = match req.header("origin") {
             Some(o) => o,
             None => {
-                return S3Response::error(
+                return S3Response::error_with_ids(
                     &ServerError::InvalidRequest {
                         reason: "Insufficient information. Origin request header needed."
                             .to_string(),
                     },
                     req.path(),
+                    wire_ids,
                 );
             }
         };
 
         let request_method = match req.header("access-control-request-method") {
             Some(m) => m,
-            None => return S3Response::forbidden(),
+            None => return S3Response::forbidden_with_ids(wire_ids),
         };
 
         let request_headers_str = req.header("access-control-request-headers");
@@ -867,11 +926,11 @@ impl HttpFrontend {
         // Load CORS config
         let cors_config_xml = match self.coordinator.load_bucket_cors_config(bucket) {
             Ok(Some(xml)) => xml,
-            _ => return S3Response::forbidden(),
+            _ => return S3Response::forbidden_with_ids(wire_ids),
         };
         let config = match crate::http::xml::parse_cors_config_xml(cors_config_xml.as_bytes()) {
             Ok(c) => c,
-            Err(_) => return S3Response::forbidden(),
+            Err(_) => return S3Response::forbidden_with_ids(wire_ids),
         };
 
         match crate::cors::find_matching_rule(&config, origin, request_method, &request_headers) {
@@ -888,7 +947,7 @@ impl HttpFrontend {
                 }
                 resp
             }
-            None => S3Response::forbidden(),
+            None => S3Response::forbidden_with_ids(wire_ids),
         }
     }
 
@@ -1387,6 +1446,10 @@ impl HttpFrontend {
                 let cond = read_condition_from_headers(req);
                 let vid = parse_version_id(req)?;
                 let requester = Self::requester_from_auth(auth);
+                let wire_ids = WireResponseIds::new(
+                    current_trace_context().request_id(),
+                    self.host_id.clone(),
+                );
                 #[cfg(feature = "deep-tracing")]
                 let trace = current_trace_context();
                 if let Some(pn_str) = req.query_param_lossy("partNumber") {
@@ -1471,7 +1534,9 @@ impl HttpFrontend {
                                     Ok(resp)
                                 }
                                 Err(ServerError::InvalidRange { total_size }) => {
-                                    Ok(S3Response::range_not_satisfiable(total_size))
+                                    Ok(S3Response::range_not_satisfiable_with_ids(
+                                        total_size, &wire_ids,
+                                    ))
                                 }
                                 Err(e) => Err(e),
                             }
@@ -4145,7 +4210,10 @@ pub fn s3_response_to_hyper(
         permit: Option<OwnedSemaphorePermit>,
         trace_meta: ResponseTraceMeta,
     ) -> http::Response<S3HyperBody> {
-        let resp = S3Response::error(&ServerError::InternalError { reason }, "");
+        let wire_ids =
+            WireResponseIds::new(trace_meta.context.request_id(), trace_meta.host_id.clone());
+        let resp =
+            S3Response::error_with_ids(&ServerError::InternalError { reason }, "", &wire_ids);
         let status = http::StatusCode::from_u16(resp.status_code)
             .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
         let trace =
@@ -4168,6 +4236,16 @@ pub fn s3_response_to_hyper(
                 response.headers_mut().insert(name, value);
             }
         }
+        response.headers_mut().insert(
+            http::header::HeaderName::from_static("x-amz-request-id"),
+            http::header::HeaderValue::from_str(wire_ids.request_id())
+                .expect("request id is a valid header value"),
+        );
+        response.headers_mut().insert(
+            http::header::HeaderName::from_static("x-amz-id-2"),
+            http::header::HeaderValue::from_str(wire_ids.host_id())
+                .expect("host id is a valid header value"),
+        );
         response
     }
 
@@ -4190,7 +4268,10 @@ pub fn s3_response_to_hyper(
             )
         }
     };
-    let mut validated_headers = Vec::with_capacity(resp.headers.len());
+    let mut has_request_id_header = false;
+    let mut has_host_id_header = false;
+    let mut has_server_header = false;
+    let mut validated_headers = Vec::with_capacity(resp.headers.len() + 2);
     for (name, value) in &resp.headers {
         let parsed_name = match http::header::HeaderName::from_bytes(name.as_bytes()) {
             Ok(name) => name,
@@ -4212,7 +4293,36 @@ pub fn s3_response_to_hyper(
                 )
             }
         };
+        if parsed_name == http::header::HeaderName::from_static("x-amz-request-id") {
+            has_request_id_header = true;
+        }
+        if parsed_name == http::header::HeaderName::from_static("x-amz-id-2") {
+            has_host_id_header = true;
+        }
+        if parsed_name == http::header::SERVER {
+            has_server_header = true;
+        }
         validated_headers.push((parsed_name, parsed_value));
+    }
+    if !has_request_id_header {
+        validated_headers.push((
+            http::header::HeaderName::from_static("x-amz-request-id"),
+            http::header::HeaderValue::from_str(trace_meta.context.request_id())
+                .expect("request id is a valid header value"),
+        ));
+    }
+    if !has_host_id_header {
+        validated_headers.push((
+            http::header::HeaderName::from_static("x-amz-id-2"),
+            http::header::HeaderValue::from_str(&trace_meta.host_id)
+                .expect("host id is a valid header value"),
+        ));
+    }
+    if !has_server_header {
+        validated_headers.push((
+            http::header::SERVER,
+            http::header::HeaderValue::from_static(AWS_SERVER_HEADER_VALUE),
+        ));
     }
     let trace = ResponseBodyTrace::new(
         trace_meta,
@@ -5398,6 +5508,7 @@ mod tests {
         HttpFrontend {
             coordinator,
             credentials,
+            host_id: Arc::<str>::from("host-id"),
         }
     }
 
@@ -6003,7 +6114,13 @@ mod tests {
             resp,
             None,
             8192,
-            ResponseTraceMeta::new(observability::TraceContext::new_request(), "GET", "/", ""),
+            ResponseTraceMeta::new(
+                crate::http::new_request_trace_context(),
+                Arc::<str>::from("host-id"),
+                "GET",
+                "/",
+                "",
+            ),
         );
         assert_eq!(hyper_resp.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
     }
@@ -6024,7 +6141,13 @@ mod tests {
             resp,
             None,
             8192,
-            ResponseTraceMeta::new(observability::TraceContext::new_request(), "GET", "/", ""),
+            ResponseTraceMeta::new(
+                crate::http::new_request_trace_context(),
+                Arc::<str>::from("host-id"),
+                "GET",
+                "/",
+                "",
+            ),
         );
         assert_eq!(
             hyper_resp
@@ -6041,6 +6164,88 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("5")
         );
+    }
+
+    #[test]
+    fn new_request_trace_context_matches_expected_id_shapes() {
+        let ctx = crate::http::new_request_trace_context();
+        assert_eq!(ctx.trace_id().len(), 32);
+        assert_eq!(ctx.request_id().len(), 16);
+        assert!(ctx.trace_id().bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(ctx.trace_id().bytes().all(|b| !b.is_ascii_uppercase()));
+        assert!(ctx
+            .request_id()
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()));
+    }
+
+    #[test]
+    fn new_host_id_returns_visible_ascii_header_value() {
+        let host_id = crate::http::new_host_id();
+        assert!(!host_id.is_empty());
+        assert!(host_id.bytes().all(|b| b.is_ascii_graphic()));
+        assert!(http::header::HeaderValue::from_str(&host_id).is_ok());
+    }
+
+    #[test]
+    fn s3_response_to_hyper_injects_request_and_host_headers() {
+        let resp = S3Response {
+            status_code: 200,
+            headers: Vec::new(),
+            body: Vec::new(),
+            stream: None,
+        };
+
+        let hyper_resp = s3_response_to_hyper(
+            resp,
+            None,
+            8192,
+            ResponseTraceMeta::new(
+                observability::TraceContext::from_ids(
+                    "0123456789abcdef0123456789abcdef".to_string(),
+                    "2VG1X5NNMZ52HKC0".to_string(),
+                ),
+                Arc::<str>::from("stable-host-id"),
+                "GET",
+                "/",
+                "",
+            ),
+        );
+
+        assert_eq!(
+            hyper_resp
+                .headers()
+                .get("x-amz-request-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("2VG1X5NNMZ52HKC0")
+        );
+        assert_eq!(
+            hyper_resp
+                .headers()
+                .get("x-amz-id-2")
+                .and_then(|value| value.to_str().ok()),
+            Some("stable-host-id")
+        );
+    }
+
+    #[test]
+    fn s3_response_error_with_ids_embeds_explicit_request_and_host_ids() {
+        let wire_ids =
+            WireResponseIds::new("2VG1X5NNMZ52HKC0".to_string(), "stable-host-id".to_string());
+        let resp = S3Response::error_with_ids(
+            &ServerError::MetadataTooLargeDetailed {
+                size: 2049,
+                max_size_allowed: 2048,
+            },
+            "",
+            &wire_ids,
+        );
+        let body = std::str::from_utf8(&resp.body).unwrap_or("");
+        assert!(resp.stream.is_some());
+        assert!(body.is_empty());
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("<RequestId>2VG1X5NNMZ52HKC0</RequestId>"));
+        assert!(body.contains("<HostId>stable-host-id</HostId>"));
     }
 
     #[test]

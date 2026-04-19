@@ -60,6 +60,10 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    let host_id = config
+        .host_id
+        .clone()
+        .unwrap_or_else(server_http::http::new_host_id);
 
     // EC self-test
     if let Err(e) = ec::self_test() {
@@ -140,6 +144,7 @@ async fn main() {
         frontends.push(HttpFrontend {
             coordinator,
             credentials,
+            host_id: Arc::<str>::from(host_id.clone()),
         });
     }
 
@@ -165,7 +170,7 @@ async fn main() {
     };
 
     eprintln!(
-        "argmin-s3 listening on {}://{} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight, read chunk {} bytes, region {})",
+        "argmin-s3 listening on {}://{} (EC {},{}, {} PGs, {} workers, max {} conns, max {} in-flight, read chunk {} bytes, region {}, host id {})",
         scheme,
         config.listen_addr,
         config.ec_k,
@@ -175,7 +180,8 @@ async fn main() {
         config.max_connections,
         config.max_inflight_requests,
         config.stream_read_chunk_size,
-        config.region
+        config.region,
+        host_id
     );
 
     let serve_config = server_http::http::serve::ServeConfig {

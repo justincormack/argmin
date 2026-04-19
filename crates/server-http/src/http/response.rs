@@ -1,5 +1,7 @@
 //! Build HTTP responses for S3 operations.
 
+use std::sync::Arc;
+
 use crate::coordinator::{
     BucketSummary, CompleteMultipartUploadResult, CopyObjectResult, DeleteObjectResult,
     DeleteObjectsResult, GetBucketAclResult, GetObjectAclResult, GetObjectPartResult,
@@ -19,6 +21,36 @@ use server_core::system_metadata::SystemMetadata;
 use storage::{EffectiveBucketEncryptionConfig, ManagedEncryptionAlgorithm, UploadId};
 
 use super::xml;
+
+const TEST_REQUEST_ID: &str = "request-id";
+#[cfg(test)]
+const TEST_HOST_ID: &str = "host-id";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WireResponseIds {
+    request_id: Arc<str>,
+    host_id: Arc<str>,
+}
+
+impl WireResponseIds {
+    #[must_use]
+    pub fn new(request_id: impl Into<Arc<str>>, host_id: impl Into<Arc<str>>) -> Self {
+        Self {
+            request_id: request_id.into(),
+            host_id: host_id.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    #[must_use]
+    pub fn host_id(&self) -> &str {
+        &self.host_id
+    }
+}
 
 /// Format a `version_id` for S3 API responses.
 /// Null version is displayed as "null".
@@ -289,20 +321,25 @@ fn client_error_message(err: &ServerError) -> String {
     }
 }
 
-impl S3Response {
-    const TEST_REQUEST_ID: &'static str = "request-id";
-    const TEST_HOST_ID: &'static str = "host-id";
+fn current_request_id() -> String {
+    TEST_REQUEST_ID.to_string()
+}
 
-    fn client_error_response(err: &ServerError, resource: &str) -> Self {
+impl S3Response {
+    fn client_error_response_with_ids(
+        err: &ServerError,
+        resource: &str,
+        wire_ids: &WireResponseIds,
+    ) -> Self {
+        let request_id = wire_ids.request_id();
+        let host_id = wire_ids.host_id();
         match err {
             ServerError::BucketNotFound { name } => {
-                let body =
-                    xml::no_such_bucket_error_xml(name, Self::TEST_REQUEST_ID, Self::TEST_HOST_ID);
+                let body = xml::no_such_bucket_error_xml(name, request_id, host_id);
                 Self::new(404).chunked_xml_body(body)
             }
             ServerError::ObjectNotFound { key, .. } | ServerError::DeleteMarkerHit { key, .. } => {
-                let body =
-                    xml::no_such_key_error_xml(key, Self::TEST_REQUEST_ID, Self::TEST_HOST_ID);
+                let body = xml::no_such_key_error_xml(key, request_id, host_id);
                 Self::new(404).chunked_xml_body(body)
             }
             ServerError::HeadDeleteMarkerMethodNotAllowed {
@@ -310,19 +347,15 @@ impl S3Response {
                 last_modified,
             } => Self::head_delete_marker_method_not_allowed(*version_id, *last_modified),
             ServerError::NoSuchBucketPolicy { bucket } => {
-                let body = xml::no_such_bucket_policy_error_xml(
-                    bucket,
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
-                );
+                let body = xml::no_such_bucket_policy_error_xml(bucket, request_id, host_id);
                 Self::new(404).chunked_xml_body(body)
             }
             ServerError::AnonymousApiAccessDenied => {
                 let body = xml::error_xml_with_host_id(
                     "AccessDenied",
                     &client_error_message(err),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
+                    request_id,
+                    host_id,
                 );
                 Self::new(403).chunked_xml_body(body)
             }
@@ -336,8 +369,8 @@ impl S3Response {
                         "User: {} is not authorized to perform: s3:PutBucketPolicy on resource: \"arn:aws:s3:::{}\" because public policies are prevented by the BlockPublicPolicy setting in S3 Block Public Access.",
                         requester_principal, bucket
                     ),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
+                    request_id,
+                    host_id,
                 );
                 Self::new(403).chunked_xml_body(body)
             }
@@ -347,8 +380,8 @@ impl S3Response {
                 let body = xml::error_xml_with_host_id(
                     "AccessDenied",
                     &client_error_message(err),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
+                    request_id,
+                    host_id,
                 );
                 Self::new(403).chunked_xml_body(body)
             }
@@ -371,8 +404,8 @@ impl S3Response {
                     xml::xml_escape(client_hash),
                     xml::xml_escape(server_hash),
                     xml::xml_escape(resource),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
                 );
                 Self::new(400).chunked_xml_body(body)
             }
@@ -391,8 +424,8 @@ impl S3Response {
                     xml::xml_escape(&client_error_message(err)),
                     xml::xml_escape(&headers_str),
                     xml::xml_escape(resource),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
                 );
                 Self::new(403).chunked_xml_body(body)
             }
@@ -404,21 +437,17 @@ impl S3Response {
                      <Message>{}</Message>\
                      <Token-0>{}</Token-0>\
                      <RequestId>{}</RequestId>\
-                     <HostId>{}</HostId>\
+                    <HostId>{}</HostId>\
                      </Error>",
                     xml::xml_escape(&client_error_message(err)),
                     xml::xml_escape(token),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
                 );
                 Self::new(400).chunked_xml_body(body)
             }
             ServerError::Auth(auth::AuthError::DuplicateAuthorizationHeader) => {
-                let body = xml::header_not_implemented_xml(
-                    "Authorization",
-                    resource,
-                    Self::TEST_REQUEST_ID,
-                );
+                let body = xml::header_not_implemented_xml("Authorization", resource, request_id);
                 Self::new(501).chunked_xml_body(body)
             }
             ServerError::MaxMessageLengthExceeded {
@@ -435,21 +464,18 @@ impl S3Response {
                      </Error>",
                     xml::xml_escape(&client_error_message(err)),
                     max_message_length_bytes,
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
                 );
                 Self::new(400).chunked_xml_body(body)
             }
             ServerError::HeaderNotImplemented { header } => {
-                let body = xml::header_not_implemented_xml(header, resource, Self::TEST_REQUEST_ID);
+                let body = xml::header_not_implemented_xml(header, resource, request_id);
                 Self::new(501).chunked_xml_body(body)
             }
             ServerError::QueryParameterNotImplemented { query_parameter } => {
-                let body = xml::query_parameter_not_implemented_xml(
-                    query_parameter,
-                    resource,
-                    Self::TEST_REQUEST_ID,
-                );
+                let body =
+                    xml::query_parameter_not_implemented_xml(query_parameter, resource, request_id);
                 Self::new(501).chunked_xml_body(body)
             }
             ServerError::InvalidSseCustomerKeyMd5 => {
@@ -462,11 +488,11 @@ impl S3Response {
                      <Resource>{}</Resource>\
                      <RequestId>{}</RequestId>\
                      <HostId>{}</HostId>\
-                     </Error>",
+                    </Error>",
                     xml::xml_escape(&client_error_message(err)),
                     xml::xml_escape(resource),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
                 );
                 Self::new(400).chunked_xml_body(body)
             }
@@ -485,8 +511,8 @@ impl S3Response {
                     xml::xml_escape(&client_error_message(err)),
                     xml::xml_escape(value),
                     xml::xml_escape(resource),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
+                    xml::xml_escape(request_id),
+                    xml::xml_escape(host_id),
                 );
                 Self::new(400).chunked_xml_body(body)
             }
@@ -497,7 +523,7 @@ impl S3Response {
                     "AuthorizationHeaderMalformed",
                     &client_error_message(err),
                     resource,
-                    Self::TEST_REQUEST_ID,
+                    request_id,
                     expected_region,
                 );
                 Self::new(400)
@@ -511,7 +537,7 @@ impl S3Response {
                     "InvalidBucketNamespace",
                     &client_error_message(err),
                     bucket_namespace,
-                    Self::TEST_REQUEST_ID,
+                    request_id,
                 );
                 Self::new(400).chunked_xml_body(body)
             }
@@ -519,8 +545,8 @@ impl S3Response {
                 let body = xml::error_xml_with_host_id(
                     err.s3_error_code(),
                     &client_error_message(err),
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
+                    request_id,
+                    host_id,
                 );
                 Self::new(400).chunked_xml_body(body)
             }
@@ -528,8 +554,7 @@ impl S3Response {
                 size,
                 max_size_allowed,
             } => {
-                let body =
-                    xml::key_too_long_error_xml(*size, *max_size_allowed, Self::TEST_REQUEST_ID);
+                let body = xml::key_too_long_error_xml(*size, *max_size_allowed, request_id);
                 Self::new(400).chunked_xml_body(body)
             }
             ServerError::MetadataTooLargeDetailed {
@@ -539,22 +564,17 @@ impl S3Response {
                 let body = xml::metadata_too_large_error_xml(
                     *size,
                     *max_size_allowed,
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
+                    request_id,
+                    host_id,
                 );
                 Self::new(400).chunked_xml_body(body)
             }
             ServerError::PostPolicyAccessDenied { reason } => {
-                let body = xml::error_xml_with_host_id(
-                    "AccessDenied",
-                    reason,
-                    Self::TEST_REQUEST_ID,
-                    Self::TEST_HOST_ID,
-                );
+                let body = xml::error_xml_with_host_id("AccessDenied", reason, request_id, host_id);
                 Self::new(403).chunked_xml_body(body)
             }
             ServerError::NoSuchUpload { upload_id } => {
-                let body = xml::no_such_upload_error_xml(upload_id, Self::TEST_REQUEST_ID);
+                let body = xml::no_such_upload_error_xml(upload_id, request_id);
                 Self::new(404).chunked_xml_body(body)
             }
             _ => {
@@ -562,7 +582,7 @@ impl S3Response {
                     err.s3_error_code(),
                     &client_error_message(err),
                     resource,
-                    Self::TEST_REQUEST_ID,
+                    request_id,
                 );
                 let resp = Self::new(err.http_status()).chunked_xml_body(body);
                 if matches!(err, ServerError::SlowDown) {
@@ -1040,11 +1060,24 @@ impl S3Response {
     /// Build a 416 Range Not Satisfiable response.
     #[must_use]
     pub fn range_not_satisfiable(_total_size: u64) -> Self {
+        let request_id = current_request_id();
         let body = xml::error_xml(
             "InvalidRange",
             "The requested range is not satisfiable",
             "",
-            "request-id",
+            &request_id,
+        );
+        Self::new(416).chunked_xml_body(body)
+    }
+
+    /// Build a 416 Range Not Satisfiable response with explicit wire IDs.
+    #[must_use]
+    pub fn range_not_satisfiable_with_ids(_total_size: u64, wire_ids: &WireResponseIds) -> Self {
+        let body = xml::error_xml(
+            "InvalidRange",
+            "The requested range is not satisfiable",
+            "",
+            wire_ids.request_id(),
         );
         Self::new(416).chunked_xml_body(body)
     }
@@ -1284,11 +1317,24 @@ impl S3Response {
     /// Build a 412 Precondition Failed response with XML error body.
     #[must_use]
     pub fn precondition_failed() -> Self {
+        let request_id = current_request_id();
         let body = xml::error_xml(
             "PreconditionFailed",
             "At least one of the pre-conditions you specified did not hold",
             "",
-            "request-id",
+            &request_id,
+        );
+        Self::new(412).chunked_xml_body(body)
+    }
+
+    /// Build a 412 Precondition Failed response with explicit wire IDs.
+    #[must_use]
+    pub fn precondition_failed_with_ids(wire_ids: &WireResponseIds) -> Self {
+        let body = xml::error_xml(
+            "PreconditionFailed",
+            "At least one of the pre-conditions you specified did not hold",
+            "",
+            wire_ids.request_id(),
         );
         Self::new(412).chunked_xml_body(body)
     }
@@ -1642,20 +1688,36 @@ impl S3Response {
 
     /// Build a 403 Forbidden response.
     #[must_use]
-    pub fn forbidden() -> Self {
+    pub fn forbidden(host_id: &str) -> Self {
+        let request_id = current_request_id();
+        let body =
+            xml::error_xml_with_host_id("AccessDenied", "Access Denied", &request_id, host_id);
+        Self::new(403).chunked_xml_body(body)
+    }
+
+    /// Build a 403 Forbidden response with explicit wire IDs.
+    #[must_use]
+    pub fn forbidden_with_ids(wire_ids: &WireResponseIds) -> Self {
         let body = xml::error_xml_with_host_id(
             "AccessDenied",
             "Access Denied",
-            Self::TEST_REQUEST_ID,
-            Self::TEST_HOST_ID,
+            wire_ids.request_id(),
+            wire_ids.host_id(),
         );
         Self::new(403).chunked_xml_body(body)
     }
 
     /// Build an error response.
     #[must_use]
-    pub fn error(err: &ServerError, resource: &str) -> Self {
-        Self::client_error_response(err, resource)
+    pub fn error(err: &ServerError, resource: &str, host_id: &str) -> Self {
+        let wire_ids = WireResponseIds::new(TEST_REQUEST_ID, host_id);
+        Self::client_error_response_with_ids(err, resource, &wire_ids)
+    }
+
+    /// Build an error response with explicit wire IDs.
+    #[must_use]
+    pub fn error_with_ids(err: &ServerError, resource: &str, wire_ids: &WireResponseIds) -> Self {
+        Self::client_error_response_with_ids(err, resource, wire_ids)
     }
 }
 
@@ -2672,7 +2734,7 @@ mod tests {
             provided_region: "us-east-1".to_string(),
             expected_region: "us-west-2".to_string(),
         };
-        let resp = S3Response::error(&err, "/bucket/key");
+        let resp = S3Response::error(&err, "/bucket/key", TEST_HOST_ID);
         assert_eq!(resp.status_code, 400);
         assert_eq!(find_header(&resp, "x-amz-bucket-region"), Some("us-west-2"));
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
@@ -2687,7 +2749,7 @@ mod tests {
             reason: "namespace mismatch".to_string(),
             bucket_namespace: "bucket-111122223333-us-east-1-an".to_string(),
         };
-        let resp = S3Response::error(&err, "/bucket");
+        let resp = S3Response::error(&err, "/bucket", TEST_HOST_ID);
         assert_eq!(resp.status_code, 400);
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<Code>InvalidBucketNamespace</Code>"));
@@ -2702,7 +2764,7 @@ mod tests {
         let err = ServerError::Auth(auth::AuthError::UnexpectedSecurityToken {
             token: "bad-token-causes-400".to_string(),
         });
-        let resp = S3Response::error(&err, "/bucket/key");
+        let resp = S3Response::error(&err, "/bucket/key", TEST_HOST_ID);
         assert_eq!(resp.status_code, 400);
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<Code>InvalidToken</Code>"));
@@ -3030,7 +3092,7 @@ mod tests {
     #[test]
     fn error_response_404() {
         let err = ServerError::BucketNotFound { name: "b".into() };
-        let resp = S3Response::error(&err, "/b");
+        let resp = S3Response::error(&err, "/b", TEST_HOST_ID);
         assert_eq!(resp.status_code, 404);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
         assert_eq!(find_header(&resp, "Content-Length"), None);
@@ -3043,7 +3105,7 @@ mod tests {
         let err = ServerError::NoSuchUpload {
             upload_id: "abc".into(),
         };
-        let resp = S3Response::error(&err, "/bucket/key");
+        let resp = S3Response::error(&err, "/bucket/key", TEST_HOST_ID);
         assert_eq!(resp.status_code, 404);
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<Code>NoSuchUpload</Code>"));
@@ -3058,7 +3120,7 @@ mod tests {
         let err = ServerError::InvalidRedirectLocation {
             reason: "The website redirect location must have a prefix of 'http://' or 'https://' or '/'.".to_string(),
         };
-        let resp = S3Response::error(&err, "/bucket/key");
+        let resp = S3Response::error(&err, "/bucket/key", TEST_HOST_ID);
         assert_eq!(resp.status_code, 400);
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<Code>InvalidRedirectLocation</Code>"));
@@ -3072,7 +3134,7 @@ mod tests {
             size: 2049,
             max_size_allowed: 2048,
         };
-        let resp = S3Response::error(&err, "/bucket/key");
+        let resp = S3Response::error(&err, "/bucket/key", TEST_HOST_ID);
         assert_eq!(resp.status_code, 400);
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("<Code>MetadataTooLarge</Code>"));
@@ -3083,9 +3145,22 @@ mod tests {
     }
 
     #[test]
+    fn error_response_uses_attached_request_id() {
+        let _trace = observability::AttachedTrace::new(observability::TraceContext::from_ids(
+            "0123456789abcdef0123456789abcdef".to_string(),
+            "2VG1X5NNMZ52HKC0".to_string(),
+        ));
+        let err = ServerError::Auth(auth::AuthError::MissingAuth);
+        let resp = S3Response::error(&err, "/", TEST_HOST_ID);
+        let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
+        assert!(body.contains("<RequestId>request-id</RequestId>"));
+        assert!(body.contains("<HostId>host-id</HostId>"));
+    }
+
+    #[test]
     fn error_response_403() {
         let err = ServerError::Auth(auth::AuthError::MissingAuth);
-        let resp = S3Response::error(&err, "/");
+        let resp = S3Response::error(&err, "/", TEST_HOST_ID);
         assert_eq!(resp.status_code, 403);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
         assert_eq!(find_header(&resp, "Content-Length"), None);
@@ -3096,7 +3171,7 @@ mod tests {
     #[test]
     fn error_response_500() {
         let err = ServerError::Store(storage::StoreError::NotFound);
-        let resp = S3Response::error(&err, "/x");
+        let resp = S3Response::error(&err, "/x", TEST_HOST_ID);
         assert_eq!(resp.status_code, 500);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
         assert_eq!(find_header(&resp, "Content-Length"), None);
@@ -3111,7 +3186,7 @@ mod tests {
         let err = ServerError::InternalError {
             reason: "sqlite path /tmp/secret.db".to_string(),
         };
-        let resp = S3Response::error(&err, "/x");
+        let resp = S3Response::error(&err, "/x", TEST_HOST_ID);
         assert_eq!(resp.status_code, 500);
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("InternalError"));
@@ -3124,7 +3199,7 @@ mod tests {
         let err = ServerError::MetadataBlobError {
             reason: "invalid metadata bytes: 0xFF".to_string(),
         };
-        let resp = S3Response::error(&err, "/x");
+        let resp = S3Response::error(&err, "/x", TEST_HOST_ID);
         assert_eq!(resp.status_code, 500);
         let body = String::from_utf8(resp.into_test_body_bytes().unwrap()).unwrap();
         assert!(body.contains("InternalError"));
@@ -3163,7 +3238,7 @@ mod tests {
 
         for (err, leaks) in cases {
             let body = String::from_utf8(
-                S3Response::error(&err, "/x")
+                S3Response::error(&err, "/x", TEST_HOST_ID)
                     .into_test_body_bytes()
                     .unwrap(),
             )
@@ -3178,7 +3253,7 @@ mod tests {
 
     #[test]
     fn slow_down_response_has_retry_after() {
-        let resp = S3Response::error(&ServerError::SlowDown, "/");
+        let resp = S3Response::error(&ServerError::SlowDown, "/", TEST_HOST_ID);
         assert_eq!(resp.status_code, 503);
         assert_eq!(find_header(&resp, "Retry-After"), Some("1"));
         assert_eq!(find_header(&resp, "Content-Length"), None);
@@ -3189,7 +3264,7 @@ mod tests {
     #[test]
     fn error_response_has_xml_content_type() {
         let err = ServerError::MethodNotAllowed;
-        let resp = S3Response::error(&err, "/");
+        let resp = S3Response::error(&err, "/", TEST_HOST_ID);
         assert_eq!(find_header(&resp, "Content-Type"), Some("application/xml"));
         assert_eq!(find_header(&resp, "Content-Length"), None);
         assert!(resp.stream.is_some());

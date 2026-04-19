@@ -20,7 +20,7 @@ use tokio_rustls::TlsAcceptor;
 use super::request::{
     parse_upload_part_query, S3Request, TransportSecurity, MAX_BUFFERED_CONTROL_BODY_SIZE,
 };
-use super::response::S3Response;
+use super::response::{S3Response, WireResponseIds};
 use super::router::{route, S3Operation};
 use super::s3_response_to_hyper;
 use super::{HttpFrontend, S3HyperBody};
@@ -211,6 +211,7 @@ impl Default for ServeConfig {
 /// and timeout configuration.
 struct ServerState {
     pool: Vec<Arc<HttpFrontend>>,
+    host_id: Arc<str>,
     counter: AtomicUsize,
     request_semaphore: Arc<Semaphore>,
     segment_buffer_pool: SegmentBufferPool,
@@ -378,10 +379,20 @@ async fn serve_plain_or_tls(
     tls_acceptor: Option<TlsAcceptor>,
 ) {
     assert!(!frontends.is_empty(), "at least one frontend required");
+    let host_id = frontends
+        .first()
+        .expect("frontends is non-empty")
+        .host_id
+        .clone();
+    assert!(
+        frontends.iter().all(|frontend| frontend.host_id == host_id),
+        "all frontends must share the same host id"
+    );
 
     let header_read_timeout = config.header_read_timeout;
     let state = Arc::new(ServerState {
         pool: frontends.into_iter().map(Arc::new).collect(),
+        host_id,
         counter: AtomicUsize::new(0),
         request_semaphore: Arc::new(Semaphore::new(max_inflight_requests as usize)),
         segment_buffer_pool: SegmentBufferPool::new(max_inflight_requests as usize),
@@ -487,11 +498,19 @@ async fn handle(
     req: Request<Incoming>,
     transport_security: TransportSecurity,
 ) -> Result<http::Response<S3HyperBody>, Infallible> {
-    let trace = observability::TraceContext::new_request();
+    let trace = crate::http::new_request_trace_context();
+    let _trace = observability::AttachedTrace::new(trace.clone());
+    let wire_ids = WireResponseIds::new(trace.request_id(), state.host_id.clone());
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
     let query = req.uri().query().unwrap_or("").to_string();
-    let response_trace = crate::http::ResponseTraceMeta::new(trace.clone(), &method, &path, &query);
+    let response_trace = crate::http::ResponseTraceMeta::new(
+        trace.clone(),
+        state.host_id.clone(),
+        &method,
+        &path,
+        &query,
+    );
     #[cfg(feature = "deep-tracing")]
     let query_summary = observability::query_summary(&query);
     #[cfg(feature = "deep-tracing")]
@@ -526,7 +545,7 @@ async fn handle(
     {
         permit
     } else {
-        let resp = S3Response::error(&ServerError::SlowDown, "");
+        let resp = S3Response::error_with_ids(&ServerError::SlowDown, "", &wire_ids);
         return Ok(s3_response_to_hyper(
             resp,
             None,
@@ -542,7 +561,7 @@ async fn handle(
         Ok(op) => op,
         Err(err) => {
             return Ok(s3_response_to_hyper(
-                S3Response::error(&err, ""),
+                S3Response::error_with_ids(&err, "", &wire_ids),
                 Some(req_permit),
                 state.config.stream_read_chunk_size,
                 response_trace,
@@ -554,7 +573,7 @@ async fn handle(
             Ok(req) => req,
             Err(err) => {
                 return Ok(s3_response_to_hyper(
-                    S3Response::error(&err, ""),
+                    S3Response::error_with_ids(&err, "", &wire_ids),
                     Some(req_permit),
                     state.config.stream_read_chunk_size,
                     response_trace.clone(),
@@ -567,7 +586,7 @@ async fn handle(
             Ok(mode) => mode,
             Err(err) => {
                 return Ok(s3_response_to_hyper(
-                    S3Response::error(&err, ""),
+                    S3Response::error_with_ids(&err, "", &wire_ids),
                     Some(req_permit),
                     state.config.stream_read_chunk_size,
                     response_trace.clone(),
@@ -584,6 +603,7 @@ async fn handle(
                     key,
                     chunked,
                     trace.clone(),
+                    wire_ids.clone(),
                 )
                 .await;
                 append_actual_cors_headers(
@@ -613,6 +633,7 @@ async fn handle(
                     part_number,
                     chunked,
                     trace.clone(),
+                    wire_ids.clone(),
                 )
                 .await;
                 append_actual_cors_headers(
@@ -640,7 +661,7 @@ async fn handle(
             Ok(req) => req,
             Err(err) => {
                 return Ok(s3_response_to_hyper(
-                    S3Response::error(&err, ""),
+                    S3Response::error_with_ids(&err, "", &wire_ids),
                     Some(req_permit),
                     state.config.stream_read_chunk_size,
                     response_trace,
@@ -655,6 +676,7 @@ async fn handle(
             body,
             bucket.clone(),
             trace.clone(),
+            wire_ids.clone(),
         )
         .await;
         append_actual_cors_headers(
@@ -680,7 +702,7 @@ async fn handle(
         Ok(bytes) => bytes,
         Err(err) => {
             return Ok(s3_response_to_hyper(
-                S3Response::error(&err, ""),
+                S3Response::error_with_ids(&err, "", &wire_ids),
                 Some(req_permit),
                 state.config.stream_read_chunk_size,
                 response_trace,
@@ -692,7 +714,7 @@ async fn handle(
         Ok(req) => req,
         Err(err) => {
             return Ok(s3_response_to_hyper(
-                S3Response::error(&err, ""),
+                S3Response::error_with_ids(&err, "", &wire_ids),
                 Some(req_permit),
                 state.config.stream_read_chunk_size,
                 response_trace,
@@ -701,17 +723,19 @@ async fn handle(
     };
 
     let state_ref = Arc::clone(&state);
+    let wire_ids_for_blocking = wire_ids.clone();
     let resp = spawn_blocking_with_trace(trace, move || {
         let frontend = acquire_frontend(&state_ref);
-        frontend.handle_s3_request(&s3req)
+        frontend.handle_s3_request(&s3req, &wire_ids_for_blocking)
     })
     .await
     .unwrap_or_else(|_| {
-        S3Response::error(
+        S3Response::error_with_ids(
             &ServerError::InvalidRequest {
                 reason: "internal error".to_string(),
             },
             "",
+            &wire_ids,
         )
     });
 
@@ -1466,10 +1490,21 @@ async fn handle_streaming_post_object(
     body: Incoming,
     bucket: BucketName,
     trace: observability::TraceContext,
+    wire_ids: WireResponseIds,
 ) -> S3Response {
     use base64::Engine;
 
     let idle_timeout = state.config.body_idle_timeout;
+    let error_response = |err: &ServerError| S3Response::error_with_ids(err, "", &wire_ids);
+    let internal_error_response = || {
+        S3Response::error_with_ids(
+            &ServerError::InvalidRequest {
+                reason: "internal error".to_string(),
+            },
+            "",
+            &wire_ids,
+        )
+    };
 
     let req_arc = Arc::new(s3req);
 
@@ -1737,6 +1772,7 @@ async fn handle_streaming_post_object(
 ///
 /// Each chunk append is dispatched via `spawn_blocking` with a brief frontend
 /// lock. Between appends, no frontend is held — body reading is async.
+#[allow(clippy::too_many_arguments)]
 async fn handle_streaming_put(
     state: Arc<ServerState>,
     s3req: S3Request,
@@ -1745,8 +1781,19 @@ async fn handle_streaming_put(
     key: String,
     chunked: ChunkedMode,
     trace: observability::TraceContext,
+    wire_ids: WireResponseIds,
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
+    let error_response = |err: &ServerError| S3Response::error_with_ids(err, "", &wire_ids);
+    let internal_error_response = || {
+        S3Response::error_with_ids(
+            &ServerError::InvalidRequest {
+                reason: "internal error".to_string(),
+            },
+            "",
+            &wire_ids,
+        )
+    };
     let mut body = body;
 
     let state2 = Arc::clone(&state);
@@ -2167,6 +2214,7 @@ async fn ensure_streaming_put_session(
     session_id: &mut Option<SessionId>,
     body_bytes_received: u64,
 ) -> Result<(), S3Response> {
+    let wire_ids = WireResponseIds::new(ctx.trace.request_id(), state.host_id.clone());
     if session_id.is_some() {
         return Ok(());
     }
@@ -2215,8 +2263,8 @@ async fn ensure_streaming_put_session(
             *session_id = Some(new_session_id);
             Ok(())
         }
-        Ok(Err(err)) => Err(error_response(&err)),
-        Err(_) => Err(internal_error_response()),
+        Ok(Err(err)) => Err(error_response(&err, &wire_ids)),
+        Err(_) => Err(internal_error_response(&wire_ids)),
     }
 }
 
@@ -2229,6 +2277,7 @@ async fn append_streaming_put_buffer(
     body_bytes_received: u64,
     timing: &mut StreamingBodyTiming,
 ) -> Result<(), S3Response> {
+    let wire_ids = WireResponseIds::new(ctx.trace.request_id(), state.host_id.clone());
     ensure_streaming_put_session(state, ctx, session_id, body_bytes_received).await?;
     let session_id_value = session_id
         .as_ref()
@@ -2304,11 +2353,11 @@ async fn append_streaming_put_buffer(
         }
         Ok((Err(err), _flush_data)) => {
             abort_streaming(state, ctx, session_id.clone()).await;
-            Err(error_response(&err))
+            Err(error_response(&err, &wire_ids))
         }
         Err(_) => {
             abort_streaming(state, ctx, session_id.clone()).await;
-            Err(internal_error_response())
+            Err(internal_error_response(&wire_ids))
         }
     }
 }
@@ -2319,6 +2368,7 @@ async fn ingest_streaming_put_payload(
     payload: &[u8],
     ingest: &mut StreamingPutIngestState<'_>,
 ) -> Result<(), S3Response> {
+    let wire_ids = WireResponseIds::new(ctx.trace.request_id(), state.host_id.clone());
     if payload.is_empty() {
         return Ok(());
     }
@@ -2337,10 +2387,13 @@ async fn ingest_streaming_put_payload(
     *ingest.total_size += payload.len() as u64;
     if *ingest.total_size > MAX_OBJECT_SIZE {
         abort_streaming(state, ctx, ingest.session_id.clone()).await;
-        return Err(error_response(&ServerError::ObjectTooLarge {
-            size: *ingest.total_size,
-            max: MAX_OBJECT_SIZE,
-        }));
+        return Err(error_response(
+            &ServerError::ObjectTooLarge {
+                size: *ingest.total_size,
+                max: MAX_OBJECT_SIZE,
+            },
+            &wire_ids,
+        ));
     }
     if !*ingest.body_started_emitted {
         *ingest.body_started_emitted = true;
@@ -2417,8 +2470,19 @@ async fn handle_streaming_part(
     part_number: u32,
     chunked: ChunkedMode,
     trace: observability::TraceContext,
+    wire_ids: WireResponseIds,
 ) -> S3Response {
     let idle_timeout = state.config.body_idle_timeout;
+    let error_response = |err: &ServerError| S3Response::error_with_ids(err, "", &wire_ids);
+    let internal_error_response = || {
+        S3Response::error_with_ids(
+            &ServerError::InvalidRequest {
+                reason: "internal error".to_string(),
+            },
+            "",
+            &wire_ids,
+        )
+    };
     let mut body = body;
 
     let state2 = Arc::clone(&state);
@@ -2871,6 +2935,7 @@ async fn ingest_streaming_part_payload(
     payload: &[u8],
     ingest: &mut StreamingPartIngestState<'_>,
 ) -> Result<(), S3Response> {
+    let wire_ids = WireResponseIds::new(ctx.trace.request_id(), state.host_id.clone());
     if payload.is_empty() {
         return Ok(());
     }
@@ -2889,10 +2954,13 @@ async fn ingest_streaming_part_payload(
     *ingest.total_size += payload.len() as u64;
     if *ingest.total_size > MAX_OBJECT_SIZE {
         abort_streaming_part_ctx(state, ctx).await;
-        return Err(error_response(&ServerError::ObjectTooLarge {
-            size: *ingest.total_size,
-            max: MAX_OBJECT_SIZE,
-        }));
+        return Err(error_response(
+            &ServerError::ObjectTooLarge {
+                size: *ingest.total_size,
+                max: MAX_OBJECT_SIZE,
+            },
+            &wire_ids,
+        ));
     }
     if !*ingest.body_started_emitted {
         *ingest.body_started_emitted = true;
@@ -3002,11 +3070,11 @@ async fn ingest_streaming_part_payload(
             Ok((Ok(()), _flush_data)) => {}
             Ok((Err(err), _flush_data)) => {
                 abort_streaming_part_ctx(state, ctx).await;
-                return Err(error_response(&err));
+                return Err(error_response(&err, &wire_ids));
             }
             Err(_) => {
                 abort_streaming_part_ctx(state, ctx).await;
-                return Err(internal_error_response());
+                return Err(internal_error_response(&wire_ids));
             }
         }
         ingest.timing.append_wait_us += elapsed_micros(dispatch_start);
@@ -3260,16 +3328,17 @@ async fn collect_body_with_limit(
     Ok(Bytes::from(data))
 }
 
-fn error_response(err: &ServerError) -> S3Response {
-    S3Response::error(err, "")
+fn error_response(err: &ServerError, wire_ids: &WireResponseIds) -> S3Response {
+    S3Response::error_with_ids(err, "", wire_ids)
 }
 
-fn internal_error_response() -> S3Response {
-    S3Response::error(
+fn internal_error_response(wire_ids: &WireResponseIds) -> S3Response {
+    S3Response::error_with_ids(
         &ServerError::InvalidRequest {
             reason: "internal error".to_string(),
         },
         "",
+        wire_ids,
     )
 }
 
@@ -3360,6 +3429,7 @@ mod tests {
         Arc::new(HttpFrontend {
             coordinator,
             credentials,
+            host_id: Arc::<str>::from("host-id"),
         })
     }
 
@@ -3407,8 +3477,10 @@ mod tests {
 
         let config = ServeConfig::default();
         let header_read_timeout = config.header_read_timeout;
+        let host_id = frontend.host_id.clone();
         let state = Arc::new(ServerState {
             pool: vec![frontend],
+            host_id,
             counter: AtomicUsize::new(0),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(8)),
             segment_buffer_pool: SegmentBufferPool::new(8),

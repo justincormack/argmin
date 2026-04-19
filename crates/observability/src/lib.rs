@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TraceContext {
     trace_id: Arc<str>,
+    request_id: Arc<str>,
 }
 
 impl TraceContext {
@@ -28,12 +29,29 @@ impl TraceContext {
         let sequence = NEXT_TRACE_ID.fetch_add(1, Ordering::Relaxed);
         Self {
             trace_id: Arc::<str>::from(format!("{now_micros:016x}{sequence:016x}")),
+            request_id: Arc::<str>::from(format!(
+                "{:016X}",
+                (now_micros as u64) ^ sequence.rotate_left(13)
+            )),
+        }
+    }
+
+    #[must_use]
+    pub fn from_ids(trace_id: String, request_id: String) -> Self {
+        Self {
+            trace_id: Arc::<str>::from(trace_id),
+            request_id: Arc::<str>::from(request_id),
         }
     }
 
     #[must_use]
     pub fn trace_id(&self) -> &str {
         &self.trace_id
+    }
+
+    #[must_use]
+    pub fn request_id(&self) -> &str {
+        &self.request_id
     }
 }
 
@@ -585,10 +603,6 @@ pub struct AttachedTrace {
 impl AttachedTrace {
     #[must_use]
     pub fn new(context: TraceContext) -> Self {
-        if !trace_config().enabled {
-            return Self { previous: None };
-        }
-
         let previous = TRACE_STATE.with(|slot| {
             let mut slot = slot.borrow_mut();
             let next_depth = slot.as_ref().map_or(0, |state| state.depth);
@@ -603,10 +617,6 @@ impl AttachedTrace {
 
 impl Drop for AttachedTrace {
     fn drop(&mut self) {
-        if !trace_config().enabled {
-            return;
-        }
-
         TRACE_STATE.with(|slot| {
             *slot.borrow_mut() = self.previous.take();
         });
@@ -887,5 +897,18 @@ mod tests {
             after.multipart_completion_bucket_lock_wait_exceeded_total,
             before.multipart_completion_bucket_lock_wait_exceeded_total + 1
         );
+    }
+
+    #[test]
+    fn attached_trace_sets_current_context_even_when_tracing_is_disabled() {
+        let ctx = TraceContext::from_ids(
+            "0123456789abcdef0123456789abcdef".to_string(),
+            "2VG1X5NNMZ52HKC0".to_string(),
+        );
+
+        let guard = AttachedTrace::new(ctx.clone());
+        assert_eq!(current_context(), Some(ctx));
+        drop(guard);
+        assert_eq!(current_context(), None);
     }
 }

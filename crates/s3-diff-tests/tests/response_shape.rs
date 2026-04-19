@@ -26,20 +26,43 @@ use s3_tests::{
 };
 use s3_types::is_legacy_create_bucket_region;
 
-const DROPPED_RESPONSE_HEADERS: &[&str] = &[
-    "connection",
-    "date",
-    "server",
-    "x-amz-id-2",
-    "x-amz-request-id",
-];
-const IGNORE_VALUE_RESPONSE_HEADERS: &[&str] = &["last-modified"];
-// The repo intentionally does not match AWS exact ETag semantics yet.
-// See plans/completed/sse-c-encryption-plan.md and plans/completed/territory-map.md.
-const KNOWN_ETAG_DIVERGENCE_HEADERS: &[&str] = &["etag"];
+const COMMON_TRANSPORT_IGNORED_HEADERS: &[&str] = &["connection", "date", "server"];
+const COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS: &[&str] =
+    &["connection", "date", "server", "etag"];
+const COMMON_TRANSPORT_AND_TRANSFER_ENCODING_IGNORED_HEADERS: &[&str] =
+    &["connection", "date", "server", "transfer-encoding"];
+const COMMON_PRESENCE_ONLY_HEADERS: &[&str] = &["last-modified"];
 const AWS_MIN_MULTIPART_PART_SIZE: usize = 5 * 1024 * 1024;
 const SYSTEM_METADATA_SIZE_LIMIT: usize = 2 * 1024;
 const WEBSITE_REDIRECT_HEADER_NAME: &str = "x-amz-website-redirect-location";
+const REQUEST_ID_HEADER_NAME: &str = "x-amz-request-id";
+const HOST_ID_HEADER_NAME: &str = "x-amz-id-2";
+
+fn is_aws_request_id_shape(value: &str) -> bool {
+    value.len() == 16
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b.is_ascii_uppercase())
+}
+
+fn is_aws_host_id_shape(value: &str) -> bool {
+    value.len() >= 40
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='))
+}
+
+fn normalize_id_value(name: &str, value: &str) -> String {
+    match name {
+        REQUEST_ID_HEADER_NAME | "RequestId" if is_aws_request_id_shape(value) => {
+            "<aws-request-id>".to_string()
+        }
+        HOST_ID_HEADER_NAME | "HostId" if is_aws_host_id_shape(value) => {
+            "<aws-host-id>".to_string()
+        }
+        _ => value.to_string(),
+    }
+}
 
 struct ComparisonEnv {
     external_client: Client,
@@ -369,18 +392,13 @@ fn normalized_headers(
     let mut normalized = BTreeMap::new();
     for (name, value) in headers {
         let name = name.to_ascii_lowercase();
-        if DROPPED_RESPONSE_HEADERS.contains(&name.as_str()) {
-            continue;
-        }
         if ignored_headers.contains(&name.as_str()) {
             continue;
         }
-        let value = if IGNORE_VALUE_RESPONSE_HEADERS.contains(&name.as_str())
-            || presence_only_headers.contains(&name.as_str())
-        {
+        let value = if presence_only_headers.contains(&name.as_str()) {
             "<present>".to_string()
         } else {
-            value.clone()
+            normalize_id_value(&name, value)
         };
         normalized.entry(name).or_insert_with(Vec::new).push(value);
     }
@@ -435,12 +453,56 @@ fn assert_response_headers_match(
     );
 }
 
+fn extract_xml_text(body: &str, tag: &str) -> Option<String> {
+    let start_tag = format!("<{tag}>");
+    let end_tag = format!("</{tag}>");
+    let start = body.find(&start_tag)? + start_tag.len();
+    let end = body[start..].find(&end_tag)? + start;
+    Some(body[start..end].to_string())
+}
+
+fn assert_response_id_shapes(operation: &str, response: &RawResponse) {
+    if let Some(request_id) = response_header_value(response, REQUEST_ID_HEADER_NAME) {
+        assert!(
+            is_aws_request_id_shape(request_id),
+            "{operation}: invalid x-amz-request-id shape: {request_id}"
+        );
+    }
+    if let Some(host_id) = response_header_value(response, HOST_ID_HEADER_NAME) {
+        assert!(
+            is_aws_host_id_shape(host_id),
+            "{operation}: invalid x-amz-id-2 shape: {host_id}"
+        );
+    }
+}
+
+fn assert_xml_error_ids_match_headers(operation: &str, response: &RawResponse) {
+    let header_request_id = response_header_value(response, REQUEST_ID_HEADER_NAME);
+    let header_host_id = response_header_value(response, HOST_ID_HEADER_NAME);
+    let xml_request_id = extract_xml_text(&response.body, "RequestId");
+    let xml_host_id = extract_xml_text(&response.body, "HostId");
+
+    if let (Some(header_request_id), Some(xml_request_id)) =
+        (header_request_id, xml_request_id.as_deref())
+    {
+        assert_eq!(
+            xml_request_id, header_request_id,
+            "{operation}: RequestId XML/header mismatch\nresponse: {response:?}"
+        );
+    }
+    if let (Some(header_host_id), Some(xml_host_id)) = (header_host_id, xml_host_id.as_deref()) {
+        assert_eq!(
+            xml_host_id, header_host_id,
+            "{operation}: HostId XML/header mismatch\nresponse: {response:?}"
+        );
+    }
+}
+
 fn normalize_xml_text_tags(body: &str, tags: &[&str]) -> String {
     let mut normalized = body.to_string();
     for tag in tags {
         let start_tag = format!("<{tag}>");
         let end_tag = format!("</{tag}>");
-        let replacement = format!("{start_tag}<present>{end_tag}");
         let mut search_from = 0;
         loop {
             let Some(relative_start) = normalized[search_from..].find(&start_tag) else {
@@ -451,6 +513,7 @@ fn normalize_xml_text_tags(body: &str, tags: &[&str]) -> String {
             let Some(relative_end) = normalized[content_start..].find(&end_tag) else {
                 break;
             };
+            let replacement = format!("{start_tag}<present>{end_tag}");
             let end = content_start + relative_end + end_tag.len();
             normalized.replace_range(start..end, &replacement);
             search_from = start + replacement.len();
@@ -467,6 +530,8 @@ fn assert_xml_response_shape_matches(
     presence_only_headers: &[&str],
     presence_only_xml_tags: &[&str],
 ) {
+    assert_response_id_shapes(operation, aws);
+    assert_response_id_shapes(operation, local);
     assert_response_headers_match(
         operation,
         aws,
@@ -481,6 +546,8 @@ fn assert_xml_response_shape_matches(
         aws.body,
         local.body,
     );
+    assert_xml_error_ids_match_headers(operation, aws);
+    assert_xml_error_ids_match_headers(operation, local);
 }
 
 fn extract_xml_blocks(body: &str, tag: &str) -> Vec<String> {
@@ -507,7 +574,13 @@ fn extract_xml_blocks(body: &str, tag: &str) -> Vec<String> {
 }
 
 fn assert_delete_objects_response_shape_matches(aws: &RawResponse, local: &RawResponse) {
-    assert_response_headers_match("DeleteObjects", aws, local, &[], &[]);
+    assert_response_headers_match(
+        "DeleteObjects",
+        aws,
+        local,
+        COMMON_TRANSPORT_IGNORED_HEADERS,
+        COMMON_PRESENCE_ONLY_HEADERS,
+    );
 
     let aws_root_end = aws
         .body
@@ -854,8 +927,8 @@ fn test_put_get_head_object_response_shape_matches_aws() {
             "PutObject",
             &aws_put,
             &local_put,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         let aws_get = env.send_external(
@@ -878,8 +951,8 @@ fn test_put_get_head_object_response_shape_matches_aws() {
             "GetObject",
             &aws_get,
             &local_get,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         let aws_head = env.send_external(
@@ -902,8 +975,8 @@ fn test_put_get_head_object_response_shape_matches_aws() {
             "HeadObject",
             &aws_head,
             &local_head,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
@@ -941,8 +1014,8 @@ fn test_object_website_redirect_response_shape_matches_aws() {
             "PutObjectWebsiteRedirect",
             &aws_put,
             &local_put,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         let aws_get = env.send_external(
@@ -965,8 +1038,8 @@ fn test_object_website_redirect_response_shape_matches_aws() {
             "GetObjectWebsiteRedirect",
             &aws_get,
             &local_get,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
         assert_eq!(
             response_header_value(&aws_get, WEBSITE_REDIRECT_HEADER_NAME),
@@ -997,8 +1070,8 @@ fn test_object_website_redirect_response_shape_matches_aws() {
             "HeadObjectWebsiteRedirect",
             &aws_head,
             &local_head,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
         assert_eq!(
             response_header_value(&aws_head, WEBSITE_REDIRECT_HEADER_NAME),
@@ -1043,8 +1116,8 @@ fn test_object_website_redirect_invalid_value_error_shape_matches_aws() {
             "PutObjectInvalidWebsiteRedirect",
             &aws_put,
             &local_put,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &["RequestId", "HostId"],
         );
 
@@ -1084,8 +1157,8 @@ fn test_object_website_redirect_metadata_too_large_error_shape_matches_aws() {
             "PutObjectWebsiteRedirectMetadataTooLarge",
             &aws_put,
             &local_put,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &["RequestId", "HostId"],
         );
 
@@ -1133,8 +1206,8 @@ fn test_object_system_metadata_headers_round_trip_raw_values_match_aws() {
                 &format!("PutObjectRawSystemMetadata[{header_name}]"),
                 &aws_put,
                 &local_put,
-                KNOWN_ETAG_DIVERGENCE_HEADERS,
-                &[],
+                COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+                COMMON_PRESENCE_ONLY_HEADERS,
             );
 
             let aws_head = env.send_external(
@@ -1157,8 +1230,8 @@ fn test_object_system_metadata_headers_round_trip_raw_values_match_aws() {
                 &format!("HeadObjectRawSystemMetadata[{header_name}]"),
                 &aws_head,
                 &local_head,
-                KNOWN_ETAG_DIVERGENCE_HEADERS,
-                &[],
+                COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+                COMMON_PRESENCE_ONLY_HEADERS,
             );
             assert_eq!(
                 response_header_value(&aws_head, header_name),
@@ -1213,8 +1286,8 @@ fn test_range_and_override_response_shape_matches_aws() {
             "PutObjectRangeFixture",
             &aws_put,
             &local_put,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         let aws_range = env.send_external(
@@ -1237,8 +1310,8 @@ fn test_range_and_override_response_shape_matches_aws() {
             "GetObjectRange",
             &aws_range,
             &local_range,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         let override_query = concat!(
@@ -1265,8 +1338,8 @@ fn test_range_and_override_response_shape_matches_aws() {
             "GetObjectOverrides",
             &aws_override,
             &local_override,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
@@ -1303,8 +1376,8 @@ fn test_head_bucket_response_shape_matches_aws_when_regions_match() {
             "HeadBucket",
             &aws_head,
             &local_head,
-            &["transfer-encoding"],
-            &[],
+            COMMON_TRANSPORT_AND_TRANSFER_ENCODING_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
@@ -1340,8 +1413,8 @@ fn test_list_objects_v2_no_such_bucket_error_shape_matches_aws() {
             "ListObjectsV2NoSuchBucket",
             &aws_error,
             &local_error,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &["RequestId", "HostId"],
         );
     });
@@ -1375,8 +1448,8 @@ fn test_get_object_no_such_key_error_shape_matches_aws() {
             "GetObjectNoSuchKey",
             &aws_error,
             &local_error,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &["RequestId", "HostId"],
         );
 
@@ -1425,8 +1498,8 @@ fn test_get_object_access_denied_error_shape_matches_aws() {
             "GetObjectAccessDenied",
             &aws_error,
             &local_error,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &["RequestId", "HostId"],
         );
 
@@ -1465,8 +1538,8 @@ fn test_checksum_mode_object_response_shape_matches_aws() {
             "PutObjectChecksumFixture",
             &aws_put,
             &local_put,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         let aws_get = env.send_external(
@@ -1489,8 +1562,8 @@ fn test_checksum_mode_object_response_shape_matches_aws() {
             "GetObjectChecksumMode",
             &aws_get,
             &local_get,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         let aws_head = env.send_external(
@@ -1513,8 +1586,8 @@ fn test_checksum_mode_object_response_shape_matches_aws() {
             "HeadObjectChecksumMode",
             &aws_head,
             &local_head,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
@@ -1581,8 +1654,8 @@ fn test_versioned_object_response_shape_matches_aws() {
             "GetObjectVersionedCurrent",
             &aws_current_get,
             &local_current_get,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &["x-amz-version-id"],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            &["last-modified", "x-amz-version-id"],
         );
 
         let aws_version_get = env.send_external(
@@ -1605,8 +1678,8 @@ fn test_versioned_object_response_shape_matches_aws() {
             "GetObjectExplicitVersion",
             &aws_version_get,
             &local_version_get,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &["x-amz-version-id"],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            &["last-modified", "x-amz-version-id"],
         );
 
         let aws_version_head = env.send_external(
@@ -1629,8 +1702,8 @@ fn test_versioned_object_response_shape_matches_aws() {
             "HeadObjectExplicitVersion",
             &aws_version_head,
             &local_version_head,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &["x-amz-version-id"],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            &["last-modified", "x-amz-version-id"],
         );
 
         cleanup_versioned_bucket(&env.external_client, &external_bucket).await;
@@ -1663,7 +1736,14 @@ fn test_get_bucket_location_response_shape_matches_aws() {
             std::iter::empty::<(&str, &str)>(),
         );
 
-        assert_xml_response_shape_matches("GetBucketLocation", &aws_get, &local_get, &[], &[], &[]);
+        assert_xml_response_shape_matches(
+            "GetBucketLocation",
+            &aws_get,
+            &local_get,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &[],
+        );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
         delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
@@ -1701,8 +1781,8 @@ fn test_get_bucket_versioning_response_shape_matches_aws() {
             "GetBucketVersioning",
             &aws_get,
             &local_get,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &[],
         );
 
@@ -1768,8 +1848,8 @@ fn test_get_bucket_encryption_response_shape_matches_aws() {
             "GetBucketEncryption",
             &aws_get,
             &local_get,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &[],
         );
 
@@ -1832,7 +1912,14 @@ fn test_get_bucket_cors_response_shape_matches_aws() {
             std::iter::empty::<(&str, &str)>(),
         );
 
-        assert_xml_response_shape_matches("GetBucketCors", &aws_get, &local_get, &[], &[], &[]);
+        assert_xml_response_shape_matches(
+            "GetBucketCors",
+            &aws_get,
+            &local_get,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &[],
+        );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
         delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
@@ -1884,7 +1971,14 @@ fn test_get_bucket_tagging_response_shape_matches_aws() {
             std::iter::empty::<(&str, &str)>(),
         );
 
-        assert_xml_response_shape_matches("GetBucketTagging", &aws_get, &local_get, &[], &[], &[]);
+        assert_xml_response_shape_matches(
+            "GetBucketTagging",
+            &aws_get,
+            &local_get,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &[],
+        );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[]).await;
         delete_all_and_bucket(&env.local_client, &local_bucket, &[]).await;
@@ -1941,8 +2035,8 @@ fn test_get_bucket_lifecycle_response_shape_matches_aws() {
             "GetBucketLifecycleConfiguration",
             &aws_get,
             &local_get,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &[],
         );
 
@@ -2001,8 +2095,8 @@ fn test_get_bucket_public_access_block_response_shape_matches_aws() {
             "GetPublicAccessBlock",
             &aws_get,
             &local_get,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &[],
         );
 
@@ -2064,8 +2158,8 @@ fn test_get_bucket_ownership_controls_response_shape_matches_aws() {
             "GetBucketOwnershipControls",
             &aws_get,
             &local_get,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &[],
         );
 
@@ -2103,8 +2197,8 @@ fn test_get_bucket_policy_status_response_shape_matches_aws() {
             "GetBucketPolicyStatus",
             &aws_get,
             &local_get,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &["RequestId", "HostId"],
         );
 
@@ -2142,8 +2236,8 @@ fn test_get_bucket_acl_response_shape_matches_aws() {
             "GetBucketAcl",
             &aws_get,
             &local_get,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &["ID", "DisplayName"],
         );
 
@@ -2209,8 +2303,8 @@ fn test_get_bucket_object_lock_configuration_response_shape_matches_aws() {
             "GetBucketObjectLockConfiguration",
             &aws_get,
             &local_get,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &[],
         );
 
@@ -2294,7 +2388,7 @@ fn test_get_object_retention_response_shape_matches_aws() {
             "GetObjectRetention",
             &aws_get,
             &local_get,
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
             &["x-amz-version-id"],
             &[],
         );
@@ -2374,7 +2468,7 @@ fn test_get_object_legal_hold_response_shape_matches_aws() {
             "GetObjectLegalHold",
             &aws_get,
             &local_get,
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
             &["x-amz-version-id"],
             &[],
         );
@@ -2440,7 +2534,14 @@ fn test_get_object_tagging_response_shape_matches_aws() {
             std::iter::empty::<(&str, &str)>(),
         );
 
-        assert_xml_response_shape_matches("GetObjectTagging", &aws_get, &local_get, &[], &[], &[]);
+        assert_xml_response_shape_matches(
+            "GetObjectTagging",
+            &aws_get,
+            &local_get,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+            &[],
+        );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
         delete_all_and_bucket(&env.local_client, &local_bucket, &[key.to_string()]).await;
@@ -2479,8 +2580,8 @@ fn test_get_object_acl_response_shape_matches_aws() {
             "GetObjectAcl",
             &aws_get,
             &local_get,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
             &["ID", "DisplayName"],
         );
 
@@ -2538,8 +2639,8 @@ fn test_post_object_response_shape_matches_aws() {
             "PostObject",
             &aws_post,
             &local_post,
-            &["etag", "location"],
-            &[],
+            &["date", "etag", "location", "server"],
+            COMMON_PRESENCE_ONLY_HEADERS,
             &["ETag"],
         );
         assert_eq!(
@@ -2590,8 +2691,8 @@ fn test_copy_object_response_shape_matches_aws() {
             "CopySourceFixture",
             &aws_put,
             &local_put,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         let aws_copy = env.send_external(
@@ -2614,8 +2715,8 @@ fn test_copy_object_response_shape_matches_aws() {
             "CopyObject",
             &aws_copy,
             &local_copy,
-            &["content-length"],
-            &[],
+            &["content-length", "date"],
+            COMMON_PRESENCE_ONLY_HEADERS,
             &["ETag", "LastModified"],
         );
 
@@ -2664,8 +2765,8 @@ fn test_multipart_response_headers_match_aws() {
             "CreateMultipartUpload",
             &aws_create,
             &local_create,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
         let external_upload_id = xml_tag_text(&aws_create.body, "UploadId")
             .expect("external raw create upload id")
@@ -2694,8 +2795,8 @@ fn test_multipart_response_headers_match_aws() {
             "UploadPart",
             &aws_upload_part,
             &local_upload_part,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
         let external_part_etag =
             response_header_value(&aws_upload_part, "etag").expect("external upload part etag");
@@ -2718,7 +2819,13 @@ fn test_multipart_response_headers_match_aws() {
             b"",
             std::iter::empty::<(&str, &str)>(),
         );
-        assert_response_headers_match("ListParts", &aws_list_parts, &local_list_parts, &[], &[]);
+        assert_response_headers_match(
+            "ListParts",
+            &aws_list_parts,
+            &local_list_parts,
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
+        );
 
         let complete_body_external = format!(
             "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
@@ -2748,8 +2855,8 @@ fn test_multipart_response_headers_match_aws() {
             "CompleteMultipartUpload",
             &aws_complete,
             &local_complete,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
@@ -2798,8 +2905,8 @@ fn test_object_part_response_shape_matches_aws() {
             "HeadObjectPart",
             &aws_head_part,
             &local_head_part,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         let aws_get_part = env.send_external(
@@ -2822,8 +2929,8 @@ fn test_object_part_response_shape_matches_aws() {
             "GetObjectPart",
             &aws_get_part,
             &local_get_part,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
@@ -2862,8 +2969,8 @@ fn test_upload_part_copy_response_shape_matches_aws() {
             "UploadPartCopySourceFixture",
             &aws_put,
             &local_put,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &[],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         let (external_upload_id, local_upload_id) =
@@ -2890,8 +2997,8 @@ fn test_upload_part_copy_response_shape_matches_aws() {
             "UploadPartCopy",
             &aws_upload_part_copy,
             &local_upload_part_copy,
-            &["content-length"],
-            &[],
+            &["content-length", "date"],
+            COMMON_PRESENCE_ONLY_HEADERS,
             &["ETag", "LastModified"],
         );
 
@@ -3001,8 +3108,8 @@ fn test_get_object_attributes_response_shape_matches_aws() {
             "GetObjectAttributes",
             &aws_get_object_attributes,
             &local_get_object_attributes,
-            &[],
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            COMMON_PRESENCE_ONLY_HEADERS,
         );
 
         delete_all_and_bucket(&env.external_client, &external_bucket, &[key.to_string()]).await;
@@ -3091,8 +3198,8 @@ fn test_object_lock_read_response_shape_matches_aws() {
             "GetObjectObjectLock",
             &aws_locked_get,
             &local_locked_get,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &["x-amz-version-id"],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            &["last-modified", "x-amz-version-id"],
         );
 
         let aws_locked_head = env.send_external(
@@ -3115,8 +3222,8 @@ fn test_object_lock_read_response_shape_matches_aws() {
             "HeadObjectObjectLock",
             &aws_locked_head,
             &local_locked_head,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &["x-amz-version-id"],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            &["last-modified", "x-amz-version-id"],
         );
 
         let aws_locked_attributes = env.send_external(
@@ -3139,8 +3246,8 @@ fn test_object_lock_read_response_shape_matches_aws() {
             "GetObjectAttributesObjectLock",
             &aws_locked_attributes,
             &local_locked_attributes,
-            &[],
-            &["x-amz-version-id"],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
+            &["last-modified", "x-amz-version-id"],
         );
 
         let aws_locked_version_get = env.send_external(
@@ -3163,8 +3270,8 @@ fn test_object_lock_read_response_shape_matches_aws() {
             "GetObjectObjectLockExplicitVersion",
             &aws_locked_version_get,
             &local_locked_version_get,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &["x-amz-version-id"],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            &["last-modified", "x-amz-version-id"],
         );
 
         let aws_locked_version_head = env.send_external(
@@ -3187,8 +3294,8 @@ fn test_object_lock_read_response_shape_matches_aws() {
             "HeadObjectObjectLockExplicitVersion",
             &aws_locked_version_head,
             &local_locked_version_head,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &["x-amz-version-id"],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            &["last-modified", "x-amz-version-id"],
         );
 
         let aws_plain_head = env.send_external(
@@ -3211,8 +3318,8 @@ fn test_object_lock_read_response_shape_matches_aws() {
             "HeadObjectObjectLockBucketPlainObject",
             &aws_plain_head,
             &local_plain_head,
-            KNOWN_ETAG_DIVERGENCE_HEADERS,
-            &["x-amz-version-id"],
+            COMMON_TRANSPORT_AND_ETAG_IGNORED_HEADERS,
+            &["last-modified", "x-amz-version-id"],
         );
 
         cleanup_object_lock_bucket(&env.external_client, &external_bucket).await;
@@ -3321,7 +3428,7 @@ fn test_delete_object_response_shape_matches_aws() {
             "DeleteObjectCurrentVersion",
             &aws_delete_current,
             &local_delete_current,
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
             &["x-amz-version-id"],
         );
 
@@ -3354,7 +3461,7 @@ fn test_delete_object_response_shape_matches_aws() {
             "DeleteObjectDeleteMarkerVersion",
             &aws_delete_marker,
             &local_delete_marker,
-            &[],
+            COMMON_TRANSPORT_IGNORED_HEADERS,
             &["x-amz-version-id"],
         );
 
@@ -3456,8 +3563,8 @@ fn test_list_object_versions_response_shape_matches_aws() {
             "ListObjectVersions",
             &aws_list_versions,
             &local_list_versions,
-            &["content-length"],
-            &[],
+            &["content-length", "date"],
+            COMMON_PRESENCE_ONLY_HEADERS,
             &[
                 "Name",
                 "VersionId",
@@ -3525,7 +3632,7 @@ fn test_list_objects_v1_without_delimiter_omits_next_marker_like_aws() {
             "ListObjectsV1WithoutDelimiter",
             &aws_list,
             &local_list,
-            &["content-length"],
+            &["content-length", "date", "server", "transfer-encoding"],
             &[],
             &["Name", "LastModified", "ETag", "ID", "DisplayName"],
         );
@@ -3606,7 +3713,7 @@ fn test_list_objects_v2_response_shape_matches_aws() {
             "ListObjectsV2",
             &aws_list,
             &local_list,
-            &["content-length"],
+            &["content-length", "date", "server", "transfer-encoding"],
             &[],
             &["Name", "NextContinuationToken", "LastModified", "ETag"],
         );
@@ -3687,8 +3794,8 @@ fn test_list_multipart_uploads_response_shape_matches_aws() {
             "ListMultipartUploads",
             &aws_list_uploads,
             &local_list_uploads,
-            &["content-length"],
-            &[],
+            &["content-length", "date"],
+            COMMON_PRESENCE_ONLY_HEADERS,
             &[
                 "Bucket",
                 "UploadId",

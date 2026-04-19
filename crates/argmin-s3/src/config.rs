@@ -12,6 +12,7 @@ pub(crate) struct ServerConfig {
     pub(crate) account_id: String,
     pub(crate) access_key_id: String,
     pub(crate) secret_access_key: String,
+    pub(crate) host_id: Option<String>,
     pub(crate) sse_c_validator_key_b64: Option<String>,
     pub(crate) sse_s3_wrapping_key_b64: String,
     pub(crate) region: String,
@@ -27,6 +28,7 @@ impl ServerConfig {
     /// Required: `ARGMIN_ACCOUNT_ID`, `ARGMIN_ACCESS_KEY_ID`,
     /// `ARGMIN_SECRET_ACCESS_KEY`
     /// Optional (with defaults):
+    ///   `ARGMIN_HOST_ID` (random stable-for-process host ID)
     ///   `ARGMIN_LISTEN_ADDR` (127.0.0.1:9000)
     ///   `ARGMIN_TLS_CERT_PATH` / `ARGMIN_TLS_KEY_PATH` (unset)
     ///   `ARGMIN_DATA_DIR` (./data)
@@ -54,6 +56,7 @@ impl ServerConfig {
             .ok_or_else(|| "ARGMIN_ACCESS_KEY_ID is required".to_string())?;
         let secret_access_key = get("ARGMIN_SECRET_ACCESS_KEY")
             .ok_or_else(|| "ARGMIN_SECRET_ACCESS_KEY is required".to_string())?;
+        let host_id = get("ARGMIN_HOST_ID");
         let sse_c_validator_key_b64 = get("ARGMIN_SSE_C_VALIDATOR_KEY");
         let sse_s3_wrapping_key_b64 = get("ARGMIN_SSE_S3_WRAPPING_KEY")
             .ok_or_else(|| "ARGMIN_SSE_S3_WRAPPING_KEY is required".to_string())?;
@@ -107,6 +110,14 @@ impl ServerConfig {
         if stream_read_chunk_size == 0 {
             return Err("ARGMIN_STREAM_READ_CHUNK_SIZE must be > 0".to_string());
         }
+        if let Some(host_id) = &host_id {
+            if host_id.is_empty() || !host_id.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(
+                    "ARGMIN_HOST_ID must be non-empty and contain only printable non-space ASCII"
+                        .to_string(),
+                );
+            }
+        }
         match (&tls_cert_path, &tls_key_path) {
             (Some(_), None) => {
                 return Err(
@@ -132,6 +143,7 @@ impl ServerConfig {
             account_id,
             access_key_id,
             secret_access_key,
+            host_id,
             sse_c_validator_key_b64,
             sse_s3_wrapping_key_b64,
             region,
@@ -246,6 +258,7 @@ mod tests {
         );
         assert_eq!(cfg.access_key_id, "AKID");
         assert_eq!(cfg.secret_access_key, "SECRET");
+        assert_eq!(cfg.host_id, None);
         assert_eq!(cfg.sse_c_validator_key_b64, None);
         assert_eq!(
             cfg.sse_s3_wrapping_key_b64,
@@ -259,6 +272,7 @@ mod tests {
             ("ARGMIN_ACCOUNT_ID", "444455556666"),
             ("ARGMIN_ACCESS_KEY_ID", "mykey"),
             ("ARGMIN_SECRET_ACCESS_KEY", "mysecret"),
+            ("ARGMIN_HOST_ID", "custom-host-id"),
             ("ARGMIN_SSE_C_VALIDATOR_KEY", "Zm9v"),
             ("ARGMIN_SSE_S3_WRAPPING_KEY", "YmFy"),
             ("ARGMIN_LISTEN_ADDR", "0.0.0.0:8080"),
@@ -288,8 +302,16 @@ mod tests {
         );
         assert_eq!(cfg.access_key_id, "mykey");
         assert_eq!(cfg.secret_access_key, "mysecret");
+        assert_eq!(cfg.host_id.as_deref(), Some("custom-host-id"));
         assert_eq!(cfg.sse_c_validator_key_b64, Some("Zm9v".to_string()));
         assert_eq!(cfg.sse_s3_wrapping_key_b64, "YmFy");
+    }
+
+    #[test]
+    fn invalid_host_id() {
+        let err = ServerConfig::from_lookup(make_required_env(&[("ARGMIN_HOST_ID", "bad host")]))
+            .unwrap_err();
+        assert!(err.contains("ARGMIN_HOST_ID"));
     }
 
     #[test]

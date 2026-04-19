@@ -148,6 +148,7 @@ impl TestServer {
             .expect("create control coordinator")
         };
 
+        let host_id = Arc::<str>::from(server_http::http::new_host_id());
         let frontends: Vec<server_http::http::HttpFrontend> = (0..POOL_SIZE)
             .map(|_| {
                 let ec_config = ec::EcConfig::default();
@@ -229,6 +230,7 @@ impl TestServer {
                 server_http::http::HttpFrontend {
                     coordinator,
                     credentials,
+                    host_id: Arc::clone(&host_id),
                 }
             })
             .collect();

@@ -45,6 +45,7 @@ async fn start_server(
     let storage_node =
         Arc::new(storage::SharedStorageNode::open(&data_path, &pg_ids).expect("open storage"));
 
+    let host_id = Arc::<str>::from(server_http::http::new_host_id());
     let frontends: Vec<server_http::http::HttpFrontend> = (0..pool_size)
         .map(|_| {
             let ec_config = ec::EcConfig::default();
@@ -72,6 +73,7 @@ async fn start_server(
             server_http::http::HttpFrontend {
                 coordinator,
                 credentials,
+                host_id: Arc::clone(&host_id),
             }
         })
         .collect();

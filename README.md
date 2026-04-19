@@ -28,6 +28,7 @@ The server is configured via environment variables:
 | `ARGMIN_ACCOUNT_ID` | *(required)* | 12-digit bucket-owner account ID used for ownership and `x-amz-expected-bucket-owner` checks |
 | `ARGMIN_ACCESS_KEY_ID` | *(required)* | S3 access key |
 | `ARGMIN_SECRET_ACCESS_KEY` | *(required)* | S3 secret key |
+| `ARGMIN_HOST_ID` | *(random at startup)* | Stable S3 `HostId` / `x-amz-id-2` value to emit in responses; set this explicitly if you want it to persist across restarts |
 | `ARGMIN_SSE_S3_WRAPPING_KEY` | *(required)* | Base64-encoded 32-byte SSE-S3 wrapping key; required because new buckets default to `AES256` / SSE-S3 |
 | `ARGMIN_SSE_C_VALIDATOR_KEY` | *(unset)* | Base64-encoded 32-byte SSE-C validator secret; required to use SSE-C |
 | `ARGMIN_LISTEN_ADDR` | `127.0.0.1:9000` | Listen address |
@@ -59,6 +60,11 @@ validator secret. For now it is configured directly via environment variable.
 Once secret storage exists for the broader encryption work (`SSE-S3` / KMS),
 this should move there as well.
 
+`ARGMIN_HOST_ID` is optional. If it is unset, `argmin-s3` generates a random
+host ID once at startup and reuses it for all responses from that process. If
+you want `HostId` / `x-amz-id-2` to stay stable across restarts, set
+`ARGMIN_HOST_ID` explicitly and keep it unchanged.
+
 If you set `ARGMIN_SSE_C_VALIDATOR_KEY`, keep it stable for the lifetime of
 existing SSE-C objects. It is a base64-encoded 32-byte secret.
 
@@ -66,6 +72,8 @@ For an existing data directory, treat these settings as stable:
 
 - `ARGMIN_PG_COUNT` is part of placement. Changing it without migration will
   route buckets and objects to different PGs.
+- If you set `ARGMIN_HOST_ID`, keep it stable if you want `HostId` /
+  `x-amz-id-2` to remain stable across restarts.
 - `ARGMIN_SSE_S3_WRAPPING_KEY` must remain stable for existing SSE-S3 objects.
 - `ARGMIN_SSE_C_VALIDATOR_KEY` must remain stable for existing SSE-C objects.
 - `ARGMIN_EC_K` and `ARGMIN_EC_M` are stored per object, but reconfiguration is
