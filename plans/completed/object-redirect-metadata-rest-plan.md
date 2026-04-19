@@ -20,9 +20,12 @@ Completed:
   - stored system metadata blobs serialize and deserialize the redirect field
   - unit tests cover header extraction and blob round-tripping
 
-Current next step:
+Completed outcome:
 
-- verification against AWS with the updated local implementation
+- REST object redirect metadata support now exists end to end
+- the local `website_redirect` suite runs in embedded-server mode and passes
+- the implementation matches the AWS-backed behavior matrix captured during
+  Phase 1 for the REST endpoint scope of this plan
 
 ## Scope
 
@@ -382,7 +385,7 @@ Exit criteria:
 
 Status:
 
-- completed locally
+- completed
 
 ## Verification
 

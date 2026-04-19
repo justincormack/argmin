@@ -2,9 +2,9 @@
 
 This is a short future-work note, not an implementation plan.
 
-Implementation plan for the narrower REST metadata surface:
+Completed plan for the narrower REST metadata surface:
 
-- [plans/object-redirect-metadata-rest-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/object-redirect-metadata-rest-plan.md)
+- [plans/completed/object-redirect-metadata-rest-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/completed/object-redirect-metadata-rest-plan.md)
 
 ## Current position
 
@@ -17,15 +17,17 @@ gap and should stay visible.
 
 "Website behavior" is more than one feature.
 
-There are at least two distinct areas:
+There are at least three distinct areas:
 
 - object-level website redirect metadata such as
   `x-amz-website-redirect-location` / `WebsiteRedirectLocation`
 - bucket website configuration APIs such as `PutBucketWebsite`,
   `GetBucketWebsite`, and `DeleteBucketWebsite`
+- website-endpoint redirect and document-serving behavior
 
-If we revisit this later, we should treat them separately. Object metadata is a
-smaller compatibility target than full website hosting behavior.
+These should stay separate. The REST object metadata surface is now completed;
+the remaining work is bucket website configuration and website-endpoint
+behavior.
 
 ## Why this note exists
 
@@ -34,8 +36,8 @@ Recent AWS CLI integration checks highlighted that this is still an exposed gap.
 In particular:
 
 - `aws s3 cp --website-redirect ...` is a real client path
-- we do not currently have native `s3-tests` coverage for
-  `WebsiteRedirectLocation`
+- the REST metadata path for `WebsiteRedirectLocation` is now implemented and
+  covered in native `s3-tests`
 - broader website configuration behavior is also known to be incomplete
 
 So even if static website hosting is out of scope for now, object-level website
@@ -119,9 +121,20 @@ The important gaps and ambiguities are:
   serving on the website endpoint are related but distinct compatibility
   targets.
 
-## Local test coverage gaps
+## Current state
 
-Local references do not currently give us strong redirect-metadata coverage:
+The REST object redirect metadata surface is now in better shape:
+
+- local native coverage exists in
+  [website_redirect.rs](/home/justin/src/github.com/justincormack/argmin/crates/s3-tests/tests/website_redirect.rs)
+- the embedded-server suite now runs that coverage locally instead of skipping
+- request parsing, persistence, readback, copy, multipart, POST, versioning,
+  metadata size errors, and POST policy error shapes are covered
+
+The remaining gaps are no longer about REST object metadata. They are about the
+larger website feature set.
+
+## Remaining coverage gaps
 
 - `./tmp/s3-tests` currently has only a `s3website_redirect_location` pytest
   marker in `pytest.ini`; no concrete redirect-location test cases were found by
@@ -134,12 +147,13 @@ Local references do not currently give us strong redirect-metadata coverage:
 
 ## If revisited later
 
-Start small and verify each step directly against AWS:
+Start with the remaining website-scoped features and verify each step directly
+against AWS:
 
-- object upload/copy handling of `WebsiteRedirectLocation`
-- `HeadObject` / `GetObject` response behavior for stored redirect metadata
 - bucket website configuration CRUD APIs
-- only after that, any website-endpoint-specific behavior
+- website-endpoint redirect behavior
+- only after that, broader website hosting behavior such as routing rules,
+  index documents, and error documents
 
 The important design point is not to blur these together:
 
