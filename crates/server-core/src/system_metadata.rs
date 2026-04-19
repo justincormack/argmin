@@ -1,4 +1,5 @@
 use checksum::{ChecksumAlgorithm, ChecksumType};
+use s3_types::WebsiteRedirectLocation;
 
 use crate::error::ServerError;
 
@@ -12,6 +13,7 @@ const CONTENT_DISPOSITION_BIT: u16 = 1 << 3;
 const CONTENT_LANGUAGE_BIT: u16 = 1 << 4;
 const EXPIRES_BIT: u16 = 1 << 5;
 const CHECKSUM_BIT: u16 = 1 << 6;
+const WEBSITE_REDIRECT_LOCATION_BIT: u16 = 1 << 7;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectChecksumMetadata {
@@ -64,6 +66,7 @@ pub struct SystemMetadata {
     content_language: Option<String>,
     expires: Option<String>,
     checksum: Option<ObjectChecksumMetadata>,
+    website_redirect_location: Option<WebsiteRedirectLocation>,
 }
 
 fn has_invalid_header_bytes(s: &str) -> bool {
@@ -90,6 +93,7 @@ fn is_system_metadata_header_name(name: &str) -> bool {
             | "content-disposition"
             | "content-language"
             | "expires"
+            | "x-amz-website-redirect-location"
             | "x-amz-checksum-algorithm"
             | "x-amz-checksum-type"
     ) || checksum_algorithm_from_header_name(name).is_some()
@@ -104,6 +108,7 @@ impl SystemMetadata {
         content_language: None,
         expires: None,
         checksum: None,
+        website_redirect_location: None,
     };
 
     #[must_use]
@@ -150,6 +155,14 @@ impl SystemMetadata {
                 "content-disposition" => out.content_disposition = Some(value.to_string()),
                 "content-language" => out.content_language = Some(value.to_string()),
                 "expires" => out.expires = Some(value.to_string()),
+                "x-amz-website-redirect-location" => {
+                    out.website_redirect_location =
+                        Some(WebsiteRedirectLocation::new(value).map_err(|err| {
+                            ServerError::InvalidRequest {
+                                reason: err.to_string(),
+                            }
+                        })?);
+                }
                 "x-amz-checksum-algorithm" => {
                     checksum_algorithm = ChecksumAlgorithm::parse(value);
                 }
@@ -184,6 +197,12 @@ impl SystemMetadata {
                 "content-disposition" => out.content_disposition = Some((*v).to_string()),
                 "content-language" => out.content_language = Some((*v).to_string()),
                 "expires" => out.expires = Some((*v).to_string()),
+                "x-amz-website-redirect-location" => {
+                    out.website_redirect_location = Some(
+                        WebsiteRedirectLocation::new(*v)
+                            .expect("trusted system metadata pairs must be valid"),
+                    );
+                }
                 "x-amz-checksum-type" => {
                     if let Some(ref mut checksum) = out.checksum {
                         checksum.checksum_type = ChecksumType::parse(v);
@@ -234,6 +253,19 @@ impl SystemMetadata {
     #[must_use]
     pub fn expires(&self) -> Option<&str> {
         self.expires.as_deref()
+    }
+
+    #[must_use]
+    pub fn website_redirect_location(&self) -> Option<&WebsiteRedirectLocation> {
+        self.website_redirect_location.as_ref()
+    }
+
+    pub fn set_website_redirect_location(&mut self, value: WebsiteRedirectLocation) {
+        self.website_redirect_location = Some(value);
+    }
+
+    pub fn clear_website_redirect_location(&mut self) {
+        self.website_redirect_location = None;
     }
 
     #[must_use]
@@ -302,6 +334,9 @@ impl SystemMetadata {
         if other.expires.is_some() {
             self.expires = other.expires.clone();
         }
+        if other.website_redirect_location.is_some() {
+            self.website_redirect_location = other.website_redirect_location.clone();
+        }
         if other.checksum.is_some() {
             self.checksum = other.checksum.clone();
         }
@@ -365,6 +400,9 @@ impl SystemMetadata {
         if self.checksum.is_some() {
             flags |= CHECKSUM_BIT;
         }
+        if self.website_redirect_location.is_some() {
+            flags |= WEBSITE_REDIRECT_LOCATION_BIT;
+        }
         out.extend_from_slice(&flags.to_le_bytes());
 
         for value in [
@@ -374,6 +412,9 @@ impl SystemMetadata {
             self.content_disposition.as_deref(),
             self.content_language.as_deref(),
             self.expires.as_deref(),
+            self.website_redirect_location
+                .as_ref()
+                .map(WebsiteRedirectLocation::as_str),
         ]
         .into_iter()
         .flatten()
@@ -472,6 +513,20 @@ impl SystemMetadata {
         } else {
             None
         };
+        let website_redirect_location = if flags & WEBSITE_REDIRECT_LOCATION_BIT != 0 {
+            Some(
+                WebsiteRedirectLocation::new(read_system_string(
+                    data,
+                    &mut pos,
+                    "x-amz-website-redirect-location",
+                )?)
+                .map_err(|err| ServerError::MetadataBlobError {
+                    reason: format!("invalid website redirect location: {err}"),
+                })?,
+            )
+        } else {
+            None
+        };
         let checksum = if flags & CHECKSUM_BIT != 0 {
             if pos + 4 > data.len() {
                 return Err(ServerError::MetadataBlobError {
@@ -515,6 +570,7 @@ impl SystemMetadata {
             content_language,
             expires,
             checksum,
+            website_redirect_location,
         })
     }
 }
@@ -529,12 +585,19 @@ mod tests {
             ("Content-Type", "text/plain"),
             ("X-Amz-Meta-Author", "alice"),
             ("Cache-Control", "no-cache"),
+            ("X-Amz-Website-Redirect-Location", "/landing/index.html"),
             ("X-Amz-Checksum-Sha256", "abc"),
             ("X-Amz-Checksum-Type", "FULL_OBJECT"),
         ])
         .unwrap();
         assert_eq!(metadata.content_type(), Some("text/plain"));
         assert_eq!(metadata.cache_control(), Some("no-cache"));
+        assert_eq!(
+            metadata
+                .website_redirect_location()
+                .map(WebsiteRedirectLocation::as_str),
+            Some("/landing/index.html")
+        );
         let checksum = metadata.checksum().unwrap();
         assert_eq!(checksum.algorithm(), ChecksumAlgorithm::Sha256);
         assert_eq!(checksum.checksum_type(), Some(ChecksumType::FullObject));
@@ -546,6 +609,8 @@ mod tests {
         let mut metadata = SystemMetadata::new();
         metadata.content_type = Some("text/plain".to_string());
         metadata.content_encoding = Some("gzip".to_string());
+        metadata.website_redirect_location =
+            Some(WebsiteRedirectLocation::new("/docs/start.html").unwrap());
         metadata.set_checksum(
             ChecksumAlgorithm::Crc32,
             Some(ChecksumType::FullObject),
@@ -576,5 +641,24 @@ mod tests {
         let value = "v".repeat(SYSTEM_METADATA_SIZE_LIMIT - "content-disposition".len() + 1);
         let err = SystemMetadata::from_headers(&[("Content-Disposition", &value)]).unwrap_err();
         assert!(matches!(err, ServerError::MetadataTooLarge));
+    }
+
+    #[test]
+    fn round_trip_website_redirect_without_checksum() {
+        let mut metadata = SystemMetadata::new();
+        metadata.set_website_redirect_location(
+            WebsiteRedirectLocation::new("https://example.com/docs").unwrap(),
+        );
+
+        let bytes = metadata.serialize().unwrap();
+        let decoded = SystemMetadata::deserialize(&bytes).unwrap();
+
+        assert_eq!(
+            decoded
+                .website_redirect_location()
+                .map(WebsiteRedirectLocation::as_str),
+            Some("https://example.com/docs")
+        );
+        assert_eq!(decoded, metadata);
     }
 }

@@ -14,10 +14,15 @@ Completed:
   - `CreateMultipartUpload` to completed object persistence
   - `POST Object`
   - versioned `HEAD` / `GET`
+- Phase 2 typed metadata plumbing landed in
+  [system_metadata.rs](/home/justin/src/github.com/justincormack/argmin/crates/server-core/src/system_metadata.rs):
+  - `SystemMetadata` now carries `x-amz-website-redirect-location`
+  - stored system metadata blobs serialize and deserialize the redirect field
+  - unit tests cover header extraction and blob round-tripping
 
 Current next step:
 
-- Phase 2 typed metadata plumbing
+- Phase 3 write-path support
 
 ## Scope
 
@@ -322,6 +327,10 @@ Deliverables:
 Exit criteria:
 
 - redirect metadata can be stored and loaded as first-class system metadata
+
+Status:
+
+- completed
 
 ### Phase 3: Write-Path Support
 

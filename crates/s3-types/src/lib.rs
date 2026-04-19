@@ -9,6 +9,13 @@ pub use lifecycle::*;
 
 /// Maximum supported principal string length stored in metadata.
 pub const MAX_PRINCIPAL_LEN: usize = 256;
+pub const WEBSITE_REDIRECT_LOCATION_HEADER_NAME: &str = "x-amz-website-redirect-location";
+/// Maximum supported bytes in `x-amz-website-redirect-location`.
+///
+/// This is the largest single redirect value that can fit within the current
+/// 2 KiB system-metadata budget once the header name itself is accounted for.
+pub const MAX_WEBSITE_REDIRECT_LOCATION_LEN: usize =
+    2 * 1024 - WEBSITE_REDIRECT_LOCATION_HEADER_NAME.len();
 
 /// AWS account IDs are 12 decimal digits.
 pub const AWS_ACCOUNT_ID_LEN: usize = 12;
@@ -92,6 +99,66 @@ pub fn aws_account_id_from_principal(principal: &str) -> Option<&str> {
     let account_id = parts.next()?;
     let _resource = parts.next()?;
     is_valid_aws_account_id(account_id).then_some(account_id)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WebsiteRedirectLocationError {
+    #[error(
+        "website redirect location must be 1-{MAX_WEBSITE_REDIRECT_LOCATION_LEN} bytes, got {length}"
+    )]
+    InvalidLength { length: usize },
+    #[error("website redirect location contains invalid header bytes")]
+    InvalidHeaderBytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WebsiteRedirectLocation(String);
+
+impl WebsiteRedirectLocation {
+    pub fn new(value: impl Into<String>) -> Result<Self, WebsiteRedirectLocationError> {
+        let value = value.into();
+        if value.is_empty() || value.len() > MAX_WEBSITE_REDIRECT_LOCATION_LEN {
+            return Err(WebsiteRedirectLocationError::InvalidLength {
+                length: value.len(),
+            });
+        }
+        if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(WebsiteRedirectLocationError::InvalidHeaderBytes);
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for WebsiteRedirectLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for WebsiteRedirectLocation {
+    type Error = WebsiteRedirectLocationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<&str> for WebsiteRedirectLocation {
+    type Error = WebsiteRedirectLocationError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
 }
 
 /// Bucket namespace requested by `CreateBucket`.
@@ -743,9 +810,10 @@ mod tests {
         is_valid_aws_account_id, parse_account_regional_bucket_name, requires_sigv4,
         supports_legacy_sigv2, AccountIdentity, AclGrant, AclGrantee, AclGrants, AclPermission,
         BucketObjectLockConfig, BucketVersioningState, CanonicalUserId, LegalHoldStatus,
-        ObjectLockDefaultRetention, ObjectLockMode, ObjectLockState, ObjectRetention,
-        RetentionPeriod, StoredLegalHoldStatus, VersionId, ANONYMOUS_UPLOAD_CANONICAL_USER_ID,
-        CANONICAL_USER_ID_LEN,
+        MAX_WEBSITE_REDIRECT_LOCATION_LEN, ObjectLockDefaultRetention, ObjectLockMode,
+        ObjectLockState, ObjectRetention, RetentionPeriod, StoredLegalHoldStatus, VersionId,
+        WebsiteRedirectLocation, WebsiteRedirectLocationError,
+        ANONYMOUS_UPLOAD_CANONICAL_USER_ID, CANONICAL_USER_ID_LEN,
     };
 
     #[test]
@@ -973,6 +1041,32 @@ mod tests {
             "reader",
         );
         assert_eq!(account.account_id(), Some("111122223333"));
+    }
+
+    #[test]
+    fn website_redirect_location_accepts_valid_value() {
+        let value = WebsiteRedirectLocation::new("/docs/index.html").unwrap();
+        assert_eq!(value.as_str(), "/docs/index.html");
+    }
+
+    #[test]
+    fn website_redirect_location_rejects_empty_or_oversized_values() {
+        assert!(matches!(
+            WebsiteRedirectLocation::new(""),
+            Err(WebsiteRedirectLocationError::InvalidLength { length: 0 })
+        ));
+        assert!(matches!(
+            WebsiteRedirectLocation::new("v".repeat(MAX_WEBSITE_REDIRECT_LOCATION_LEN + 1)),
+            Err(WebsiteRedirectLocationError::InvalidLength { .. })
+        ));
+    }
+
+    #[test]
+    fn website_redirect_location_rejects_invalid_header_bytes() {
+        assert!(matches!(
+            WebsiteRedirectLocation::new("https://example.com/\nnext"),
+            Err(WebsiteRedirectLocationError::InvalidHeaderBytes)
+        ));
     }
 
     #[test]
