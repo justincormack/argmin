@@ -7,7 +7,6 @@ use s3_types::{
 use crate::error::ServerError;
 
 const FORMAT_VERSION: u8 = 1;
-pub const SYSTEM_METADATA_SIZE_LIMIT: usize = 2 * 1024;
 
 const CONTENT_TYPE_BIT: u16 = 1 << 0;
 const CONTENT_ENCODING_BIT: u16 = 1 << 1;
@@ -87,7 +86,7 @@ fn checksum_algorithm_from_header_name(name: &str) -> Option<ChecksumAlgorithm> 
     }
 }
 
-fn is_system_metadata_header_name(name: &str) -> bool {
+pub fn is_system_metadata_header_name(name: &str) -> bool {
     matches!(
         name,
         "content-type"
@@ -131,7 +130,6 @@ impl SystemMetadata {
         let mut checksum_algorithm = None;
         let mut checksum_type = None;
         let mut checksum_value = None;
-        let mut total_system_metadata_size = 0usize;
 
         for (name, value) in headers {
             let lower = name.to_ascii_lowercase();
@@ -141,15 +139,6 @@ impl SystemMetadata {
                         "system metadata value for '{lower}' contains invalid header bytes"
                     ),
                 });
-            }
-            if is_system_metadata_header_name(&lower) {
-                total_system_metadata_size = total_system_metadata_size
-                    .checked_add(lower.len())
-                    .and_then(|size| size.checked_add(value.len()))
-                    .ok_or(ServerError::MetadataTooLarge)?;
-                if total_system_metadata_size > SYSTEM_METADATA_SIZE_LIMIT {
-                    return Err(ServerError::MetadataTooLarge);
-                }
             }
             match lower.as_str() {
                 "content-type" => {
@@ -732,25 +721,6 @@ mod tests {
             metadata.content_encoding().map(ContentEncoding::as_str),
             Some("gzip")
         );
-    }
-
-    #[test]
-    fn from_headers_accepts_system_metadata_at_limit() {
-        let value = "v".repeat(SYSTEM_METADATA_SIZE_LIMIT - "content-disposition".len());
-        let metadata = SystemMetadata::from_headers(&[("Content-Disposition", &value)]).unwrap();
-        assert_eq!(
-            metadata
-                .content_disposition()
-                .map(ContentDisposition::as_str),
-            Some(value.as_str())
-        );
-    }
-
-    #[test]
-    fn from_headers_rejects_system_metadata_over_limit() {
-        let value = "v".repeat(SYSTEM_METADATA_SIZE_LIMIT - "content-disposition".len() + 1);
-        let err = SystemMetadata::from_headers(&[("Content-Disposition", &value)]).unwrap_err();
-        assert!(matches!(err, ServerError::MetadataTooLarge));
     }
 
     #[test]

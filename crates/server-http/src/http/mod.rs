@@ -34,7 +34,7 @@ use crate::coordinator::TaggingDirective;
 use crate::coordinator::UploadPartCopyRequest;
 use crate::coordinator::{AuthorizePutObjectRequest, AuthorizedPutObjectWrite};
 use crate::error::ServerError;
-use crate::metadata_blob::MetadataBlob;
+use crate::metadata_blob::{MetadataBlob, USER_METADATA_SIZE_LIMIT};
 use checksum::{ChecksumAlgorithm, ChecksumType, MultipartChecksumConfig, RawChecksum};
 use conditional::{
     copy_source_condition_from_headers, delete_condition_from_headers, read_condition_from_headers,
@@ -51,13 +51,14 @@ use s3_types::{
 use server_core::sse::{
     SseCustomerRequest, SseCustomerWriteContext, SSE_CUSTOMER_ALGORITHM, SSE_C_CUSTOMER_KEY_LEN,
 };
-use server_core::system_metadata::SystemMetadata;
+use server_core::system_metadata::{is_system_metadata_header_name, SystemMetadata};
 use storage::{BucketName, ManagedEncryptionAlgorithm, ObjectKey, SessionId, UploadId};
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 
 const TRACE_TARGET: &str = "server_http";
 const S3_MAX_LIST_KEYS: u32 = 1_000;
 const SLOW_REQUEST_EVENT_THRESHOLD_US: u128 = 5_000_000;
+const SYSTEM_METADATA_SIZE_LIMIT: usize = 2 * 1024;
 
 fn current_trace_context() -> observability::TraceContext {
     observability::current_context().unwrap_or_else(observability::TraceContext::new_request)
@@ -291,6 +292,28 @@ where
     I: IntoIterator<Item = (&'a str, &'a str)>,
 {
     let headers: Vec<(&str, &str)> = headers.into_iter().collect();
+    let mut total_user_metadata_size = 0usize;
+    let mut total_system_metadata_size = 0usize;
+    for (name, value) in &headers {
+        let lower = name.to_ascii_lowercase();
+        if lower.starts_with("x-amz-meta-") {
+            total_user_metadata_size = total_user_metadata_size
+                .checked_add(lower.len())
+                .and_then(|size| size.checked_add(value.len()))
+                .ok_or(ServerError::MetadataTooLarge)?;
+            if total_user_metadata_size > USER_METADATA_SIZE_LIMIT {
+                return Err(ServerError::MetadataTooLarge);
+            }
+        } else if is_system_metadata_header_name(&lower) {
+            total_system_metadata_size = total_system_metadata_size
+                .checked_add(lower.len())
+                .and_then(|size| size.checked_add(value.len()))
+                .ok_or(ServerError::MetadataTooLarge)?;
+            if total_system_metadata_size > SYSTEM_METADATA_SIZE_LIMIT {
+                return Err(ServerError::MetadataTooLarge);
+            }
+        }
+    }
     Ok((
         MetadataBlob::from_header_iter(headers.iter().copied())?,
         SystemMetadata::from_header_iter(headers)?,
@@ -5489,6 +5512,63 @@ mod tests {
             .collect();
         let err = validate_write_request_header_section_size(&refs).unwrap_err();
         assert!(matches!(err, ServerError::RequestHeaderSectionTooLarge));
+    }
+
+    #[test]
+    fn parse_request_metadata_accepts_user_metadata_at_limit() {
+        let key = "x-amz-meta-limit";
+        let value = "m".repeat(USER_METADATA_SIZE_LIMIT - key.len());
+
+        let (metadata, system_metadata) = parse_request_metadata([(key, value.as_str())]).unwrap();
+
+        assert_eq!(metadata.get("x-amz-meta-limit"), Some(value.as_str()));
+        assert_eq!(system_metadata, SystemMetadata::EMPTY);
+    }
+
+    #[test]
+    fn parse_request_metadata_rejects_user_metadata_over_limit() {
+        let key = "x-amz-meta-limit";
+        let value = "m".repeat(USER_METADATA_SIZE_LIMIT - key.len() + 1);
+
+        let err = parse_request_metadata([(key, value.as_str())]).unwrap_err();
+        assert!(matches!(err, ServerError::MetadataTooLarge));
+    }
+
+    #[test]
+    fn parse_request_metadata_accepts_system_metadata_at_limit() {
+        let value = "v".repeat(SYSTEM_METADATA_SIZE_LIMIT - "content-disposition".len());
+
+        let (metadata, system_metadata) =
+            parse_request_metadata([("content-disposition", value.as_str())]).unwrap();
+
+        assert_eq!(metadata, MetadataBlob::new());
+        assert_eq!(
+            system_metadata
+                .content_disposition()
+                .map(|value| value.as_str()),
+            Some(value.as_str())
+        );
+    }
+
+    #[test]
+    fn parse_request_metadata_rejects_system_metadata_over_limit() {
+        let value = "v".repeat(SYSTEM_METADATA_SIZE_LIMIT - "content-disposition".len() + 1);
+
+        let err = parse_request_metadata([("content-disposition", value.as_str())]).unwrap_err();
+        assert!(matches!(err, ServerError::MetadataTooLarge));
+    }
+
+    #[test]
+    fn parse_request_metadata_rejects_redirect_plus_other_system_metadata_over_limit() {
+        let redirect_len = SYSTEM_METADATA_SIZE_LIMIT - "x-amz-website-redirect-location".len();
+        let redirect = format!("/{}", "r".repeat(redirect_len - 1));
+
+        let err = parse_request_metadata([
+            ("x-amz-website-redirect-location", redirect.as_str()),
+            ("cache-control", "x"),
+        ])
+        .unwrap_err();
+        assert!(matches!(err, ServerError::MetadataTooLarge));
     }
 
     #[test]

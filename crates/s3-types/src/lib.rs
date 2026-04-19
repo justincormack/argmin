@@ -10,18 +10,6 @@ pub use lifecycle::*;
 /// Maximum supported principal string length stored in metadata.
 pub const MAX_PRINCIPAL_LEN: usize = 256;
 pub const WEBSITE_REDIRECT_LOCATION_HEADER_NAME: &str = "x-amz-website-redirect-location";
-/// Maximum supported bytes in `x-amz-website-redirect-location`.
-///
-/// This is the largest single redirect value that can fit within the current
-/// 2 KiB system-metadata budget once the header name itself is accounted for.
-pub const MAX_WEBSITE_REDIRECT_LOCATION_LEN: usize =
-    2 * 1024 - WEBSITE_REDIRECT_LOCATION_HEADER_NAME.len();
-pub const MAX_CONTENT_TYPE_LEN: usize = 2 * 1024 - "content-type".len();
-pub const MAX_CONTENT_ENCODING_LEN: usize = 2 * 1024 - "content-encoding".len();
-pub const MAX_CACHE_CONTROL_LEN: usize = 2 * 1024 - "cache-control".len();
-pub const MAX_CONTENT_DISPOSITION_LEN: usize = 2 * 1024 - "content-disposition".len();
-pub const MAX_CONTENT_LANGUAGE_LEN: usize = 2 * 1024 - "content-language".len();
-pub const MAX_EXPIRES_LEN: usize = 2 * 1024 - "expires".len();
 
 /// AWS account IDs are 12 decimal digits.
 pub const AWS_ACCOUNT_ID_LEN: usize = 12;
@@ -109,19 +97,10 @@ pub fn aws_account_id_from_principal(principal: &str) -> Option<&str> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StoredHeaderValueValidationError {
-    InvalidLength { length: usize },
     InvalidHeaderBytes,
 }
 
-fn validate_stored_header_value(
-    value: &str,
-    max_len: usize,
-) -> Result<(), StoredHeaderValueValidationError> {
-    if value.len() > max_len {
-        return Err(StoredHeaderValueValidationError::InvalidLength {
-            length: value.len(),
-        });
-    }
+fn validate_stored_header_value(value: &str) -> Result<(), StoredHeaderValueValidationError> {
     if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
         return Err(StoredHeaderValueValidationError::InvalidHeaderBytes);
     }
@@ -129,14 +108,9 @@ fn validate_stored_header_value(
 }
 
 macro_rules! bounded_system_metadata_value {
-    ($name:ident, $error:ident, $header_name:literal, $max_len:ident) => {
+    ($name:ident, $error:ident, $header_name:literal) => {
         #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
         pub enum $error {
-            #[error(
-                                "{field_name} value must be at most {max} bytes, got {length}",
-                                field_name = $header_name
-                            )]
-            InvalidLength { length: usize, max: usize },
             #[error("{field_name} value contains invalid header bytes", field_name = $header_name)]
             InvalidHeaderBytes,
         }
@@ -147,14 +121,8 @@ macro_rules! bounded_system_metadata_value {
         impl $name {
             pub fn new(value: impl Into<String>) -> Result<Self, $error> {
                 let value = value.into();
-                match validate_stored_header_value(&value, $max_len) {
+                match validate_stored_header_value(&value) {
                     Ok(()) => Ok(Self(value)),
-                    Err(StoredHeaderValueValidationError::InvalidLength { length }) => {
-                        Err($error::InvalidLength {
-                            length,
-                            max: $max_len,
-                        })
-                    }
                     Err(StoredHeaderValueValidationError::InvalidHeaderBytes) => {
                         Err($error::InvalidHeaderBytes)
                     }
@@ -196,44 +164,21 @@ macro_rules! bounded_system_metadata_value {
     };
 }
 
-bounded_system_metadata_value!(
-    ContentType,
-    ContentTypeError,
-    "content-type",
-    MAX_CONTENT_TYPE_LEN
-);
-bounded_system_metadata_value!(
-    ContentEncoding,
-    ContentEncodingError,
-    "content-encoding",
-    MAX_CONTENT_ENCODING_LEN
-);
-bounded_system_metadata_value!(
-    CacheControl,
-    CacheControlError,
-    "cache-control",
-    MAX_CACHE_CONTROL_LEN
-);
+bounded_system_metadata_value!(ContentType, ContentTypeError, "content-type");
+bounded_system_metadata_value!(ContentEncoding, ContentEncodingError, "content-encoding");
+bounded_system_metadata_value!(CacheControl, CacheControlError, "cache-control");
 bounded_system_metadata_value!(
     ContentDisposition,
     ContentDispositionError,
-    "content-disposition",
-    MAX_CONTENT_DISPOSITION_LEN
+    "content-disposition"
 );
-bounded_system_metadata_value!(
-    ContentLanguage,
-    ContentLanguageError,
-    "content-language",
-    MAX_CONTENT_LANGUAGE_LEN
-);
-bounded_system_metadata_value!(Expires, ExpiresError, "expires", MAX_EXPIRES_LEN);
+bounded_system_metadata_value!(ContentLanguage, ContentLanguageError, "content-language");
+bounded_system_metadata_value!(Expires, ExpiresError, "expires");
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum WebsiteRedirectLocationError {
-    #[error(
-        "website redirect location must be 1-{MAX_WEBSITE_REDIRECT_LOCATION_LEN} bytes, got {length}"
-    )]
-    InvalidLength { length: usize },
+    #[error("website redirect location must not be empty")]
+    Empty,
     #[error("website redirect location contains invalid header bytes")]
     InvalidHeaderBytes,
 }
@@ -244,10 +189,8 @@ pub struct WebsiteRedirectLocation(String);
 impl WebsiteRedirectLocation {
     pub fn new(value: impl Into<String>) -> Result<Self, WebsiteRedirectLocationError> {
         let value = value.into();
-        if value.is_empty() || value.len() > MAX_WEBSITE_REDIRECT_LOCATION_LEN {
-            return Err(WebsiteRedirectLocationError::InvalidLength {
-                length: value.len(),
-            });
+        if value.is_empty() {
+            return Err(WebsiteRedirectLocationError::Empty);
         }
         if value.bytes().any(|b| b < 0x20 || b == 0x7f) {
             return Err(WebsiteRedirectLocationError::InvalidHeaderBytes);
@@ -940,8 +883,7 @@ mod tests {
         ContentEncoding, ContentType, Expires, LegalHoldStatus, ObjectLockDefaultRetention,
         ObjectLockMode, ObjectLockState, ObjectRetention, RetentionPeriod, StoredLegalHoldStatus,
         VersionId, WebsiteRedirectLocation, WebsiteRedirectLocationError,
-        ANONYMOUS_UPLOAD_CANONICAL_USER_ID, CANONICAL_USER_ID_LEN, MAX_CONTENT_TYPE_LEN,
-        MAX_WEBSITE_REDIRECT_LOCATION_LEN,
+        ANONYMOUS_UPLOAD_CANONICAL_USER_ID, CANONICAL_USER_ID_LEN,
     };
 
     #[test]
@@ -1181,11 +1123,9 @@ mod tests {
     }
 
     #[test]
-    fn content_type_rejects_oversized_values() {
-        let err = ContentType::new("t".repeat(MAX_CONTENT_TYPE_LEN + 1)).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("content-type value must be at most"));
+    fn content_type_accepts_large_value_without_boundary_budget_limit() {
+        let value = "t".repeat(4096);
+        assert_eq!(ContentType::new(value.clone()).unwrap().as_str(), value);
     }
 
     #[test]
@@ -1202,14 +1142,10 @@ mod tests {
     }
 
     #[test]
-    fn website_redirect_location_rejects_empty_or_oversized_values() {
+    fn website_redirect_location_rejects_empty() {
         assert!(matches!(
             WebsiteRedirectLocation::new(""),
-            Err(WebsiteRedirectLocationError::InvalidLength { length: 0 })
-        ));
-        assert!(matches!(
-            WebsiteRedirectLocation::new("v".repeat(MAX_WEBSITE_REDIRECT_LOCATION_LEN + 1)),
-            Err(WebsiteRedirectLocationError::InvalidLength { .. })
+            Err(WebsiteRedirectLocationError::Empty)
         ));
     }
 
@@ -1219,6 +1155,17 @@ mod tests {
             WebsiteRedirectLocation::new("https://example.com/\nnext"),
             Err(WebsiteRedirectLocationError::InvalidHeaderBytes)
         ));
+    }
+
+    #[test]
+    fn website_redirect_location_accepts_large_value_without_boundary_budget_limit() {
+        let value = format!("/{}", "r".repeat(4095));
+        assert_eq!(
+            WebsiteRedirectLocation::new(value.clone())
+                .unwrap()
+                .as_str(),
+            value
+        );
     }
 
     #[test]
