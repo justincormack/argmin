@@ -2,6 +2,7 @@ use s3_types::{aws_account_id_from_principal, CanonicalUserId};
 use serde_json::Value;
 use std::net::{IpAddr, Ipv4Addr};
 
+mod condition_key;
 mod condition_op;
 
 pub const MAX_BUCKET_POLICY_BYTES: usize = 20 * 1024;
