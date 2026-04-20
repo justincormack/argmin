@@ -1368,19 +1368,18 @@ fn condition_clause_supported_for_evaluable_object_action(
 
 fn request_header_condition_supported_for_action(action: PolicyAction, key: &str) -> bool {
     match key {
-        "s3:x-amz-copy-source" | "s3:x-amz-acl" | "s3:x-amz-server-side-encryption" => !matches!(
+        "s3:x-amz-copy-source"
+        | "s3:x-amz-metadata-directive"
+        | "s3:x-amz-acl"
+        | "s3:x-amz-grant-read"
+        | "s3:x-amz-grant-read-acp"
+        | "s3:x-amz-grant-full-control"
+        | "s3:x-amz-server-side-encryption"
+        | "s3:x-amz-server-side-encryption-customer-algorithm" => !matches!(
             action,
             PolicyAction::GetObject | PolicyAction::GetObjectVersion
         ),
-        "s3:x-amz-metadata-directive"
-        | "s3:x-amz-grant-read"
-        | "s3:x-amz-server-side-encryption-customer-algorithm" => {
-            !matches!(action, PolicyAction::GetObject)
-        }
-        "s3:x-amz-grant-write"
-        | "s3:x-amz-grant-read-acp"
-        | "s3:x-amz-grant-write-acp"
-        | "s3:x-amz-grant-full-control" => true,
+        "s3:x-amz-grant-write" | "s3:x-amz-grant-write-acp" => true,
         _ => false,
     }
 }
@@ -2391,23 +2390,93 @@ mod tests {
     }
 
     #[test]
-    fn mixed_get_object_version_and_put_object_metadata_directive_condition_is_not_rejected() {
+    fn mixed_get_object_version_and_put_object_metadata_directive_condition_is_rejected() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObjectVersion","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-metadata-directive":"COPY"}}}]}"#,
         )
         .unwrap();
 
-        assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
     }
 
     #[test]
-    fn mixed_get_object_version_and_put_object_sse_c_condition_is_not_rejected() {
+    fn mixed_get_object_version_and_put_object_sse_c_condition_is_rejected() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObjectVersion","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-server-side-encryption-customer-algorithm":"true"}}}]}"#,
         )
         .unwrap();
 
-        assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_and_put_object_grant_read_acp_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-grant-read-acp":"uri=http://acs.amazonaws.com/groups/global/AllUsers"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_and_put_object_grant_full_control_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-grant-full-control":"uri=http://acs.amazonaws.com/groups/global/AllUsers"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_version_and_put_object_grant_read_acp_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObjectVersion","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-grant-read-acp":"uri=http://acs.amazonaws.com/groups/global/AllUsers"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_version_and_put_object_grant_full_control_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObjectVersion","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-grant-full-control":"uri=http://acs.amazonaws.com/groups/global/AllUsers"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
     }
 
     #[test]

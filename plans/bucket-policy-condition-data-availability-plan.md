@@ -301,10 +301,29 @@ The corresponding `CopyObject` source/destination split is now AWS-pinned too:
   - policy rejected at `PutBucketPolicy`
   - AWS returns `MalformedPolicy`
 - mixed `["s3:GetObjectVersion", "s3:PutObject"]` with
-  `s3:x-amz-metadata-directive` or
-  `s3:x-amz-server-side-encryption-customer-algorithm`
-  - not AWS-pinned yet
-  - local validation should not reject these by inference alone
+  `StringEquals { "s3:x-amz-metadata-directive": "COPY" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObjectVersion", "s3:PutObject"]` with
+  `Null { "s3:x-amz-server-side-encryption-customer-algorithm": "true" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObject", "s3:PutObject"]` with
+  `StringEquals { "s3:x-amz-grant-read-acp": "uri=http://acs.amazonaws.com/groups/global/AllUsers" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObject", "s3:PutObject"]` with
+  `StringEquals { "s3:x-amz-grant-full-control": "uri=http://acs.amazonaws.com/groups/global/AllUsers" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObjectVersion", "s3:PutObject"]` with
+  `StringEquals { "s3:x-amz-grant-read-acp": "uri=http://acs.amazonaws.com/groups/global/AllUsers" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObjectVersion", "s3:PutObject"]` with
+  `StringEquals { "s3:x-amz-grant-full-control": "uri=http://acs.amazonaws.com/groups/global/AllUsers" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
 
 So for the copy/header family:
 
@@ -313,10 +332,11 @@ So for the copy/header family:
 - destination SSE request headers are also not accepted on the source-read
   `GetObject` side of mixed `CopyObject` statements
 - at least the representative ACL/grant destination headers we tested
-  (`s3:x-amz-acl`, `s3:x-amz-grant-read`) are also not accepted on the
-  source-read `GetObject` side of mixed `CopyObject` statements
+  (`s3:x-amz-acl`, `s3:x-amz-grant-read`, `s3:x-amz-grant-read-acp`,
+  `s3:x-amz-grant-full-control`) are also not accepted on the source-read
+  `GetObject` side of mixed `CopyObject` statements
 - the same mixed-statement rejection also applies on the versioned source-read
-  `GetObjectVersion` side for representative copy-specific, ACL, and SSE rows
+  `GetObjectVersion` side for copy-specific, ACL, grant, and SSE rows
 - AWS does not accept them on the source-read `GetObject` or `GetObjectVersion`
   side of `CopyObject`
 - if a single statement mixes a valid destination action with an invalid
@@ -480,6 +500,10 @@ Acceptance criteria:
 - source-side and destination-side condition data are only evaluated where AWS
   makes them available
 - composite operations keep distinct sub-action behavior where AWS does
+
+Status:
+
+- complete
 
 ## Phase 5: Auth Model Cleanup
 

@@ -270,13 +270,14 @@ impl GeneratedActionPattern {
             GeneratedConditionKey::CopySource
             | GeneratedConditionKey::MetadataDirective
             | GeneratedConditionKey::CannedAcl
+            | GeneratedConditionKey::GrantReadAcp
+            | GeneratedConditionKey::GrantFullControl
             | GeneratedConditionKey::ServerSideEncryption
             | GeneratedConditionKey::SseCustomerAlgorithm
             | GeneratedConditionKey::GrantRead => !matches!(self, Self::Literal("s3:GetObject")),
             GeneratedConditionKey::GrantWrite
-            | GeneratedConditionKey::GrantReadAcp
             | GeneratedConditionKey::GrantWriteAcp
-            | GeneratedConditionKey::GrantFullControl => true,
+            => true,
         }
     }
 }

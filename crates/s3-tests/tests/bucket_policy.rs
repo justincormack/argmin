@@ -7099,6 +7099,276 @@ fn test_bucket_policy_sse_s3_condition_is_rejected_for_mixed_get_version_and_put
 }
 
 #[test]
+fn test_bucket_policy_metadata_directive_condition_is_rejected_for_mixed_get_version_and_put() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let key = "metadata-directive-mixed-version";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"body"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": ["s3:GetObjectVersion", "s3:PutObject"],
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:x-amz-metadata-directive": "COPY"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_sse_c_condition_is_rejected_for_mixed_get_version_and_put() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let key = "sse-c-mixed-version";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"body"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": ["s3:GetObjectVersion", "s3:PutObject"],
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "Null": {
+                                "s3:x-amz-server-side-encryption-customer-algorithm": "true"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_grant_read_acp_condition_is_rejected_for_mixed_get_and_put() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let key = "grant-read-acp-mixed";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"body"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": ["s3:GetObject", "s3:PutObject"],
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:x-amz-grant-read-acp": "uri=http://acs.amazonaws.com/groups/global/AllUsers"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_grant_full_control_condition_is_rejected_for_mixed_get_and_put() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let key = "grant-full-control-mixed";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"body"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": ["s3:GetObject", "s3:PutObject"],
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:x-amz-grant-full-control": "uri=http://acs.amazonaws.com/groups/global/AllUsers"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_grant_read_acp_condition_is_rejected_for_mixed_get_version_and_put() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let key = "grant-read-acp-mixed-version";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"body"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": ["s3:GetObjectVersion", "s3:PutObject"],
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:x-amz-grant-read-acp": "uri=http://acs.amazonaws.com/groups/global/AllUsers"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_grant_full_control_condition_is_rejected_for_mixed_get_version_and_put() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let key = "grant-full-control-mixed-version";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"body"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": ["s3:GetObjectVersion", "s3:PutObject"],
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:x-amz-grant-full-control": "uri=http://acs.amazonaws.com/groups/global/AllUsers"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_object_inline_tags_require_put_object_tagging() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
