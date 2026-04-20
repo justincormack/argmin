@@ -262,6 +262,39 @@ So for `UploadPartCopy` specifically:
 - `s3:x-amz-metadata-directive` is also accepted and operative, even though the
   part-copy request does not send that header
 
+The first multipart destination-encryption row is also now AWS-pinned:
+
+- destination-side `s3:x-amz-server-side-encryption = AES256`
+  - `CreateMultipartUpload` can satisfy the bucket-policy condition at
+    initiation time
+  - `UploadPartCopy` reuses that destination SSE-S3 context even without
+    resending the header on the part-copy request
+  - `CompleteMultipartUpload` also reuses that destination SSE-S3 context
+    without resending the header
+  - local coordinator regressions now pin the exact reuse point at
+    `with_multipart_upload_managed_encryption_policy_context(...)`
+- destination-side
+  `s3:x-amz-server-side-encryption-customer-algorithm = AES256`
+  - `CreateMultipartUpload` accepts the header and the multipart upload is
+    created under SSE-C
+  - `UploadPartCopy` does not reuse the destination SSE-C header value from
+    initiation; the part-copy request still fails under a deny-on-missing-header
+    policy
+  - `CompleteMultipartUpload` does not reuse the destination SSE-C header value
+    from initiation; the request still fails under a deny-on-missing-header
+    policy
+
+So the multipart destination-encryption behavior now appears split by
+encryption family:
+
+- SSE-S3 context is reused across multipart lifecycle steps
+- this likely reflects durable multipart state: the upload records managed
+  encryption mode without any secret-bearing request material
+- SSE-C context is not reused uniformly across multipart lifecycle steps
+- this likely reflects request-scoped key material: later operations do not
+  inherit customer-provided encryption headers just because initiation used
+  SSE-C
+
 One more regression shape also needs to be pinned directly:
 
 - mixed-action statements that combine one policy-invalid action with one valid

@@ -2250,6 +2250,74 @@ fn upload_part_copy_bucket_policy_copy_source_controls_access() {
 }
 
 #[test]
+fn multipart_upload_managed_encryption_policy_context_enables_upload_part_copy_write() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("owner-a", "dst", false)
+        .unwrap();
+    put_bucket_policy_test(&coord,
+            "dst",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::dst/*"},{"Effect":"Deny","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::dst/*","Condition":{"Null":{"s3:x-amz-server-side-encryption":"true"}}}]}"#,
+            test_helpers::requester("owner-a"), None)
+        .unwrap();
+
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "dst",
+                "copied",
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::managed(ManagedEncryptionAlgorithm::Aes256),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let bucket = coord.unchecked_active_bucket_summary("dst").unwrap();
+    let policy = coord.cached_bucket_policy(&bucket).unwrap();
+    let meta_pg = coord
+        .storage_node
+        .get_pg(coord.object_pg_id("dst", "copied"))
+        .unwrap();
+    let upload = meta_pg.get_multipart_upload(&upload.upload_id).unwrap();
+    let requester = test_helpers::requester("other-user");
+    let base_context = PutObjectPolicyContext::new(Some("src/public/foo"), None, None);
+
+    assert!(
+        !Coordinator::requester_can_write_multipart_upload_with_bucket_policy(
+            &requester,
+            &bucket,
+            &upload,
+            base_context,
+            policy.as_deref(),
+        )
+        .unwrap()
+    );
+    assert!(
+        Coordinator::requester_can_write_multipart_upload_with_bucket_policy(
+            &requester,
+            &bucket,
+            &upload,
+            Coordinator::with_multipart_upload_managed_encryption_policy_context(
+                PutObjectPolicyContext::new(Some("src/public/foo"), None, None),
+                &upload,
+            ),
+            policy.as_deref(),
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn begin_stream_put_bucket_policy_deny_on_public_acl() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
@@ -6042,6 +6110,73 @@ fn authorize_complete_multipart_upload_rejects_non_owner_requester() {
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn multipart_upload_managed_encryption_policy_context_enables_complete_multipart_write() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("owner-a", "bucket", false)
+        .unwrap();
+    put_bucket_policy_test(&coord,
+            "bucket",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"},{"Effect":"Deny","Principal":{"AWS":"other-user"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-server-side-encryption":"true"}}}]}"#,
+            test_helpers::requester("owner-a"), None)
+        .unwrap();
+
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "bucket",
+                "key",
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::managed(ManagedEncryptionAlgorithm::Aes256),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let bucket = coord.unchecked_active_bucket_summary("bucket").unwrap();
+    let policy = coord.cached_bucket_policy(&bucket).unwrap();
+    let meta_pg = coord
+        .storage_node
+        .get_pg(coord.object_pg_id("bucket", "key"))
+        .unwrap();
+    let upload = meta_pg.get_multipart_upload(&upload.upload_id).unwrap();
+    let requester = test_helpers::requester("other-user");
+
+    assert!(
+        !Coordinator::requester_can_write_multipart_upload_with_bucket_policy(
+            &requester,
+            &bucket,
+            &upload,
+            PutObjectPolicyContext::default(),
+            policy.as_deref(),
+        )
+        .unwrap()
+    );
+    assert!(
+        Coordinator::requester_can_write_multipart_upload_with_bucket_policy(
+            &requester,
+            &bucket,
+            &upload,
+            Coordinator::with_multipart_upload_managed_encryption_policy_context(
+                PutObjectPolicyContext::default(),
+                &upload,
+            ),
+            policy.as_deref(),
+        )
+        .unwrap()
+    );
 }
 
 #[test]
