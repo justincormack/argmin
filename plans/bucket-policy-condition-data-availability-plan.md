@@ -113,6 +113,9 @@ The object-lock mutation row is now partially AWS-pinned too:
 - `PutObjectRetention`
   - policy rejected at `PutBucketPolicy`
   - AWS returns `MalformedPolicy`
+- `PutObjectLegalHold`
+  - same shape as `PutObjectRetention`
+  - policy rejected at `PutBucketPolicy` with `MalformedPolicy`
 - `BypassGovernanceRetention`
   - same shape as `PutObjectRetention`
   - policy rejected at `PutBucketPolicy` with `MalformedPolicy`
