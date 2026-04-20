@@ -1374,7 +1374,8 @@ fn condition_clause_supported_for_evaluable_object_action(
                     | "s3:x-amz-grant-full-control"
             ))
         || (evaluable_string_condition_operator_supported(clause.operator.as_str())
-            && clause.key.starts_with("s3:RequestObjectTag/"))
+            && clause.key.starts_with("s3:RequestObjectTag/")
+            && request_object_tag_condition_supported_for_action(action))
 }
 
 fn existing_object_tag_condition_evaluable_for_action(action: PolicyAction) -> bool {
@@ -1395,6 +1396,10 @@ fn existing_object_tag_condition_supported_for_action(action: PolicyAction) -> b
             | PolicyAction::DeleteObject
             | PolicyAction::DeleteObjectVersion
     )
+}
+
+fn request_object_tag_condition_supported_for_action(action: PolicyAction) -> bool {
+    !matches!(action, PolicyAction::PutObjectAcl)
 }
 
 fn string_equals_condition_matches(
@@ -2161,6 +2166,21 @@ mod tests {
         .with_request_object_tags(&request_tags);
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+    }
+
+    #[test]
+    fn put_object_acl_request_object_tag_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObjectAcl","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
     }
 
     #[test]

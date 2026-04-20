@@ -125,6 +125,24 @@ This reinforces the current pattern:
 - object-lock actions so far are policy-invalid for `ExistingObjectTag`
 - tagging actions remain fully evaluable
 
+The first `RequestObjectTag` result is now AWS-pinned too:
+
+- `PutObjectAcl`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+
+This is only one pinned request-side result so far. It is enough to prove that
+`RequestObjectTag` is not generically valid across all object actions, but it
+is not enough to justify a broader allowlist or denylist yet.
+
+Until more actions are AWS-pinned, auth should only encode the specific invalid
+pair that is already proven:
+
+- `PutObjectAcl` + `s3:RequestObjectTag/*` is policy-invalid
+
+Other request-tag/action combinations still need explicit AWS-backed tests
+before they are narrowed or rejected in production validation.
+
 One more regression shape also needs to be pinned directly:
 
 - mixed-action statements that combine one policy-invalid action with one valid

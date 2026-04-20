@@ -169,11 +169,7 @@ impl LocalRequest {
                 "key",
                 Some(principal),
                 None,
-                if existing_tags.is_empty() {
-                    auth::bucket_policy::ExistingObjectTags::Unavailable
-                } else {
-                    auth::bucket_policy::ExistingObjectTags::Available(&existing_tags)
-                },
+                auth::bucket_policy::ExistingObjectTags::Available(&existing_tags),
             )
         }
         .with_request_object_tags(&request_tags)

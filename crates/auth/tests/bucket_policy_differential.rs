@@ -263,7 +263,10 @@ impl GeneratedActionPattern {
             | GeneratedConditionKey::ExistingTagRegion => {
                 !matches!(self, Self::Literal("s3:DeleteObject"))
             }
-            GeneratedConditionKey::RequestTagTeam => true,
+            GeneratedConditionKey::RequestTagTeam => matches!(
+                self,
+                Self::Literal("s3:PutObject") | Self::Literal("s3:PutObjectTagging")
+            ),
             GeneratedConditionKey::CopySource
             | GeneratedConditionKey::MetadataDirective
             | GeneratedConditionKey::CannedAcl
@@ -738,11 +741,7 @@ fn evaluate_generated(policy: &BucketPolicy, generated: &GeneratedRequest) -> Po
         KEY,
         generated.requester.principal(),
         requester_canonical.as_ref(),
-        if existing_tags.is_empty() {
-            ExistingObjectTags::Unavailable
-        } else {
-            ExistingObjectTags::Available(&existing_tags)
-        },
+        ExistingObjectTags::Available(&existing_tags),
     )
     .with_request_object_tags(&request_tags)
     .with_copy_source(generated.copy_source.as_deref())
