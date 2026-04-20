@@ -1419,22 +1419,20 @@ fn string_equals_condition_matches(
     clause: &PolicyConditionClause,
     actual: Option<&str>,
 ) -> ConditionMatchResult {
-    let (operator, if_exists) = split_if_exists_operator(clause.operator.as_str());
-    if operator != "StringEquals" {
+    // The ExistingObjectTag fast path only evaluates StringEquals-family
+    // operators; other operators return Unsupported even if they are in the
+    // table.
+    let Some(op) = condition_op::lookup(clause.operator.as_str()) else {
+        return ConditionMatchResult::Unsupported;
+    };
+    if op.kind != condition_op::ConditionOpKind::StringEquals {
         return ConditionMatchResult::Unsupported;
     }
-
-    match actual {
-        Some(actual) => {
-            if clause.values.iter().any(|expected| expected == actual) {
-                ConditionMatchResult::Matches
-            } else {
-                ConditionMatchResult::NoMatch
-            }
-        }
-        None if if_exists => ConditionMatchResult::Matches,
-        None => ConditionMatchResult::NoMatch,
-    }
+    let actual = match actual {
+        Some(value) => condition_op::ActualValue::Present(value),
+        None => condition_op::ActualValue::Absent,
+    };
+    (op.evaluate)(&clause.values, actual)
 }
 
 fn string_condition_matches(
@@ -1463,13 +1461,6 @@ fn evaluable_string_condition_operator_supported(operator: &str) -> bool {
             | "StringLikeIfExists"
             | "StringNotEqualsIfExists"
     )
-}
-
-fn split_if_exists_operator(operator: &str) -> (&str, bool) {
-    match operator.strip_suffix("IfExists") {
-        Some(base) => (base, true),
-        None => (operator, false),
-    }
 }
 
 fn action_pattern_matches(pattern: &str, action: &str) -> bool {
