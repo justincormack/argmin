@@ -130,18 +130,38 @@ The first `RequestObjectTag` result is now AWS-pinned too:
 - `PutObjectAcl`
   - policy rejected at `PutBucketPolicy`
   - AWS returns `MalformedPolicy`
+- `PutObjectRetention`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- `PutObjectLegalHold`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
 
-This is only one pinned request-side result so far. It is enough to prove that
-`RequestObjectTag` is not generically valid across all object actions, but it
-is not enough to justify a broader allowlist or denylist yet.
+These are still only a few pinned request-side results. They are enough to
+prove that `RequestObjectTag` is not generically valid across all object
+actions, but they are still not enough to justify a broad allowlist or
+denylist yet.
 
 Until more actions are AWS-pinned, auth should only encode the specific invalid
-pair that is already proven:
+pairs that are already proven:
 
 - `PutObjectAcl` + `s3:RequestObjectTag/*` is policy-invalid
+- `PutObjectRetention` + `s3:RequestObjectTag/*` is policy-invalid
+- `PutObjectLegalHold` + `s3:RequestObjectTag/*` is policy-invalid
 
 Other request-tag/action combinations still need explicit AWS-backed tests
 before they are narrowed or rejected in production validation.
+
+The mixed-action rejection rule is now also pinned for request-tag conditions:
+
+- `["s3:PutObjectAcl", "s3:PutObjectTagging"]`
+  - with `s3:RequestObjectTag/*`
+  - is rejected at `PutBucketPolicy` with `MalformedPolicy`
+
+So for request-side conditions too:
+
+- if any action in the statement makes the condition/action combination
+  invalid, AWS rejects the whole statement at policy write time
 
 One more regression shape also needs to be pinned directly:
 

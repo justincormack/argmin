@@ -5806,6 +5806,51 @@ fn test_bucket_policy_put_object_acl_request_object_tag_condition_is_rejected() 
 }
 
 #[test]
+fn test_bucket_policy_put_object_acl_and_tagging_request_object_tag_condition_is_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let key = "request-tag-mixed";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"body"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": ["s3:PutObjectAcl", "s3:PutObjectTagging"],
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:RequestObjectTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_object_inline_tags_require_put_object_tagging() {
     s3_tests::run(async {
         let principal = alt_policy_principal();

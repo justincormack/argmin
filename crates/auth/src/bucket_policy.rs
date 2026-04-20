@@ -1399,7 +1399,12 @@ fn existing_object_tag_condition_supported_for_action(action: PolicyAction) -> b
 }
 
 fn request_object_tag_condition_supported_for_action(action: PolicyAction) -> bool {
-    !matches!(action, PolicyAction::PutObjectAcl)
+    !matches!(
+        action,
+        PolicyAction::PutObjectAcl
+            | PolicyAction::PutObjectRetention
+            | PolicyAction::PutObjectLegalHold
+    )
 }
 
 fn string_equals_condition_matches(
@@ -2172,6 +2177,51 @@ mod tests {
     fn put_object_acl_request_object_tag_condition_is_rejected() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObjectAcl","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn put_object_retention_request_object_tag_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObjectRetention","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn put_object_legal_hold_request_object_tag_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObjectLegalHold","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_put_object_acl_and_tagging_request_object_tag_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:PutObjectAcl","s3:PutObjectTagging"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}}]}"#,
         )
         .unwrap();
 
