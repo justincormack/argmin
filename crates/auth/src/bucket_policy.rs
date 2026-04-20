@@ -1360,22 +1360,29 @@ fn condition_clause_supported_for_evaluable_object_action(
     ) && clause.key.starts_with("s3:ExistingObjectTag/")
         && existing_object_tag_condition_supported_for_action(action))
         || (evaluable_string_condition_operator_supported(clause.operator.as_str())
-            && matches!(
-                clause.key.as_str(),
-                "s3:x-amz-copy-source"
-                    | "s3:x-amz-metadata-directive"
-                    | "s3:x-amz-acl"
-                    | "s3:x-amz-server-side-encryption"
-                    | "s3:x-amz-server-side-encryption-customer-algorithm"
-                    | "s3:x-amz-grant-read"
-                    | "s3:x-amz-grant-write"
-                    | "s3:x-amz-grant-read-acp"
-                    | "s3:x-amz-grant-write-acp"
-                    | "s3:x-amz-grant-full-control"
-            ))
+            && request_header_condition_supported_for_action(action, clause.key.as_str()))
         || (evaluable_string_condition_operator_supported(clause.operator.as_str())
             && clause.key.starts_with("s3:RequestObjectTag/")
             && request_object_tag_condition_supported_for_action(action))
+}
+
+fn request_header_condition_supported_for_action(action: PolicyAction, key: &str) -> bool {
+    match key {
+        "s3:x-amz-copy-source" | "s3:x-amz-acl" | "s3:x-amz-server-side-encryption" => !matches!(
+            action,
+            PolicyAction::GetObject | PolicyAction::GetObjectVersion
+        ),
+        "s3:x-amz-metadata-directive"
+        | "s3:x-amz-grant-read"
+        | "s3:x-amz-server-side-encryption-customer-algorithm" => {
+            !matches!(action, PolicyAction::GetObject)
+        }
+        "s3:x-amz-grant-write"
+        | "s3:x-amz-grant-read-acp"
+        | "s3:x-amz-grant-write-acp"
+        | "s3:x-amz-grant-full-control" => true,
+        _ => false,
+    }
 }
 
 fn existing_object_tag_condition_evaluable_for_action(action: PolicyAction) -> bool {
@@ -2246,6 +2253,161 @@ mod tests {
                 reason: "unsupported Condition for currently enforced bucket policy action",
             })
         );
+    }
+
+    #[test]
+    fn mixed_get_object_and_put_object_copy_source_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringLike":{"s3:x-amz-copy-source":"src/public/*"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_and_put_object_metadata_directive_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-metadata-directive":"COPY"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_and_put_object_sse_s3_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-server-side-encryption":"true"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_and_put_object_sse_c_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-server-side-encryption-customer-algorithm":"true"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_and_put_object_canned_acl_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-acl":"private"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_and_put_object_grant_read_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-grant-read":"uri=http://acs.amazonaws.com/groups/global/AllUsers"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_version_and_put_object_copy_source_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObjectVersion","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringLike":{"s3:x-amz-copy-source":"src/public/*"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_version_and_put_object_canned_acl_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObjectVersion","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-acl":"private"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_version_and_put_object_sse_s3_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObjectVersion","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-server-side-encryption":"true"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_version_and_put_object_metadata_directive_condition_is_not_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObjectVersion","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-metadata-directive":"COPY"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
+    }
+
+    #[test]
+    fn mixed_get_object_version_and_put_object_sse_c_condition_is_not_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObjectVersion","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-server-side-encryption-customer-algorithm":"true"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
     }
 
     #[test]

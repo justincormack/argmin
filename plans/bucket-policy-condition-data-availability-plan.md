@@ -262,6 +262,66 @@ So for `UploadPartCopy` specifically:
 - `s3:x-amz-metadata-directive` is also accepted and operative, even though the
   part-copy request does not send that header
 
+The corresponding `CopyObject` source/destination split is now AWS-pinned too:
+
+- mixed `["s3:GetObject", "s3:PutObject"]` with
+  `StringLike { "s3:x-amz-copy-source": "src/public/*" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObject", "s3:PutObject"]` with
+  `StringEquals { "s3:x-amz-metadata-directive": "COPY" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObject", "s3:PutObject"]` with
+  `Null { "s3:x-amz-server-side-encryption": "true" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObject", "s3:PutObject"]` with
+  `Null { "s3:x-amz-server-side-encryption-customer-algorithm": "true" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObject", "s3:PutObject"]` with
+  `StringEquals { "s3:x-amz-acl": "private" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObject", "s3:PutObject"]` with
+  `StringEquals { "s3:x-amz-grant-read": "uri=http://acs.amazonaws.com/groups/global/AllUsers" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObjectVersion", "s3:PutObject"]` with
+  `StringLike { "s3:x-amz-copy-source": "src/public/*" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObjectVersion", "s3:PutObject"]` with
+  `StringEquals { "s3:x-amz-acl": "private" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObjectVersion", "s3:PutObject"]` with
+  `Null { "s3:x-amz-server-side-encryption": "true" }`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- mixed `["s3:GetObjectVersion", "s3:PutObject"]` with
+  `s3:x-amz-metadata-directive` or
+  `s3:x-amz-server-side-encryption-customer-algorithm`
+  - not AWS-pinned yet
+  - local validation should not reject these by inference alone
+
+So for the copy/header family:
+
+- `s3:x-amz-copy-source` and `s3:x-amz-metadata-directive` are destination-write
+  condition keys
+- destination SSE request headers are also not accepted on the source-read
+  `GetObject` side of mixed `CopyObject` statements
+- at least the representative ACL/grant destination headers we tested
+  (`s3:x-amz-acl`, `s3:x-amz-grant-read`) are also not accepted on the
+  source-read `GetObject` side of mixed `CopyObject` statements
+- the same mixed-statement rejection also applies on the versioned source-read
+  `GetObjectVersion` side for representative copy-specific, ACL, and SSE rows
+- AWS does not accept them on the source-read `GetObject` or `GetObjectVersion`
+  side of `CopyObject`
+- if a single statement mixes a valid destination action with an invalid
+  source-read action for those keys, AWS rejects the whole statement
+
 The first multipart destination-encryption row is also now AWS-pinned:
 
 - destination-side `s3:x-amz-server-side-encryption = AES256`

@@ -272,8 +272,8 @@ impl GeneratedActionPattern {
             | GeneratedConditionKey::CannedAcl
             | GeneratedConditionKey::ServerSideEncryption
             | GeneratedConditionKey::SseCustomerAlgorithm
-            | GeneratedConditionKey::GrantRead
-            | GeneratedConditionKey::GrantWrite
+            | GeneratedConditionKey::GrantRead => !matches!(self, Self::Literal("s3:GetObject")),
+            GeneratedConditionKey::GrantWrite
             | GeneratedConditionKey::GrantReadAcp
             | GeneratedConditionKey::GrantWriteAcp
             | GeneratedConditionKey::GrantFullControl => true,
