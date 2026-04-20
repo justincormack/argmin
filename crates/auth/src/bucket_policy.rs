@@ -1441,76 +1441,14 @@ fn string_condition_matches(
     clause: &PolicyConditionClause,
     actual: Option<&str>,
 ) -> ConditionMatchResult {
-    let (operator, if_exists) = split_if_exists_operator(clause.operator.as_str());
-    match operator {
-        "StringEquals" => match actual {
-            Some(actual) => {
-                if clause.values.iter().any(|expected| expected == actual) {
-                    ConditionMatchResult::Matches
-                } else {
-                    ConditionMatchResult::NoMatch
-                }
-            }
-            None if if_exists => ConditionMatchResult::Matches,
-            None => ConditionMatchResult::NoMatch,
-        },
-        "StringLike" => match actual {
-            Some(actual) => {
-                if clause
-                    .values
-                    .iter()
-                    .any(|expected| wildcard_matches(expected, actual))
-                {
-                    ConditionMatchResult::Matches
-                } else {
-                    ConditionMatchResult::NoMatch
-                }
-            }
-            None if if_exists => ConditionMatchResult::Matches,
-            None => ConditionMatchResult::NoMatch,
-        },
-        "StringNotLike" => match actual {
-            Some(actual) => {
-                if clause
-                    .values
-                    .iter()
-                    .all(|expected| !wildcard_matches(expected, actual))
-                {
-                    ConditionMatchResult::Matches
-                } else {
-                    ConditionMatchResult::NoMatch
-                }
-            }
-            None => ConditionMatchResult::Matches,
-        },
-        "StringNotEquals" => match actual {
-            Some(actual) => {
-                if clause.values.iter().all(|expected| expected != actual) {
-                    ConditionMatchResult::Matches
-                } else {
-                    ConditionMatchResult::NoMatch
-                }
-            }
-            None => ConditionMatchResult::Matches,
-        },
-        "Null" => {
-            let is_null = actual.is_none();
-            if clause
-                .values
-                .iter()
-                .any(|expected| match expected.as_str() {
-                    "true" => is_null,
-                    "false" => !is_null,
-                    _ => false,
-                })
-            {
-                ConditionMatchResult::Matches
-            } else {
-                ConditionMatchResult::NoMatch
-            }
-        }
-        _ => ConditionMatchResult::Unsupported,
-    }
+    let Some(op) = condition_op::lookup(clause.operator.as_str()) else {
+        return ConditionMatchResult::Unsupported;
+    };
+    let actual = match actual {
+        Some(value) => condition_op::ActualValue::Present(value),
+        None => condition_op::ActualValue::Absent,
+    };
+    (op.evaluate)(&clause.values, actual)
 }
 
 fn evaluable_string_condition_operator_supported(operator: &str) -> bool {
