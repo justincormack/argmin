@@ -7,14 +7,12 @@
 //! adding a new condition key is a one-row change instead of a new arm in
 //! several different match statements.
 //!
-//! This module is introduced as dead code ahead of the migration commits
-//! tracked by `plans/bucket-policy-evaluator-structure-plan.md` phase 2.
 //! The existing evaluator continues to use its hand-rolled dispatch until
-//! those commits route through [`CONDITION_KEYS`].
+//! the migration commits route through [`CONDITION_KEYS`].
 
 #![allow(dead_code)]
 
-use super::{PolicyAction, PolicyRequest};
+use super::{ExistingObjectTagValue, PolicyAction, PolicyRequest};
 
 /// Resolved value for a condition key in a given request.
 ///
@@ -89,10 +87,98 @@ pub(super) struct ConditionKeyResolver {
 
 /// The compile-time condition-key table.
 ///
-/// Empty for now. Later commits populate it with `s3:ExistingObjectTag/*`,
-/// `s3:RequestObjectTag/*`, the `s3:x-amz-*` header keys, and their
-/// per-action evaluability / support predicates.
-pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[];
+/// Order is not load-bearing; lookup is a linear scan and prefix keys match
+/// only on their literal prefix, so the table cannot have ambiguous rows.
+pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
+    ConditionKeyResolver {
+        key: KeyMatch::Prefix("s3:ExistingObjectTag/"),
+        operator_support: OperatorSupport::StringEqualsOnly,
+        resolve: resolve_existing_object_tag,
+        evaluable_for_action: Some(existing_object_tag_evaluable_for_action),
+        supported_for_action: Some(existing_object_tag_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Prefix("s3:RequestObjectTag/"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_request_object_tag,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_object_tag_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-copy-source"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_copy_source,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_header_supported_for_action_non_get),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-metadata-directive"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_metadata_directive,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_header_supported_for_action_non_get),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-acl"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_canned_acl,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_header_supported_for_action_non_get),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-server-side-encryption"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_server_side_encryption,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_header_supported_for_action_non_get),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-server-side-encryption-customer-algorithm"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_sse_customer_algorithm,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_header_supported_for_action_non_get),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-grant-read"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_grant_read,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_header_supported_for_action_non_get),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-grant-write"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_grant_write,
+        evaluable_for_action: None,
+        // grant-write and grant-write-acp are intentionally supported for
+        // all actions, including GetObject/GetObjectVersion. Preserves the
+        // asymmetry documented in the legacy request_header_condition_
+        // supported_for_action predicate.
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-grant-read-acp"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_grant_read_acp,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_header_supported_for_action_non_get),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-grant-write-acp"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_grant_write_acp,
+        evaluable_for_action: None,
+        supported_for_action: None,
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Exact("s3:x-amz-grant-full-control"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_grant_full_control,
+        evaluable_for_action: None,
+        supported_for_action: Some(request_header_supported_for_action_non_get),
+    },
+];
 
 /// Look up a resolver for a given condition-key name.
 ///
@@ -105,6 +191,109 @@ pub(super) fn lookup(key: &str) -> Option<(&'static ConditionKeyResolver, &str)>
         }
     }
     None
+}
+
+fn resolve_existing_object_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> ResolvedValue<'a> {
+    match request.existing_object_tag_value(param) {
+        ExistingObjectTagValue::Unavailable => ResolvedValue::Unavailable,
+        ExistingObjectTagValue::Available(Some(value)) => ResolvedValue::Present(value),
+        ExistingObjectTagValue::Available(None) => ResolvedValue::Absent,
+    }
+}
+
+fn resolve_request_object_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.request_object_tag_value(param))
+}
+
+fn resolve_copy_source<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.copy_source())
+}
+
+fn resolve_metadata_directive<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.metadata_directive())
+}
+
+fn resolve_canned_acl<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.canned_acl())
+}
+
+fn resolve_server_side_encryption<'a>(
+    request: &PolicyRequest<'a>,
+    _param: &str,
+) -> ResolvedValue<'a> {
+    option_to_resolved(request.server_side_encryption())
+}
+
+fn resolve_sse_customer_algorithm<'a>(
+    request: &PolicyRequest<'a>,
+    _param: &str,
+) -> ResolvedValue<'a> {
+    option_to_resolved(request.sse_customer_algorithm())
+}
+
+fn resolve_grant_read<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.grant_read())
+}
+
+fn resolve_grant_write<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.grant_write())
+}
+
+fn resolve_grant_read_acp<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.grant_read_acp())
+}
+
+fn resolve_grant_write_acp<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.grant_write_acp())
+}
+
+fn resolve_grant_full_control<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
+    option_to_resolved(request.grant_full_control())
+}
+
+fn option_to_resolved(value: Option<&str>) -> ResolvedValue<'_> {
+    match value {
+        Some(value) => ResolvedValue::Present(value),
+        None => ResolvedValue::Absent,
+    }
+}
+
+fn existing_object_tag_evaluable_for_action(action: PolicyAction) -> bool {
+    !matches!(
+        action,
+        PolicyAction::GetObjectAttributes | PolicyAction::GetObjectVersionAttributes
+    )
+}
+
+fn existing_object_tag_supported_for_action(action: PolicyAction) -> bool {
+    !matches!(
+        action,
+        PolicyAction::GetObjectRetention
+            | PolicyAction::GetObjectLegalHold
+            | PolicyAction::PutObjectRetention
+            | PolicyAction::PutObjectLegalHold
+            | PolicyAction::BypassGovernanceRetention
+            | PolicyAction::DeleteObject
+            | PolicyAction::DeleteObjectVersion
+    )
+}
+
+fn request_object_tag_supported_for_action(action: PolicyAction) -> bool {
+    !matches!(
+        action,
+        PolicyAction::PutObjectAcl
+            | PolicyAction::PutObjectRetention
+            | PolicyAction::PutObjectLegalHold
+    )
+}
+
+/// Shared support predicate for request-header keys that are not evaluable
+/// on read paths.
+fn request_header_supported_for_action_non_get(action: PolicyAction) -> bool {
+    !matches!(
+        action,
+        PolicyAction::GetObject | PolicyAction::GetObjectVersion
+    )
 }
 
 #[cfg(test)]
@@ -131,11 +320,124 @@ mod tests {
     }
 
     #[test]
-    fn lookup_empty_table_returns_none() {
-        // The table is intentionally empty until the phase 2 migration
-        // commits begin populating it. Once a resolver row lands, this
-        // test should be deleted rather than updated.
-        assert!(CONDITION_KEYS.is_empty());
-        assert!(lookup("s3:x-amz-acl").is_none());
+    fn lookup_existing_object_tag_returns_prefix_resolver() {
+        let (resolver, param) = lookup("s3:ExistingObjectTag/classification").unwrap();
+        assert_eq!(param, "classification");
+        assert_eq!(resolver.operator_support, OperatorSupport::StringEqualsOnly);
+        assert!(resolver.evaluable_for_action.is_some());
+        assert!(resolver.supported_for_action.is_some());
+    }
+
+    #[test]
+    fn lookup_request_object_tag_returns_prefix_resolver() {
+        let (resolver, param) = lookup("s3:RequestObjectTag/classification").unwrap();
+        assert_eq!(param, "classification");
+        assert_eq!(resolver.operator_support, OperatorSupport::AnyEvaluable);
+        assert!(resolver.evaluable_for_action.is_none());
+    }
+
+    #[test]
+    fn lookup_exact_header_keys() {
+        let (acl, param) = lookup("s3:x-amz-acl").unwrap();
+        assert_eq!(param, "");
+        assert_eq!(acl.operator_support, OperatorSupport::AnyEvaluable);
+
+        let (sse, _) = lookup("s3:x-amz-server-side-encryption").unwrap();
+        assert!(sse.supported_for_action.is_some());
+    }
+
+    #[test]
+    fn lookup_unknown_key_returns_none() {
+        assert!(lookup("aws:SourceVpc").is_none());
+        assert!(lookup("").is_none());
+    }
+
+    #[test]
+    fn grant_write_keys_are_supported_for_get_object() {
+        // The legacy predicate intentionally allowed grant-write and
+        // grant-write-acp on every action. The resolver preserves that by
+        // leaving supported_for_action=None, so we test here that the
+        // table row encodes this asymmetry.
+        for key in ["s3:x-amz-grant-write", "s3:x-amz-grant-write-acp"] {
+            let (resolver, _) = lookup(key).unwrap();
+            assert!(
+                resolver.supported_for_action.is_none(),
+                "{key} should be supported for every action"
+            );
+        }
+
+        // Counterexample: the read-flavor grants are supported only on
+        // non-Get actions, via the shared predicate.
+        for key in [
+            "s3:x-amz-grant-read",
+            "s3:x-amz-grant-read-acp",
+            "s3:x-amz-grant-full-control",
+        ] {
+            let (resolver, _) = lookup(key).unwrap();
+            let predicate = resolver
+                .supported_for_action
+                .expect("read-flavor grants have a support predicate");
+            assert!(!predicate(PolicyAction::GetObject));
+            assert!(!predicate(PolicyAction::GetObjectVersion));
+            assert!(predicate(PolicyAction::PutObject));
+        }
+    }
+
+    #[test]
+    fn existing_object_tag_unevaluable_for_get_object_attributes() {
+        let (resolver, _) = lookup("s3:ExistingObjectTag/x").unwrap();
+        let predicate = resolver
+            .evaluable_for_action
+            .expect("ExistingObjectTag has an evaluability predicate");
+        assert!(!predicate(PolicyAction::GetObjectAttributes));
+        assert!(!predicate(PolicyAction::GetObjectVersionAttributes));
+        assert!(predicate(PolicyAction::GetObject));
+    }
+
+    #[test]
+    fn existing_object_tag_unsupported_for_retention_and_delete() {
+        let (resolver, _) = lookup("s3:ExistingObjectTag/x").unwrap();
+        let predicate = resolver
+            .supported_for_action
+            .expect("ExistingObjectTag has a support predicate");
+        assert!(!predicate(PolicyAction::DeleteObject));
+        assert!(!predicate(PolicyAction::DeleteObjectVersion));
+        assert!(!predicate(PolicyAction::PutObjectRetention));
+        assert!(!predicate(PolicyAction::PutObjectLegalHold));
+        assert!(!predicate(PolicyAction::BypassGovernanceRetention));
+        assert!(predicate(PolicyAction::GetObject));
+        assert!(predicate(PolicyAction::PutObject));
+    }
+
+    #[test]
+    fn request_object_tag_unsupported_for_acl_and_lock_updates() {
+        let (resolver, _) = lookup("s3:RequestObjectTag/x").unwrap();
+        let predicate = resolver
+            .supported_for_action
+            .expect("RequestObjectTag has a support predicate");
+        assert!(!predicate(PolicyAction::PutObjectAcl));
+        assert!(!predicate(PolicyAction::PutObjectRetention));
+        assert!(!predicate(PolicyAction::PutObjectLegalHold));
+        assert!(predicate(PolicyAction::PutObject));
+    }
+
+    #[test]
+    fn every_expected_key_has_a_row() {
+        for key in [
+            "s3:ExistingObjectTag/x",
+            "s3:RequestObjectTag/x",
+            "s3:x-amz-copy-source",
+            "s3:x-amz-metadata-directive",
+            "s3:x-amz-acl",
+            "s3:x-amz-server-side-encryption",
+            "s3:x-amz-server-side-encryption-customer-algorithm",
+            "s3:x-amz-grant-read",
+            "s3:x-amz-grant-write",
+            "s3:x-amz-grant-read-acp",
+            "s3:x-amz-grant-write-acp",
+            "s3:x-amz-grant-full-control",
+        ] {
+            assert!(lookup(key).is_some(), "missing resolver for {key}");
+        }
     }
 }
