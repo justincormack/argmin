@@ -142,6 +142,49 @@ So even closely-related mutation actions can split sharply:
 - delete actions: policy-invalid
 - delete-tagging actions: fully evaluable
 
+The versioned ACL row is now also AWS-pinned:
+
+- `GetObjectAcl`
+  - policy accepted
+  - condition is fully evaluable
+  - pinned with same-policy public/private tag controls
+- `PutObjectAcl`
+  - policy accepted
+  - condition is fully evaluable
+  - pinned with same-policy public/private tag controls
+- `GetObjectVersionAcl`
+  - policy accepted
+  - condition is fully evaluable
+  - pinned with same-policy public/private tag controls
+- `PutObjectVersionAcl`
+  - policy accepted
+  - condition is fully evaluable
+  - pinned with same-policy public/private tag controls
+
+So at least in the ACL family, the versioned actions match the current-version
+shape rather than splitting the way `GetObjectAttributes` did.
+
+The versioned tagging row is now AWS-pinned too:
+
+- `GetObjectVersionTagging`
+  - policy accepted
+  - condition is fully evaluable
+- `PutObjectVersionTagging`
+  - policy accepted
+  - condition is fully evaluable
+
+So the tagging family now looks consistent across:
+
+- `GetObjectTagging`
+- `PutObjectTagging`
+- `DeleteObjectTagging`
+- `GetObjectVersionTagging`
+- `PutObjectVersionTagging`
+- `DeleteObjectVersionTagging`
+
+with all six currently behaving as fully evaluable for
+`s3:ExistingObjectTag/*`.
+
 The object-lock mutation row is now partially AWS-pinned too:
 
 - `PutObjectRetention`
