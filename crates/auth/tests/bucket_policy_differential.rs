@@ -275,9 +275,7 @@ impl GeneratedActionPattern {
             | GeneratedConditionKey::ServerSideEncryption
             | GeneratedConditionKey::SseCustomerAlgorithm
             | GeneratedConditionKey::GrantRead => !matches!(self, Self::Literal("s3:GetObject")),
-            GeneratedConditionKey::GrantWrite
-            | GeneratedConditionKey::GrantWriteAcp
-            => true,
+            GeneratedConditionKey::GrantWrite | GeneratedConditionKey::GrantWriteAcp => true,
         }
     }
 }
