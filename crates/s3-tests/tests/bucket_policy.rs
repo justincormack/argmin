@@ -7753,6 +7753,248 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
     });
 }
 
+#[test]
+fn test_bucket_policy_upload_part_copy_destination_copy_source_condition() {
+    s3_tests::run(async {
+        let principal = same_account_exact_principal().await;
+        let client = CTX.client();
+        let second_client = CTX.require_second_client();
+
+        let src_bucket = unique_bucket();
+        let dst_bucket = unique_bucket();
+        s3_tests::create_bucket(client, &src_bucket).await.unwrap();
+        s3_tests::create_bucket(client, &dst_bucket).await.unwrap();
+
+        for (key, body) in [
+            ("public/foo", ByteStream::from_static(b"public/foo")),
+            ("private/foo", ByteStream::from_static(b"private/foo")),
+        ] {
+            client
+                .put_object()
+                .bucket(&src_bucket)
+                .key(key)
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let src_policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "AWS": principal.clone() },
+                "Action": "s3:GetObject",
+                "Resource": bucket_wildcard_resource(&src_bucket),
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&src_bucket)
+            .policy(src_policy)
+            .send()
+            .await
+            .unwrap();
+
+        let dst_policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": { "AWS": principal.clone() },
+                    "Action": "s3:PutObject",
+                    "Resource": bucket_wildcard_resource(&dst_bucket),
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": { "AWS": principal },
+                    "Action": "s3:PutObject",
+                    "Resource": bucket_wildcard_resource(&dst_bucket),
+                    "Condition": {
+                        "StringNotLike": {
+                            "s3:x-amz-copy-source": format!("{src_bucket}/public/*")
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&dst_bucket)
+            .policy(dst_policy)
+            .send()
+            .await
+            .unwrap();
+
+        let allowed_upload = eventually_ok(
+            "CreateMultipartUpload by owner for UploadPartCopy policy probe",
+            || {
+                client
+                    .create_multipart_upload()
+                    .bucket(&dst_bucket)
+                    .key("copied")
+                    .send()
+            },
+        )
+        .await;
+        let allowed_upload_id = allowed_upload.upload_id().unwrap().to_string();
+
+        let copied_part = upload_part_copy_eventually(
+            second_client,
+            &dst_bucket,
+            "copied",
+            &allowed_upload_id,
+            1,
+            format!("{src_bucket}/public/foo"),
+        )
+        .await;
+        complete_single_part_upload(
+            client,
+            &dst_bucket,
+            "copied",
+            &allowed_upload_id,
+            copied_part.copy_part_result().unwrap().e_tag().unwrap(),
+        )
+        .await;
+
+        let denied_upload = eventually_ok(
+            "CreateMultipartUpload by owner for denied UploadPartCopy probe",
+            || {
+                client
+                    .create_multipart_upload()
+                    .bucket(&dst_bucket)
+                    .key("copied-denied")
+                    .send()
+            },
+        )
+        .await;
+        let denied_upload_id = denied_upload.upload_id().unwrap().to_string();
+
+        let denied = second_client
+            .upload_part_copy()
+            .bucket(&dst_bucket)
+            .key("copied-denied")
+            .upload_id(&denied_upload_id)
+            .part_number(1)
+            .copy_source(format!("{src_bucket}/private/foo"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let response = client
+            .get_object()
+            .bucket(&dst_bucket)
+            .key("copied")
+            .send()
+            .await
+            .unwrap();
+        let body = response.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), b"public/foo");
+
+        cleanup_with_client(client, &dst_bucket, &["copied", "copied-denied"]).await;
+        cleanup(&src_bucket, &["public/foo", "private/foo"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_upload_part_copy_destination_metadata_directive_condition() {
+    s3_tests::run(async {
+        let principal = same_account_exact_principal().await;
+        let client = CTX.client();
+        let second_client = CTX.require_second_client();
+
+        let src_bucket = unique_bucket();
+        let dst_bucket = unique_bucket();
+        s3_tests::create_bucket(client, &src_bucket).await.unwrap();
+        s3_tests::create_bucket(client, &dst_bucket).await.unwrap();
+
+        client
+            .put_object()
+            .bucket(&src_bucket)
+            .key("src")
+            .body(ByteStream::from_static(b"copy-source"))
+            .send()
+            .await
+            .unwrap();
+
+        let src_policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": { "AWS": principal.clone() },
+                "Action": "s3:GetObject",
+                "Resource": bucket_wildcard_resource(&src_bucket),
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&src_bucket)
+            .policy(src_policy)
+            .send()
+            .await
+            .unwrap();
+
+        let dst_policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Principal": { "AWS": principal.clone() },
+                    "Action": "s3:PutObject",
+                    "Resource": bucket_wildcard_resource(&dst_bucket),
+                },
+                {
+                    "Effect": "Deny",
+                    "Principal": { "AWS": principal },
+                    "Action": "s3:PutObject",
+                    "Resource": bucket_wildcard_resource(&dst_bucket),
+                    "Condition": {
+                        "StringNotEquals": {
+                            "s3:x-amz-metadata-directive": "COPY"
+                        }
+                    }
+                }
+            ],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&dst_bucket)
+            .policy(dst_policy)
+            .send()
+            .await
+            .unwrap();
+
+        let upload = client
+            .create_multipart_upload()
+            .bucket(&dst_bucket)
+            .key("copied")
+            .send()
+            .await
+            .unwrap();
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        let denied = second_client
+            .upload_part_copy()
+            .bucket(&dst_bucket)
+            .key("copied")
+            .upload_id(&upload_id)
+            .part_number(1)
+            .copy_source(format!("{src_bucket}/src"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup_with_client(client, &dst_bucket, &["copied"]).await;
+        cleanup(&src_bucket, &["src"]).await;
+    });
+}
+
 /// Apply the same policy to two different buckets and verify both work.
 ///
 /// Matches Ceph: test_bucket_policy_another_bucket

@@ -240,6 +240,28 @@ So for request-side conditions too:
 - if any action in the statement makes the condition/action combination
   invalid, AWS rejects the whole statement at policy write time
 
+The first copy/header-conditioned `UploadPartCopy` row is now AWS-pinned too:
+
+- destination-side `s3:x-amz-copy-source`
+  - policy accepted on `s3:PutObject`
+  - `UploadPartCopy` evaluates it on the destination write path
+  - same-account non-initiator part-copy from `public/*` succeeds
+  - same policy denies part-copy from `private/*`
+- destination-side `s3:x-amz-metadata-directive`
+  - policy accepted on `s3:PutObject`
+  - `UploadPartCopy` still evaluates the missing header as an absent request
+    value on the destination write path
+  - a `StringNotEquals { "s3:x-amz-metadata-directive": "COPY" }` deny blocks
+    `UploadPartCopy`
+
+So for `UploadPartCopy` specifically:
+
+- destination bucket policy is not limited to plain `CreateMultipartUpload`
+  and `UploadPart`
+- `s3:x-amz-copy-source` is fully evaluable on the part-copy call
+- `s3:x-amz-metadata-directive` is also accepted and operative, even though the
+  part-copy request does not send that header
+
 One more regression shape also needs to be pinned directly:
 
 - mixed-action statements that combine one policy-invalid action with one valid

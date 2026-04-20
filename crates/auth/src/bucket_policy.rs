@@ -1461,6 +1461,20 @@ fn string_condition_matches(
             None if if_exists => ConditionMatchResult::Matches,
             None => ConditionMatchResult::NoMatch,
         },
+        "StringNotLike" => match actual {
+            Some(actual) => {
+                if clause
+                    .values
+                    .iter()
+                    .all(|expected| !wildcard_matches(expected, actual))
+                {
+                    ConditionMatchResult::Matches
+                } else {
+                    ConditionMatchResult::NoMatch
+                }
+            }
+            None => ConditionMatchResult::Matches,
+        },
         "StringNotEquals" => match actual {
             Some(actual) => {
                 if clause.values.iter().all(|expected| expected != actual) {
@@ -1496,6 +1510,7 @@ fn evaluable_string_condition_operator_supported(operator: &str) -> bool {
         operator,
         "StringEquals"
             | "StringLike"
+            | "StringNotLike"
             | "StringNotEquals"
             | "Null"
             | "StringEqualsIfExists"
@@ -2523,6 +2538,26 @@ mod tests {
         .with_copy_source(Some("src/private/foo"));
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn copy_source_condition_string_not_like_matches_mismatched_header() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::dst/*","Condition":{"StringNotLike":{"s3:x-amz-copy-source":"src/public/*"}}}]}"#,
+        )
+        .unwrap();
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "dst",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_copy_source(Some("src/private/foo"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
+        assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
     }
 
     #[test]
