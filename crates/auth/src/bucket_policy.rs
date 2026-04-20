@@ -33,7 +33,7 @@ impl BucketPolicy {
 
     #[must_use]
     pub fn requires_existing_object_tags_for_action(&self, action: PolicyAction) -> bool {
-        if !existing_object_tag_condition_evaluable_for_action(action) {
+        if !condition_key::key_is_evaluable_for_action("s3:ExistingObjectTag/", action) {
             return false;
         }
         let action = action.as_str();
@@ -1322,62 +1322,7 @@ fn condition_clause_supported_for_evaluable_object_action(
     action: PolicyAction,
     clause: &PolicyConditionClause,
 ) -> bool {
-    let operator = clause.operator.as_str();
-    (matches!(operator, "StringEquals" | "StringEqualsIfExists")
-        && clause.key.starts_with("s3:ExistingObjectTag/")
-        && existing_object_tag_condition_supported_for_action(action))
-        || (condition_op::is_evaluable_on_evaluable_object_actions(operator)
-            && request_header_condition_supported_for_action(action, clause.key.as_str()))
-        || (condition_op::is_evaluable_on_evaluable_object_actions(operator)
-            && clause.key.starts_with("s3:RequestObjectTag/")
-            && request_object_tag_condition_supported_for_action(action))
-}
-
-fn request_header_condition_supported_for_action(action: PolicyAction, key: &str) -> bool {
-    match key {
-        "s3:x-amz-copy-source"
-        | "s3:x-amz-metadata-directive"
-        | "s3:x-amz-acl"
-        | "s3:x-amz-grant-read"
-        | "s3:x-amz-grant-read-acp"
-        | "s3:x-amz-grant-full-control"
-        | "s3:x-amz-server-side-encryption"
-        | "s3:x-amz-server-side-encryption-customer-algorithm" => !matches!(
-            action,
-            PolicyAction::GetObject | PolicyAction::GetObjectVersion
-        ),
-        "s3:x-amz-grant-write" | "s3:x-amz-grant-write-acp" => true,
-        _ => false,
-    }
-}
-
-fn existing_object_tag_condition_evaluable_for_action(action: PolicyAction) -> bool {
-    !matches!(
-        action,
-        PolicyAction::GetObjectAttributes | PolicyAction::GetObjectVersionAttributes
-    )
-}
-
-fn existing_object_tag_condition_supported_for_action(action: PolicyAction) -> bool {
-    !matches!(
-        action,
-        PolicyAction::GetObjectRetention
-            | PolicyAction::GetObjectLegalHold
-            | PolicyAction::PutObjectRetention
-            | PolicyAction::PutObjectLegalHold
-            | PolicyAction::BypassGovernanceRetention
-            | PolicyAction::DeleteObject
-            | PolicyAction::DeleteObjectVersion
-    )
-}
-
-fn request_object_tag_condition_supported_for_action(action: PolicyAction) -> bool {
-    !matches!(
-        action,
-        PolicyAction::PutObjectAcl
-            | PolicyAction::PutObjectRetention
-            | PolicyAction::PutObjectLegalHold
-    )
+    condition_key::supports_clause_for_action(clause, action)
 }
 
 fn action_pattern_matches(pattern: &str, action: &str) -> bool {

@@ -300,6 +300,50 @@ fn request_header_supported_for_action_non_get(action: PolicyAction) -> bool {
     )
 }
 
+/// Whether a condition clause is supported on a given action at
+/// statement-validation time.
+///
+/// A clause is supported when its key has a resolver row, the operator is
+/// compatible with the row's `operator_support`, and the row's
+/// `supported_for_action` predicate (if any) admits the action.
+pub(super) fn supports_clause_for_action(
+    clause: &PolicyConditionClause,
+    action: PolicyAction,
+) -> bool {
+    let Some((resolver, _param)) = lookup(clause.key.as_str()) else {
+        return false;
+    };
+    let operator = clause.operator.as_str();
+    let operator_ok = match resolver.operator_support {
+        OperatorSupport::AnyEvaluable => {
+            condition_op::is_evaluable_on_evaluable_object_actions(operator)
+        }
+        OperatorSupport::StringEqualsOnly => {
+            matches!(operator, "StringEquals" | "StringEqualsIfExists")
+        }
+    };
+    if !operator_ok {
+        return false;
+    }
+    resolver
+        .supported_for_action
+        .is_none_or(|predicate| predicate(action))
+}
+
+/// Whether a resolver key is evaluable for an action at evaluator time.
+///
+/// Returns `true` by default when the resolver does not constrain
+/// evaluability, or when the key is not in the table (the caller typically
+/// treats unknown keys as not requiring this gate).
+pub(super) fn key_is_evaluable_for_action(key: &str, action: PolicyAction) -> bool {
+    let Some((resolver, _)) = lookup(key) else {
+        return true;
+    };
+    resolver
+        .evaluable_for_action
+        .is_none_or(|predicate| predicate(action))
+}
+
 /// Evaluate a condition clause against a request.
 ///
 /// Single entry point for the evaluator. Returns `Unsupported` if the
