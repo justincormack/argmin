@@ -1356,14 +1356,13 @@ fn condition_clause_supported_for_evaluable_object_action(
     action: PolicyAction,
     clause: &PolicyConditionClause,
 ) -> bool {
-    (matches!(
-        clause.operator.as_str(),
-        "StringEquals" | "StringEqualsIfExists"
-    ) && clause.key.starts_with("s3:ExistingObjectTag/")
+    let operator = clause.operator.as_str();
+    (matches!(operator, "StringEquals" | "StringEqualsIfExists")
+        && clause.key.starts_with("s3:ExistingObjectTag/")
         && existing_object_tag_condition_supported_for_action(action))
-        || (evaluable_string_condition_operator_supported(clause.operator.as_str())
+        || (condition_op::is_evaluable_on_evaluable_object_actions(operator)
             && request_header_condition_supported_for_action(action, clause.key.as_str()))
-        || (evaluable_string_condition_operator_supported(clause.operator.as_str())
+        || (condition_op::is_evaluable_on_evaluable_object_actions(operator)
             && clause.key.starts_with("s3:RequestObjectTag/")
             && request_object_tag_condition_supported_for_action(action))
 }
@@ -1447,20 +1446,6 @@ fn string_condition_matches(
         None => condition_op::ActualValue::Absent,
     };
     (op.evaluate)(&clause.values, actual)
-}
-
-fn evaluable_string_condition_operator_supported(operator: &str) -> bool {
-    matches!(
-        operator,
-        "StringEquals"
-            | "StringLike"
-            | "StringNotLike"
-            | "StringNotEquals"
-            | "Null"
-            | "StringEqualsIfExists"
-            | "StringLikeIfExists"
-            | "StringNotEqualsIfExists"
-    )
 }
 
 fn action_pattern_matches(pattern: &str, action: &str) -> bool {
