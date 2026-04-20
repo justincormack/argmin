@@ -1,6 +1,6 @@
 ## Bucket Policy Condition Data Availability Plan
 
-Status: planned
+Status: in progress
 
 ## Goal
 
@@ -20,6 +20,50 @@ The working hypothesis is:
   not match for that action
 
 This plan turns that hypothesis into explicit AWS-pinned tests.
+
+Early AWS-backed results have already shown that the rule is more nuanced than
+the initial hypothesis:
+
+- some actions accept the policy statement but do not evaluate the condition
+  for that action
+- some actions reject the policy at `PutBucketPolicy` time because the
+  condition does not apply to that action at all
+
+So the matrix needs to classify at least three distinct outcomes:
+
+- evaluable and matching
+- accepted but not evaluable for the action
+- rejected at policy write time as an invalid condition/action combination
+
+## Findings So Far
+
+The first `s3:ExistingObjectTag/*` row is now AWS-pinned:
+
+- `GetObject`
+  - evaluable and matching
+- `GetObjectAttributes`
+  - policy accepted
+  - condition not evaluated for the action
+  - runtime result is `AccessDenied`
+- `GetObjectVersionAttributes`
+  - same shape as `GetObjectAttributes`
+  - policy accepted
+  - condition not evaluated for the action
+  - runtime result is `AccessDenied`
+- `GetObjectRetention`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy` with
+    `Conditions do not apply to combination of actions and resources in statement`
+- `GetObjectLegalHold`
+  - same shape as `GetObjectRetention`
+  - policy rejected at `PutBucketPolicy` with `MalformedPolicy`
+
+That means `ExistingObjectTag` is not a single “supported or unsupported”
+family. Its behavior is action-specific in at least three ways:
+
+- fully evaluable
+- accepted but non-evaluable
+- policy-invalid
 
 ## Scope
 
@@ -76,6 +120,7 @@ Acceptance criteria:
 - every action above is classified by AWS-backed test as one of:
   - evaluable and matching
   - accepted but not evaluable for that action
+  - rejected at policy write time for that action
   - another concrete AWS behavior that must be modeled explicitly
 
 ## Phase 2: Versioned Pair Matrix
@@ -144,6 +189,7 @@ Implementation goal:
 
 - model condition-family-by-action evaluability explicitly
 - keep “accepted but not evaluable” distinct from “unsupported condition”
+- keep “policy-invalid for this action” distinct from both of the above
 - use the same matrix to drive any prefetch decisions for object tags or other
   policy inputs
 

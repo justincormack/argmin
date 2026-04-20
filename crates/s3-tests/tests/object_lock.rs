@@ -7,7 +7,7 @@ use aws_sdk_s3::types::{
     DefaultRetention, Delete, ObjectIdentifier, ObjectLockConfiguration, ObjectLockEnabled,
     ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
     ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership, OwnershipControls,
-    OwnershipControlsRule, VersioningConfiguration,
+    OwnershipControlsRule, Tag, Tagging, VersioningConfiguration,
 };
 use base64::Engine;
 use ring::hmac;
@@ -158,6 +158,13 @@ fn alt_policy_principal() -> serde_json::Value {
 
 fn owner_policy_principal() -> serde_json::Value {
     json!({ "AWS": format!("arn:aws:iam::{}:root", CTX.account_id()) })
+}
+
+fn object_tagging(key: &str, value: &str) -> Tagging {
+    Tagging::builder()
+        .tag_set(Tag::builder().key(key).value(value).build().unwrap())
+        .build()
+        .unwrap()
 }
 
 async fn put_bucket_policy_json(bucket: &str, policy: serde_json::Value) {
@@ -1185,6 +1192,51 @@ fn test_object_lock_bucket_policy_put_get_obj_retention() {
             .await
             .unwrap();
         assert_eq!(response.retention(), Some(&retention));
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_get_retention() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        put_object_bytes(&bucket, key, b"abc").await;
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:GetObjectRetention",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:ExistingObjectTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
 
         cleanup_object_lock_bucket(&bucket).await;
     });
@@ -2837,6 +2889,51 @@ fn test_object_lock_bucket_policy_put_get_legal_hold() {
             response.legal_hold(),
             Some(&legal_hold(ObjectLockLegalHoldStatus::On))
         );
+
+        cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_get_legal_hold() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = setup_object_lock_bucket().await;
+        let key = "file1";
+        put_object_bytes(&bucket, key, b"abc").await;
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:GetObjectLegalHold",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:ExistingObjectTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
 
         cleanup_object_lock_bucket(&bucket).await;
     });

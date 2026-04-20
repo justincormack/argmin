@@ -501,6 +501,84 @@ fn test_get_object_attributes_bucket_policy_existing_tag_condition_does_not_auth
 }
 
 #[test]
+fn test_get_object_version_attributes_bucket_policy_existing_tag_condition_does_not_authorize() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt = CTX.alt_client();
+        let bucket = create_versioned_bucket(client).await;
+        let key = "policy-versioned-tagged-object";
+        let version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"versioned-tagged"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected version id")
+            .to_string();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": ["s3:GetObjectVersion", "s3:GetObjectVersionAttributes"],
+                    "Resource": object_resource(&bucket, key),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:ExistingObjectTag/security": "public"
+                        }
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        eventually_ok(
+            "alt GetObject version with ExistingObjectTag bucket policy on tagged version",
+            || {
+                alt.get_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .version_id(&version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_err_status(
+            "alt GetObjectAttributes version with ExistingObjectTag bucket policy on tagged version",
+            403,
+            Some("AccessDenied"),
+            || {
+                alt.get_object_attributes()
+                    .bucket(&bucket)
+                    .key(key)
+                    .version_id(&version_id)
+                    .object_attributes(ObjectAttributes::ObjectSize)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
 fn test_get_object_attributes_missing_key_uses_list_bucket_policy_for_404_vs_403() {
     s3_tests::run(async {
         let client = CTX.client();

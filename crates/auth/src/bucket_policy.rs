@@ -611,9 +611,19 @@ impl PolicyStatement {
     }
 
     fn conditions_supported_for_evaluable_object_actions(&self) -> bool {
-        self.conditions
+        EVALUABLE_OBJECT_POLICY_ACTIONS
             .iter()
-            .all(condition_clause_supported_for_evaluable_object_actions)
+            .copied()
+            .filter(|action| {
+                self.actions
+                    .iter()
+                    .any(|pattern| action_pattern_matches(pattern, action.as_str()))
+            })
+            .all(|action| {
+                self.conditions.iter().all(|clause| {
+                    condition_clause_supported_for_evaluable_object_action(action, clause)
+                })
+            })
     }
 
     fn condition_match_result(&self, request: &PolicyRequest<'_>) -> ConditionMatchResult {
@@ -1318,11 +1328,15 @@ fn condition_clause_matches_request(
     }
 }
 
-fn condition_clause_supported_for_evaluable_object_actions(clause: &PolicyConditionClause) -> bool {
+fn condition_clause_supported_for_evaluable_object_action(
+    action: PolicyAction,
+    clause: &PolicyConditionClause,
+) -> bool {
     (matches!(
         clause.operator.as_str(),
         "StringEquals" | "StringEqualsIfExists"
-    ) && clause.key.starts_with("s3:ExistingObjectTag/"))
+    ) && clause.key.starts_with("s3:ExistingObjectTag/")
+        && existing_object_tag_condition_supported_for_action(action))
         || (evaluable_string_condition_operator_supported(clause.operator.as_str())
             && matches!(
                 clause.key.as_str(),
@@ -1345,6 +1359,13 @@ fn existing_object_tag_condition_evaluable_for_action(action: PolicyAction) -> b
     !matches!(
         action,
         PolicyAction::GetObjectAttributes | PolicyAction::GetObjectVersionAttributes
+    )
+}
+
+fn existing_object_tag_condition_supported_for_action(action: PolicyAction) -> bool {
+    !matches!(
+        action,
+        PolicyAction::GetObjectRetention | PolicyAction::GetObjectLegalHold
     )
 }
 
@@ -2424,21 +2445,33 @@ mod tests {
     }
 
     #[test]
-    fn get_object_retention_existing_tag_condition_matches() {
+    fn get_object_retention_existing_tag_condition_is_rejected() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObjectRetention","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
         )
         .unwrap();
-        let tags = [PolicyTag::new("security", "public")];
-        let request = request(
-            PolicyAction::GetObjectRetention,
-            "bucket",
-            "key",
-            Some("caller"),
-            &tags,
-        );
 
-        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn get_object_legal_hold_existing_tag_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObjectLegalHold","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
     }
 
     #[test]
