@@ -2062,6 +2062,108 @@ fn test_delete_tags_obj_public() {
 }
 
 #[test]
+fn test_bucket_policy_delete_obj_tagging_existing_tag() {
+    let _guard = BUCKET_POLICY_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let public_key = "publictag-delete";
+        let private_key = "privatetag-delete";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        for key in [public_key, private_key] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"data"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let policy = bucket_policy_document(
+            principal,
+            "s3:DeleteObjectTagging",
+            bucket_wildcard_resource(&bucket),
+            Some(json!({
+                "StringEquals": {
+                    "s3:ExistingObjectTag/security": "public"
+                }
+            })),
+        );
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(public_key)
+            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(private_key)
+            .tagging(tagging(vec![tag("security", "private")]))
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .delete_object_tagging()
+            .bucket(&bucket)
+            .key(public_key)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = alt_client
+            .delete_object_tagging()
+            .bucket(&bucket)
+            .key(private_key)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let public_tags = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(public_key)
+            .send()
+            .await
+            .unwrap();
+        assert!(public_tags.tag_set().is_empty());
+
+        let private_tags = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(private_key)
+            .send()
+            .await
+            .unwrap();
+        assert!(private_tags
+            .tag_set()
+            .iter()
+            .any(|tag| tag.key() == "security" && tag.value() == "private"));
+
+        cleanup(&bucket, &[public_key, private_key]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_get_obj_existing_tag() {
     let _guard = BUCKET_POLICY_TEST_GUARD
         .lock()
@@ -2515,6 +2617,138 @@ fn test_bucket_policy_put_obj_version_tagging_request_object_tag() {
             .await
             .unwrap();
         assert_tag_sets_match_unordered(stored.tag_set(), public_tags.tag_set());
+
+        cleanup_versioned_bucket(CTX.client(), &bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_delete_obj_version_tagging_existing_tag() {
+    let _guard = BUCKET_POLICY_TEST_GUARD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let bucket = unique_bucket();
+        let public_key = "publictag-version-delete";
+        let private_key = "privatetag-version-delete";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let public_version = client
+            .put_object()
+            .bucket(&bucket)
+            .key(public_key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected version id")
+            .to_string();
+        let private_version = client
+            .put_object()
+            .bucket(&bucket)
+            .key(private_key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected version id")
+            .to_string();
+
+        let policy = bucket_policy_document(
+            principal,
+            "s3:DeleteObjectVersionTagging",
+            bucket_wildcard_resource(&bucket),
+            Some(json!({
+                "StringEquals": {
+                    "s3:ExistingObjectTag/security": "public"
+                }
+            })),
+        );
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(public_key)
+            .version_id(&public_version)
+            .tagging(tagging(vec![tag("security", "public"), tag("foo", "bar")]))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(private_key)
+            .version_id(&private_version)
+            .tagging(tagging(vec![tag("security", "private")]))
+            .send()
+            .await
+            .unwrap();
+
+        alt_client
+            .delete_object_tagging()
+            .bucket(&bucket)
+            .key(public_key)
+            .version_id(&public_version)
+            .send()
+            .await
+            .unwrap();
+
+        let denied = alt_client
+            .delete_object_tagging()
+            .bucket(&bucket)
+            .key(private_key)
+            .version_id(&private_version)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let public_tags = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(public_key)
+            .version_id(&public_version)
+            .send()
+            .await
+            .unwrap();
+        assert!(public_tags.tag_set().is_empty());
+
+        let private_tags = client
+            .get_object_tagging()
+            .bucket(&bucket)
+            .key(private_key)
+            .version_id(&private_version)
+            .send()
+            .await
+            .unwrap();
+        assert!(private_tags
+            .tag_set()
+            .iter()
+            .any(|tag| tag.key() == "security" && tag.value() == "private"));
 
         cleanup_versioned_bucket(CTX.client(), &bucket).await;
     });

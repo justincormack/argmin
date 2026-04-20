@@ -65,6 +65,41 @@ family. Its behavior is action-specific in at least three ways:
 - accepted but non-evaluable
 - policy-invalid
 
+The next delete/tagging row is also now AWS-pinned:
+
+- `DeleteObject`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- `DeleteObjectVersion`
+  - same shape as `DeleteObject`
+  - policy rejected at `PutBucketPolicy` with `MalformedPolicy`
+- `DeleteObjectTagging`
+  - policy accepted
+  - condition is fully evaluable
+- `DeleteObjectVersionTagging`
+  - same shape as `DeleteObjectTagging`
+  - policy accepted
+  - condition is fully evaluable
+
+So even closely-related mutation actions can split sharply:
+
+- delete actions: policy-invalid
+- delete-tagging actions: fully evaluable
+
+The object-lock mutation row is now partially AWS-pinned too:
+
+- `PutObjectRetention`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
+- `BypassGovernanceRetention`
+  - same shape as `PutObjectRetention`
+  - policy rejected at `PutBucketPolicy` with `MalformedPolicy`
+
+This reinforces the current pattern:
+
+- object-lock actions so far are policy-invalid for `ExistingObjectTag`
+- tagging actions remain fully evaluable
+
 ## Scope
 
 Focus first on bucket-policy condition families that depend on object state or

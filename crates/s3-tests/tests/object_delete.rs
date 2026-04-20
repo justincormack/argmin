@@ -3,9 +3,10 @@ use aws_sdk_s3::types::{
     BucketVersioningStatus, Delete, ObjectIdentifier, VersioningConfiguration,
 };
 use s3_tests::{
-    create_objects, create_objects_with_keys, delete_all_and_bucket, delete_objects_with_md5,
-    err_status, unique_bucket, CTX,
+    assert_s3_err_code, create_objects, create_objects_with_keys, delete_all_and_bucket,
+    delete_objects_with_md5, err_status, unique_bucket, CTX,
 };
+use serde_json::json;
 
 // ── Local helpers ───────────────────────────────────────────────────
 
@@ -53,6 +54,27 @@ fn get_keys(objects: &[aws_sdk_s3::types::Object]) -> Vec<String> {
         .collect()
 }
 
+fn object_resource(bucket: &str, key: &str) -> String {
+    format!("arn:aws:s3:::{bucket}/{key}")
+}
+
+fn alt_policy_principal() -> serde_json::Value {
+    json!({ "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) })
+}
+
+fn object_tagging(key: &str, value: &str) -> aws_sdk_s3::types::Tagging {
+    aws_sdk_s3::types::Tagging::builder()
+        .tag_set(
+            aws_sdk_s3::types::Tag::builder()
+                .key(key)
+                .value(value)
+                .build()
+                .unwrap(),
+        )
+        .build()
+        .unwrap()
+}
+
 // ── Multi-object delete ─────────────────────────────────────────────
 
 #[test]
@@ -76,6 +98,177 @@ fn test_multi_object_delete() {
         assert!(list.contents().is_empty());
 
         client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_policy_delete_object_existing_tag_condition_is_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let public_key = "public-delete";
+        let private_key = "private-delete";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        for key in [public_key, private_key] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"data"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(public_key)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(private_key)
+            .tagging(object_tagging("security", "private"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:DeleteObject",
+                        "Resource": [object_resource(&bucket, public_key), object_resource(&bucket, private_key)],
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:ExistingObjectTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(private_key)
+            .send()
+            .await
+            .unwrap();
+        client
+            .delete_object()
+            .bucket(&bucket)
+            .key(public_key)
+            .send()
+            .await
+            .unwrap();
+        client.delete_bucket().bucket(&bucket).send().await.unwrap();
+    });
+}
+
+#[test]
+fn test_bucket_policy_delete_object_version_existing_tag_condition_is_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let public_key = "public-version-delete";
+        let private_key = "private-version-delete";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_bucket_versioning()
+            .bucket(&bucket)
+            .versioning_configuration(
+                VersioningConfiguration::builder()
+                    .status(BucketVersioningStatus::Enabled)
+                    .build(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let public_version = client
+            .put_object()
+            .bucket(&bucket)
+            .key(public_key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected version id")
+            .to_string();
+        let private_version = client
+            .put_object()
+            .bucket(&bucket)
+            .key(private_key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected version id")
+            .to_string();
+
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(public_key)
+            .version_id(&public_version)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(private_key)
+            .version_id(&private_version)
+            .tagging(object_tagging("security", "private"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:DeleteObjectVersion",
+                        "Resource": [object_resource(&bucket, public_key), object_resource(&bucket, private_key)],
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:ExistingObjectTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        cleanup_versioned_bucket(&bucket).await;
     });
 }
 

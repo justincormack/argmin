@@ -255,6 +255,26 @@ impl GeneratedActionPattern {
             Self::Literal(value) => value,
         }
     }
+
+    fn supports_condition(self, key: GeneratedConditionKey) -> bool {
+        match key {
+            GeneratedConditionKey::ExistingTagClassification
+            | GeneratedConditionKey::ExistingTagRegion => {
+                !matches!(self, Self::Literal("s3:DeleteObject"))
+            }
+            GeneratedConditionKey::RequestTagTeam => true,
+            GeneratedConditionKey::CopySource
+            | GeneratedConditionKey::MetadataDirective
+            | GeneratedConditionKey::CannedAcl
+            | GeneratedConditionKey::ServerSideEncryption
+            | GeneratedConditionKey::SseCustomerAlgorithm
+            | GeneratedConditionKey::GrantRead
+            | GeneratedConditionKey::GrantWrite
+            | GeneratedConditionKey::GrantReadAcp
+            | GeneratedConditionKey::GrantWriteAcp
+            | GeneratedConditionKey::GrantFullControl => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -836,9 +856,14 @@ fn generated_statement_strategy() -> impl Strategy<Value = GeneratedStatement> {
         proptest::collection::vec(generated_condition_clause_strategy(), 0..=2),
     )
         .prop_map(
-            |(effect, principal, mut actions, mut resources, conditions)| {
+            |(effect, principal, mut actions, mut resources, mut conditions)| {
                 dedup_actions(&mut actions);
                 dedup_resources(&mut resources);
+                conditions.retain(|clause| {
+                    actions
+                        .iter()
+                        .all(|action| action.supports_condition(clause.key))
+                });
                 GeneratedStatement {
                     effect,
                     principal,
@@ -848,6 +873,33 @@ fn generated_statement_strategy() -> impl Strategy<Value = GeneratedStatement> {
                 }
             },
         )
+}
+
+fn generated_invalid_statement_strategy() -> impl Strategy<Value = GeneratedStatement> {
+    (
+        prop_oneof![Just(GeneratedEffect::Allow), Just(GeneratedEffect::Deny)],
+        generated_principal_strategy(),
+        generated_action_pattern_strategy(),
+        generated_condition_clause_strategy(),
+    )
+        .prop_filter(
+            "action and condition must be validation-incompatible",
+            |(_, _, action, clause)| {
+                matches!(action, GeneratedActionPattern::Literal("s3:DeleteObject"))
+                    && matches!(
+                        clause.key,
+                        GeneratedConditionKey::ExistingTagClassification
+                            | GeneratedConditionKey::ExistingTagRegion
+                    )
+            },
+        )
+        .prop_map(|(effect, principal, action, clause)| GeneratedStatement {
+            effect,
+            principal,
+            actions: vec![action],
+            resources: vec![GeneratedResourcePattern::ObjectBucketWildcard(BUCKET)],
+            conditions: vec![clause],
+        })
 }
 
 fn generated_principal_strategy() -> impl Strategy<Value = GeneratedPrincipal> {
@@ -1154,6 +1206,22 @@ proptest! {
         let original_eval = evaluate_generated(&policy, &case.request);
         let reversed_eval = evaluate_generated(&reversed, &case.request);
         prop_assert_eq!(reversed_eval, original_eval, "statement reordering changed evaluation\noriginal={}\nreversed={}\nrequest={}", case.policy.render(RenderStyle::CompactSingletons), case.policy.reversed().render(RenderStyle::CompactSingletons), case.request.render_builder());
+    }
+
+    #[test]
+    fn bucket_policy_differential_validation_rejects_invalid_action_condition_pairs(
+        statement in generated_invalid_statement_strategy(),
+    ) {
+        let policy = GeneratedPolicy {
+            statements: vec![statement],
+        };
+        let error = parse_generated_policy(&policy, RenderStyle::CompactSingletons)
+            .expect_err("invalid generated policy must be rejected");
+        prop_assert!(
+            error.contains("unsupported Condition for currently enforced bucket policy action"),
+            "unexpected validation error for invalid generated policy\npolicy={}\nerror={error}",
+            policy.render(RenderStyle::CompactSingletons),
+        );
     }
 
     #[test]
