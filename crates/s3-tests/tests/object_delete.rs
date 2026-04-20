@@ -273,6 +273,60 @@ fn test_bucket_policy_delete_object_version_existing_tag_condition_is_rejected()
 }
 
 #[test]
+fn test_bucket_policy_delete_and_delete_tagging_existing_tag_condition_is_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let key = "mixed-delete-action";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": ["s3:DeleteObject", "s3:DeleteObjectTagging"],
+                        "Resource": object_resource(&bucket, key),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:ExistingObjectTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        delete_all_and_bucket(client, &bucket, &[key.to_string()]).await;
+    });
+}
+
+#[test]
 fn test_multi_objectv2_delete() {
     s3_tests::run(async {
         let client = CTX.client();

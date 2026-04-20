@@ -755,13 +755,15 @@ impl Coordinator {
             return Ok(auth::PolicyEvaluation::NoMatch);
         };
 
-        let existing_tags = if policy.requires_existing_object_tags_for_action(action) {
-            Self::parse_policy_existing_object_tags(object)?
+        let existing_tags_required = policy.requires_existing_object_tags_for_action(action);
+        let existing_tags = if existing_tags_required {
+            Some(Self::parse_policy_existing_object_tags(object)?)
         } else {
-            Vec::new()
+            None
         };
         let existing_tags: Vec<auth::PolicyTag<'_>> = existing_tags
             .iter()
+            .flat_map(|tags| tags.iter())
             .map(|(key, value)| auth::PolicyTag::new(key, value))
             .collect();
         let request_object_tags = if policy.requires_request_object_tags_for_action(action) {
@@ -776,15 +778,19 @@ impl Coordinator {
             .iter()
             .map(|(key, value)| auth::PolicyTag::new(key, value))
             .collect();
-        let request = auth::PolicyRequest::new(
+        let request = auth::PolicyRequest::for_object(
             action,
             bucket.name.as_str(),
             object.key().as_str(),
             requester.principal_opt(),
             requester.canonical_user_id(),
+            if existing_tags_required {
+                auth::bucket_policy::ExistingObjectTags::Available(&existing_tags)
+            } else {
+                auth::bucket_policy::ExistingObjectTags::Unavailable
+            },
         );
         let request = request
-            .with_existing_object_tags(&existing_tags)
             .with_request_object_tags(&request_object_tags)
             .with_copy_source(policy_context.copy_source)
             .with_metadata_directive(policy_context.metadata_directive)
@@ -814,12 +820,13 @@ impl Coordinator {
             return auth::PolicyEvaluation::NoMatch;
         };
 
-        let request = auth::PolicyRequest::new(
+        let request = auth::PolicyRequest::for_object(
             action,
             bucket.name.as_str(),
             key,
             requester.principal_opt(),
             requester.canonical_user_id(),
+            auth::bucket_policy::ExistingObjectTags::Unavailable,
         );
         policy.evaluate(&request)
     }
@@ -893,12 +900,13 @@ impl Coordinator {
             .iter()
             .map(|(tag_key, value)| auth::PolicyTag::new(tag_key, value))
             .collect();
-        let request = auth::PolicyRequest::new(
+        let request = auth::PolicyRequest::for_object(
             action,
             bucket.name.as_str(),
             key,
             requester.principal_opt(),
             requester.canonical_user_id(),
+            auth::bucket_policy::ExistingObjectTags::Unavailable,
         )
         .with_request_object_tags(&request_object_tags)
         .with_copy_source(policy_context.copy_source)

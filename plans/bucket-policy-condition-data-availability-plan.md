@@ -35,6 +35,28 @@ So the matrix needs to classify at least three distinct outcomes:
 - accepted but not evaluable for the action
 - rejected at policy write time as an invalid condition/action combination
 
+There is now a second modeling distinction to preserve inside auth:
+
+- data unavailable to this request path
+- data available, but no matching value present
+
+Those are not the same state. In particular:
+
+- `ExistingObjectTag` on `GetObjectAttributes` is an AWS semantic:
+  - policy accepted
+  - condition family accepted
+  - action does not make tag data available for evaluation
+- forgetting to preload tags for an action that is supposed to evaluate them is
+  an internal bug:
+  - the request should carry an explicit `Unavailable` state
+  - the evaluator must not collapse that to “available but empty”
+
+So the auth model has to represent three layers separately:
+
+- policy validity
+- request-time condition data availability
+- condition value matching
+
 ## Findings So Far
 
 The first `s3:ExistingObjectTag/*` row is now AWS-pinned:
@@ -99,6 +121,15 @@ This reinforces the current pattern:
 
 - object-lock actions so far are policy-invalid for `ExistingObjectTag`
 - tagging actions remain fully evaluable
+
+One more regression shape also needs to be pinned directly:
+
+- mixed-action statements that combine one policy-invalid action with one valid
+  action, for example:
+  - `["s3:DeleteObject", "s3:DeleteObjectTagging"]`
+  - with `s3:ExistingObjectTag/*`
+- these should be rejected at `PutBucketPolicy` if any matched action in the
+  statement makes the condition/action combination invalid
 
 ## Scope
 
@@ -223,8 +254,10 @@ evaluability centrally rather than via per-action ad hoc checks.
 Implementation goal:
 
 - model condition-family-by-action evaluability explicitly
+- model request-time condition inputs explicitly as available vs unavailable
 - keep “accepted but not evaluable” distinct from “unsupported condition”
 - keep “policy-invalid for this action” distinct from both of the above
+- keep “input unavailable at runtime” distinct from “available but missing”
 - use the same matrix to drive any prefetch decisions for object tags or other
   policy inputs
 
@@ -233,6 +266,7 @@ Acceptance criteria:
 - the auth layer can explain every special-case action by a small evaluability
   table
 - no current behavior depends on hidden “don’t load this field” shortcuts
+- request construction cannot silently encode “unavailable” as an empty set
 
 ## Verification
 

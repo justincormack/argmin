@@ -1,5 +1,6 @@
 use auth::bucket_policy::{
-    parse_bucket_policy, BucketPolicy, PolicyAction, PolicyEvaluation, PolicyRequest, PolicyTag,
+    parse_bucket_policy, BucketPolicy, ExistingObjectTags, PolicyAction, PolicyEvaluation,
+    PolicyRequest, PolicyTag,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence};
@@ -417,21 +418,30 @@ struct GeneratedRequest {
 impl GeneratedRequest {
     fn render_builder(&self) -> String {
         let mut out = format!(
-            "PolicyRequest::new(PolicyAction::{}, \"{}\", \"{}\", {:?}, requester_canonical.as_ref())",
+            "PolicyRequest::for_object(PolicyAction::{}, \"{}\", \"{}\", {:?}, requester_canonical.as_ref(), ExistingObjectTags::{})",
             self.action.variant_name(),
             BUCKET,
             KEY,
-            self.requester.principal()
+            self.requester.principal(),
+            if self.existing_tags.is_empty() {
+                "Unavailable"
+            } else {
+                "Available(&[])"
+            }
         );
         if !self.existing_tags.is_empty() {
-            out.push_str(&format!(
-                ".with_existing_object_tags(&[{}])",
+            out = format!(
+                "PolicyRequest::for_object(PolicyAction::{}, \"{}\", \"{}\", {:?}, requester_canonical.as_ref(), ExistingObjectTags::Available(&[{}]))",
+                self.action.variant_name(),
+                BUCKET,
+                KEY,
+                self.requester.principal(),
                 self.existing_tags
                     .iter()
                     .map(|(k, v)| format!("PolicyTag::new({k:?}, {v:?})"))
                     .collect::<Vec<_>>()
                     .join(", ")
-            ));
+            );
         }
         if !self.request_tags.is_empty() {
             out.push_str(&format!(
@@ -722,14 +732,18 @@ fn evaluate_generated(policy: &BucketPolicy, generated: &GeneratedRequest) -> Po
         .map(|(key, value)| PolicyTag::new(key.as_str(), value.as_str()))
         .collect::<Vec<_>>();
 
-    let request = PolicyRequest::new(
+    let request = PolicyRequest::for_object(
         generated.action.policy_action(),
         BUCKET,
         KEY,
         generated.requester.principal(),
         requester_canonical.as_ref(),
+        if existing_tags.is_empty() {
+            ExistingObjectTags::Unavailable
+        } else {
+            ExistingObjectTags::Available(&existing_tags)
+        },
     )
-    .with_existing_object_tags(&existing_tags)
     .with_request_object_tags(&request_tags)
     .with_copy_source(generated.copy_source.as_deref())
     .with_metadata_directive(generated.metadata_directive.as_deref())
@@ -1450,7 +1464,14 @@ fn bucket_policy_differential_phase2_bucket_vs_object_resource_applicability_mat
                 );
             } else {
                 let policy = policy.expect("object action applicability policy parses");
-                let request = PolicyRequest::new(action, BUCKET, KEY, Some(ALT_USER), None);
+                let request = PolicyRequest::for_object(
+                    action,
+                    BUCKET,
+                    KEY,
+                    Some(ALT_USER),
+                    None,
+                    ExistingObjectTags::Unavailable,
+                );
                 assert_eq!(
                     policy.evaluate(&request),
                     PolicyEvaluation::ExplicitAllow,

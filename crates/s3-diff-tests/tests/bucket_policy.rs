@@ -163,9 +163,19 @@ impl LocalRequest {
         let request = if self.bucket_resource {
             PolicyRequest::for_bucket(self.action, bucket, Some(principal), None)
         } else {
-            PolicyRequest::new(self.action, bucket, "key", Some(principal), None)
+            PolicyRequest::for_object(
+                self.action,
+                bucket,
+                "key",
+                Some(principal),
+                None,
+                if existing_tags.is_empty() {
+                    auth::bucket_policy::ExistingObjectTags::Unavailable
+                } else {
+                    auth::bucket_policy::ExistingObjectTags::Available(&existing_tags)
+                },
+            )
         }
-        .with_existing_object_tags(&existing_tags)
         .with_request_object_tags(&request_tags)
         .with_copy_source(self.copy_source.as_deref())
         .with_metadata_directive(self.metadata_directive)

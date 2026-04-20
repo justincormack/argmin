@@ -236,6 +236,12 @@ impl<'a> PolicyTag<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExistingObjectTags<'a> {
+    Unavailable,
+    Available(&'a [PolicyTag<'a>]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyRequest<'a> {
     action: PolicyAction,
     bucket: &'a str,
@@ -243,7 +249,7 @@ pub struct PolicyRequest<'a> {
     bucket_resource: bool,
     requester_principal: Option<&'a str>,
     requester_canonical_user_id: Option<&'a CanonicalUserId>,
-    existing_object_tags: &'a [PolicyTag<'a>],
+    existing_object_tags: ExistingObjectTags<'a>,
     request_object_tags: &'a [PolicyTag<'a>],
     copy_source: Option<&'a str>,
     metadata_directive: Option<&'a str>,
@@ -259,12 +265,13 @@ pub struct PolicyRequest<'a> {
 
 impl<'a> PolicyRequest<'a> {
     #[must_use]
-    pub const fn new(
+    pub const fn for_object(
         action: PolicyAction,
         bucket: &'a str,
         key: &'a str,
         requester_principal: Option<&'a str>,
         requester_canonical_user_id: Option<&'a CanonicalUserId>,
+        existing_object_tags: ExistingObjectTags<'a>,
     ) -> Self {
         Self {
             action,
@@ -273,7 +280,7 @@ impl<'a> PolicyRequest<'a> {
             bucket_resource: false,
             requester_principal,
             requester_canonical_user_id,
-            existing_object_tags: &[],
+            existing_object_tags,
             request_object_tags: &[],
             copy_source: None,
             metadata_directive: None,
@@ -302,7 +309,7 @@ impl<'a> PolicyRequest<'a> {
             bucket_resource: true,
             requester_principal,
             requester_canonical_user_id,
-            existing_object_tags: &[],
+            existing_object_tags: ExistingObjectTags::Unavailable,
             request_object_tags: &[],
             copy_source: None,
             metadata_directive: None,
@@ -347,17 +354,13 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
-    fn existing_object_tag_value(&self, key: &str) -> Option<&'a str> {
-        self.existing_object_tags
-            .iter()
-            .find(|tag| tag.key == key)
-            .map(|tag| tag.value)
-    }
-
-    #[must_use]
-    pub fn with_existing_object_tags(mut self, existing_object_tags: &'a [PolicyTag<'a>]) -> Self {
-        self.existing_object_tags = existing_object_tags;
-        self
+    fn existing_object_tag_value(&self, key: &str) -> ExistingObjectTagValue<'a> {
+        match self.existing_object_tags {
+            ExistingObjectTags::Unavailable => ExistingObjectTagValue::Unavailable,
+            ExistingObjectTags::Available(tags) => ExistingObjectTagValue::Available(
+                tags.iter().find(|tag| tag.key == key).map(|tag| tag.value),
+            ),
+        }
     }
 
     #[must_use]
@@ -568,6 +571,7 @@ impl PolicyStatement {
             ConditionMatchResult::Matches => Some(self.effect),
             ConditionMatchResult::NoMatch => None,
             ConditionMatchResult::AcceptedButNotEvaluable => None,
+            ConditionMatchResult::InputUnavailable => None,
             ConditionMatchResult::Unsupported => {
                 (self.effect == PolicyEffect::Deny).then_some(PolicyEffect::Deny)
             }
@@ -629,6 +633,7 @@ impl PolicyStatement {
     fn condition_match_result(&self, request: &PolicyRequest<'_>) -> ConditionMatchResult {
         let mut saw_unsupported = false;
         let mut saw_accepted_but_not_evaluable = false;
+        let mut saw_input_unavailable = false;
         for clause in &self.conditions {
             match condition_clause_matches_request(clause, request) {
                 ConditionMatchResult::Matches => {}
@@ -636,11 +641,16 @@ impl PolicyStatement {
                 ConditionMatchResult::AcceptedButNotEvaluable => {
                     saw_accepted_but_not_evaluable = true;
                 }
+                ConditionMatchResult::InputUnavailable => {
+                    saw_input_unavailable = true;
+                }
                 ConditionMatchResult::Unsupported => saw_unsupported = true,
             }
         }
         if saw_unsupported {
             ConditionMatchResult::Unsupported
+        } else if saw_input_unavailable {
+            ConditionMatchResult::InputUnavailable
         } else if saw_accepted_but_not_evaluable {
             ConditionMatchResult::AcceptedButNotEvaluable
         } else {
@@ -720,10 +730,17 @@ const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 22] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExistingObjectTagValue<'a> {
+    Unavailable,
+    Available(Option<&'a str>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ConditionMatchResult {
     Matches,
     NoMatch,
     AcceptedButNotEvaluable,
+    InputUnavailable,
     Unsupported,
 }
 
@@ -1299,7 +1316,12 @@ fn condition_clause_matches_request(
         if !existing_object_tag_condition_evaluable_for_action(request.action()) {
             return ConditionMatchResult::AcceptedButNotEvaluable;
         }
-        return string_equals_condition_matches(clause, request.existing_object_tag_value(tag_key));
+        return match request.existing_object_tag_value(tag_key) {
+            ExistingObjectTagValue::Unavailable => ConditionMatchResult::InputUnavailable,
+            ExistingObjectTagValue::Available(actual) => {
+                string_equals_condition_matches(clause, actual)
+            }
+        };
     }
     if let Some(tag_key) = clause.key.strip_prefix("s3:RequestObjectTag/") {
         return string_condition_matches(clause, request.request_object_tag_value(tag_key));
@@ -1651,8 +1673,14 @@ mod tests {
         requester_principal: Option<&'a str>,
         existing_object_tags: &'a [PolicyTag<'a>],
     ) -> PolicyRequest<'a> {
-        PolicyRequest::new(action, bucket, key, requester_principal, None)
-            .with_existing_object_tags(existing_object_tags)
+        PolicyRequest::for_object(
+            action,
+            bucket,
+            key,
+            requester_principal,
+            None,
+            ExistingObjectTags::Available(existing_object_tags),
+        )
     }
 
     fn bucket_request<'a>(
@@ -1973,6 +2001,39 @@ mod tests {
     }
 
     #[test]
+    fn existing_object_tag_condition_unavailable_input_is_distinct_from_missing_tag() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let unavailable_request = PolicyRequest::for_object(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        );
+        let available_empty_tags: [PolicyTag<'_>; 0] = [];
+        let available_request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            &available_empty_tags,
+        );
+
+        assert_eq!(
+            policy.statements[0].condition_match_result(&unavailable_request),
+            ConditionMatchResult::InputUnavailable
+        );
+        assert_eq!(
+            policy.statements[0].condition_match_result(&available_request),
+            ConditionMatchResult::NoMatch
+        );
+    }
+
+    #[test]
     fn existing_object_tag_condition_is_not_evaluable_for_get_object_attributes() {
         let allow_policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObjectAttributes","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
@@ -2017,6 +2078,21 @@ mod tests {
     }
 
     #[test]
+    fn mixed_delete_and_delete_tagging_existing_tag_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:DeleteObject","s3:DeleteObjectTagging"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
     fn requires_request_object_tags_for_matching_action() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:RequestObjectTag/security":"public"}}},{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
@@ -2035,12 +2111,13 @@ mod tests {
         )
         .unwrap();
         let request_tags = [PolicyTag::new("security", "public")];
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         )
         .with_request_object_tags(&request_tags);
 
@@ -2053,12 +2130,13 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:RequestObjectTag/security":"true"}}}]}"#,
         )
         .unwrap();
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         );
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
@@ -2071,12 +2149,13 @@ mod tests {
         )
         .unwrap();
         let request_tags = [PolicyTag::new("security", "private")];
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         )
         .with_request_object_tags(&request_tags);
 
@@ -2089,12 +2168,13 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-grant-full-control":"id=owner-canonical-id"}}}]}"#,
         )
         .unwrap();
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         )
         .with_grant_full_control(Some("id=owner-canonical-id"));
 
@@ -2107,12 +2187,13 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-grant-full-control":"true"}}}]}"#,
         )
         .unwrap();
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         );
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
@@ -2124,12 +2205,13 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"s3:x-amz-grant-full-control":"id=owner-canonical-id"}}}]}"#,
         )
         .unwrap();
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         )
         .with_grant_full_control(Some("id=someone-else"));
 
@@ -2142,12 +2224,13 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-server-side-encryption-customer-algorithm":"AES256"}}}]}"#,
         )
         .unwrap();
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         )
         .with_sse_customer_algorithm(Some("AES256"));
 
@@ -2160,12 +2243,13 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-server-side-encryption-customer-algorithm":"true"}}}]}"#,
         )
         .unwrap();
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         );
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
@@ -2177,12 +2261,13 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"s3:x-amz-server-side-encryption-customer-algorithm":"AES256"}}}]}"#,
         )
         .unwrap();
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         )
         .with_sse_customer_algorithm(Some("AES192"));
 
@@ -2195,12 +2280,13 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-server-side-encryption":"AES256"}}}]}"#,
         )
         .unwrap();
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         )
         .with_server_side_encryption(Some("AES256"));
 
@@ -2213,12 +2299,13 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"Null":{"s3:x-amz-server-side-encryption":"true"}}}]}"#,
         )
         .unwrap();
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         );
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
@@ -2230,12 +2317,13 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringNotEquals":{"s3:x-amz-server-side-encryption":"AES256"}}}]}"#,
         )
         .unwrap();
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         )
         .with_server_side_encryption(Some("aws:kms"));
 
@@ -2315,9 +2403,15 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::dst/*","Condition":{"StringLike":{"s3:x-amz-copy-source":"src/public/*"}}}]}"#,
         )
         .unwrap();
-        let request =
-            PolicyRequest::new(PolicyAction::PutObject, "dst", "key", Some("caller"), None)
-                .with_copy_source(Some("src/public/foo"));
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "dst",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_copy_source(Some("src/public/foo"));
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
     }
@@ -2328,8 +2422,14 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::dst/*","Condition":{"StringLikeIfExists":{"s3:x-amz-copy-source":"src/public/*"}}}]}"#,
         )
         .unwrap();
-        let request =
-            PolicyRequest::new(PolicyAction::PutObject, "dst", "key", Some("caller"), None);
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "dst",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        );
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
         assert_eq!(policy.validate_evaluable_object_conditions(), Ok(()));
@@ -2341,9 +2441,15 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::dst/*","Condition":{"StringLikeIfExists":{"s3:x-amz-copy-source":"src/public/*"}}}]}"#,
         )
         .unwrap();
-        let request =
-            PolicyRequest::new(PolicyAction::PutObject, "dst", "key", Some("caller"), None)
-                .with_copy_source(Some("src/private/foo"));
+        let request = PolicyRequest::for_object(
+            PolicyAction::PutObject,
+            "dst",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        )
+        .with_copy_source(Some("src/private/foo"));
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
     }
@@ -2354,19 +2460,21 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:x-amz-metadata-directive":"COPY"}}}]}"#,
         )
         .unwrap();
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         );
-        let explicit_copy = PolicyRequest::new(
+        let explicit_copy = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         )
         .with_metadata_directive(Some("COPY"));
 
@@ -2383,12 +2491,13 @@ mod tests {
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringLike":{"s3:x-amz-acl":"public*"}}}]}"#,
         )
         .unwrap();
-        let request = PolicyRequest::new(
+        let request = PolicyRequest::for_object(
             PolicyAction::PutObject,
             "bucket",
             "key",
             Some("caller"),
             None,
+            ExistingObjectTags::Unavailable,
         )
         .with_canned_acl(Some("public-read"));
 
