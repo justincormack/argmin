@@ -9,9 +9,9 @@ use s3_tests::{
         error::ProvideErrorMetadata,
         primitives::ByteStream,
         types::{
-            BucketLocationConstraint, CreateBucketConfiguration, MetadataDirective,
-            ObjectCannedAcl, ObjectOwnership, OwnershipControls, OwnershipControlsRule,
-            ServerSideEncryption, Tag, Tagging,
+            BucketCannedAcl, BucketLocationConstraint, CreateBucketConfiguration,
+            MetadataDirective, ObjectAttributes, ObjectCannedAcl, ObjectOwnership,
+            OwnershipControls, OwnershipControlsRule, ServerSideEncryption, Tag, Tagging,
         },
         Client,
     },
@@ -35,17 +35,45 @@ struct PutObjectShape {
     server_side_encryption: Option<&'static str>,
     sse_customer_algorithm: Option<&'static str>,
     grant_read: Option<String>,
+    grant_write: Option<String>,
+    grant_read_acp: Option<String>,
+    grant_write_acp: Option<String>,
+    grant_full_control: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AclMutationShape {
+    canned_acl: Option<&'static str>,
+    grant_read: Option<String>,
+    grant_write: Option<String>,
+    grant_read_acp: Option<String>,
+    grant_write_acp: Option<String>,
+    grant_full_control: Option<String>,
 }
 
 #[derive(Clone, Debug)]
 enum ScenarioOperation {
     PutObject(PutObjectShape),
+    GetObject {
+        key: &'static str,
+    },
+    GetObjectAcl {
+        key: &'static str,
+    },
+    GetObjectAttributes {
+        key: &'static str,
+    },
     GetObjectTagging {
         key: &'static str,
     },
     PutObjectTagging {
         key: &'static str,
         request_tag: &'static str,
+    },
+    PutBucketAcl(AclMutationShape),
+    PutObjectAcl {
+        key: &'static str,
+        acl: AclMutationShape,
     },
     CopyObjectCopySource {
         source_key: &'static str,
@@ -57,18 +85,38 @@ enum ScenarioOperation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GrantHeaderCondition {
+    Read,
+    Write,
+    ReadAcp,
+    WriteAcp,
+    FullControl,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExistingTagReadAction {
+    Object,
+    ObjectAcl,
+    ObjectAttributes,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PolicyShape {
+    ExistingTagRead(ExistingTagReadAction),
     GetObjectTaggingExistingPublic,
     PutObjectTaggingRequestPublic,
     PutObjectInlineTaggingRequestPublic,
     PutObjectAclPrivate,
     PutObjectGrantReadOwner,
+    PutBucketAclGrant(GrantHeaderCondition),
+    PutObjectAclGrant(GrantHeaderCondition),
     PutObjectSseAes256,
     PutObjectSseCustomerAlgorithmAes256,
     PutObjectAclNullDeny,
     PutObjectSseS3NullDeny,
     CopyObjectCopySourcePublic,
     CopyObjectMetadataDirectiveCopy,
+    CopyObjectCopySourcePublicAndMetadataDirectiveCopy,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +140,11 @@ struct LocalRequest {
     server_side_encryption: Option<&'static str>,
     sse_customer_algorithm: Option<&'static str>,
     grant_read: Option<String>,
+    grant_write: Option<String>,
+    grant_read_acp: Option<String>,
+    grant_write_acp: Option<String>,
+    grant_full_control: Option<String>,
+    bucket_resource: bool,
 }
 
 impl LocalRequest {
@@ -107,15 +160,23 @@ impl LocalRequest {
             .map(|(key, value)| PolicyTag::new(key, value))
             .collect::<Vec<_>>();
 
-        let request = PolicyRequest::new(self.action, bucket, "key", Some(principal), None)
-            .with_existing_object_tags(&existing_tags)
-            .with_request_object_tags(&request_tags)
-            .with_copy_source(self.copy_source.as_deref())
-            .with_metadata_directive(self.metadata_directive)
-            .with_canned_acl(self.canned_acl)
-            .with_server_side_encryption(self.server_side_encryption)
-            .with_sse_customer_algorithm(self.sse_customer_algorithm)
-            .with_grant_read(self.grant_read.as_deref());
+        let request = if self.bucket_resource {
+            PolicyRequest::for_bucket(self.action, bucket, Some(principal), None)
+        } else {
+            PolicyRequest::new(self.action, bucket, "key", Some(principal), None)
+        }
+        .with_existing_object_tags(&existing_tags)
+        .with_request_object_tags(&request_tags)
+        .with_copy_source(self.copy_source.as_deref())
+        .with_metadata_directive(self.metadata_directive)
+        .with_canned_acl(self.canned_acl)
+        .with_server_side_encryption(self.server_side_encryption)
+        .with_sse_customer_algorithm(self.sse_customer_algorithm)
+        .with_grant_read(self.grant_read.as_deref())
+        .with_grant_write(self.grant_write.as_deref())
+        .with_grant_read_acp(self.grant_read_acp.as_deref())
+        .with_grant_write_acp(self.grant_write_acp.as_deref())
+        .with_grant_full_control(self.grant_full_control.as_deref());
         policy.evaluate(&request)
     }
 }
@@ -183,8 +244,142 @@ fn object_resource(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}/*")
 }
 
+fn bucket_resource(bucket: &str) -> String {
+    format!("arn:aws:s3:::{bucket}")
+}
+
 fn alt_root_principal(account_id: &str) -> String {
     format!("arn:aws:iam::{account_id}:root")
+}
+
+impl GrantHeaderCondition {
+    fn policy_condition_key(self) -> &'static str {
+        match self {
+            Self::Read => "s3:x-amz-grant-read",
+            Self::Write => "s3:x-amz-grant-write",
+            Self::ReadAcp => "s3:x-amz-grant-read-acp",
+            Self::WriteAcp => "s3:x-amz-grant-write-acp",
+            Self::FullControl => "s3:x-amz-grant-full-control",
+        }
+    }
+
+    fn request_header_name(self) -> &'static str {
+        match self {
+            Self::Read => "x-amz-grant-read",
+            Self::Write => "x-amz-grant-write",
+            Self::ReadAcp => "x-amz-grant-read-acp",
+            Self::WriteAcp => "x-amz-grant-write-acp",
+            Self::FullControl => "x-amz-grant-full-control",
+        }
+    }
+}
+
+impl ExistingTagReadAction {
+    fn policy_action(self) -> PolicyAction {
+        match self {
+            Self::Object => PolicyAction::GetObject,
+            Self::ObjectAcl => PolicyAction::GetObjectAcl,
+            Self::ObjectAttributes => PolicyAction::GetObjectAttributes,
+        }
+    }
+}
+
+fn apply_grant_header_to_local_request(
+    request: &mut LocalRequest,
+    condition: GrantHeaderCondition,
+    value: String,
+) {
+    match condition {
+        GrantHeaderCondition::Read => request.grant_read = Some(value),
+        GrantHeaderCondition::Write => request.grant_write = Some(value),
+        GrantHeaderCondition::ReadAcp => request.grant_read_acp = Some(value),
+        GrantHeaderCondition::WriteAcp => request.grant_write_acp = Some(value),
+        GrantHeaderCondition::FullControl => request.grant_full_control = Some(value),
+    }
+}
+
+fn apply_grant_header_to_acl_shape(
+    shape: &mut AclMutationShape,
+    condition: GrantHeaderCondition,
+    value: String,
+) {
+    match condition {
+        GrantHeaderCondition::Read => shape.grant_read = Some(value),
+        GrantHeaderCondition::Write => shape.grant_write = Some(value),
+        GrantHeaderCondition::ReadAcp => shape.grant_read_acp = Some(value),
+        GrantHeaderCondition::WriteAcp => shape.grant_write_acp = Some(value),
+        GrantHeaderCondition::FullControl => shape.grant_full_control = Some(value),
+    }
+}
+
+fn put_object_grant_headers(shape: &PutObjectShape) -> Vec<(&'static str, String)> {
+    let mut headers = Vec::new();
+    if let Some(value) = &shape.grant_read {
+        headers.push((
+            GrantHeaderCondition::Read.request_header_name(),
+            value.clone(),
+        ));
+    }
+    if let Some(value) = &shape.grant_write {
+        headers.push((
+            GrantHeaderCondition::Write.request_header_name(),
+            value.clone(),
+        ));
+    }
+    if let Some(value) = &shape.grant_read_acp {
+        headers.push((
+            GrantHeaderCondition::ReadAcp.request_header_name(),
+            value.clone(),
+        ));
+    }
+    if let Some(value) = &shape.grant_write_acp {
+        headers.push((
+            GrantHeaderCondition::WriteAcp.request_header_name(),
+            value.clone(),
+        ));
+    }
+    if let Some(value) = &shape.grant_full_control {
+        headers.push((
+            GrantHeaderCondition::FullControl.request_header_name(),
+            value.clone(),
+        ));
+    }
+    headers
+}
+
+fn acl_mutation_grant_headers(shape: &AclMutationShape) -> Vec<(&'static str, String)> {
+    let mut headers = Vec::new();
+    if let Some(value) = &shape.grant_read {
+        headers.push((
+            GrantHeaderCondition::Read.request_header_name(),
+            value.clone(),
+        ));
+    }
+    if let Some(value) = &shape.grant_write {
+        headers.push((
+            GrantHeaderCondition::Write.request_header_name(),
+            value.clone(),
+        ));
+    }
+    if let Some(value) = &shape.grant_read_acp {
+        headers.push((
+            GrantHeaderCondition::ReadAcp.request_header_name(),
+            value.clone(),
+        ));
+    }
+    if let Some(value) = &shape.grant_write_acp {
+        headers.push((
+            GrantHeaderCondition::WriteAcp.request_header_name(),
+            value.clone(),
+        ));
+    }
+    if let Some(value) = &shape.grant_full_control {
+        headers.push((
+            GrantHeaderCondition::FullControl.request_header_name(),
+            value.clone(),
+        ));
+    }
+    headers
 }
 
 fn bucket_policy_document(
@@ -236,12 +431,41 @@ impl PolicyShape {
     fn requires_acl_capable_bucket(self) -> bool {
         matches!(
             self,
-            Self::PutObjectAclPrivate | Self::PutObjectGrantReadOwner | Self::PutObjectAclNullDeny
+            Self::PutObjectAclPrivate
+                | Self::PutObjectGrantReadOwner
+                | Self::PutObjectAclNullDeny
+                | Self::PutBucketAclGrant(_)
+                | Self::PutObjectAclGrant(_)
         )
     }
 
     fn render(self, bucket: &str, principal: &str, owner_canonical_id: &str) -> String {
         match self {
+            Self::ExistingTagRead(ExistingTagReadAction::ObjectAttributes) => serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": { "AWS": principal },
+                    "Action": ["s3:GetObject", "s3:GetObjectAttributes"],
+                    "Resource": object_resource(bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:ExistingObjectTag/security": "public"
+                        }
+                    },
+                }],
+            })
+            .to_string(),
+            Self::ExistingTagRead(action) => bucket_policy_document(
+                principal,
+                action.policy_action().as_str(),
+                object_resource(bucket),
+                serde_json::json!({
+                    "StringEquals": {
+                        "s3:ExistingObjectTag/security": "public"
+                    }
+                }),
+            ),
             Self::GetObjectTaggingExistingPublic => bucket_policy_document(
                 principal,
                 "s3:GetObjectTagging",
@@ -294,6 +518,26 @@ impl PolicyShape {
                 serde_json::json!({
                     "StringEquals": {
                         "s3:x-amz-grant-read": format!("id=\"{owner_canonical_id}\"")
+                    }
+                }),
+            ),
+            Self::PutBucketAclGrant(condition) => bucket_policy_document(
+                principal,
+                "s3:PutBucketAcl",
+                bucket_resource(bucket),
+                serde_json::json!({
+                    "StringEquals": {
+                        condition.policy_condition_key(): format!("id=\"{owner_canonical_id}\"")
+                    }
+                }),
+            ),
+            Self::PutObjectAclGrant(condition) => bucket_policy_document(
+                principal,
+                "s3:PutObjectAcl",
+                object_resource(bucket),
+                serde_json::json!({
+                    "StringEquals": {
+                        condition.policy_condition_key(): format!("id=\"{owner_canonical_id}\"")
                     }
                 }),
             ),
@@ -381,6 +625,20 @@ impl PolicyShape {
                     }
                 }),
             ),
+            Self::CopyObjectCopySourcePublicAndMetadataDirectiveCopy => {
+                copy_bucket_policy_document(
+                    principal,
+                    bucket,
+                    serde_json::json!({
+                        "StringLike": {
+                            "s3:x-amz-copy-source": format!("{bucket}/src/public/*")
+                        },
+                        "StringEquals": {
+                            "s3:x-amz-metadata-directive": "COPY"
+                        }
+                    }),
+                )
+            }
         }
     }
 }
@@ -400,6 +658,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-request-tag-allowed",
@@ -423,6 +686,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-request-tag-denied",
@@ -446,6 +714,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::GetObjectTagging {
                 key: "existing-public",
@@ -466,8 +739,163 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::GetObjectTagging {
+                key: "existing-private",
+            },
+            local_expected: PolicyEvaluation::NoMatch,
+            remote_expected: RemoteOutcome::Reject,
+        },
+        Scenario {
+            name: "get-object existing tag allow",
+            policy_shape: PolicyShape::ExistingTagRead(ExistingTagReadAction::Object),
+            local_request: LocalRequest {
+                action: PolicyAction::GetObject,
+                existing_tags: vec![("security", "public")],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
+            },
+            operation: ScenarioOperation::GetObject {
+                key: "existing-public",
+            },
+            local_expected: PolicyEvaluation::ExplicitAllow,
+            remote_expected: RemoteOutcome::Allow,
+        },
+        Scenario {
+            name: "get-object existing tag mismatch",
+            policy_shape: PolicyShape::ExistingTagRead(ExistingTagReadAction::Object),
+            local_request: LocalRequest {
+                action: PolicyAction::GetObject,
+                existing_tags: vec![("security", "private")],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
+            },
+            operation: ScenarioOperation::GetObject {
+                key: "existing-private",
+            },
+            local_expected: PolicyEvaluation::NoMatch,
+            remote_expected: RemoteOutcome::Reject,
+        },
+        Scenario {
+            name: "get-object-acl existing tag allow",
+            policy_shape: PolicyShape::ExistingTagRead(ExistingTagReadAction::ObjectAcl),
+            local_request: LocalRequest {
+                action: PolicyAction::GetObjectAcl,
+                existing_tags: vec![("security", "public")],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
+            },
+            operation: ScenarioOperation::GetObjectAcl {
+                key: "existing-public",
+            },
+            local_expected: PolicyEvaluation::ExplicitAllow,
+            remote_expected: RemoteOutcome::Allow,
+        },
+        Scenario {
+            name: "get-object-acl existing tag mismatch",
+            policy_shape: PolicyShape::ExistingTagRead(ExistingTagReadAction::ObjectAcl),
+            local_request: LocalRequest {
+                action: PolicyAction::GetObjectAcl,
+                existing_tags: vec![("security", "private")],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
+            },
+            operation: ScenarioOperation::GetObjectAcl {
+                key: "existing-private",
+            },
+            local_expected: PolicyEvaluation::NoMatch,
+            remote_expected: RemoteOutcome::Reject,
+        },
+        Scenario {
+            name: "get-object-attributes existing tag allow",
+            policy_shape: PolicyShape::ExistingTagRead(ExistingTagReadAction::ObjectAttributes),
+            local_request: LocalRequest {
+                action: PolicyAction::GetObjectAttributes,
+                existing_tags: vec![("security", "public")],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
+            },
+            operation: ScenarioOperation::GetObjectAttributes {
+                key: "existing-public",
+            },
+            local_expected: PolicyEvaluation::ExplicitAllow,
+            remote_expected: RemoteOutcome::Allow,
+        },
+        Scenario {
+            name: "get-object-attributes existing tag mismatch",
+            policy_shape: PolicyShape::ExistingTagRead(ExistingTagReadAction::ObjectAttributes),
+            local_request: LocalRequest {
+                action: PolicyAction::GetObjectAttributes,
+                existing_tags: vec![("security", "private")],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
+            },
+            operation: ScenarioOperation::GetObjectAttributes {
                 key: "existing-private",
             },
             local_expected: PolicyEvaluation::NoMatch,
@@ -486,6 +914,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObjectTagging {
                 key: "tag-target",
@@ -507,6 +940,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObjectTagging {
                 key: "tag-target",
@@ -528,6 +966,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-acl-private-allowed",
@@ -551,6 +994,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-acl-private-denied",
@@ -573,6 +1021,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: Some(String::new()),
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-grant-read-allowed",
@@ -596,12 +1049,237 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-grant-read-denied",
                 body: b"denied",
                 ..PutObjectShape::default()
             }),
+            local_expected: PolicyEvaluation::NoMatch,
+            remote_expected: RemoteOutcome::Reject,
+        },
+        Scenario {
+            name: "put-bucket-acl grant-read allow",
+            policy_shape: PolicyShape::PutBucketAclGrant(GrantHeaderCondition::Read),
+            local_request: LocalRequest {
+                action: PolicyAction::PutBucketAcl,
+                existing_tags: vec![],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: Some(String::new()),
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: true,
+            },
+            operation: ScenarioOperation::PutBucketAcl(AclMutationShape {
+                grant_read: Some(String::new()),
+                ..AclMutationShape::default()
+            }),
+            local_expected: PolicyEvaluation::ExplicitAllow,
+            remote_expected: RemoteOutcome::Allow,
+        },
+        Scenario {
+            name: "put-bucket-acl grant-read mismatch",
+            policy_shape: PolicyShape::PutBucketAclGrant(GrantHeaderCondition::Read),
+            local_request: LocalRequest {
+                action: PolicyAction::PutBucketAcl,
+                existing_tags: vec![],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: Some("private"),
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: true,
+            },
+            operation: ScenarioOperation::PutBucketAcl(AclMutationShape {
+                canned_acl: Some("private"),
+                ..AclMutationShape::default()
+            }),
+            local_expected: PolicyEvaluation::NoMatch,
+            remote_expected: RemoteOutcome::Reject,
+        },
+        Scenario {
+            name: "put-bucket-acl grant-full-control allow",
+            policy_shape: PolicyShape::PutBucketAclGrant(GrantHeaderCondition::FullControl),
+            local_request: LocalRequest {
+                action: PolicyAction::PutBucketAcl,
+                existing_tags: vec![],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: Some(String::new()),
+                bucket_resource: true,
+            },
+            operation: ScenarioOperation::PutBucketAcl(AclMutationShape {
+                grant_full_control: Some(String::new()),
+                ..AclMutationShape::default()
+            }),
+            local_expected: PolicyEvaluation::ExplicitAllow,
+            remote_expected: RemoteOutcome::Allow,
+        },
+        Scenario {
+            name: "put-bucket-acl grant-full-control mismatch",
+            policy_shape: PolicyShape::PutBucketAclGrant(GrantHeaderCondition::FullControl),
+            local_request: LocalRequest {
+                action: PolicyAction::PutBucketAcl,
+                existing_tags: vec![],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: Some("private"),
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: true,
+            },
+            operation: ScenarioOperation::PutBucketAcl(AclMutationShape {
+                canned_acl: Some("private"),
+                ..AclMutationShape::default()
+            }),
+            local_expected: PolicyEvaluation::NoMatch,
+            remote_expected: RemoteOutcome::Reject,
+        },
+        Scenario {
+            name: "put-object-acl grant-read allow",
+            policy_shape: PolicyShape::PutObjectAclGrant(GrantHeaderCondition::Read),
+            local_request: LocalRequest {
+                action: PolicyAction::PutObjectAcl,
+                existing_tags: vec![],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: Some(String::new()),
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
+            },
+            operation: ScenarioOperation::PutObjectAcl {
+                key: "acl-target",
+                acl: AclMutationShape {
+                    grant_read: Some(String::new()),
+                    ..AclMutationShape::default()
+                },
+            },
+            local_expected: PolicyEvaluation::ExplicitAllow,
+            remote_expected: RemoteOutcome::Allow,
+        },
+        Scenario {
+            name: "put-object-acl grant-read mismatch",
+            policy_shape: PolicyShape::PutObjectAclGrant(GrantHeaderCondition::Read),
+            local_request: LocalRequest {
+                action: PolicyAction::PutObjectAcl,
+                existing_tags: vec![],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: Some("private"),
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
+            },
+            operation: ScenarioOperation::PutObjectAcl {
+                key: "acl-target",
+                acl: AclMutationShape {
+                    canned_acl: Some("private"),
+                    ..AclMutationShape::default()
+                },
+            },
+            local_expected: PolicyEvaluation::NoMatch,
+            remote_expected: RemoteOutcome::Reject,
+        },
+        Scenario {
+            name: "put-object-acl grant-full-control allow",
+            policy_shape: PolicyShape::PutObjectAclGrant(GrantHeaderCondition::FullControl),
+            local_request: LocalRequest {
+                action: PolicyAction::PutObjectAcl,
+                existing_tags: vec![],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: Some(String::new()),
+                bucket_resource: false,
+            },
+            operation: ScenarioOperation::PutObjectAcl {
+                key: "acl-target",
+                acl: AclMutationShape {
+                    grant_full_control: Some(String::new()),
+                    ..AclMutationShape::default()
+                },
+            },
+            local_expected: PolicyEvaluation::ExplicitAllow,
+            remote_expected: RemoteOutcome::Allow,
+        },
+        Scenario {
+            name: "put-object-acl grant-full-control mismatch",
+            policy_shape: PolicyShape::PutObjectAclGrant(GrantHeaderCondition::FullControl),
+            local_request: LocalRequest {
+                action: PolicyAction::PutObjectAcl,
+                existing_tags: vec![],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: Some("private"),
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
+            },
+            operation: ScenarioOperation::PutObjectAcl {
+                key: "acl-target",
+                acl: AclMutationShape {
+                    canned_acl: Some("private"),
+                    ..AclMutationShape::default()
+                },
+            },
             local_expected: PolicyEvaluation::NoMatch,
             remote_expected: RemoteOutcome::Reject,
         },
@@ -618,6 +1296,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: Some("AES256"),
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-sse-s3-allowed",
@@ -641,6 +1324,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-sse-s3-denied",
@@ -663,6 +1351,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: Some("AES256"),
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-sse-c-allowed",
@@ -686,6 +1379,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-sse-c-denied",
@@ -708,6 +1406,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-acl-null-denied",
@@ -730,6 +1433,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-acl-null-allowed",
@@ -753,6 +1461,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-sse-null-denied",
@@ -775,6 +1488,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: Some("AES256"),
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::PutObject(PutObjectShape {
                 key: "put-sse-null-allowed",
@@ -798,6 +1516,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::CopyObjectCopySource {
                 source_key: "src/public/foo",
@@ -818,6 +1541,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::CopyObjectCopySource {
                 source_key: "src/private/foo",
@@ -838,6 +1566,11 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::CopyObjectMetadataDirective {
                 source_key: "src/meta/foo",
@@ -859,10 +1592,93 @@ fn build_scenarios() -> Vec<Scenario> {
                 server_side_encryption: None,
                 sse_customer_algorithm: None,
                 grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
             },
             operation: ScenarioOperation::CopyObjectMetadataDirective {
                 source_key: "src/meta/foo",
                 metadata_directive: None,
+            },
+            local_expected: PolicyEvaluation::NoMatch,
+            remote_expected: RemoteOutcome::Reject,
+        },
+        Scenario {
+            name: "copy-object copy-source and metadata-directive allow",
+            policy_shape: PolicyShape::CopyObjectCopySourcePublicAndMetadataDirectiveCopy,
+            local_request: LocalRequest {
+                action: PolicyAction::PutObject,
+                existing_tags: vec![],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: Some("COPY"),
+                canned_acl: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
+            },
+            operation: ScenarioOperation::CopyObjectMetadataDirective {
+                source_key: "src/public/foo",
+                metadata_directive: Some(MetadataDirective::Copy),
+            },
+            local_expected: PolicyEvaluation::ExplicitAllow,
+            remote_expected: RemoteOutcome::Allow,
+        },
+        Scenario {
+            name: "copy-object copy-source and metadata-directive missing is no-match",
+            policy_shape: PolicyShape::CopyObjectCopySourcePublicAndMetadataDirectiveCopy,
+            local_request: LocalRequest {
+                action: PolicyAction::PutObject,
+                existing_tags: vec![],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: None,
+                canned_acl: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
+            },
+            operation: ScenarioOperation::CopyObjectMetadataDirective {
+                source_key: "src/public/foo",
+                metadata_directive: None,
+            },
+            local_expected: PolicyEvaluation::NoMatch,
+            remote_expected: RemoteOutcome::Reject,
+        },
+        Scenario {
+            name: "copy-object copy-source and metadata-directive source mismatch",
+            policy_shape: PolicyShape::CopyObjectCopySourcePublicAndMetadataDirectiveCopy,
+            local_request: LocalRequest {
+                action: PolicyAction::PutObject,
+                existing_tags: vec![],
+                request_tags: vec![],
+                copy_source: None,
+                metadata_directive: Some("COPY"),
+                canned_acl: None,
+                server_side_encryption: None,
+                sse_customer_algorithm: None,
+                grant_read: None,
+                grant_write: None,
+                grant_read_acp: None,
+                grant_write_acp: None,
+                grant_full_control: None,
+                bucket_resource: false,
+            },
+            operation: ScenarioOperation::CopyObjectMetadataDirective {
+                source_key: "src/private/foo",
+                metadata_directive: Some(MetadataDirective::Copy),
             },
             local_expected: PolicyEvaluation::NoMatch,
             remote_expected: RemoteOutcome::Reject,
@@ -879,15 +1695,62 @@ fn materialize_scenario(template: &Scenario, bucket: &str, owner_canonical_id: &
         }
         _ => None,
     };
-    let grant_read_header = format!("id=\"{owner_canonical_id}\"");
+    let owner_grant_header = format!("id=\"{owner_canonical_id}\"");
     if matches!(scenario.policy_shape, PolicyShape::PutObjectGrantReadOwner) {
         if scenario.local_request.grant_read.is_some() {
-            scenario.local_request.grant_read = Some(grant_read_header.clone());
+            scenario.local_request.grant_read = Some(owner_grant_header.clone());
         }
         if let ScenarioOperation::PutObject(shape) = &mut scenario.operation {
             if shape.grant_read.is_some() {
-                shape.grant_read = Some(grant_read_header);
+                shape.grant_read = Some(owner_grant_header.clone());
             }
+        }
+    }
+    if let PolicyShape::PutBucketAclGrant(condition) | PolicyShape::PutObjectAclGrant(condition) =
+        scenario.policy_shape
+    {
+        let local_has_placeholder = match condition {
+            GrantHeaderCondition::Read => scenario.local_request.grant_read.is_some(),
+            GrantHeaderCondition::Write => scenario.local_request.grant_write.is_some(),
+            GrantHeaderCondition::ReadAcp => scenario.local_request.grant_read_acp.is_some(),
+            GrantHeaderCondition::WriteAcp => scenario.local_request.grant_write_acp.is_some(),
+            GrantHeaderCondition::FullControl => {
+                scenario.local_request.grant_full_control.is_some()
+            }
+        };
+        if local_has_placeholder {
+            apply_grant_header_to_local_request(
+                &mut scenario.local_request,
+                condition,
+                owner_grant_header.clone(),
+            );
+        }
+        match &mut scenario.operation {
+            ScenarioOperation::PutBucketAcl(acl) => {
+                let op_has_placeholder = match condition {
+                    GrantHeaderCondition::Read => acl.grant_read.is_some(),
+                    GrantHeaderCondition::Write => acl.grant_write.is_some(),
+                    GrantHeaderCondition::ReadAcp => acl.grant_read_acp.is_some(),
+                    GrantHeaderCondition::WriteAcp => acl.grant_write_acp.is_some(),
+                    GrantHeaderCondition::FullControl => acl.grant_full_control.is_some(),
+                };
+                if op_has_placeholder {
+                    apply_grant_header_to_acl_shape(acl, condition, owner_grant_header.clone());
+                }
+            }
+            ScenarioOperation::PutObjectAcl { acl, .. } => {
+                let op_has_placeholder = match condition {
+                    GrantHeaderCondition::Read => acl.grant_read.is_some(),
+                    GrantHeaderCondition::Write => acl.grant_write.is_some(),
+                    GrantHeaderCondition::ReadAcp => acl.grant_read_acp.is_some(),
+                    GrantHeaderCondition::WriteAcp => acl.grant_write_acp.is_some(),
+                    GrantHeaderCondition::FullControl => acl.grant_full_control.is_some(),
+                };
+                if op_has_placeholder {
+                    apply_grant_header_to_acl_shape(acl, condition, owner_grant_header.clone());
+                }
+            }
+            _ => {}
         }
     }
     scenario
@@ -1025,24 +1888,48 @@ async fn observe_scenario(client: &Client, bucket: &str, scenario: &Scenario) ->
                         .sse_customer_key(key_b64)
                         .sse_customer_key_md5(key_md5_b64);
                 }
-                let result = match &shape.grant_read {
-                    Some(grant_read) => {
-                        request
-                            .customize()
-                            .mutate_request({
-                                let grant_read = grant_read.clone();
-                                move |req| {
-                                    req.headers_mut()
-                                        .insert("x-amz-grant-read", grant_read.clone());
-                                }
-                            })
-                            .send()
-                            .await
-                    }
-                    None => request.send().await,
+                let grant_headers = put_object_grant_headers(shape);
+                let result = if grant_headers.is_empty() {
+                    request.send().await
+                } else {
+                    request
+                        .customize()
+                        .mutate_request(move |req| {
+                            for (header, value) in &grant_headers {
+                                req.headers_mut().insert(*header, value.clone());
+                            }
+                        })
+                        .send()
+                        .await
                 };
                 handle_observed_result(scenario.name, attempt, result)
             }
+            ScenarioOperation::GetObject { key } => handle_observed_result(
+                scenario.name,
+                attempt,
+                client.get_object().bucket(bucket).key(*key).send().await,
+            ),
+            ScenarioOperation::GetObjectAcl { key } => handle_observed_result(
+                scenario.name,
+                attempt,
+                client
+                    .get_object_acl()
+                    .bucket(bucket)
+                    .key(*key)
+                    .send()
+                    .await,
+            ),
+            ScenarioOperation::GetObjectAttributes { key } => handle_observed_result(
+                scenario.name,
+                attempt,
+                client
+                    .get_object_attributes()
+                    .bucket(bucket)
+                    .key(*key)
+                    .object_attributes(ObjectAttributes::ObjectSize)
+                    .send()
+                    .await,
+            ),
             ScenarioOperation::GetObjectTagging { key } => handle_observed_result(
                 scenario.name,
                 attempt,
@@ -1064,6 +1951,58 @@ async fn observe_scenario(client: &Client, bucket: &str, scenario: &Scenario) ->
                     .send()
                     .await,
             ),
+            ScenarioOperation::PutBucketAcl(acl) => {
+                let request = client.put_bucket_acl().bucket(bucket);
+                let request = if let Some(canned_acl) = acl.canned_acl {
+                    request.acl(match canned_acl {
+                        "private" => BucketCannedAcl::Private,
+                        other => panic!("unsupported bucket acl {other}"),
+                    })
+                } else {
+                    request
+                };
+                let grant_headers = acl_mutation_grant_headers(acl);
+                let result = if grant_headers.is_empty() {
+                    request.send().await
+                } else {
+                    request
+                        .customize()
+                        .mutate_request(move |req| {
+                            for (header, value) in &grant_headers {
+                                req.headers_mut().insert(*header, value.clone());
+                            }
+                        })
+                        .send()
+                        .await
+                };
+                handle_observed_result(scenario.name, attempt, result)
+            }
+            ScenarioOperation::PutObjectAcl { key, acl } => {
+                let request = client.put_object_acl().bucket(bucket).key(*key);
+                let request = if let Some(canned_acl) = acl.canned_acl {
+                    request.acl(match canned_acl {
+                        "private" => ObjectCannedAcl::Private,
+                        other => panic!("unsupported object acl {other}"),
+                    })
+                } else {
+                    request
+                };
+                let grant_headers = acl_mutation_grant_headers(acl);
+                let result = if grant_headers.is_empty() {
+                    request.send().await
+                } else {
+                    request
+                        .customize()
+                        .mutate_request(move |req| {
+                            for (header, value) in &grant_headers {
+                                req.headers_mut().insert(*header, value.clone());
+                            }
+                        })
+                        .send()
+                        .await
+                };
+                handle_observed_result(scenario.name, attempt, result)
+            }
             ScenarioOperation::CopyObjectCopySource { source_key } => handle_observed_result(
                 scenario.name,
                 attempt,
@@ -1161,6 +2100,7 @@ async fn prepare_bucket_pair(env: &DiffEnv, bucket: &str) {
         setup_tagged_object(client, bucket, "existing-public", "public").await;
         setup_tagged_object(client, bucket, "existing-private", "private").await;
         setup_plain_object(client, bucket, "tag-target").await;
+        setup_plain_object(client, bucket, "acl-target").await;
         setup_copy_source_object(client, bucket, "src/public/foo").await;
         setup_copy_source_object(client, bucket, "src/private/foo").await;
         setup_copy_source_object(client, bucket, "src/meta/foo").await;
@@ -1171,6 +2111,7 @@ const SCENARIO_CLEANUP_KEYS: &[&str] = &[
     "existing-public",
     "existing-private",
     "tag-target",
+    "acl-target",
     "put-request-tag-allowed",
     "put-request-tag-denied",
     "put-acl-private-allowed",
@@ -1191,6 +2132,8 @@ const SCENARIO_CLEANUP_KEYS: &[&str] = &[
     "dst-src-public-foo",
     "dst-src-private-foo",
     "dst-meta-src-meta-foo",
+    "dst-meta-src-public-foo",
+    "dst-meta-src-private-foo",
 ];
 
 fn run_selected_scenarios(selected_shapes: &[PolicyShape]) {
@@ -1272,6 +2215,8 @@ fn run_selected_scenarios(selected_shapes: &[PolicyShape]) {
 #[test]
 fn test_bucket_policy_tagging_conditions_match_aws() {
     run_selected_scenarios(&[
+        PolicyShape::ExistingTagRead(ExistingTagReadAction::Object),
+        PolicyShape::ExistingTagRead(ExistingTagReadAction::ObjectAcl),
         PolicyShape::GetObjectTaggingExistingPublic,
         PolicyShape::PutObjectTaggingRequestPublic,
         PolicyShape::PutObjectInlineTaggingRequestPublic,
@@ -1284,6 +2229,10 @@ fn test_bucket_policy_put_object_acl_and_grant_conditions_match_aws() {
         PolicyShape::PutObjectAclPrivate,
         PolicyShape::PutObjectGrantReadOwner,
         PolicyShape::PutObjectAclNullDeny,
+        PolicyShape::PutBucketAclGrant(GrantHeaderCondition::Read),
+        PolicyShape::PutBucketAclGrant(GrantHeaderCondition::FullControl),
+        PolicyShape::PutObjectAclGrant(GrantHeaderCondition::Read),
+        PolicyShape::PutObjectAclGrant(GrantHeaderCondition::FullControl),
     ]);
 }
 
@@ -1301,5 +2250,6 @@ fn test_bucket_policy_copy_conditions_match_aws() {
     run_selected_scenarios(&[
         PolicyShape::CopyObjectCopySourcePublic,
         PolicyShape::CopyObjectMetadataDirectiveCopy,
+        PolicyShape::CopyObjectCopySourcePublicAndMetadataDirectiveCopy,
     ]);
 }

@@ -30,6 +30,9 @@ impl BucketPolicy {
 
     #[must_use]
     pub fn requires_existing_object_tags_for_action(&self, action: PolicyAction) -> bool {
+        if !existing_object_tag_condition_evaluable_for_action(action) {
+            return false;
+        }
         let action = action.as_str();
         self.statements.iter().any(|statement| {
             statement.matches_action(action) && statement.references_existing_object_tag_condition()
@@ -1283,6 +1286,9 @@ fn condition_clause_matches_request(
     request: &PolicyRequest<'_>,
 ) -> ConditionMatchResult {
     if let Some(tag_key) = clause.key.strip_prefix("s3:ExistingObjectTag/") {
+        if !existing_object_tag_condition_evaluable_for_action(request.action()) {
+            return ConditionMatchResult::AcceptedButNotEvaluable;
+        }
         return string_equals_condition_matches(clause, request.existing_object_tag_value(tag_key));
     }
     if let Some(tag_key) = clause.key.strip_prefix("s3:RequestObjectTag/") {
@@ -1333,6 +1339,13 @@ fn condition_clause_supported_for_evaluable_object_actions(clause: &PolicyCondit
             ))
         || (evaluable_string_condition_operator_supported(clause.operator.as_str())
             && clause.key.starts_with("s3:RequestObjectTag/"))
+}
+
+fn existing_object_tag_condition_evaluable_for_action(action: PolicyAction) -> bool {
+    !matches!(
+        action,
+        PolicyAction::GetObjectAttributes | PolicyAction::GetObjectVersionAttributes
+    )
 }
 
 fn string_equals_condition_matches(
@@ -1924,12 +1937,57 @@ mod tests {
     #[test]
     fn requires_existing_object_tags_for_matching_action() {
         let policy = parse_bucket_policy(
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}},{"Effect":"Allow","Principal":"*","Action":"s3:GetObjectTagging","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}},{"Effect":"Allow","Principal":"*","Action":"s3:GetObjectTagging","Resource":"arn:aws:s3:::bucket/*"},{"Effect":"Allow","Principal":"*","Action":"s3:GetObjectAttributes","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
         )
         .unwrap();
 
         assert!(policy.requires_existing_object_tags_for_action(PolicyAction::GetObject));
         assert!(!policy.requires_existing_object_tags_for_action(PolicyAction::GetObjectTagging));
+        assert!(!policy.requires_existing_object_tags_for_action(PolicyAction::GetObjectAttributes));
+    }
+
+    #[test]
+    fn existing_object_tag_condition_is_not_evaluable_for_get_object_attributes() {
+        let allow_policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObjectAttributes","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let deny_policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObjectAttributes","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let tags = [PolicyTag::new("security", "public")];
+        let attrs_request = request(
+            PolicyAction::GetObjectAttributes,
+            "bucket",
+            "key",
+            Some("caller"),
+            &tags,
+        );
+        let object_request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            &tags,
+        );
+        let object_policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            allow_policy.evaluate(&attrs_request),
+            PolicyEvaluation::NoMatch
+        );
+        assert_eq!(
+            deny_policy.evaluate(&attrs_request),
+            PolicyEvaluation::NoMatch
+        );
+        assert_eq!(
+            object_policy.evaluate(&object_request),
+            PolicyEvaluation::ExplicitAllow
+        );
     }
 
     #[test]

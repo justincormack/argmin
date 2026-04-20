@@ -5,7 +5,7 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
     BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, ObjectAttributes,
-    ObjectOwnership, VersioningConfiguration,
+    ObjectOwnership, Tag, Tagging, VersioningConfiguration,
 };
 use s3_tests::{cleanup_versioned_bucket, unique_bucket, CTX};
 use serde_json::json;
@@ -114,6 +114,13 @@ fn object_wildcard_resource(bucket: &str) -> String {
 
 fn alt_policy_principal() -> serde_json::Value {
     json!({ "AWS": format!("arn:aws:iam::{}:root", CTX.alt_account_id()) })
+}
+
+fn object_tagging(key: &str, value: &str) -> Tagging {
+    Tagging::builder()
+        .tag_set(Tag::builder().key(key).value(value).build().unwrap())
+        .build()
+        .unwrap()
 }
 
 async fn put_bucket_policy_json(bucket: &str, policy: serde_json::Value) {
@@ -422,6 +429,74 @@ fn test_get_object_attributes_bucket_policy_requires_get_object_version_too() {
         assert_eq!(attrs.object_size(), Some(9));
 
         cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_get_object_attributes_bucket_policy_existing_tag_condition_does_not_authorize() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "policy-tagged-object";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": ["s3:GetObject", "s3:GetObjectAttributes"],
+                    "Resource": object_resource(&bucket, key),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:ExistingObjectTag/security": "public"
+                        }
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        eventually_ok(
+            "alt GetObject with ExistingObjectTag bucket policy on tagged object",
+            || alt.get_object().bucket(&bucket).key(key).send(),
+        )
+        .await;
+
+        eventually_err_status(
+            "alt GetObjectAttributes with ExistingObjectTag bucket policy on tagged object",
+            403,
+            Some("AccessDenied"),
+            || {
+                alt.get_object_attributes()
+                    .bucket(&bucket)
+                    .key(key)
+                    .object_attributes(ObjectAttributes::ObjectSize)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_bucket(&bucket, &[key]).await;
     });
 }
 
