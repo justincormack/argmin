@@ -12,7 +12,11 @@
 
 #![allow(dead_code)]
 
-use super::{ExistingObjectTagValue, PolicyAction, PolicyRequest};
+use super::condition_op::{self, ActualValue, ConditionOpKind};
+use super::{
+    ConditionMatchResult, ExistingObjectTagValue, PolicyAction, PolicyConditionClause,
+    PolicyRequest,
+};
 
 /// Resolved value for a condition key in a given request.
 ///
@@ -294,6 +298,42 @@ fn request_header_supported_for_action_non_get(action: PolicyAction) -> bool {
         action,
         PolicyAction::GetObject | PolicyAction::GetObjectVersion
     )
+}
+
+/// Evaluate a condition clause against a request.
+///
+/// Single entry point for the evaluator. Returns `Unsupported` if the
+/// condition key is not in the table or if the operator is not in the
+/// resolver's allowed set.
+pub(super) fn evaluate_clause(
+    clause: &PolicyConditionClause,
+    request: &PolicyRequest<'_>,
+) -> ConditionMatchResult {
+    let Some((resolver, param)) = lookup(clause.key.as_str()) else {
+        return ConditionMatchResult::Unsupported;
+    };
+    if let Some(evaluable) = resolver.evaluable_for_action {
+        if !evaluable(request.action()) {
+            return ConditionMatchResult::AcceptedButNotEvaluable;
+        }
+    }
+    let Some(op) = condition_op::lookup(clause.operator.as_str()) else {
+        return ConditionMatchResult::Unsupported;
+    };
+    match resolver.operator_support {
+        OperatorSupport::AnyEvaluable => {}
+        OperatorSupport::StringEqualsOnly => {
+            if op.kind != ConditionOpKind::StringEquals {
+                return ConditionMatchResult::Unsupported;
+            }
+        }
+    }
+    let actual = match (resolver.resolve)(request, param) {
+        ResolvedValue::Present(value) => ActualValue::Present(value),
+        ResolvedValue::Absent => ActualValue::Absent,
+        ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
+    };
+    (op.evaluate)(&clause.values, actual)
 }
 
 #[cfg(test)]

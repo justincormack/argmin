@@ -1315,42 +1315,7 @@ fn condition_clause_matches_request(
     clause: &PolicyConditionClause,
     request: &PolicyRequest<'_>,
 ) -> ConditionMatchResult {
-    if let Some(tag_key) = clause.key.strip_prefix("s3:ExistingObjectTag/") {
-        if !existing_object_tag_condition_evaluable_for_action(request.action()) {
-            return ConditionMatchResult::AcceptedButNotEvaluable;
-        }
-        return match request.existing_object_tag_value(tag_key) {
-            ExistingObjectTagValue::Unavailable => ConditionMatchResult::InputUnavailable,
-            ExistingObjectTagValue::Available(actual) => {
-                string_equals_condition_matches(clause, actual)
-            }
-        };
-    }
-    if let Some(tag_key) = clause.key.strip_prefix("s3:RequestObjectTag/") {
-        return string_condition_matches(clause, request.request_object_tag_value(tag_key));
-    }
-
-    match clause.key.as_str() {
-        "s3:x-amz-copy-source" => string_condition_matches(clause, request.copy_source()),
-        "s3:x-amz-metadata-directive" => {
-            string_condition_matches(clause, request.metadata_directive())
-        }
-        "s3:x-amz-acl" => string_condition_matches(clause, request.canned_acl()),
-        "s3:x-amz-server-side-encryption" => {
-            string_condition_matches(clause, request.server_side_encryption())
-        }
-        "s3:x-amz-server-side-encryption-customer-algorithm" => {
-            string_condition_matches(clause, request.sse_customer_algorithm())
-        }
-        "s3:x-amz-grant-read" => string_condition_matches(clause, request.grant_read()),
-        "s3:x-amz-grant-write" => string_condition_matches(clause, request.grant_write()),
-        "s3:x-amz-grant-read-acp" => string_condition_matches(clause, request.grant_read_acp()),
-        "s3:x-amz-grant-write-acp" => string_condition_matches(clause, request.grant_write_acp()),
-        "s3:x-amz-grant-full-control" => {
-            string_condition_matches(clause, request.grant_full_control())
-        }
-        _ => ConditionMatchResult::Unsupported,
-    }
+    condition_key::evaluate_clause(clause, request)
 }
 
 fn condition_clause_supported_for_evaluable_object_action(
@@ -1413,40 +1378,6 @@ fn request_object_tag_condition_supported_for_action(action: PolicyAction) -> bo
             | PolicyAction::PutObjectRetention
             | PolicyAction::PutObjectLegalHold
     )
-}
-
-fn string_equals_condition_matches(
-    clause: &PolicyConditionClause,
-    actual: Option<&str>,
-) -> ConditionMatchResult {
-    // The ExistingObjectTag fast path only evaluates StringEquals-family
-    // operators; other operators return Unsupported even if they are in the
-    // table.
-    let Some(op) = condition_op::lookup(clause.operator.as_str()) else {
-        return ConditionMatchResult::Unsupported;
-    };
-    if op.kind != condition_op::ConditionOpKind::StringEquals {
-        return ConditionMatchResult::Unsupported;
-    }
-    let actual = match actual {
-        Some(value) => condition_op::ActualValue::Present(value),
-        None => condition_op::ActualValue::Absent,
-    };
-    (op.evaluate)(&clause.values, actual)
-}
-
-fn string_condition_matches(
-    clause: &PolicyConditionClause,
-    actual: Option<&str>,
-) -> ConditionMatchResult {
-    let Some(op) = condition_op::lookup(clause.operator.as_str()) else {
-        return ConditionMatchResult::Unsupported;
-    };
-    let actual = match actual {
-        Some(value) => condition_op::ActualValue::Present(value),
-        None => condition_op::ActualValue::Absent,
-    };
-    (op.evaluate)(&clause.values, actual)
 }
 
 fn action_pattern_matches(pattern: &str, action: &str) -> bool {
