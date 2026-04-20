@@ -579,6 +579,240 @@ fn test_get_object_version_attributes_bucket_policy_existing_tag_condition_does_
 }
 
 #[test]
+fn test_get_object_bucket_policy_existing_tag_condition_authorizes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "policy-tagged-get-object";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, key),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:ExistingObjectTag/security": "public"
+                        }
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        eventually_ok(
+            "alt GetObject with ExistingObjectTag bucket policy on tagged object",
+            || alt.get_object().bucket(&bucket).key(key).send(),
+        )
+        .await;
+
+        cleanup_bucket(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_get_object_version_bucket_policy_existing_tag_condition_authorizes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt = CTX.alt_client();
+        let bucket = create_versioned_bucket(client).await;
+        let key = "policy-versioned-tagged-get-object";
+        let version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"versioned-tagged"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected version id")
+            .to_string();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:GetObjectVersion",
+                    "Resource": object_resource(&bucket, key),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:ExistingObjectTag/security": "public"
+                        }
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        eventually_ok(
+            "alt GetObject version with ExistingObjectTag bucket policy on tagged version",
+            || {
+                alt.get_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .version_id(&version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_head_object_bucket_policy_existing_tag_condition_authorizes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "policy-tagged-head-object";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:GetObject",
+                    "Resource": object_resource(&bucket, key),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:ExistingObjectTag/security": "public"
+                        }
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        eventually_ok(
+            "alt HeadObject with ExistingObjectTag bucket policy on tagged object",
+            || alt.head_object().bucket(&bucket).key(key).send(),
+        )
+        .await;
+
+        cleanup_bucket(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_head_object_version_bucket_policy_existing_tag_condition_authorizes() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt = CTX.alt_client();
+        let bucket = create_versioned_bucket(client).await;
+        let key = "policy-versioned-tagged-head-object";
+        let version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"versioned-tagged"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected version id")
+            .to_string();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:GetObjectVersion",
+                    "Resource": object_resource(&bucket, key),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:ExistingObjectTag/security": "public"
+                        }
+                    }
+                }]
+            }),
+        )
+        .await;
+
+        eventually_ok(
+            "alt HeadObject version with ExistingObjectTag bucket policy on tagged version",
+            || {
+                alt.head_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .version_id(&version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
 fn test_get_object_attributes_existing_tag_condition_still_denies_with_tag_read_access() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -665,6 +899,340 @@ fn test_get_object_attributes_existing_tag_condition_still_denies_with_tag_read_
         .await;
 
         cleanup_bucket(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_get_object_existing_tag_condition_still_authorizes_with_tag_read_access() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "policy-tagged-get-object-with-tag-read";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:GetObjectTagging",
+                        "Resource": object_resource(&bucket, key),
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:GetObject",
+                        "Resource": object_resource(&bucket, key),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:ExistingObjectTag/security": "public"
+                            }
+                        }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        let tagging = eventually_ok(
+            "alt GetObjectTagging with explicit tag-read policy on tagged object for GetObject",
+            || alt.get_object_tagging().bucket(&bucket).key(key).send(),
+        )
+        .await;
+        assert_eq!(
+            tagging
+                .tag_set()
+                .iter()
+                .map(|tag| (tag.key(), tag.value()))
+                .collect::<Vec<_>>(),
+            vec![("security", "public")]
+        );
+
+        eventually_ok(
+            "alt GetObject with ExistingObjectTag bucket policy and tag-read access",
+            || alt.get_object().bucket(&bucket).key(key).send(),
+        )
+        .await;
+
+        cleanup_bucket(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_head_object_existing_tag_condition_still_authorizes_with_tag_read_access() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt = CTX.alt_client();
+        let bucket = unique_bucket();
+        let key = "policy-tagged-head-object-with-tag-read";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"data"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:GetObjectTagging",
+                        "Resource": object_resource(&bucket, key),
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:GetObject",
+                        "Resource": object_resource(&bucket, key),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:ExistingObjectTag/security": "public"
+                            }
+                        }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        let tagging = eventually_ok(
+            "alt GetObjectTagging with explicit tag-read policy on tagged object for HeadObject",
+            || alt.get_object_tagging().bucket(&bucket).key(key).send(),
+        )
+        .await;
+        assert_eq!(
+            tagging
+                .tag_set()
+                .iter()
+                .map(|tag| (tag.key(), tag.value()))
+                .collect::<Vec<_>>(),
+            vec![("security", "public")]
+        );
+
+        eventually_ok(
+            "alt HeadObject with ExistingObjectTag bucket policy and tag-read access",
+            || alt.head_object().bucket(&bucket).key(key).send(),
+        )
+        .await;
+
+        cleanup_bucket(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_get_object_version_existing_tag_condition_still_authorizes_with_tag_read_access() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt = CTX.alt_client();
+        let bucket = create_versioned_bucket(client).await;
+        let key = "policy-versioned-tagged-get-object-with-tag-read";
+        let version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"versioned-tagged"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected version id")
+            .to_string();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:GetObjectVersionTagging",
+                        "Resource": object_resource(&bucket, key),
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:GetObjectVersion",
+                        "Resource": object_resource(&bucket, key),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:ExistingObjectTag/security": "public"
+                            }
+                        }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        let tagging = eventually_ok(
+            "alt GetObjectTagging version with explicit tag-read policy on tagged version for GetObject",
+            || {
+                alt.get_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .version_id(&version_id)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            tagging
+                .tag_set()
+                .iter()
+                .map(|tag| (tag.key(), tag.value()))
+                .collect::<Vec<_>>(),
+            vec![("security", "public")]
+        );
+
+        eventually_ok(
+            "alt GetObject version with ExistingObjectTag bucket policy and tag-read access",
+            || {
+                alt.get_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .version_id(&version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_head_object_version_existing_tag_condition_still_authorizes_with_tag_read_access() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt = CTX.alt_client();
+        let bucket = create_versioned_bucket(client).await;
+        let key = "policy-versioned-tagged-head-object-with-tag-read";
+        let version_id = client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"versioned-tagged"))
+            .send()
+            .await
+            .unwrap()
+            .version_id()
+            .expect("expected version id")
+            .to_string();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(key)
+            .version_id(&version_id)
+            .tagging(object_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+
+        put_bucket_policy_json(
+            &bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:GetObjectVersionTagging",
+                        "Resource": object_resource(&bucket, key),
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:GetObjectVersion",
+                        "Resource": object_resource(&bucket, key),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:ExistingObjectTag/security": "public"
+                            }
+                        }
+                    }
+                ]
+            }),
+        )
+        .await;
+
+        let tagging = eventually_ok(
+            "alt GetObjectTagging version with explicit tag-read policy on tagged version for HeadObject",
+            || {
+                alt.get_object_tagging()
+                    .bucket(&bucket)
+                    .key(key)
+                    .version_id(&version_id)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            tagging
+                .tag_set()
+                .iter()
+                .map(|tag| (tag.key(), tag.value()))
+                .collect::<Vec<_>>(),
+            vec![("security", "public")]
+        );
+
+        eventually_ok(
+            "alt HeadObject version with ExistingObjectTag bucket policy and tag-read access",
+            || {
+                alt.head_object()
+                    .bucket(&bucket)
+                    .key(key)
+                    .version_id(&version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &bucket).await;
     });
 }
 

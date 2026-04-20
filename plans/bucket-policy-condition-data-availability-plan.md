@@ -63,6 +63,24 @@ The first `s3:ExistingObjectTag/*` row is now AWS-pinned:
 
 - `GetObject`
   - evaluable and matching
+- `HeadObject`
+  - same shape as `GetObject`
+  - evaluable and matching
+- `GetObjectVersion`
+  - same shape as `GetObject`
+  - evaluable and matching
+- `HeadObject` with explicit `GetObjectTagging`
+  - still the same shape as `GetObject`
+  - separate permission to read tags does not change evaluability
+- `GetObjectVersion` with explicit `GetObjectVersionTagging`
+  - still the same shape as `GetObjectVersion`
+  - separate permission to read tags does not change evaluability
+- `HeadObjectVersion`
+  - same shape as `GetObjectVersion`
+  - evaluable and matching
+- `HeadObjectVersion` with explicit `GetObjectVersionTagging`
+  - still the same shape as `GetObjectVersion`
+  - separate permission to read tags does not change evaluability
 - `GetObjectAttributes`
   - policy accepted
   - condition not evaluated for the action
@@ -86,6 +104,22 @@ family. Its behavior is action-specific in at least three ways:
 - fully evaluable
 - accepted but non-evaluable
 - policy-invalid
+
+The `HeadObject` result narrows one possible explanation:
+
+- this is not simply “operations that do not return tags cannot evaluate
+  tag-based conditions”
+- `HeadObject` does not return tags either, but AWS evaluates
+  `ExistingObjectTag` for it just like `GetObject`
+- even granting explicit tag-read access does not make
+  `GetObjectAttributes`/`GetObjectVersionAttributes` evaluate the condition
+
+So the current best model is narrower:
+
+- `HeadObject` belongs to the `GetObject` authorization family for tag-based
+  condition evaluation
+- `GetObjectAttributes` and `GetObjectVersionAttributes` are distinct,
+  accepted-but-non-evaluable actions for `ExistingObjectTag`
 
 The next delete/tagging row is also now AWS-pinned:
 
@@ -238,6 +272,8 @@ evaluability.
 Primary pairs:
 
 - `GetObject` vs `GetObjectVersion`
+- `HeadObject` vs `HeadObject` with separate tag-read permission
+- `HeadObjectVersion` vs `HeadObjectVersion` with separate tag-read permission
 - `GetObjectAttributes` vs `GetObjectVersionAttributes`
 - `DeleteObject` vs `DeleteObjectVersion`
 - `DeleteObjectTagging` vs `DeleteObjectVersionTagging`
