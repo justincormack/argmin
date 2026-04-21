@@ -358,6 +358,17 @@ Completed so far:
     AWS rejects `s3:CreateBucket` in bucket policy as `MalformedPolicy`
     (`Policy has invalid action`), so it is not part of the enabled-state
     bucket-tag matrix
+  - the versioned object subresource/mutation rows are now pinned too:
+    - `GetObjectVersionAcl`
+    - `PutObjectVersionAcl`
+    - `GetObjectVersionTagging`
+    - `PutObjectVersionTagging`
+    - `DeleteObjectVersion`
+    - `DeleteObjectTagging`
+    - `DeleteObjectVersionTagging`
+  - `PutObjectVersionAcl` is not a special bucket-ABAC exception after all:
+    once ACLs are enabled on the bucket, AWS evaluates
+    `s3:PutObjectVersionAcl` normally under `s3:BucketTag/*`
 
 Still open inside Phase 7:
 - whether cross-principal authorization revocation after `TagResource`
@@ -366,11 +377,8 @@ Still open inside Phase 7:
 - tightening the temporary same-endpoint `TagResource` / `UntagResource`
   acceptance into explicit `s3-control` host/endpoint validation
 - any remaining enabled-state bucket-tag actions outside the now-pinned
-  bucket/object read-write, object-lock, and multipart/copy rows above
-  - most notably the versioned object subresource/mutation variants
-    (`GetObjectVersionAcl`, `PutObjectVersionAcl`, `GetObjectVersionTagging`,
-    `PutObjectVersionTagging`, `DeleteObjectVersion`,
-    `DeleteObjectTagging`, `DeleteObjectVersionTagging`)
+  bucket/object read-write, object-lock, versioned subresource/mutation,
+  and multipart/copy rows above
 
 ## Test Plan
 

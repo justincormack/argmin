@@ -310,16 +310,23 @@ fn bucket_tag_supported_for_action(action: PolicyAction) -> bool {
         action,
         PolicyAction::GetObject
             | PolicyAction::GetObjectAcl
+            | PolicyAction::GetObjectVersionAcl
             | PolicyAction::GetObjectTagging
+            | PolicyAction::GetObjectVersionTagging
             | PolicyAction::GetObjectRetention
             | PolicyAction::GetObjectLegalHold
             | PolicyAction::PutObject
             | PolicyAction::PutObjectAcl
+            | PolicyAction::PutObjectVersionAcl
             | PolicyAction::PutObjectTagging
+            | PolicyAction::PutObjectVersionTagging
             | PolicyAction::PutObjectRetention
             | PolicyAction::PutObjectLegalHold
             | PolicyAction::BypassGovernanceRetention
             | PolicyAction::DeleteObject
+            | PolicyAction::DeleteObjectVersion
+            | PolicyAction::DeleteObjectTagging
+            | PolicyAction::DeleteObjectVersionTagging
             | PolicyAction::GetBucketPolicy
             | PolicyAction::PutBucketPolicy
             | PolicyAction::DeleteBucket

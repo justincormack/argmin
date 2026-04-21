@@ -408,6 +408,41 @@ async fn enable_bucket_abac_with_security_tag(
         .unwrap();
 }
 
+async fn create_versioned_bucket_allowing_public_policy(client: &aws_sdk_s3::Client) -> String {
+    let bucket = create_bucket_allowing_public_policy(client).await;
+    client
+        .put_bucket_versioning()
+        .bucket(&bucket)
+        .versioning_configuration(
+            VersioningConfiguration::builder()
+                .status(BucketVersioningStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
+    bucket
+}
+
+async fn put_versioned_object(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    body: &'static [u8],
+) -> String {
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from_static(body))
+        .send()
+        .await
+        .unwrap()
+        .version_id()
+        .expect("expected VersionId for versioned object")
+        .to_string()
+}
+
 fn bucket_resource_arn(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}")
 }
@@ -3843,6 +3878,763 @@ fn test_bucket_policy_delete_object_bucket_tag_condition_when_abac_enabled() {
 
         cleanup(&public_bucket, &[]).await;
         cleanup(&private_bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_object_version_acl_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "bucket-tag-version-acl-get";
+
+        let public_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        let public_version_id = put_versioned_object(client, &public_bucket, key, b"body").await;
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal.clone(),
+                        "Action": "s3:GetObjectVersionAcl",
+                        "Resource": bucket_wildcard_resource(&public_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        let private_version_id = put_versioned_object(client, &private_bucket, key, b"body").await;
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:GetObjectVersionAcl",
+                        "Resource": bucket_wildcard_resource(&private_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let acl = eventually_ok(
+            "GetObjectVersionAcl allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_object_acl()
+                    .bucket(&public_bucket)
+                    .key(key)
+                    .version_id(&public_version_id)
+                    .send()
+            },
+        )
+        .await;
+        assert!(
+            acl.owner().is_some(),
+            "expected owner in GetObjectVersionAcl"
+        );
+
+        eventually_access_denied(
+            "GetObjectVersionAcl denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_object_acl()
+                    .bucket(&private_bucket)
+                    .key(key)
+                    .version_id(&private_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &public_bucket).await;
+        cleanup_versioned_bucket(client, &private_bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_version_acl_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "bucket-tag-version-acl-put";
+        let alt_id = client_canonical_id(alt_client).await;
+        let grant_read_header = format!("id=\"{alt_id}\"");
+
+        let public_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        set_object_writer_ownership(&public_bucket).await;
+        let public_version_id = put_versioned_object(client, &public_bucket, key, b"body").await;
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal.clone(),
+                        "Action": "s3:PutObjectVersionAcl",
+                        "Resource": bucket_wildcard_resource(&public_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        set_object_writer_ownership(&private_bucket).await;
+        let private_version_id = put_versioned_object(client, &private_bucket, key, b"body").await;
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:PutObjectVersionAcl",
+                        "Resource": bucket_wildcard_resource(&private_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectVersionAcl allowed for public bucket tag when ABAC is enabled",
+            || {
+                let grant_read_header = grant_read_header.clone();
+                alt_client
+                    .put_object_acl()
+                    .bucket(&public_bucket)
+                    .key(key)
+                    .version_id(&public_version_id)
+                    .customize()
+                    .mutate_request(move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-read", grant_read_header.clone());
+                    })
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutObjectVersionAcl denied for private bucket tag when ABAC is enabled",
+            || {
+                let grant_read_header = grant_read_header.clone();
+                alt_client
+                    .put_object_acl()
+                    .bucket(&private_bucket)
+                    .key(key)
+                    .version_id(&private_version_id)
+                    .customize()
+                    .mutate_request(move |req| {
+                        req.headers_mut()
+                            .insert("x-amz-grant-read", grant_read_header.clone());
+                    })
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &public_bucket).await;
+        cleanup_versioned_bucket(client, &private_bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_object_version_tagging_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "bucket-tag-version-tagging-get";
+
+        let public_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        let public_version_id = put_versioned_object(client, &public_bucket, key, b"body").await;
+        client
+            .put_object_tagging()
+            .bucket(&public_bucket)
+            .key(key)
+            .version_id(&public_version_id)
+            .tagging(simple_bucket_tagging("color", "blue"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal.clone(),
+                        "Action": "s3:GetObjectVersionTagging",
+                        "Resource": bucket_wildcard_resource(&public_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        let private_version_id = put_versioned_object(client, &private_bucket, key, b"body").await;
+        client
+            .put_object_tagging()
+            .bucket(&private_bucket)
+            .key(key)
+            .version_id(&private_version_id)
+            .tagging(simple_bucket_tagging("color", "blue"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:GetObjectVersionTagging",
+                        "Resource": bucket_wildcard_resource(&private_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let tagging = eventually_ok(
+            "GetObjectVersionTagging allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_object_tagging()
+                    .bucket(&public_bucket)
+                    .key(key)
+                    .version_id(&public_version_id)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(tagging.tag_set().len(), 1);
+        assert_eq!(tagging.tag_set()[0].key(), "color");
+        assert_eq!(tagging.tag_set()[0].value(), "blue");
+
+        eventually_access_denied(
+            "GetObjectVersionTagging denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_object_tagging()
+                    .bucket(&private_bucket)
+                    .key(key)
+                    .version_id(&private_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &public_bucket).await;
+        cleanup_versioned_bucket(client, &private_bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_version_tagging_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "bucket-tag-version-tagging-put";
+
+        let public_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        let public_version_id = put_versioned_object(client, &public_bucket, key, b"body").await;
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal.clone(),
+                        "Action": "s3:PutObjectVersionTagging",
+                        "Resource": bucket_wildcard_resource(&public_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        let private_version_id = put_versioned_object(client, &private_bucket, key, b"body").await;
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:PutObjectVersionTagging",
+                        "Resource": bucket_wildcard_resource(&private_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObjectVersionTagging allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&public_bucket)
+                    .key(key)
+                    .version_id(&public_version_id)
+                    .tagging(simple_bucket_tagging("color", "blue"))
+                    .send()
+            },
+        )
+        .await;
+
+        let owner_tagging = client
+            .get_object_tagging()
+            .bucket(&public_bucket)
+            .key(key)
+            .version_id(&public_version_id)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(owner_tagging.tag_set().len(), 1);
+        assert_eq!(owner_tagging.tag_set()[0].key(), "color");
+        assert_eq!(owner_tagging.tag_set()[0].value(), "blue");
+
+        eventually_access_denied(
+            "PutObjectVersionTagging denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_object_tagging()
+                    .bucket(&private_bucket)
+                    .key(key)
+                    .version_id(&private_version_id)
+                    .tagging(simple_bucket_tagging("color", "blue"))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &public_bucket).await;
+        cleanup_versioned_bucket(client, &private_bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_delete_object_version_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "bucket-tag-version-delete";
+
+        let public_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        let public_version_id = put_versioned_object(client, &public_bucket, key, b"body").await;
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal.clone(),
+                        "Action": "s3:DeleteObjectVersion",
+                        "Resource": bucket_wildcard_resource(&public_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        let private_version_id = put_versioned_object(client, &private_bucket, key, b"body").await;
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:DeleteObjectVersion",
+                        "Resource": bucket_wildcard_resource(&private_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "DeleteObjectVersion allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .delete_object()
+                    .bucket(&public_bucket)
+                    .key(key)
+                    .version_id(&public_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "DeleteObjectVersion denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .delete_object()
+                    .bucket(&private_bucket)
+                    .key(key)
+                    .version_id(&private_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &public_bucket).await;
+        cleanup_versioned_bucket(client, &private_bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_delete_object_tagging_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "bucket-tag-delete-tagging";
+
+        let public_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        let _public_version_id = put_versioned_object(client, &public_bucket, key, b"body").await;
+        client
+            .put_object_tagging()
+            .bucket(&public_bucket)
+            .key(key)
+            .tagging(simple_bucket_tagging("color", "blue"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal.clone(),
+                        "Action": "s3:DeleteObjectTagging",
+                        "Resource": bucket_wildcard_resource(&public_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        let _private_version_id = put_versioned_object(client, &private_bucket, key, b"body").await;
+        client
+            .put_object_tagging()
+            .bucket(&private_bucket)
+            .key(key)
+            .tagging(simple_bucket_tagging("color", "blue"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:DeleteObjectTagging",
+                        "Resource": bucket_wildcard_resource(&private_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "DeleteObjectTagging allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .delete_object_tagging()
+                    .bucket(&public_bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+
+        let owner_tagging = client
+            .get_object_tagging()
+            .bucket(&public_bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert!(owner_tagging.tag_set().is_empty());
+
+        eventually_access_denied(
+            "DeleteObjectTagging denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .delete_object_tagging()
+                    .bucket(&private_bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &public_bucket).await;
+        cleanup_versioned_bucket(client, &private_bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_delete_object_version_tagging_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "bucket-tag-version-delete-tagging";
+
+        let public_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        let public_version_id = put_versioned_object(client, &public_bucket, key, b"body").await;
+        client
+            .put_object_tagging()
+            .bucket(&public_bucket)
+            .key(key)
+            .version_id(&public_version_id)
+            .tagging(simple_bucket_tagging("color", "blue"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal.clone(),
+                        "Action": "s3:DeleteObjectVersionTagging",
+                        "Resource": bucket_wildcard_resource(&public_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = create_versioned_bucket_allowing_public_policy(client).await;
+        let private_version_id = put_versioned_object(client, &private_bucket, key, b"body").await;
+        client
+            .put_object_tagging()
+            .bucket(&private_bucket)
+            .key(key)
+            .version_id(&private_version_id)
+            .tagging(simple_bucket_tagging("color", "blue"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:DeleteObjectVersionTagging",
+                        "Resource": bucket_wildcard_resource(&private_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "DeleteObjectVersionTagging allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .delete_object_tagging()
+                    .bucket(&public_bucket)
+                    .key(key)
+                    .version_id(&public_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        let owner_tagging = client
+            .get_object_tagging()
+            .bucket(&public_bucket)
+            .key(key)
+            .version_id(&public_version_id)
+            .send()
+            .await
+            .unwrap();
+        assert!(owner_tagging.tag_set().is_empty());
+
+        eventually_access_denied(
+            "DeleteObjectVersionTagging denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .delete_object_tagging()
+                    .bucket(&private_bucket)
+                    .key(key)
+                    .version_id(&private_version_id)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &public_bucket).await;
+        cleanup_versioned_bucket(client, &private_bucket).await;
     });
 }
 
