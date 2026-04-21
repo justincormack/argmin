@@ -365,7 +365,7 @@ pub fn parse_amz_date(ts: &str) -> Option<u64> {
         return None;
     }
 
-    Some(days as u64 * 86400 + hour as u64 * 3600 + min as u64 * 60 + sec as u64)
+    Some(days * 86400 + hour as u64 * 3600 + min as u64 * 60 + sec as u64)
 }
 
 pub(crate) fn parse_amz_date_stamp(date_stamp: &str) -> Option<u64> {
