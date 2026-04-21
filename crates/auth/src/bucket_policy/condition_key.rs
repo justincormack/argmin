@@ -309,7 +309,17 @@ fn bucket_tag_supported_for_action(action: PolicyAction) -> bool {
     matches!(
         action,
         PolicyAction::GetObject
+            | PolicyAction::GetObjectAcl
+            | PolicyAction::GetObjectTagging
+            | PolicyAction::GetObjectRetention
+            | PolicyAction::GetObjectLegalHold
             | PolicyAction::PutObject
+            | PolicyAction::PutObjectAcl
+            | PolicyAction::PutObjectTagging
+            | PolicyAction::PutObjectRetention
+            | PolicyAction::PutObjectLegalHold
+            | PolicyAction::BypassGovernanceRetention
+            | PolicyAction::DeleteObject
             | PolicyAction::GetBucketPolicy
             | PolicyAction::PutBucketPolicy
             | PolicyAction::DeleteBucketPolicy

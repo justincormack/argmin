@@ -3202,6 +3202,33 @@ mod tests {
     }
 
     #[test]
+    fn bucket_tag_condition_is_supported_for_pinned_object_actions() {
+        for action in [
+            "s3:GetObjectAcl",
+            "s3:GetObjectTagging",
+            "s3:GetObjectRetention",
+            "s3:GetObjectLegalHold",
+            "s3:PutObjectAcl",
+            "s3:PutObjectTagging",
+            "s3:PutObjectRetention",
+            "s3:PutObjectLegalHold",
+            "s3:BypassGovernanceRetention",
+            "s3:DeleteObject",
+        ] {
+            let policy = parse_bucket_policy(&format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":"*","Action":"{action}","Resource":"arn:aws:s3:::bucket/*","Condition":{{"StringEquals":{{"s3:BucketTag/security":"public"}}}}}}]}}"#
+            ))
+            .unwrap();
+
+            assert_eq!(
+                policy.validate_evaluable_object_conditions(),
+                Ok(()),
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
     fn get_encryption_configuration_matches_bucket_resource() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetEncryptionConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,

@@ -329,7 +329,12 @@ Completed so far:
       - pinned with an unconditional `GetObjectAttributes` allow plus a
         bucket-tag-conditioned `GetObject` allow, which proves the implicit
         read-side check is bucket-tag-aware on AWS
+    - `GetObjectTagging`
+    - `PutObjectTagging`
+    - `GetObjectAcl`
+    - `PutObjectAcl`
     - `PutObject`
+    - `DeleteObject`
     - `CreateMultipartUpload`
     - `UploadPart`
     - `CompleteMultipartUpload`
@@ -337,6 +342,11 @@ Completed so far:
     - `UploadPartCopy` destination writes
     - `CopyObject` source reads
     - `UploadPartCopy` source reads
+    - `GetObjectRetention`
+    - `PutObjectRetention`
+    - `BypassGovernanceRetention`
+    - `GetObjectLegalHold`
+    - `PutObjectLegalHold`
   - local authz now derives bucket-tag availability from
     `bucket_abac_enabled` on both bucket and object request paths, and the
     previously implicit `GetObject` / `PutObject` families above are now
@@ -353,7 +363,11 @@ Still open inside Phase 7:
 - tightening the temporary same-endpoint `TagResource` / `UntagResource`
   acceptance into explicit `s3-control` host/endpoint validation
 - any remaining enabled-state bucket-tag actions outside the now-pinned
-  bucket/object read-write and multipart/copy rows above
+  bucket/object read-write, object-lock, and multipart/copy rows above
+  - most notably the versioned object subresource/mutation variants
+    (`GetObjectVersionAcl`, `PutObjectVersionAcl`, `GetObjectVersionTagging`,
+    `PutObjectVersionTagging`, `DeleteObjectVersion`,
+    `DeleteObjectTagging`, `DeleteObjectVersionTagging`)
 
 ## Test Plan
 

@@ -3,11 +3,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::{ByteStream, DateTime, DateTimeFormat};
 use aws_sdk_s3::types::{
-    BucketCannedAcl, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
-    DefaultRetention, Delete, ObjectIdentifier, ObjectLockConfiguration, ObjectLockEnabled,
-    ObjectLockLegalHold, ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention,
-    ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership, OwnershipControls,
-    OwnershipControlsRule, Tag, Tagging, VersioningConfiguration,
+    AbacStatus, BucketAbacStatus, BucketCannedAcl, BucketVersioningStatus,
+    CompletedMultipartUpload, CompletedPart, DefaultRetention, Delete, ObjectIdentifier,
+    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockLegalHold, ObjectLockLegalHoldStatus,
+    ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership,
+    OwnershipControls, OwnershipControlsRule, Tag, Tagging, VersioningConfiguration,
 };
 use base64::Engine;
 use ring::hmac;
@@ -165,6 +165,27 @@ fn object_tagging(key: &str, value: &str) -> Tagging {
         .tag_set(Tag::builder().key(key).value(value).build().unwrap())
         .build()
         .unwrap()
+}
+
+async fn enable_bucket_abac_with_security_tag(bucket: &str, value: &str) {
+    CTX.client()
+        .put_bucket_tagging()
+        .bucket(bucket)
+        .tagging(object_tagging("security", value))
+        .send()
+        .await
+        .unwrap();
+    CTX.client()
+        .put_bucket_abac()
+        .bucket(bucket)
+        .abac_status(
+            AbacStatus::builder()
+                .status(BucketAbacStatus::Enabled)
+                .build(),
+        )
+        .send()
+        .await
+        .unwrap();
 }
 
 async fn put_bucket_policy_json(bucket: &str, policy: serde_json::Value) {
@@ -1198,6 +1219,98 @@ fn test_object_lock_bucket_policy_put_get_obj_retention() {
 }
 
 #[test]
+fn test_object_lock_bucket_policy_get_obj_retention_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "file1";
+        let retain_until = governance_retain_until();
+        let retention = retention(ObjectLockRetentionMode::Governance, retain_until);
+
+        let public_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&public_bucket, key, b"abc").await;
+        client
+            .put_object_retention()
+            .bucket(&public_bucket)
+            .key(key)
+            .retention(retention.clone())
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(&public_bucket, "public").await;
+        put_bucket_policy_json(
+            &public_bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:GetObjectRetention",
+                    "Resource": bucket_wildcard_resource(&public_bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:BucketTag/security": "public"
+                        }
+                    }
+                }],
+            }),
+        )
+        .await;
+
+        let private_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&private_bucket, key, b"abc").await;
+        client
+            .put_object_retention()
+            .bucket(&private_bucket)
+            .key(key)
+            .retention(retention.clone())
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(&private_bucket, "private").await;
+        put_bucket_policy_json(
+            &private_bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:GetObjectRetention",
+                    "Resource": bucket_wildcard_resource(&private_bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:BucketTag/security": "public"
+                        }
+                    }
+                }],
+            }),
+        )
+        .await;
+
+        let response = alt_client
+            .get_object_retention()
+            .bucket(&public_bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.retention(), Some(&retention));
+
+        let denied = alt_client
+            .get_object_retention()
+            .bucket(&private_bucket)
+            .key(key)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup_object_lock_bucket(&public_bucket).await;
+        cleanup_object_lock_bucket(&private_bucket).await;
+    });
+}
+
+#[test]
 fn test_object_lock_bucket_policy_existing_tag_condition_is_rejected_for_get_retention() {
     s3_tests::run(async {
         let client = CTX.client();
@@ -1331,6 +1444,112 @@ fn test_object_lock_bucket_policy_bypass_governance_retention_requires_explicit_
         .await;
 
         cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_bucket_policy_bypass_governance_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "file1";
+
+        let public_bucket = setup_object_lock_bucket().await;
+        let public_version_id = put_object_bytes(&public_bucket, key, b"abc").await;
+        client
+            .put_object_retention()
+            .bucket(&public_bucket)
+            .key(key)
+            .version_id(&public_version_id)
+            .retention(retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until_later(),
+            ))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(&public_bucket, "public").await;
+        put_bucket_policy_json(
+            &public_bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": ["s3:PutObjectRetention", "s3:BypassGovernanceRetention"],
+                    "Resource": bucket_wildcard_resource(&public_bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:BucketTag/security": "public"
+                        }
+                    }
+                }],
+            }),
+        )
+        .await;
+
+        let private_bucket = setup_object_lock_bucket().await;
+        let private_version_id = put_object_bytes(&private_bucket, key, b"abc").await;
+        client
+            .put_object_retention()
+            .bucket(&private_bucket)
+            .key(key)
+            .version_id(&private_version_id)
+            .retention(retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until_later(),
+            ))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(&private_bucket, "private").await;
+        put_bucket_policy_json(
+            &private_bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": ["s3:PutObjectRetention", "s3:BypassGovernanceRetention"],
+                    "Resource": bucket_wildcard_resource(&private_bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:BucketTag/security": "public"
+                        }
+                    }
+                }],
+            }),
+        )
+        .await;
+
+        wait_for_bypass_retention_update_to_succeed(
+            &public_bucket,
+            key,
+            &public_version_id,
+            retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until(),
+            ),
+        )
+        .await;
+
+        let denied = alt_client
+            .put_object_retention()
+            .bucket(&private_bucket)
+            .key(key)
+            .version_id(&private_version_id)
+            .retention(retention(
+                ObjectLockRetentionMode::Governance,
+                governance_retain_until(),
+            ))
+            .bypass_governance_retention(true)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup_object_lock_bucket(&public_bucket).await;
+        cleanup_object_lock_bucket(&private_bucket).await;
     });
 }
 
@@ -3100,6 +3319,266 @@ fn test_object_lock_bucket_policy_put_get_legal_hold() {
         );
 
         cleanup_object_lock_bucket(&bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_bucket_policy_get_obj_legal_hold_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "file1";
+        let hold_on = legal_hold(ObjectLockLegalHoldStatus::On);
+
+        let public_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&public_bucket, key, b"abc").await;
+        client
+            .put_object_legal_hold()
+            .bucket(&public_bucket)
+            .key(key)
+            .legal_hold(hold_on.clone())
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(&public_bucket, "public").await;
+        put_bucket_policy_json(
+            &public_bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:GetObjectLegalHold",
+                    "Resource": bucket_wildcard_resource(&public_bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:BucketTag/security": "public"
+                        }
+                    }
+                }],
+            }),
+        )
+        .await;
+
+        let private_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&private_bucket, key, b"abc").await;
+        client
+            .put_object_legal_hold()
+            .bucket(&private_bucket)
+            .key(key)
+            .legal_hold(hold_on.clone())
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(&private_bucket, "private").await;
+        put_bucket_policy_json(
+            &private_bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:GetObjectLegalHold",
+                    "Resource": bucket_wildcard_resource(&private_bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:BucketTag/security": "public"
+                        }
+                    }
+                }],
+            }),
+        )
+        .await;
+
+        let response = alt_client
+            .get_object_legal_hold()
+            .bucket(&public_bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.legal_hold(), Some(&hold_on));
+
+        let denied = alt_client
+            .get_object_legal_hold()
+            .bucket(&private_bucket)
+            .key(key)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup_object_lock_bucket(&public_bucket).await;
+        cleanup_object_lock_bucket(&private_bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_bucket_policy_put_obj_retention_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "file1";
+        let retain_until = governance_retain_until();
+        let retention = retention(ObjectLockRetentionMode::Governance, retain_until);
+
+        let public_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&public_bucket, key, b"abc").await;
+        enable_bucket_abac_with_security_tag(&public_bucket, "public").await;
+        put_bucket_policy_json(
+            &public_bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:PutObjectRetention",
+                    "Resource": bucket_wildcard_resource(&public_bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:BucketTag/security": "public"
+                        }
+                    }
+                }],
+            }),
+        )
+        .await;
+
+        let private_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&private_bucket, key, b"abc").await;
+        enable_bucket_abac_with_security_tag(&private_bucket, "private").await;
+        put_bucket_policy_json(
+            &private_bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:PutObjectRetention",
+                    "Resource": bucket_wildcard_resource(&private_bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:BucketTag/security": "public"
+                        }
+                    }
+                }],
+            }),
+        )
+        .await;
+
+        alt_client
+            .put_object_retention()
+            .bucket(&public_bucket)
+            .key(key)
+            .retention(retention.clone())
+            .send()
+            .await
+            .unwrap();
+        let response = client
+            .get_object_retention()
+            .bucket(&public_bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.retention(), Some(&retention));
+
+        let denied = alt_client
+            .put_object_retention()
+            .bucket(&private_bucket)
+            .key(key)
+            .retention(retention.clone())
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup_object_lock_bucket(&public_bucket).await;
+        cleanup_object_lock_bucket(&private_bucket).await;
+    });
+}
+
+#[test]
+fn test_object_lock_bucket_policy_put_obj_legal_hold_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "file1";
+        let hold_on = legal_hold(ObjectLockLegalHoldStatus::On);
+
+        let public_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&public_bucket, key, b"abc").await;
+        enable_bucket_abac_with_security_tag(&public_bucket, "public").await;
+        put_bucket_policy_json(
+            &public_bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:PutObjectLegalHold",
+                    "Resource": bucket_wildcard_resource(&public_bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:BucketTag/security": "public"
+                        }
+                    }
+                }],
+            }),
+        )
+        .await;
+
+        let private_bucket = setup_object_lock_bucket().await;
+        put_object_bytes(&private_bucket, key, b"abc").await;
+        enable_bucket_abac_with_security_tag(&private_bucket, "private").await;
+        put_bucket_policy_json(
+            &private_bucket,
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": "s3:PutObjectLegalHold",
+                    "Resource": bucket_wildcard_resource(&private_bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:BucketTag/security": "public"
+                        }
+                    }
+                }],
+            }),
+        )
+        .await;
+
+        alt_client
+            .put_object_legal_hold()
+            .bucket(&public_bucket)
+            .key(key)
+            .legal_hold(hold_on.clone())
+            .send()
+            .await
+            .unwrap();
+        let response = client
+            .get_object_legal_hold()
+            .bucket(&public_bucket)
+            .key(key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.legal_hold(), Some(&hold_on));
+
+        let denied = alt_client
+            .put_object_legal_hold()
+            .bucket(&private_bucket)
+            .key(key)
+            .legal_hold(hold_on)
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup_object_lock_bucket(&public_bucket).await;
+        cleanup_object_lock_bucket(&private_bucket).await;
     });
 }
 
