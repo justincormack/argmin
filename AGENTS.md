@@ -33,12 +33,21 @@ keep the test dependencies manageable and under control.
 We are designing a highly reliable system so we need to have full trust in it. We need a very comprehensive
 set of tests, and will look at different test methodologies, formal methods, fuzz testing and so on as needed.
 
-We are using the Ceph test suite and porting these to native tests 1:1, these tests are in ./tmp/s3/tests
+We were using the Ceph test suite and porting these to native tests 1:1, these tests are in ./tmp/s3/tests,
+this is largely complete now.
 
 Use `./scripts/coverage` to measure integration test coverage, which is the main measure we want to improve,
 not unit test coverage.
 
 Always run the full test suite before comitting in case something unexpected breaks.
+
+We have tried to fix convergence issues on AWS, where some control plane (not data plane) operations take time
+to converge. There may be a few cases left. Locally most operations are immediate, although DeleteBucket does
+take time to converge.
+
+If a test fails on AWS, explore what the test failure tells you about AWS, and what else you should test, especially
+if the test is unexpected. It might be telling you there is a modelling error, or give you new branches to test.
+DO not just rush to fix it, reason about the behaviour.  
 
 ## Running tests against AWS
 
