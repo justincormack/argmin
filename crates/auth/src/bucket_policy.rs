@@ -3185,6 +3185,23 @@ mod tests {
     }
 
     #[test]
+    fn get_object_bucket_tag_deny_condition_is_nonoperative_when_bucket_tags_unavailable() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"},{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:BucketTag/security":"private"}}}]}"#,
+        )
+        .unwrap();
+        let request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            &[],
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
     fn get_encryption_configuration_matches_bucket_resource() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetEncryptionConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,

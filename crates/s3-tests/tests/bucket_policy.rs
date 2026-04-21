@@ -442,6 +442,25 @@ fn bucket_abac_control_endpoint() -> String {
     }
 }
 
+async fn eventually_get_object_succeeds(
+    description: &str,
+    mut op: impl FnMut() -> aws_sdk_s3::operation::get_object::builders::GetObjectFluentBuilder,
+) {
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match op().send().await {
+            Ok(_) => return,
+            Err(_) if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(err) => panic!("{description} failed unexpectedly: {err:?}"),
+        }
+    }
+
+    unreachable!()
+}
+
 fn bucket_abac_connect_endpoint() -> String {
     if CTX.tls_ca_pem().is_some() || !CTX.endpoint().contains("amazonaws.com") {
         CTX.endpoint().to_string()
@@ -1801,6 +1820,72 @@ fn test_bucket_policy_put_object_bucket_tag_condition() {
             &["bucket-tag-put-public", "bucket-tag-put-private"],
         )
         .await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_object_bucket_tag_deny_condition_when_abac_disabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        let key = "bucket-tag-deny-disabled";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"bucket-tag-body"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("security", "private"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": principal,
+                            "Action": "s3:GetObject",
+                            "Resource": bucket_wildcard_resource(&bucket),
+                        },
+                        {
+                            "Effect": "Deny",
+                            "Principal": principal,
+                            "Action": "s3:GetObject",
+                            "Resource": bucket_wildcard_resource(&bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:BucketTag/security": "private"
+                                }
+                            }
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_get_object_succeeds(
+            "GetObject unexpectedly denied by bucket-tag deny while ABAC is disabled",
+            || alt_client.get_object().bucket(&bucket).key(key),
+        )
+        .await;
+
+        cleanup(&bucket, &[key]).await;
     });
 }
 
