@@ -52,6 +52,15 @@
             "Resource": "arn:aws:s3:::claude-s3-*"
         },
         {
+            "Sid": "AllowBucketTagControlPlaneOps",
+            "Effect": "Allow",
+            "Action": [
+                "s3:TagResource",
+                "s3:UntagResource"
+            ],
+            "Resource": "*"
+        },
+        {
             "Sid": "AllowObjectOpsOnlyInsidePrefixedBuckets",
             "Effect": "Allow",
             "Action": [

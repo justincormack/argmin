@@ -268,6 +268,23 @@ fn delete_bucket_tags_test(
     ))
 }
 
+fn put_bucket_tags_for_tag_resource_test(
+    coord: &Coordinator,
+    name: &str,
+    config: &str,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+    account_id: &str,
+) -> Result<(), ServerError> {
+    coord.put_bucket_tags_for_tag_resource(&PutBucketTagControlRequest {
+        control: BucketTagControlRequest {
+            bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+            account_id,
+        },
+        config,
+    })
+}
+
 fn set_bucket_abac_enabled_test(coord: &Coordinator, name: &str, enabled: bool) {
     coord
         .set_bucket_abac_enabled_for_test(name, enabled)
@@ -4263,12 +4280,13 @@ fn get_bucket_policy_status_bucket_tag_policy_applies_when_abac_enabled() {
 
     let private_tags =
         "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>";
-    put_bucket_tags_test(
+    put_bucket_tags_for_tag_resource_test(
         &coord,
         "bucket",
         private_tags,
         test_helpers::requester("111122223333"),
         None,
+        "111122223333",
     )
     .unwrap();
 
@@ -4325,12 +4343,13 @@ fn authorize_list_bucket_bucket_tag_policy_applies_when_abac_enabled() {
 
     let private_tags =
         "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>";
-    put_bucket_tags_test(
+    put_bucket_tags_for_tag_resource_test(
         &coord,
         "bucket",
         private_tags,
         test_helpers::requester("111122223333"),
         None,
+        "111122223333",
     )
     .unwrap();
 

@@ -444,6 +444,20 @@ pub struct PutBucketConfigRequest<'a> {
     pub config: &'a str,
 }
 
+/// Request for a minimal `s3-control` bucket-tag operation.
+#[derive(Debug)]
+pub struct BucketTagControlRequest<'a> {
+    pub bucket: BucketRequest<'a>,
+    pub account_id: &'a str,
+}
+
+/// Request for a control-plane bucket-tag update that stores a full tag set.
+#[derive(Debug)]
+pub struct PutBucketTagControlRequest<'a> {
+    pub control: BucketTagControlRequest<'a>,
+    pub config: &'a str,
+}
+
 /// Request for a PutBucketPolicy operation.
 #[derive(Debug)]
 pub struct PutBucketPolicyRequest<'a> {

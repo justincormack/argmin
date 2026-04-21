@@ -348,6 +348,11 @@ The committed policy assumes:
 - bucket ABAC validation additionally requires:
   - `s3:GetBucketAbac`
   - `s3:PutBucketAbac`
+  - `s3:TagResource`
+  - `s3:UntagResource`
+  - `s3:TagResource` and `s3:UntagResource` are currently granted on `Resource: "*"`
+    in the committed test policy; scoping them to `arn:aws:s3:::claude-s3-*` was not
+    sufficient for the AWS control-plane `TagResource` / `UntagResource` calls
 - lifecycle validation requires:
   - `s3:GetLifecycleConfiguration`
   - `s3:PutLifecycleConfiguration`

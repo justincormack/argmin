@@ -135,6 +135,18 @@ Argmin currently exposes a single S3 API endpoint. It does not implement the
 separate AWS `s3-control` endpoint family, and it does not currently inspect or
 differentiate endpoint-style host headers beyond the normal S3 API surface.
 
+Current narrow exception:
+
+- the minimal bucket-ABAC `TagResource` / `UntagResource` subset is currently
+  accepted on the same endpoint as the rest of the S3 API
+- AWS itself expects those operations on the account-prefixed control-plane
+  host `https://{account_id}.s3-control.{region}.amazonaws.com`
+- Argmin does not yet enforce that distinct AWS `s3-control` `Host` /
+  endpoint shape for those operations and still accepts them on the ordinary
+  S3 endpoint
+- this is a temporary compatibility compromise and may be tightened later once
+  the dedicated `s3-control` routing surface exists locally
+
 Unsupported URL/addressing forms include:
 
 - website endpoints
@@ -237,19 +249,28 @@ Related plan:
 
 ### 11. The `s3-control` API family is not implemented
 
-Argmin implements the normal S3 API/data-plane endpoint only. It does not
-currently implement the separate AWS `s3-control` control-plane API family.
+Argmin implements the normal S3 API/data-plane endpoint and only a very narrow
+bucket-ABAC subset of `s3-control`.
 
 That means the following AWS surface is currently unsupported:
 
 - `s3-control` endpoint routing and host-style distinctions
-- `s3-control` resource tag management such as `TagResource` / `UntagResource`
 - broader `s3-control` surfaces such as access-point, multi-region access
   point, Storage Lens, batch operations, and other account/control-plane APIs
 
+Current narrow exception:
+
+- `TagResource` / `UntagResource` for the bucket-ABAC general-purpose-bucket
+  flow are implemented
+- AWS-pinned control-plane behavior uses the account-prefixed host
+  `https://{account_id}.s3-control.{region}.amazonaws.com`
+- locally they are still accepted on the ordinary S3 endpoint without distinct
+  `s3-control` host validation
+- this is intentionally temporary and may be tightened later
+
 In practice, any AWS behavior that depends on `s3-control` APIs, endpoint
 routing, or control-plane state such as `TagResource` / `UntagResource` should
-be treated as unsupported until that API family exists locally.
+be treated as unsupported apart from this narrow bucket-ABAC tagging subset.
 
 ### 12. Bucket-policy condition acceptance and runtime context are still partial
 

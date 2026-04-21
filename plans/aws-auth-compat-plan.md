@@ -298,12 +298,32 @@ Completed so far:
     `This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To add tags to this bucket, initiate a TagResource request. To delete tags from this bucket, initiate an UntagResource request.`
   - `DeleteBucketTagging` returns `400 BadRequest` with:
     `This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To delete tags from this bucket, initiate an UntagResource request.`
+- temporary endpoint/routing decision:
+  - the minimal `TagResource` / `UntagResource` subset is currently accepted on
+    the same endpoint as the normal S3 API
+  - local Host / endpoint distinction against the real AWS `s3-control`
+    surface is not enforced yet
+  - this is explicitly temporary and should be revisited once the broader
+    `s3-control` shape is implemented
+- local minimal bucket-tag control-plane support:
+  - `TagResource` merges into the stored bucket tag set
+  - `UntagResource` removes only the requested keys
+  - the same endpoint path `/v20180820/tags/{resourceArn}` is accepted locally
+- AWS-pinned `TagResource` / `UntagResource` control-plane behavior:
+  - the real AWS host shape is
+    `https://{account_id}.s3-control.{region}.amazonaws.com`
+  - both operations still sign with SigV4 service name `s3`
+  - both operations require `x-amz-account-id`
+  - the targeted AWS `bucket_admin_root` probe now runs successfully against
+    the real control-plane host
+  - the committed IAM test-user policy needed `s3:TagResource` /
+    `s3:UntagResource` on `Resource: "*"` for those AWS control-plane calls
 
 Still open inside Phase 7:
-- the minimal `s3-control` `TagResource` / `UntagResource` subset required once
-  ABAC is enabled
 - explicit enabled-state mapping for `s3:BucketTag/${TagKey}` authorization
   behavior beyond the disabled baseline
+- tightening the temporary same-endpoint `TagResource` / `UntagResource`
+  acceptance into explicit `s3-control` host/endpoint validation
 
 ## Test Plan
 
@@ -347,9 +367,9 @@ AWS checks:
   work is started
 
 4. Minimal `s3-control` endpoint shape
-- whether the initial bucket-ABAC subset should introduce an explicit
-  `s3-control` endpoint/routing distinction immediately, or temporarily reuse
-  the existing endpoint surface while keeping the scope tightly constrained
+- keep the initial bucket-ABAC subset on the existing endpoint surface for now,
+  while documenting that this does not yet enforce the distinct AWS
+  `s3-control` host/endpoint model
 
 ## Recommended Default Decisions
 

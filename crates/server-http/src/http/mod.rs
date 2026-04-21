@@ -190,6 +190,21 @@ fn parse_bucket_name(name: &str) -> Result<BucketName, ServerError> {
     })
 }
 
+fn parse_bucket_resource_arn(resource_arn: &str) -> Result<BucketName, ServerError> {
+    let bucket =
+        resource_arn
+            .strip_prefix("arn:aws:s3:::")
+            .ok_or_else(|| ServerError::InvalidRequest {
+                reason: format!("unsupported TagResource resource ARN: {resource_arn}"),
+            })?;
+    if bucket.is_empty() || bucket.contains('/') {
+        return Err(ServerError::InvalidRequest {
+            reason: format!("unsupported TagResource resource ARN: {resource_arn}"),
+        });
+    }
+    parse_bucket_name(bucket)
+}
+
 fn parse_object_key(key: &str) -> Result<ObjectKey, ServerError> {
     ObjectKey::try_from(key.to_string()).map_err(|error| ServerError::InvalidRequest {
         reason: error.to_string(),
@@ -453,6 +468,18 @@ fn expected_bucket_owner(req: &S3Request) -> Option<&str> {
 
 fn expected_source_bucket_owner(req: &S3Request) -> Option<&str> {
     req.header("x-amz-source-expected-bucket-owner")
+}
+
+fn required_account_id(req: &S3Request) -> Result<&str, ServerError> {
+    if req.header_count("x-amz-account-id") > 1 {
+        return Err(ServerError::InvalidArgument {
+            reason: "x-amz-account-id must not be repeated".to_string(),
+        });
+    }
+    req.header("x-amz-account-id")
+        .ok_or_else(|| ServerError::InvalidRequest {
+            reason: "Missing required header for this request: x-amz-account-id".to_string(),
+        })
 }
 
 fn parse_bucket_namespace(req: &S3Request) -> Result<BucketNamespace, ServerError> {
@@ -1119,6 +1146,65 @@ impl HttpFrontend {
         let expected_bucket_owner = expected_bucket_owner(req);
         // Dispatch to coordinator
         match operation {
+            S3Operation::TagResource { resource_arn } => {
+                let account_id = required_account_id(req)?;
+                let bucket = parse_bucket_resource_arn(&resource_arn)?;
+                let tags = xml::TagSet::parse_tag_resource_xml(&req.body)?;
+                let requester = Self::requester_from_auth(auth);
+                let control = crate::coordinator::BucketTagControlRequest {
+                    bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
+                    account_id,
+                };
+                let existing_tags = self
+                    .coordinator
+                    .get_bucket_tags_for_tag_resource(&control)?
+                    .map(|tagging_xml| xml::TagSet::parse_tagging_xml(tagging_xml.as_bytes(), 50))
+                    .transpose()?
+                    .unwrap_or_else(|| xml::TagSet::empty(50));
+                let merged_tags = existing_tags.merge(&tags)?;
+                let merged_xml = merged_tags.to_xml();
+                self.coordinator.put_bucket_tags_for_tag_resource(
+                    &crate::coordinator::PutBucketTagControlRequest {
+                        control,
+                        config: &merged_xml,
+                    },
+                )?;
+                Ok(S3Response::tag_resource())
+            }
+            S3Operation::UntagResource { resource_arn } => {
+                let account_id = required_account_id(req)?;
+                let bucket = parse_bucket_resource_arn(&resource_arn)?;
+                let tag_keys = req
+                    .query_params_lossy("tagKeys")
+                    .into_iter()
+                    .map(std::borrow::Cow::into_owned)
+                    .collect::<Vec<_>>();
+                let requester = Self::requester_from_auth(auth);
+                let control = crate::coordinator::BucketTagControlRequest {
+                    bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
+                    account_id,
+                };
+                let existing_tags = self
+                    .coordinator
+                    .get_bucket_tags_for_tag_resource(&control)?
+                    .map(|tagging_xml| xml::TagSet::parse_tagging_xml(tagging_xml.as_bytes(), 50))
+                    .transpose()?
+                    .unwrap_or_else(|| xml::TagSet::empty(50));
+                let remaining_tags = existing_tags.remove_keys(&tag_keys);
+                if remaining_tags.is_empty() {
+                    self.coordinator
+                        .delete_bucket_tags_for_tag_resource(&control)?;
+                } else {
+                    let remaining_xml = remaining_tags.to_xml();
+                    self.coordinator.put_bucket_tags_for_tag_resource(
+                        &crate::coordinator::PutBucketTagControlRequest {
+                            control,
+                            config: &remaining_xml,
+                        },
+                    )?;
+                }
+                Ok(S3Response::untag_resource())
+            }
             S3Operation::ListBuckets => {
                 let requester = Self::requester_from_auth(auth);
                 let owner_account = Self::authenticated_account(auth)?;
@@ -1987,8 +2073,8 @@ impl HttpFrontend {
                     req,
                     RequestChecksumRequirement::ContentMd5OrChecksumHeader,
                 )?;
-                let tags = xml::parse_tagging_xml(&req.body, 50)?;
-                let tags_xml = xml::get_tagging_xml(&tags);
+                let tags = xml::TagSet::parse_tagging_xml(&req.body, 50)?;
+                let tags_xml = tags.to_xml();
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .put_bucket_tags(&crate::coordinator::PutBucketConfigRequest {
@@ -2160,8 +2246,8 @@ impl HttpFrontend {
             S3Operation::PutObjectTagging { bucket, key } => {
                 validate_request_checksum_headers(req, true, false)?;
                 let vid = parse_version_id(req)?;
-                let tags = xml::parse_tagging_xml(&req.body, 10)?;
-                let tags_xml = xml::get_tagging_xml(&tags);
+                let tags = xml::TagSet::parse_tagging_xml(&req.body, 10)?;
+                let tags_xml = tags.to_xml();
                 let requester = Self::requester_from_auth(auth);
                 self.coordinator
                     .put_object_tags(&crate::coordinator::PutObjectTagsRequest {
@@ -2182,12 +2268,12 @@ impl HttpFrontend {
                 if let Some(tags_xml) = self.coordinator.get_object_tags(
                     &object_version_request(&bucket, &key, vid, requester, expected_bucket_owner)?,
                 )? {
-                    let mut tags = xml::parse_tagging_xml(tags_xml.as_bytes(), 10)?;
+                    let mut tags = xml::TagSet::parse_tagging_xml(tags_xml.as_bytes(), 10)?;
                     tags.reverse();
-                    Ok(S3Response::get_object_tagging(&xml::get_tagging_xml(&tags)))
+                    Ok(S3Response::get_object_tagging(&tags.to_xml()))
                 } else {
                     // S3 returns empty TagSet (not 404) for objects with no tags
-                    let empty = xml::get_tagging_xml(&[]);
+                    let empty = xml::TagSet::empty(10).to_xml();
                     Ok(S3Response::get_object_tagging(&empty))
                 }
             }

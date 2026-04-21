@@ -7,6 +7,12 @@ use storage::{BucketName, ObjectKey};
 #[derive(Debug, PartialEq, Eq)]
 pub enum S3Operation {
     ListBuckets,
+    TagResource {
+        resource_arn: String,
+    },
+    UntagResource {
+        resource_arn: String,
+    },
     CreateBucket {
         bucket: BucketName,
     },
@@ -212,7 +218,7 @@ pub enum S3Operation {
 impl S3Operation {
     pub fn bucket_name(&self) -> Option<&BucketName> {
         match self {
-            Self::ListBuckets => None,
+            Self::ListBuckets | Self::TagResource { .. } | Self::UntagResource { .. } => None,
             Self::CreateBucket { bucket }
             | Self::DeleteBucket { bucket }
             | Self::HeadBucket { bucket }
@@ -309,6 +315,15 @@ pub(crate) fn validate_object_key(key: &str) -> Result<(), ServerError> {
 pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, ServerError> {
     // Split path into segments
     let trimmed = path.strip_prefix('/').unwrap_or(path);
+
+    if let Some(resource_arn) = trimmed.strip_prefix("v20180820/tags/") {
+        let resource_arn = crate::http::request::percent_decode_strict(resource_arn)?;
+        return match method {
+            "POST" => Ok(S3Operation::TagResource { resource_arn }),
+            "DELETE" => Ok(S3Operation::UntagResource { resource_arn }),
+            _ => Err(ServerError::MethodNotAllowed),
+        };
+    }
 
     if trimmed.is_empty() {
         // Root path: GET / = ListBuckets
@@ -661,6 +676,31 @@ mod tests {
     #[test]
     fn list_buckets() {
         assert_eq!(route("GET", "/", "").unwrap(), S3Operation::ListBuckets);
+    }
+
+    #[test]
+    fn tag_resource() {
+        assert_eq!(
+            route("POST", "/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Abucket", "").unwrap(),
+            S3Operation::TagResource {
+                resource_arn: "arn:aws:s3:::bucket".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn untag_resource() {
+        assert_eq!(
+            route(
+                "DELETE",
+                "/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Abucket",
+                "tagKeys=env&tagKeys=security"
+            )
+            .unwrap(),
+            S3Operation::UntagResource {
+                resource_arn: "arn:aws:s3:::bucket".to_string(),
+            }
+        );
     }
 
     #[test]

@@ -1494,6 +1494,18 @@ impl S3Response {
         Self::new(204)
     }
 
+    /// Build a response for `TagResource` (204 No Content).
+    #[must_use]
+    pub fn tag_resource() -> Self {
+        Self::new(204)
+    }
+
+    /// Build a response for `UntagResource` (204 No Content).
+    #[must_use]
+    pub fn untag_resource() -> Self {
+        Self::new(204)
+    }
+
     /// Build a response for `PutBucketAbac` (200 OK, no body).
     #[must_use]
     pub fn put_bucket_abac() -> Self {

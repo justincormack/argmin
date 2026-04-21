@@ -35,12 +35,12 @@ use super::pg_guards::LockedReadObject;
 use super::request_types::{
     authorization_policy_context_for_put_object_write_acl, AuthorizePutObjectRequest,
     BeginStreamPartRequest, BucketAcl, BucketRequest, BucketScopedAuthorizationRequest,
-    CompleteMultipartUploadRequest, CopyObjectRequest, CreateBucketAcl, CreateBucketRequest,
-    CreateMultipartUploadRequest, DeleteEntry, DeleteObjectRequest, DeleteObjectsRequest,
-    GetObjectAttributesRequest, GetObjectRequest, ListBucketsRequest, ListMultipartUploadsRequest,
-    ListObjectVersionsRequest, ListObjectsV2Request, ListPartsRequest, MultipartObjectRequest,
-    ObjectRequest, ObjectVersionRequest, PutBucketAbacRequest, PutBucketAclInput,
-    PutBucketAclRequest, PutBucketConfigRequest, PutBucketEncryptionRequest,
+    BucketTagControlRequest, CompleteMultipartUploadRequest, CopyObjectRequest, CreateBucketAcl,
+    CreateBucketRequest, CreateMultipartUploadRequest, DeleteEntry, DeleteObjectRequest,
+    DeleteObjectsRequest, GetObjectAttributesRequest, GetObjectRequest, ListBucketsRequest,
+    ListMultipartUploadsRequest, ListObjectVersionsRequest, ListObjectsV2Request, ListPartsRequest,
+    MultipartObjectRequest, ObjectRequest, ObjectVersionRequest, PutBucketAbacRequest,
+    PutBucketAclInput, PutBucketAclRequest, PutBucketConfigRequest, PutBucketEncryptionRequest,
     PutBucketObjectLockConfigurationRequest, PutBucketOwnershipControlsRequest,
     PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest, PutBucketVersioningRequest,
     PutObjectAcl, PutObjectAclInput, PutObjectAclRequest, PutObjectLegalHoldRequest,
@@ -2463,6 +2463,27 @@ impl Coordinator {
         Ok(AuthorizedBucketSubresourceDelete {
             bucket: req.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Tagging,
+        })
+    }
+
+    fn validate_tag_resource_account_id(
+        bucket_info: &BucketSummary,
+        account_id: &str,
+    ) -> Result<(), ServerError> {
+        if aws_account_id_from_principal(&bucket_info.owner_principal) == Some(account_id) {
+            return Ok(());
+        }
+        Err(ServerError::AccessDenied)
+    }
+
+    pub(super) fn authorize_bucket_tag_control(
+        &self,
+        req: &BucketTagControlRequest<'_>,
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
+        let bucket_info = self.authorize_bucket_owner_account_admin_for(&req.bucket)?;
+        Self::validate_tag_resource_account_id(&bucket_info, req.account_id)?;
+        Ok(AuthorizedBucketConfigAccess {
+            bucket: req.bucket.name_typed().clone(),
         })
     }
 

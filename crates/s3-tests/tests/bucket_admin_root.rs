@@ -11,7 +11,10 @@ use aws_sdk_s3::types::{
     ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
     Tag, Tagging, VersioningConfiguration,
 };
-use s3_tests::{put_bucket_lifecycle_with_md5, unique_bucket, CTX};
+use s3_tests::{
+    put_bucket_lifecycle_with_md5, send_signed_request_to_endpoint_for_service_with_credentials,
+    unique_bucket, SignedRequestCredentials, CTX,
+};
 
 fn owner_root_client() -> &'static aws_sdk_s3::Client {
     CTX.require_owner_root_client()
@@ -269,6 +272,110 @@ fn enabled_abac_status() -> AbacStatus {
     AbacStatus::builder()
         .status(BucketAbacStatus::Enabled)
         .build()
+}
+
+fn bucket_resource_arn(bucket: &str) -> String {
+    format!("arn:aws:s3:::{bucket}")
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+fn bucket_abac_control_endpoint() -> String {
+    if CTX.tls_ca_pem().is_some() || !CTX.endpoint().contains("amazonaws.com") {
+        CTX.endpoint().to_string()
+    } else {
+        format!(
+            "https://{}.s3-control.{}.amazonaws.com",
+            CTX.account_id(),
+            CTX.region()
+        )
+    }
+}
+
+fn bucket_abac_connect_endpoint() -> String {
+    if CTX.tls_ca_pem().is_some() || !CTX.endpoint().contains("amazonaws.com") {
+        CTX.endpoint().to_string()
+    } else {
+        bucket_abac_control_endpoint()
+    }
+}
+
+fn raw_primary_credentials() -> SignedRequestCredentials<'static> {
+    SignedRequestCredentials {
+        access_key: CTX.access_key(),
+        secret_key: CTX.secret_key(),
+        region: CTX.region(),
+        tls_ca_pem: CTX.tls_ca_pem(),
+    }
+}
+
+fn tag_resource_body(tags: &[(&str, &str)]) -> String {
+    let mut body =
+        String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\"><Tags>");
+    for (key, value) in tags {
+        body.push_str("<Tag><Key>");
+        body.push_str(key);
+        body.push_str("</Key><Value>");
+        body.push_str(value);
+        body.push_str("</Value></Tag>");
+    }
+    body.push_str("</Tags></TagResourceRequest>");
+    body
+}
+
+fn tag_resource(bucket: &str, tags: &[(&str, &str)]) -> s3_tests::RawResponse {
+    let endpoint = bucket_abac_control_endpoint();
+    let connect_endpoint = bucket_abac_connect_endpoint();
+    let resource = percent_encode_path_segment(&bucket_resource_arn(bucket));
+    let signed_url = format!("{endpoint}/v20180820/tags/{resource}");
+    let connect_url = format!("{connect_endpoint}/v20180820/tags/{resource}");
+    send_signed_request_to_endpoint_for_service_with_credentials(
+        "POST",
+        &connect_url,
+        &signed_url,
+        tag_resource_body(tags).as_bytes(),
+        [("x-amz-account-id", CTX.account_id())],
+        "s3",
+        raw_primary_credentials(),
+    )
+}
+
+fn untag_resource(bucket: &str, tag_keys: &[&str]) -> s3_tests::RawResponse {
+    let endpoint = bucket_abac_control_endpoint();
+    let connect_endpoint = bucket_abac_connect_endpoint();
+    let resource = percent_encode_path_segment(&bucket_resource_arn(bucket));
+    let query = tag_keys
+        .iter()
+        .map(|key| format!("tagKeys={}", percent_encode_path_segment(key)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let signed_url = format!("{endpoint}/v20180820/tags/{resource}?{query}");
+    let connect_url = format!("{connect_endpoint}/v20180820/tags/{resource}?{query}");
+    send_signed_request_to_endpoint_for_service_with_credentials(
+        "DELETE",
+        &connect_url,
+        &signed_url,
+        &[],
+        [("x-amz-account-id", CTX.account_id())],
+        "s3",
+        raw_primary_credentials(),
+    )
 }
 
 fn simple_cors_config() -> CorsConfiguration {
@@ -752,6 +859,62 @@ fn test_same_account_root_and_non_root_bucket_abac_admin() {
 
         cleanup_bucket(root_client, non_root_client, &root_bucket).await;
         cleanup_bucket(root_client, non_root_client, &non_root_bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_abac_tag_resource_and_untag_resource() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_standard_bucket(client).await;
+
+        eventually_ok("PutBucketTagging before enable", || {
+            client
+                .put_bucket_tagging()
+                .bucket(&bucket)
+                .tagging(simple_tagging())
+                .send()
+        })
+        .await;
+
+        eventually_ok("PutBucketAbac enabled", || {
+            client
+                .put_bucket_abac()
+                .bucket(&bucket)
+                .abac_status(enabled_abac_status())
+                .send()
+        })
+        .await;
+
+        let tag = tag_resource(&bucket, &[("security", "public")]);
+        assert_eq!(tag.status, 204, "TagResource failed: {:?}", tag);
+
+        let get = eventually_ok("GetBucketTagging after TagResource", || {
+            client.get_bucket_tagging().bucket(&bucket).send()
+        })
+        .await;
+        assert_eq!(get.tag_set().len(), 2);
+        assert!(get
+            .tag_set()
+            .iter()
+            .any(|tag| tag.key() == "env" && tag.value() == "root-admin"));
+        assert!(get
+            .tag_set()
+            .iter()
+            .any(|tag| tag.key() == "security" && tag.value() == "public"));
+
+        let untag = untag_resource(&bucket, &["env"]);
+        assert_eq!(untag.status, 204, "UntagResource failed: {:?}", untag);
+
+        let get = eventually_ok("GetBucketTagging after UntagResource", || {
+            client.get_bucket_tagging().bucket(&bucket).send()
+        })
+        .await;
+        assert_eq!(get.tag_set().len(), 1);
+        assert_eq!(get.tag_set()[0].key(), "security");
+        assert_eq!(get.tag_set()[0].value(), "public");
+
+        cleanup_bucket(owner_root_client(), client, &bucket).await;
     });
 }
 

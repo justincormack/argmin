@@ -12,6 +12,8 @@ pub use helpers::{
     delete_all_and_bucket, delete_objects_with_md5, disable_bucket_public_access_block,
     enable_bucket_sse_c, err_status, object_url, presign_url, presign_url_with_credentials,
     put_bucket_lifecycle_with_md5, sdk_checksum_headers, send_signed_request,
+    send_signed_request_for_service_with_credentials,
+    send_signed_request_to_endpoint_for_service_with_credentials,
     send_signed_request_with_credentials, sse_c_header_values, test_sse_c_key, unique_bucket,
     PresignedRequest, RawResponse, SignedRequestCredentials,
 };

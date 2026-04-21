@@ -17,10 +17,11 @@ use super::{
     AuthorizedBucketSubresourceDelete, AuthorizedBucketSubresourceGet,
     AuthorizedBucketSubresourcePut, AuthorizedDeleteBucket, AuthorizedHeadBucket,
     AuthorizedListBuckets, AuthorizedPutBucketAcl, BucketCreateOutcome, BucketRequest,
-    BucketSummary, Coordinator, CreateBucketAcl, CreateBucketRequest, GetBucketAclResult,
-    ListBucketsRequest, PutBucketAbacRequest, PutBucketAclInput, PutBucketAclRequest,
-    PutBucketConfigRequest, PutBucketEncryptionRequest, PutBucketObjectLockConfigurationRequest,
-    PutBucketOwnershipControlsRequest, PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest,
+    BucketSummary, BucketTagControlRequest, Coordinator, CreateBucketAcl, CreateBucketRequest,
+    GetBucketAclResult, ListBucketsRequest, PutBucketAbacRequest, PutBucketAclInput,
+    PutBucketAclRequest, PutBucketConfigRequest, PutBucketEncryptionRequest,
+    PutBucketObjectLockConfigurationRequest, PutBucketOwnershipControlsRequest,
+    PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest, PutBucketTagControlRequest,
     PutBucketVersioningRequest, TRACE_TARGET,
 };
 use crate::error::ServerError;
@@ -663,6 +664,62 @@ impl Coordinator {
         );
         let authorized = self.authorize_delete_bucket_tagging(req)?;
         self.remove_authorized_bucket_subresource(&authorized)
+    }
+
+    pub fn get_bucket_tags_for_tag_resource(
+        &self,
+        req: &BucketTagControlRequest<'_>,
+    ) -> Result<Option<String>, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_tags_for_tag_resource",
+            "bucket={:?}",
+            req.bucket.name
+        );
+        let authorized = self.authorize_bucket_tag_control(req)?;
+        self.load_authorized_bucket_subresource(&AuthorizedBucketSubresourceGet {
+            bucket: authorized.bucket,
+            kind: storage::BucketSubresourceKind::Tagging,
+        })
+    }
+
+    pub fn put_bucket_tags_for_tag_resource(
+        &self,
+        req: &PutBucketTagControlRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_tags_for_tag_resource",
+            "bucket={:?} bytes={}",
+            req.control.bucket.name,
+            req.config.len()
+        );
+        let authorized = self.authorize_bucket_tag_control(&req.control)?;
+        self.store_bucket_subresource(
+            &authorized.bucket,
+            storage::PutBucketSubresource {
+                kind: storage::BucketSubresourceKind::Tagging,
+                body: req.config,
+                aux: storage::BucketSubresourceAux::None,
+            },
+        )
+    }
+
+    pub fn delete_bucket_tags_for_tag_resource(
+        &self,
+        req: &BucketTagControlRequest<'_>,
+    ) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::delete_bucket_tags_for_tag_resource",
+            "bucket={:?}",
+            req.bucket.name
+        );
+        let authorized = self.authorize_bucket_tag_control(req)?;
+        self.remove_authorized_bucket_subresource(&AuthorizedBucketSubresourceDelete {
+            bucket: authorized.bucket,
+            kind: storage::BucketSubresourceKind::Tagging,
+        })
     }
 
     pub fn put_bucket_abac(&self, req: &PutBucketAbacRequest<'_>) -> Result<(), ServerError> {

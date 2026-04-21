@@ -253,6 +253,11 @@ impl S3Request {
         query_param_lossy(self.query_string(), name)
     }
 
+    #[must_use]
+    pub fn query_params_lossy(&self, name: &str) -> Vec<Cow<'_, str>> {
+        query_params_lossy(self.query_string(), name)
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(crate) fn new_for_test(
@@ -300,6 +305,14 @@ impl S3Request {
 #[must_use]
 pub(crate) fn query_param_lossy<'a>(query_string: &'a str, name: &str) -> Option<Cow<'a, str>> {
     query_param_raw(query_string, name).map(percent_decode_lossy)
+}
+
+#[must_use]
+pub(crate) fn query_params_lossy<'a>(query_string: &'a str, name: &str) -> Vec<Cow<'a, str>> {
+    query_pairs(query_string)
+        .filter(|(key, _)| *key == name)
+        .map(|(_, value)| percent_decode_lossy(value))
+        .collect()
 }
 
 pub(crate) fn parse_part_number(value: &str) -> Result<u32, ServerError> {

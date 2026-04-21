@@ -599,11 +599,12 @@ where
     V: AsRef<str>,
     I: IntoIterator<Item = (K, V)>,
 {
-    send_signed_request_with_credentials(
+    send_signed_request_for_service_with_credentials(
         method,
         url_str,
         body,
         extra_headers,
+        "s3",
         SignedRequestCredentials {
             access_key: CTX.access_key(),
             secret_key: CTX.secret_key(),
@@ -626,15 +627,67 @@ where
     V: AsRef<str>,
     I: IntoIterator<Item = (K, V)>,
 {
-    let parsed = url::Url::parse(url_str).expect("parse URL");
+    send_signed_request_for_service_with_credentials(
+        method,
+        url_str,
+        body,
+        extra_headers,
+        "s3",
+        credentials,
+    )
+}
+
+/// Send a raw signed request using an explicit SigV4 service name.
+pub fn send_signed_request_for_service_with_credentials<K, V, I>(
+    method: &str,
+    url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+    service: &str,
+    credentials: SignedRequestCredentials<'_>,
+) -> RawResponse
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    send_signed_request_to_endpoint_for_service_with_credentials(
+        method,
+        url_str,
+        url_str,
+        body,
+        extra_headers,
+        service,
+        credentials,
+    )
+}
+
+/// Send a raw signed request to one endpoint while signing and sending a
+/// distinct `Host` header.
+pub fn send_signed_request_to_endpoint_for_service_with_credentials<K, V, I>(
+    method: &str,
+    connect_url_str: &str,
+    signed_url_str: &str,
+    body: &[u8],
+    extra_headers: I,
+    service: &str,
+    credentials: SignedRequestCredentials<'_>,
+) -> RawResponse
+where
+    K: AsRef<str>,
+    V: AsRef<str>,
+    I: IntoIterator<Item = (K, V)>,
+{
+    let parsed = url::Url::parse(connect_url_str).expect("parse URL");
+    let signed_parsed = url::Url::parse(signed_url_str).expect("parse signed URL");
     let endpoint = parsed.origin().ascii_serialization();
     let agent = crate::build_test_agent(
         &endpoint,
         credentials.tls_ca_pem,
         crate::configured_test_timeout(),
     );
-    let path = parsed.path();
-    let query = normalize_query(parsed.query().unwrap_or(""));
+    let path = signed_parsed.path();
+    let query = normalize_query(signed_parsed.query().unwrap_or(""));
 
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -643,16 +696,17 @@ where
     let amz_date = format_amz_date(secs);
     let date_stamp = &amz_date[..8];
 
-    let host = parsed
+    let host = signed_parsed
         .host_str()
         .map(|host| {
-            if let Some(port) = parsed.port() {
+            if let Some(port) = signed_parsed.port() {
                 format!("{host}:{port}")
             } else {
                 host.to_string()
             }
         })
         .expect("URL host");
+    let host_header = host.clone();
     let payload_hash = sha256_hex(body);
 
     let mut request_headers: Vec<(String, String)> = vec![
@@ -677,12 +731,17 @@ where
     let canonical_request =
         format!("{method}\n{path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
 
-    let scope = format!("{date_stamp}/{}/s3/aws4_request", credentials.region);
+    let scope = format!("{date_stamp}/{}/{service}/aws4_request", credentials.region);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
         sha256_hex(canonical_request.as_bytes())
     );
-    let signing_key = derive_signing_key(credentials.secret_key, date_stamp, credentials.region);
+    let signing_key = derive_signing_key_with_service(
+        credentials.secret_key,
+        date_stamp,
+        credentials.region,
+        service,
+    );
     let signature: String = hmac_sha256(&signing_key, string_to_sign.as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
@@ -697,9 +756,10 @@ where
     loop {
         let mut response = if method == "HEAD" {
             let mut request = agent
-                .head(url_str)
+                .head(connect_url_str)
                 .header("Authorization", &authorization)
                 .header("x-amz-date", &amz_date)
+                .header("Host", &host_header)
                 .header("x-amz-content-sha256", &payload_hash);
             for (name, value) in &request_headers {
                 if name == "host" || name == "x-amz-content-sha256" || name == "x-amz-date" {
@@ -710,9 +770,10 @@ where
             request.call().expect("raw HEAD transport error")
         } else if method == "GET" {
             let mut request = agent
-                .get(url_str)
+                .get(connect_url_str)
                 .header("Authorization", &authorization)
                 .header("x-amz-date", &amz_date)
+                .header("Host", &host_header)
                 .header("x-amz-content-sha256", &payload_hash);
             for (name, value) in &request_headers {
                 if name == "host" || name == "x-amz-content-sha256" || name == "x-amz-date" {
@@ -723,9 +784,10 @@ where
             request.call().expect("raw GET transport error")
         } else if method == "DELETE" {
             let mut request = agent
-                .delete(url_str)
+                .delete(connect_url_str)
                 .header("Authorization", &authorization)
                 .header("x-amz-date", &amz_date)
+                .header("Host", &host_header)
                 .header("x-amz-content-sha256", &payload_hash);
             for (name, value) in &request_headers {
                 if name == "host" || name == "x-amz-content-sha256" || name == "x-amz-date" {
@@ -736,12 +798,13 @@ where
             request.call().expect("raw DELETE transport error")
         } else {
             let mut request = match method {
-                "PUT" => agent.put(url_str),
-                "POST" => agent.post(url_str),
+                "PUT" => agent.put(connect_url_str),
+                "POST" => agent.post(connect_url_str),
                 other => panic!("unsupported method: {other}"),
             }
             .header("Authorization", &authorization)
             .header("x-amz-date", &amz_date)
+            .header("Host", &host_header)
             .header("x-amz-content-sha256", &payload_hash);
             for (name, value) in &request_headers {
                 if name == "host" || name == "x-amz-content-sha256" || name == "x-amz-date" {
@@ -781,6 +844,21 @@ where
             body: body_text,
         };
     }
+}
+
+fn derive_signing_key_with_service(
+    secret_key: &str,
+    date_stamp: &str,
+    region: &str,
+    service: &str,
+) -> Vec<u8> {
+    let k_date = hmac_sha256(
+        format!("AWS4{secret_key}").as_bytes(),
+        date_stamp.as_bytes(),
+    );
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, service.as_bytes());
+    hmac_sha256(&k_service, b"aws4_request")
 }
 
 fn md5_b64(data: &[u8]) -> String {
