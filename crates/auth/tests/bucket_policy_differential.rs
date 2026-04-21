@@ -1487,7 +1487,13 @@ fn bucket_policy_differential_phase2_bucket_vs_object_resource_applicability_mat
             );
             if matches!(resource, GeneratedResourcePattern::BucketArn(_)) {
                 let policy = policy.expect("bucket action applicability policy parses");
-                let request = PolicyRequest::for_bucket(action, BUCKET, Some(ALT_USER), None);
+                let request = PolicyRequest::for_bucket(
+                    action,
+                    BUCKET,
+                    Some(ALT_USER),
+                    None,
+                    auth::bucket_policy::BucketTags::Unavailable,
+                );
                 assert_eq!(
                     policy.evaluate(&request),
                     PolicyEvaluation::ExplicitAllow,

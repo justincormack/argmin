@@ -65,6 +65,7 @@ pub struct BucketSummary {
     pub bucket_policy_generation: u64,
     pub bucket_lifecycle_present: bool,
     pub bucket_lifecycle_generation: u64,
+    pub bucket_abac_enabled: bool,
     pub encryption: EffectiveBucketEncryptionConfig,
 }
 

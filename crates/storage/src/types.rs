@@ -1865,6 +1865,8 @@ pub struct BucketInfo {
     pub bucket_lifecycle_present: bool,
     /// Monotonic generation incremented on every lifecycle update/delete.
     pub bucket_lifecycle_generation: u64,
+    /// Whether bucket ABAC is enabled for `s3:BucketTag/${TagKey}` evaluation.
+    pub bucket_abac_enabled: bool,
     /// Effective bucket encryption semantics used on hot paths.
     pub encryption: EffectiveBucketEncryptionConfig,
 }
@@ -1901,6 +1903,7 @@ impl std::fmt::Debug for BucketInfo {
                 "bucket_lifecycle_generation",
                 &self.bucket_lifecycle_generation,
             )
+            .field("bucket_abac_enabled", &self.bucket_abac_enabled)
             .field("encryption", &self.encryption)
             .finish()
     }
@@ -1939,6 +1942,7 @@ pub struct BucketFastPathInfo {
     pub bucket_policy_generation: u64,
     pub bucket_lifecycle_present: bool,
     pub bucket_lifecycle_generation: u64,
+    pub bucket_abac_enabled: bool,
     pub encryption: EffectiveBucketEncryptionConfig,
 }
 
@@ -1968,6 +1972,7 @@ impl std::fmt::Debug for BucketFastPathInfo {
                 "bucket_lifecycle_generation",
                 &self.bucket_lifecycle_generation,
             )
+            .field("bucket_abac_enabled", &self.bucket_abac_enabled)
             .field("encryption", &self.encryption)
             .finish()
     }
@@ -2037,6 +2042,7 @@ impl From<BucketInfo> for BucketFastPathInfo {
             bucket_policy_generation: info.bucket_policy_generation,
             bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
+            bucket_abac_enabled: info.bucket_abac_enabled,
             encryption: info.encryption,
         }
     }
@@ -2062,6 +2068,7 @@ impl From<&BucketInfo> for BucketFastPathInfo {
             bucket_policy_generation: info.bucket_policy_generation,
             bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
+            bucket_abac_enabled: info.bucket_abac_enabled,
             encryption: info.encryption,
         }
     }
@@ -2750,6 +2757,7 @@ mod tests {
             bucket_policy_generation: 7,
             bucket_lifecycle_present: true,
             bucket_lifecycle_generation: 8,
+            bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         };
         let debug = format!("{info:?}");

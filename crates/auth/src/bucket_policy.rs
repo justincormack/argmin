@@ -51,6 +51,14 @@ impl BucketPolicy {
         })
     }
 
+    #[must_use]
+    pub fn requires_bucket_tags_for_action(&self, action: PolicyAction) -> bool {
+        let action = action.as_str();
+        self.statements.iter().any(|statement| {
+            statement.matches_action(action) && statement.references_bucket_tag_condition()
+        })
+    }
+
     pub fn validate_evaluable_object_conditions(&self) -> Result<(), BucketPolicyError> {
         for statement in &self.statements {
             if statement.references_evaluable_object_action()
@@ -246,6 +254,12 @@ pub enum ExistingObjectTags<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketTags<'a> {
+    Unavailable,
+    Available(&'a [PolicyTag<'a>]),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PolicyRequest<'a> {
     action: PolicyAction,
     bucket: &'a str,
@@ -253,6 +267,7 @@ pub struct PolicyRequest<'a> {
     bucket_resource: bool,
     requester_principal: Option<&'a str>,
     requester_canonical_user_id: Option<&'a CanonicalUserId>,
+    bucket_tags: BucketTags<'a>,
     existing_object_tags: ExistingObjectTags<'a>,
     request_object_tags: &'a [PolicyTag<'a>],
     copy_source: Option<&'a str>,
@@ -284,6 +299,7 @@ impl<'a> PolicyRequest<'a> {
             bucket_resource: false,
             requester_principal,
             requester_canonical_user_id,
+            bucket_tags: BucketTags::Unavailable,
             existing_object_tags,
             request_object_tags: &[],
             copy_source: None,
@@ -305,6 +321,7 @@ impl<'a> PolicyRequest<'a> {
         bucket: &'a str,
         requester_principal: Option<&'a str>,
         requester_canonical_user_id: Option<&'a CanonicalUserId>,
+        bucket_tags: BucketTags<'a>,
     ) -> Self {
         Self {
             action,
@@ -313,6 +330,7 @@ impl<'a> PolicyRequest<'a> {
             bucket_resource: true,
             requester_principal,
             requester_canonical_user_id,
+            bucket_tags,
             existing_object_tags: ExistingObjectTags::Unavailable,
             request_object_tags: &[],
             copy_source: None,
@@ -362,6 +380,16 @@ impl<'a> PolicyRequest<'a> {
         match self.existing_object_tags {
             ExistingObjectTags::Unavailable => ExistingObjectTagValue::Unavailable,
             ExistingObjectTags::Available(tags) => ExistingObjectTagValue::Available(
+                tags.iter().find(|tag| tag.key == key).map(|tag| tag.value),
+            ),
+        }
+    }
+
+    #[must_use]
+    fn bucket_tag_value(&self, key: &str) -> BucketTagValue<'a> {
+        match self.bucket_tags {
+            BucketTags::Unavailable => BucketTagValue::Unavailable,
+            BucketTags::Available(tags) => BucketTagValue::Available(
                 tags.iter().find(|tag| tag.key == key).map(|tag| tag.value),
             ),
         }
@@ -610,6 +638,12 @@ impl PolicyStatement {
             .any(|clause| clause.key.starts_with("s3:RequestObjectTag/"))
     }
 
+    fn references_bucket_tag_condition(&self) -> bool {
+        self.conditions
+            .iter()
+            .any(|clause| clause.key.starts_with("s3:BucketTag/"))
+    }
+
     fn references_evaluable_object_action(&self) -> bool {
         self.actions.iter().any(|pattern| {
             EVALUABLE_OBJECT_POLICY_ACTIONS
@@ -735,6 +769,12 @@ const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 22] = [
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExistingObjectTagValue<'a> {
+    Unavailable,
+    Available(Option<&'a str>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BucketTagValue<'a> {
     Unavailable,
     Available(Option<&'a str>),
 }
@@ -1529,7 +1569,28 @@ mod tests {
         bucket: &'a str,
         requester_principal: Option<&'a str>,
     ) -> PolicyRequest<'a> {
-        PolicyRequest::for_bucket(action, bucket, requester_principal, None)
+        PolicyRequest::for_bucket(
+            action,
+            bucket,
+            requester_principal,
+            None,
+            BucketTags::Unavailable,
+        )
+    }
+
+    fn bucket_request_with_tags<'a>(
+        action: PolicyAction,
+        bucket: &'a str,
+        requester_principal: Option<&'a str>,
+        bucket_tags: &'a [PolicyTag<'a>],
+    ) -> PolicyRequest<'a> {
+        PolicyRequest::for_bucket(
+            action,
+            bucket,
+            requester_principal,
+            None,
+            BucketTags::Available(bucket_tags),
+        )
     }
 
     #[test]
@@ -1937,6 +1998,21 @@ mod tests {
     fn put_object_existing_tag_condition_is_rejected() {
         let policy = parse_bucket_policy(
             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            policy.validate_evaluable_object_conditions(),
+            Err(BucketPolicyError::Malformed {
+                reason: "unsupported Condition for currently enforced bucket policy action",
+            })
+        );
+    }
+
+    #[test]
+    fn mixed_get_object_and_put_object_existing_tag_condition_is_rejected() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
         )
         .unwrap();
 
@@ -2991,6 +3067,43 @@ mod tests {
         let request = bucket_request(PolicyAction::GetBucketTagging, "bucket", Some("caller"));
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+    }
+
+    #[test]
+    fn get_bucket_tagging_matches_bucket_tag_condition() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketTagging","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let public = [PolicyTag::new("security", "public")];
+        let private = [PolicyTag::new("security", "private")];
+
+        let request = bucket_request_with_tags(
+            PolicyAction::GetBucketTagging,
+            "bucket",
+            Some("caller"),
+            &public,
+        );
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+        let request = bucket_request_with_tags(
+            PolicyAction::GetBucketTagging,
+            "bucket",
+            Some("caller"),
+            &private,
+        );
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn get_bucket_tagging_bucket_tag_condition_no_match_when_bucket_tags_unavailable() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketTagging","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let request = bucket_request(PolicyAction::GetBucketTagging, "bucket", Some("caller"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
     }
 
     #[test]

@@ -12,8 +12,8 @@
 
 use super::condition_op::{self, ActualValue, ConditionOpKind};
 use super::{
-    ConditionMatchResult, ExistingObjectTagValue, PolicyAction, PolicyConditionClause,
-    PolicyRequest,
+    BucketTagValue, ConditionMatchResult, ExistingObjectTagValue, PolicyAction,
+    PolicyConditionClause, PolicyRequest,
 };
 
 /// Resolved value for a condition key in a given request.
@@ -98,6 +98,13 @@ pub(super) const CONDITION_KEYS: &[ConditionKeyResolver] = &[
         resolve: resolve_existing_object_tag,
         evaluable_for_action: Some(existing_object_tag_evaluable_for_action),
         supported_for_action: Some(existing_object_tag_supported_for_action),
+    },
+    ConditionKeyResolver {
+        key: KeyMatch::Prefix("s3:BucketTag/"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_bucket_tag,
+        evaluable_for_action: None,
+        supported_for_action: Some(bucket_tag_supported_for_action),
     },
     ConditionKeyResolver {
         key: KeyMatch::Prefix("s3:RequestObjectTag/"),
@@ -207,6 +214,14 @@ fn resolve_request_object_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> R
     option_to_resolved(request.request_object_tag_value(param))
 }
 
+fn resolve_bucket_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> ResolvedValue<'a> {
+    match request.bucket_tag_value(param) {
+        BucketTagValue::Unavailable => ResolvedValue::Unavailable,
+        BucketTagValue::Available(Some(value)) => ResolvedValue::Present(value),
+        BucketTagValue::Available(None) => ResolvedValue::Absent,
+    }
+}
+
 fn resolve_copy_source<'a>(request: &PolicyRequest<'a>, _param: &str) -> ResolvedValue<'a> {
     option_to_resolved(request.copy_source())
 }
@@ -287,6 +302,40 @@ fn request_object_tag_supported_for_action(action: PolicyAction) -> bool {
         PolicyAction::PutObjectAcl
             | PolicyAction::PutObjectRetention
             | PolicyAction::PutObjectLegalHold
+    )
+}
+
+fn bucket_tag_supported_for_action(action: PolicyAction) -> bool {
+    matches!(
+        action,
+        PolicyAction::GetObject
+            | PolicyAction::PutObject
+            | PolicyAction::GetBucketPolicy
+            | PolicyAction::PutBucketPolicy
+            | PolicyAction::DeleteBucketPolicy
+            | PolicyAction::GetBucketLocation
+            | PolicyAction::GetBucketCors
+            | PolicyAction::GetBucketAcl
+            | PolicyAction::GetBucketVersioning
+            | PolicyAction::GetBucketOwnershipControls
+            | PolicyAction::GetBucketTagging
+            | PolicyAction::GetEncryptionConfiguration
+            | PolicyAction::GetLifecycleConfiguration
+            | PolicyAction::GetBucketPolicyStatus
+            | PolicyAction::GetBucketPublicAccessBlock
+            | PolicyAction::GetBucketObjectLockConfiguration
+            | PolicyAction::ListBucket
+            | PolicyAction::ListBucketVersions
+            | PolicyAction::ListBucketMultipartUploads
+            | PolicyAction::PutBucketAcl
+            | PolicyAction::PutBucketCors
+            | PolicyAction::PutBucketVersioning
+            | PolicyAction::PutBucketOwnershipControls
+            | PolicyAction::PutBucketTagging
+            | PolicyAction::PutEncryptionConfiguration
+            | PolicyAction::PutLifecycleConfiguration
+            | PolicyAction::PutBucketPublicAccessBlock
+            | PolicyAction::PutBucketObjectLockConfiguration
     )
 }
 

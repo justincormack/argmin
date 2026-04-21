@@ -713,6 +713,7 @@ mod tests {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
+            bucket_abac_enabled: false,
             encryption: crate::types::EffectiveBucketEncryptionConfig::default(),
         };
         node.upsert_bucket_fast_path(info);

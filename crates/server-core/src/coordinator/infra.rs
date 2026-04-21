@@ -255,6 +255,7 @@ impl Coordinator {
             bucket_policy_generation: info.bucket_policy_generation,
             bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
+            bucket_abac_enabled: info.bucket_abac_enabled,
             encryption: info.encryption,
         }
     }
@@ -277,6 +278,7 @@ impl Coordinator {
             bucket_policy_generation: info.bucket_policy_generation,
             bucket_lifecycle_present: info.bucket_lifecycle_present,
             bucket_lifecycle_generation: info.bucket_lifecycle_generation,
+            bucket_abac_enabled: info.bucket_abac_enabled,
             encryption: info.encryption,
         }
     }

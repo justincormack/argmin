@@ -377,6 +377,7 @@ CREATE TABLE IF NOT EXISTS buckets (
     bucket_policy_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_policy_generation >= 0),
     bucket_lifecycle_generation INTEGER NOT NULL DEFAULT 0 CHECK (bucket_lifecycle_generation >= 0),
     completed_multipart_upload_sequence INTEGER NOT NULL DEFAULT 0 CHECK (completed_multipart_upload_sequence >= 0),
+    bucket_abac_enabled INTEGER NOT NULL DEFAULT 0 CHECK (bucket_abac_enabled IN (0, 1)),
     default_encryption_type INTEGER CHECK (
         default_encryption_type IS NULL OR default_encryption_type IN (1)
     ),

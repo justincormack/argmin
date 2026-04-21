@@ -29,7 +29,7 @@ SELECT name, owner_principal, owner_canonical_id, created_at, region, state, ver
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 4 AND body IS NOT NULL) AS bucket_policy_present, \
        bucket_policy_public, bucket_policy_generation, \
        EXISTS(SELECT 1 FROM bucket_subresources WHERE bucket_name = buckets.name AND kind = 5 AND body IS NOT NULL) AS bucket_lifecycle_present, \
-       bucket_lifecycle_generation, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
+       bucket_lifecycle_generation, bucket_abac_enabled, default_encryption_type, sse_c_blocked, object_lock_enabled, object_lock_default_mode, object_lock_default_days, object_lock_default_years \
 FROM buckets";
 
 /// Part segment rows use a sentinel version_id during staging (pre-CompleteMultipartUpload).
@@ -1019,12 +1019,12 @@ impl PgStore {
         let ownership_controls = Self::parse_ownership_controls(row.get(17)?, 17)?;
         let object_lock = Self::parse_bucket_object_lock(
             (
-                row.get::<_, i64>(25)?,
-                row.get::<_, Option<u8>>(26)?,
-                row.get::<_, Option<i64>>(27)?,
+                row.get::<_, i64>(26)?,
+                row.get::<_, Option<u8>>(27)?,
                 row.get::<_, Option<i64>>(28)?,
+                row.get::<_, Option<i64>>(29)?,
             ),
-            [25, 26, 27, 28],
+            [26, 27, 28, 29],
         )?;
         let acl_grants = Self::parse_acl_grants(row.get::<_, String>(7)?, 7, "acl_grants")?;
         Ok(BucketInfo {
@@ -1057,20 +1057,21 @@ impl PgStore {
             bucket_policy_generation: row.get::<_, i64>(20)? as u64,
             bucket_lifecycle_present: row.get::<_, i64>(21)? != 0,
             bucket_lifecycle_generation: row.get::<_, i64>(22)? as u64,
+            bucket_abac_enabled: row.get::<_, i64>(23)? != 0,
             encryption: BucketEncryptionConfig {
                 default_encryption: row
-                    .get::<_, Option<u8>>(23)?
+                    .get::<_, Option<u8>>(24)?
                     .map(|value| {
                         ManagedEncryptionAlgorithm::from_u8(value).ok_or_else(|| {
                             rusqlite::Error::FromSqlConversionFailure(
-                                23,
+                                24,
                                 rusqlite::types::Type::Integer,
                                 Box::from(format!("invalid default_encryption_type: {value}")),
                             )
                         })
                     })
                     .transpose()?,
-                sse_c_blocked: row.get::<_, i64>(24)? != 0,
+                sse_c_blocked: row.get::<_, i64>(25)? != 0,
             }
             .effective(),
         })

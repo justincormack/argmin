@@ -171,6 +171,14 @@ Current AWS-backed baseline:
 - we should not treat accepted syntax as operative behavior until the
   ABAC-enabled state is mapped too
 
+Implementation note for the first step:
+- bucket metadata should carry an explicit `bucket_abac_enabled: bool`
+- the evaluator should continue to see only bucket-tag input availability
+  (`Available` vs `Unavailable`), not the raw ABAC flag itself
+- when bucket ABAC is disabled, authz should derive
+  `BucketTags::Unavailable` from that bucket state rather than inferring
+  non-operability from policy shape alone
+
 ## Target Behavior
 
 ### Authentication

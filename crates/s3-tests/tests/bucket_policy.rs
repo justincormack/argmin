@@ -1478,6 +1478,222 @@ fn test_bucket_policy_get_bucket_tagging_cross_account_allow() {
 }
 
 #[test]
+fn test_bucket_policy_get_bucket_tagging_bucket_tag_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:GetBucketTagging",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied(
+            "GetBucketTagging denied for public bucket tag while bucket ABAC is disabled",
+            || alt_client.get_bucket_tagging().bucket(&bucket).send(),
+        )
+        .await;
+
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("security", "private"))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied(
+            "GetBucketTagging denied for private bucket tag while bucket ABAC is disabled",
+            || alt_client.get_bucket_tagging().bucket(&bucket).send(),
+        )
+        .await;
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_object_bucket_tag_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        let key = "bucket-tag-get";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"bucket-tag-body"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:GetObject",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied(
+            "GetObject denied for public bucket tag while bucket ABAC is disabled",
+            || alt_client.get_object().bucket(&bucket).key(key).send(),
+        )
+        .await;
+
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("security", "private"))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied(
+            "GetObject denied for private bucket tag while bucket ABAC is disabled",
+            || alt_client.get_object().bucket(&bucket).key(key).send(),
+        )
+        .await;
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_bucket_tag_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied(
+            "PutObject denied for public bucket tag while bucket ABAC is disabled",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("bucket-tag-put-public")
+                    .body(ByteStream::from_static(b"public"))
+                    .send()
+            },
+        )
+        .await;
+
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("security", "private"))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied(
+            "PutObject denied for private bucket tag while bucket ABAC is disabled",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("bucket-tag-put-private")
+                    .body(ByteStream::from_static(b"private"))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(
+            &bucket,
+            &["bucket-tag-put-public", "bucket-tag-put-private"],
+        )
+        .await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_put_bucket_tagging_cross_account_allow() {
     s3_tests::run(async {
         let principal = alt_policy_principal();
@@ -3198,6 +3414,164 @@ fn test_bucket_policy_put_object_existing_tag_condition_is_rejected() {
         assert_s3_err_code(&result, "MalformedPolicy");
 
         cleanup(&bucket, &[public_key, private_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_copy_object_source_existing_tag_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let src_bucket = unique_bucket();
+        let dst_bucket = unique_bucket();
+        let public_key = "public-copy";
+        let private_key = "private-copy";
+
+        s3_tests::create_bucket(client, &src_bucket).await.unwrap();
+        s3_tests::create_bucket(alt_client, &dst_bucket)
+            .await
+            .unwrap();
+
+        for key in [public_key, private_key] {
+            client
+                .put_object()
+                .bucket(&src_bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"copy-source"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_object_tagging()
+            .bucket(&src_bucket)
+            .key(public_key)
+            .tagging(simple_bucket_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&src_bucket)
+            .key(private_key)
+            .tagging(simple_bucket_tagging("security", "private"))
+            .send()
+            .await
+            .unwrap();
+
+        let policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:GetObject",
+                "Resource": bucket_wildcard_resource(&src_bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:ExistingObjectTag/security": "public"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&src_bucket)
+            .policy(policy)
+            .send()
+            .await
+            .unwrap();
+
+        let source_read = eventually_ok_with_retry(
+            "GetObject with ExistingObjectTag-conditioned source bucket policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .get_object()
+                    .bucket(&src_bucket)
+                    .key(public_key)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            source_read
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes()
+                .as_ref(),
+            b"copy-source"
+        );
+
+        eventually_access_denied(
+            "CopyObject denied for public source under ExistingObjectTag policy",
+            || {
+                alt_client
+                    .copy_object()
+                    .bucket(&dst_bucket)
+                    .key("copied")
+                    .copy_source(format!("{src_bucket}/{public_key}"))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "CopyObject denied for private source under ExistingObjectTag policy",
+            || {
+                alt_client
+                    .copy_object()
+                    .bucket(&dst_bucket)
+                    .key("copied-denied")
+                    .copy_source(format!("{src_bucket}/{private_key}"))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_with_client(alt_client, &dst_bucket, &["copied", "copied-denied"]).await;
+        cleanup(&src_bucket, &[public_key, private_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_existing_tag_condition_is_rejected_for_mixed_copy_statement() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": ["s3:GetObject", "s3:PutObject"],
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:ExistingObjectTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        cleanup(&bucket, &[]).await;
     });
 }
 
@@ -8791,6 +9165,160 @@ fn test_bucket_policy_upload_part_copy_copy_source() {
         )
         .await;
         cleanup(&src_bucket, &["public/foo", "public/bar", "private/foo"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_upload_part_copy_source_existing_tag_condition() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let src_bucket = unique_bucket();
+        let dst_bucket = unique_bucket();
+        let public_key = "public/foo";
+        let private_key = "private/foo";
+        s3_tests::create_bucket(client, &src_bucket).await.unwrap();
+        s3_tests::create_bucket(alt_client, &dst_bucket)
+            .await
+            .unwrap();
+
+        for key in [public_key, private_key] {
+            client
+                .put_object()
+                .bucket(&src_bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"copy-source"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_object_tagging()
+            .bucket(&src_bucket)
+            .key(public_key)
+            .tagging(simple_bucket_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&src_bucket)
+            .key(private_key)
+            .tagging(simple_bucket_tagging("security", "private"))
+            .send()
+            .await
+            .unwrap();
+
+        let src_policy = json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": principal,
+                "Action": "s3:GetObject",
+                "Resource": bucket_wildcard_resource(&src_bucket),
+                "Condition": {
+                    "StringEquals": {
+                        "s3:ExistingObjectTag/security": "public"
+                    }
+                }
+            }],
+        })
+        .to_string();
+        client
+            .put_bucket_policy()
+            .bucket(&src_bucket)
+            .policy(src_policy)
+            .send()
+            .await
+            .unwrap();
+
+        let source_read = eventually_ok_with_retry(
+            "GetObject source read with ExistingObjectTag-conditioned bucket policy",
+            60,
+            std::time::Duration::from_millis(500),
+            || {
+                alt_client
+                    .get_object()
+                    .bucket(&src_bucket)
+                    .key(public_key)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            source_read
+                .body
+                .collect()
+                .await
+                .unwrap()
+                .into_bytes()
+                .as_ref(),
+            b"copy-source"
+        );
+
+        let upload = alt_client
+            .create_multipart_upload()
+            .bucket(&dst_bucket)
+            .key("copied")
+            .send()
+            .await
+            .unwrap();
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        let copied_part = upload_part_copy_eventually(
+            alt_client,
+            &dst_bucket,
+            "copied",
+            &upload_id,
+            1,
+            format!("{src_bucket}/{public_key}"),
+        )
+        .await;
+        complete_single_part_upload(
+            alt_client,
+            &dst_bucket,
+            "copied",
+            &upload_id,
+            copied_part.copy_part_result().unwrap().e_tag().unwrap(),
+        )
+        .await;
+
+        let denied_upload = alt_client
+            .create_multipart_upload()
+            .bucket(&dst_bucket)
+            .key("copied-denied")
+            .send()
+            .await
+            .unwrap();
+        let denied_upload_id = denied_upload.upload_id().unwrap().to_string();
+
+        let denied = alt_client
+            .upload_part_copy()
+            .bucket(&dst_bucket)
+            .key("copied-denied")
+            .upload_id(&denied_upload_id)
+            .part_number(1)
+            .copy_source(format!("{src_bucket}/{private_key}"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        let response = alt_client
+            .get_object()
+            .bucket(&dst_bucket)
+            .key("copied")
+            .send()
+            .await
+            .unwrap();
+        let body = response.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), b"copy-source");
+
+        cleanup_with_client(alt_client, &dst_bucket, &["copied", "copied-denied"]).await;
+        cleanup(&src_bucket, &[public_key, private_key]).await;
     });
 }
 

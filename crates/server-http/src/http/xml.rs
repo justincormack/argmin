@@ -4413,6 +4413,7 @@ mod tests {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
+            bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         }];
         let owner_canonical_id = CanonicalUserId::from_principal("owner");

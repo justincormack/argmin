@@ -2900,6 +2900,7 @@ mod tests {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
+            bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         };
         let resp = S3Response::head_bucket(&info, "us-west-2");
@@ -3007,6 +3008,7 @@ mod tests {
             bucket_policy_generation: 0,
             bucket_lifecycle_present: false,
             bucket_lifecycle_generation: 0,
+            bucket_abac_enabled: false,
             encryption: EffectiveBucketEncryptionConfig::default(),
         }];
         let owner_canonical_id = CanonicalUserId::from_principal("owner");

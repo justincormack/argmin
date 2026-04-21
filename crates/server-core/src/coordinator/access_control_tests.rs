@@ -2147,6 +2147,99 @@ fn create_multipart_upload_bucket_policy_request_object_tag_requires_put_object_
 }
 
 #[test]
+fn copy_object_bucket_policy_existing_tag_source_is_not_evaluable() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("owner-a", "src", false)
+        .unwrap();
+    coord
+        .create_bucket_for_owner("other-user", "dst", false)
+        .unwrap();
+    put_bucket_policy_test(&coord,
+            "src",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::src/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+            test_helpers::requester("owner-a"), None)
+        .unwrap();
+
+    for (key, body, tags) in [
+        (
+            "public/foo",
+            b"public-foo".as_slice(),
+            Some(
+                "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+            ),
+        ),
+        (
+            "private/foo",
+            b"private-foo".as_slice(),
+            Some(
+                "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+            ),
+        ),
+    ] {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "src",
+                    key,
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: body,
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let source = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "src",
+                "public/foo",
+                None,
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(source.body.read_all().unwrap(), b"public-foo");
+
+    let denied = coord
+        .authorize_copy_object(&CopyObjectRequest {
+            source: copy_source("src", "public/foo", None),
+            destination: object_request_with_expected_owner(
+                "dst",
+                "copied",
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            dst_condition: NO_WRITE,
+            directive: MetadataDirective::Copy,
+            website_redirect_location: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            tagging: TaggingDirective::Copy,
+            source_sse_customer: None,
+            destination_encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap_err();
+    assert!(matches!(denied, ServerError::AccessDenied));
+}
+
+#[test]
 fn upload_part_copy_bucket_policy_copy_source_controls_access() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
@@ -2242,6 +2335,151 @@ fn upload_part_copy_bucket_policy_copy_source_controls_access() {
             part_number: 2,
             copy_source_range: None,
 
+            source_sse_customer: None,
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(matches!(denied, ServerError::AccessDenied));
+}
+
+#[test]
+fn upload_part_copy_bucket_policy_existing_tag_source_controls_access() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("owner-a", "src", false)
+        .unwrap();
+    coord
+        .create_bucket_for_owner("other-user", "dst", false)
+        .unwrap();
+    put_bucket_policy_test(&coord,
+            "src",
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::src/*","Condition":{"StringEquals":{"s3:ExistingObjectTag/security":"public"}}}]}"#,
+            test_helpers::requester("owner-a"), None)
+        .unwrap();
+
+    for (key, body, tags) in [
+        (
+            "public/foo",
+            b"public-foo".as_slice(),
+            Some(
+                "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+            ),
+        ),
+        (
+            "private/foo",
+            b"private-foo".as_slice(),
+            Some(
+                "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+            ),
+        ),
+    ] {
+        test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "src",
+                    key,
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: body,
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        )
+        .unwrap();
+    }
+
+    let source = coord
+        .get_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "src",
+                "public/foo",
+                None,
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+    assert_eq!(source.body.read_all().unwrap(), b"public-foo");
+
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "dst",
+                "copied",
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let copied_part = coord
+        .upload_part_copy(&UploadPartCopyRequest {
+            source: copy_source("src", "public/foo", None),
+            upload: multipart_object_request_with_expected_owner(
+                "dst",
+                "copied",
+                &upload.upload_id,
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            part_number: 1,
+            copy_source_range: None,
+            source_sse_customer: None,
+            sse_customer: None,
+        })
+        .unwrap();
+    assert!(!copied_part.etag.is_empty());
+
+    let denied_upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "dst",
+                "copied-denied",
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let denied = coord
+        .upload_part_copy(&UploadPartCopyRequest {
+            source: copy_source("src", "private/foo", None),
+            upload: multipart_object_request_with_expected_owner(
+                "dst",
+                "copied-denied",
+                &denied_upload.upload_id,
+                test_helpers::requester("other-user"),
+                None,
+            ),
+            part_number: 1,
+            copy_source_range: None,
             source_sse_customer: None,
             sse_customer: None,
         })

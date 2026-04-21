@@ -67,6 +67,7 @@ enum MissingObjectDiscovery {
 impl MissingObjectDiscovery {
     fn requester_can_discover_missing(
         self,
+        coord: &Coordinator,
         requester: &Requester,
         bucket: &BucketSummary,
         key: &str,
@@ -76,12 +77,11 @@ impl MissingObjectDiscovery {
         match self {
             Self::ReadBucket => Ok(Coordinator::requester_can_discover_missing_object(
                 requester, bucket,
-            ) || Coordinator::requester_can_list_bucket_with_bucket_policy(
-                requester, bucket, policy,
-            )),
+            ) || coord
+                .requester_can_list_bucket_with_bucket_policy(requester, bucket, policy)?),
             Self::ReadObjectAttributes => {
                 Coordinator::requester_can_discover_missing_object_attrs_with_bucket_policy(
-                    requester, bucket, key, version_id, policy,
+                    coord, requester, bucket, key, version_id, policy,
                 )
             }
             Self::BucketAdmin => Ok(Coordinator::requester_can_bucket_owner_account_admin(
@@ -750,6 +750,7 @@ impl Coordinator {
         action: auth::PolicyAction,
         policy_context: PutObjectPolicyContext<'_>,
         policy: Option<&auth::BucketPolicy>,
+        existing_object_tags_available: bool,
     ) -> Result<auth::PolicyEvaluation, ServerError> {
         let Some(policy) = policy else {
             return Ok(auth::PolicyEvaluation::NoMatch);
@@ -784,7 +785,7 @@ impl Coordinator {
             object.key().as_str(),
             requester.principal_opt(),
             requester.canonical_user_id(),
-            if existing_tags_required {
+            if existing_tags_required && existing_object_tags_available {
                 auth::bucket_policy::ExistingObjectTags::Available(&existing_tags)
             } else {
                 auth::bucket_policy::ExistingObjectTags::Unavailable
@@ -831,41 +832,99 @@ impl Coordinator {
         policy.evaluate(&request)
     }
 
-    pub(super) fn bucket_policy_decision_for_bucket(
+    fn bucket_policy_decision_for_bucket_loaded(
+        &self,
         requester: &Requester,
         bucket: &BucketSummary,
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
-    ) -> auth::PolicyEvaluation {
+    ) -> Result<auth::PolicyEvaluation, ServerError> {
         let Some(policy) = policy else {
-            return auth::PolicyEvaluation::NoMatch;
+            return Ok(auth::PolicyEvaluation::NoMatch);
         };
+
+        let bucket_tags_available =
+            bucket.bucket_abac_enabled && policy.requires_bucket_tags_for_action(action);
+        let bucket_tags = if bucket_tags_available {
+            let bucket_pg = self.get_bucket_pg_for(&bucket.name)?;
+            let tags = Self::load_bucket_subresource_from_pg(
+                &bucket_pg,
+                &bucket.name,
+                storage::BucketSubresourceKind::Tagging,
+            )?;
+            let tags = match tags {
+                Some(tags_xml) => Self::parse_serialized_tag_set(&tags_xml)?,
+                None => Vec::new(),
+            };
+            Some(tags)
+        } else {
+            None
+        };
+        let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
+            .iter()
+            .flat_map(|tags| tags.iter())
+            .map(|(key, value)| auth::PolicyTag::new(key, value))
+            .collect();
 
         let request = auth::PolicyRequest::for_bucket(
             action,
             bucket.name.as_str(),
             requester.principal_opt(),
             requester.canonical_user_id(),
+            if bucket_tags_available {
+                auth::bucket_policy::BucketTags::Available(&bucket_tags)
+            } else {
+                auth::bucket_policy::BucketTags::Unavailable
+            },
         );
-        policy.evaluate(&request)
+        Ok(policy.evaluate(&request))
     }
 
-    pub(super) fn bucket_policy_decision_for_bucket_with_context(
+    fn bucket_policy_decision_for_bucket_with_context_loaded(
+        &self,
         requester: &Requester,
         bucket: &BucketSummary,
         action: auth::PolicyAction,
         policy_context: PutObjectPolicyContext<'_>,
         policy: Option<&auth::BucketPolicy>,
-    ) -> auth::PolicyEvaluation {
+    ) -> Result<auth::PolicyEvaluation, ServerError> {
         let Some(policy) = policy else {
-            return auth::PolicyEvaluation::NoMatch;
+            return Ok(auth::PolicyEvaluation::NoMatch);
         };
+
+        let bucket_tags_available =
+            bucket.bucket_abac_enabled && policy.requires_bucket_tags_for_action(action);
+        let bucket_tags = if bucket_tags_available {
+            let bucket_pg = self.get_bucket_pg_for(&bucket.name)?;
+            let tags = Self::load_bucket_subresource_from_pg(
+                &bucket_pg,
+                &bucket.name,
+                storage::BucketSubresourceKind::Tagging,
+            )?;
+            let tags = match tags {
+                Some(tags_xml) => Self::parse_serialized_tag_set(&tags_xml)?,
+                None => Vec::new(),
+            };
+            Some(tags)
+        } else {
+            None
+        };
+        let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
+            .iter()
+            .flat_map(|tags| tags.iter())
+            .map(|(key, value)| auth::PolicyTag::new(key, value))
+            .collect();
 
         let request = auth::PolicyRequest::for_bucket(
             action,
             bucket.name.as_str(),
             requester.principal_opt(),
             requester.canonical_user_id(),
+            if bucket_tags_available {
+                auth::bucket_policy::BucketTags::Available(&bucket_tags)
+            } else {
+                auth::bucket_policy::BucketTags::Unavailable
+            },
         )
         .with_canned_acl(policy_context.canned_acl)
         .with_grant_read(policy_context.grant_read)
@@ -873,7 +932,7 @@ impl Coordinator {
         .with_grant_read_acp(policy_context.grant_read_acp)
         .with_grant_write_acp(policy_context.grant_write_acp)
         .with_grant_full_control(policy_context.grant_full_control);
-        policy.evaluate(&request)
+        Ok(policy.evaluate(&request))
     }
 
     pub(super) fn bucket_policy_decision_for_put_object_action(
@@ -1011,6 +1070,33 @@ impl Coordinator {
             action,
             policy_context,
             policy,
+            true,
+        )?;
+        Ok(Self::bucket_policy_allows_with_fallback(
+            requester, bucket, decision, fallback,
+        ))
+    }
+
+    fn requester_can_object_action_with_unavailable_existing_tags_with_bucket_policy<F>(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy_context: PutObjectPolicyContext<'_>,
+        policy: Option<&auth::BucketPolicy>,
+        fallback: F,
+    ) -> Result<bool, ServerError>
+    where
+        F: FnOnce() -> bool,
+    {
+        let decision = Self::bucket_policy_decision_for_object(
+            requester,
+            bucket,
+            object,
+            action,
+            policy_context,
+            policy,
+            false,
         )?;
         Ok(Self::bucket_policy_allows_with_fallback(
             requester, bucket, decision, fallback,
@@ -1057,6 +1143,7 @@ impl Coordinator {
                 action,
                 policy_context,
                 policy,
+                true,
             ),
             ObjectPolicyTarget::MissingKey(key) => Ok(Self::bucket_policy_decision_for_key(
                 requester, bucket, key, action, policy,
@@ -1072,6 +1159,24 @@ impl Coordinator {
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
         Self::requester_can_object_action_with_bucket_policy(
+            requester,
+            bucket,
+            object,
+            action,
+            PutObjectPolicyContext::default(),
+            policy,
+            || Self::requester_can_read_object(requester, bucket, object),
+        )
+    }
+
+    pub(super) fn requester_can_read_object_without_existing_tags_with_bucket_policy(
+        requester: &Requester,
+        bucket: &BucketSummary,
+        object: &StoredObject,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<bool, ServerError> {
+        Self::requester_can_object_action_with_unavailable_existing_tags_with_bucket_policy(
             requester,
             bucket,
             object,
@@ -1100,18 +1205,20 @@ impl Coordinator {
             object,
             read_action,
             policy,
-        )? && Self::requester_can_object_action_with_bucket_policy(
-            requester,
-            bucket,
-            object,
-            action,
-            PutObjectPolicyContext::default(),
-            policy,
-            || Self::requester_can_read_object_attributes(requester, bucket, object),
-        )?)
+        )?
+            && Self::requester_can_object_action_with_unavailable_existing_tags_with_bucket_policy(
+                requester,
+                bucket,
+                object,
+                action,
+                PutObjectPolicyContext::default(),
+                policy,
+                || Self::requester_can_read_object_attributes(requester, bucket, object),
+            )?)
     }
 
     pub(super) fn requester_can_discover_missing_object_attrs_with_bucket_policy(
+        &self,
         requester: &Requester,
         bucket: &BucketSummary,
         key: &str,
@@ -1137,7 +1244,7 @@ impl Coordinator {
 
         Ok(read_allowed
             && attrs_allowed
-            && Self::requester_can_list_bucket_with_bucket_policy(requester, bucket, policy))
+            && self.requester_can_list_bucket_with_bucket_policy(requester, bucket, policy)?)
     }
 
     pub(super) fn requester_can_manage_object_tags_with_bucket_policy(
@@ -1166,7 +1273,7 @@ impl Coordinator {
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
-        Self::requester_can_object_action_with_bucket_policy(
+        Self::requester_can_object_action_with_unavailable_existing_tags_with_bucket_policy(
             requester,
             bucket,
             object,
@@ -1304,11 +1411,12 @@ impl Coordinator {
     }
 
     pub(super) fn requester_can_get_bucket_public_access_block_with_bucket_policy(
+        &self,
         requester: &Requester,
         bucket: &BucketSummary,
         policy: Option<&auth::BucketPolicy>,
-    ) -> bool {
-        Self::requester_can_bucket_action_with_bucket_policy(
+    ) -> Result<bool, ServerError> {
+        self.requester_can_bucket_action_with_bucket_policy(
             requester,
             bucket,
             auth::PolicyAction::GetBucketPublicAccessBlock,
@@ -1318,35 +1426,48 @@ impl Coordinator {
     }
 
     pub(super) fn requester_can_bucket_action_with_bucket_policy(
+        &self,
         requester: &Requester,
         bucket: &BucketSummary,
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
         default_allowed: bool,
-    ) -> bool {
-        let decision = Self::bucket_policy_decision_for_bucket(requester, bucket, action, policy);
-        Self::bucket_policy_allows_with_fallback(requester, bucket, decision, || default_allowed)
+    ) -> Result<bool, ServerError> {
+        let decision =
+            self.bucket_policy_decision_for_bucket_loaded(requester, bucket, action, policy)?;
+        Ok(Self::bucket_policy_allows_with_fallback(
+            requester,
+            bucket,
+            decision,
+            || default_allowed,
+        ))
     }
 
     pub(super) fn requester_can_bucket_policy_action_with_bucket_policy(
+        &self,
         requester: &Requester,
         bucket: &BucketSummary,
         action: auth::PolicyAction,
         policy: Option<&auth::BucketPolicy>,
         default_allowed: bool,
-    ) -> bool {
-        let decision = Self::bucket_policy_decision_for_bucket(requester, bucket, action, policy);
-        Self::bucket_policy_allows_with_root_principal_bypass(requester, bucket, decision, || {
-            default_allowed
-        })
+    ) -> Result<bool, ServerError> {
+        let decision =
+            self.bucket_policy_decision_for_bucket_loaded(requester, bucket, action, policy)?;
+        Ok(Self::bucket_policy_allows_with_root_principal_bypass(
+            requester,
+            bucket,
+            decision,
+            || default_allowed,
+        ))
     }
 
     pub(super) fn requester_can_get_bucket_policy_status_with_bucket_policy(
+        &self,
         requester: &Requester,
         bucket: &BucketSummary,
         policy: Option<&auth::BucketPolicy>,
-    ) -> bool {
-        Self::requester_can_bucket_action_with_bucket_policy(
+    ) -> Result<bool, ServerError> {
+        self.requester_can_bucket_action_with_bucket_policy(
             requester,
             bucket,
             auth::PolicyAction::GetBucketPolicyStatus,
@@ -1356,11 +1477,12 @@ impl Coordinator {
     }
 
     pub(super) fn requester_can_get_bucket_object_lock_configuration_with_bucket_policy(
+        &self,
         requester: &Requester,
         bucket: &BucketSummary,
         policy: Option<&auth::BucketPolicy>,
-    ) -> bool {
-        Self::requester_can_bucket_action_with_bucket_policy(
+    ) -> Result<bool, ServerError> {
+        self.requester_can_bucket_action_with_bucket_policy(
             requester,
             bucket,
             auth::PolicyAction::GetBucketObjectLockConfiguration,
@@ -1370,11 +1492,12 @@ impl Coordinator {
     }
 
     pub(super) fn requester_can_list_bucket_with_bucket_policy(
+        &self,
         requester: &Requester,
         bucket: &BucketSummary,
         policy: Option<&auth::BucketPolicy>,
-    ) -> bool {
-        Self::requester_can_bucket_action_with_bucket_policy(
+    ) -> Result<bool, ServerError> {
+        self.requester_can_bucket_action_with_bucket_policy(
             requester,
             bucket,
             auth::PolicyAction::ListBucket,
@@ -1398,13 +1521,15 @@ impl Coordinator {
     ) -> Result<ValidatedBucket, ServerError> {
         let info = self.checked_active_bucket_summary_for(bucket, expected_bucket_owner)?;
         let bucket_policy = self.cached_bucket_policy(&info)?;
-        if Self::requester_can_bucket_action_with_bucket_policy(
+        let policy_decision = self.bucket_policy_decision_for_bucket_loaded(
             requester,
             &info,
             action,
             bucket_policy.as_deref(),
-            Self::requester_can_bucket_owner_account_admin(requester, &info),
-        ) {
+        )?;
+        if Self::bucket_policy_allows_with_fallback(requester, &info, policy_decision, || {
+            Self::requester_can_bucket_owner_account_admin(requester, &info)
+        }) {
             Ok(info)
         } else {
             Err(ServerError::AccessDenied)
@@ -2339,13 +2464,13 @@ impl Coordinator {
             req.bucket.expected_bucket_owner(),
         )?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !Self::requester_can_bucket_policy_action_with_bucket_policy(
+        if !self.requester_can_bucket_policy_action_with_bucket_policy(
             &req.bucket.requester,
             &bucket_info,
             auth::PolicyAction::PutBucketPolicy,
             bucket_policy.as_deref(),
             Self::requester_can_bucket_owner_account_admin(&req.bucket.requester, &bucket_info),
-        ) {
+        )? {
             return Err(ServerError::AccessDenied);
         }
         let parsed_policy =
@@ -2390,13 +2515,13 @@ impl Coordinator {
         let bucket_info =
             self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !Self::requester_can_bucket_policy_action_with_bucket_policy(
+        if !self.requester_can_bucket_policy_action_with_bucket_policy(
             &req.requester,
             &bucket_info,
             auth::PolicyAction::GetBucketPolicy,
             bucket_policy.as_deref(),
             Self::requester_can_bucket_owner_account_admin(&req.requester, &bucket_info),
-        ) {
+        )? {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedBucketSubresourceGet {
@@ -2412,13 +2537,13 @@ impl Coordinator {
         let bucket_info =
             self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !Self::requester_can_bucket_policy_action_with_bucket_policy(
+        if !self.requester_can_bucket_policy_action_with_bucket_policy(
             &req.requester,
             &bucket_info,
             auth::PolicyAction::DeleteBucketPolicy,
             bucket_policy.as_deref(),
             Self::requester_can_bucket_owner_account_admin(&req.requester, &bucket_info),
-        ) {
+        )? {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedBucketSubresourceDelete {
@@ -2447,11 +2572,11 @@ impl Coordinator {
     ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
         let bucket_info = self.active_bucket_summary_for(req)?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !Self::requester_can_get_bucket_public_access_block_with_bucket_policy(
+        if !self.requester_can_get_bucket_public_access_block_with_bucket_policy(
             &req.requester,
             &bucket_info,
             bucket_policy.as_deref(),
-        ) {
+        )? {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedBucketConfigAccess {
@@ -2657,10 +2782,25 @@ impl Coordinator {
             req.bucket.expected_bucket_owner(),
         )?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !Self::requester_can_list_bucket_with_bucket_policy(
+        let policy_decision = self.bucket_policy_decision_for_bucket_loaded(
             &req.bucket.requester,
             &bucket_info,
+            auth::PolicyAction::ListBucket,
             bucket_policy.as_deref(),
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.bucket.requester,
+            &bucket_info,
+            policy_decision,
+            || {
+                Self::requester_can_read_bucket(
+                    &req.bucket.requester,
+                    &bucket_info,
+                    &bucket_info.owner_principal,
+                    &bucket_info.acl_grants,
+                    Self::effective_public_read(&bucket_info),
+                )
+            },
         ) {
             return Err(ServerError::AccessDenied);
         }
@@ -2688,18 +2828,25 @@ impl Coordinator {
             req.bucket.expected_bucket_owner(),
         )?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !Self::requester_can_bucket_action_with_bucket_policy(
+        let policy_decision = self.bucket_policy_decision_for_bucket_loaded(
             &req.bucket.requester,
             &bucket_info,
             auth::PolicyAction::ListBucketVersions,
             bucket_policy.as_deref(),
-            Self::requester_can_read_bucket(
-                &req.bucket.requester,
-                &bucket_info,
-                &bucket_info.owner_principal,
-                &bucket_info.acl_grants,
-                Self::effective_public_read(&bucket_info),
-            ),
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.bucket.requester,
+            &bucket_info,
+            policy_decision,
+            || {
+                Self::requester_can_read_bucket(
+                    &req.bucket.requester,
+                    &bucket_info,
+                    &bucket_info.owner_principal,
+                    &bucket_info.acl_grants,
+                    Self::effective_public_read(&bucket_info),
+                )
+            },
         ) {
             return Err(ServerError::AccessDenied);
         }
@@ -2717,18 +2864,25 @@ impl Coordinator {
             req.bucket.expected_bucket_owner(),
         )?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !Self::requester_can_bucket_action_with_bucket_policy(
+        let policy_decision = self.bucket_policy_decision_for_bucket_loaded(
             &req.bucket.requester,
             &bucket_info,
             auth::PolicyAction::ListBucketMultipartUploads,
             bucket_policy.as_deref(),
-            Self::requester_can_read_bucket(
-                &req.bucket.requester,
-                &bucket_info,
-                &bucket_info.owner_principal,
-                &bucket_info.acl_grants,
-                Self::effective_public_read(&bucket_info),
-            ),
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.bucket.requester,
+            &bucket_info,
+            policy_decision,
+            || {
+                Self::requester_can_read_bucket(
+                    &req.bucket.requester,
+                    &bucket_info,
+                    &bucket_info.owner_principal,
+                    &bucket_info.acl_grants,
+                    Self::effective_public_read(&bucket_info),
+                )
+            },
         ) {
             return Err(ServerError::AccessDenied);
         }
@@ -2798,11 +2952,11 @@ impl Coordinator {
     ) -> Result<AuthorizedGetBucketObjectLockConfiguration, ServerError> {
         let info = self.active_bucket_summary_for(req)?;
         let bucket_policy = self.cached_bucket_policy(&info)?;
-        if !Self::requester_can_get_bucket_object_lock_configuration_with_bucket_policy(
+        if !self.requester_can_get_bucket_object_lock_configuration_with_bucket_policy(
             &req.requester,
             &info,
             bucket_policy.as_deref(),
-        ) {
+        )? {
             return Err(ServerError::AccessDenied);
         }
         if !info.object_lock.enabled {
@@ -2829,11 +2983,11 @@ impl Coordinator {
             });
         }
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !Self::requester_can_get_bucket_policy_status_with_bucket_policy(
+        if !self.requester_can_get_bucket_policy_status_with_bucket_policy(
             &req.requester,
             &bucket_info,
             bucket_policy.as_deref(),
-        ) {
+        )? {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedGetBucketPolicyStatus {
@@ -2848,12 +3002,17 @@ impl Coordinator {
         let bucket =
             self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner())?;
         let bucket_policy = self.cached_bucket_policy(&bucket)?;
-        if !Self::requester_can_bucket_action_with_bucket_policy(
+        let policy_decision = self.bucket_policy_decision_for_bucket_loaded(
             &req.requester,
             &bucket,
             auth::PolicyAction::GetBucketAcl,
             bucket_policy.as_deref(),
-            Self::requester_can_read_bucket_acl(&req.requester, &bucket),
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.requester,
+            &bucket,
+            policy_decision,
+            || Self::requester_can_read_bucket_acl(&req.requester, &bucket),
         ) {
             return Err(ServerError::AccessDenied);
         }
@@ -2887,13 +3046,13 @@ impl Coordinator {
             req.bucket.expected_bucket_owner(),
         )?;
         let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        let policy_decision = Self::bucket_policy_decision_for_bucket_with_context(
+        let policy_decision = self.bucket_policy_decision_for_bucket_with_context_loaded(
             &req.bucket.requester,
             &bucket_info,
             auth::PolicyAction::PutBucketAcl,
             req.authorization_policy_context()?,
             bucket_policy.as_deref(),
-        );
+        )?;
         if !Self::bucket_policy_allows_with_fallback(
             &req.bucket.requester,
             &bucket_info,
@@ -2946,7 +3105,7 @@ impl Coordinator {
         object: &StoredObject,
         policy: Option<&auth::BucketPolicy>,
     ) -> Result<bool, ServerError> {
-        Self::requester_can_object_action_with_bucket_policy(
+        Self::requester_can_object_action_with_unavailable_existing_tags_with_bucket_policy(
             requester,
             bucket,
             object,
@@ -3277,7 +3436,7 @@ impl Coordinator {
             tags: request_object_tags_xml,
             encryption: req.destination_encryption,
         })?;
-        let source = self.authorize_object_read(
+        let source = self.authorize_object_read_without_existing_tags(
             requester,
             &req.source.bucket,
             &req.source.key,
@@ -3697,6 +3856,7 @@ impl Coordinator {
                 }
             };
             let can_discover_missing = req.missing_discovery.requester_can_discover_missing(
+                self,
                 req.requester,
                 &bucket_info,
                 req.key.as_str(),
@@ -3733,6 +3893,7 @@ impl Coordinator {
             ObjectBucketPolicyRequirement::Required => fresh_bucket_policy,
         };
         let can_discover_missing = req.missing_discovery.requester_can_discover_missing(
+            self,
             req.requester,
             &bucket_info,
             req.key.as_str(),
@@ -3762,13 +3923,50 @@ impl Coordinator {
         loaded: &LoadedObjectState<'_>,
         policy_action: auth::PolicyAction,
     ) -> Result<(), ServerError> {
-        let allowed = Self::requester_can_read_object_with_bucket_policy(
+        Self::ensure_loaded_object_read_allowed_with_existing_tag_availability(
             requester,
-            &loaded.bucket_info,
-            &loaded.locked.record,
+            loaded,
             policy_action,
-            loaded.bucket_policy.as_deref(),
-        )?;
+            true,
+        )
+    }
+
+    fn ensure_loaded_object_read_allowed_without_existing_tags(
+        requester: &Requester,
+        loaded: &LoadedObjectState<'_>,
+        policy_action: auth::PolicyAction,
+    ) -> Result<(), ServerError> {
+        Self::ensure_loaded_object_read_allowed_with_existing_tag_availability(
+            requester,
+            loaded,
+            policy_action,
+            false,
+        )
+    }
+
+    fn ensure_loaded_object_read_allowed_with_existing_tag_availability(
+        requester: &Requester,
+        loaded: &LoadedObjectState<'_>,
+        policy_action: auth::PolicyAction,
+        existing_object_tags_available: bool,
+    ) -> Result<(), ServerError> {
+        let allowed = if existing_object_tags_available {
+            Self::requester_can_read_object_with_bucket_policy(
+                requester,
+                &loaded.bucket_info,
+                &loaded.locked.record,
+                policy_action,
+                loaded.bucket_policy.as_deref(),
+            )?
+        } else {
+            Self::requester_can_read_object_without_existing_tags_with_bucket_policy(
+                requester,
+                &loaded.bucket_info,
+                &loaded.locked.record,
+                policy_action,
+                loaded.bucket_policy.as_deref(),
+            )?
+        };
         if allowed {
             Ok(())
         } else {
@@ -3815,6 +4013,32 @@ impl Coordinator {
             missing_discovery: MissingObjectDiscovery::ReadBucket,
         })?;
         Self::ensure_loaded_object_read_allowed(requester, &loaded, policy_action)?;
+        Ok(loaded.locked)
+    }
+
+    fn authorize_object_read_without_existing_tags<'a>(
+        &'a self,
+        requester: &Requester,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: Option<VersionId>,
+        expected_bucket_owner: Option<&str>,
+        policy_action: auth::PolicyAction,
+    ) -> Result<LockedReadObject<'a>, ServerError> {
+        let loaded = self.load_locked_object_state(ObjectStateLoadRequest {
+            requester,
+            bucket,
+            key,
+            version_id,
+            expected_bucket_owner,
+            policy_requirement: ObjectBucketPolicyRequirement::Required,
+            missing_discovery: MissingObjectDiscovery::ReadBucket,
+        })?;
+        Self::ensure_loaded_object_read_allowed_without_existing_tags(
+            requester,
+            &loaded,
+            policy_action,
+        )?;
         Ok(loaded.locked)
     }
 

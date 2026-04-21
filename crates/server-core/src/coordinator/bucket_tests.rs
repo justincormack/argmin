@@ -268,6 +268,13 @@ fn delete_bucket_tags_test(
     ))
 }
 
+fn set_bucket_abac_enabled_test(coord: &Coordinator, name: &str, enabled: bool) {
+    let bucket_pg = coord.get_bucket_pg(name).unwrap();
+    let enabled = if enabled { 1 } else { 0 };
+    let sql = format!("UPDATE buckets SET bucket_abac_enabled = {enabled} WHERE name = '{name}'");
+    bucket_pg.connection().execute(&sql, []).unwrap();
+}
+
 fn put_bucket_policy_test(
     coord: &Coordinator,
     name: &str,
@@ -4056,6 +4063,167 @@ fn get_bucket_tags_bucket_policy_allow_applies() {
     )
     .unwrap();
     assert_eq!(config, Some(tags.to_string()));
+}
+
+#[test]
+fn get_bucket_tags_bucket_tag_policy_denied_when_abac_disabled() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let tags =
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
+    coord
+        .create_bucket_for_owner("111122223333", "bucket", false)
+        .unwrap();
+    put_bucket_tags_test(
+        &coord,
+        "bucket",
+        tags,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetBucketTagging","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+
+    let err = get_bucket_tags_test(
+        &coord,
+        "bucket",
+        test_helpers::requester("444455556666"),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn get_bucket_policy_status_bucket_tag_policy_applies_when_abac_enabled() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let public_tags =
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
+    coord
+        .create_bucket_for_owner("111122223333", "bucket", false)
+        .unwrap();
+    put_bucket_tags_test(
+        &coord,
+        "bucket",
+        public_tags,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    set_bucket_abac_enabled_test(&coord, "bucket", true);
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetBucketPolicyStatus","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+
+    let is_public = get_bucket_policy_status_test(
+        &coord,
+        "bucket",
+        test_helpers::requester("444455556666"),
+        None,
+    )
+    .unwrap();
+    assert!(!is_public);
+
+    let private_tags =
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>";
+    put_bucket_tags_test(
+        &coord,
+        "bucket",
+        private_tags,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+
+    let err = get_bucket_policy_status_test(
+        &coord,
+        "bucket",
+        test_helpers::requester("444455556666"),
+        None,
+    )
+    .unwrap_err();
+    assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn authorize_list_bucket_bucket_tag_policy_applies_when_abac_enabled() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let public_tags =
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
+    coord
+        .create_bucket_for_owner("111122223333", "bucket", false)
+        .unwrap();
+    put_bucket_tags_test(
+        &coord,
+        "bucket",
+        public_tags,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    set_bucket_abac_enabled_test(&coord, "bucket", true);
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+
+    coord
+        .authorize_list_objects_v2(&ListObjectsV2Request {
+            bucket: bucket_request_with_expected_owner(
+                "bucket",
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            prefix: None,
+            delimiter: None,
+            continuation_token: None,
+            max_keys: 1000,
+        })
+        .unwrap();
+
+    let private_tags =
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>";
+    put_bucket_tags_test(
+        &coord,
+        "bucket",
+        private_tags,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+
+    let err = coord
+        .authorize_list_objects_v2(&ListObjectsV2Request {
+            bucket: bucket_request_with_expected_owner(
+                "bucket",
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            prefix: None,
+            delimiter: None,
+            continuation_token: None,
+            max_keys: 1000,
+        })
+        .unwrap_err();
+    assert!(matches!(err, ServerError::AccessDenied));
 }
 
 #[test]

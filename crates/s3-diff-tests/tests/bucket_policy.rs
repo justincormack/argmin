@@ -161,7 +161,13 @@ impl LocalRequest {
             .collect::<Vec<_>>();
 
         let request = if self.bucket_resource {
-            PolicyRequest::for_bucket(self.action, bucket, Some(principal), None)
+            PolicyRequest::for_bucket(
+                self.action,
+                bucket,
+                Some(principal),
+                None,
+                auth::bucket_policy::BucketTags::Unavailable,
+            )
         } else {
             PolicyRequest::for_object(
                 self.action,
