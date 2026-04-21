@@ -318,10 +318,23 @@ Completed so far:
     the real control-plane host
   - the committed IAM test-user policy needed `s3:TagResource` /
     `s3:UntagResource` on `Resource: "*"` for those AWS control-plane calls
+ - initial AWS-pinned enabled-state `s3:BucketTag/${TagKey}` behavior:
+   - with ABAC enabled and bucket tag `security=public`, the same conditional
+     allow shape authorizes:
+     - `GetBucketTagging`
+     - `ListBucket`
+     - `GetObject`
+     - `PutObject`
+   - local authz now derives bucket-tag availability from
+     `bucket_abac_enabled` on both bucket and object request paths, so the
+     enabled positive path matches AWS for those actions
 
 Still open inside Phase 7:
-- explicit enabled-state mapping for `s3:BucketTag/${TagKey}` authorization
-  behavior beyond the disabled baseline
+- the rest of the enabled-state `s3:BucketTag/${TagKey}` matrix beyond the
+  first `GetBucketTagging` / `ListBucket` / `GetObject` / `PutObject` row
+- whether cross-principal authorization revocation after `TagResource`
+  should be modeled as eventually consistent for some data-plane actions
+  (`ListBucket` / `GetObject`) rather than as an immediate semantic change
 - tightening the temporary same-endpoint `TagResource` / `UntagResource`
   acceptance into explicit `s3-control` host/endpoint validation
 

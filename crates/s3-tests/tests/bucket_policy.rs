@@ -1,19 +1,21 @@
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    AccessControlPolicy, BlockedEncryptionTypes, BucketCannedAcl, BucketLifecycleConfiguration,
-    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, CorsConfiguration, CorsRule,
-    DefaultRetention, EncryptionType, ExpirationStatus, Grant, Grantee, LifecycleExpiration,
-    LifecycleRule, LifecycleRuleFilter, ObjectCannedAcl, ObjectLockConfiguration,
-    ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership, Owner,
-    OwnershipControls, OwnershipControlsRule, Permission, PublicAccessBlockConfiguration,
-    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-    ServerSideEncryptionRule, Tag, Tagging, Type, VersioningConfiguration,
+    AbacStatus, AccessControlPolicy, BlockedEncryptionTypes, BucketAbacStatus, BucketCannedAcl,
+    BucketLifecycleConfiguration, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
+    CorsConfiguration, CorsRule, DefaultRetention, EncryptionType, ExpirationStatus, Grant,
+    Grantee, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectCannedAcl,
+    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule,
+    ObjectOwnership, Owner, OwnershipControls, OwnershipControlsRule, Permission,
+    PublicAccessBlockConfiguration, ServerSideEncryption, ServerSideEncryptionByDefault,
+    ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging, Type,
+    VersioningConfiguration,
 };
 use s3_tests::{
     assert_s3_err_code, cleanup_versioned_bucket, create_public_bucket,
     disable_bucket_public_access_block, err_status, put_bucket_lifecycle_with_md5,
-    sse_c_header_values, test_sse_c_key, unique_bucket, CTX,
+    send_signed_request_to_endpoint_for_service_with_credentials, sse_c_header_values,
+    test_sse_c_key, unique_bucket, SignedRequestCredentials, CTX,
 };
 use serde_json::json;
 use std::future::Future;
@@ -377,6 +379,94 @@ fn simple_bucket_tagging(key: &str, value: &str) -> Tagging {
         .tag_set(Tag::builder().key(key).value(value).build().unwrap())
         .build()
         .unwrap()
+}
+
+fn enabled_abac_status() -> AbacStatus {
+    AbacStatus::builder()
+        .status(BucketAbacStatus::Enabled)
+        .build()
+}
+
+fn bucket_resource_arn(bucket: &str) -> String {
+    format!("arn:aws:s3:::{bucket}")
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0F) as usize] as char);
+            }
+        }
+    }
+    out
+}
+
+fn bucket_abac_control_endpoint() -> String {
+    if CTX.tls_ca_pem().is_some() || !CTX.endpoint().contains("amazonaws.com") {
+        CTX.endpoint().to_string()
+    } else {
+        format!(
+            "https://{}.s3-control.{}.amazonaws.com",
+            CTX.account_id(),
+            CTX.region()
+        )
+    }
+}
+
+fn bucket_abac_connect_endpoint() -> String {
+    if CTX.tls_ca_pem().is_some() || !CTX.endpoint().contains("amazonaws.com") {
+        CTX.endpoint().to_string()
+    } else {
+        bucket_abac_control_endpoint()
+    }
+}
+
+fn raw_primary_credentials() -> SignedRequestCredentials<'static> {
+    SignedRequestCredentials {
+        access_key: CTX.access_key(),
+        secret_key: CTX.secret_key(),
+        region: CTX.region(),
+        tls_ca_pem: CTX.tls_ca_pem(),
+    }
+}
+
+fn tag_resource_body(tags: &[(&str, &str)]) -> String {
+    let mut body =
+        String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><TagResourceRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\"><Tags>");
+    for (key, value) in tags {
+        body.push_str("<Tag><Key>");
+        body.push_str(key);
+        body.push_str("</Key><Value>");
+        body.push_str(value);
+        body.push_str("</Value></Tag>");
+    }
+    body.push_str("</Tags></TagResourceRequest>");
+    body
+}
+
+fn tag_resource(bucket: &str, tags: &[(&str, &str)]) -> s3_tests::RawResponse {
+    let endpoint = bucket_abac_control_endpoint();
+    let connect_endpoint = bucket_abac_connect_endpoint();
+    let resource = percent_encode_path_segment(&bucket_resource_arn(bucket));
+    let signed_url = format!("{endpoint}/v20180820/tags/{resource}");
+    let connect_url = format!("{connect_endpoint}/v20180820/tags/{resource}");
+    send_signed_request_to_endpoint_for_service_with_credentials(
+        "POST",
+        &connect_url,
+        &signed_url,
+        tag_resource_body(tags).as_bytes(),
+        [("x-amz-account-id", CTX.account_id())],
+        "s3",
+        raw_primary_credentials(),
+    )
 }
 
 fn simple_lifecycle_configuration(prefix: &str, days: i32) -> BucketLifecycleConfiguration {
@@ -1688,6 +1778,316 @@ fn test_bucket_policy_put_object_bucket_tag_condition() {
         cleanup(
             &bucket,
             &["bucket-tag-put-public", "bucket-tag-put-private"],
+        )
+        .await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_tagging_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_abac()
+            .bucket(&bucket)
+            .abac_status(enabled_abac_status())
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:GetBucketTagging",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let response = eventually_ok(
+            "GetBucketTagging allowed for public bucket tag when ABAC is enabled",
+            || alt_client.get_bucket_tagging().bucket(&bucket).send(),
+        )
+        .await;
+        assert_eq!(response.tag_set().len(), 1);
+        assert_eq!(response.tag_set()[0].key(), "security");
+        assert_eq!(response.tag_set()[0].value(), "public");
+
+        let tag = tag_resource(&bucket, &[("security", "private")]);
+        assert_eq!(tag.status, 204, "TagResource failed: {:?}", tag);
+        let get = eventually_ok("Owner GetBucketTagging after TagResource private", || {
+            client.get_bucket_tagging().bucket(&bucket).send()
+        })
+        .await;
+        assert_eq!(get.tag_set().len(), 1);
+        assert_eq!(get.tag_set()[0].key(), "security");
+        assert_eq!(get.tag_set()[0].value(), "private");
+
+        eventually_access_denied(
+            "GetBucketTagging denied for private bucket tag when ABAC is enabled",
+            || alt_client.get_bucket_tagging().bucket(&bucket).send(),
+        )
+        .await;
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_abac()
+            .bucket(&bucket)
+            .abac_status(enabled_abac_status())
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:ListBucket",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "ListBucket allowed for public bucket tag when ABAC is enabled",
+            || alt_client.list_objects_v2().bucket(&bucket).send(),
+        )
+        .await;
+
+        let tag = tag_resource(&bucket, &[("security", "private")]);
+        assert_eq!(tag.status, 204, "TagResource failed: {:?}", tag);
+        let get = eventually_ok("Owner GetBucketTagging after TagResource private", || {
+            client.get_bucket_tagging().bucket(&bucket).send()
+        })
+        .await;
+        assert_eq!(get.tag_set().len(), 1);
+        assert_eq!(get.tag_set()[0].key(), "security");
+        assert_eq!(get.tag_set()[0].value(), "private");
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_object_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        let key = "bucket-tag-get-enabled";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"bucket-tag-body"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_abac()
+            .bucket(&bucket)
+            .abac_status(enabled_abac_status())
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:GetObject",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let response = eventually_ok(
+            "GetObject allowed for public bucket tag when ABAC is enabled",
+            || alt_client.get_object().bucket(&bucket).key(key).send(),
+        )
+        .await;
+        assert_eq!(response.content_length(), Some(15));
+
+        let tag = tag_resource(&bucket, &[("security", "private")]);
+        assert_eq!(tag.status, 204, "TagResource failed: {:?}", tag);
+        let get = eventually_ok("Owner GetBucketTagging after TagResource private", || {
+            client.get_bucket_tagging().bucket(&bucket).send()
+        })
+        .await;
+        assert_eq!(get.tag_set().len(), 1);
+        assert_eq!(get.tag_set()[0].key(), "security");
+        assert_eq!(get.tag_set()[0].value(), "private");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_object_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_abac()
+            .bucket(&bucket)
+            .abac_status(enabled_abac_status())
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "PutObject allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("bucket-tag-put-public-enabled")
+                    .body(ByteStream::from_static(b"public"))
+                    .send()
+            },
+        )
+        .await;
+
+        let tag = tag_resource(&bucket, &[("security", "private")]);
+        assert_eq!(tag.status, 204, "TagResource failed: {:?}", tag);
+        let get = eventually_ok("Owner GetBucketTagging after TagResource private", || {
+            client.get_bucket_tagging().bucket(&bucket).send()
+        })
+        .await;
+        assert_eq!(get.tag_set().len(), 1);
+        assert_eq!(get.tag_set()[0].key(), "security");
+        assert_eq!(get.tag_set()[0].value(), "private");
+
+        eventually_access_denied(
+            "PutObject denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_object()
+                    .bucket(&bucket)
+                    .key("bucket-tag-put-private-enabled")
+                    .body(ByteStream::from_static(b"private"))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(
+            &bucket,
+            &[
+                "bucket-tag-put-public-enabled",
+                "bucket-tag-put-private-enabled",
+            ],
         )
         .await;
     });

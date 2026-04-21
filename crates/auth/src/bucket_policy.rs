@@ -402,6 +402,12 @@ impl<'a> PolicyRequest<'a> {
     }
 
     #[must_use]
+    pub fn with_bucket_tags(mut self, bucket_tags: BucketTags<'a>) -> Self {
+        self.bucket_tags = bucket_tags;
+        self
+    }
+
+    #[must_use]
     pub fn with_copy_source(mut self, copy_source: Option<&'a str>) -> Self {
         self.copy_source = copy_source;
         self
@@ -1591,6 +1597,24 @@ mod tests {
             None,
             BucketTags::Available(bucket_tags),
         )
+    }
+
+    fn request_with_bucket_tags<'a>(
+        action: PolicyAction,
+        bucket: &'a str,
+        key: &'a str,
+        requester_principal: Option<&'a str>,
+        existing_object_tags: &'a [PolicyTag<'a>],
+        bucket_tags: &'a [PolicyTag<'a>],
+    ) -> PolicyRequest<'a> {
+        request(
+            action,
+            bucket,
+            key,
+            requester_principal,
+            existing_object_tags,
+        )
+        .with_bucket_tags(BucketTags::Available(bucket_tags))
     }
 
     #[test]
@@ -3102,6 +3126,53 @@ mod tests {
         )
         .unwrap();
         let request = bucket_request(PolicyAction::GetBucketTagging, "bucket", Some("caller"));
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn get_object_matches_bucket_tag_condition() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let public = [PolicyTag::new("security", "public")];
+        let private = [PolicyTag::new("security", "private")];
+
+        let request = request_with_bucket_tags(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            &[],
+            &public,
+        );
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+        let request = request_with_bucket_tags(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            &[],
+            &private,
+        );
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn get_object_bucket_tag_condition_no_match_when_bucket_tags_unavailable() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let request = request(
+            PolicyAction::GetObject,
+            "bucket",
+            "key",
+            Some("caller"),
+            &[],
+        );
 
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
     }

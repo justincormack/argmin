@@ -1,6 +1,7 @@
 use super::test_helpers::{self, UploadPartRequest};
 use super::test_support::*;
 use super::*;
+use crate::coordinator::authz::BucketPolicyRequestContext;
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
@@ -1784,15 +1785,17 @@ fn bucket_policy_decision_for_put_object_tagging_requires_matching_action() {
 
     let bucket = coord.unchecked_active_bucket_summary("bucket").unwrap();
     let policy = coord.cached_bucket_policy(&bucket).unwrap();
-    let decision = Coordinator::bucket_policy_decision_for_put_object_action(
-        &test_helpers::requester("other-user"),
-        &bucket,
+    let decision = coord.bucket_policy_decision_for_put_object_action(
+        BucketPolicyRequestContext {
+            requester: &test_helpers::requester("other-user"),
+            bucket: &bucket,
+            action: auth::PolicyAction::PutObjectTagging,
+            policy_context: PutObjectPolicyContext::default().with_request_object_tags_xml(Some(
+                "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+            )),
+            policy: policy.as_deref(),
+        },
         "public-key",
-        auth::PolicyAction::PutObjectTagging,
-        PutObjectPolicyContext::default().with_request_object_tags_xml(Some(
-            "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
-        )),
-        policy.as_deref(),
     )
     .unwrap();
 
@@ -1814,15 +1817,17 @@ fn bucket_policy_decision_for_put_object_tagging_honors_inline_request_object_ta
 
     let bucket = coord.unchecked_active_bucket_summary("bucket").unwrap();
     let policy = coord.cached_bucket_policy(&bucket).unwrap();
-    let decision = Coordinator::bucket_policy_decision_for_put_object_action(
-        &test_helpers::requester("other-user"),
-        &bucket,
+    let decision = coord.bucket_policy_decision_for_put_object_action(
+        BucketPolicyRequestContext {
+            requester: &test_helpers::requester("other-user"),
+            bucket: &bucket,
+            action: auth::PolicyAction::PutObjectTagging,
+            policy_context: PutObjectPolicyContext::default().with_request_object_tags_xml(Some(
+                "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+            )),
+            policy: policy.as_deref(),
+        },
         "public-key",
-        auth::PolicyAction::PutObjectTagging,
-        PutObjectPolicyContext::default().with_request_object_tags_xml(Some(
-            "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
-        )),
-        policy.as_deref(),
     )
     .unwrap();
 
@@ -2530,18 +2535,17 @@ fn multipart_upload_managed_encryption_policy_context_enables_upload_part_copy_w
     let requester = test_helpers::requester("other-user");
     let base_context = PutObjectPolicyContext::new(Some("src/public/foo"), None, None);
 
-    assert!(
-        !Coordinator::requester_can_write_multipart_upload_with_bucket_policy(
+    assert!(!coord
+        .requester_can_write_multipart_upload_with_bucket_policy(
             &requester,
             &bucket,
             &upload,
             base_context,
             policy.as_deref(),
         )
-        .unwrap()
-    );
-    assert!(
-        Coordinator::requester_can_write_multipart_upload_with_bucket_policy(
+        .unwrap());
+    assert!(coord
+        .requester_can_write_multipart_upload_with_bucket_policy(
             &requester,
             &bucket,
             &upload,
@@ -2551,8 +2555,7 @@ fn multipart_upload_managed_encryption_policy_context_enables_upload_part_copy_w
             ),
             policy.as_deref(),
         )
-        .unwrap()
-    );
+        .unwrap());
 }
 
 #[test]
@@ -6392,18 +6395,17 @@ fn multipart_upload_managed_encryption_policy_context_enables_complete_multipart
     let upload = meta_pg.get_multipart_upload(&upload.upload_id).unwrap();
     let requester = test_helpers::requester("other-user");
 
-    assert!(
-        !Coordinator::requester_can_write_multipart_upload_with_bucket_policy(
+    assert!(!coord
+        .requester_can_write_multipart_upload_with_bucket_policy(
             &requester,
             &bucket,
             &upload,
             PutObjectPolicyContext::default(),
             policy.as_deref(),
         )
-        .unwrap()
-    );
-    assert!(
-        Coordinator::requester_can_write_multipart_upload_with_bucket_policy(
+        .unwrap());
+    assert!(coord
+        .requester_can_write_multipart_upload_with_bucket_policy(
             &requester,
             &bucket,
             &upload,
@@ -6413,8 +6415,7 @@ fn multipart_upload_managed_encryption_policy_context_enables_complete_multipart
             ),
             policy.as_deref(),
         )
-        .unwrap()
-    );
+        .unwrap());
 }
 
 #[test]
