@@ -1,0 +1,323 @@
+Bucket tag conditions ignored when ABAC disabled allow deny bypass
+Link: https://chatgpt.com/codex/cloud/security/findings/1b239ac05c2c81918716f295e2ff88f6?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: high (attack path: high)
+Status: invalid
+
+# Metadata
+Repo: justincormack/argmin
+Commit: 43fa580
+Author: justin@specialbusservice.com
+Created: 21/04/2026, 13:34:03
+Assignee: Unassigned
+Signals: Security, Validated, Patch generated, Attack-path
+
+# Summary
+Invalid: the reported behavior is real, but it matches AWS and is therefore not a compatibility or security bug for Argmin.
+With bucket ABAC disabled, bucket-tag conditions are accepted syntactically but are non-operative at evaluation time. That includes Deny statements conditioned on `s3:BucketTag/*`. This initially looked like a fail-open local bug, but direct AWS testing shows the same result: an unconditional `Allow` plus a bucket-tag-conditioned `Deny` on `GetObject` still allows access while ABAC is disabled.
+
+Reference tests added to pin this:
+- local evaluator regression: `crates/auth/src/bucket_policy.rs:get_object_bucket_tag_deny_condition_is_nonoperative_when_bucket_tags_unavailable`
+- AWS-backed regression: `crates/s3-tests/tests/bucket_policy.rs:test_bucket_policy_get_object_bucket_tag_deny_condition_when_abac_disabled`
+
+# Validation
+## Rubric
+- [x] Identify where bucket tags are unavailable for object requests and when ABAC is disabled (authz.rs, bucket_policy.rs)
+- [x] Confirm s3:BucketTag is supported and resolves to InputUnavailable when tags are missing (condition_key.rs)
+- [x] Verify InputUnavailable makes matching statements no-op (bucket_policy.rs)
+- [x] Demonstrate bypass with a minimal policy evaluation test (bucket_tag_bypass.rs + test log)
+- [ ] Reproduce via crash/ASan/valgrind (not applicable; valgrind missing, no crash expected)
+## Report
+Disposition update:
+- The original reasoning about `InputUnavailable` was accurate.
+- The conclusion that this is a local authorization bypass was not.
+- AWS exhibits the same behavior when ABAC is disabled, so Argmin is aligned.
+
+Summary of evidence:
+- Policy requests for objects always set bucket tags to Unavailable (crates/auth/src/bucket_policy.rs:287-303), and bucket tag loading is gated on bucket_abac_enabled in server-core (crates/server-core/src/coordinator/authz.rs:846-878).
+- s3:BucketTag/* is registered as a supported condition key (crates/auth/src/bucket_policy/condition_key.rs:102-108). When tags are unavailable, resolve_bucket_tag returns ResolvedValue::Unavailable (crates/auth/src/bucket_policy/condition_key.rs:217-222), which becomes ConditionMatchResult::InputUnavailable (crates/auth/src/bucket_policy/condition_key.rs:423-427). InputUnavailable causes the statement to have no effect, even for Deny (crates/auth/src/bucket_policy.rs:602-606).
+Dynamic PoC:
+- Local evaluator regression now lives in `crates/auth/src/bucket_policy.rs:get_object_bucket_tag_deny_condition_is_nonoperative_when_bucket_tags_unavailable` and confirms that a `Deny` conditioned on `s3:BucketTag/security` is skipped when bucket tags are unavailable, leaving the unconditional `Allow` effective.
+- AWS-backed regression now lives in `crates/s3-tests/tests/bucket_policy.rs:test_bucket_policy_get_object_bucket_tag_deny_condition_when_abac_disabled` and confirms the same behavior against Amazon S3.
+Attempts per rubric:
+- Crash attempt: built/runs succeeded; no crash expected for logic bug.
+- Valgrind: not installed (`valgrind: command not found`).
+- Debugger: lldb ran the test binary successfully (no crash, but confirms execution under debugger).
+
+# Evidence
+/workspace/argmin/crates/auth/src/bucket_policy.rs (L287 to 303)
+  Note: Object policy requests always set bucket_tags to Unavailable, so s3:BucketTag conditions never have data for object actions.
+```
+    pub const fn for_object(
+        action: PolicyAction,
+        bucket: &'a str,
+        key: &'a str,
+        requester_principal: Option<&'a str>,
+        requester_canonical_user_id: Option<&'a CanonicalUserId>,
+        existing_object_tags: ExistingObjectTags<'a>,
+    ) -> Self {
+        Self {
+            action,
+            bucket,
+            key,
+            bucket_resource: false,
+            requester_principal,
+            requester_canonical_user_id,
+            bucket_tags: BucketTags::Unavailable,
+            existing_object_tags,
+```
+
+/workspace/argmin/crates/auth/src/bucket_policy.rs (L602 to 606)
+  Note: InputUnavailable causes the statement to have no effect, so Deny rules conditioned on bucket tags are skipped.
+```
+        match self.condition_match_result(request) {
+            ConditionMatchResult::Matches => Some(self.effect),
+            ConditionMatchResult::NoMatch => None,
+            ConditionMatchResult::AcceptedButNotEvaluable => None,
+            ConditionMatchResult::InputUnavailable => None,
+```
+
+/workspace/argmin/crates/auth/src/bucket_policy/condition_key.rs (L102 to 108)
+  Note: s3:BucketTag/* is registered as a supported condition key, so policies with these conditions are accepted.
+```
+    ConditionKeyResolver {
+        key: KeyMatch::Prefix("s3:BucketTag/"),
+        operator_support: OperatorSupport::AnyEvaluable,
+        resolve: resolve_bucket_tag,
+        evaluable_for_action: None,
+        supported_for_action: Some(bucket_tag_supported_for_action),
+    },
+```
+
+/workspace/argmin/crates/auth/src/bucket_policy/condition_key.rs (L217 to 223)
+  Note: resolve_bucket_tag maps missing tags to ResolvedValue::Unavailable.
+```
+fn resolve_bucket_tag<'a>(request: &PolicyRequest<'a>, param: &str) -> ResolvedValue<'a> {
+    match request.bucket_tag_value(param) {
+        BucketTagValue::Unavailable => ResolvedValue::Unavailable,
+        BucketTagValue::Available(Some(value)) => ResolvedValue::Present(value),
+        BucketTagValue::Available(None) => ResolvedValue::Absent,
+    }
+}
+```
+
+/workspace/argmin/crates/auth/src/bucket_policy/condition_key.rs (L423 to 427)
+  Note: ResolvedValue::Unavailable becomes ConditionMatchResult::InputUnavailable.
+```
+    let actual = match (resolver.resolve)(request, param) {
+        ResolvedValue::Present(value) => ActualValue::Present(value),
+        ResolvedValue::Absent => ActualValue::Absent,
+        ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
+    };
+```
+
+/workspace/argmin/crates/server-core/src/coordinator/authz.rs (L846 to 877)
+  Note: Bucket tags are only loaded when bucket_abac_enabled is true; otherwise BucketTags::Unavailable is passed into policy evaluation.
+```
+        let bucket_tags_available =
+            bucket.bucket_abac_enabled && policy.requires_bucket_tags_for_action(action);
+        let bucket_tags = if bucket_tags_available {
+            let bucket_pg = self.get_bucket_pg_for(&bucket.name)?;
+            let tags = Self::load_bucket_subresource_from_pg(
+                &bucket_pg,
+                &bucket.name,
+                storage::BucketSubresourceKind::Tagging,
+            )?;
+            let tags = match tags {
+                Some(tags_xml) => Self::parse_serialized_tag_set(&tags_xml)?,
+                None => Vec::new(),
+            };
+            Some(tags)
+        } else {
+            None
+        };
+        let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
+            .iter()
+            .flat_map(|tags| tags.iter())
+            .map(|(key, value)| auth::PolicyTag::new(key, value))
+            .collect();
+
+        let request = auth::PolicyRequest::for_bucket(
+            action,
+            bucket.name.as_str(),
+            requester.principal_opt(),
+            requester.canonical_user_id(),
+            if bucket_tags_available {
+                auth::bucket_policy::BucketTags::Available(&bucket_tags)
+            } else {
+                auth::bucket_policy::BucketTags::Unavailable
+```
+
+Proposed patch:
+diff --git a/crates/auth/src/bucket_policy.rs b/crates/auth/src/bucket_policy.rs
+index 33d657c03d3e94c144f25cdacc0eb8ac21cdcd50..2f83d07ab1066b22e6d2135496a51bacafec4500 100644
+--- a/crates/auth/src/bucket_policy.rs
++++ b/crates/auth/src/bucket_policy.rs
+@@ -3084,50 +3084,68 @@ mod tests {
+             Some("caller"),
+             &public,
+         );
+         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+ 
+         let request = bucket_request_with_tags(
+             PolicyAction::GetBucketTagging,
+             "bucket",
+             Some("caller"),
+             &private,
+         );
+         assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+     }
+ 
+     #[test]
+     fn get_bucket_tagging_bucket_tag_condition_no_match_when_bucket_tags_unavailable() {
+         let policy = parse_bucket_policy(
+             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetBucketTagging","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+         )
+         .unwrap();
+         let request = bucket_request(PolicyAction::GetBucketTagging, "bucket", Some("caller"));
+ 
+         assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+     }
+ 
++    #[test]
++    fn bucket_tag_unavailable_deny_condition_is_fail_closed() {
++        let policy = parse_bucket_policy(
++            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:BucketTag/security":"private"}}},{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
++        )
++        .unwrap();
++        let request = PolicyRequest::for_object(
++            PolicyAction::GetObject,
++            "bucket",
++            "key",
++            Some("caller"),
++            None,
++            ExistingObjectTags::Unavailable,
++        );
++
++        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitDeny);
++    }
++
+     #[test]
+     fn get_encryption_configuration_matches_bucket_resource() {
+         let policy = parse_bucket_policy(
+             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetEncryptionConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+         )
+         .unwrap();
+         let request = bucket_request(
+             PolicyAction::GetEncryptionConfiguration,
+             "bucket",
+             Some("caller"),
+         );
+ 
+         assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+     }
+ 
+     #[test]
+     fn get_lifecycle_configuration_matches_bucket_resource() {
+         let policy = parse_bucket_policy(
+             r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetLifecycleConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+         )
+         .unwrap();
+         let request = bucket_request(
+             PolicyAction::GetLifecycleConfiguration,
+             "bucket",
+             Some("caller"),
+
+
+diff --git a/crates/auth/src/bucket_policy/condition_key.rs b/crates/auth/src/bucket_policy/condition_key.rs
+index 58d53aa800c566c6924a8fae7961cbd81b1e46df..ea13108062169847f48ba5af6bac28976bcbf864 100644
+--- a/crates/auth/src/bucket_policy/condition_key.rs
++++ b/crates/auth/src/bucket_policy/condition_key.rs
+@@ -401,51 +401,56 @@ pub(super) fn evaluate_clause(
+     clause: &PolicyConditionClause,
+     request: &PolicyRequest<'_>,
+ ) -> ConditionMatchResult {
+     let Some((resolver, param)) = lookup(clause.key.as_str()) else {
+         return ConditionMatchResult::Unsupported;
+     };
+     if let Some(evaluable) = resolver.evaluable_for_action {
+         if !evaluable(request.action()) {
+             return ConditionMatchResult::AcceptedButNotEvaluable;
+         }
+     }
+     let Some(op) = condition_op::lookup(clause.operator.as_str()) else {
+         return ConditionMatchResult::Unsupported;
+     };
+     match resolver.operator_support {
+         OperatorSupport::AnyEvaluable => {}
+         OperatorSupport::StringEqualsOnly => {
+             if op.kind != ConditionOpKind::StringEquals {
+                 return ConditionMatchResult::Unsupported;
+             }
+         }
+     }
+     let actual = match (resolver.resolve)(request, param) {
+         ResolvedValue::Present(value) => ActualValue::Present(value),
+         ResolvedValue::Absent => ActualValue::Absent,
+-        ResolvedValue::Unavailable => return ConditionMatchResult::InputUnavailable,
++        ResolvedValue::Unavailable => {
++            if clause.key.starts_with("s3:BucketTag/") {
++                return ConditionMatchResult::Unsupported;
++            }
++            return ConditionMatchResult::InputUnavailable;
++        }
+     };
+     (op.evaluate)(&clause.values, actual)
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
+     #[test]
+     fn key_match_exact_requires_equality() {
+         let key = KeyMatch::Exact("s3:x-amz-acl");
+         assert_eq!(key.match_key("s3:x-amz-acl"), Some(""));
+         assert_eq!(key.match_key("s3:x-amz-acls"), None);
+         assert_eq!(key.match_key("x-amz-acl"), None);
+     }
+ 
+     #[test]
+     fn key_match_prefix_returns_remainder() {
+         let key = KeyMatch::Prefix("s3:ExistingObjectTag/");
+         assert_eq!(
+             key.match_key("s3:ExistingObjectTag/classification"),
+             Some("classification")
+         );
+         assert_eq!(key.match_key("s3:ExistingObjectTag/"), Some(""));
+         assert_eq!(key.match_key("s3:RequestObjectTag/x"), None);
+
+# Attack-path analysis
+Final: high | Decider: model_decided | Matrix severity: high | Policy adjusted: high
+## Rationale
+The bug is a real authorization bypass: bucket tag conditions are accepted but evaluated as InputUnavailable, and Deny statements are ignored (bucket_policy.rs:602-606). Object requests always set BucketTags::Unavailable (bucket_policy.rs:287-303), and bucket tags are only loaded when bucket_abac_enabled is true (authz.rs:846-878), which defaults to disabled (schema.rs:380). This allows unauthorized object access whenever an Allow path exists, which is a major security impact, though dependent on policy configuration. Severity remains high with medium likelihood.
+## Likelihood
+high - Exploitation is straightforward over the S3 HTTP API but requires a bucket policy that uses s3:BucketTag conditions and an Allow path; ABAC is disabled by default, making the mis-evaluation likely if such policies are used. | Remote network vector
+## Impact
+high - Deny statements conditioned on bucket tags are ignored, allowing reads/writes that should be blocked by policy; this directly affects object confidentiality and integrity for affected buckets.
+## Assumptions
+- The argmin-s3 HTTP service is reachable by remote clients (directly or via reverse proxy).
+- A bucket policy uses s3:BucketTag/* conditions (notably Deny statements) for bucket or object actions.
+- There is at least one Allow path (policy, ACL, or public access) that would apply absent the Deny.
+- Bucket ABAC is disabled by default unless explicitly enabled, and object requests never provide bucket tags.
+- Bucket policy includes s3:BucketTag/* condition (often Deny).
+- Request is evaluated with BucketTags::Unavailable (object actions always, or bucket_abac_enabled=false).
+- Another Allow path exists (ACL/public or other policy statement).
+## Path
+n1(Remote client) -> n2(HTTP/authz) -> n3(Policy conditions: InputUnavailable) -> n4(Data access)
+## Path evidence
+- `crates/server-core/src/coordinator/authz.rs:846-878` - Bucket tags are only loaded when bucket_abac_enabled is true; otherwise BucketTags::Unavailable is used for policy evaluation.
+- `crates/auth/src/bucket_policy.rs:287-303` - Object policy requests always set bucket_tags to BucketTags::Unavailable.
+- `crates/auth/src/bucket_policy/condition_key.rs:102-108` - s3:BucketTag/* is registered as a supported condition key.
+- `crates/auth/src/bucket_policy/condition_key.rs:423-426` - ResolvedValue::Unavailable becomes ConditionMatchResult::InputUnavailable.
+- `crates/auth/src/bucket_policy.rs:602-606` - InputUnavailable causes the statement to have no effect, even for Deny.
+- `crates/storage/src/schema.rs:380` - bucket_abac_enabled defaults to 0 (disabled).
+- `crates/argmin-s3/src/config.rs:64-65` - Default listen address is 127.0.0.1:9000 (configurable via ARGMIN_LISTEN_ADDR).
+## Narrative
+Bucket tag conditions are registered as supported, but object policy requests always set bucket_tags to Unavailable and bucket tag loading is gated on bucket_abac_enabled. When tags are unavailable, condition evaluation returns InputUnavailable, and PolicyStatement::request_effect ignores the statement entirely—including Deny. As a result, Deny statements conditioned on s3:BucketTag/* are skipped; any other Allow (policy/ACL/public) can grant access, enabling unauthorized object operations over the normal S3 HTTP surface. ABAC is disabled by default in the schema, making this path plausible for typical deployments.
+## Controls
+- SigV4 authentication
+- Bucket policy evaluation
+- ACL/public access block settings
+## Blindspots
+- No deployment manifests found to confirm whether the service is internet-exposed or proxied with TLS.
+- No runtime verification of policy usage frequency; impact depends on operators using s3:BucketTag conditions.
