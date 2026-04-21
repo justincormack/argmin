@@ -548,10 +548,7 @@ fn normalize_xml_text_tags(body: &str, tags: &[&str]) -> String {
         let start_tag = format!("<{tag}>");
         let end_tag = format!("</{tag}>");
         let mut search_from = 0;
-        loop {
-            let Some(relative_start) = normalized[search_from..].find(&start_tag) else {
-                break;
-            };
+        while let Some(relative_start) = normalized[search_from..].find(&start_tag) {
             let start = search_from + relative_start;
             let content_start = start + start_tag.len();
             let Some(relative_end) = normalized[content_start..].find(&end_tag) else {
@@ -612,10 +609,7 @@ fn extract_xml_blocks(body: &str, tag: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut search_from = 0;
 
-    loop {
-        let Some(relative_start) = body[search_from..].find(&start_tag) else {
-            break;
-        };
+    while let Some(relative_start) = body[search_from..].find(&start_tag) {
         let start = search_from + relative_start;
         let content_start = start + start_tag.len();
         let Some(relative_end) = body[content_start..].find(&end_tag) else {

@@ -1,6 +1,6 @@
 use auth::bucket_policy::{
-    parse_bucket_policy, BucketPolicy, ExistingObjectTags, PolicyAction, PolicyEvaluation,
-    PolicyRequest, PolicyTag,
+    clause_supported_for_action_for_tests, parse_bucket_policy, BucketPolicy, ExistingObjectTags,
+    PolicyAction, PolicyEvaluation, PolicyRequest, PolicyTag,
 };
 use proptest::prelude::*;
 use proptest::test_runner::{Config as ProptestConfig, FileFailurePersistence};
@@ -257,26 +257,23 @@ impl GeneratedActionPattern {
         }
     }
 
-    fn supports_condition(self, key: GeneratedConditionKey) -> bool {
-        match key {
-            GeneratedConditionKey::ExistingTagClassification
-            | GeneratedConditionKey::ExistingTagRegion => {
-                !matches!(self, Self::Literal("s3:DeleteObject"))
-            }
-            GeneratedConditionKey::RequestTagTeam => matches!(
-                self,
-                Self::Literal("s3:PutObject") | Self::Literal("s3:PutObjectTagging")
-            ),
-            GeneratedConditionKey::CopySource
-            | GeneratedConditionKey::MetadataDirective
-            | GeneratedConditionKey::CannedAcl
-            | GeneratedConditionKey::GrantReadAcp
-            | GeneratedConditionKey::GrantFullControl
-            | GeneratedConditionKey::ServerSideEncryption
-            | GeneratedConditionKey::SseCustomerAlgorithm
-            | GeneratedConditionKey::GrantRead => !matches!(self, Self::Literal("s3:GetObject")),
-            GeneratedConditionKey::GrantWrite | GeneratedConditionKey::GrantWriteAcp => true,
+    fn policy_action(self) -> PolicyAction {
+        match self {
+            Self::Literal("s3:GetObject") => PolicyAction::GetObject,
+            Self::Literal("s3:PutObject") => PolicyAction::PutObject,
+            Self::Literal("s3:GetObjectTagging") => PolicyAction::GetObjectTagging,
+            Self::Literal("s3:PutObjectTagging") => PolicyAction::PutObjectTagging,
+            Self::Literal("s3:DeleteObject") => PolicyAction::DeleteObject,
+            Self::Literal(_) => unreachable!("unsupported generated action pattern"),
         }
+    }
+
+    fn supports_clause(self, clause: &GeneratedConditionClause) -> bool {
+        clause_supported_for_action_for_tests(
+            clause.operator.as_str(),
+            clause.key.as_str(),
+            self.policy_action(),
+        )
     }
 }
 
@@ -871,11 +868,8 @@ fn generated_statement_strategy() -> impl Strategy<Value = GeneratedStatement> {
             |(effect, principal, mut actions, mut resources, mut conditions)| {
                 dedup_actions(&mut actions);
                 dedup_resources(&mut resources);
-                conditions.retain(|clause| {
-                    actions
-                        .iter()
-                        .all(|action| action.supports_condition(clause.key))
-                });
+                conditions
+                    .retain(|clause| actions.iter().all(|action| action.supports_clause(clause)));
                 GeneratedStatement {
                     effect,
                     principal,
@@ -896,14 +890,7 @@ fn generated_invalid_statement_strategy() -> impl Strategy<Value = GeneratedStat
     )
         .prop_filter(
             "action and condition must be validation-incompatible",
-            |(_, _, action, clause)| {
-                matches!(action, GeneratedActionPattern::Literal("s3:DeleteObject"))
-                    && matches!(
-                        clause.key,
-                        GeneratedConditionKey::ExistingTagClassification
-                            | GeneratedConditionKey::ExistingTagRegion
-                    )
-            },
+            |(_, _, action, clause)| !action.supports_clause(clause),
         )
         .prop_map(|(effect, principal, action, clause)| GeneratedStatement {
             effect,
@@ -1550,5 +1537,64 @@ fn bucket_policy_differential_phase2_unsupported_condition_keys_are_rejected() {
             policy.validate_evaluable_object_conditions().is_err(),
             "unsupported condition key unexpectedly entered evaluable subset: {unsupported_key}"
         );
+    }
+}
+
+#[test]
+fn bucket_policy_differential_generator_support_matches_production_table() {
+    let actions = [
+        GeneratedActionPattern::Literal("s3:GetObject"),
+        GeneratedActionPattern::Literal("s3:PutObject"),
+        GeneratedActionPattern::Literal("s3:GetObjectTagging"),
+        GeneratedActionPattern::Literal("s3:PutObjectTagging"),
+        GeneratedActionPattern::Literal("s3:DeleteObject"),
+    ];
+    let operators = [
+        GeneratedConditionOperator::StringEquals,
+        GeneratedConditionOperator::StringEqualsIfExists,
+        GeneratedConditionOperator::StringLike,
+        GeneratedConditionOperator::StringLikeIfExists,
+        GeneratedConditionOperator::StringNotEquals,
+        GeneratedConditionOperator::StringNotEqualsIfExists,
+        GeneratedConditionOperator::Null,
+    ];
+    let keys = [
+        GeneratedConditionKey::ExistingTagClassification,
+        GeneratedConditionKey::ExistingTagRegion,
+        GeneratedConditionKey::RequestTagTeam,
+        GeneratedConditionKey::CopySource,
+        GeneratedConditionKey::MetadataDirective,
+        GeneratedConditionKey::CannedAcl,
+        GeneratedConditionKey::ServerSideEncryption,
+        GeneratedConditionKey::SseCustomerAlgorithm,
+        GeneratedConditionKey::GrantRead,
+        GeneratedConditionKey::GrantWrite,
+        GeneratedConditionKey::GrantReadAcp,
+        GeneratedConditionKey::GrantWriteAcp,
+        GeneratedConditionKey::GrantFullControl,
+    ];
+
+    for action in actions {
+        for operator in operators {
+            for key in keys {
+                let clause = GeneratedConditionClause {
+                    operator,
+                    key,
+                    values: vec!["value".to_string()],
+                };
+                assert_eq!(
+                    action.supports_clause(&clause),
+                    clause_supported_for_action_for_tests(
+                        operator.as_str(),
+                        key.as_str(),
+                        action.policy_action(),
+                    ),
+                    "generator/production support mismatch for action {} operator {} key {}",
+                    action.as_str(),
+                    operator.as_str(),
+                    key.as_str(),
+                );
+            }
+        }
     }
 }

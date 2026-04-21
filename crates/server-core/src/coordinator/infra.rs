@@ -174,7 +174,7 @@ impl Coordinator {
             Ok::<(), ServerError>(())
         })?;
 
-        uploads.sort_by(|a, b| b.2.cmp(&a.2));
+        uploads.sort_by_key(|entry| std::cmp::Reverse(entry.2));
         for (pg_id, upload_id, _) in uploads.into_iter().skip(keep) {
             let pg = self
                 .storage_node

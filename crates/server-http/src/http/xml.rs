@@ -4223,12 +4223,7 @@ pub fn parse_complete_multipart_upload_xml(body: &[u8]) -> Result<Vec<CompletePa
             Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
                 (State::InRoot, b"Part") => {}
                 (State::InPart, b"PartNumber" | b"ETag") => {}
-                (State::InPart, name) => {
-                    if checksum_algorithm_for_element(name).is_some() {
-                    } else {
-                        return Err(malformed_complete_multipart_xml());
-                    }
-                }
+                (State::InPart, name) if checksum_algorithm_for_element(name).is_some() => {}
                 _ => return Err(malformed_complete_multipart_xml()),
             },
             Ok(Event::End(e)) => match (state, e.name().as_ref()) {

@@ -1326,6 +1326,21 @@ fn condition_clause_supported_for_evaluable_object_action(
     condition_key::supports_clause_for_action(clause, action)
 }
 
+#[doc(hidden)]
+#[must_use]
+pub fn clause_supported_for_action_for_tests(
+    operator: &str,
+    key: &str,
+    action: PolicyAction,
+) -> bool {
+    let clause = PolicyConditionClause {
+        operator: operator.to_string(),
+        key: key.to_string(),
+        values: vec!["test".to_string()],
+    };
+    condition_key::supports_clause_for_action(&clause, action)
+}
+
 fn action_pattern_matches(pattern: &str, action: &str) -> bool {
     wildcard_matches(&pattern.to_ascii_lowercase(), &action.to_ascii_lowercase())
 }

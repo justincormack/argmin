@@ -224,24 +224,20 @@ impl Coordinator {
         let mut is_truncated = false;
         let mut active_common_prefix: Option<(String, Option<ObjectKey>)> = None;
 
-        loop {
-            let Some((cursor_index, current_key)) = cursors
-                .iter()
-                .enumerate()
-                .filter_map(|(cursor_index, cursor)| {
-                    cursor
-                        .current()
-                        .map(|object| (cursor_index, object.key().to_string()))
-                })
-                .min_by(|(left_index, left_key), (right_index, right_key)| {
-                    left_key
-                        .cmp(right_key)
-                        .then_with(|| left_index.cmp(right_index))
-                })
-            else {
-                break;
-            };
-
+        while let Some((cursor_index, current_key)) = cursors
+            .iter()
+            .enumerate()
+            .filter_map(|(cursor_index, cursor)| {
+                cursor
+                    .current()
+                    .map(|object| (cursor_index, object.key().to_string()))
+            })
+            .min_by(|(left_index, left_key), (right_index, right_key)| {
+                left_key
+                    .cmp(right_key)
+                    .then_with(|| left_index.cmp(right_index))
+            })
+        {
             if let Some((ref common_prefix, ref upper_bound)) = active_common_prefix {
                 if current_key.starts_with(common_prefix) {
                     if let Some(upper_bound) = upper_bound.clone() {
