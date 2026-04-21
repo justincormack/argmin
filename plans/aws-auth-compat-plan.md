@@ -318,25 +318,42 @@ Completed so far:
     the real control-plane host
   - the committed IAM test-user policy needed `s3:TagResource` /
     `s3:UntagResource` on `Resource: "*"` for those AWS control-plane calls
- - initial AWS-pinned enabled-state `s3:BucketTag/${TagKey}` behavior:
-   - with ABAC enabled and bucket tag `security=public`, the same conditional
-     allow shape authorizes:
-     - `GetBucketTagging`
-     - `ListBucket`
-     - `GetObject`
-     - `PutObject`
-   - local authz now derives bucket-tag availability from
-     `bucket_abac_enabled` on both bucket and object request paths, so the
-     enabled positive path matches AWS for those actions
+- AWS-pinned enabled-state `s3:BucketTag/${TagKey}` behavior:
+  - with ABAC enabled and bucket tag `security=public`, the same conditional
+    allow shape authorizes:
+    - `GetBucketTagging`
+    - `ListBucket`
+    - `GetObject`
+    - `HeadObject`
+    - `GetObjectAttributes`
+      - pinned with an unconditional `GetObjectAttributes` allow plus a
+        bucket-tag-conditioned `GetObject` allow, which proves the implicit
+        read-side check is bucket-tag-aware on AWS
+    - `PutObject`
+    - `CreateMultipartUpload`
+    - `UploadPart`
+    - `CompleteMultipartUpload`
+    - `CopyObject` destination writes
+    - `UploadPartCopy` destination writes
+    - `CopyObject` source reads
+    - `UploadPartCopy` source reads
+  - local authz now derives bucket-tag availability from
+    `bucket_abac_enabled` on both bucket and object request paths, and the
+    previously implicit `GetObject` / `PutObject` families above are now
+    explicitly AWS-pinned instead of inferred
+  - `CreateBucket` / `DeleteBucket` remain separate from this matrix for now:
+    they are not currently modeled as bucket-policy actions in the local auth
+    surface, so they need their own follow-up rather than being inferred from
+    Phase 7 bucket-tag results
 
 Still open inside Phase 7:
-- the rest of the enabled-state `s3:BucketTag/${TagKey}` matrix beyond the
-  first `GetBucketTagging` / `ListBucket` / `GetObject` / `PutObject` row
 - whether cross-principal authorization revocation after `TagResource`
   should be modeled as eventually consistent for some data-plane actions
   (`ListBucket` / `GetObject`) rather than as an immediate semantic change
 - tightening the temporary same-endpoint `TagResource` / `UntagResource`
   acceptance into explicit `s3-control` host/endpoint validation
+- any remaining enabled-state bucket-tag actions outside the now-pinned
+  bucket/object read-write and multipart/copy rows above
 
 ## Test Plan
 

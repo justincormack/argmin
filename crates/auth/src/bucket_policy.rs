@@ -59,6 +59,13 @@ impl BucketPolicy {
         })
     }
 
+    #[must_use]
+    pub fn references_bucket_tag_conditions(&self) -> bool {
+        self.statements
+            .iter()
+            .any(PolicyStatement::references_bucket_tag_condition)
+    }
+
     pub fn validate_evaluable_object_conditions(&self) -> Result<(), BucketPolicyError> {
         for statement in &self.statements {
             if statement.references_evaluable_object_action()

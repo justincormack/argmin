@@ -4,9 +4,9 @@ use aws_sdk_s3::types::{
     AbacStatus, AccessControlPolicy, BlockedEncryptionTypes, BucketAbacStatus, BucketCannedAcl,
     BucketLifecycleConfiguration, BucketVersioningStatus, CompletedMultipartUpload, CompletedPart,
     CorsConfiguration, CorsRule, DefaultRetention, EncryptionType, ExpirationStatus, Grant,
-    Grantee, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectCannedAcl,
-    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule,
-    ObjectOwnership, Owner, OwnershipControls, OwnershipControlsRule, Permission,
+    Grantee, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter, ObjectAttributes,
+    ObjectCannedAcl, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode,
+    ObjectLockRule, ObjectOwnership, Owner, OwnershipControls, OwnershipControlsRule, Permission,
     PublicAccessBlockConfiguration, ServerSideEncryption, ServerSideEncryptionByDefault,
     ServerSideEncryptionConfiguration, ServerSideEncryptionRule, Tag, Tagging, Type,
     VersioningConfiguration,
@@ -385,6 +385,27 @@ fn enabled_abac_status() -> AbacStatus {
     AbacStatus::builder()
         .status(BucketAbacStatus::Enabled)
         .build()
+}
+
+async fn enable_bucket_abac_with_security_tag(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    value: &str,
+) {
+    client
+        .put_bucket_tagging()
+        .bucket(bucket)
+        .tagging(simple_bucket_tagging("security", value))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_bucket_abac()
+        .bucket(bucket)
+        .abac_status(enabled_abac_status())
+        .send()
+        .await
+        .unwrap();
 }
 
 fn bucket_resource_arn(bucket: &str) -> String {
@@ -2090,6 +2111,946 @@ fn test_bucket_policy_put_object_bucket_tag_condition_when_abac_enabled() {
             ],
         )
         .await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_head_object_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "bucket-tag-head-enabled";
+
+        let public_bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_object()
+            .bucket(&public_bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"bucket-tag-body"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal.clone(),
+                        "Action": "s3:GetObject",
+                        "Resource": bucket_wildcard_resource(&public_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_object()
+            .bucket(&private_bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"bucket-tag-body"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:GetObject",
+                        "Resource": bucket_wildcard_resource(&private_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let head = eventually_ok(
+            "HeadObject allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .head_object()
+                    .bucket(&public_bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(head.content_length(), Some(15));
+
+        eventually_access_denied(
+            "HeadObject denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .head_object()
+                    .bucket(&private_bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&public_bucket, &[key]).await;
+        cleanup(&private_bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_object_attributes_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "bucket-tag-attrs-enabled";
+
+        let public_bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_object()
+            .bucket(&public_bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"bucket-tag-body"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": principal.clone(),
+                            "Action": "s3:GetObject",
+                            "Resource": bucket_wildcard_resource(&public_bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:BucketTag/security": "public"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": principal.clone(),
+                            "Action": "s3:GetObjectAttributes",
+                            "Resource": bucket_wildcard_resource(&public_bucket)
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_object()
+            .bucket(&private_bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"bucket-tag-body"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": principal.clone(),
+                            "Action": "s3:GetObject",
+                            "Resource": bucket_wildcard_resource(&private_bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:BucketTag/security": "public"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": principal,
+                            "Action": "s3:GetObjectAttributes",
+                            "Resource": bucket_wildcard_resource(&private_bucket)
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let attrs = eventually_ok(
+            "GetObjectAttributes allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_object_attributes()
+                    .bucket(&public_bucket)
+                    .key(key)
+                    .object_attributes(ObjectAttributes::ObjectSize)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(attrs.object_size(), Some(15));
+
+        eventually_access_denied(
+            "GetObjectAttributes denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_object_attributes()
+                    .bucket(&private_bucket)
+                    .key(key)
+                    .object_attributes(ObjectAttributes::ObjectSize)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&public_bucket, &[key]).await;
+        cleanup(&private_bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_create_multipart_upload_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "bucket-tag-mpu-create-enabled";
+
+        let public_bucket = create_bucket_allowing_sse_c(client).await;
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal.clone(),
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&public_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = create_bucket_allowing_sse_c(client).await;
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&private_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok(
+            "CreateMultipartUpload allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&public_bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&public_bucket)
+            .key(key)
+            .upload_id(upload.upload_id().unwrap())
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied(
+            "CreateMultipartUpload denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&private_bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_upload_part_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "bucket-tag-upload-part-enabled";
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        enable_bucket_abac_with_security_tag(client, &bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok(
+            "CreateMultipartUpload for UploadPart bucket-tag probe",
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        let uploaded = eventually_ok(
+            "UploadPart allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from_static(b"bucket-tag-part"))
+                    .send()
+            },
+        )
+        .await;
+        assert!(uploaded.e_tag().is_some());
+
+        alt_client
+            .abort_multipart_upload()
+            .bucket(&bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await
+            .unwrap();
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_complete_multipart_upload_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let key = "bucket-tag-complete-enabled";
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        enable_bucket_abac_with_security_tag(client, &bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok(
+            "CreateMultipartUpload for CompleteMultipartUpload bucket-tag probe",
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+        let uploaded = eventually_ok(
+            "UploadPart for CompleteMultipartUpload bucket-tag probe",
+            || {
+                alt_client
+                    .upload_part()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from_static(b"bucket-tag-part"))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_ok(
+            "CompleteMultipartUpload allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .complete_multipart_upload()
+                    .bucket(&bucket)
+                    .key(key)
+                    .upload_id(&upload_id)
+                    .multipart_upload(
+                        CompletedMultipartUpload::builder()
+                            .parts(
+                                CompletedPart::builder()
+                                    .part_number(1)
+                                    .e_tag(uploaded.e_tag().unwrap())
+                                    .build(),
+                            )
+                            .build(),
+                    )
+                    .send()
+            },
+        )
+        .await;
+
+        let object = eventually_ok(
+            "GetObject after CompleteMultipartUpload bucket-tag probe",
+            || client.get_object().bucket(&bucket).key(key).send(),
+        )
+        .await;
+        let body = object.body.collect().await.unwrap().into_bytes();
+        assert_eq!(body.as_ref(), b"bucket-tag-part");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_copy_object_source_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let public_key = "source-public";
+        let private_key = "source-private";
+
+        let public_src_bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_object()
+            .bucket(&public_src_bucket)
+            .key(public_key)
+            .body(ByteStream::from_static(b"public-source"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &public_src_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_src_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal.clone(),
+                        "Action": "s3:GetObject",
+                        "Resource": bucket_wildcard_resource(&public_src_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_src_bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_object()
+            .bucket(&private_src_bucket)
+            .key(private_key)
+            .body(ByteStream::from_static(b"private-source"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &private_src_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_src_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:GetObject",
+                        "Resource": bucket_wildcard_resource(&private_src_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let dst_bucket = unique_bucket();
+        s3_tests::create_bucket(alt_client, &dst_bucket)
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "CopyObject source read allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .copy_object()
+                    .bucket(&dst_bucket)
+                    .key("copied-public")
+                    .copy_source(format!("{public_src_bucket}/{public_key}"))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "CopyObject source read denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .copy_object()
+                    .bucket(&dst_bucket)
+                    .key("copied-private")
+                    .copy_source(format!("{private_src_bucket}/{private_key}"))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_with_client(
+            alt_client,
+            &dst_bucket,
+            &["copied-public", "copied-private"],
+        )
+        .await;
+        cleanup(&public_src_bucket, &[public_key]).await;
+        cleanup(&private_src_bucket, &[private_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_upload_part_copy_source_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let public_key = "source-public";
+        let private_key = "source-private";
+
+        let public_src_bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_object()
+            .bucket(&public_src_bucket)
+            .key(public_key)
+            .body(ByteStream::from_static(b"public-source"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &public_src_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_src_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal.clone(),
+                        "Action": "s3:GetObject",
+                        "Resource": bucket_wildcard_resource(&public_src_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_src_bucket = create_bucket_allowing_sse_c(client).await;
+        client
+            .put_object()
+            .bucket(&private_src_bucket)
+            .key(private_key)
+            .body(ByteStream::from_static(b"private-source"))
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &private_src_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_src_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:GetObject",
+                        "Resource": bucket_wildcard_resource(&private_src_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let dst_bucket = unique_bucket();
+        s3_tests::create_bucket(alt_client, &dst_bucket)
+            .await
+            .unwrap();
+        let upload = alt_client
+            .create_multipart_upload()
+            .bucket(&dst_bucket)
+            .key("copied")
+            .send()
+            .await
+            .unwrap();
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        let copied_part = upload_part_copy_eventually(
+            alt_client,
+            &dst_bucket,
+            "copied",
+            &upload_id,
+            1,
+            format!("{public_src_bucket}/{public_key}"),
+        )
+        .await;
+        complete_single_part_upload(
+            alt_client,
+            &dst_bucket,
+            "copied",
+            &upload_id,
+            copied_part.copy_part_result().unwrap().e_tag().unwrap(),
+        )
+        .await;
+
+        let denied_upload = alt_client
+            .create_multipart_upload()
+            .bucket(&dst_bucket)
+            .key("copied-denied")
+            .send()
+            .await
+            .unwrap();
+        let denied_upload_id = denied_upload.upload_id().unwrap().to_string();
+        let denied = alt_client
+            .upload_part_copy()
+            .bucket(&dst_bucket)
+            .key("copied-denied")
+            .upload_id(&denied_upload_id)
+            .part_number(1)
+            .copy_source(format!("{private_src_bucket}/{private_key}"))
+            .send()
+            .await;
+        assert_eq!(err_status(&denied), 403);
+        assert_s3_err_code(&denied, "AccessDenied");
+
+        cleanup_with_client(alt_client, &dst_bucket, &["copied", "copied-denied"]).await;
+        cleanup(&public_src_bucket, &[public_key]).await;
+        cleanup(&private_src_bucket, &[private_key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_copy_object_destination_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let src_bucket = unique_bucket();
+        let src_key = "source";
+
+        s3_tests::create_bucket(alt_client, &src_bucket)
+            .await
+            .unwrap();
+        alt_client
+            .put_object()
+            .bucket(&src_bucket)
+            .key(src_key)
+            .body(ByteStream::from_static(b"copy-body"))
+            .send()
+            .await
+            .unwrap();
+
+        let public_dst_bucket = create_bucket_allowing_sse_c(client).await;
+        enable_bucket_abac_with_security_tag(client, &public_dst_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_dst_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal.clone(),
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&public_dst_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_dst_bucket = create_bucket_allowing_sse_c(client).await;
+        enable_bucket_abac_with_security_tag(client, &private_dst_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_dst_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&private_dst_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "CopyObject destination write allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .copy_object()
+                    .bucket(&public_dst_bucket)
+                    .key("copied-public")
+                    .copy_source(format!("{src_bucket}/{src_key}"))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "CopyObject destination write denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .copy_object()
+                    .bucket(&private_dst_bucket)
+                    .key("copied-private")
+                    .copy_source(format!("{src_bucket}/{src_key}"))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_with_client(alt_client, &src_bucket, &[src_key]).await;
+        cleanup(&public_dst_bucket, &["copied-public"]).await;
+        cleanup(&private_dst_bucket, &["copied-private"]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_upload_part_copy_destination_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let src_bucket = unique_bucket();
+        let src_key = "source";
+
+        s3_tests::create_bucket(alt_client, &src_bucket)
+            .await
+            .unwrap();
+        alt_client
+            .put_object()
+            .bucket(&src_bucket)
+            .key(src_key)
+            .body(ByteStream::from_static(b"copy-body"))
+            .send()
+            .await
+            .unwrap();
+
+        let dst_bucket = create_bucket_allowing_sse_c(client).await;
+        enable_bucket_abac_with_security_tag(client, &dst_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&dst_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&dst_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let upload = eventually_ok(
+            "CreateMultipartUpload for UploadPartCopy destination bucket-tag probe",
+            || {
+                alt_client
+                    .create_multipart_upload()
+                    .bucket(&dst_bucket)
+                    .key("copied")
+                    .send()
+            },
+        )
+        .await;
+        let upload_id = upload.upload_id().unwrap().to_string();
+
+        let copied_part = upload_part_copy_eventually(
+            alt_client,
+            &dst_bucket,
+            "copied",
+            &upload_id,
+            1,
+            format!("{src_bucket}/{src_key}"),
+        )
+        .await;
+        complete_single_part_upload(
+            alt_client,
+            &dst_bucket,
+            "copied",
+            &upload_id,
+            copied_part.copy_part_result().unwrap().e_tag().unwrap(),
+        )
+        .await;
+
+        cleanup_with_client(alt_client, &src_bucket, &[src_key]).await;
+        cleanup(&dst_bucket, &["copied"]).await;
     });
 }
 

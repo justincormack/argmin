@@ -1789,6 +1789,7 @@ fn bucket_policy_decision_for_put_object_tagging_requires_matching_action() {
         BucketPolicyRequestContext {
             requester: &test_helpers::requester("other-user"),
             bucket: &bucket,
+            bucket_tags: None,
             action: auth::PolicyAction::PutObjectTagging,
             policy_context: PutObjectPolicyContext::default().with_request_object_tags_xml(Some(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
@@ -1821,6 +1822,7 @@ fn bucket_policy_decision_for_put_object_tagging_honors_inline_request_object_ta
         BucketPolicyRequestContext {
             requester: &test_helpers::requester("other-user"),
             bucket: &bucket,
+            bucket_tags: None,
             action: auth::PolicyAction::PutObjectTagging,
             policy_context: PutObjectPolicyContext::default().with_request_object_tags_xml(Some(
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
@@ -2539,6 +2541,7 @@ fn multipart_upload_managed_encryption_policy_context_enables_upload_part_copy_w
         .requester_can_write_multipart_upload_with_bucket_policy(
             &requester,
             &bucket,
+            None,
             &upload,
             base_context,
             policy.as_deref(),
@@ -2548,6 +2551,7 @@ fn multipart_upload_managed_encryption_policy_context_enables_upload_part_copy_w
         .requester_can_write_multipart_upload_with_bucket_policy(
             &requester,
             &bucket,
+            None,
             &upload,
             Coordinator::with_multipart_upload_managed_encryption_policy_context(
                 PutObjectPolicyContext::new(Some("src/public/foo"), None, None),
@@ -6399,6 +6403,7 @@ fn multipart_upload_managed_encryption_policy_context_enables_complete_multipart
         .requester_can_write_multipart_upload_with_bucket_policy(
             &requester,
             &bucket,
+            None,
             &upload,
             PutObjectPolicyContext::default(),
             policy.as_deref(),
@@ -6408,6 +6413,7 @@ fn multipart_upload_managed_encryption_policy_context_enables_complete_multipart
         .requester_can_write_multipart_upload_with_bucket_policy(
             &requester,
             &bucket,
+            None,
             &upload,
             Coordinator::with_multipart_upload_managed_encryption_policy_context(
                 PutObjectPolicyContext::default(),

@@ -210,6 +210,7 @@ pub(super) struct AuthorizedObjectRead<'a> {
 pub(super) struct LoadedObjectState<'a> {
     pub(super) bucket_info: ValidatedBucket,
     pub(super) bucket_policy: Option<Arc<BucketPolicy>>,
+    pub(super) bucket_tags: Option<Vec<(String, String)>>,
     pub(super) locked: LockedReadObject<'a>,
 }
 
