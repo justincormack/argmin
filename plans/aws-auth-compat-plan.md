@@ -12,6 +12,7 @@ auth design.
 This follow-up covers:
 - remaining account-level public-access/authz gaps
 - credential-scope / same-account authorization compatibility
+- the minimal `s3-control` subset required for bucket ABAC compatibility
 - conformance tests and documentation for the above
 
 This still does not cover:
@@ -71,6 +72,8 @@ Still open:
   investigation once policy-evaluator expansion resumes
 - bucket-policy evaluator expansion for AWS-accepted condition keys whose
   request context is still missing locally
+- bucket ABAC compatibility, which AWS gates behind `s3-control` APIs rather
+  than the ordinary S3 endpoint family
 
 ## Remaining Work
 
@@ -137,6 +140,36 @@ Already covered:
 - AWS validation for constrained same-account write denial
 - AWS validation that `PutBucketPolicy` accepts at least some object-policy
   condition clauses that our current runtime evaluator still cannot fully model
+
+### 4. Minimal `s3-control` Subset For Bucket ABAC
+
+Still missing:
+- bucket ABAC enablement support for general purpose buckets
+- AWS-backed mapping of `s3:BucketTag/${TagKey}` behavior in the current
+  ABAC-disabled baseline and after ABAC enablement
+- the minimum bucket-tag control-plane subset required once ABAC is enabled
+- a documented initial endpoint/routing shape for the narrow `s3-control`
+  surface we need here
+
+Initial target scope:
+- `PutBucketAbac`
+- `GetBucketAbac`
+- whatever bucket-tag control-plane support AWS requires once ABAC is enabled
+  (likely `TagResource` / `UntagResource`, while `GetBucketTagging` remains on
+  the ordinary S3 API)
+
+Explicitly out of scope:
+- broad `s3-control` parity
+- access points and multi-region access points
+- batch operations
+- Storage Lens
+- broader account-scoped `s3-control` administration
+
+Current AWS-backed baseline:
+- with bucket ABAC disabled, `s3:BucketTag/${TagKey}` statements can be accepted
+  at `PutBucketPolicy` time but still fail to authorize later requests
+- we should not treat accepted syntax as operative behavior until the
+  ABAC-enabled state is mapped too
 
 ## Target Behavior
 
@@ -223,6 +256,17 @@ Deliver:
   - account-level Block Public Access, if still deferred
   - policy evaluation, if still deferred
 
+### Phase 7: Minimal `s3-control` Support For Bucket ABAC
+
+Status: open.
+
+Deliver:
+- AWS-compatible `GetBucketAbac` / `PutBucketAbac` behavior
+- the minimum endpoint/routing support required for that subset
+- the minimum bucket-tag control-plane support required once ABAC is enabled
+- AWS-backed `s3:BucketTag/${TagKey}` conformance tests in both ABAC-disabled
+  and ABAC-enabled states
+
 ## Test Plan
 
 Unit tests:
@@ -244,6 +288,8 @@ Targeted integration tests:
 AWS checks:
 - rerun the narrowed auth/public-access subset against AWS while working on
   Phase 5 account-level public-access behavior
+- run targeted bucket ABAC probes against AWS while working on Phase 7,
+  covering both ABAC-disabled and ABAC-enabled buckets
 
 ## Open Decisions
 
@@ -261,6 +307,11 @@ AWS checks:
 - whether the remaining `s3:ResourceTag/*` compatibility investigation should
   live under a future policy-evaluator plan or stay tracked here until that
   work is started
+
+4. Minimal `s3-control` endpoint shape
+- whether the initial bucket-ABAC subset should introduce an explicit
+  `s3-control` endpoint/routing distinction immediately, or temporarily reuse
+  the existing endpoint surface while keeping the scope tightly constrained
 
 ## Recommended Default Decisions
 
