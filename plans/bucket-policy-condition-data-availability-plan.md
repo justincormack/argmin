@@ -346,6 +346,27 @@ So for the copy/header family:
 - if a single statement mixes a valid destination action with an invalid
   source-read action for those keys, AWS rejects the whole statement
 
+The first `ExistingObjectTag` copy probes are now AWS-pinned, and they do not
+behave symmetrically:
+
+- source-side `CopyObject`
+  - a source bucket policy on `s3:GetObject` with
+    `StringEquals { "s3:ExistingObjectTag/security": "public" }` still allows
+    plain `GetObject`
+  - the same policy does not authorize `CopyObject` source reads, even for the
+    same public-tagged object
+  - local coordinator auth now models that by treating `CopyObject` source
+    reads as not having existing tags available for policy evaluation
+- source-side `UploadPartCopy`
+  - the same `s3:GetObject` `ExistingObjectTag` policy does authorize
+    multipart copy-source reads for the public-tagged object
+  - private-tagged source reads are still denied
+- mixed `["s3:GetObject", "s3:PutObject"]` with
+  `s3:ExistingObjectTag/*`
+  - is rejected at `PutBucketPolicy`
+  - the destination `PutObject` side remains policy-invalid even though the
+    source `GetObject` side is valid
+
 The first multipart destination-encryption row is also now AWS-pinned:
 
 - destination-side `s3:x-amz-server-side-encryption = AES256`
