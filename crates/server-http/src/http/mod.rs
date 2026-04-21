@@ -2019,6 +2019,31 @@ impl HttpFrontend {
                 )?)?;
                 Ok(S3Response::delete_bucket_tagging())
             }
+            S3Operation::PutBucketAbac { bucket } => {
+                require_request_checksum(
+                    req,
+                    RequestChecksumRequirement::ContentMd5OrChecksumHeader,
+                )?;
+                let enabled = xml::parse_bucket_abac_xml(&req.body)?;
+                let requester = Self::requester_from_auth(auth);
+                self.coordinator
+                    .put_bucket_abac(&crate::coordinator::PutBucketAbacRequest {
+                        bucket: bucket_request(&bucket, requester, expected_bucket_owner)?,
+                        enabled,
+                    })?;
+                Ok(S3Response::put_bucket_abac())
+            }
+            S3Operation::GetBucketAbac { bucket } => {
+                let requester = Self::requester_from_auth(auth);
+                let enabled = self.coordinator.get_bucket_abac(&bucket_request(
+                    &bucket,
+                    requester,
+                    expected_bucket_owner,
+                )?)?;
+                Ok(S3Response::get_bucket_abac(&xml::get_bucket_abac_xml(
+                    enabled,
+                )))
+            }
             S3Operation::PutBucketLifecycle { bucket } => {
                 require_request_checksum(req, RequestChecksumRequirement::PutBucketLifecycle)?;
                 let config = ensure_lifecycle_rule_ids(
@@ -8308,6 +8333,61 @@ mod tests {
             },
             "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
         );
+    }
+
+    #[test]
+    fn put_bucket_abac_missing_request_checksum_rejected() {
+        let body = br#"<AbacStatus><Status>Enabled</Status></AbacStatus>"#.to_vec();
+        assert_missing_request_checksum_rejected(
+            http::Method::PUT,
+            "",
+            vec![],
+            body,
+            S3Operation::PutBucketAbac {
+                bucket: test_bucket_name("mybucket"),
+            },
+            "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
+        );
+    }
+
+    #[test]
+    fn put_bucket_abac_sdk_checksum_header_accepted() {
+        let body = br#"<AbacStatus><Status>Enabled</Status></AbacStatus>"#.to_vec();
+        assert_sdk_checksum_request_accepted(
+            http::Method::PUT,
+            "",
+            vec![],
+            body,
+            S3Operation::PutBucketAbac {
+                bucket: test_bucket_name("mybucket"),
+            },
+        );
+    }
+
+    #[test]
+    fn put_bucket_abac_content_md5_accepted() {
+        let body = br#"<AbacStatus><Status>Enabled</Status></AbacStatus>"#.to_vec();
+        let tmp = test_util::tempdir();
+        let fe = setup_frontend(tmp.path());
+        create_test_bucket(&fe.coordinator, "mybucket");
+
+        let req = new_req(
+            http::Method::PUT,
+            "",
+            "",
+            vec![("Content-MD5".to_string(), content_md5_value(&body))],
+            body,
+        );
+        let resp = fe
+            .dispatch_routed(
+                &req,
+                &test_auth(),
+                S3Operation::PutBucketAbac {
+                    bucket: test_bucket_name("mybucket"),
+                },
+            )
+            .unwrap();
+        assert_eq!(resp.status_code, 200);
     }
 
     #[test]

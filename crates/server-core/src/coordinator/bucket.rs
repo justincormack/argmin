@@ -18,8 +18,8 @@ use super::{
     AuthorizedBucketSubresourcePut, AuthorizedDeleteBucket, AuthorizedHeadBucket,
     AuthorizedListBuckets, AuthorizedPutBucketAcl, BucketCreateOutcome, BucketRequest,
     BucketSummary, Coordinator, CreateBucketAcl, CreateBucketRequest, GetBucketAclResult,
-    ListBucketsRequest, PutBucketAclInput, PutBucketAclRequest, PutBucketConfigRequest,
-    PutBucketEncryptionRequest, PutBucketObjectLockConfigurationRequest,
+    ListBucketsRequest, PutBucketAbacRequest, PutBucketAclInput, PutBucketAclRequest,
+    PutBucketConfigRequest, PutBucketEncryptionRequest, PutBucketObjectLockConfigurationRequest,
     PutBucketOwnershipControlsRequest, PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest,
     PutBucketVersioningRequest, TRACE_TARGET,
 };
@@ -138,6 +138,29 @@ impl Coordinator {
         let owner = OwnerIdentity::from_principal(owner_principal);
         let acl_grants = Self::bucket_acl_grants_from_flags(&owner, public_read, false);
         self.create_bucket_with_acl_grants(&owner, name, acl_grants, false)?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_bucket_abac_enabled_for_test(
+        &self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<(), ServerError> {
+        let bucket = trusted_bucket_name(name);
+        let bucket_pg = self.get_bucket_pg_for(&bucket)?;
+        storage::PgMetadataStore::put_bucket_abac_enabled(&*bucket_pg, &bucket, enabled).map_err(
+            |e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            },
+        )?;
+        self.storage_node
+            .update_bucket_fast_path_if_present(&bucket, |info| {
+                info.bucket_abac_enabled = enabled;
+            });
         Ok(())
     }
 
@@ -640,6 +663,53 @@ impl Coordinator {
         );
         let authorized = self.authorize_delete_bucket_tagging(req)?;
         self.remove_authorized_bucket_subresource(&authorized)
+    }
+
+    pub fn put_bucket_abac(&self, req: &PutBucketAbacRequest<'_>) -> Result<(), ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::put_bucket_abac",
+            "bucket={:?} enabled={}",
+            req.bucket.name,
+            req.enabled
+        );
+        let authorized = self.authorize_put_bucket_abac(req)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
+        storage::PgMetadataStore::put_bucket_abac_enabled(
+            &*bucket_pg,
+            &authorized.bucket,
+            authorized.enabled,
+        )
+        .map_err(|e| match e {
+            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            other => ServerError::Metadata(other),
+        })?;
+        self.storage_node
+            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
+                info.bucket_abac_enabled = authorized.enabled;
+            });
+        Ok(())
+    }
+
+    pub fn get_bucket_abac(&self, req: &BucketRequest<'_>) -> Result<bool, ServerError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "Coordinator::get_bucket_abac",
+            "bucket={:?}",
+            req.name
+        );
+        let authorized = self.authorize_get_bucket_abac(req)?;
+        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
+        storage::PgMetadataStore::get_bucket_abac_enabled(&*bucket_pg, &authorized.bucket).map_err(
+            |e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            },
+        )
     }
 
     pub fn put_bucket_policy(&self, req: &PutBucketPolicyRequest<'_>) -> Result<(), ServerError> {

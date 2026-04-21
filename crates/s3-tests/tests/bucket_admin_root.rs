@@ -3,12 +3,13 @@ use std::time::Duration;
 
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::types::{
-    BucketLifecycleConfiguration, BucketVersioningStatus, CorsConfiguration, CorsRule,
-    DefaultRetention, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
-    ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRetentionMode, ObjectLockRule,
-    ObjectOwnership, OwnershipControls, OwnershipControlsRule, PublicAccessBlockConfiguration,
-    ServerSideEncryption, ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration,
-    ServerSideEncryptionRule, Tag, Tagging, VersioningConfiguration,
+    AbacStatus, BucketAbacStatus, BucketLifecycleConfiguration, BucketVersioningStatus,
+    CorsConfiguration, CorsRule, DefaultRetention, ExpirationStatus, LifecycleExpiration,
+    LifecycleRule, LifecycleRuleFilter, ObjectLockConfiguration, ObjectLockEnabled,
+    ObjectLockRetentionMode, ObjectLockRule, ObjectOwnership, OwnershipControls,
+    OwnershipControlsRule, PublicAccessBlockConfiguration, ServerSideEncryption,
+    ServerSideEncryptionByDefault, ServerSideEncryptionConfiguration, ServerSideEncryptionRule,
+    Tag, Tagging, VersioningConfiguration,
 };
 use s3_tests::{put_bucket_lifecycle_with_md5, unique_bucket, CTX};
 
@@ -69,6 +70,63 @@ async fn eventually_err_status<T, E, F, Fut>(
             _ => panic!(
                 "{description} did not converge to HTTP {expected_status} ({expected_code:?})"
             ),
+        }
+    }
+
+    unreachable!()
+}
+
+async fn eventually_err_status_with_message<T, E, F, Fut>(
+    description: &str,
+    expected_status: u16,
+    expected_code: Option<&str>,
+    expected_message: &str,
+    mut op: F,
+) where
+    E: std::fmt::Debug + ProvideErrorMetadata,
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, aws_sdk_s3::error::SdkError<E>>>,
+{
+    const MAX_ATTEMPTS: usize = 20;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = op().await;
+        match &result {
+            Err(err)
+                if err
+                    .raw_response()
+                    .map(|response| response.status().as_u16())
+                    == Some(expected_status)
+                    && expected_code.is_none_or(|code| {
+                        err.as_service_error().and_then(ProvideErrorMetadata::code) == Some(code)
+                    })
+                    && err
+                        .as_service_error()
+                        .and_then(ProvideErrorMetadata::message)
+                        == Some(expected_message) =>
+            {
+                return;
+            }
+            _ if attempt + 1 < MAX_ATTEMPTS => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            _ => {
+                let last_result = match &result {
+                    Ok(_) => "Ok".to_string(),
+                    Err(err) => format!(
+                        "status={:?} code={:?} message={:?}",
+                        err.raw_response()
+                            .map(|response| response.status().as_u16()),
+                        err.as_service_error().and_then(ProvideErrorMetadata::code),
+                        err.as_service_error()
+                            .and_then(ProvideErrorMetadata::message),
+                    ),
+                };
+                panic!(
+                    "{description} did not converge to HTTP {expected_status} ({expected_code:?}) with message {expected_message:?}; last result: {}",
+                    last_result
+                );
+            }
         }
     }
 
@@ -205,6 +263,12 @@ fn simple_tagging() -> Tagging {
         )
         .build()
         .unwrap()
+}
+
+fn enabled_abac_status() -> AbacStatus {
+    AbacStatus::builder()
+        .status(BucketAbacStatus::Enabled)
+        .build()
 }
 
 fn simple_cors_config() -> CorsConfiguration {
@@ -583,6 +647,105 @@ fn test_same_account_root_and_non_root_bucket_tagging_admin() {
                 404,
                 Some("NoSuchTagSet"),
                 || admin_client.get_bucket_tagging().bucket(bucket).send(),
+            )
+            .await;
+        }
+
+        cleanup_bucket(root_client, non_root_client, &root_bucket).await;
+        cleanup_bucket(root_client, non_root_client, &non_root_bucket).await;
+    });
+}
+
+#[test]
+fn test_same_account_root_and_non_root_bucket_abac_admin() {
+    s3_tests::run(async {
+        let root_client = owner_root_client();
+        let non_root_client = CTX.client();
+        let root_bucket = create_standard_bucket(root_client).await;
+        let non_root_bucket = create_standard_bucket(non_root_client).await;
+        let tags = simple_tagging();
+
+        for (description, bucket, admin_client) in [
+            (
+                "non-root manages root-created bucket ABAC",
+                root_bucket.as_str(),
+                non_root_client,
+            ),
+            (
+                "root manages non-root-created bucket ABAC",
+                non_root_bucket.as_str(),
+                root_client,
+            ),
+        ] {
+            let get = eventually_ok(&format!("{description} GetBucketAbac disabled"), || {
+                admin_client.get_bucket_abac().bucket(bucket).send()
+            })
+            .await;
+            assert_eq!(
+                get.abac_status().and_then(|status| status.status()),
+                Some(&BucketAbacStatus::Disabled)
+            );
+
+            eventually_ok(
+                &format!("{description} PutBucketTagging before enable"),
+                || {
+                    admin_client
+                        .put_bucket_tagging()
+                        .bucket(bucket)
+                        .tagging(tags.clone())
+                        .send()
+                },
+            )
+            .await;
+
+            eventually_ok(&format!("{description} PutBucketAbac enabled"), || {
+                admin_client
+                    .put_bucket_abac()
+                    .bucket(bucket)
+                    .abac_status(enabled_abac_status())
+                    .send()
+            })
+            .await;
+
+            let get = eventually_ok(&format!("{description} GetBucketAbac enabled"), || {
+                admin_client.get_bucket_abac().bucket(bucket).send()
+            })
+            .await;
+            assert_eq!(
+                get.abac_status().and_then(|status| status.status()),
+                Some(&BucketAbacStatus::Enabled)
+            );
+
+            let get = eventually_ok(
+                &format!("{description} GetBucketTagging after enable"),
+                || admin_client.get_bucket_tagging().bucket(bucket).send(),
+            )
+            .await;
+            assert_eq!(get.tag_set().len(), 1);
+            assert_eq!(get.tag_set()[0].key(), "env");
+            assert_eq!(get.tag_set()[0].value(), "root-admin");
+
+            eventually_err_status_with_message(
+                &format!("{description} PutBucketTagging after enable"),
+                400,
+                Some("BadRequest"),
+                "This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To add tags to this bucket, initiate a TagResource request. To delete tags from this bucket, initiate an UntagResource request.",
+                || {
+                    admin_client
+                        .put_bucket_tagging()
+                        .bucket(bucket)
+                        .tagging(tags.clone())
+                        .send()
+                },
+            )
+            .await;
+
+            eventually_err_status_with_message(
+                &format!("{description} DeleteBucketTagging after enable"),
+                400,
+                Some("BadRequest"),
+                "This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To delete tags from this bucket, initiate an UntagResource request.",
+                || admin_client.delete_bucket_tagging().bucket(bucket).send(),
             )
             .await;
         }

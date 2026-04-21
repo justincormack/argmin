@@ -3703,6 +3703,113 @@ pub fn get_ownership_controls_xml(config: &BucketOwnershipControls) -> String {
     )
 }
 
+/// Parse an `<AbacStatus>` XML request body.
+pub fn parse_bucket_abac_xml(data: &[u8]) -> Result<bool, ServerError> {
+    const MAX_BUCKET_ABAC_XML_BYTES: usize = 1024;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum State {
+        Start,
+        InRoot,
+        InStatus,
+        Done,
+    }
+
+    fn malformed_abac_xml(reason: &str) -> ServerError {
+        ServerError::MalformedXML {
+            reason: reason.to_string(),
+        }
+    }
+
+    ensure_xml_body_size(data, MAX_BUCKET_ABAC_XML_BYTES)?;
+
+    let mut reader = Reader::from_reader(data);
+    let mut buf = Vec::new();
+    let mut state = State::Start;
+    let mut current_text = String::new();
+    let mut status: Option<String> = None;
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => match (state, e.name().as_ref()) {
+                (State::Start, b"AbacStatus") => state = State::InRoot,
+                (State::InRoot, b"Status") => {
+                    current_text.clear();
+                    state = State::InStatus;
+                }
+                _ => return Err(malformed_abac_xml("unexpected element in bucket ABAC XML")),
+            },
+            Ok(Event::Empty(e)) => match (state, e.name().as_ref()) {
+                (State::InRoot, b"Status") => status = Some(String::new()),
+                _ => {
+                    return Err(malformed_abac_xml(
+                        "unexpected empty element in bucket ABAC XML",
+                    ));
+                }
+            },
+            Ok(Event::End(e)) => match (state, e.name().as_ref()) {
+                (State::InRoot, b"AbacStatus") => state = State::Done,
+                (State::InStatus, b"Status") => {
+                    status = Some(std::mem::take(&mut current_text));
+                    state = State::InRoot;
+                }
+                _ => {
+                    return Err(malformed_abac_xml(
+                        "unexpected closing element in bucket ABAC XML",
+                    ));
+                }
+            },
+            Ok(Event::Text(t)) => {
+                let text = decode_xml_text(
+                    t.as_ref(),
+                    "invalid UTF-8 in bucket ABAC XML body",
+                    "invalid XML entity in bucket ABAC XML body",
+                )?;
+                match state {
+                    State::InStatus => current_text.push_str(&text),
+                    _ if text.trim().is_empty() => {}
+                    _ => return Err(malformed_abac_xml("unexpected text in bucket ABAC XML")),
+                }
+            }
+            Ok(Event::CData(t)) => {
+                let text = std::str::from_utf8(t.as_ref())
+                    .map_err(|_| malformed_abac_xml("invalid UTF-8 in bucket ABAC XML body"))?;
+                match state {
+                    State::InStatus => current_text.push_str(text),
+                    _ if text.trim().is_empty() => {}
+                    _ => return Err(malformed_abac_xml("unexpected CDATA in bucket ABAC XML")),
+                }
+            }
+            Ok(Event::Comment(_) | Event::Decl(_) | Event::PI(_) | Event::DocType(_)) => {}
+            Ok(Event::Eof) => {
+                return match state {
+                    State::Done => match status.as_deref() {
+                        Some("Enabled") => Ok(true),
+                        Some("Disabled") => Ok(false),
+                        Some(_) => Err(malformed_abac_xml("invalid Status value in AbacStatus")),
+                        None => Err(malformed_abac_xml("missing Status element in AbacStatus")),
+                    },
+                    State::Start => Err(malformed_abac_xml("missing AbacStatus element")),
+                    _ => Err(malformed_abac_xml("unexpected end of bucket ABAC XML")),
+                };
+            }
+            Err(_) => return Err(malformed_abac_xml("malformed bucket ABAC XML")),
+        }
+        buf.clear();
+    }
+}
+
+#[must_use]
+pub fn get_bucket_abac_xml(enabled: bool) -> String {
+    let status = if enabled { "Enabled" } else { "Disabled" };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <AbacStatus xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Status>{status}</Status>\
+         </AbacStatus>"
+    )
+}
+
 /// Recognized object attribute names for `GetObjectAttributes`.
 const VALID_OBJECT_ATTRIBUTES: &[&str] = &[
     "ETag",
@@ -6088,6 +6195,32 @@ mod tests {
     fn parse_ownership_controls_xml_invalid_utf8() {
         let xml: &[u8] = &[0xFF, 0xFE];
         assert!(parse_ownership_controls_xml(xml).is_err());
+    }
+
+    #[test]
+    fn bucket_abac_xml_round_trip_enabled() {
+        let xml = get_bucket_abac_xml(true);
+        let parsed = parse_bucket_abac_xml(xml.as_bytes()).unwrap();
+        assert!(parsed);
+    }
+
+    #[test]
+    fn bucket_abac_xml_round_trip_disabled() {
+        let xml = get_bucket_abac_xml(false);
+        let parsed = parse_bucket_abac_xml(xml.as_bytes()).unwrap();
+        assert!(!parsed);
+    }
+
+    #[test]
+    fn parse_bucket_abac_xml_invalid_value() {
+        let xml = b"<AbacStatus><Status>Invalid</Status></AbacStatus>";
+        assert!(parse_bucket_abac_xml(xml).is_err());
+    }
+
+    #[test]
+    fn parse_bucket_abac_xml_missing_root() {
+        let xml = b"<Status>Enabled</Status>";
+        assert!(parse_bucket_abac_xml(xml).is_err());
     }
 
     // ── GetObjectAttributes XML tests ───────────────────────────────

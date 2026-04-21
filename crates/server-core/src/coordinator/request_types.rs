@@ -466,6 +466,13 @@ pub struct PutBucketOwnershipControlsRequest<'a> {
     pub config: BucketOwnershipControls,
 }
 
+/// Request for a PutBucketAbac operation.
+#[derive(Debug)]
+pub struct PutBucketAbacRequest<'a> {
+    pub bucket: BucketRequest<'a>,
+    pub enabled: bool,
+}
+
 /// Request for a PutBucketVersioning operation.
 #[derive(Debug)]
 pub struct PutBucketVersioningRequest<'a> {

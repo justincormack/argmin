@@ -220,6 +220,7 @@ fn client_error_message(err: &ServerError) -> String {
             "The authorization header is malformed; the region '{provided_region}' is wrong; expecting '{expected_region}'"
         ),
         ServerError::InvalidRequest { reason }
+        | ServerError::BadRequest { reason }
         | ServerError::InvalidArgument { reason }
         | ServerError::InvalidRedirectLocation { reason }
         | ServerError::InvalidURI { reason }
@@ -1491,6 +1492,18 @@ impl S3Response {
     #[must_use]
     pub fn delete_bucket_tagging() -> Self {
         Self::new(204)
+    }
+
+    /// Build a response for `PutBucketAbac` (200 OK, no body).
+    #[must_use]
+    pub fn put_bucket_abac() -> Self {
+        Self::new(200)
+    }
+
+    /// Build a response for `GetBucketAbac` (200 OK, XML body).
+    #[must_use]
+    pub fn get_bucket_abac(xml: &str) -> Self {
+        Self::new(200).chunked_xml_body_no_content_type(xml.to_string())
     }
 
     /// Build a response for `PutBucketLifecycleConfiguration` (200 OK, no body).

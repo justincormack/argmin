@@ -269,10 +269,9 @@ fn delete_bucket_tags_test(
 }
 
 fn set_bucket_abac_enabled_test(coord: &Coordinator, name: &str, enabled: bool) {
-    let bucket_pg = coord.get_bucket_pg(name).unwrap();
-    let enabled = if enabled { 1 } else { 0 };
-    let sql = format!("UPDATE buckets SET bucket_abac_enabled = {enabled} WHERE name = '{name}'");
-    bucket_pg.connection().execute(&sql, []).unwrap();
+    coord
+        .set_bucket_abac_enabled_for_test(name, enabled)
+        .unwrap();
 }
 
 fn put_bucket_policy_test(
@@ -371,6 +370,32 @@ fn get_bucket_policy_status_test(
     expected_bucket_owner: Option<&str>,
 ) -> Result<bool, ServerError> {
     coord.get_bucket_policy_status(&bucket_request_with_expected_owner(
+        name,
+        requester,
+        expected_bucket_owner,
+    ))
+}
+
+fn put_bucket_abac_test(
+    coord: &Coordinator,
+    name: &str,
+    enabled: bool,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<(), ServerError> {
+    coord.put_bucket_abac(&PutBucketAbacRequest {
+        bucket: bucket_request_with_expected_owner(name, requester, expected_bucket_owner),
+        enabled,
+    })
+}
+
+fn get_bucket_abac_test(
+    coord: &Coordinator,
+    name: &str,
+    requester: Requester,
+    expected_bucket_owner: Option<&str>,
+) -> Result<bool, ServerError> {
+    coord.get_bucket_abac(&bucket_request_with_expected_owner(
         name,
         requester,
         expected_bucket_owner,
@@ -4099,6 +4124,105 @@ fn get_bucket_tags_bucket_tag_policy_denied_when_abac_disabled() {
     )
     .unwrap_err();
     assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
+fn put_and_get_bucket_abac_round_trip() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("111122223333", "bucket", false)
+        .unwrap();
+
+    assert!(!get_bucket_abac_test(
+        &coord,
+        "bucket",
+        test_helpers::requester("111122223333"),
+        None
+    )
+    .unwrap());
+
+    put_bucket_abac_test(
+        &coord,
+        "bucket",
+        true,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    assert!(get_bucket_abac_test(
+        &coord,
+        "bucket",
+        test_helpers::requester("111122223333"),
+        None
+    )
+    .unwrap());
+
+    put_bucket_abac_test(
+        &coord,
+        "bucket",
+        false,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    assert!(!get_bucket_abac_test(
+        &coord,
+        "bucket",
+        test_helpers::requester("111122223333"),
+        None
+    )
+    .unwrap());
+}
+
+#[test]
+fn bucket_tagging_rejected_when_abac_enabled() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let tags =
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
+    coord
+        .create_bucket_for_owner("111122223333", "bucket", false)
+        .unwrap();
+    put_bucket_abac_test(
+        &coord,
+        "bucket",
+        true,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+
+    let err = put_bucket_tags_test(
+        &coord,
+        "bucket",
+        tags,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap_err();
+    match err {
+        ServerError::BadRequest { reason } => assert_eq!(
+            reason,
+            "This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To add tags to this bucket, initiate a TagResource request. To delete tags from this bucket, initiate an UntagResource request."
+        ),
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+
+    let err = delete_bucket_tags_test(
+        &coord,
+        "bucket",
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap_err();
+    match err {
+        ServerError::BadRequest { reason } => assert_eq!(
+            reason,
+            "This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To delete tags from this bucket, initiate an UntagResource request."
+        ),
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
 }
 
 #[test]

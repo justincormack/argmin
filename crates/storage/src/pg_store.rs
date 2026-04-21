@@ -2827,6 +2827,43 @@ impl PgMetadataStore for PgStore {
         Ok(())
     }
 
+    fn put_bucket_abac_enabled(
+        &self,
+        name: &BucketName,
+        enabled: bool,
+    ) -> Result<(), MetadataError> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE buckets SET bucket_abac_enabled = ?1 WHERE name = ?2",
+                params![if enabled { 1 } else { 0 }, name.as_str()],
+            )
+            .map_err(|e| MetadataError::Db {
+                context: "put bucket abac enabled",
+                source: e,
+            })?;
+        if updated == 0 {
+            return Err(bucket_not_found(name.as_str()));
+        }
+        Ok(())
+    }
+
+    fn get_bucket_abac_enabled(&self, name: &BucketName) -> Result<bool, MetadataError> {
+        self.conn
+            .query_row(
+                "SELECT bucket_abac_enabled FROM buckets WHERE name = ?1",
+                params![name.as_str()],
+                |row| Ok(row.get::<_, i64>(0)? != 0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => bucket_not_found(name.as_str()),
+                source => MetadataError::Db {
+                    context: "get bucket abac enabled",
+                    source,
+                },
+            })
+    }
+
     fn put_bucket_encryption(
         &self,
         name: &BucketName,

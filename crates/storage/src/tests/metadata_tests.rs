@@ -761,6 +761,22 @@ fn file_bucket_metadata_config_roundtrip() {
         None
     );
 
+    assert!(!store
+        .get_bucket_abac_enabled(&bucket_name("bucket"))
+        .unwrap());
+    store
+        .put_bucket_abac_enabled(&bucket_name("bucket"), true)
+        .unwrap();
+    assert!(store
+        .get_bucket_abac_enabled(&bucket_name("bucket"))
+        .unwrap());
+    store
+        .put_bucket_abac_enabled(&bucket_name("bucket"), false)
+        .unwrap();
+    assert!(!store
+        .get_bucket_abac_enabled(&bucket_name("bucket"))
+        .unwrap());
+
     store
         .put_bucket_subresource(
             &bucket_name("bucket"),
@@ -1049,6 +1065,15 @@ fn file_bucket_subresource_roundtrip() {
             .unwrap(),
         Some(ownership_controls)
     );
+    assert!(!store
+        .get_bucket_abac_enabled(&bucket_name("bucket"))
+        .unwrap());
+    store
+        .put_bucket_abac_enabled(&bucket_name("bucket"), true)
+        .unwrap();
+    assert!(store
+        .get_bucket_abac_enabled(&bucket_name("bucket"))
+        .unwrap());
 
     let public_access_block = PublicAccessBlockConfig {
         block_public_acls: true,

@@ -243,14 +243,13 @@ currently implement the separate AWS `s3-control` control-plane API family.
 That means the following AWS surface is currently unsupported:
 
 - `s3-control` endpoint routing and host-style distinctions
-- bucket ABAC enablement APIs such as `PutBucketAbac` / `GetBucketAbac`
 - `s3-control` resource tag management such as `TagResource` / `UntagResource`
 - broader `s3-control` surfaces such as access-point, multi-region access
   point, Storage Lens, batch operations, and other account/control-plane APIs
 
 In practice, any AWS behavior that depends on `s3-control` APIs, endpoint
-routing, or control-plane state should be treated as unsupported until that API
-family exists locally.
+routing, or control-plane state such as `TagResource` / `UntagResource` should
+be treated as unsupported until that API family exists locally.
 
 ### 12. Bucket-policy condition acceptance and runtime context are still partial
 

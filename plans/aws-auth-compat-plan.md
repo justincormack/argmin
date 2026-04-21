@@ -12,7 +12,8 @@ auth design.
 This follow-up covers:
 - remaining account-level public-access/authz gaps
 - credential-scope / same-account authorization compatibility
-- the minimal `s3-control` subset required for bucket ABAC compatibility
+- the remaining bucket ABAC surface, including the `s3-control` tag-management
+  subset it depends on after enablement
 - conformance tests and documentation for the above
 
 This still does not cover:
@@ -72,8 +73,9 @@ Still open:
   investigation once policy-evaluator expansion resumes
 - bucket-policy evaluator expansion for AWS-accepted condition keys whose
   request context is still missing locally
-- bucket ABAC compatibility, which AWS gates behind `s3-control` APIs rather
-  than the ordinary S3 endpoint family
+- bucket ABAC compatibility, where `GetBucketAbac` / `PutBucketAbac` are
+  ordinary S3 bucket APIs but post-enable bucket tag mutation depends on
+  `s3-control` tag-management APIs
 
 ## Remaining Work
 
@@ -141,7 +143,7 @@ Already covered:
 - AWS validation that `PutBucketPolicy` accepts at least some object-policy
   condition clauses that our current runtime evaluator still cannot fully model
 
-### 4. Minimal `s3-control` Subset For Bucket ABAC
+### 4. Bucket ABAC And Minimal `s3-control` Tag Management
 
 Still missing:
 - bucket ABAC enablement support for general purpose buckets
@@ -149,7 +151,7 @@ Still missing:
   ABAC-disabled baseline and after ABAC enablement
 - the minimum bucket-tag control-plane subset required once ABAC is enabled
 - a documented initial endpoint/routing shape for the narrow `s3-control`
-  surface we need here
+  tag-management surface we need here
 
 Initial target scope:
 - `PutBucketAbac`
@@ -157,6 +159,8 @@ Initial target scope:
 - whatever bucket-tag control-plane support AWS requires once ABAC is enabled
   (likely `TagResource` / `UntagResource`, while `GetBucketTagging` remains on
   the ordinary S3 API)
+
+These two are ordinary S3 bucket APIs, not `s3-control`.
 
 Explicitly out of scope:
 - broad `s3-control` parity
@@ -178,6 +182,9 @@ Implementation note for the first step:
 - when bucket ABAC is disabled, authz should derive
   `BucketTags::Unavailable` from that bucket state rather than inferring
   non-operability from policy shape alone
+- that ABAC bit should have real storage/coordinator accessors rather than
+  living only as schema state plus raw test SQL, so later `GetBucketAbac` /
+  `PutBucketAbac` wiring can reuse the same state surface
 
 ## Target Behavior
 
@@ -266,7 +273,7 @@ Deliver:
 
 ### Phase 7: Minimal `s3-control` Support For Bucket ABAC
 
-Status: open.
+Status: in progress.
 
 Deliver:
 - AWS-compatible `GetBucketAbac` / `PutBucketAbac` behavior
@@ -274,6 +281,29 @@ Deliver:
 - the minimum bucket-tag control-plane support required once ABAC is enabled
 - AWS-backed `s3:BucketTag/${TagKey}` conformance tests in both ABAC-disabled
   and ABAC-enabled states
+
+Completed so far:
+- persisted `bucket_abac_enabled` bucket state with coordinator/storage accessors
+- AWS-compatible disabled baseline:
+  - fresh buckets return `GetBucketAbac = Disabled`
+  - `s3:BucketTag/${TagKey}` policy clauses can be accepted but remain
+    non-operative while ABAC is disabled
+- ordinary S3 endpoint support for:
+  - `GetBucketAbac`
+  - `PutBucketAbac`
+- AWS-backed same-account root/non-root admin coverage for enabling ABAC
+- AWS-backed post-enable bucket-tagging behavior:
+  - `GetBucketTagging` still works
+  - `PutBucketTagging` returns `400 BadRequest` with:
+    `This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To add tags to this bucket, initiate a TagResource request. To delete tags from this bucket, initiate an UntagResource request.`
+  - `DeleteBucketTagging` returns `400 BadRequest` with:
+    `This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To delete tags from this bucket, initiate an UntagResource request.`
+
+Still open inside Phase 7:
+- the minimal `s3-control` `TagResource` / `UntagResource` subset required once
+  ABAC is enabled
+- explicit enabled-state mapping for `s3:BucketTag/${TagKey}` authorization
+  behavior beyond the disabled baseline
 
 ## Test Plan
 

@@ -53,6 +53,9 @@ pub enum ServerError {
     #[error("invalid request: {reason}")]
     InvalidRequest { reason: String },
 
+    #[error("bad request: {reason}")]
+    BadRequest { reason: String },
+
     #[error("invalid argument: {reason}")]
     InvalidArgument { reason: String },
 
@@ -330,6 +333,7 @@ impl ServerError {
             Self::PreconditionFailed => "PreconditionFailed",
             Self::NotModified { .. } => "NotModified",
             Self::InvalidRequest { .. } => "InvalidRequest",
+            Self::BadRequest { .. } => "BadRequest",
             Self::InvalidArgument { .. } => "InvalidArgument",
             Self::InvalidRedirectLocation { .. } => "InvalidRedirectLocation",
             Self::UnexpectedContent => "UnexpectedContent",
@@ -428,6 +432,7 @@ impl ServerError {
             Self::Auth(auth::AuthError::DuplicateAuthorizationHeader) => 501,
             Self::Auth(_) => 403,
             Self::InvalidRequest { .. }
+            | Self::BadRequest { .. }
             | Self::InvalidArgument { .. }
             | Self::InvalidRedirectLocation { .. }
             | Self::UnexpectedContent
@@ -710,6 +715,14 @@ mod tests {
     }
 
     #[test]
+    fn s3_error_code_bad_request() {
+        let err = ServerError::BadRequest {
+            reason: "bad".into(),
+        };
+        assert_eq!(err.s3_error_code(), "BadRequest");
+    }
+
+    #[test]
     fn s3_error_code_invalid_redirect_location() {
         let err = ServerError::InvalidRedirectLocation {
             reason: "bad redirect".into(),
@@ -893,6 +906,10 @@ mod tests {
     fn http_status_400() {
         assert_eq!(
             ServerError::InvalidRequest { reason: "x".into() }.http_status(),
+            400
+        );
+        assert_eq!(
+            ServerError::BadRequest { reason: "x".into() }.http_status(),
             400
         );
         assert_eq!(

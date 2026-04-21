@@ -345,6 +345,9 @@ The committed policy assumes:
 - buckets are created under the `claude-s3-` prefix
 - both users can create and delete prefixed buckets
 - both users can perform the bucket/object operations exercised by `s3-tests`
+- bucket ABAC validation additionally requires:
+  - `s3:GetBucketAbac`
+  - `s3:PutBucketAbac`
 - lifecycle validation requires:
   - `s3:GetLifecycleConfiguration`
   - `s3:PutLifecycleConfiguration`

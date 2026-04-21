@@ -89,6 +89,12 @@ pub enum S3Operation {
     DeleteBucketTagging {
         bucket: BucketName,
     },
+    PutBucketAbac {
+        bucket: BucketName,
+    },
+    GetBucketAbac {
+        bucket: BucketName,
+    },
     PutBucketLifecycle {
         bucket: BucketName,
     },
@@ -229,6 +235,8 @@ impl S3Operation {
             | Self::PutBucketTagging { bucket }
             | Self::GetBucketTagging { bucket }
             | Self::DeleteBucketTagging { bucket }
+            | Self::PutBucketAbac { bucket }
+            | Self::GetBucketAbac { bucket }
             | Self::PutBucketLifecycle { bucket }
             | Self::GetBucketLifecycle { bucket }
             | Self::DeleteBucketLifecycle { bucket }
@@ -358,6 +366,9 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
         ("PUT", None) if query_has_key(query, "tagging") => Ok(S3Operation::PutBucketTagging {
             bucket: bucket.clone(),
         }),
+        ("PUT", None) if query_has_key(query, "abac") => Ok(S3Operation::PutBucketAbac {
+            bucket: bucket.clone(),
+        }),
         ("PUT", None) if query_has_key(query, "lifecycle") => Ok(S3Operation::PutBucketLifecycle {
             bucket: bucket.clone(),
         }),
@@ -450,6 +461,11 @@ pub fn route(method: &str, path: &str, query: &str) -> Result<S3Operation, Serve
             // Check for ?tagging → GetBucketTagging
             if query_has_key(query, "tagging") {
                 return Ok(S3Operation::GetBucketTagging {
+                    bucket: bucket.clone(),
+                });
+            }
+            if query_has_key(query, "abac") {
+                return Ok(S3Operation::GetBucketAbac {
                     bucket: bucket.clone(),
                 });
             }
@@ -1207,6 +1223,26 @@ mod tests {
         assert_eq!(
             route("GET", "/mybucket", "ownershipControls").unwrap(),
             S3Operation::GetBucketOwnershipControls {
+                bucket: bucket_name("mybucket")
+            }
+        );
+    }
+
+    #[test]
+    fn put_bucket_abac() {
+        assert_eq!(
+            route("PUT", "/mybucket", "abac").unwrap(),
+            S3Operation::PutBucketAbac {
+                bucket: bucket_name("mybucket")
+            }
+        );
+    }
+
+    #[test]
+    fn get_bucket_abac() {
+        assert_eq!(
+            route("GET", "/mybucket", "abac").unwrap(),
+            S3Operation::GetBucketAbac {
                 bucket: bucket_name("mybucket")
             }
         );

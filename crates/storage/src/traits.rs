@@ -175,6 +175,16 @@ pub trait PgMetadataStore {
     /// Delete the bucket ownership controls configuration. Idempotent.
     fn delete_bucket_ownership_controls(&self, name: &BucketName) -> Result<(), MetadataError>;
 
+    /// Store whether bucket ABAC is enabled for the bucket.
+    fn put_bucket_abac_enabled(
+        &self,
+        name: &BucketName,
+        enabled: bool,
+    ) -> Result<(), MetadataError>;
+
+    /// Retrieve whether bucket ABAC is enabled for the bucket.
+    fn get_bucket_abac_enabled(&self, name: &BucketName) -> Result<bool, MetadataError>;
+
     /// Store the currently supported bucket encryption configuration subset.
     fn put_bucket_encryption(
         &self,

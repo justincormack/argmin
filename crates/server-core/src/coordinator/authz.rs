@@ -23,10 +23,10 @@ use super::authz_results::{
     AuthorizedGetObjectRetention, AuthorizedHeadBucket, AuthorizedListBuckets,
     AuthorizedListMultipartUploads, AuthorizedListObjectVersions, AuthorizedListObjectsV2,
     AuthorizedListParts, AuthorizedMultipartPartWrite, AuthorizedObjectRead,
-    AuthorizedObjectTagsAccess, AuthorizedPutBucketAcl, AuthorizedPutBucketEncryption,
-    AuthorizedPutBucketLifecycle, AuthorizedPutBucketObjectLockConfiguration,
-    AuthorizedPutBucketOwnershipControls, AuthorizedPutBucketPolicy,
-    AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketVersioning,
+    AuthorizedObjectTagsAccess, AuthorizedPutBucketAbac, AuthorizedPutBucketAcl,
+    AuthorizedPutBucketEncryption, AuthorizedPutBucketLifecycle,
+    AuthorizedPutBucketObjectLockConfiguration, AuthorizedPutBucketOwnershipControls,
+    AuthorizedPutBucketPolicy, AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketVersioning,
     AuthorizedPutObjectAclUpdate, AuthorizedPutObjectLegalHold, AuthorizedPutObjectRetention,
     AuthorizedUploadPartCopy, LoadedObjectState,
 };
@@ -39,12 +39,13 @@ use super::request_types::{
     CreateMultipartUploadRequest, DeleteEntry, DeleteObjectRequest, DeleteObjectsRequest,
     GetObjectAttributesRequest, GetObjectRequest, ListBucketsRequest, ListMultipartUploadsRequest,
     ListObjectVersionsRequest, ListObjectsV2Request, ListPartsRequest, MultipartObjectRequest,
-    ObjectRequest, ObjectVersionRequest, PutBucketAclInput, PutBucketAclRequest,
-    PutBucketConfigRequest, PutBucketEncryptionRequest, PutBucketObjectLockConfigurationRequest,
-    PutBucketOwnershipControlsRequest, PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest,
-    PutBucketVersioningRequest, PutObjectAcl, PutObjectAclInput, PutObjectAclRequest,
-    PutObjectLegalHoldRequest, PutObjectPolicyContext, PutObjectRetentionRequest,
-    PutObjectTagsRequest, PutObjectWriteAcl, Requester, TaggingDirective, UploadPartCopyRequest,
+    ObjectRequest, ObjectVersionRequest, PutBucketAbacRequest, PutBucketAclInput,
+    PutBucketAclRequest, PutBucketConfigRequest, PutBucketEncryptionRequest,
+    PutBucketObjectLockConfigurationRequest, PutBucketOwnershipControlsRequest,
+    PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest, PutBucketVersioningRequest,
+    PutObjectAcl, PutObjectAclInput, PutObjectAclRequest, PutObjectLegalHoldRequest,
+    PutObjectPolicyContext, PutObjectRetentionRequest, PutObjectTagsRequest, PutObjectWriteAcl,
+    Requester, TaggingDirective, UploadPartCopyRequest,
 };
 use super::response_types::{BucketSummary, GetBucketAclResult, GetObjectAclResult};
 use super::{read_rwlock_unpoisoned, write_rwlock_unpoisoned, Coordinator};
@@ -2416,10 +2417,15 @@ impl Coordinator {
         &self,
         req: &PutBucketConfigRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourcePut, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
             &req.bucket,
             auth::PolicyAction::PutBucketTagging,
         )?;
+        if bucket_info.bucket_abac_enabled {
+            return Err(ServerError::BadRequest {
+                reason: "This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To add tags to this bucket, initiate a TagResource request. To delete tags from this bucket, initiate an UntagResource request.".to_string(),
+            });
+        }
         Ok(AuthorizedBucketSubresourcePut {
             bucket: req.bucket.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Tagging,
@@ -2445,13 +2451,39 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
             req,
             auth::PolicyAction::PutBucketTagging,
         )?;
+        if bucket_info.bucket_abac_enabled {
+            return Err(ServerError::BadRequest {
+                reason: "This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To delete tags from this bucket, initiate an UntagResource request.".to_string(),
+            });
+        }
         Ok(AuthorizedBucketSubresourceDelete {
             bucket: req.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Tagging,
+        })
+    }
+
+    pub(super) fn authorize_put_bucket_abac(
+        &self,
+        req: &PutBucketAbacRequest<'_>,
+    ) -> Result<AuthorizedPutBucketAbac, ServerError> {
+        let _bucket_info = self.authorize_bucket_owner_account_admin_for(&req.bucket)?;
+        Ok(AuthorizedPutBucketAbac {
+            bucket: req.bucket.name_typed().clone(),
+            enabled: req.enabled,
+        })
+    }
+
+    pub(super) fn authorize_get_bucket_abac(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
+        let _bucket_info = self.authorize_bucket_owner_account_admin_for(req)?;
+        Ok(AuthorizedBucketConfigAccess {
+            bucket: req.name_typed().clone(),
         })
     }
 

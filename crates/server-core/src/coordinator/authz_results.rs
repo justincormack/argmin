@@ -56,6 +56,12 @@ pub(super) struct AuthorizedPutBucketOwnershipControls {
 }
 
 #[derive(Debug)]
+pub(super) struct AuthorizedPutBucketAbac {
+    pub(super) bucket: BucketName,
+    pub(super) enabled: bool,
+}
+
+#[derive(Debug)]
 pub(super) struct AuthorizedPutBucketPolicy {
     pub(super) bucket: BucketName,
     pub(super) body: String,
