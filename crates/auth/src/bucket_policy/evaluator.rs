@@ -19,7 +19,7 @@
 
 #![allow(dead_code)]
 
-use super::{PolicyEffect, PolicyRequest};
+use super::{BucketPolicy, PolicyEffect, PolicyEvaluation, PolicyRequest};
 
 /// Which policy source produced a given decision.
 ///
@@ -104,6 +104,30 @@ pub(crate) trait PolicyEvaluator {
 /// cross-account requiring both identity and resource policy, or permission
 /// boundaries being restrictive rather than granting, will layer on top
 /// when IAM arrives.
+impl PolicyEvaluator for BucketPolicy {
+    fn evaluate_decision(&self, request: &PolicyRequest<'_>) -> PolicyDecision {
+        policy_evaluation_to_decision(self.evaluate(request), PolicySourceKind::BucketPolicy)
+    }
+}
+
+/// Translate a [`PolicyEvaluation`] from a single source into a
+/// [`PolicyDecision`].
+///
+/// This is the one conversion between the legacy per-source outcome enum
+/// and the source-tagged decision shape used by the combinator. Kept as a
+/// free function so it can be exercised directly without constructing a
+/// real `BucketPolicy`.
+const fn policy_evaluation_to_decision(
+    evaluation: PolicyEvaluation,
+    source: PolicySourceKind,
+) -> PolicyDecision {
+    match evaluation {
+        PolicyEvaluation::ExplicitAllow => PolicyDecision::allow(source),
+        PolicyEvaluation::ExplicitDeny => PolicyDecision::deny(source),
+        PolicyEvaluation::NoMatch => PolicyDecision::no_match(source),
+    }
+}
+
 pub(crate) fn combine_decisions(decisions: &[PolicyDecision]) -> FinalDecision {
     if decisions
         .iter()
@@ -222,5 +246,132 @@ mod tests {
 
         let none = PolicyDecision::no_match(BUCKET);
         assert_eq!(none.effect, None);
+    }
+
+    #[test]
+    fn policy_evaluation_to_decision_maps_all_three_cases() {
+        assert_eq!(
+            policy_evaluation_to_decision(PolicyEvaluation::ExplicitAllow, BUCKET),
+            PolicyDecision::allow(BUCKET)
+        );
+        assert_eq!(
+            policy_evaluation_to_decision(PolicyEvaluation::ExplicitDeny, BUCKET),
+            PolicyDecision::deny(BUCKET)
+        );
+        assert_eq!(
+            policy_evaluation_to_decision(PolicyEvaluation::NoMatch, BUCKET),
+            PolicyDecision::no_match(BUCKET)
+        );
+    }
+
+    mod bucket_policy_impl {
+        //! End-to-end plumbing tests: parse a real bucket policy, invoke
+        //! it through the [`PolicyEvaluator`] trait, and feed the decision
+        //! into [`combine_decisions`]. Policy-evaluation semantics are
+        //! covered elsewhere (`bucket_policy.rs` unit tests and the
+        //! `bucket_policy_differential` integration tests); these tests
+        //! only exercise the trait wiring and the combinator integration.
+
+        use super::*;
+        use crate::bucket_policy::{parse_bucket_policy, ExistingObjectTags, PolicyAction};
+
+        const ALT_USER: &str = "arn:aws:iam::444455556666:user/alt";
+
+        fn request_for(action: PolicyAction, principal: Option<&str>) -> PolicyRequest<'_> {
+            PolicyRequest::for_object(
+                action,
+                "bucket",
+                "key",
+                principal,
+                None,
+                ExistingObjectTags::Available(&[]),
+            )
+        }
+
+        #[test]
+        fn allow_policy_produces_allow_decision_via_trait() {
+            let policy = parse_bucket_policy(
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            )
+            .unwrap();
+            let request = request_for(PolicyAction::GetObject, Some(ALT_USER));
+            let decision = policy.evaluate_decision(&request);
+            assert_eq!(decision, PolicyDecision::allow(BUCKET));
+            assert_eq!(combine_decisions(&[decision]), FinalDecision::Allow);
+        }
+
+        #[test]
+        fn deny_policy_produces_deny_decision_via_trait() {
+            let policy = parse_bucket_policy(
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            )
+            .unwrap();
+            let request = request_for(PolicyAction::GetObject, Some(ALT_USER));
+            let decision = policy.evaluate_decision(&request);
+            assert_eq!(decision, PolicyDecision::deny(BUCKET));
+            assert_eq!(combine_decisions(&[decision]), FinalDecision::Deny);
+        }
+
+        #[test]
+        fn no_match_policy_produces_no_match_decision_via_trait() {
+            // Policy targets PutObject; request is GetObject, so nothing
+            // matches.
+            let policy = parse_bucket_policy(
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            )
+            .unwrap();
+            let request = request_for(PolicyAction::GetObject, Some(ALT_USER));
+            let decision = policy.evaluate_decision(&request);
+            assert_eq!(decision, PolicyDecision::no_match(BUCKET));
+            // Default-deny resolves the single no-match decision.
+            assert_eq!(combine_decisions(&[decision]), FinalDecision::Deny);
+        }
+
+        #[test]
+        fn allow_and_deny_statements_combine_via_combinator_to_deny() {
+            // Explicit deny in a second statement wins over an allow in
+            // the first, which the bucket-policy evaluator already
+            // encodes as ExplicitDeny. This test validates that the
+            // trait preserves that collapse and the combinator agrees.
+            let policy = parse_bucket_policy(
+                r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"},{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+            )
+            .unwrap();
+            let request = request_for(PolicyAction::GetObject, Some(ALT_USER));
+            let decision = policy.evaluate_decision(&request);
+            assert_eq!(decision, PolicyDecision::deny(BUCKET));
+            assert_eq!(combine_decisions(&[decision]), FinalDecision::Deny);
+        }
+
+        #[test]
+        fn trait_call_matches_inherent_evaluate() {
+            // The inherent BucketPolicy::evaluate is the stable entry
+            // point; the trait must produce a decision that round-trips
+            // with it for every policy evaluation outcome.
+            let policies = [
+                (
+                    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                    PolicyEvaluation::ExplicitAllow,
+                ),
+                (
+                    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                    PolicyEvaluation::ExplicitDeny,
+                ),
+                (
+                    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+                    PolicyEvaluation::NoMatch,
+                ),
+            ];
+            for (json, expected_evaluation) in policies {
+                let policy = parse_bucket_policy(json).unwrap();
+                let request = request_for(PolicyAction::GetObject, Some(ALT_USER));
+                assert_eq!(policy.evaluate(&request), expected_evaluation);
+                let decision = policy.evaluate_decision(&request);
+                assert_eq!(
+                    decision,
+                    policy_evaluation_to_decision(expected_evaluation, BUCKET)
+                );
+            }
+        }
     }
 }
