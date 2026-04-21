@@ -4,45 +4,25 @@
 //! (`StringEquals`, `StringLike`, `Null`, …). Each operator owns its own
 //! semantics, including `IfExists` handling and negation, so call sites do
 //! not re-enumerate the operator list. The public evaluator in
-//! `super::bucket_policy` will migrate its operator dispatch onto this table
-//! in later commits of the phase 1 refactor tracked by
-//! `plans/bucket-policy-evaluator-structure-plan.md`.
-//!
-//! The existing evaluator continues to use its own operator match statements
-//! until the migration commits route through [`CONDITION_OPS`].
-
-#![allow(dead_code)]
+//! `super::bucket_policy` routes its operator dispatch onto this table so
+//! that adding a new operator is a one-row table change instead of a new
+//! arm in several different match statements.
 
 use super::{wildcard_matches, ConditionMatchResult};
 
 /// Value presented to a condition operator by the evaluator.
 ///
-/// The three branches exactly mirror the states the evaluator already
-/// distinguishes:
-///
 /// - `Present(value)`: the condition key resolved to a concrete string
 /// - `Absent`: the key is known but not supplied by the request
-/// - `Unavailable`: the key is known but its value cannot be determined in
-///   this context (for example, object tags on a `PutObject` request)
 ///
-/// `Unavailable` is produced and handled by the condition-key resolver, not
-/// the operator, but it is carried through this type so that a future
-/// resolver-driven call site can pass it opaquely.
+/// The third input state the evaluator distinguishes — "cannot be
+/// determined in this context" — is handled by the condition-key resolver
+/// (see `super::condition_key::evaluate_clause`) before the operator is
+/// called, so operators do not need to model it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ActualValue<'a> {
     Present(&'a str),
     Absent,
-    Unavailable,
-}
-
-/// The kind of values a condition operator expects on its right-hand side.
-///
-/// Reserved for later phases where non-string operators (`IpAddress`,
-/// `NumericLessThan`, `Bool`, `DateEquals`, …) get their own parsing and
-/// normalization step. String operators all share the `String` kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ConditionValueKind {
-    String,
 }
 
 /// Tagged discriminant for condition operators.
@@ -63,13 +43,11 @@ pub(super) enum ConditionOpKind {
 /// `name` is the on-the-wire operator string (for example `"StringEquals"`
 /// or `"StringEqualsIfExists"`). Operators that accept an `IfExists` variant
 /// appear as two separate rows so lookup stays a single exact-match step;
-/// `if_exists` records which form the row represents.
+/// the row's `evaluate` function captures the full `IfExists` semantics.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ConditionOpDef {
     pub(super) name: &'static str,
     pub(super) kind: ConditionOpKind,
-    pub(super) if_exists: bool,
-    pub(super) value_kind: ConditionValueKind,
     pub(super) evaluate: fn(operands: &[String], actual: ActualValue<'_>) -> ConditionMatchResult,
     /// Whether this operator is evaluated by the currently enforced
     /// object-action policy subset. Mirrors the existing
@@ -80,39 +58,32 @@ pub(super) struct ConditionOpDef {
 
 /// The compile-time operator table.
 ///
-/// `StringNotLikeIfExists` is intentionally absent so the supportedness
+/// `StringNotLikeIfExists` is intentionally marked
+/// `evaluable_on_evaluable_object_actions: false` so the supportedness
 /// predicate preserves the asymmetry currently encoded in
 /// `evaluable_string_condition_operator_supported`.
 pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
     ConditionOpDef {
         name: "StringEquals",
         kind: ConditionOpKind::StringEquals,
-        if_exists: false,
-        value_kind: ConditionValueKind::String,
         evaluate: eval_string_equals,
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
         name: "StringEqualsIfExists",
         kind: ConditionOpKind::StringEquals,
-        if_exists: true,
-        value_kind: ConditionValueKind::String,
         evaluate: eval_string_equals_if_exists,
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
         name: "StringNotEquals",
         kind: ConditionOpKind::StringNotEquals,
-        if_exists: false,
-        value_kind: ConditionValueKind::String,
         evaluate: eval_string_not_equals,
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
         name: "StringNotEqualsIfExists",
         kind: ConditionOpKind::StringNotEquals,
-        if_exists: true,
-        value_kind: ConditionValueKind::String,
         // StringNotEquals already treats Absent as Matches, so the IfExists
         // variant shares the same evaluator.
         evaluate: eval_string_not_equals,
@@ -121,32 +92,24 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
     ConditionOpDef {
         name: "StringLike",
         kind: ConditionOpKind::StringLike,
-        if_exists: false,
-        value_kind: ConditionValueKind::String,
         evaluate: eval_string_like,
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
         name: "StringLikeIfExists",
         kind: ConditionOpKind::StringLike,
-        if_exists: true,
-        value_kind: ConditionValueKind::String,
         evaluate: eval_string_like_if_exists,
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
         name: "StringNotLike",
         kind: ConditionOpKind::StringNotLike,
-        if_exists: false,
-        value_kind: ConditionValueKind::String,
         evaluate: eval_string_not_like,
         evaluable_on_evaluable_object_actions: true,
     },
     ConditionOpDef {
         name: "StringNotLikeIfExists",
         kind: ConditionOpKind::StringNotLike,
-        if_exists: true,
-        value_kind: ConditionValueKind::String,
         // StringNotLike already treats Absent as Matches, so the IfExists
         // variant shares the same evaluator.
         evaluate: eval_string_not_like,
@@ -157,8 +120,6 @@ pub(super) const CONDITION_OPS: &[ConditionOpDef] = &[
     ConditionOpDef {
         name: "Null",
         kind: ConditionOpKind::Null,
-        if_exists: false,
-        value_kind: ConditionValueKind::String,
         evaluate: eval_null,
         evaluable_on_evaluable_object_actions: true,
     },
@@ -191,7 +152,6 @@ fn eval_string_equals(operands: &[String], actual: ActualValue<'_>) -> Condition
             }
         }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
-        ActualValue::Unavailable => ConditionMatchResult::InputUnavailable,
     }
 }
 
@@ -202,7 +162,6 @@ fn eval_string_equals_if_exists(
     match actual {
         ActualValue::Present(_) => eval_string_equals(operands, actual),
         ActualValue::Absent => ConditionMatchResult::Matches,
-        ActualValue::Unavailable => ConditionMatchResult::InputUnavailable,
     }
 }
 
@@ -216,7 +175,6 @@ fn eval_string_not_equals(operands: &[String], actual: ActualValue<'_>) -> Condi
             }
         }
         ActualValue::Absent => ConditionMatchResult::Matches,
-        ActualValue::Unavailable => ConditionMatchResult::InputUnavailable,
     }
 }
 
@@ -233,7 +191,6 @@ fn eval_string_like(operands: &[String], actual: ActualValue<'_>) -> ConditionMa
             }
         }
         ActualValue::Absent => ConditionMatchResult::NoMatch,
-        ActualValue::Unavailable => ConditionMatchResult::InputUnavailable,
     }
 }
 
@@ -244,7 +201,6 @@ fn eval_string_like_if_exists(
     match actual {
         ActualValue::Present(_) => eval_string_like(operands, actual),
         ActualValue::Absent => ConditionMatchResult::Matches,
-        ActualValue::Unavailable => ConditionMatchResult::InputUnavailable,
     }
 }
 
@@ -261,7 +217,6 @@ fn eval_string_not_like(operands: &[String], actual: ActualValue<'_>) -> Conditi
             }
         }
         ActualValue::Absent => ConditionMatchResult::Matches,
-        ActualValue::Unavailable => ConditionMatchResult::InputUnavailable,
     }
 }
 
@@ -301,8 +256,17 @@ mod tests {
         let if_exists = lookup("StringEqualsIfExists").expect("IfExists variant is in the table");
         assert_eq!(base.kind, ConditionOpKind::StringEquals);
         assert_eq!(if_exists.kind, ConditionOpKind::StringEquals);
-        assert!(!base.if_exists);
-        assert!(if_exists.if_exists);
+        // The two rows share a kind but must use different evaluator fns;
+        // compare their observable behaviour on an absent value.
+        let operands = operands(&["value"]);
+        assert_eq!(
+            (base.evaluate)(&operands, ActualValue::Absent),
+            ConditionMatchResult::NoMatch
+        );
+        assert_eq!(
+            (if_exists.evaluate)(&operands, ActualValue::Absent),
+            ConditionMatchResult::Matches
+        );
     }
 
     #[test]
@@ -342,21 +306,6 @@ mod tests {
         assert_eq!(
             (if_exists.evaluate)(&expected, ActualValue::Absent),
             ConditionMatchResult::Matches
-        );
-    }
-
-    #[test]
-    fn string_equals_unavailable_propagates() {
-        let op = lookup("StringEquals").unwrap();
-        let if_exists = lookup("StringEqualsIfExists").unwrap();
-        let expected = operands(&["value"]);
-        assert_eq!(
-            (op.evaluate)(&expected, ActualValue::Unavailable),
-            ConditionMatchResult::InputUnavailable
-        );
-        assert_eq!(
-            (if_exists.evaluate)(&expected, ActualValue::Unavailable),
-            ConditionMatchResult::InputUnavailable
         );
     }
 
@@ -476,8 +425,7 @@ mod tests {
     #[test]
     fn every_evaluable_operator_has_an_absent_handler() {
         // Guard: every row must produce a determinate `Matches`/`NoMatch`
-        // answer on an absent value, with `Unavailable` reserved for keys
-        // the resolver cannot answer.
+        // answer on an absent value.
         for op in CONDITION_OPS {
             let result = (op.evaluate)(&[], ActualValue::Absent);
             assert!(

@@ -10,8 +10,6 @@
 //! The existing evaluator continues to use its hand-rolled dispatch until
 //! the migration commits route through [`CONDITION_KEYS`].
 
-#![allow(dead_code)]
-
 use super::condition_op::{self, ActualValue, ConditionOpKind};
 use super::{
     ConditionMatchResult, ExistingObjectTagValue, PolicyAction, PolicyConditionClause,

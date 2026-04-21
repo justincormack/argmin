@@ -8,7 +8,8 @@
 //! identity policies, permission boundaries, or service control policies
 //! later is a change of inputs rather than a change of rules.
 //!
-//! Tracked by `plans/bucket-policy-evaluator-structure-plan.md` phase 3.
+//! Tracked by `plans/completed/bucket-policy-evaluator-structure-plan.md`
+//! phase 3.
 //!
 //! ## Non-goals
 //!
@@ -16,6 +17,11 @@
 //! - this phase does not wire the trait into `server-core`
 //! - the existing public `BucketPolicy::evaluate` entry point is kept
 //!   unchanged
+//!
+//! Consequence: every public item in this module currently has no
+//! non-test caller. The `allow(dead_code)` below is a deliberate
+//! seam-ahead-of-use. It should be removed when the IAM plan wires a
+//! second `PolicyEvaluator` into `server-core` via `combine_decisions`.
 
 #![allow(dead_code)]
 
