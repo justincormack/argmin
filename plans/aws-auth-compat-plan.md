@@ -273,7 +273,7 @@ Deliver:
 
 ### Phase 7: Minimal `s3-control` Support For Bucket ABAC
 
-Status: in progress.
+Status: complete.
 
 Deliver:
 - AWS-compatible `GetBucketAbac` / `PutBucketAbac` behavior
@@ -409,12 +409,11 @@ Completed so far:
     - there is now an AWS-backed regression for that warm `GetObject`
       revocation path
 
-Still open inside Phase 7:
-- the remaining revocation-timing question is now narrower:
-  - `GetObject` warm-read revocation is pinned as a slow eventually-consistent
-    path
-  - `ListBucket` still appears to revoke on an even slower propagation path
-    and is not yet locked down as a committed regression
+Follow-up outside Phase 7:
+- additional revocation coverage can be added in `s3-local-tests` if we want
+  more local-only assertions on slow eventual-convergence paths like
+  `ListBucket`, without turning the AWS compatibility suite into a long
+  propagation harness
 - endpoint / host-routing parity remains deferred to a separate plan:
   [endpoint-routing-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/endpoint-routing-compat-plan.md)
   That broader deferred area includes:
