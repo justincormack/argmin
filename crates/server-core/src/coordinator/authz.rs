@@ -2511,7 +2511,10 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedDeleteBucket, ServerError> {
-        let _bucket_info = self.authorize_bucket_owner_account_admin_for(req)?;
+        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+            req,
+            auth::PolicyAction::DeleteBucket,
+        )?;
         Ok(AuthorizedDeleteBucket {
             name: req.name_typed().clone(),
         })

@@ -125,6 +125,7 @@ impl BucketPolicy {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PolicyAction {
+    DeleteBucket,
     GetBucketPolicy,
     PutBucketPolicy,
     DeleteBucketPolicy,
@@ -169,6 +170,7 @@ pub enum PolicyAction {
     PutObjectRetention,
     PutObjectLegalHold,
     BypassGovernanceRetention,
+    AbortMultipartUpload,
     DeleteObject,
     DeleteObjectVersion,
     DeleteObjectTagging,
@@ -179,6 +181,7 @@ impl PolicyAction {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::DeleteBucket => "s3:DeleteBucket",
             Self::GetBucketPolicy => "s3:GetBucketPolicy",
             Self::PutBucketPolicy => "s3:PutBucketPolicy",
             Self::DeleteBucketPolicy => "s3:DeleteBucketPolicy",
@@ -223,6 +226,7 @@ impl PolicyAction {
             Self::PutObjectRetention => "s3:PutObjectRetention",
             Self::PutObjectLegalHold => "s3:PutObjectLegalHold",
             Self::BypassGovernanceRetention => "s3:BypassGovernanceRetention",
+            Self::AbortMultipartUpload => "s3:AbortMultipartUpload",
             Self::DeleteObject => "s3:DeleteObject",
             Self::DeleteObjectVersion => "s3:DeleteObjectVersion",
             Self::DeleteObjectTagging => "s3:DeleteObjectTagging",
@@ -755,7 +759,7 @@ impl PolicyEffect {
     }
 }
 
-const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 22] = [
+const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 23] = [
     PolicyAction::GetObject,
     PolicyAction::GetObjectVersion,
     PolicyAction::GetObjectAttributes,
@@ -774,6 +778,7 @@ const EVALUABLE_OBJECT_POLICY_ACTIONS: [PolicyAction; 22] = [
     PolicyAction::PutObjectRetention,
     PolicyAction::PutObjectLegalHold,
     PolicyAction::BypassGovernanceRetention,
+    PolicyAction::AbortMultipartUpload,
     PolicyAction::DeleteObject,
     PolicyAction::DeleteObjectVersion,
     PolicyAction::DeleteObjectTagging,
@@ -1145,9 +1150,17 @@ fn validate_resource_applicability(
             .iter()
             .any(|action| action_pattern_matches(pattern, action.as_str()))
     });
+    let all_actions_supported = actions.iter().all(|pattern| {
+        SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS
+            .iter()
+            .chain(SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS.iter())
+            .any(|action| action_pattern_matches(pattern, action.as_str()))
+    });
 
-    if !has_bucket_action && !has_object_action {
-        return Ok(());
+    if !all_actions_supported {
+        return Err(BucketPolicyError::Malformed {
+            reason: "Policy has invalid action",
+        });
     }
 
     let has_bucket_resource = resources.iter().any(|resource| {
@@ -1172,7 +1185,8 @@ fn validate_resource_applicability(
     Ok(())
 }
 
-const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 26] = [
+const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 27] = [
+    PolicyAction::DeleteBucket,
     PolicyAction::GetBucketPolicy,
     PolicyAction::PutBucketPolicy,
     PolicyAction::DeleteBucketPolicy,
@@ -1201,7 +1215,7 @@ const SUPPORTED_BUCKET_POLICY_BUCKET_ACTIONS: [PolicyAction; 26] = [
     PolicyAction::PutBucketObjectLockConfiguration,
 ];
 
-const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 22] = [
+const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 23] = [
     PolicyAction::GetObject,
     PolicyAction::GetObjectVersion,
     PolicyAction::GetObjectAttributes,
@@ -1220,6 +1234,7 @@ const SUPPORTED_BUCKET_POLICY_OBJECT_ACTIONS: [PolicyAction; 22] = [
     PolicyAction::PutObjectRetention,
     PolicyAction::PutObjectLegalHold,
     PolicyAction::BypassGovernanceRetention,
+    PolicyAction::AbortMultipartUpload,
     PolicyAction::DeleteObject,
     PolicyAction::DeleteObjectVersion,
     PolicyAction::DeleteObjectTagging,
@@ -1784,6 +1799,39 @@ mod tests {
                 reason: "NotPrincipal, NotAction, and NotResource are not supported"
             }
         );
+    }
+
+    #[test]
+    fn invalid_create_bucket_action_is_rejected() {
+        let err = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:CreateBucket","Resource":"arn:aws:s3:::bucket"}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err,
+            BucketPolicyError::Malformed {
+                reason: "Policy has invalid action"
+            }
+        );
+    }
+
+    #[test]
+    fn abort_multipart_upload_action_is_accepted() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:AbortMultipartUpload","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        )
+        .unwrap();
+
+        let request = PolicyRequest::for_object(
+            PolicyAction::AbortMultipartUpload,
+            "bucket",
+            "key",
+            Some("caller"),
+            None,
+            ExistingObjectTags::Unavailable,
+        );
+
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
     }
 
     #[test]
@@ -3134,6 +3182,32 @@ mod tests {
         .unwrap();
         let request = bucket_request(PolicyAction::GetBucketTagging, "bucket", Some("caller"));
 
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
+    }
+
+    #[test]
+    fn delete_bucket_matches_bucket_tag_condition() {
+        let policy = parse_bucket_policy(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:DeleteBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        )
+        .unwrap();
+        let public = [PolicyTag::new("security", "public")];
+        let private = [PolicyTag::new("security", "private")];
+
+        let request = bucket_request_with_tags(
+            PolicyAction::DeleteBucket,
+            "bucket",
+            Some("caller"),
+            &public,
+        );
+        assert_eq!(policy.evaluate(&request), PolicyEvaluation::ExplicitAllow);
+
+        let request = bucket_request_with_tags(
+            PolicyAction::DeleteBucket,
+            "bucket",
+            Some("caller"),
+            &private,
+        );
         assert_eq!(policy.evaluate(&request), PolicyEvaluation::NoMatch);
     }
 

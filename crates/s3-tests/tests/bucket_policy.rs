@@ -2200,6 +2200,117 @@ fn test_bucket_policy_put_object_bucket_tag_condition_when_abac_enabled() {
 }
 
 #[test]
+fn test_bucket_policy_create_bucket_bucket_tag_condition_is_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = create_bucket_allowing_public_policy(client).await;
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:CreateBucket",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+
+        cleanup(&bucket, &[]).await;
+
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
+    });
+}
+
+#[test]
+fn test_bucket_policy_delete_bucket_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let public_bucket = create_bucket_allowing_public_policy(client).await;
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        let public_policy = client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:DeleteBucket",
+                        "Resource": bucket_resource(&public_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+
+        let private_bucket = create_bucket_allowing_public_policy(client).await;
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        let private_policy = client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:DeleteBucket",
+                        "Resource": bucket_resource(&private_bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+
+        public_policy.unwrap();
+        private_policy.unwrap();
+
+        eventually_ok(
+            "DeleteBucket allowed for public bucket tag when ABAC is enabled",
+            || alt_client.delete_bucket().bucket(&public_bucket).send(),
+        )
+        .await;
+
+        eventually_access_denied(
+            "DeleteBucket denied for private bucket tag when ABAC is enabled",
+            || alt_client.delete_bucket().bucket(&private_bucket).send(),
+        )
+        .await;
+
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_head_object_bucket_tag_condition_when_abac_enabled() {
     s3_tests::run(async {
         let principal = alt_policy_principal();

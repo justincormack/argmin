@@ -322,6 +322,7 @@ fn bucket_tag_supported_for_action(action: PolicyAction) -> bool {
             | PolicyAction::DeleteObject
             | PolicyAction::GetBucketPolicy
             | PolicyAction::PutBucketPolicy
+            | PolicyAction::DeleteBucket
             | PolicyAction::DeleteBucketPolicy
             | PolicyAction::GetBucketLocation
             | PolicyAction::GetBucketCors

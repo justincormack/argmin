@@ -351,10 +351,13 @@ Completed so far:
     `bucket_abac_enabled` on both bucket and object request paths, and the
     previously implicit `GetObject` / `PutObject` families above are now
     explicitly AWS-pinned instead of inferred
-  - `CreateBucket` / `DeleteBucket` remain separate from this matrix for now:
-    they are not currently modeled as bucket-policy actions in the local auth
-    surface, so they need their own follow-up rather than being inferred from
-    Phase 7 bucket-tag results
+  - `DeleteBucket` is now part of this matrix:
+    under ABAC-enabled buckets, `s3:BucketTag/*` is operative for
+    `s3:DeleteBucket`
+  - `CreateBucket` remains separate:
+    AWS rejects `s3:CreateBucket` in bucket policy as `MalformedPolicy`
+    (`Policy has invalid action`), so it is not part of the enabled-state
+    bucket-tag matrix
 
 Still open inside Phase 7:
 - whether cross-principal authorization revocation after `TagResource`
