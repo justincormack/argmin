@@ -322,7 +322,32 @@ Completed so far:
   - with ABAC enabled and bucket tag `security=public`, the same conditional
     allow shape authorizes:
     - `GetBucketTagging`
+    - `GetBucketPolicyStatus`
+    - `GetBucketAcl`
+    - `PutBucketAcl`
+    - `GetBucketVersioning`
+    - `PutBucketVersioning`
+    - `ListBucketVersions`
+    - `ListBucketMultipartUploads`
+    - `GetBucketLocation`
+    - `GetBucketCors`
+    - `PutBucketCors`
+    - `GetLifecycleConfiguration`
+    - `PutLifecycleConfiguration`
+    - `GetBucketOwnershipControls`
+    - `PutBucketOwnershipControls`
+    - `GetEncryptionConfiguration`
+    - `PutEncryptionConfiguration`
+    - `GetBucketPublicAccessBlock`
+    - `PutBucketPublicAccessBlock`
+    - `GetBucketObjectLockConfiguration`
+    - `PutBucketObjectLockConfiguration`
     - `ListBucket`
+    - `HeadBucket`
+      - the enabled-state bucket-tag path is not a dedicated single action:
+        `s3:GetBucketLocation` alone is insufficient, but the combined
+        `s3:ListBucket` + `s3:GetBucketLocation` allow shape authorizes
+        `HeadBucket` on AWS
     - `GetObject`
     - `HeadObject`
     - `GetObjectAttributes`
@@ -376,9 +401,9 @@ Still open inside Phase 7:
   (`ListBucket` / `GetObject`) rather than as an immediate semantic change
 - tightening the temporary same-endpoint `TagResource` / `UntagResource`
   acceptance into explicit `s3-control` host/endpoint validation
-- any remaining enabled-state bucket-tag actions outside the now-pinned
-  bucket/object read-write, object-lock, versioned subresource/mutation,
-  and multipart/copy rows above
+- the remaining enabled-state bucket-tag bucket-side edge cases:
+  the bucket-policy-management actions
+  (`GetBucketPolicy`, `PutBucketPolicy`, `DeleteBucketPolicy`)
 
 ## Test Plan
 

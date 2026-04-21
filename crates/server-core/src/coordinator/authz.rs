@@ -2396,40 +2396,6 @@ impl Coordinator {
         })
     }
 
-    pub(super) fn authorize_bucket_read_requester(
-        &self,
-        requester: &Requester,
-        bucket: &BucketName,
-        expected_bucket_owner: Option<&str>,
-    ) -> Result<ValidatedBucket, ServerError> {
-        let info = self.checked_active_bucket_summary_for(bucket, expected_bucket_owner)?;
-        if Self::requester_can_read_bucket(
-            requester,
-            &info,
-            &info.owner_principal,
-            &info.acl_grants,
-            Self::effective_public_read(&info),
-        ) {
-            Ok(info)
-        } else {
-            Err(ServerError::AccessDenied)
-        }
-    }
-
-    pub(super) fn authorize_bucket_read_for<R>(
-        &self,
-        req: &R,
-    ) -> Result<ValidatedBucket, ServerError>
-    where
-        R: BucketScopedAuthorizationRequest + ?Sized,
-    {
-        self.authorize_bucket_read_requester(
-            req.requester(),
-            req.bucket_name_typed(),
-            req.expected_bucket_owner(),
-        )
-    }
-
     pub(super) fn authorize_bucket_owner_account_admin_requester(
         &self,
         requester: &Requester,
@@ -2501,7 +2467,43 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedHeadBucket, ServerError> {
-        let info = self.authorize_bucket_read_for(req)?;
+        let info =
+            self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner())?;
+        let bucket_policy = self.cached_bucket_policy(&info)?;
+        let bucket_read_fallback = || {
+            Self::requester_can_read_bucket(
+                req.requester(),
+                &info,
+                &info.owner_principal,
+                &info.acl_grants,
+                Self::effective_public_read(&info),
+            )
+        };
+        let list_decision = self.bucket_policy_decision_for_bucket_loaded(
+            req.requester(),
+            &info,
+            auth::PolicyAction::ListBucket,
+            bucket_policy.as_deref(),
+        )?;
+        let location_decision = self.bucket_policy_decision_for_bucket_loaded(
+            req.requester(),
+            &info,
+            auth::PolicyAction::GetBucketLocation,
+            bucket_policy.as_deref(),
+        )?;
+        let list_allowed =
+            Self::bucket_policy_allows_with_fallback(req.requester(), &info, list_decision, || {
+                bucket_read_fallback()
+            });
+        let location_allowed = Self::bucket_policy_allows_with_fallback(
+            req.requester(),
+            &info,
+            location_decision,
+            bucket_read_fallback,
+        );
+        if !(list_allowed && location_allowed) {
+            return Err(ServerError::AccessDenied);
+        }
         Ok(AuthorizedHeadBucket {
             bucket_info: info.into_inner(),
         })

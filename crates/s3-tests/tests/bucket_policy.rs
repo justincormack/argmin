@@ -408,6 +408,50 @@ async fn enable_bucket_abac_with_security_tag(
         .unwrap();
 }
 
+async fn put_bucket_tag_condition_policy_for_alt(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    action: &str,
+) {
+    client
+        .put_bucket_policy()
+        .bucket(bucket)
+        .policy(
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": alt_policy_principal(),
+                    "Action": action,
+                    "Resource": bucket_resource(bucket),
+                    "Condition": {
+                        "StringEquals": {
+                            "s3:BucketTag/security": "public"
+                        }
+                    }
+                }],
+            })
+            .to_string(),
+        )
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn create_bucket_pair_allowing_bucket_tag_action(action: &str) -> (String, String) {
+    let client = CTX.client();
+
+    let public_bucket = create_bucket_allowing_public_policy(client).await;
+    enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+    put_bucket_tag_condition_policy_for_alt(client, &public_bucket, action).await;
+
+    let private_bucket = create_bucket_allowing_public_policy(client).await;
+    enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+    put_bucket_tag_condition_policy_for_alt(client, &private_bucket, action).await;
+
+    (public_bucket, private_bucket)
+}
+
 async fn create_versioned_bucket_allowing_public_policy(client: &aws_sdk_s3::Client) -> String {
     let bucket = create_bucket_allowing_public_policy(client).await;
     client
@@ -2341,6 +2385,1009 @@ fn test_bucket_policy_delete_bucket_bucket_tag_condition_when_abac_enabled() {
         )
         .await;
 
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_policy_status_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:GetBucketPolicyStatus").await;
+
+        let public = eventually_ok(
+            "GetBucketPolicyStatus allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_bucket_policy_status()
+                    .bucket(&public_bucket)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            public.policy_status().and_then(|status| status.is_public()),
+            Some(false)
+        );
+
+        eventually_access_denied(
+            "GetBucketPolicyStatus denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_bucket_policy_status()
+                    .bucket(&private_bucket)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_acl_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:GetBucketAcl").await;
+
+        let acl = eventually_ok(
+            "GetBucketAcl allowed for public bucket tag when ABAC is enabled",
+            || alt_client.get_bucket_acl().bucket(&public_bucket).send(),
+        )
+        .await;
+        assert!(acl.owner().is_some(), "expected owner in GetBucketAcl");
+
+        eventually_access_denied(
+            "GetBucketAcl denied for private bucket tag when ABAC is enabled",
+            || alt_client.get_bucket_acl().bucket(&private_bucket).send(),
+        )
+        .await;
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_acl_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:PutBucketAcl").await;
+        set_object_writer_ownership(&public_bucket).await;
+        set_object_writer_ownership(&private_bucket).await;
+
+        eventually_ok(
+            "PutBucketAcl allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_bucket_acl()
+                    .bucket(&public_bucket)
+                    .acl(BucketCannedAcl::Private)
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutBucketAcl denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_bucket_acl()
+                    .bucket(&private_bucket)
+                    .acl(BucketCannedAcl::Private)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_versioning_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:GetBucketVersioning").await;
+
+        let versioning = eventually_ok(
+            "GetBucketVersioning allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_bucket_versioning()
+                    .bucket(&public_bucket)
+                    .send()
+            },
+        )
+        .await;
+        assert!(
+            versioning.status().is_none(),
+            "expected unversioned bucket to report no status"
+        );
+
+        eventually_access_denied(
+            "GetBucketVersioning denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_bucket_versioning()
+                    .bucket(&private_bucket)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_versioning_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:PutBucketVersioning").await;
+
+        eventually_ok(
+            "PutBucketVersioning allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_bucket_versioning()
+                    .bucket(&public_bucket)
+                    .versioning_configuration(
+                        VersioningConfiguration::builder()
+                            .status(BucketVersioningStatus::Enabled)
+                            .build(),
+                    )
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutBucketVersioning denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_bucket_versioning()
+                    .bucket(&private_bucket)
+                    .versioning_configuration(
+                        VersioningConfiguration::builder()
+                            .status(BucketVersioningStatus::Enabled)
+                            .build(),
+                    )
+                    .send()
+            },
+        )
+        .await;
+
+        let public_versioning = client
+            .get_bucket_versioning()
+            .bucket(&public_bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            public_versioning.status(),
+            Some(&BucketVersioningStatus::Enabled)
+        );
+
+        cleanup_versioned_bucket(client, &public_bucket).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_versions_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:ListBucketVersions").await;
+
+        for bucket in [&public_bucket, &private_bucket] {
+            client
+                .put_bucket_versioning()
+                .bucket(bucket)
+                .versioning_configuration(
+                    VersioningConfiguration::builder()
+                        .status(BucketVersioningStatus::Enabled)
+                        .build(),
+                )
+                .send()
+                .await
+                .unwrap();
+            client
+                .put_object()
+                .bucket(bucket)
+                .key("key")
+                .body(ByteStream::from_static(b"one"))
+                .send()
+                .await
+                .unwrap();
+            client
+                .put_object()
+                .bucket(bucket)
+                .key("key")
+                .body(ByteStream::from_static(b"two"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let versions = eventually_ok(
+            "ListBucketVersions allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .list_object_versions()
+                    .bucket(&public_bucket)
+                    .send()
+            },
+        )
+        .await;
+        assert!(
+            versions
+                .versions()
+                .iter()
+                .filter(|version| version.key() == Some("key"))
+                .count()
+                >= 2,
+            "expected at least two versions for key"
+        );
+
+        eventually_access_denied(
+            "ListBucketVersions denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .list_object_versions()
+                    .bucket(&private_bucket)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_versioned_bucket(client, &public_bucket).await;
+        cleanup_versioned_bucket(client, &private_bucket).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_list_bucket_multipart_uploads_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:ListBucketMultipartUploads").await;
+
+        let public_upload = client
+            .create_multipart_upload()
+            .bucket(&public_bucket)
+            .key("multipart-key")
+            .send()
+            .await
+            .unwrap();
+        let private_upload = client
+            .create_multipart_upload()
+            .bucket(&private_bucket)
+            .key("multipart-key")
+            .send()
+            .await
+            .unwrap();
+
+        let uploads = eventually_ok(
+            "ListBucketMultipartUploads allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .list_multipart_uploads()
+                    .bucket(&public_bucket)
+                    .send()
+            },
+        )
+        .await;
+        assert!(uploads
+            .uploads()
+            .iter()
+            .any(|upload| upload.key() == Some("multipart-key")));
+
+        eventually_access_denied(
+            "ListBucketMultipartUploads denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .list_multipart_uploads()
+                    .bucket(&private_bucket)
+                    .send()
+            },
+        )
+        .await;
+
+        client
+            .abort_multipart_upload()
+            .bucket(&public_bucket)
+            .key("multipart-key")
+            .upload_id(public_upload.upload_id().unwrap())
+            .send()
+            .await
+            .unwrap();
+        client
+            .abort_multipart_upload()
+            .bucket(&private_bucket)
+            .key("multipart-key")
+            .upload_id(private_upload.upload_id().unwrap())
+            .send()
+            .await
+            .unwrap();
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_lifecycle_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:GetLifecycleConfiguration").await;
+
+        put_bucket_lifecycle_with_md5(
+            client,
+            &public_bucket,
+            simple_lifecycle_configuration("logs/", 30),
+        )
+        .send()
+        .await
+        .unwrap();
+        put_bucket_lifecycle_with_md5(
+            client,
+            &private_bucket,
+            simple_lifecycle_configuration("logs/", 30),
+        )
+        .send()
+        .await
+        .unwrap();
+
+        let response = eventually_ok(
+            "GetLifecycleConfiguration allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_bucket_lifecycle_configuration()
+                    .bucket(&public_bucket)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(response.rules().len(), 1);
+        assert_eq!(response.rules()[0].id(), Some("expire-current"));
+
+        eventually_access_denied(
+            "GetLifecycleConfiguration denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_bucket_lifecycle_configuration()
+                    .bucket(&private_bucket)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_lifecycle_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:PutLifecycleConfiguration").await;
+
+        eventually_ok(
+            "PutLifecycleConfiguration allowed for public bucket tag when ABAC is enabled",
+            || {
+                put_bucket_lifecycle_with_md5(
+                    alt_client,
+                    &public_bucket,
+                    simple_lifecycle_configuration("archive/", 14),
+                )
+                .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutLifecycleConfiguration denied for private bucket tag when ABAC is enabled",
+            || {
+                put_bucket_lifecycle_with_md5(
+                    alt_client,
+                    &private_bucket,
+                    simple_lifecycle_configuration("archive/", 14),
+                )
+                .send()
+            },
+        )
+        .await;
+
+        let read_back = client
+            .get_bucket_lifecycle_configuration()
+            .bucket(&public_bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_back.rules().len(), 1);
+        assert_eq!(
+            read_back.rules()[0].filter().and_then(|f| f.prefix()),
+            Some("archive/")
+        );
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_ownership_controls_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:GetBucketOwnershipControls").await;
+
+        for bucket in [&public_bucket, &private_bucket] {
+            client
+                .put_bucket_ownership_controls()
+                .bucket(bucket)
+                .ownership_controls(simple_bucket_ownership_controls(
+                    ObjectOwnership::BucketOwnerPreferred,
+                ))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let response = eventually_ok(
+            "GetBucketOwnershipControls allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_bucket_ownership_controls()
+                    .bucket(&public_bucket)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            response.ownership_controls().unwrap().rules()[0].object_ownership,
+            ObjectOwnership::BucketOwnerPreferred
+        );
+
+        eventually_access_denied(
+            "GetBucketOwnershipControls denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_bucket_ownership_controls()
+                    .bucket(&private_bucket)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_ownership_controls_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:PutBucketOwnershipControls").await;
+
+        eventually_ok(
+            "PutBucketOwnershipControls allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_bucket_ownership_controls()
+                    .bucket(&public_bucket)
+                    .ownership_controls(simple_bucket_ownership_controls(
+                        ObjectOwnership::BucketOwnerPreferred,
+                    ))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutBucketOwnershipControls denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_bucket_ownership_controls()
+                    .bucket(&private_bucket)
+                    .ownership_controls(simple_bucket_ownership_controls(
+                        ObjectOwnership::BucketOwnerPreferred,
+                    ))
+                    .send()
+            },
+        )
+        .await;
+
+        let read_back = client
+            .get_bucket_ownership_controls()
+            .bucket(&public_bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            read_back.ownership_controls().unwrap().rules()[0].object_ownership,
+            ObjectOwnership::BucketOwnerPreferred
+        );
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_encryption_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:GetEncryptionConfiguration").await;
+
+        for bucket in [&public_bucket, &private_bucket] {
+            client
+                .put_bucket_encryption()
+                .bucket(bucket)
+                .server_side_encryption_configuration(simple_bucket_encryption(
+                    EncryptionType::SseC,
+                ))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let response = eventually_ok(
+            "GetEncryptionConfiguration allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_bucket_encryption()
+                    .bucket(&public_bucket)
+                    .send()
+            },
+        )
+        .await;
+        let rules = response
+            .server_side_encryption_configuration()
+            .unwrap()
+            .rules();
+        assert_eq!(
+            blocked_encryption_types(&rules[0]),
+            vec!["SSE-C".to_string()]
+        );
+
+        eventually_access_denied(
+            "GetEncryptionConfiguration denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_bucket_encryption()
+                    .bucket(&private_bucket)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_encryption_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:PutEncryptionConfiguration").await;
+
+        eventually_ok(
+            "PutEncryptionConfiguration allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_bucket_encryption()
+                    .bucket(&public_bucket)
+                    .server_side_encryption_configuration(simple_bucket_encryption(
+                        EncryptionType::SseC,
+                    ))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutEncryptionConfiguration denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_bucket_encryption()
+                    .bucket(&private_bucket)
+                    .server_side_encryption_configuration(simple_bucket_encryption(
+                        EncryptionType::SseC,
+                    ))
+                    .send()
+            },
+        )
+        .await;
+
+        let read_back = client
+            .get_bucket_encryption()
+            .bucket(&public_bucket)
+            .send()
+            .await
+            .unwrap();
+        let rules = read_back
+            .server_side_encryption_configuration()
+            .unwrap()
+            .rules();
+        assert_eq!(
+            blocked_encryption_types(&rules[0]),
+            vec!["SSE-C".to_string()]
+        );
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_location_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:GetBucketLocation").await;
+
+        let location = eventually_ok(
+            "GetBucketLocation allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_bucket_location()
+                    .bucket(&public_bucket)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(
+            location.location_constraint().map(|v| v.as_str()),
+            expected_bucket_location_constraint_for_sdk(CTX.region())
+        );
+
+        eventually_access_denied(
+            "GetBucketLocation denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_bucket_location()
+                    .bucket(&private_bucket)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_cors_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:GetBucketCors").await;
+
+        for bucket in [&public_bucket, &private_bucket] {
+            client
+                .put_bucket_cors()
+                .bucket(bucket)
+                .cors_configuration(simple_cors_configuration("https://example.com", "GET"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let response = eventually_ok(
+            "GetBucketCors allowed for public bucket tag when ABAC is enabled",
+            || alt_client.get_bucket_cors().bucket(&public_bucket).send(),
+        )
+        .await;
+        assert_eq!(response.cors_rules().len(), 1);
+
+        eventually_access_denied(
+            "GetBucketCors denied for private bucket tag when ABAC is enabled",
+            || alt_client.get_bucket_cors().bucket(&private_bucket).send(),
+        )
+        .await;
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_cors_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:PutBucketCors").await;
+
+        eventually_ok(
+            "PutBucketCors allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_bucket_cors()
+                    .bucket(&public_bucket)
+                    .cors_configuration(simple_cors_configuration("https://example.com", "GET"))
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutBucketCors denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_bucket_cors()
+                    .bucket(&private_bucket)
+                    .cors_configuration(simple_cors_configuration("https://example.com", "GET"))
+                    .send()
+            },
+        )
+        .await;
+
+        let read_back = client
+            .get_bucket_cors()
+            .bucket(&public_bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_back.cors_rules().len(), 1);
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_public_access_block_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:GetBucketPublicAccessBlock").await;
+
+        for bucket in [&public_bucket, &private_bucket] {
+            client
+                .put_public_access_block()
+                .bucket(bucket)
+                .public_access_block_configuration(simple_public_access_block())
+                .send()
+                .await
+                .unwrap();
+        }
+
+        let response = eventually_ok(
+            "GetBucketPublicAccessBlock allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_public_access_block()
+                    .bucket(&public_bucket)
+                    .send()
+            },
+        )
+        .await;
+        let config = response.public_access_block_configuration().unwrap();
+        assert_eq!(config.block_public_acls(), Some(true));
+
+        eventually_access_denied(
+            "GetBucketPublicAccessBlock denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_public_access_block()
+                    .bucket(&private_bucket)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_public_access_block_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+        let (public_bucket, private_bucket) =
+            create_bucket_pair_allowing_bucket_tag_action("s3:PutBucketPublicAccessBlock").await;
+
+        eventually_ok(
+            "PutBucketPublicAccessBlock allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_public_access_block()
+                    .bucket(&public_bucket)
+                    .public_access_block_configuration(simple_public_access_block())
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutBucketPublicAccessBlock denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_public_access_block()
+                    .bucket(&private_bucket)
+                    .public_access_block_configuration(simple_public_access_block())
+                    .send()
+            },
+        )
+        .await;
+
+        let read_back = client
+            .get_public_access_block()
+            .bucket(&public_bucket)
+            .send()
+            .await
+            .unwrap();
+        let config = read_back.public_access_block_configuration().unwrap();
+        assert_eq!(config.block_public_acls(), Some(true));
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_bucket_object_lock_configuration_bucket_tag_condition_when_abac_enabled()
+{
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let public_bucket = create_object_lock_bucket(client).await;
+        let public_config = simple_object_lock_configuration();
+        client
+            .put_object_lock_configuration()
+            .bucket(&public_bucket)
+            .object_lock_configuration(public_config.clone())
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        put_bucket_tag_condition_policy_for_alt(
+            client,
+            &public_bucket,
+            "s3:GetBucketObjectLockConfiguration",
+        )
+        .await;
+
+        let private_bucket = create_object_lock_bucket(client).await;
+        let private_config = simple_object_lock_configuration();
+        client
+            .put_object_lock_configuration()
+            .bucket(&private_bucket)
+            .object_lock_configuration(private_config.clone())
+            .send()
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        put_bucket_tag_condition_policy_for_alt(
+            client,
+            &private_bucket,
+            "s3:GetBucketObjectLockConfiguration",
+        )
+        .await;
+
+        let response = eventually_ok(
+            "GetBucketObjectLockConfiguration allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_object_lock_configuration()
+                    .bucket(&public_bucket)
+                    .send()
+            },
+        )
+        .await;
+        assert_eq!(response.object_lock_configuration(), Some(&public_config));
+
+        eventually_access_denied(
+            "GetBucketObjectLockConfiguration denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .get_object_lock_configuration()
+                    .bucket(&private_bucket)
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_put_bucket_object_lock_configuration_bucket_tag_condition_when_abac_enabled()
+{
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let public_bucket = create_object_lock_bucket(client).await;
+        let public_config = simple_object_lock_configuration();
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        put_bucket_tag_condition_policy_for_alt(
+            client,
+            &public_bucket,
+            "s3:PutBucketObjectLockConfiguration",
+        )
+        .await;
+
+        let private_bucket = create_object_lock_bucket(client).await;
+        let private_config = simple_object_lock_configuration();
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        put_bucket_tag_condition_policy_for_alt(
+            client,
+            &private_bucket,
+            "s3:PutBucketObjectLockConfiguration",
+        )
+        .await;
+
+        eventually_ok(
+            "PutBucketObjectLockConfiguration allowed for public bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_object_lock_configuration()
+                    .bucket(&public_bucket)
+                    .object_lock_configuration(public_config.clone())
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "PutBucketObjectLockConfiguration denied for private bucket tag when ABAC is enabled",
+            || {
+                alt_client
+                    .put_object_lock_configuration()
+                    .bucket(&private_bucket)
+                    .object_lock_configuration(private_config.clone())
+                    .send()
+            },
+        )
+        .await;
+
+        let read_back = client
+            .get_object_lock_configuration()
+            .bucket(&public_bucket)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(read_back.object_lock_configuration(), Some(&public_config));
+
+        cleanup(&public_bucket, &[]).await;
         cleanup(&private_bucket, &[]).await;
     });
 }
@@ -13482,6 +14529,150 @@ fn test_bucket_policy_head_bucket_list_bucket_policy_is_not_sufficient() {
         eventually_access_denied("HeadBucket still denied with ListBucket policy", || {
             alt_client.head_bucket().bucket(&bucket).send()
         })
+        .await;
+
+        cleanup(&bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_head_bucket_bucket_tag_conditions_with_list_and_location_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let public_bucket = create_bucket_allowing_public_policy(client).await;
+        enable_bucket_abac_with_security_tag(client, &public_bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&public_bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:BucketTag/security": "public"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:GetBucketLocation",
+                            "Resource": bucket_resource(&public_bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:BucketTag/security": "public"
+                                }
+                            }
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = create_bucket_allowing_public_policy(client).await;
+        enable_bucket_abac_with_security_tag(client, &private_bucket, "private").await;
+        client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:ListBucket",
+                            "Resource": bucket_resource(&private_bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:BucketTag/security": "public"
+                                }
+                            }
+                        },
+                        {
+                            "Effect": "Allow",
+                            "Principal": alt_policy_principal(),
+                            "Action": "s3:GetBucketLocation",
+                            "Resource": bucket_resource(&private_bucket),
+                            "Condition": {
+                                "StringEquals": {
+                                    "s3:BucketTag/security": "public"
+                                }
+                            }
+                        }
+                    ],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        let result = eventually_ok(
+            "HeadBucket allowed with bucket-tag-conditioned ListBucket and GetBucketLocation",
+            || alt_client.head_bucket().bucket(&public_bucket).send(),
+        )
+        .await;
+        assert_eq!(result.bucket_region(), Some(CTX.region()));
+
+        eventually_access_denied(
+            "HeadBucket denied for private bucket tag with ListBucket and GetBucketLocation",
+            || alt_client.head_bucket().bucket(&private_bucket).send(),
+        )
+        .await;
+
+        cleanup(&public_bucket, &[]).await;
+        cleanup(&private_bucket, &[]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_head_bucket_bucket_tag_condition_with_location_only_when_abac_enabled() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_public_policy(client).await;
+        enable_bucket_abac_with_security_tag(client, &bucket, "public").await;
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:GetBucketLocation",
+                        "Resource": bucket_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        eventually_access_denied(
+            "HeadBucket denied with bucket-tag-conditioned GetBucketLocation alone",
+            || alt_client.head_bucket().bucket(&bucket).send(),
+        )
         .await;
 
         cleanup(&bucket, &[]).await;

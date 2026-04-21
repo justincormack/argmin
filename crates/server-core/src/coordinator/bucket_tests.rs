@@ -4370,6 +4370,63 @@ fn authorize_list_bucket_bucket_tag_policy_applies_when_abac_enabled() {
 }
 
 #[test]
+fn authorize_head_bucket_bucket_tag_policy_requires_list_and_location_when_abac_enabled() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let public_tags =
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>";
+    coord
+        .create_bucket_for_owner("111122223333", "bucket", false)
+        .unwrap();
+    put_bucket_tags_test(
+        &coord,
+        "bucket",
+        public_tags,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    set_bucket_abac_enabled_test(&coord, "bucket", true);
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:ListBucket","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}},{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:GetBucketLocation","Resource":"arn:aws:s3:::bucket","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+
+    coord
+        .authorize_head_bucket(&bucket_request_with_expected_owner(
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        ))
+        .unwrap();
+
+    let private_tags =
+        "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>";
+    put_bucket_tags_for_tag_resource_test(
+        &coord,
+        "bucket",
+        private_tags,
+        test_helpers::requester("111122223333"),
+        None,
+        "111122223333",
+    )
+    .unwrap();
+
+    let err = coord
+        .authorize_head_bucket(&bucket_request_with_expected_owner(
+            "bucket",
+            test_helpers::requester("444455556666"),
+            None,
+        ))
+        .unwrap_err();
+    assert!(matches!(err, ServerError::AccessDenied));
+}
+
+#[test]
 fn put_and_delete_bucket_tags_bucket_policy_allow_applies() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator(tmp.path());
