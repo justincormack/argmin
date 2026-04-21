@@ -47,7 +47,9 @@ take time to converge.
 
 If a test fails on AWS, explore what the test failure tells you about AWS, and what else you should test, especially
 if the test is unexpected. It might be telling you there is a modelling error, or give you new branches to test.
-DO not just rush to fix it, reason about the behaviour.  
+Do not just rush to fix it, reason about the behaviour. If you do not understand why a test fails, you need to debug
+rather than just guess. Only when you understand why a test has failed should you fix it, or you might fix a
+symptom and leave the real cause hidden. 
 
 ## Running tests against AWS
 
