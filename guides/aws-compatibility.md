@@ -131,10 +131,15 @@ Related note:
 
 Argmin currently targets path-style access on the normal API endpoint.
 
+Argmin currently exposes a single S3 API endpoint. It does not implement the
+separate AWS `s3-control` endpoint family, and it does not currently inspect or
+differentiate endpoint-style host headers beyond the normal S3 API surface.
+
 Unsupported URL/addressing forms include:
 
 - website endpoints
 - DNS / virtual-hosted-style bucket addressing
+- `s3-control` endpoints and their distinct host/endpoint routing model
 - other AWS endpoint variants that depend on bucket-in-host routing
 
 Related note:
@@ -230,7 +235,24 @@ Related plan:
 
 - [plans/aws-auth-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/aws-auth-compat-plan.md)
 
-### 11. Bucket-policy condition acceptance and runtime context are still partial
+### 11. The `s3-control` API family is not implemented
+
+Argmin implements the normal S3 API/data-plane endpoint only. It does not
+currently implement the separate AWS `s3-control` control-plane API family.
+
+That means the following AWS surface is currently unsupported:
+
+- `s3-control` endpoint routing and host-style distinctions
+- bucket ABAC enablement APIs such as `PutBucketAbac` / `GetBucketAbac`
+- `s3-control` resource tag management such as `TagResource` / `UntagResource`
+- broader `s3-control` surfaces such as access-point, multi-region access
+  point, Storage Lens, batch operations, and other account/control-plane APIs
+
+In practice, any AWS behavior that depends on `s3-control` APIs, endpoint
+routing, or control-plane state should be treated as unsupported until that API
+family exists locally.
+
+### 12. Bucket-policy condition acceptance and runtime context are still partial
 
 Argmin's compatibility target is to accept the same bucket-policy condition
 keys that AWS accepts on the implemented S3 surface, even when the current
@@ -272,7 +294,7 @@ Related plan:
 
 - [plans/aws-auth-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/aws-auth-compat-plan.md)
 
-### 12. `AccessDenied` does not yet match AWS principal-specific error text
+### 13. `AccessDenied` does not yet match AWS principal-specific error text
 
 Argmin now matches the generic XML error shape for several `AccessDenied`
 cases, but it does not yet reproduce AWS's more specific denial messages that
