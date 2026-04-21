@@ -264,12 +264,35 @@ Deliver:
 Status: open.
 
 Deliver:
-- rerun targeted auth/public-access `s3-tests`
-- account for the remaining auth/header-related Ceph test coverage that is not
-  yet ported into `crates/s3-tests`
-- document remaining intentional incompatibilities:
+- rerun the targeted auth/public-access suites after Phase 5 lands:
+  - `public_access_block.rs`
+  - `bucket_policy.rs`
+  - `bucket_policy_root.rs`
+  - `bucket_admin_root.rs`
+  - `ownership.rs`
+  - `expected_bucket_owner.rs` if Phase 5 changes interact with it
+- document the actual remaining deferred auth/authz gaps in one place:
   - account-level Block Public Access, if still deferred
-  - policy evaluation, if still deferred
+  - account-policy/IAM-side `CreateBucket` / `ListBuckets`
+  - bucket-policy condition keys whose request context is still intentionally
+    missing locally:
+    - `aws:PrincipalArn`
+    - `aws:SourceVpc`
+    - `aws:SourceVpce`
+    - `aws:SourceArn`
+    - `aws:SourceAccount`
+    - `aws:SourceOwner`
+    - `aws:userid`
+    - `aws:PrincipalOrgID`
+    - `s3:DataAccessPointAccount`
+    - `s3:DataAccessPointArn`
+  - deferred `s3:ResourceTag/*`
+
+Notes:
+- this is now a short release-closeout pass, not a broad new implementation
+  phase
+- the earlier placeholder about “remaining auth/header-related Ceph ports” is
+  intentionally retired here unless concrete missing test cases are identified
 
 ### Phase 7: Minimal `s3-control` Support For Bucket ABAC
 
