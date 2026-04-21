@@ -180,16 +180,19 @@ The missing wire-visible surface includes:
 - `x-amz-request-payer: requester`
 - `x-amz-request-charged: requester`
 
-### 7. MFA Delete on bucket versioning is not implemented
+### 7. MFA Delete is not implemented
 
 Argmin supports the basic bucket versioning state (`Enabled` / `Suspended`),
 but it does not implement AWS's MFA Delete surface.
 
-That means the current gap includes both APIs involved in the AWS behavior:
+That means the current gap includes both the bucket-versioning control path and
+the delete path that AWS protects with the same `x-amz-mfa` header family:
 
 - `GetBucketVersioning` does not expose the `MfaDelete` response element
 - `PutBucketVersioning` does not implement `MfaDelete` request handling or the
   required `x-amz-mfa` header flow for changing MFA Delete state
+- `DeleteObjects` does not implement the optional `x-amz-mfa` header behavior
+  used by AWS when MFA Delete is enabled on the target bucket
 
 AWS documents this as part of the bucket versioning configuration rather than a
 separate API surface:
@@ -203,8 +206,31 @@ Sources:
 
 - https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetBucketVersioning.html
 - https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketVersioning.html
+- https://docs.aws.amazon.com/AmazonS3/latest/API/API_DeleteObjects.html
 
-### 8. `HeadBucket` omits `Transfer-Encoding: chunked`
+### 8. Lifecycle transition-default header is not implemented
+
+Argmin does not currently implement lifecycle transition behavior, and it also
+does not implement the corresponding
+`x-amz-transition-default-minimum-object-size` request surface on
+`PutBucketLifecycleConfiguration`.
+
+Today:
+
+- `PutBucketLifecycleConfiguration` ignores that modeled request header because
+  transition semantics are not implemented
+- `GetBucketLifecycleConfiguration` currently returns a fixed
+  `x-amz-transition-default-minimum-object-size: all_storage_classes_128K`
+  header rather than a real persisted value
+
+Treat this header as unsupported until lifecycle transition behavior is
+implemented end-to-end.
+
+Source:
+
+- https://docs.aws.amazon.com/AmazonS3/latest/API/API_PutBucketLifecycleConfiguration.html
+
+### 9. `HeadBucket` omits `Transfer-Encoding: chunked`
 
 AWS includes `Transfer-Encoding: chunked` on successful `HeadBucket`
 responses. Argmin does not currently emit that header.
@@ -216,7 +242,7 @@ instead.
 
 The `s3-diff-tests` `HeadBucket` response-shape check ignores only this header.
 
-### 9. SigV2 is not implemented
+### 10. SigV2 is not implemented
 
 Argmin does not implement AWS Signature Version 2 authentication.
 
@@ -234,7 +260,7 @@ Related note:
 
 - [plans/sigv2-compat-note.md](/home/justin/src/github.com/justincormack/argmin/plans/sigv2-compat-note.md)
 
-### 10. Account-level Block Public Access is not implemented
+### 11. Account-level Block Public Access is not implemented
 
 Argmin supports the bucket-level public access block surface needed by the
 current feature set, but it does not implement AWS account-level Block Public
@@ -247,7 +273,7 @@ Related plan:
 
 - [plans/aws-auth-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/aws-auth-compat-plan.md)
 
-### 11. The `s3-control` API family is not implemented
+### 12. The `s3-control` API family is not implemented
 
 Argmin implements the normal S3 API/data-plane endpoint and only a very narrow
 bucket-ABAC subset of `s3-control`.
