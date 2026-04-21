@@ -361,6 +361,43 @@ async fn alt_get_bucket_policy_status_access_denied_eventually(bucket: &str) {
     unreachable!()
 }
 
+async fn alt_get_object_access_denied_eventually(bucket: &str, key: &str) {
+    // After a successful GetObject, AWS can keep honoring the old bucket-tag
+    // decision for tens of seconds after TagResource has made the new tag
+    // visible via GetBucketTagging. This pins the warm-read revocation path.
+    const MAX_ATTEMPTS: usize = 400;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        let result = CTX
+            .alt_client()
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await;
+        match &result {
+            Ok(_) => {}
+            Err(err)
+                if err.raw_response().map(|r| r.status().as_u16()) == Some(403)
+                    && err.as_service_error().and_then(ProvideErrorMetadata::code)
+                        == Some("AccessDenied") =>
+            {
+                return;
+            }
+            Err(_) => {}
+        }
+        if attempt + 1 < MAX_ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            continue;
+        }
+        panic!(
+            "GetObject did not converge to AccessDenied for bucket {bucket} key {key}: {result:?}"
+        );
+    }
+
+    unreachable!()
+}
+
 fn simple_cors_configuration(origin: &str, method: &str) -> CorsConfiguration {
     CorsConfiguration::builder()
         .cors_rules(
@@ -2180,6 +2217,86 @@ fn test_bucket_policy_get_object_bucket_tag_condition_when_abac_enabled() {
         assert_eq!(get.tag_set().len(), 1);
         assert_eq!(get.tag_set()[0].key(), "security");
         assert_eq!(get.tag_set()[0].value(), "private");
+
+        cleanup(&bucket, &[key]).await;
+    });
+}
+
+#[test]
+fn test_bucket_policy_get_object_bucket_tag_revocation_when_abac_enabled() {
+    s3_tests::run(async {
+        let principal = alt_policy_principal();
+        let client = CTX.client();
+        let alt_client = CTX.alt_client();
+
+        let bucket = create_bucket_allowing_sse_c(client).await;
+        let key = "bucket-tag-get-revocation";
+        client
+            .put_object()
+            .bucket(&bucket)
+            .key(key)
+            .body(ByteStream::from_static(b"bucket-tag-body"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_tagging()
+            .bucket(&bucket)
+            .tagging(simple_bucket_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_abac()
+            .bucket(&bucket)
+            .abac_status(enabled_abac_status())
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": principal,
+                        "Action": "s3:GetObject",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:BucketTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await
+            .unwrap();
+
+        {
+            let response = eventually_ok(
+                "GetObject allowed for public bucket tag before revocation",
+                || alt_client.get_object().bucket(&bucket).key(key).send(),
+            )
+            .await;
+            assert_eq!(response.content_length(), Some(15));
+        }
+
+        let tag = tag_resource(&bucket, &[("security", "private")]);
+        assert_eq!(tag.status, 204, "TagResource failed: {:?}", tag);
+        let get = eventually_ok("Owner GetBucketTagging after TagResource private", || {
+            client.get_bucket_tagging().bucket(&bucket).send()
+        })
+        .await;
+        assert_eq!(get.tag_set().len(), 1);
+        assert_eq!(get.tag_set()[0].key(), "security");
+        assert_eq!(get.tag_set()[0].value(), "private");
+
+        alt_get_object_access_denied_eventually(&bucket, key).await;
 
         cleanup(&bucket, &[key]).await;
     });

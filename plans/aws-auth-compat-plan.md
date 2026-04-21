@@ -399,11 +399,22 @@ Completed so far:
     - `GetBucketPolicy`
     - `PutBucketPolicy`
     - `DeleteBucketPolicy`
+  - revocation after `TagResource` is now partially pinned too:
+    - warm `GetObject` revocation is eventually consistent rather than
+      immediate
+    - in the current AWS probes, the owner sees the new private tag via
+      `GetBucketTagging` quickly, but a previously successful cross-principal
+      `GetObject` can continue to succeed for roughly 30 seconds before
+      converging to `AccessDenied`
+    - there is now an AWS-backed regression for that warm `GetObject`
+      revocation path
 
 Still open inside Phase 7:
-- whether cross-principal authorization revocation after `TagResource`
-  should be modeled as eventually consistent for some data-plane actions
-  (`ListBucket` / `GetObject`) rather than as an immediate semantic change
+- the remaining revocation-timing question is now narrower:
+  - `GetObject` warm-read revocation is pinned as a slow eventually-consistent
+    path
+  - `ListBucket` still appears to revoke on an even slower propagation path
+    and is not yet locked down as a committed regression
 - endpoint / host-routing parity remains deferred to a separate plan:
   [endpoint-routing-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/endpoint-routing-compat-plan.md)
   That broader deferred area includes:
