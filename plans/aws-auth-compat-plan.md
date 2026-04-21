@@ -394,16 +394,23 @@ Completed so far:
   - `PutObjectVersionAcl` is not a special bucket-ABAC exception after all:
     once ACLs are enabled on the bucket, AWS evaluates
     `s3:PutObjectVersionAcl` normally under `s3:BucketTag/*`
+  - the bucket-policy-management actions are now pinned too, using the
+    same-account constrained user plus owner-root harness:
+    - `GetBucketPolicy`
+    - `PutBucketPolicy`
+    - `DeleteBucketPolicy`
 
 Still open inside Phase 7:
 - whether cross-principal authorization revocation after `TagResource`
   should be modeled as eventually consistent for some data-plane actions
   (`ListBucket` / `GetObject`) rather than as an immediate semantic change
-- tightening the temporary same-endpoint `TagResource` / `UntagResource`
-  acceptance into explicit `s3-control` host/endpoint validation
-- the remaining enabled-state bucket-tag bucket-side edge cases:
-  the bucket-policy-management actions
-  (`GetBucketPolicy`, `PutBucketPolicy`, `DeleteBucketPolicy`)
+- endpoint / host-routing parity remains deferred to a separate plan:
+  [endpoint-routing-compat-plan.md](/home/justin/src/github.com/justincormack/argmin/plans/endpoint-routing-compat-plan.md)
+  That broader deferred area includes:
+  - explicit `s3-control` host/endpoint validation
+  - virtual-hosted-style bucket addressing
+  - website endpoints
+  - other bucket-in-host routing surfaces
 
 ## Test Plan
 
@@ -446,10 +453,11 @@ AWS checks:
   live under a future policy-evaluator plan or stay tracked here until that
   work is started
 
-4. Minimal `s3-control` endpoint shape
-- keep the initial bucket-ABAC subset on the existing endpoint surface for now,
-  while documenting that this does not yet enforce the distinct AWS
-  `s3-control` host/endpoint model
+4. Endpoint-routing follow-up ownership
+- keep the bucket-ABAC behavior work complete here
+- track all deferred host/endpoint routing work under the separate
+  endpoint-routing compatibility plan rather than keeping a partial
+  `s3-control` routing note open in this auth plan
 
 ## Recommended Default Decisions
 
@@ -458,3 +466,5 @@ AWS checks:
 - Keep `AuthorizationProfile` explicit at auth boundaries rather than inferring
   broad rights from same-account identity
 - Keep `owner_canonical_id` explicitly stored rather than deriving it ad hoc in XML rendering
+- Keep endpoint / host-routing parity explicitly deferred to the separate
+  endpoint-routing compatibility plan

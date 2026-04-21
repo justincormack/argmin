@@ -2,7 +2,10 @@ use std::future::Future;
 use std::time::Duration;
 
 use aws_sdk_s3::error::ProvideErrorMetadata;
-use aws_sdk_s3::types::PublicAccessBlockConfiguration;
+use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{
+    AbacStatus, BucketAbacStatus, PublicAccessBlockConfiguration, Tag, Tagging,
+};
 use s3_tests::{unique_bucket, CTX};
 use serde_json::json;
 
@@ -73,6 +76,93 @@ fn non_public_root_get_policy(bucket: &str) -> String {
             "Principal": owner_root_principal(),
             "Action": "s3:GetBucketPolicy",
             "Resource": bucket_resource(bucket),
+        }],
+    })
+    .to_string()
+}
+
+fn enabled_abac_status() -> AbacStatus {
+    AbacStatus::builder()
+        .status(BucketAbacStatus::Enabled)
+        .build()
+}
+
+fn simple_bucket_tagging(key: &str, value: &str) -> Tagging {
+    Tagging::builder()
+        .tag_set(Tag::builder().key(key).value(value).build().unwrap())
+        .build()
+        .unwrap()
+}
+
+async fn enable_bucket_abac_with_security_tag(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    value: &str,
+) {
+    client
+        .put_bucket_tagging()
+        .bucket(bucket)
+        .tagging(simple_bucket_tagging("security", value))
+        .send()
+        .await
+        .unwrap();
+    client
+        .put_bucket_abac()
+        .bucket(bucket)
+        .abac_status(enabled_abac_status())
+        .send()
+        .await
+        .unwrap();
+}
+
+async fn same_account_exact_principal(root_client: &aws_sdk_s3::Client) -> String {
+    if std::env::var_os("S3_TEST_ENDPOINT").is_none() {
+        return format!("arn:aws:iam::{}:user/limited", CTX.account_id());
+    }
+
+    let client = CTX.require_second_client();
+    let bucket = unique_bucket();
+    s3_tests::create_bucket(root_client, &bucket).await.unwrap();
+    let denied = client
+        .put_object()
+        .bucket(&bucket)
+        .key("principal-discovery")
+        .body(ByteStream::from_static(b"principal-discovery"))
+        .send()
+        .await;
+    let message = denied
+        .as_ref()
+        .err()
+        .and_then(|err| err.as_service_error())
+        .and_then(ProvideErrorMetadata::message)
+        .unwrap_or_else(|| {
+            panic!("expected AccessDenied message while discovering same-account principal")
+        });
+    let principal = message
+        .strip_prefix("User: ")
+        .and_then(|rest| rest.split(" is not authorized").next())
+        .filter(|principal| principal.starts_with("arn:aws:iam::"))
+        .unwrap_or_else(|| {
+            panic!("failed to parse same-account principal from AccessDenied message: {message}")
+        })
+        .to_string();
+    cleanup_bucket(root_client, &bucket).await;
+    principal
+}
+
+fn bucket_tag_condition_policy(bucket: &str, principal: &str, action: &str, value: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "AWS": principal },
+            "Action": action,
+            "Resource": bucket_resource(bucket),
+            "Condition": {
+                "StringEquals": {
+                    "s3:BucketTag/security": value
+                }
+            }
         }],
     })
     .to_string()
@@ -511,5 +601,226 @@ fn test_owner_root_confirm_remove_self_bucket_access_accepts_non_locking_policy(
         assert_eq!(fetched_policy, expected_policy);
 
         cleanup_bucket(root_client, &bucket).await;
+    });
+}
+
+#[test]
+fn test_same_account_non_root_get_bucket_policy_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let root_client = owner_root_client();
+        let client = CTX.require_second_client();
+        let principal = same_account_exact_principal(root_client).await;
+
+        let public_bucket = unique_bucket();
+        s3_tests::create_bucket(root_client, &public_bucket)
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(root_client, &public_bucket, "public").await;
+        let public_policy =
+            bucket_tag_condition_policy(&public_bucket, &principal, "s3:GetBucketPolicy", "public");
+        root_client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(public_policy.clone())
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = unique_bucket();
+        s3_tests::create_bucket(root_client, &private_bucket)
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(root_client, &private_bucket, "private").await;
+        let private_policy = bucket_tag_condition_policy(
+            &private_bucket,
+            &principal,
+            "s3:GetBucketPolicy",
+            "public",
+        );
+        root_client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(private_policy)
+            .send()
+            .await
+            .unwrap();
+
+        let fetched = eventually_ok(
+            "same-account non-root GetBucketPolicy with public bucket tag",
+            || client.get_bucket_policy().bucket(&public_bucket).send(),
+        )
+        .await;
+        let fetched_policy: serde_json::Value =
+            serde_json::from_str(fetched.policy().unwrap()).unwrap();
+        let expected_policy: serde_json::Value = serde_json::from_str(&public_policy).unwrap();
+        assert_eq!(fetched_policy, expected_policy);
+
+        eventually_access_denied(
+            "same-account non-root GetBucketPolicy denied for private bucket tag",
+            || client.get_bucket_policy().bucket(&private_bucket).send(),
+        )
+        .await;
+
+        cleanup_bucket(root_client, &public_bucket).await;
+        cleanup_bucket(root_client, &private_bucket).await;
+    });
+}
+
+#[test]
+fn test_same_account_non_root_put_bucket_policy_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let root_client = owner_root_client();
+        let client = CTX.require_second_client();
+        let principal = same_account_exact_principal(root_client).await;
+
+        let public_bucket = unique_bucket();
+        s3_tests::create_bucket(root_client, &public_bucket)
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(root_client, &public_bucket, "public").await;
+        root_client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(bucket_tag_condition_policy(
+                &public_bucket,
+                &principal,
+                "s3:PutBucketPolicy",
+                "public",
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = unique_bucket();
+        s3_tests::create_bucket(root_client, &private_bucket)
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(root_client, &private_bucket, "private").await;
+        root_client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(bucket_tag_condition_policy(
+                &private_bucket,
+                &principal,
+                "s3:PutBucketPolicy",
+                "public",
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let replacement = non_public_root_get_policy(&public_bucket);
+        eventually_ok(
+            "same-account non-root PutBucketPolicy with public bucket tag",
+            || {
+                client
+                    .put_bucket_policy()
+                    .bucket(&public_bucket)
+                    .policy(replacement.clone())
+                    .send()
+            },
+        )
+        .await;
+
+        let fetched = eventually_ok(
+            "owner-root GetBucketPolicy after non-root PutBucketPolicy",
+            || {
+                root_client
+                    .get_bucket_policy()
+                    .bucket(&public_bucket)
+                    .send()
+            },
+        )
+        .await;
+        let fetched_policy: serde_json::Value =
+            serde_json::from_str(fetched.policy().unwrap()).unwrap();
+        let expected_policy: serde_json::Value = serde_json::from_str(&replacement).unwrap();
+        assert_eq!(fetched_policy, expected_policy);
+
+        eventually_access_denied(
+            "same-account non-root PutBucketPolicy denied for private bucket tag",
+            || {
+                client
+                    .put_bucket_policy()
+                    .bucket(&private_bucket)
+                    .policy(non_public_root_get_policy(&private_bucket))
+                    .send()
+            },
+        )
+        .await;
+
+        cleanup_bucket(root_client, &public_bucket).await;
+        cleanup_bucket(root_client, &private_bucket).await;
+    });
+}
+
+#[test]
+fn test_same_account_non_root_delete_bucket_policy_bucket_tag_condition_when_abac_enabled() {
+    s3_tests::run(async {
+        let root_client = owner_root_client();
+        let client = CTX.require_second_client();
+        let principal = same_account_exact_principal(root_client).await;
+
+        let public_bucket = unique_bucket();
+        s3_tests::create_bucket(root_client, &public_bucket)
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(root_client, &public_bucket, "public").await;
+        root_client
+            .put_bucket_policy()
+            .bucket(&public_bucket)
+            .policy(bucket_tag_condition_policy(
+                &public_bucket,
+                &principal,
+                "s3:DeleteBucketPolicy",
+                "public",
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        let private_bucket = unique_bucket();
+        s3_tests::create_bucket(root_client, &private_bucket)
+            .await
+            .unwrap();
+        enable_bucket_abac_with_security_tag(root_client, &private_bucket, "private").await;
+        root_client
+            .put_bucket_policy()
+            .bucket(&private_bucket)
+            .policy(bucket_tag_condition_policy(
+                &private_bucket,
+                &principal,
+                "s3:DeleteBucketPolicy",
+                "public",
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        eventually_ok(
+            "same-account non-root DeleteBucketPolicy with public bucket tag",
+            || client.delete_bucket_policy().bucket(&public_bucket).send(),
+        )
+        .await;
+
+        eventually_no_such_bucket_policy(
+            "owner-root GetBucketPolicy after non-root DeleteBucketPolicy",
+            || {
+                root_client
+                    .get_bucket_policy()
+                    .bucket(&public_bucket)
+                    .send()
+            },
+        )
+        .await;
+
+        eventually_access_denied(
+            "same-account non-root DeleteBucketPolicy denied for private bucket tag",
+            || client.delete_bucket_policy().bucket(&private_bucket).send(),
+        )
+        .await;
+
+        cleanup_bucket(root_client, &public_bucket).await;
+        cleanup_bucket(root_client, &private_bucket).await;
     });
 }
