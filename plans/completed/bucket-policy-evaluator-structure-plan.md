@@ -1,6 +1,12 @@
 # Bucket Policy Evaluator Structure Plan
 
-Status: planned
+Status: completed
+
+Phase 1 (condition operator table), phase 2 (condition-key resolver), and
+phase 3 (`PolicyEvaluator` seam with `PolicyDecision` and combinator) have
+landed under `crates/auth/src/bucket_policy/{condition_op,condition_key,evaluator}.rs`.
+Phase 4 was always marked as a handoff to the IAM plan and is out of scope
+for this plan.
 
 ## Scope
 
