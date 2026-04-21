@@ -123,6 +123,9 @@ So the current best model is narrower:
 
 The next delete/tagging row is also now AWS-pinned:
 
+- `PutObject`
+  - policy rejected at `PutBucketPolicy`
+  - AWS returns `MalformedPolicy`
 - `DeleteObject`
   - policy rejected at `PutBucketPolicy`
   - AWS returns `MalformedPolicy`
@@ -139,6 +142,7 @@ The next delete/tagging row is also now AWS-pinned:
 
 So even closely-related mutation actions can split sharply:
 
+- plain overwrite via `PutObject`: policy-invalid
 - delete actions: policy-invalid
 - delete-tagging actions: fully evaluable
 
@@ -415,6 +419,7 @@ object actions.
 
 Start with the highest-value candidates:
 
+- `PutObject`
 - `GetObjectVersionAttributes`
 - `GetObjectRetention`
 - `GetObjectLegalHold`

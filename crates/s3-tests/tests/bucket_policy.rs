@@ -3136,6 +3136,72 @@ fn test_bucket_policy_copy_object_grant_write_acp_condition() {
 }
 
 #[test]
+fn test_bucket_policy_put_object_existing_tag_condition_is_rejected() {
+    s3_tests::run(async {
+        let client = CTX.client();
+        let bucket = unique_bucket();
+        let public_key = "public-overwrite";
+        let private_key = "private-overwrite";
+        s3_tests::create_bucket(client, &bucket).await.unwrap();
+
+        for key in [public_key, private_key] {
+            client
+                .put_object()
+                .bucket(&bucket)
+                .key(key)
+                .body(ByteStream::from_static(b"tagged-body"))
+                .send()
+                .await
+                .unwrap();
+        }
+
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(public_key)
+            .tagging(simple_bucket_tagging("security", "public"))
+            .send()
+            .await
+            .unwrap();
+        client
+            .put_object_tagging()
+            .bucket(&bucket)
+            .key(private_key)
+            .tagging(simple_bucket_tagging("security", "private"))
+            .send()
+            .await
+            .unwrap();
+
+        let result = client
+            .put_bucket_policy()
+            .bucket(&bucket)
+            .policy(
+                json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Principal": alt_policy_principal(),
+                        "Action": "s3:PutObject",
+                        "Resource": bucket_wildcard_resource(&bucket),
+                        "Condition": {
+                            "StringEquals": {
+                                "s3:ExistingObjectTag/security": "public"
+                            }
+                        }
+                    }],
+                })
+                .to_string(),
+            )
+            .send()
+            .await;
+        assert_eq!(err_status(&result), 400);
+        assert_s3_err_code(&result, "MalformedPolicy");
+
+        cleanup(&bucket, &[public_key, private_key]).await;
+    });
+}
+
+#[test]
 fn test_bucket_policy_get_object_acl_existing_tag_condition() {
     s3_tests::run(async {
         let principal = alt_policy_principal();

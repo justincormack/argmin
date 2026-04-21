@@ -270,7 +270,8 @@ fn existing_object_tag_evaluable_for_action(action: PolicyAction) -> bool {
 fn existing_object_tag_supported_for_action(action: PolicyAction) -> bool {
     !matches!(
         action,
-        PolicyAction::GetObjectRetention
+        PolicyAction::PutObject
+            | PolicyAction::GetObjectRetention
             | PolicyAction::GetObjectLegalHold
             | PolicyAction::PutObjectRetention
             | PolicyAction::PutObjectLegalHold
@@ -488,7 +489,7 @@ mod tests {
         assert!(!predicate(PolicyAction::PutObjectLegalHold));
         assert!(!predicate(PolicyAction::BypassGovernanceRetention));
         assert!(predicate(PolicyAction::GetObject));
-        assert!(predicate(PolicyAction::PutObject));
+        assert!(!predicate(PolicyAction::PutObject));
     }
 
     #[test]
