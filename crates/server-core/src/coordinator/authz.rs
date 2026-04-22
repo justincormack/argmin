@@ -34,7 +34,8 @@ use super::authz_results::{
 };
 use super::authz_types::{AuthorizedPutObjectWrite, AuthorizedPutObjectWriteAcl, ValidatedBucket};
 use super::bucket_handles::{
-    BucketHandleRequest, LoadedBucketHandle, LoadedBucketValue, LoadedObjectHandle,
+    BucketHandleLoader, BucketHandleRequest, LoadedBucketHandle, LoadedBucketValue,
+    LoadedObjectHandle,
 };
 use super::pg_guards::LockedReadObject;
 use super::request_types::{
@@ -1719,17 +1720,18 @@ impl Coordinator {
         R: BucketScopedRequest + ExpectedBucketOwnerRequest + ?Sized,
     {
         let expected_bucket_owner = req.expected_bucket_owner();
-        self.with_unchecked_bucket_write_reservation_for(req.bucket_name_typed(), |bucket_info| {
-            let bucket_info =
-                Self::validate_expected_bucket_owner(bucket_info, expected_bucket_owner)?
-                    .into_inner();
-            let bucket_pg = self.get_bucket_pg_for(req.bucket_name_typed())?;
-            let bucket = self
-                .bucket_handle_loader()
-                .load_bucket_handle_from_reserved_pg(bucket_info, request, &bucket_pg)?;
-            drop(bucket_pg);
-            action(bucket)
-        })
+        let bucket = self
+            .storage_node
+            .with_bucket_write_snapshot(
+                req.bucket_name_typed(),
+                request.resolve_to_storage_request(),
+                |snapshot| {
+                    self.bucket_handle_loader()
+                        .load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)
+                },
+            )
+            .map_err(BucketHandleLoader::map_bucket_snapshot_error)??;
+        action(bucket)
     }
 
     fn load_bucket_handle_for_bucket_read(

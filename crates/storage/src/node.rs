@@ -689,6 +689,32 @@ impl SharedStorageNode {
         Self::load_bucket_snapshot_from_pg(&bucket_pg, bucket, request)
     }
 
+    pub fn with_bucket_write_snapshot<T, E>(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(BucketSnapshot) -> Result<T, E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        loop {
+            let pg_id = self.pg_topology.bucket_pg_for(bucket);
+            let bucket_pg = self.get_pg(pg_id)?;
+            match PgMetadataStore::acquire_bucket_write_reservation(&*bucket_pg, bucket) {
+                Ok(_info) => {
+                    let snapshot = Self::load_bucket_snapshot_from_pg(&bucket_pg, bucket, request)?;
+                    drop(bucket_pg);
+                    let result = action(snapshot);
+                    let release_result = self.release_bucket_write_reservation(bucket);
+                    return Self::finish_bucket_write_snapshot(result, release_result);
+                }
+                Err(crate::error::MetadataError::BucketWriteDraining) => {
+                    drop(bucket_pg);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(other) => return Err(other.into()),
+            }
+        }
+    }
+
     pub fn load_bucket_snapshot_pair(
         &self,
         source: (&BucketName, BucketSnapshotRequest),
@@ -805,6 +831,28 @@ impl SharedStorageNode {
                 None => LoadedBucketSubresource::Missing,
             },
         )
+    }
+
+    fn release_bucket_write_reservation(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<(), BucketSnapshotLoadError> {
+        let pg_id = self.pg_topology.bucket_pg_for(bucket);
+        let bucket_pg = self.get_pg(pg_id)?;
+        PgMetadataStore::release_bucket_write_reservation(&*bucket_pg, bucket)?;
+        Ok(())
+    }
+
+    fn finish_bucket_write_snapshot<T, E>(
+        result: Result<T, E>,
+        release_result: Result<(), BucketSnapshotLoadError>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        match (result, release_result) {
+            (Ok(value), Ok(())) => Ok(Ok(value)),
+            (Ok(_), Err(err)) => Err(err),
+            (Err(err), Ok(())) => Ok(Err(err)),
+            (Err(err), Err(_)) => Ok(Err(err)),
+        }
     }
 }
 
@@ -1117,6 +1165,59 @@ mod tests {
                 "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>".to_owned()
             )
         );
+    }
+
+    #[test]
+    fn with_bucket_write_snapshot_loads_requested_subresources_and_releases() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+        let bucket_pg = node
+            .get_pg(node.pg_topology().bucket_pg_for(&bucket))
+            .unwrap();
+        bucket_pg
+            .put_bucket_subresource(
+                &bucket,
+                crate::types::PutBucketSubresource {
+                    kind: crate::types::BucketSubresourceKind::Lifecycle,
+                    body: "<LifecycleConfiguration><Rule><ID>r</ID><Status>Enabled</Status><Filter><Prefix></Prefix></Filter><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>",
+                    aux: crate::types::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        drop(bucket_pg);
+
+        let first = node
+            .with_bucket_write_snapshot(
+                &bucket,
+                crate::types::BucketSnapshotRequest {
+                    lifecycle: true,
+                    ..Default::default()
+                },
+                |snapshot| Ok::<_, ()>(snapshot.lifecycle),
+            )
+            .unwrap();
+        assert!(matches!(
+            first,
+            Ok(crate::types::LoadedBucketSubresource::Loaded(_))
+        ));
+
+        let second = node
+            .with_bucket_write_snapshot(&bucket, Default::default(), |snapshot| {
+                Ok::<_, ()>(snapshot.bucket)
+            })
+            .unwrap();
+        assert_eq!(second.unwrap().name, bucket);
+    }
+
+    #[test]
+    fn finish_bucket_write_snapshot_preserves_action_error_over_release_error() {
+        let result = SharedStorageNode::finish_bucket_write_snapshot::<(), &'static str>(
+            Err("action failed"),
+            Err(crate::error::MetadataError::BucketWriteDraining.into()),
+        )
+        .unwrap();
+        assert_eq!(result, Err("action failed"));
     }
 
     #[test]

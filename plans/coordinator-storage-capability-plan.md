@@ -523,6 +523,17 @@ Acceptance criteria:
 - `BucketHandleLoader` remains a semantic adapter, not a storage-mechanism
   owner
 
+Phase 4c status:
+
+- completed
+- `storage::SharedStorageNode` now owns write-side bucket reservation +
+  snapshot loading through `with_bucket_write_snapshot(...)`
+- ordinary single-object write/delete paths no longer resolve bucket PGs as
+  part of the write-scoped bucket-handle flow
+- remaining coordinator-visible bucket PG reads in this area are on older
+  bucket-read or multipart/copy paths, not the migrated single-object
+  write/delete surface
+
 ### Re-Review After Phase 4c
 
 Once phase 4c lands, rerun the phase-4 checkpoint review specifically against
