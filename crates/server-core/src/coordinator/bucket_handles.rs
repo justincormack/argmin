@@ -180,10 +180,10 @@ impl LoadedBucketHandle {
         &self.cors
     }
 
-    /// Phase-0 object-handle skeleton.
+    /// Derive an object handle from this loaded bucket snapshot.
     ///
-    /// This borrow-based API makes the intended derivation shape explicit
-    /// before request-family migrations start.
+    /// This is borrow-based so object access stays tied to the request-scoped
+    /// bucket handle it was derived from.
     pub(super) fn load_object<'a>(&'a self, key: ObjectKey) -> LoadedObjectHandle<'a> {
         LoadedObjectHandle {
             bucket: self,
@@ -205,7 +205,7 @@ impl LoadedBucketHandle {
     }
 }
 
-/// Phase-0 skeleton for object derivation from a loaded bucket handle.
+/// Request-scoped object handle derived from a loaded bucket handle.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct LoadedObjectHandle<'a> {
     bucket: &'a LoadedBucketHandle,
@@ -271,15 +271,15 @@ impl LoadedBucketPair {
     }
 }
 
-/// Phase-0 storage-boundary loader for request-scoped bucket handles.
+/// Loader for request-scoped bucket handles.
 ///
 /// Request paths are meant to talk to this loader, not to PGs. It is the
 /// place where same-bucket coalescing and dual-bucket acquisition ordering
-/// live before later phases migrate real request families over.
+/// are centralized.
 ///
-/// This is still transitional scaffolding: it centralizes bucket loading for
-/// phase 0, but it is not yet the final single-use request-family entry point
-/// that will make duplicate bucket acquisition structurally impossible.
+/// This is still transitional scaffolding: it centralizes bucket loading, but
+/// it is not yet the final single-use request-family entry point that will
+/// make duplicate bucket acquisition structurally impossible.
 pub(super) struct BucketHandleLoader<'a> {
     coordinator: &'a Coordinator,
 }
