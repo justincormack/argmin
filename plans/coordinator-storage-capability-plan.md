@@ -597,7 +597,7 @@ Acceptance criteria:
 
 Phase 5 status:
 
-- in progress
+- completed
 - first migrated slice:
   - `PutBucketCors`
   - `DeleteBucketCors`
@@ -626,9 +626,11 @@ Phase 5 status:
 - bucket-policy management actions in this slice now preserve the existing
   owner-root bypass semantics while moving to the same write-scoped loaded
   bucket handle path
-- remaining phase-5 surface to migrate:
+- final migrated slice:
   - `PutBucketAcl`
-  - any remaining bucket mutation path still using direct summary/cache lookup
+- phase-5 scope is now effectively covered for the normal single-bucket
+  mutation/admin/config surface; `DeleteBucket` remains separate in phase 6
+  and bucket-wide listing/fanout remains deferred to phase 4b
 
 ### Phase 6: DeleteBucket and Bucket Teardown
 

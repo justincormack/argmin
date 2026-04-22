@@ -1110,10 +1110,10 @@ impl Coordinator {
         )
     }
 
-    fn bucket_policy_decision_for_bucket_with_context_loaded(
+    fn bucket_policy_decision_for_loaded_handle_with_context(
         &self,
         requester: &Requester,
-        bucket: &BucketSummary,
+        bucket: &LoadedBucketHandle,
         action: auth::PolicyAction,
         policy_context: PutObjectPolicyContext<'_>,
         policy: Option<&auth::BucketPolicy>,
@@ -1122,23 +1122,8 @@ impl Coordinator {
             return Ok(auth::PolicyEvaluation::NoMatch);
         };
 
-        let bucket_tags_available =
-            bucket.bucket_abac_enabled && policy.requires_bucket_tags_for_action(action);
-        let bucket_tags = if bucket_tags_available {
-            let bucket_pg = self.get_bucket_pg_for(&bucket.name)?;
-            let tags = Self::load_bucket_subresource_from_pg(
-                &bucket_pg,
-                &bucket.name,
-                storage::BucketSubresourceKind::Tagging,
-            )?;
-            let tags = match tags {
-                Some(tags_xml) => Self::parse_serialized_tag_set(&tags_xml)?,
-                None => Vec::new(),
-            };
-            Some(tags)
-        } else {
-            None
-        };
+        let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket)?;
+        let bucket_tags_available = bucket_tags.is_some();
         let bucket_tags: Vec<auth::PolicyTag<'_>> = bucket_tags
             .iter()
             .flat_map(|tags| tags.iter())
@@ -1147,7 +1132,7 @@ impl Coordinator {
 
         let request = auth::PolicyRequest::for_bucket(
             action,
-            bucket.name.as_str(),
+            bucket.bucket().name.as_str(),
             requester.principal_opt(),
             requester.canonical_user_id(),
             if bucket_tags_available {
@@ -3495,34 +3480,39 @@ impl Coordinator {
         &self,
         req: &PutBucketAclRequest<'_>,
     ) -> Result<AuthorizedPutBucketAcl, ServerError> {
-        let bucket_info = self.checked_active_bucket_summary_for(
-            req.bucket.name_typed(),
-            req.bucket.expected_bucket_owner(),
+        let bucket = self.with_bucket_write_handle_for(
+            &req.bucket,
+            BucketHandleRequest::new()
+                .requiring_policy_view()
+                .requiring_bucket_tags_if_abac_enabled(),
+            |bucket| {
+                let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+                let policy_decision = self.bucket_policy_decision_for_loaded_handle_with_context(
+                    &req.bucket.requester,
+                    &bucket,
+                    auth::PolicyAction::PutBucketAcl,
+                    req.authorization_policy_context()?,
+                    bucket_policy.as_deref(),
+                )?;
+                if !Self::bucket_policy_allows_with_fallback(
+                    &req.bucket.requester,
+                    bucket.bucket(),
+                    policy_decision,
+                    || Self::requester_can_write_bucket_acl(&req.bucket.requester, bucket.bucket()),
+                ) {
+                    return Err(ServerError::AccessDenied);
+                }
+                Ok(bucket)
+            },
         )?;
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        let policy_decision = self.bucket_policy_decision_for_bucket_with_context_loaded(
-            &req.bucket.requester,
-            &bucket_info,
-            auth::PolicyAction::PutBucketAcl,
-            req.authorization_policy_context()?,
-            bucket_policy.as_deref(),
-        )?;
-        if !Self::bucket_policy_allows_with_fallback(
-            &req.bucket.requester,
-            &bucket_info,
-            policy_decision,
-            || Self::requester_can_write_bucket_acl(&req.bucket.requester, &bucket_info),
-        ) {
-            return Err(ServerError::AccessDenied);
-        }
-        let owner = Self::bucket_owner_identity(&bucket_info);
+        let owner = Self::bucket_owner_identity(bucket.bucket());
         let acl_grants = match &req.acl {
             PutBucketAclInput::Canned(acl) => {
-                Self::ensure_put_bucket_acl_supported(&bucket_info, *acl)?;
+                Self::ensure_put_bucket_acl_supported(bucket.bucket(), *acl)?;
                 Self::bucket_acl_grants_from_canned(&owner, *acl)?
             }
             PutBucketAclInput::Grants(acl_grants) => {
-                if Self::is_bucket_owner_enforced(bucket_info.ownership_controls.as_ref()) {
+                if Self::is_bucket_owner_enforced(bucket.bucket().ownership_controls.as_ref()) {
                     return Err(ServerError::AccessControlListNotSupported);
                 }
                 Self::ensure_supported_bucket_acl_grants(acl_grants)?;
@@ -3531,7 +3521,7 @@ impl Coordinator {
         };
         let public_read = Self::acl_grants_public_read(&acl_grants);
         let public_write = Self::acl_grants_public_write(&acl_grants);
-        if Self::blocks_public_acls(bucket_info.public_access_block.as_ref())
+        if Self::blocks_public_acls(bucket.bucket().public_access_block.as_ref())
             && (Self::acl_grants_grant_public_read(&acl_grants)
                 || Self::acl_grants_grant_public_write(&acl_grants))
         {
