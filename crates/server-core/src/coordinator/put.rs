@@ -116,22 +116,8 @@ impl Coordinator {
                 authorized.requested_object_lock(),
             )?;
 
-            let transient_segment_id = {
-                let rng = ring::rand::SystemRandom::new();
-                let mut id_bytes = [0u8; 16];
-                ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
-                    ServerError::InternalError {
-                        reason: "failed to generate direct put segment ID".to_string(),
-                    }
-                })?;
-                let encoded = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
-                    use std::fmt::Write;
-                    write!(s, "{b:02x}").unwrap();
-                    s
-                });
-                SessionId::try_from(encoded)
-                    .expect("generated direct put segment IDs must be valid session IDs")
-            };
+            let transient_segment_id =
+                Self::random_session_id("failed to generate direct put segment ID")?;
 
             let segment_index = 0;
             let segment_okh = stream_segment_key_hash(&transient_segment_id, segment_index);

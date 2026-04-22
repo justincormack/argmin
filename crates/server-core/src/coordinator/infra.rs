@@ -27,26 +27,34 @@ use storage::{
 };
 
 impl Coordinator {
-    pub(super) fn create_stream_put_session_for_authorized_write(
-        &self,
-        authorized: &AuthorizedPutObjectWrite,
-    ) -> Result<SessionId, ServerError> {
-        let stored_encryption = authorized.write_encryption.object_encryption();
+    pub(super) fn random_session_id(error_reason: &'static str) -> Result<SessionId, ServerError> {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
 
         let rng = ring::rand::SystemRandom::new();
         let mut id_bytes = [0u8; 16];
         ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
             ServerError::InternalError {
-                reason: "failed to generate session ID".to_string(),
+                reason: error_reason.to_string(),
             }
         })?;
-        let encoded = id_bytes.iter().fold(String::with_capacity(32), |mut s, b| {
-            use std::fmt::Write;
-            write!(s, "{b:02x}").unwrap();
-            s
-        });
-        let session_id =
-            SessionId::try_from(encoded).expect("generated stream put session IDs must be valid");
+
+        let mut encoded = [0u8; storage::SESSION_ID_LEN];
+        for (index, byte) in id_bytes.iter().copied().enumerate() {
+            encoded[index * 2] = HEX[(byte >> 4) as usize];
+            encoded[index * 2 + 1] = HEX[(byte & 0x0f) as usize];
+        }
+
+        let encoded =
+            String::from_utf8(encoded.to_vec()).expect("hex-encoded session IDs must be UTF-8");
+        Ok(SessionId::try_from(encoded).expect("generated session IDs must be valid"))
+    }
+
+    pub(super) fn create_stream_put_session_for_authorized_write(
+        &self,
+        authorized: &AuthorizedPutObjectWrite,
+    ) -> Result<SessionId, ServerError> {
+        let stored_encryption = authorized.write_encryption.object_encryption();
+        let session_id = Self::random_session_id("failed to generate session ID")?;
 
         let meta_pg_id = self.object_pg_id_for(authorized.bucket_typed(), authorized.key_typed());
         let pg = self.storage_node.get_pg(meta_pg_id)?;
