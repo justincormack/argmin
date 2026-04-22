@@ -31,6 +31,7 @@ use super::authz_results::{
     AuthorizedUploadPartCopy, LoadedObjectState,
 };
 use super::authz_types::{AuthorizedPutObjectWrite, AuthorizedPutObjectWriteAcl, ValidatedBucket};
+use super::bucket_handles::{BucketHandleRequest, LoadedBucketHandle, LoadedBucketValue};
 use super::pg_guards::LockedReadObject;
 use super::request_types::{
     authorization_policy_context_for_put_object_write_acl, AuthorizePutObjectRequest,
@@ -725,6 +726,45 @@ impl Coordinator {
         self.cached_bucket_policy_with_locked_bucket_pg(bucket, &bucket_pg)
     }
 
+    fn cached_bucket_policy_for_loaded_handle(
+        &self,
+        bucket: &LoadedBucketHandle,
+    ) -> Result<Option<Arc<auth::BucketPolicy>>, ServerError> {
+        let bucket_summary = bucket.bucket();
+        if !bucket_summary.bucket_policy_present {
+            return Ok(None);
+        }
+
+        if let Some(cached) = self.cached_bucket_policy_if_fresh(bucket_summary) {
+            return Ok(Some(cached));
+        }
+
+        let parsed_policy = match bucket.policy() {
+            LoadedBucketValue::Loaded(raw_policy) => {
+                Arc::new(auth::parse_bucket_policy(raw_policy).map_err(|e| {
+                    ServerError::InternalError {
+                        reason: format!(
+                            "stored bucket policy for {} failed to parse at request time: {}",
+                            bucket_summary.name,
+                            e.reason()
+                        ),
+                    }
+                })?)
+            }
+            LoadedBucketValue::Missing | LoadedBucketValue::NotRequested => {
+                self.clear_bucket_policy_cache(&bucket_summary.name);
+                return Ok(None);
+            }
+        };
+
+        self.cache_bucket_policy(
+            &bucket_summary.name,
+            bucket_summary.bucket_policy_generation,
+            Arc::clone(&parsed_policy),
+        );
+        Ok(Some(parsed_policy))
+    }
+
     pub(super) fn cached_bucket_policy_if_fresh(
         &self,
         bucket: &BucketSummary,
@@ -831,6 +871,18 @@ impl Coordinator {
 
         let bucket_pg = self.get_bucket_pg_for(&bucket.name)?;
         Self::preload_bucket_tags_from_loaded_bucket_pg(bucket, policy, &bucket_pg)
+    }
+
+    fn loaded_bucket_tags_for_policy(
+        bucket: &LoadedBucketHandle,
+    ) -> Result<Option<Vec<(String, String)>>, ServerError> {
+        match bucket.tags() {
+            LoadedBucketValue::NotRequested => Ok(None),
+            LoadedBucketValue::Missing => Ok(Some(Vec::new())),
+            LoadedBucketValue::Loaded(tags_xml) => {
+                Self::parse_serialized_tag_set(tags_xml).map(Some)
+            }
+        }
     }
 
     fn preload_bucket_tags_from_loaded_bucket_pg(
@@ -1033,6 +1085,23 @@ impl Coordinator {
             },
         );
         Ok(policy.evaluate(&request))
+    }
+
+    fn bucket_policy_decision_for_loaded_handle(
+        &self,
+        requester: &Requester,
+        bucket: &LoadedBucketHandle,
+        action: auth::PolicyAction,
+        policy: Option<&auth::BucketPolicy>,
+    ) -> Result<auth::PolicyEvaluation, ServerError> {
+        let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket)?;
+        self.bucket_policy_decision_for_bucket_loaded_with_tags(
+            requester,
+            bucket.bucket(),
+            bucket_tags.as_deref(),
+            action,
+            policy,
+        )
     }
 
     fn bucket_policy_decision_for_bucket_with_context_loaded(
@@ -1623,18 +1692,16 @@ impl Coordinator {
         ))
     }
 
-    pub(super) fn requester_can_get_bucket_policy_status_with_bucket_policy(
+    fn load_bucket_handle_for_bucket_policy_read(
         &self,
-        requester: &Requester,
-        bucket: &BucketSummary,
-        policy: Option<&auth::BucketPolicy>,
-    ) -> Result<bool, ServerError> {
-        self.requester_can_bucket_action_with_bucket_policy(
-            requester,
-            bucket,
-            auth::PolicyAction::GetBucketPolicyStatus,
-            policy,
-            Self::requester_can_bucket_admin(requester, &bucket.owner_principal),
+        req: &BucketRequest<'_>,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        self.bucket_handle_loader().load_bucket(
+            req.name_typed(),
+            req.expected_bucket_owner(),
+            BucketHandleRequest::new()
+                .requiring_policy_view()
+                .requiring_bucket_tags_if_abac_enabled(),
         )
     }
 
@@ -2974,12 +3041,24 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketVersioning, ServerError> {
-        let info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            req,
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+            &req.requester,
+            &bucket,
             auth::PolicyAction::GetBucketVersioning,
+            bucket_policy.as_deref(),
         )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.requester,
+            bucket.bucket(),
+            policy_decision,
+            || Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
         Ok(AuthorizedGetBucketVersioning {
-            state: info.versioning,
+            state: bucket.bucket().versioning,
         })
     }
 
@@ -2987,10 +3066,22 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketLocation, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            req,
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+            &req.requester,
+            &bucket,
             auth::PolicyAction::GetBucketLocation,
+            bucket_policy.as_deref(),
         )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.requester,
+            bucket.bucket(),
+            policy_decision,
+            || Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
         Ok(AuthorizedGetBucketLocation)
     }
 
@@ -3194,25 +3285,32 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketPolicyStatus, ServerError> {
-        let bucket_info = self.active_bucket_summary_for(req)?;
-        if !bucket_info.bucket_policy_present {
-            if !Self::requester_can_bucket_admin(&req.requester, &bucket_info.owner_principal) {
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        if !bucket.bucket().bucket_policy_present {
+            if !Self::requester_can_bucket_admin(&req.requester, &bucket.bucket().owner_principal) {
                 return Err(ServerError::AccessDenied);
             }
             return Err(ServerError::NoSuchBucketPolicy {
                 bucket: req.name.to_string(),
             });
         }
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !self.requester_can_get_bucket_policy_status_with_bucket_policy(
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
             &req.requester,
-            &bucket_info,
+            &bucket,
+            auth::PolicyAction::GetBucketPolicyStatus,
             bucket_policy.as_deref(),
-        )? {
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.requester,
+            bucket.bucket(),
+            policy_decision,
+            || Self::requester_can_bucket_admin(&req.requester, &bucket.bucket().owner_principal),
+        ) {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedGetBucketPolicyStatus {
-            is_public: bucket_info.bucket_policy_public,
+            is_public: bucket.bucket().bucket_policy_public,
         })
     }
 
@@ -3220,10 +3318,9 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketAcl, ServerError> {
-        let bucket =
-            self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner())?;
-        let bucket_policy = self.cached_bucket_policy(&bucket)?;
-        let policy_decision = self.bucket_policy_decision_for_bucket_loaded(
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
             &req.requester,
             &bucket,
             auth::PolicyAction::GetBucketAcl,
@@ -3231,14 +3328,15 @@ impl Coordinator {
         )?;
         if !Self::bucket_policy_allows_with_fallback(
             &req.requester,
-            &bucket,
+            bucket.bucket(),
             policy_decision,
-            || Self::requester_can_read_bucket_acl(&req.requester, &bucket),
+            || Self::requester_can_read_bucket_acl(&req.requester, bucket.bucket()),
         ) {
             return Err(ServerError::AccessDenied);
         }
-        let result = if Self::is_bucket_owner_enforced(bucket.ownership_controls.as_ref()) {
-            let owner = Self::bucket_owner_identity(&bucket);
+        let result = if Self::is_bucket_owner_enforced(bucket.bucket().ownership_controls.as_ref())
+        {
+            let owner = Self::bucket_owner_identity(bucket.bucket());
             GetBucketAclResult {
                 owner_principal: owner.principal,
                 owner_canonical_id: owner.canonical_id.clone(),
@@ -3248,7 +3346,7 @@ impl Coordinator {
                 )]),
             }
         } else {
-            let bucket = bucket.into_inner();
+            let bucket = bucket.bucket().clone();
             GetBucketAclResult {
                 owner_principal: bucket.owner_principal,
                 owner_canonical_id: bucket.owner_canonical_id,

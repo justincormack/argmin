@@ -299,6 +299,18 @@ Acceptance criteria:
 - bucket policy / bucket tags are loaded through the bucket capability, not by
   separate coordinator helpers
 
+Phase 1 status:
+
+- in progress
+- migrated so far:
+  - `GetBucketAcl`
+  - `GetBucketVersioning`
+  - `GetBucketLocation`
+  - `GetBucketPolicyStatus`
+- still pending in this phase:
+  - `HeadBucket`
+  - `GetBucketTagging`
+
 ### Phase 2: Bucket Read/Admin/Config Paths
 
 Expand the bucket handle model across the remaining normal bucket-side read
