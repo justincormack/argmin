@@ -604,7 +604,7 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_get_bucket_cors(req)?;
-        self.load_authorized_bucket_subresource(&authorized)
+        Ok(authorized.body)
     }
 
     pub fn load_bucket_cors_config(
@@ -652,7 +652,7 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_get_bucket_tagging(req)?;
-        self.load_authorized_bucket_subresource(&authorized)
+        Ok(authorized.body)
     }
 
     pub fn delete_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {
@@ -806,7 +806,7 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_get_bucket_policy(req)?;
-        self.load_authorized_bucket_subresource(&authorized)
+        Ok(authorized.body)
     }
 
     pub fn get_bucket_policy_status(&self, req: &BucketRequest<'_>) -> Result<bool, ServerError> {
@@ -890,7 +890,7 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_get_bucket_lifecycle(req)?;
-        self.load_authorized_bucket_subresource(&authorized)
+        Ok(authorized.body)
     }
 
     pub fn delete_bucket_lifecycle(&self, req: &BucketRequest<'_>) -> Result<(), ServerError> {

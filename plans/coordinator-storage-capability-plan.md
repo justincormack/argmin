@@ -341,20 +341,20 @@ Acceptance criteria:
 
 Phase 2 status:
 
-- started
+- in progress
 - summary-backed reads migrated end to end so far:
   - `GetBucketAbac`
   - `GetBucketEncryption`
   - `GetBucketOwnershipControls`
   - `GetBucketPublicAccessBlock`
   - `GetBucketObjectLockConfiguration`
-- auth-side handle migration started for subresource-body reads:
+- subresource-body reads now migrated end to end through the bucket handle path:
   - `GetBucketPolicy`
   - `GetBucketCors`
   - `GetBucketLifecycle`
-- still pending in phase 2:
-  - removing the separate post-auth bucket subresource loads for the remaining
-    subresource-body reads
+- phase-2 scope is now effectively covered for the normal single-bucket
+  read/admin/config paths; the deferred bucket-wide listing and iteration
+  paths remain in phase 4b
 
 ### Phase 3: Single-Object Read Paths
 

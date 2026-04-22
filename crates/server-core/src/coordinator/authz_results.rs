@@ -33,6 +33,11 @@ pub(super) struct AuthorizedBucketSubresourceGet {
 }
 
 #[derive(Debug)]
+pub(super) struct AuthorizedBucketSubresourceBodyGet {
+    pub(super) body: Option<String>,
+}
+
+#[derive(Debug)]
 pub(super) struct AuthorizedBucketSubresourceDelete {
     pub(super) bucket: BucketName,
     pub(super) kind: storage::BucketSubresourceKind,

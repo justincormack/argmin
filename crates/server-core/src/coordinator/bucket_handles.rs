@@ -69,7 +69,7 @@ impl BucketHandleRequest {
         self.0.cors
     }
 
-    const fn merge(self, other: Self) -> Self {
+    pub(super) const fn merge(self, other: Self) -> Self {
         Self(BucketSnapshotRequest {
             policy: self.0.policy || other.0.policy,
             tags: match (self.0.tags, other.0.tags) {

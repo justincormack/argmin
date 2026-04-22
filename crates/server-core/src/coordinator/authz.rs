@@ -13,11 +13,12 @@ use storage::{
 
 use super::authz_results::{
     AuthorizedAbortMultipartUpload, AuthorizedBeginStreamPart, AuthorizedBucketConfigAccess,
-    AuthorizedBucketSubresourceDelete, AuthorizedBucketSubresourceGet,
-    AuthorizedBucketSubresourcePut, AuthorizedCompleteMultipartUpload, AuthorizedCopyObject,
-    AuthorizedCreateBucket, AuthorizedCreateMultipartUpload, AuthorizedDeleteBucket,
-    AuthorizedDeleteBucketEncryption, AuthorizedDeleteObject, AuthorizedGetBucketAbac,
-    AuthorizedGetBucketAcl, AuthorizedGetBucketEncryption, AuthorizedGetBucketLocation,
+    AuthorizedBucketSubresourceBodyGet, AuthorizedBucketSubresourceDelete,
+    AuthorizedBucketSubresourceGet, AuthorizedBucketSubresourcePut,
+    AuthorizedCompleteMultipartUpload, AuthorizedCopyObject, AuthorizedCreateBucket,
+    AuthorizedCreateMultipartUpload, AuthorizedDeleteBucket, AuthorizedDeleteBucketEncryption,
+    AuthorizedDeleteObject, AuthorizedGetBucketAbac, AuthorizedGetBucketAcl,
+    AuthorizedGetBucketEncryption, AuthorizedGetBucketLocation,
     AuthorizedGetBucketObjectLockConfiguration, AuthorizedGetBucketOwnershipControls,
     AuthorizedGetBucketPolicyStatus, AuthorizedGetBucketPublicAccessBlock,
     AuthorizedGetBucketVersioning, AuthorizedGetObjectAcl, AuthorizedGetObjectLegalHold,
@@ -1664,13 +1665,34 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<LoadedBucketHandle, ServerError> {
+        self.load_bucket_handle_for_bucket_read(req, BucketHandleRequest::new())
+    }
+
+    fn load_bucket_handle_for_bucket_read(
+        &self,
+        req: &BucketRequest<'_>,
+        request: BucketHandleRequest,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        let base_request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
         self.bucket_handle_loader().load_bucket(
             req.name_typed(),
             req.expected_bucket_owner(),
-            BucketHandleRequest::new()
-                .requiring_policy_view()
-                .requiring_bucket_tags_if_abac_enabled(),
+            base_request.merge(request),
         )
+    }
+
+    fn loaded_bucket_subresource_body(
+        value: &LoadedBucketValue<String>,
+    ) -> Result<Option<String>, ServerError> {
+        match value {
+            LoadedBucketValue::Loaded(value) => Ok(Some(value.clone())),
+            LoadedBucketValue::Missing => Ok(None),
+            LoadedBucketValue::NotRequested => Err(ServerError::InternalError {
+                reason: "bucket subresource body was not requested during handle load".to_string(),
+            }),
+        }
     }
 
     fn authorize_loaded_bucket_action_for(
@@ -2610,15 +2632,53 @@ impl Coordinator {
     pub(super) fn authorize_get_bucket_cors(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_action_for(
+    ) -> Result<AuthorizedBucketSubresourceBodyGet, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_read(
             req,
-            auth::PolicyAction::GetBucketCors,
-            Self::requester_can_bucket_owner_account_admin,
+            BucketHandleRequest::new().requiring_cors_view(),
         )?;
-        Ok(AuthorizedBucketSubresourceGet {
-            bucket: req.name_typed().clone(),
-            kind: storage::BucketSubresourceKind::Cors,
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let allowed = self.requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
+            &req.requester,
+            bucket.bucket(),
+            Self::loaded_bucket_tags_for_policy(&bucket)?.as_deref(),
+            auth::PolicyAction::GetBucketCors,
+            bucket_policy.as_deref(),
+            Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()),
+        )?;
+        if !allowed {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedBucketSubresourceBodyGet {
+            body: Self::loaded_bucket_subresource_body(bucket.cors())?,
+        })
+    }
+
+    pub(super) fn authorize_get_bucket_tagging(
+        &self,
+        req: &BucketRequest<'_>,
+    ) -> Result<AuthorizedBucketSubresourceBodyGet, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_read(
+            req,
+            BucketHandleRequest::new().requiring_bucket_tags(),
+        )?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+            &req.requester,
+            &bucket,
+            auth::PolicyAction::GetBucketTagging,
+            bucket_policy.as_deref(),
+        )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.requester,
+            bucket.bucket(),
+            policy_decision,
+            || Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedBucketSubresourceBodyGet {
+            body: Self::loaded_bucket_subresource_body(bucket.tags())?,
         })
     }
 
@@ -2669,32 +2729,6 @@ impl Coordinator {
             bucket: req.bucket.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Tagging,
             body: req.config.to_string(),
-        })
-    }
-
-    pub(super) fn authorize_get_bucket_tagging(
-        &self,
-        req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
-        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
-        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
-        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
-            &req.requester,
-            &bucket,
-            auth::PolicyAction::GetBucketTagging,
-            bucket_policy.as_deref(),
-        )?;
-        if !Self::bucket_policy_allows_with_fallback(
-            &req.requester,
-            bucket.bucket(),
-            policy_decision,
-            || Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()),
-        ) {
-            return Err(ServerError::AccessDenied);
-        }
-        Ok(AuthorizedBucketSubresourceGet {
-            bucket: req.name_typed().clone(),
-            kind: storage::BucketSubresourceKind::Tagging,
         })
     }
 
@@ -2822,15 +2856,14 @@ impl Coordinator {
     pub(super) fn authorize_get_bucket_policy(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_policy_action_for(
+    ) -> Result<AuthorizedBucketSubresourceBodyGet, ServerError> {
+        let bucket = self.authorize_loaded_bucket_policy_action_for(
             req,
             auth::PolicyAction::GetBucketPolicy,
             Self::requester_can_bucket_owner_account_admin,
         )?;
-        Ok(AuthorizedBucketSubresourceGet {
-            bucket: req.name_typed().clone(),
-            kind: storage::BucketSubresourceKind::Policy,
+        Ok(AuthorizedBucketSubresourceBodyGet {
+            body: Self::loaded_bucket_subresource_body(bucket.policy())?,
         })
     }
 
@@ -2979,15 +3012,25 @@ impl Coordinator {
     pub(super) fn authorize_get_bucket_lifecycle(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
-        let _bucket = self.authorize_loaded_bucket_action_for(
+    ) -> Result<AuthorizedBucketSubresourceBodyGet, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_read(
             req,
-            auth::PolicyAction::GetLifecycleConfiguration,
-            Self::requester_can_bucket_owner_account_admin,
+            BucketHandleRequest::new().requiring_lifecycle_view(),
         )?;
-        Ok(AuthorizedBucketSubresourceGet {
-            bucket: req.name_typed().clone(),
-            kind: storage::BucketSubresourceKind::Lifecycle,
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let allowed = self.requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
+            &req.requester,
+            bucket.bucket(),
+            Self::loaded_bucket_tags_for_policy(&bucket)?.as_deref(),
+            auth::PolicyAction::GetLifecycleConfiguration,
+            bucket_policy.as_deref(),
+            Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()),
+        )?;
+        if !allowed {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedBucketSubresourceBodyGet {
+            body: Self::loaded_bucket_subresource_body(bucket.lifecycle())?,
         })
     }
 

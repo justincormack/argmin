@@ -3978,8 +3978,7 @@ fn authorize_get_bucket_cors_bucket_policy_allow_applies() {
             None,
         ))
         .unwrap();
-    assert_eq!(authorized.bucket, "bucket");
-    assert_eq!(authorized.kind, storage::BucketSubresourceKind::Cors);
+    assert_eq!(authorized.body, None);
 }
 
 #[test]
