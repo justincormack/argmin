@@ -978,6 +978,97 @@ mod tests {
         }
     }
 
+    fn create_bucket_for_snapshot_test(node: &SharedStorageNode, name: &str) -> BucketName {
+        let bucket = bucket_name(name);
+        let bucket_pg = node
+            .get_pg(node.pg_topology().bucket_pg_for(&bucket))
+            .unwrap();
+        bucket_pg
+            .create_bucket(
+                &bucket,
+                "owner",
+                &s3_types::CanonicalUserId::from_principal("owner"),
+                &s3_types::AclGrants::default(),
+                false,
+                false,
+            )
+            .unwrap();
+        bucket
+    }
+
+    #[test]
+    fn load_bucket_snapshot_loads_tags_when_abac_enabled() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+        let bucket_pg = node
+            .get_pg(node.pg_topology().bucket_pg_for(&bucket))
+            .unwrap();
+        bucket_pg
+            .put_bucket_subresource(
+                &bucket,
+                crate::types::PutBucketSubresource {
+                    kind: crate::types::BucketSubresourceKind::Tagging,
+                    body: "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+                    aux: crate::types::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        bucket_pg.put_bucket_abac_enabled(&bucket, true).unwrap();
+        drop(bucket_pg);
+
+        let snapshot = node
+            .load_bucket_snapshot(
+                &bucket,
+                crate::types::BucketSnapshotRequest {
+                    tags: crate::types::BucketSnapshotTagsRequest::IfBucketAbacEnabled,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            snapshot.tags,
+            crate::types::LoadedBucketSubresource::Loaded(_)
+        ));
+    }
+
+    #[test]
+    fn load_bucket_snapshot_skips_tags_when_abac_disabled() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+        let bucket_pg = node
+            .get_pg(node.pg_topology().bucket_pg_for(&bucket))
+            .unwrap();
+        bucket_pg
+            .put_bucket_subresource(
+                &bucket,
+                crate::types::PutBucketSubresource {
+                    kind: crate::types::BucketSubresourceKind::Tagging,
+                    body: "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+                    aux: crate::types::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        drop(bucket_pg);
+
+        let snapshot = node
+            .load_bucket_snapshot(
+                &bucket,
+                crate::types::BucketSnapshotRequest {
+                    tags: crate::types::BucketSnapshotTagsRequest::IfBucketAbacEnabled,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(
+            snapshot.tags,
+            crate::types::LoadedBucketSubresource::NotRequested
+        ));
+    }
+
     #[test]
     fn shared_node_read_shard_file_roundtrip() {
         let tmp = test_util::tempdir();

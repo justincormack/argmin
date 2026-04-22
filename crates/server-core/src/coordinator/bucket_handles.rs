@@ -29,14 +29,6 @@ impl BucketTagsLoad {
             (Self::NotNeeded, Self::NotNeeded) => Self::NotNeeded,
         }
     }
-
-    const fn should_load(self, bucket: &BucketSummary) -> bool {
-        match self {
-            Self::NotNeeded => false,
-            Self::WhenBucketAbacEnabled => bucket.bucket_abac_enabled,
-            Self::Always => true,
-        }
-    }
 }
 
 /// Bucket state a request family declares up front.
@@ -112,15 +104,6 @@ impl BucketHandleRequest {
         }
     }
 
-    fn resolve(self, bucket: &BucketSummary) -> ResolvedBucketHandleRequest {
-        ResolvedBucketHandleRequest {
-            policy_view: self.policy_view,
-            bucket_tags: self.bucket_tags.should_load(bucket),
-            lifecycle_view: self.lifecycle_view,
-            cors_view: self.cors_view,
-        }
-    }
-
     const fn resolve_to_storage_request(self) -> BucketSnapshotRequest {
         BucketSnapshotRequest {
             policy: self.policy_view,
@@ -135,14 +118,6 @@ impl BucketHandleRequest {
             cors: self.cors_view,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ResolvedBucketHandleRequest {
-    policy_view: bool,
-    bucket_tags: bool,
-    lifecycle_view: bool,
-    cors_view: bool,
 }
 
 /// Result of loading one bucket subresource declared by [`BucketHandleRequest`].

@@ -1,6 +1,6 @@
 ## Coordinator / Storage Capability Refactor
 
-Status: planned
+Status: in progress
 
 This plan follows the now-completed PG serialization work in
 `plans/completed/pg-serialization-and-crc-verification.md` and the earlier
@@ -221,6 +221,27 @@ Acceptance criteria:
 - the dual-bucket ordering primitive shape is explicit before copy migration
 - the multipart per-request contract is explicit before multipart migration
 - no request-path migration starts before phase 0 is reviewed
+
+Phase 0 status:
+
+- completed
+- landed shape:
+  - `storage` owns bucket snapshot acquisition through:
+    - `SharedStorageNode::load_bucket_snapshot(...)`
+    - `SharedStorageNode::load_bucket_snapshot_pair(...)`
+  - storage owns dual-bucket ordering and same-bucket collapse for the bucket
+    snapshot path
+  - storage owns PG topology for the bucket snapshot path via
+    `storage::pg_topology::PgTopology`
+  - `server-core` owns the semantic request-family adapter and expected-owner
+    validation in `coordinator/bucket_handles.rs`
+  - the current phase-0 types remain internal scaffolding and do not yet
+    migrate real request families
+- pinned guardrails:
+  - same-bucket pair loads collapse to one underlying bucket handle
+  - same-bucket pair loads still validate both expected-owner constraints
+  - conditional bucket-tag snapshot loading is tested directly at the storage
+    layer for the ABAC-enabled and ABAC-disabled cases
 
 ## Storage Boundary Change
 
