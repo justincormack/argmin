@@ -105,7 +105,7 @@ impl Coordinator {
         )
     }
 
-    fn with_unchecked_bucket_write_reservation_for<T>(
+    pub(super) fn with_unchecked_bucket_write_reservation_for<T>(
         &self,
         bucket: &BucketName,
         action: impl FnOnce(BucketSummary) -> Result<T, ServerError>,

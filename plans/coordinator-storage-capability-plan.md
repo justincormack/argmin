@@ -414,6 +414,26 @@ Acceptance criteria:
 - no path separately acquires bucket reservation state and then later reacquires
   bucket metadata/subresources
 
+Phase 4 status:
+
+- in progress
+- migrated so far:
+  - `PutObject` authorization now uses a reservation-backed bucket handle
+    rather than separate bucket policy/tag loads
+  - `DeleteObject` now uses the ordinary loaded bucket-handle path for bucket
+    policy / ABAC inputs
+  - the shared mutation helpers for:
+    - `PutObjectTagging`
+    - `DeleteObjectTagging`
+    - `PutObjectAcl`
+    - `PutObjectRetention`
+    - `PutObjectLegalHold`
+    now load bucket policy / ABAC inputs through the loaded bucket-handle path
+- still open in this phase:
+  - commit/publication-side write reservation integration
+  - checking whether any remaining single-object mutation helpers still bypass
+    the bucket-handle path
+
 ### Checkpoint After Phase 4
 
 After single-object write/delete migration is complete, stop and review whether

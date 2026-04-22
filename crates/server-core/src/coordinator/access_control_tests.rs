@@ -3458,6 +3458,56 @@ fn put_object_bucket_lifecycle_same_pg_completes_without_deadlock() {
 }
 
 #[test]
+fn put_object_bucket_policy_same_pg_completes_without_deadlock() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    coord
+        .create_bucket_for_owner("owner-a", "bucket", false)
+        .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+    coord.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
+
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let res = test_helpers::put_object(
+            &coord,
+            &PutObjectRequest {
+                encryption: WriteEncryptionRequest::none(),
+                policy_context: PutObjectPolicyContext::default(),
+                object_lock: ObjectLockState::default(),
+                object: object_request_with_expected_owner(
+                    "bucket",
+                    "key",
+                    test_helpers::requester("owner-a"),
+                    None,
+                ),
+                data: b"data",
+                metadata: &MetadataBlob::new(),
+                system_metadata: &SystemMetadata::EMPTY,
+                tags: None,
+                cond: NO_WRITE,
+                acl: NO_PUT_OBJECT_ACL.into(),
+            },
+        );
+        tx.send(res.map(|result| result.version_id)).unwrap();
+    });
+
+    let version_id = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("put_object with bucket policy should not self-deadlock")
+        .unwrap();
+    assert_eq!(version_id, VersionId::Null);
+    handle.join().unwrap();
+}
+
+#[test]
 fn create_multipart_upload_bucket_lifecycle_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
@@ -3626,6 +3676,64 @@ fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
         .expect("expected tags");
     assert!(tags.contains("<Key>security</Key>"));
     assert!(tags.contains("<Value>public</Value>"));
+    handle.join().unwrap();
+}
+
+#[test]
+fn put_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    coord
+        .create_bucket_for_owner("owner-a", "bucket", false)
+        .unwrap();
+    test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "key",
+                test_helpers::requester("owner-a"),
+                None,
+            ),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:PutObjectTagging","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+    coord.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
+
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let res = put_object_tags_test(
+            &coord,
+            "bucket",
+            "key",
+            None,
+            "<Tagging><TagSet><Tag><Key>team</Key><Value>storage</Value></Tag></TagSet></Tagging>",
+            test_helpers::requester("owner-a"),
+            None,
+        );
+        tx.send(res).unwrap();
+    });
+
+    rx.recv_timeout(Duration::from_secs(1))
+        .expect("put_object_tagging with bucket policy should not self-deadlock")
+        .unwrap();
     handle.join().unwrap();
 }
 

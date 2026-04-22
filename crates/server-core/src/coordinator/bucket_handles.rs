@@ -378,6 +378,61 @@ impl<'a> BucketHandleLoader<'a> {
         ))
     }
 
+    pub(super) fn load_bucket_handle_from_reserved_pg(
+        &self,
+        bucket: BucketSummary,
+        request: BucketHandleRequest,
+        bucket_pg: &storage::PgStore,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        let policy = if request.policy_view() {
+            Self::from_direct_subresource(Coordinator::load_bucket_subresource_from_pg(
+                bucket_pg,
+                &bucket.name,
+                storage::BucketSubresourceKind::Policy,
+            )?)
+        } else {
+            LoadedBucketValue::NotRequested
+        };
+
+        let tags = match request.resolve_to_storage_request().tags {
+            BucketSnapshotTagsRequest::NotRequested => LoadedBucketValue::NotRequested,
+            BucketSnapshotTagsRequest::IfBucketAbacEnabled if !bucket.bucket_abac_enabled => {
+                LoadedBucketValue::NotRequested
+            }
+            BucketSnapshotTagsRequest::IfBucketAbacEnabled | BucketSnapshotTagsRequest::Always => {
+                Self::from_direct_subresource(Coordinator::load_bucket_subresource_from_pg(
+                    bucket_pg,
+                    &bucket.name,
+                    storage::BucketSubresourceKind::Tagging,
+                )?)
+            }
+        };
+
+        let lifecycle = if request.lifecycle_view() {
+            Self::from_direct_subresource(Coordinator::load_bucket_subresource_from_pg(
+                bucket_pg,
+                &bucket.name,
+                storage::BucketSubresourceKind::Lifecycle,
+            )?)
+        } else {
+            LoadedBucketValue::NotRequested
+        };
+
+        let cors = if request.cors_view() {
+            Self::from_direct_subresource(Coordinator::load_bucket_subresource_from_pg(
+                bucket_pg,
+                &bucket.name,
+                storage::BucketSubresourceKind::Cors,
+            )?)
+        } else {
+            LoadedBucketValue::NotRequested
+        };
+
+        Ok(LoadedBucketHandle::new(
+            bucket, request, policy, tags, lifecycle, cors,
+        ))
+    }
+
     fn from_storage_subresource(
         value: storage::LoadedBucketSubresource<String>,
     ) -> LoadedBucketValue<String> {
@@ -385,6 +440,13 @@ impl<'a> BucketHandleLoader<'a> {
             storage::LoadedBucketSubresource::NotRequested => LoadedBucketValue::NotRequested,
             storage::LoadedBucketSubresource::Missing => LoadedBucketValue::Missing,
             storage::LoadedBucketSubresource::Loaded(value) => LoadedBucketValue::Loaded(value),
+        }
+    }
+
+    fn from_direct_subresource(value: Option<String>) -> LoadedBucketValue<String> {
+        match value {
+            Some(value) => LoadedBucketValue::Loaded(value),
+            None => LoadedBucketValue::Missing,
         }
     }
 
