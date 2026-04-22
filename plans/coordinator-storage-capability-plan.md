@@ -645,14 +645,20 @@ Acceptance criteria:
 
 Phase 6 status:
 
-- in progress
-- first migrated slice:
-  - `DeleteBucket` authorization now uses the write-scoped loaded bucket
-    handle path instead of the older validated-summary plus cached-policy path
-- remaining phase-6 surface:
-  - move the write-drain protocol behind the bucket-first/storage boundary
-  - make bucket teardown/finalize protocol explicit rather than coordinator
-    ad hoc drain/fanout orchestration
+- completed
+- `DeleteBucket` authorization now uses the write-scoped loaded bucket
+  handle path instead of the older validated-summary plus cached-policy path
+- storage now owns bucket delete start/finalize protocol for the normal request
+  path:
+  - `begin_bucket_delete(...)` owns drain start, bucket-wide emptiness scan, and
+    `mark_bucket_deleting(...)`
+  - `try_finalize_bucket_delete(...)` owns the bucket-wide finalize scan,
+    reclaim-root requeue decisions, completed-multipart cleanup, and final
+    metadata deletion
+- coordinator now only:
+  - authorizes `DeleteBucket`
+  - clears request-level caches/fast-path entries
+  - enqueues deferred finalize work
 
 ### Phase 7: Multipart and Streaming Paths
 

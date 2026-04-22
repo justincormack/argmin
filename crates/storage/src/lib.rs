@@ -36,7 +36,8 @@ pub mod types;
 
 pub use error::{BucketSnapshotLoadError, BucketWriteDrainError, MetadataError, StoreError};
 pub use node::{
-    BucketPairPgGuards, BucketWriteDrainGuard, LocalStorageNode, ReclaimWorkItem, SharedStorageNode,
+    BucketDeleteFinalizeOutcome, BucketPairPgGuards, BucketWriteDrainGuard, LocalStorageNode,
+    ReclaimWorkItem, SharedStorageNode,
 };
 pub use pg_store::PgStore;
 pub use pg_topology::PgTopology;

@@ -7,10 +7,10 @@ use ec::{EcConfig, ErasureCodec};
 use s3_types::{BucketLifecycleConfiguration, BucketVersioningState};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
-    BucketInfo, BucketName, BucketState, EcShape, GenerationId, ListMultipartUploadsReq,
-    ListObjectVersionsReq, ListObjectsReq, ListPartsReq, MultipartPartSegmentRecord,
-    MultipartReclaimPartRecord, ObjectEncryption, ObjectKey, OwnerIdentity, ShardKey,
-    SharedStorageNode, StoredObject, UploadId, UploadState, VersionId,
+    BucketInfo, BucketName, EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
+    ListObjectsReq, ListPartsReq, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
+    ObjectEncryption, ObjectKey, OwnerIdentity, ShardKey, SharedStorageNode, StoredObject,
+    UploadId, UploadState, VersionId,
 };
 
 use super::payload::{PooledPayloadBuffer, SharedPayloadBuffer};
@@ -1104,88 +1104,13 @@ impl ReadRuntime {
         &self,
         bucket: &BucketName,
     ) -> Result<(), ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(bucket);
-        let bucket_pg_id = self.pg_topology.bucket_pg_for(bucket);
-        {
-            let bucket_pg = self.storage_node.get_pg(bucket_pg_id)?;
-            let info = match storage::PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket) {
-                Ok(info) => info,
-                Err(storage::MetadataError::BucketNotFound { .. }) => return Ok(()),
-                Err(other) => return Err(ServerError::Metadata(other)),
-            };
-            if info.state != BucketState::Deleting {
-                return Ok(());
-            }
-        }
-
-        let mut found_visible_data = false;
-        let mut found_reclaim_root = false;
-        let mut reclaim_roots = Vec::new();
-        self.pg_topology.for_each_pg(|pg_id| {
-            let pg = self.storage_node.get_pg(pg_id)?;
-            let versions = pg.list_object_versions(&ListObjectVersionsReq {
-                bucket: bucket.clone(),
-                prefix: None,
-                key_marker: None,
-                version_id_marker: None,
-                max_keys: 1,
-            })?;
-            if !versions.versions.is_empty() {
-                found_visible_data = true;
-                return Ok(());
-            }
-            let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                bucket: bucket.clone(),
-                prefix: None,
-                key_marker: None,
-                upload_id_marker: None,
-                max_uploads: 1,
-            })?;
-            if !uploads.uploads.is_empty() {
-                found_visible_data = true;
-                return Ok(());
-            }
-            if let Some(root) =
-                storage::PgMetadataStore::get_bucket_payload_reclaim_root(&*pg, bucket)?
-            {
-                found_reclaim_root = true;
-                reclaim_roots.push(root);
-            }
-            Ok::<(), ServerError>(())
-        })?;
-
-        if found_visible_data {
-            return Ok(());
-        }
-        for root in &reclaim_roots {
-            if self.storage_node.object_payload_lease_count(
-                &root.bucket,
-                &root.key,
-                root.generation_id,
-            ) == 0
-            {
-                self.enqueue_object_payload_reclaim_for(
-                    &root.bucket,
-                    &root.key,
-                    root.generation_id,
-                );
-            }
-        }
-        if found_reclaim_root || self.storage_node.bucket_object_payload_lease_count(bucket) != 0 {
-            return Ok(());
-        }
-
-        self.pg_topology.for_each_pg(|pg_id| {
-            let pg = self.storage_node.get_pg(pg_id)?;
-            storage::PgMetadataStore::delete_completed_multipart_uploads_for_bucket(&*pg, bucket)
-                .map_err(ServerError::Metadata)
-        })?;
-
-        match self.storage_node.delete_bucket_metadata(bucket) {
-            Ok(()) => Ok(()),
-            Err(storage::BucketWriteDrainError::Metadata(
-                storage::MetadataError::BucketNotFound { .. },
-            )) => Ok(()),
+        match self.storage_node.try_finalize_bucket_delete(bucket) {
+            Ok(
+                storage::BucketDeleteFinalizeOutcome::NotFound
+                | storage::BucketDeleteFinalizeOutcome::NotDeleting
+                | storage::BucketDeleteFinalizeOutcome::Pending
+                | storage::BucketDeleteFinalizeOutcome::Finalized,
+            ) => Ok(()),
             Err(storage::BucketWriteDrainError::Store(other)) => Err(ServerError::Store(other)),
             Err(storage::BucketWriteDrainError::Metadata(other)) => {
                 Err(ServerError::Metadata(other))

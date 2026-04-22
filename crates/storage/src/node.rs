@@ -15,8 +15,9 @@ use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::{
     BucketFastPathInfo, BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
-    BucketSnapshotTagsRequest, BucketSubresourceKind, GenerationId, LoadedBucketSubresource,
-    ObjectKey, ShardKey, WriteAck,
+    BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind, GenerationId,
+    ListMultipartUploadsReq, ListObjectVersionsReq, LoadedBucketSubresource, ObjectKey, ShardKey,
+    WriteAck,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -183,6 +184,14 @@ type ReclaimRoot = (BucketName, ObjectKey, GenerationId);
 pub enum ReclaimWorkItem {
     ObjectPayload(ReclaimRoot),
     BucketDelete(BucketName),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BucketDeleteFinalizeOutcome {
+    NotFound,
+    NotDeleting,
+    Pending,
+    Finalized,
 }
 
 struct ReclaimQueueState {
@@ -742,6 +751,55 @@ impl SharedStorageNode {
         }
     }
 
+    pub fn begin_bucket_delete(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
+        let drain = self.begin_bucket_write_drain(bucket)?;
+
+        let mut bucket_not_empty = false;
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self.get_pg(pg_id)?;
+            let versions = pg.list_object_versions(&ListObjectVersionsReq {
+                bucket: bucket.clone(),
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 1,
+            })?;
+            if !versions.versions.is_empty() {
+                bucket_not_empty = true;
+                return Ok::<(), BucketWriteDrainError>(());
+            }
+
+            let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
+                bucket: bucket.clone(),
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 1,
+            })?;
+            if !uploads.uploads.is_empty() {
+                bucket_not_empty = true;
+                return Ok(());
+            }
+
+            let sessions = pg.list_all_stream_uploads()?;
+            if sessions
+                .iter()
+                .any(|session| session.bucket == bucket.as_str())
+            {
+                bucket_not_empty = true;
+            }
+            Ok(())
+        })?;
+
+        if bucket_not_empty {
+            return Err(crate::error::MetadataError::BucketNotEmpty.into());
+        }
+
+        self.mark_bucket_deleting(bucket)?;
+        drain.persist();
+        Ok(())
+    }
+
     pub fn mark_bucket_deleting(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
         let pg_id = self.pg_topology.bucket_pg_for(bucket);
         let bucket_pg = self.get_pg(pg_id)?;
@@ -754,6 +812,91 @@ impl SharedStorageNode {
         let bucket_pg = self.get_pg(pg_id)?;
         PgMetadataStore::delete_bucket(&*bucket_pg, bucket)?;
         Ok(())
+    }
+
+    pub fn try_finalize_bucket_delete(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketDeleteFinalizeOutcome, BucketWriteDrainError> {
+        let _bucket_guard = self.lock_bucket(bucket);
+        let bucket_pg_id = self.pg_topology.bucket_pg_for(bucket);
+        {
+            let bucket_pg = self.get_pg(bucket_pg_id)?;
+            let info = match PgMetadataStore::head_bucket_raw(&*bucket_pg, bucket) {
+                Ok(info) => info,
+                Err(crate::error::MetadataError::BucketNotFound { .. }) => {
+                    return Ok(BucketDeleteFinalizeOutcome::NotFound);
+                }
+                Err(other) => return Err(other.into()),
+            };
+            if info.state != BucketState::Deleting {
+                return Ok(BucketDeleteFinalizeOutcome::NotDeleting);
+            }
+        }
+
+        let mut found_visible_data = false;
+        let mut found_reclaim_root = false;
+        let mut reclaim_roots = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self.get_pg(pg_id)?;
+            let versions = pg.list_object_versions(&ListObjectVersionsReq {
+                bucket: bucket.clone(),
+                prefix: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 1,
+            })?;
+            if !versions.versions.is_empty() {
+                found_visible_data = true;
+                return Ok::<(), BucketWriteDrainError>(());
+            }
+
+            let uploads = pg.list_multipart_uploads(&ListMultipartUploadsReq {
+                bucket: bucket.clone(),
+                prefix: None,
+                key_marker: None,
+                upload_id_marker: None,
+                max_uploads: 1,
+            })?;
+            if !uploads.uploads.is_empty() {
+                found_visible_data = true;
+                return Ok(());
+            }
+
+            if let Some(root) = PgMetadataStore::get_bucket_payload_reclaim_root(&*pg, bucket)? {
+                found_reclaim_root = true;
+                reclaim_roots.push(root);
+            }
+            Ok(())
+        })?;
+
+        if found_visible_data {
+            return Ok(BucketDeleteFinalizeOutcome::Pending);
+        }
+
+        for root in &reclaim_roots {
+            if self.object_payload_lease_count(&root.bucket, &root.key, root.generation_id) == 0 {
+                self.enqueue_object_payload_reclaim(&root.bucket, &root.key, root.generation_id);
+            }
+        }
+
+        if found_reclaim_root || self.bucket_object_payload_lease_count(bucket) != 0 {
+            return Ok(BucketDeleteFinalizeOutcome::Pending);
+        }
+
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self.get_pg(pg_id)?;
+            PgMetadataStore::delete_completed_multipart_uploads_for_bucket(&*pg, bucket)?;
+            Ok::<(), BucketWriteDrainError>(())
+        })?;
+
+        match self.delete_bucket_metadata(bucket) {
+            Ok(()) => Ok(BucketDeleteFinalizeOutcome::Finalized),
+            Err(crate::error::BucketWriteDrainError::Metadata(
+                crate::error::MetadataError::BucketNotFound { .. },
+            )) => Ok(BucketDeleteFinalizeOutcome::NotFound),
+            Err(other) => Err(other),
+        }
     }
 
     pub fn with_bucket_write_snapshot<T, E>(
@@ -1310,6 +1453,57 @@ mod tests {
             })
             .unwrap();
         assert_eq!(result.unwrap().name, bucket);
+    }
+
+    #[test]
+    fn begin_bucket_delete_rejects_nonempty_bucket() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+        let object_pg = node
+            .get_pg(node.pg_topology().object_pg(bucket.as_str(), "key"))
+            .unwrap();
+        object_pg
+            .create_multipart_upload(&crate::types::CreateMultipartUploadReq {
+                upload_id: crate::tests::multipart_upload_id("upload"),
+                bucket: bucket.clone(),
+                key: ObjectKey::try_from("key").unwrap(),
+                tags: None,
+                metadata_blob: vec![].into(),
+                system_metadata_blob: crate::types::SerializedSystemMetadataBlob::default(),
+                initiator: None,
+                owner: crate::types::OwnerIdentity::from_principal("owner"),
+                acl_grants: s3_types::AclGrants::default(),
+                public_read: false,
+                object_lock: crate::types::ObjectLockState::default(),
+                checksum: None,
+                encryption: crate::types::ObjectEncryption::None,
+            })
+            .unwrap();
+        drop(object_pg);
+
+        let err = node.begin_bucket_delete(&bucket).unwrap_err();
+        assert!(matches!(
+            err,
+            BucketWriteDrainError::Metadata(crate::error::MetadataError::BucketNotEmpty)
+        ));
+    }
+
+    #[test]
+    fn try_finalize_bucket_delete_finalizes_empty_deleting_bucket() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+        node.begin_bucket_delete(&bucket).unwrap();
+
+        assert_eq!(
+            node.try_finalize_bucket_delete(&bucket).unwrap(),
+            BucketDeleteFinalizeOutcome::Finalized
+        );
+        assert_eq!(
+            node.try_finalize_bucket_delete(&bucket).unwrap(),
+            BucketDeleteFinalizeOutcome::NotFound
+        );
     }
 
     #[test]

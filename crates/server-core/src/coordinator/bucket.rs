@@ -7,8 +7,7 @@ use s3_types::{
 use storage::traits::PgMetadataStore;
 use storage::{
     BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
-    BucketState, EffectiveBucketEncryptionConfig, ListMultipartUploadsReq, ListObjectVersionsReq,
-    OwnerIdentity, PublicAccessBlockConfig,
+    BucketState, EffectiveBucketEncryptionConfig, OwnerIdentity, PublicAccessBlockConfig,
 };
 
 #[cfg(test)]
@@ -30,6 +29,9 @@ impl Coordinator {
     fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) -> ServerError {
         match err {
             storage::BucketWriteDrainError::Store(other) => ServerError::Store(other),
+            storage::BucketWriteDrainError::Metadata(storage::MetadataError::BucketNotEmpty) => {
+                ServerError::BucketNotEmpty
+            }
             storage::BucketWriteDrainError::Metadata(storage::MetadataError::BucketNotFound {
                 name,
             }) => ServerError::BucketNotFound {
@@ -307,59 +309,15 @@ impl Coordinator {
             req.name
         );
         let AuthorizedDeleteBucket { name } = self.authorize_delete_bucket(req)?;
-        let drain = self
-            .storage_node
-            .begin_bucket_write_drain(&name)
+        self.storage_node
+            .begin_bucket_delete(&name)
             .map_err(Self::map_bucket_write_drain_error)?;
-
-        let result = (|| {
-            self.pg_topology.for_each_pg(|pg_id| {
-                let pg = self.storage_node.get_pg(pg_id)?;
-                let resp = pg.list_object_versions(&ListObjectVersionsReq {
-                    bucket: name.clone(),
-                    prefix: None,
-                    key_marker: None,
-                    version_id_marker: None,
-                    max_keys: 1,
-                })?;
-                if !resp.versions.is_empty() {
-                    return Err(ServerError::BucketNotEmpty);
-                }
-                let mpu_resp = pg.list_multipart_uploads(&ListMultipartUploadsReq {
-                    bucket: name.clone(),
-                    prefix: None,
-                    key_marker: None,
-                    upload_id_marker: None,
-                    max_uploads: 1,
-                })?;
-                if !mpu_resp.uploads.is_empty() {
-                    return Err(ServerError::BucketNotEmpty);
-                }
-                let sessions = pg
-                    .list_all_stream_uploads()
-                    .map_err(ServerError::Metadata)?;
-                if sessions
-                    .iter()
-                    .any(|session| session.bucket == name.as_str())
-                {
-                    return Err(ServerError::BucketNotEmpty);
-                }
-                Ok::<(), ServerError>(())
-            })?;
-
-            self.storage_node
-                .mark_bucket_deleting(&name)
-                .map_err(Self::map_bucket_write_drain_error)?;
-            self.storage_node.remove_bucket_fast_path(&name);
-            self.clear_bucket_policy_cache(&name);
-            self.clear_bucket_lifecycle_cache(&name);
-            self.read_runtime()
-                .enqueue_bucket_delete_finalize_for(&name);
-            drain.persist();
-            Ok(())
-        })();
-
-        result
+        self.storage_node.remove_bucket_fast_path(&name);
+        self.clear_bucket_policy_cache(&name);
+        self.clear_bucket_lifecycle_cache(&name);
+        self.read_runtime()
+            .enqueue_bucket_delete_finalize_for(&name);
+        Ok(())
     }
 
     pub fn head_bucket(&self, req: &BucketRequest<'_>) -> Result<BucketSummary, ServerError> {
