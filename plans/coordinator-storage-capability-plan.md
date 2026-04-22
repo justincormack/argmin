@@ -327,10 +327,6 @@ This includes bucket-only request families such as:
 - `GetBucketObjectLockConfiguration`
 - `GetBucketLifecycle`
 - `GetBucketAbac`
-- `ListObjectsV1`
-- `ListObjectsV2`
-- `ListObjectVersions`
-- `ListMultipartUploads`
 - `GetBucketLocation`
 - any other normal bucket-side read/admin path still using direct PG access
 
@@ -447,6 +443,29 @@ Questions to answer at the checkpoint:
   redesign
 
 Do not continue into later phases until this review is complete.
+
+### Phase 4b: Bucket-wide Listing and Iteration Paths
+
+Defer the bucket-wide list/iteration family until after the single-object
+read/write shape has been exercised and reviewed.
+
+These operations are bucket-scoped at the API level but they are not the same
+shape as the simpler single-bucket metadata reads above, because they iterate
+across object state and can touch multiple PGs:
+
+- `ListObjectsV1`
+- `ListObjectsV2`
+- `ListObjectVersions`
+- `ListMultipartUploads`
+
+Acceptance criteria:
+
+- the operation still begins from one bucket handle load
+- the bucket handle provides the only bucket-derived auth/policy/config input
+- object/list iteration uses storage-owned fanout/iteration primitives rather
+  than coordinator-managed PG walking
+- the final design is informed by the object-path shape proven in phases 3 and
+  4, not guessed earlier from the bucket-only read surface
 
 ### Phase 7: Multipart and Streaming Paths
 
