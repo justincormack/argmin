@@ -344,9 +344,7 @@ impl<'a> BucketHandleLoader<'a> {
         let snapshot = self
             .coordinator
             .storage_node
-            .load_bucket_snapshot_with(name, request.resolve_to_storage_request(), |bucket| {
-                self.coordinator.bucket_pg_id_for(bucket)
-            })
+            .load_bucket_snapshot(name, request.resolve_to_storage_request())
             .map_err(Self::map_bucket_snapshot_error)?;
         self.load_bucket_handle_from_snapshot(snapshot, expected_bucket_owner, request)
     }
@@ -366,10 +364,9 @@ impl<'a> BucketHandleLoader<'a> {
         let snapshots = self
             .coordinator
             .storage_node
-            .load_bucket_snapshot_pair_with(
+            .load_bucket_snapshot_pair(
                 (source.0, source.2.resolve_to_storage_request()),
                 (destination.0, destination.2.resolve_to_storage_request()),
-                |bucket| self.coordinator.bucket_pg_id_for(bucket),
             )
             .map_err(Self::map_bucket_snapshot_error)?;
         let (source_handle, destination_handle) = match snapshots {

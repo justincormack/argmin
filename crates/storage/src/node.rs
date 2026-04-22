@@ -11,6 +11,7 @@ use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 
 use crate::error::{BucketSnapshotLoadError, StoreError};
 use crate::pg_store::PgStore;
+use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::{
     BucketFastPathInfo, BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
@@ -148,6 +149,7 @@ pub struct SharedStorageNode {
     stores: HashMap<u32, Mutex<PgStore>>,
     pg_paths: HashMap<u32, PgDataPaths>,
     pg_id_list: Vec<u32>,
+    pg_topology: PgTopology,
     data_dir: PathBuf,
     bucket_locks: Vec<Mutex<()>>,
     multipart_completion_locks: Vec<Mutex<()>>,
@@ -215,6 +217,7 @@ impl SharedStorageNode {
             stores,
             pg_paths,
             pg_id_list,
+            pg_topology: PgTopology::new(pg_ids).expect("shared storage node must have PGs"),
             data_dir: data_dir.to_path_buf(),
             bucket_locks,
             multipart_completion_locks,
@@ -240,6 +243,10 @@ impl SharedStorageNode {
     /// Return the sorted list of PG IDs.
     pub fn pg_ids(&self) -> &[u32] {
         &self.pg_id_list
+    }
+
+    pub fn pg_topology(&self) -> &PgTopology {
+        &self.pg_topology
     }
 
     fn bucket_lock_index(&self, bucket: &BucketName) -> usize {
@@ -672,29 +679,21 @@ impl SharedStorageNode {
         })
     }
 
-    pub fn load_bucket_snapshot_with<R>(
+    pub fn load_bucket_snapshot(
         &self,
         bucket: &BucketName,
         request: BucketSnapshotRequest,
-        resolve_bucket_pg: R,
-    ) -> Result<BucketSnapshot, BucketSnapshotLoadError>
-    where
-        R: FnOnce(&BucketName) -> u32,
-    {
-        let pg_id = resolve_bucket_pg(bucket);
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        let pg_id = self.pg_topology.bucket_pg_for(bucket);
         let bucket_pg = self.get_pg(pg_id)?;
         Self::load_bucket_snapshot_from_pg(&bucket_pg, bucket, request)
     }
 
-    pub fn load_bucket_snapshot_pair_with<R>(
+    pub fn load_bucket_snapshot_pair(
         &self,
         source: (&BucketName, BucketSnapshotRequest),
         destination: (&BucketName, BucketSnapshotRequest),
-        resolve_bucket_pg: R,
-    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError>
-    where
-        R: Fn(&BucketName) -> u32,
-    {
+    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError> {
         if source.0 == destination.0 {
             let merged_request = BucketSnapshotRequest {
                 policy: source.1.policy || destination.1.policy,
@@ -713,16 +712,15 @@ impl SharedStorageNode {
                 lifecycle: source.1.lifecycle || destination.1.lifecycle,
                 cors: source.1.cors || destination.1.cors,
             };
-            let bucket =
-                self.load_bucket_snapshot_with(source.0, merged_request, resolve_bucket_pg)?;
+            let bucket = self.load_bucket_snapshot(source.0, merged_request)?;
             return Ok(BucketSnapshotPair::Same {
                 bucket: Box::new(bucket),
             });
         }
 
         let guards = self.lock_bucket_pair_pgs(
-            resolve_bucket_pg(source.0),
-            resolve_bucket_pg(destination.0),
+            self.pg_topology.bucket_pg_for(source.0),
+            self.pg_topology.bucket_pg_for(destination.0),
         )?;
         match guards {
             BucketPairPgGuards::Same { bucket } => Ok(BucketSnapshotPair::Distinct {
