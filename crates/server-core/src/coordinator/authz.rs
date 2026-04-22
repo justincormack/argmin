@@ -2534,37 +2534,38 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedHeadBucket, ServerError> {
-        let info =
-            self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner())?;
-        let bucket_policy = self.cached_bucket_policy(&info)?;
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
         let bucket_read_fallback = || {
             Self::requester_can_read_bucket(
                 req.requester(),
-                &info,
-                &info.owner_principal,
-                &info.acl_grants,
-                Self::effective_public_read(&info),
+                bucket.bucket(),
+                &bucket.bucket().owner_principal,
+                &bucket.bucket().acl_grants,
+                Self::effective_public_read(bucket.bucket()),
             )
         };
-        let list_decision = self.bucket_policy_decision_for_bucket_loaded(
+        let list_decision = self.bucket_policy_decision_for_loaded_handle(
             req.requester(),
-            &info,
+            &bucket,
             auth::PolicyAction::ListBucket,
             bucket_policy.as_deref(),
         )?;
-        let location_decision = self.bucket_policy_decision_for_bucket_loaded(
+        let location_decision = self.bucket_policy_decision_for_loaded_handle(
             req.requester(),
-            &info,
+            &bucket,
             auth::PolicyAction::GetBucketLocation,
             bucket_policy.as_deref(),
         )?;
-        let list_allowed =
-            Self::bucket_policy_allows_with_fallback(req.requester(), &info, list_decision, || {
-                bucket_read_fallback()
-            });
+        let list_allowed = Self::bucket_policy_allows_with_fallback(
+            req.requester(),
+            bucket.bucket(),
+            list_decision,
+            bucket_read_fallback,
+        );
         let location_allowed = Self::bucket_policy_allows_with_fallback(
             req.requester(),
-            &info,
+            bucket.bucket(),
             location_decision,
             bucket_read_fallback,
         );
@@ -2572,7 +2573,7 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedHeadBucket {
-            bucket_info: info.into_inner(),
+            bucket_info: bucket.bucket().clone(),
         })
     }
 
@@ -2672,10 +2673,22 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
-            req,
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
+            &req.requester,
+            &bucket,
             auth::PolicyAction::GetBucketTagging,
+            bucket_policy.as_deref(),
         )?;
+        if !Self::bucket_policy_allows_with_fallback(
+            &req.requester,
+            bucket.bucket(),
+            policy_decision,
+            || Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()),
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
         Ok(AuthorizedBucketSubresourceGet {
             bucket: req.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Tagging,

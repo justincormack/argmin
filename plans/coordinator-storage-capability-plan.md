@@ -303,13 +303,14 @@ Phase 1 status:
 
 - in progress
 - migrated so far:
+  - `HeadBucket`
   - `GetBucketAcl`
+  - `GetBucketTagging`
   - `GetBucketVersioning`
   - `GetBucketLocation`
   - `GetBucketPolicyStatus`
-- still pending in this phase:
-  - `HeadBucket`
-  - `GetBucketTagging`
+- phase-1 scope is now effectively covered; the next work is the broader
+  phase-2 bucket read/admin/config surface
 
 ### Phase 2: Bucket Read/Admin/Config Paths
 
