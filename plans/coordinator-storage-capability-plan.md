@@ -301,7 +301,7 @@ Acceptance criteria:
 
 Phase 1 status:
 
-- in progress
+- completed
 - migrated so far:
   - `HeadBucket`
   - `GetBucketAcl`
@@ -341,7 +341,7 @@ Acceptance criteria:
 
 Phase 2 status:
 
-- in progress
+- completed
 - summary-backed reads migrated end to end so far:
   - `GetBucketAbac`
   - `GetBucketEncryption`
