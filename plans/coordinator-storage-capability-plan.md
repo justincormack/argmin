@@ -618,11 +618,16 @@ Phase 5 status:
   loads
 - bucket policy, ABAC tags, and bucket-state-dependent validation on this slice
   now come from the initial write-scoped bucket acquisition
-- remaining phase-5 surface to migrate:
+- second migrated slice:
   - `PutBucketPolicy`
   - `DeleteBucketPolicy`
-  - `PutBucketAcl`
   - `PutBucketAbac`
+  - bucket tag control auth for `TagResource` / `UntagResource`
+- bucket-policy management actions in this slice now preserve the existing
+  owner-root bypass semantics while moving to the same write-scoped loaded
+  bucket handle path
+- remaining phase-5 surface to migrate:
+  - `PutBucketAcl`
   - any remaining bucket mutation path still using direct summary/cache lookup
 
 ### Phase 6: DeleteBucket and Bucket Teardown
