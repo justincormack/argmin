@@ -16,9 +16,10 @@ use super::authz_results::{
     AuthorizedBucketSubresourceDelete, AuthorizedBucketSubresourceGet,
     AuthorizedBucketSubresourcePut, AuthorizedCompleteMultipartUpload, AuthorizedCopyObject,
     AuthorizedCreateBucket, AuthorizedCreateMultipartUpload, AuthorizedDeleteBucket,
-    AuthorizedDeleteBucketEncryption, AuthorizedDeleteObject, AuthorizedGetBucketAcl,
-    AuthorizedGetBucketEncryption, AuthorizedGetBucketLocation,
-    AuthorizedGetBucketObjectLockConfiguration, AuthorizedGetBucketPolicyStatus,
+    AuthorizedDeleteBucketEncryption, AuthorizedDeleteObject, AuthorizedGetBucketAbac,
+    AuthorizedGetBucketAcl, AuthorizedGetBucketEncryption, AuthorizedGetBucketLocation,
+    AuthorizedGetBucketObjectLockConfiguration, AuthorizedGetBucketOwnershipControls,
+    AuthorizedGetBucketPolicyStatus, AuthorizedGetBucketPublicAccessBlock,
     AuthorizedGetBucketVersioning, AuthorizedGetObjectAcl, AuthorizedGetObjectLegalHold,
     AuthorizedGetObjectRetention, AuthorizedHeadBucket, AuthorizedListBuckets,
     AuthorizedListMultipartUploads, AuthorizedListObjectVersions, AuthorizedListObjectsV2,
@@ -1617,39 +1618,6 @@ impl Coordinator {
         )
     }
 
-    pub(super) fn requester_can_get_bucket_public_access_block_with_bucket_policy(
-        &self,
-        requester: &Requester,
-        bucket: &BucketSummary,
-        policy: Option<&auth::BucketPolicy>,
-    ) -> Result<bool, ServerError> {
-        self.requester_can_bucket_action_with_bucket_policy(
-            requester,
-            bucket,
-            auth::PolicyAction::GetBucketPublicAccessBlock,
-            policy,
-            Self::requester_can_bucket_owner_account_admin(requester, bucket),
-        )
-    }
-
-    pub(super) fn requester_can_bucket_action_with_bucket_policy(
-        &self,
-        requester: &Requester,
-        bucket: &BucketSummary,
-        action: auth::PolicyAction,
-        policy: Option<&auth::BucketPolicy>,
-        default_allowed: bool,
-    ) -> Result<bool, ServerError> {
-        self.requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
-            requester,
-            bucket,
-            None,
-            action,
-            policy,
-            default_allowed,
-        )
-    }
-
     fn requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
         &self,
         requester: &Requester,
@@ -1705,19 +1673,53 @@ impl Coordinator {
         )
     }
 
-    pub(super) fn requester_can_get_bucket_object_lock_configuration_with_bucket_policy(
+    fn authorize_loaded_bucket_action_for(
         &self,
-        requester: &Requester,
-        bucket: &BucketSummary,
-        policy: Option<&auth::BucketPolicy>,
-    ) -> Result<bool, ServerError> {
-        self.requester_can_bucket_action_with_bucket_policy(
-            requester,
-            bucket,
-            auth::PolicyAction::GetBucketObjectLockConfiguration,
-            policy,
-            Self::requester_can_bucket_owner_account_admin(requester, bucket),
-        )
+        req: &BucketRequest<'_>,
+        action: auth::PolicyAction,
+        default_allowed: impl FnOnce(&Requester, &BucketSummary) -> bool,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        let default_allowed = default_allowed(&req.requester, bucket.bucket());
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let allowed = self.requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
+            &req.requester,
+            bucket.bucket(),
+            Self::loaded_bucket_tags_for_policy(&bucket)?.as_deref(),
+            action,
+            bucket_policy.as_deref(),
+            default_allowed,
+        )?;
+        if !allowed {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(bucket)
+    }
+
+    fn authorize_loaded_bucket_policy_action_for(
+        &self,
+        req: &BucketRequest<'_>,
+        action: auth::PolicyAction,
+        default_allowed: impl FnOnce(&Requester, &BucketSummary) -> bool,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(req)?;
+        let default_allowed = default_allowed(&req.requester, bucket.bucket());
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let decision = self.bucket_policy_decision_for_loaded_handle(
+            &req.requester,
+            &bucket,
+            action,
+            bucket_policy.as_deref(),
+        )?;
+        if !Self::bucket_policy_allows_with_root_principal_bypass(
+            &req.requester,
+            bucket.bucket(),
+            decision,
+            || default_allowed,
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(bucket)
     }
 
     fn requester_can_list_bucket_with_bucket_policy(
@@ -2609,9 +2611,10 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let _bucket = self.authorize_loaded_bucket_action_for(
             req,
             auth::PolicyAction::GetBucketCors,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         Ok(AuthorizedBucketSubresourceGet {
             bucket: req.name_typed().clone(),
@@ -2749,10 +2752,17 @@ impl Coordinator {
     pub(super) fn authorize_get_bucket_abac(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        let _bucket_info = self.authorize_bucket_owner_account_admin_for(req)?;
-        Ok(AuthorizedBucketConfigAccess {
-            bucket: req.name_typed().clone(),
+    ) -> Result<AuthorizedGetBucketAbac, ServerError> {
+        let bucket = self.bucket_handle_loader().load_bucket(
+            req.name_typed(),
+            req.expected_bucket_owner(),
+            BucketHandleRequest::new(),
+        )?;
+        if !Self::requester_can_bucket_owner_account_admin(&req.requester, bucket.bucket()) {
+            return Err(ServerError::AccessDenied);
+        }
+        Ok(AuthorizedGetBucketAbac {
+            enabled: bucket.bucket().bucket_abac_enabled,
         })
     }
 
@@ -2813,18 +2823,11 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
-        let bucket_info =
-            self.checked_active_bucket_summary_for(req.name_typed(), req.expected_bucket_owner())?;
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !self.requester_can_bucket_policy_action_with_bucket_policy(
-            &req.requester,
-            &bucket_info,
+        let _bucket = self.authorize_loaded_bucket_policy_action_for(
+            req,
             auth::PolicyAction::GetBucketPolicy,
-            bucket_policy.as_deref(),
-            Self::requester_can_bucket_owner_account_admin(&req.requester, &bucket_info),
-        )? {
-            return Err(ServerError::AccessDenied);
-        }
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
         Ok(AuthorizedBucketSubresourceGet {
             bucket: req.name_typed().clone(),
             kind: storage::BucketSubresourceKind::Policy,
@@ -2870,18 +2873,14 @@ impl Coordinator {
     pub(super) fn authorize_get_bucket_public_access_block(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        let bucket_info = self.active_bucket_summary_for(req)?;
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        if !self.requester_can_get_bucket_public_access_block_with_bucket_policy(
-            &req.requester,
-            &bucket_info,
-            bucket_policy.as_deref(),
-        )? {
-            return Err(ServerError::AccessDenied);
-        }
-        Ok(AuthorizedBucketConfigAccess {
-            bucket: req.name_typed().clone(),
+    ) -> Result<AuthorizedGetBucketPublicAccessBlock, ServerError> {
+        let bucket = self.authorize_loaded_bucket_action_for(
+            req,
+            auth::PolicyAction::GetBucketPublicAccessBlock,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        Ok(AuthorizedGetBucketPublicAccessBlock {
+            config: bucket.bucket().public_access_block,
         })
     }
 
@@ -2923,13 +2922,14 @@ impl Coordinator {
     pub(super) fn authorize_get_bucket_ownership_controls(
         &self,
         req: &BucketRequest<'_>,
-    ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+    ) -> Result<AuthorizedGetBucketOwnershipControls, ServerError> {
+        let bucket = self.authorize_loaded_bucket_action_for(
             req,
             auth::PolicyAction::GetBucketOwnershipControls,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
-        Ok(AuthorizedBucketConfigAccess {
-            bucket: req.name_typed().clone(),
+        Ok(AuthorizedGetBucketOwnershipControls {
+            config: bucket.bucket().ownership_controls,
         })
     }
 
@@ -2980,9 +2980,10 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceGet, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let _bucket = self.authorize_loaded_bucket_action_for(
             req,
             auth::PolicyAction::GetLifecycleConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         Ok(AuthorizedBucketSubresourceGet {
             bucket: req.name_typed().clone(),
@@ -3249,12 +3250,13 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketEncryption, ServerError> {
-        let info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let bucket = self.authorize_loaded_bucket_action_for(
             req,
             auth::PolicyAction::GetEncryptionConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         Ok(AuthorizedGetBucketEncryption {
-            config: info.encryption,
+            config: bucket.bucket().encryption,
         })
     }
 
@@ -3275,22 +3277,18 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedGetBucketObjectLockConfiguration, ServerError> {
-        let info = self.active_bucket_summary_for(req)?;
-        let bucket_policy = self.cached_bucket_policy(&info)?;
-        if !self.requester_can_get_bucket_object_lock_configuration_with_bucket_policy(
-            &req.requester,
-            &info,
-            bucket_policy.as_deref(),
-        )? {
-            return Err(ServerError::AccessDenied);
-        }
-        if !info.object_lock.enabled {
+        let bucket = self.authorize_loaded_bucket_action_for(
+            req,
+            auth::PolicyAction::GetBucketObjectLockConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
+        )?;
+        if !bucket.bucket().object_lock.enabled {
             return Err(ServerError::ObjectLockConfigurationNotFound {
                 bucket: req.name.to_string(),
             });
         }
         Ok(AuthorizedGetBucketObjectLockConfiguration {
-            config: info.object_lock,
+            config: bucket.bucket().object_lock,
         })
     }
 

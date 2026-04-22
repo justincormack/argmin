@@ -339,6 +339,23 @@ Acceptance criteria:
 - authz for bucket-only reads/admin paths consumes the loaded bucket handle
   rather than fetching bucket state independently
 
+Phase 2 status:
+
+- started
+- summary-backed reads migrated end to end so far:
+  - `GetBucketAbac`
+  - `GetBucketEncryption`
+  - `GetBucketOwnershipControls`
+  - `GetBucketPublicAccessBlock`
+  - `GetBucketObjectLockConfiguration`
+- auth-side handle migration started for subresource-body reads:
+  - `GetBucketPolicy`
+  - `GetBucketCors`
+  - `GetBucketLifecycle`
+- still pending in phase 2:
+  - removing the separate post-auth bucket subresource loads for the remaining
+    subresource-body reads
+
 ### Phase 3: Single-Object Read Paths
 
 Move the ordinary read family to the bucket-first shape:

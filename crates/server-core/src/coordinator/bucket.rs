@@ -758,15 +758,7 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_get_bucket_abac(req)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::get_bucket_abac_enabled(&*bucket_pg, &authorized.bucket).map_err(
-            |e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            },
-        )
+        Ok(authorized.enabled)
     }
 
     pub fn put_bucket_policy(&self, req: &PutBucketPolicyRequest<'_>) -> Result<(), ServerError> {
@@ -965,14 +957,7 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_get_bucket_public_access_block(req)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::get_bucket_public_access_block(&*bucket_pg, &authorized.bucket)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+        Ok(authorized.config)
     }
 
     pub fn delete_bucket_public_access_block(
@@ -1046,14 +1031,7 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_get_bucket_ownership_controls(req)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::get_bucket_ownership_controls(&*bucket_pg, &authorized.bucket)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })
+        Ok(authorized.config)
     }
 
     pub fn delete_bucket_ownership_controls(

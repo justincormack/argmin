@@ -44,6 +44,21 @@ pub(super) struct AuthorizedBucketConfigAccess {
 }
 
 #[derive(Debug)]
+pub(super) struct AuthorizedGetBucketAbac {
+    pub(super) enabled: bool,
+}
+
+#[derive(Debug)]
+pub(super) struct AuthorizedGetBucketPublicAccessBlock {
+    pub(super) config: Option<PublicAccessBlockConfig>,
+}
+
+#[derive(Debug)]
+pub(super) struct AuthorizedGetBucketOwnershipControls {
+    pub(super) config: Option<BucketOwnershipControls>,
+}
+
+#[derive(Debug)]
 pub(super) struct AuthorizedPutBucketPublicAccessBlock {
     pub(super) bucket: BucketName,
     pub(super) config: PublicAccessBlockConfig,

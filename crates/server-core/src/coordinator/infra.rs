@@ -330,16 +330,6 @@ impl Coordinator {
         )
     }
 
-    pub(super) fn active_bucket_summary_for<R>(
-        &self,
-        req: &R,
-    ) -> Result<ValidatedBucket, ServerError>
-    where
-        R: BucketScopedRequest + ?Sized,
-    {
-        self.checked_active_bucket_summary_for(req.bucket_name_typed(), req.expected_bucket_owner())
-    }
-
     /// Create a new coordinator.
     pub fn new(
         storage_node: Arc<SharedStorageNode>,
