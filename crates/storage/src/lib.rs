@@ -33,8 +33,8 @@ pub mod schema;
 pub mod traits;
 pub mod types;
 
-pub use error::{MetadataError, StoreError};
-pub use node::{LocalStorageNode, ReclaimWorkItem, SharedStorageNode};
+pub use error::{BucketSnapshotLoadError, MetadataError, StoreError};
+pub use node::{BucketPairPgGuards, LocalStorageNode, ReclaimWorkItem, SharedStorageNode};
 pub use pg_store::PgStore;
 pub use s3_types::lifecycle::*;
 pub use traits::{PgMetadataStore, ShardStore, StorageNode};

@@ -1871,6 +1871,96 @@ pub struct BucketInfo {
     pub encryption: EffectiveBucketEncryptionConfig,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum BucketSnapshotTagsRequest {
+    #[default]
+    NotRequested,
+    IfBucketAbacEnabled,
+    Always,
+}
+
+impl BucketSnapshotTagsRequest {
+    #[must_use]
+    pub const fn should_load(self, bucket: &BucketInfo) -> bool {
+        match self {
+            Self::NotRequested => false,
+            Self::IfBucketAbacEnabled => bucket.bucket_abac_enabled,
+            Self::Always => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BucketSnapshotRequest {
+    pub policy: bool,
+    pub tags: BucketSnapshotTagsRequest,
+    pub lifecycle: bool,
+    pub cors: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum LoadedBucketSubresource<T> {
+    #[default]
+    NotRequested,
+    Missing,
+    Loaded(T),
+}
+
+impl<T> LoadedBucketSubresource<T> {
+    #[must_use]
+    pub const fn is_requested(&self) -> bool {
+        !matches!(self, Self::NotRequested)
+    }
+
+    #[must_use]
+    pub fn as_ref(&self) -> LoadedBucketSubresource<&T> {
+        match self {
+            Self::NotRequested => LoadedBucketSubresource::NotRequested,
+            Self::Missing => LoadedBucketSubresource::Missing,
+            Self::Loaded(value) => LoadedBucketSubresource::Loaded(value),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BucketSnapshot {
+    pub bucket: BucketInfo,
+    pub request: BucketSnapshotRequest,
+    pub policy: LoadedBucketSubresource<String>,
+    pub tags: LoadedBucketSubresource<String>,
+    pub lifecycle: LoadedBucketSubresource<String>,
+    pub cors: LoadedBucketSubresource<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum BucketSnapshotPair {
+    Same {
+        bucket: Box<BucketSnapshot>,
+    },
+    Distinct {
+        source: Box<BucketSnapshot>,
+        destination: Box<BucketSnapshot>,
+    },
+}
+
+impl BucketSnapshotPair {
+    #[must_use]
+    pub const fn source(&self) -> &BucketSnapshot {
+        match self {
+            Self::Same { bucket } => bucket,
+            Self::Distinct { source, .. } => source,
+        }
+    }
+
+    #[must_use]
+    pub const fn destination(&self) -> &BucketSnapshot {
+        match self {
+            Self::Same { bucket } => bucket,
+            Self::Distinct { destination, .. } => destination,
+        }
+    }
+}
+
 impl std::fmt::Debug for BucketInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BucketInfo")

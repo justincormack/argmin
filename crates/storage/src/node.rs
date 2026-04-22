@@ -9,10 +9,14 @@ use std::time::Instant;
 
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 
-use crate::error::StoreError;
+use crate::error::{BucketSnapshotLoadError, StoreError};
 use crate::pg_store::PgStore;
-use crate::traits::{ShardStore, StorageNode};
-use crate::types::{BucketFastPathInfo, BucketName, GenerationId, ObjectKey, ShardKey, WriteAck};
+use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
+use crate::types::{
+    BucketFastPathInfo, BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
+    BucketSnapshotTagsRequest, BucketSubresourceKind, GenerationId, LoadedBucketSubresource,
+    ObjectKey, ShardKey, WriteAck,
+};
 
 const TRACE_TARGET: &str = "storage";
 const RAPIDHASH_SECRETS: RapidSecrets = RapidSecrets::seed(0);
@@ -38,6 +42,32 @@ pub struct BucketLockGuard<'a> {
 impl Drop for BucketLockGuard<'_> {
     fn drop(&mut self) {
         let _ = &self.guard;
+    }
+}
+
+pub enum BucketPairPgGuards<'a> {
+    Same {
+        bucket: MutexGuard<'a, PgStore>,
+    },
+    Distinct {
+        source: MutexGuard<'a, PgStore>,
+        destination: MutexGuard<'a, PgStore>,
+    },
+}
+
+impl<'a> BucketPairPgGuards<'a> {
+    pub fn source(&self) -> &MutexGuard<'a, PgStore> {
+        match self {
+            Self::Same { bucket } => bucket,
+            Self::Distinct { source, .. } => source,
+        }
+    }
+
+    pub fn destination(&self) -> &MutexGuard<'a, PgStore> {
+        match self {
+            Self::Same { bucket } => bucket,
+            Self::Distinct { destination, .. } => destination,
+        }
     }
 }
 
@@ -614,6 +644,170 @@ impl SharedStorageNode {
             Ok((guard_a, Some(guard_b)))
         }
     }
+
+    /// Lock a source/destination bucket PG pair while preserving request roles.
+    ///
+    /// Ordering is internal to storage. Callers provide the source and
+    /// destination PG IDs in request-role order and receive role-preserving
+    /// guards back.
+    pub fn lock_bucket_pair_pgs(
+        &self,
+        source_pg_id: u32,
+        destination_pg_id: u32,
+    ) -> Result<BucketPairPgGuards<'_>, StoreError> {
+        observability::trace_scope!(
+            TRACE_TARGET,
+            "SharedStorageNode::lock_bucket_pair_pgs",
+            "source_pg_id={} destination_pg_id={}",
+            source_pg_id,
+            destination_pg_id
+        );
+        let (source, destination) = self.lock_two_pgs(source_pg_id, destination_pg_id)?;
+        Ok(match destination {
+            Some(destination) => BucketPairPgGuards::Distinct {
+                source,
+                destination,
+            },
+            None => BucketPairPgGuards::Same { bucket: source },
+        })
+    }
+
+    pub fn load_bucket_snapshot_with<R>(
+        &self,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+        resolve_bucket_pg: R,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError>
+    where
+        R: FnOnce(&BucketName) -> u32,
+    {
+        let pg_id = resolve_bucket_pg(bucket);
+        let bucket_pg = self.get_pg(pg_id)?;
+        Self::load_bucket_snapshot_from_pg(&bucket_pg, bucket, request)
+    }
+
+    pub fn load_bucket_snapshot_pair_with<R>(
+        &self,
+        source: (&BucketName, BucketSnapshotRequest),
+        destination: (&BucketName, BucketSnapshotRequest),
+        resolve_bucket_pg: R,
+    ) -> Result<BucketSnapshotPair, BucketSnapshotLoadError>
+    where
+        R: Fn(&BucketName) -> u32,
+    {
+        if source.0 == destination.0 {
+            let merged_request = BucketSnapshotRequest {
+                policy: source.1.policy || destination.1.policy,
+                tags: match (source.1.tags, destination.1.tags) {
+                    (BucketSnapshotTagsRequest::Always, _)
+                    | (_, BucketSnapshotTagsRequest::Always) => BucketSnapshotTagsRequest::Always,
+                    (BucketSnapshotTagsRequest::IfBucketAbacEnabled, _)
+                    | (_, BucketSnapshotTagsRequest::IfBucketAbacEnabled) => {
+                        BucketSnapshotTagsRequest::IfBucketAbacEnabled
+                    }
+                    (
+                        BucketSnapshotTagsRequest::NotRequested,
+                        BucketSnapshotTagsRequest::NotRequested,
+                    ) => BucketSnapshotTagsRequest::NotRequested,
+                },
+                lifecycle: source.1.lifecycle || destination.1.lifecycle,
+                cors: source.1.cors || destination.1.cors,
+            };
+            let bucket =
+                self.load_bucket_snapshot_with(source.0, merged_request, resolve_bucket_pg)?;
+            return Ok(BucketSnapshotPair::Same {
+                bucket: Box::new(bucket),
+            });
+        }
+
+        let guards = self.lock_bucket_pair_pgs(
+            resolve_bucket_pg(source.0),
+            resolve_bucket_pg(destination.0),
+        )?;
+        match guards {
+            BucketPairPgGuards::Same { bucket } => Ok(BucketSnapshotPair::Distinct {
+                source: Box::new(Self::load_bucket_snapshot_from_pg(
+                    &bucket, source.0, source.1,
+                )?),
+                destination: Box::new(Self::load_bucket_snapshot_from_pg(
+                    &bucket,
+                    destination.0,
+                    destination.1,
+                )?),
+            }),
+            BucketPairPgGuards::Distinct {
+                source: source_pg,
+                destination: destination_pg,
+            } => Ok(BucketSnapshotPair::Distinct {
+                source: Box::new(Self::load_bucket_snapshot_from_pg(
+                    &source_pg, source.0, source.1,
+                )?),
+                destination: Box::new(Self::load_bucket_snapshot_from_pg(
+                    &destination_pg,
+                    destination.0,
+                    destination.1,
+                )?),
+            }),
+        }
+    }
+
+    fn load_bucket_snapshot_from_pg(
+        bucket_pg: &PgStore,
+        bucket: &BucketName,
+        request: BucketSnapshotRequest,
+    ) -> Result<BucketSnapshot, BucketSnapshotLoadError> {
+        let bucket_info = bucket_pg.head_bucket(bucket)?;
+        let policy = Self::load_bucket_snapshot_subresource(
+            bucket_pg,
+            bucket,
+            request.policy,
+            BucketSubresourceKind::Policy,
+        )?;
+        let tags = Self::load_bucket_snapshot_subresource(
+            bucket_pg,
+            bucket,
+            request.tags.should_load(&bucket_info),
+            BucketSubresourceKind::Tagging,
+        )?;
+        let lifecycle = Self::load_bucket_snapshot_subresource(
+            bucket_pg,
+            bucket,
+            request.lifecycle,
+            BucketSubresourceKind::Lifecycle,
+        )?;
+        let cors = Self::load_bucket_snapshot_subresource(
+            bucket_pg,
+            bucket,
+            request.cors,
+            BucketSubresourceKind::Cors,
+        )?;
+
+        Ok(BucketSnapshot {
+            bucket: bucket_info,
+            request,
+            policy,
+            tags,
+            lifecycle,
+            cors,
+        })
+    }
+
+    fn load_bucket_snapshot_subresource(
+        bucket_pg: &PgStore,
+        bucket: &BucketName,
+        requested: bool,
+        kind: BucketSubresourceKind,
+    ) -> Result<LoadedBucketSubresource<String>, BucketSnapshotLoadError> {
+        if !requested {
+            return Ok(LoadedBucketSubresource::NotRequested);
+        }
+        Ok(
+            match PgMetadataStore::get_bucket_subresource(bucket_pg, bucket, kind)? {
+                Some(stored) => LoadedBucketSubresource::Loaded(stored.body),
+                None => LoadedBucketSubresource::Missing,
+            },
+        )
+    }
 }
 
 #[cfg(test)]
@@ -756,6 +950,34 @@ mod tests {
         assert_eq!(guard_a.pg_id(), 1);
         let guard_b = opt_b.unwrap();
         assert_eq!(guard_b.pg_id(), 0);
+    }
+
+    #[test]
+    fn shared_node_lock_bucket_pair_pgs_same() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let guards = node.lock_bucket_pair_pgs(0, 0).unwrap();
+        match guards {
+            BucketPairPgGuards::Same { bucket } => assert_eq!(bucket.pg_id(), 0),
+            BucketPairPgGuards::Distinct { .. } => panic!("expected same-bucket guards"),
+        }
+    }
+
+    #[test]
+    fn shared_node_lock_bucket_pair_pgs_preserves_roles() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let guards = node.lock_bucket_pair_pgs(1, 0).unwrap();
+        match guards {
+            BucketPairPgGuards::Same { .. } => panic!("expected distinct-bucket guards"),
+            BucketPairPgGuards::Distinct {
+                source,
+                destination,
+            } => {
+                assert_eq!(source.pg_id(), 1);
+                assert_eq!(destination.pg_id(), 0);
+            }
+        }
     }
 
     #[test]

@@ -307,6 +307,7 @@ mod authz_model_tests;
 mod authz_results;
 mod authz_types;
 mod bucket;
+mod bucket_handles;
 #[cfg(test)]
 mod bucket_tests;
 mod copy;

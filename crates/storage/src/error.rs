@@ -87,3 +87,11 @@ pub enum MetadataError {
         source: rusqlite::Error,
     },
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum BucketSnapshotLoadError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Metadata(#[from] MetadataError),
+}
