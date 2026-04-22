@@ -19,8 +19,9 @@ use crate::types::{
     BucketFastPathInfo, BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
     BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind, CreateStreamUploadReq,
     FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
-    LoadedBucketSubresource, MultipartUploadRecord, ObjectKey, PreparedStreamPartCommit, SessionId,
-    ShardKey, StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId, WriteAck,
+    ListPartsReq, ListedMultipartParts, LoadedBucketSubresource, MultipartUploadRecord, ObjectKey,
+    PreparedStreamPartCommit, SessionId, ShardKey, StreamUploadPartSnapshot, StreamUploadState,
+    StreamUploadTarget, UploadId, WriteAck,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -1019,6 +1020,24 @@ impl SharedStorageNode {
             }
             Err(error) => Ok(Err(error)),
         }
+    }
+
+    pub fn list_multipart_parts_for_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    ) -> Result<ListedMultipartParts, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let upload = Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
+        let response = pg.list_multipart_parts(&ListPartsReq {
+            upload_id: upload_id.clone(),
+            part_number_marker,
+            max_parts,
+        })?;
+        Ok(ListedMultipartParts { upload, response })
     }
 
     fn validate_upload_part_stream_session(

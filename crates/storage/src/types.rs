@@ -2483,6 +2483,12 @@ pub struct ListPartsResp {
     pub next_part_number_marker: Option<u32>,
 }
 
+#[derive(Debug)]
+pub struct ListedMultipartParts {
+    pub upload: MultipartUploadRecord,
+    pub response: ListPartsResp,
+}
+
 /// Staging version id for multipart part segment rows before
 /// `CompleteMultipartUpload` assigns a real object version.
 pub const MULTIPART_PART_SEGMENT_STAGING_VERSION_ID: VersionId =

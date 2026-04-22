@@ -4253,19 +4253,26 @@ impl Coordinator {
         Ok(authorized)
     }
 
-    pub(super) fn authorize_list_parts<'a>(
-        &'a self,
+    pub(super) fn authorize_list_parts(
+        &self,
         req: &ListPartsRequest<'_>,
-    ) -> Result<AuthorizedListParts<'a>, ServerError> {
+    ) -> Result<AuthorizedListParts, ServerError> {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
         let upload_id = req.upload.upload_id_typed();
         let bucket_info =
             self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
-        let meta_pg = self
+        let listed = self
             .storage_node
-            .get_pg(self.object_pg_id_for(bucket, key))?;
-        let upload = meta_pg.get_multipart_upload(upload_id)?;
+            .list_multipart_parts_for_upload(
+                bucket,
+                key,
+                upload_id,
+                req.part_number_marker,
+                req.max_parts,
+            )
+            .map_err(Self::map_object_pg_action_error)?;
+        let upload = listed.upload;
         if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
             return Err(ServerError::NoSuchUpload {
                 upload_id: upload_id.to_string(),
@@ -4288,7 +4295,7 @@ impl Coordinator {
             bucket_info: bucket_info.into_inner(),
             key: req.upload.key_typed().clone(),
             upload,
-            meta_pg,
+            response: listed.response,
         })
     }
 

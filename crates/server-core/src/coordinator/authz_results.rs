@@ -1,4 +1,4 @@
-use std::sync::{Arc, MutexGuard};
+use std::sync::Arc;
 
 use auth::BucketPolicy;
 use checksum::MultipartChecksumConfig;
@@ -298,11 +298,12 @@ pub(super) enum AuthorizedAbortMultipartUpload {
     Completed,
 }
 
-pub(super) struct AuthorizedListParts<'a> {
+#[derive(Debug)]
+pub(super) struct AuthorizedListParts {
     pub(super) bucket_info: BucketSummary,
     pub(super) key: ObjectKey,
     pub(super) upload: MultipartUploadRecord,
-    pub(super) meta_pg: MutexGuard<'a, storage::PgStore>,
+    pub(super) response: storage::ListPartsResp,
 }
 
 #[derive(Debug)]
@@ -417,16 +418,6 @@ impl std::fmt::Debug for AuthorizedBeginStreamPart {
             .field("key", &self.key)
             .field("upload_id", &self.upload_id)
             .field("part_number", &self.part_number)
-            .field("upload", &self.upload)
-            .finish_non_exhaustive()
-    }
-}
-
-impl std::fmt::Debug for AuthorizedListParts<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuthorizedListParts")
-            .field("bucket_info", &self.bucket_info)
-            .field("key", &self.key)
             .field("upload", &self.upload)
             .finish_non_exhaustive()
     }

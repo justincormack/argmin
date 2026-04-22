@@ -3,12 +3,11 @@ use s3_types::{BucketVersioningState, VersionId};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
     BucketName, CommitMultipartReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape,
-    FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq, ListPartsReq,
-    MultipartPartRecord, MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey,
-    ObjectPartRecord, PreparedStreamPartCommit, SerializedMetadataBlob,
-    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey, StreamUploadPartSnapshot,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET,
-    UPLOAD_ID_LEN,
+    FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq, MultipartPartRecord,
+    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectPartRecord,
+    PreparedStreamPartCommit, SerializedMetadataBlob, SerializedSystemMetadataBlob,
+    SerializedTagSet, SessionId, ShardKey, StreamUploadPartSnapshot, StreamUploadState,
+    StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
 };
 
 use super::authz_results::{
@@ -41,7 +40,7 @@ use crate::pg::part_key_hash;
 use crate::system_metadata::SystemMetadata;
 
 impl Coordinator {
-    fn map_object_pg_action_error(error: storage::ObjectPgActionError) -> ServerError {
+    pub(super) fn map_object_pg_action_error(error: storage::ObjectPgActionError) -> ServerError {
         match error {
             storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
             storage::ObjectPgActionError::InvalidRequest { reason } => {
@@ -782,26 +781,15 @@ impl Coordinator {
             req.upload.upload_id(),
             req.max_parts
         );
-        let part_number_marker = req.part_number_marker;
-        let max_parts = req.max_parts;
         let AuthorizedListParts {
             bucket_info,
             key,
             upload,
-            meta_pg,
+            response: resp,
         } = self.authorize_list_parts(req)?;
-
-        let resp = meta_pg
-            .list_multipart_parts(&ListPartsReq {
-                upload_id: upload.upload_id.clone(),
-                part_number_marker,
-                max_parts,
-            })
-            .map_err(ServerError::Metadata)?;
         let upload_initiated_at = upload.initiated_at;
         let checksum_algorithm = upload.checksum.map(MultipartChecksumConfig::algorithm);
         let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);
-        drop(meta_pg);
 
         let parts = resp
             .parts

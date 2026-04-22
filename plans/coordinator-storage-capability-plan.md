@@ -787,6 +787,7 @@ Phase 7 status:
   - `CreateMultipartUpload`
   - `CompleteMultipartUpload`
   - `BeginStreamPart`
+  - `ListParts`
 - these now use the write-scoped bucket handle path for bucket policy / ABAC
   inputs instead of the older reservation-only summary path
 - `BeginStreamPart` is now the first multipart/session write path moved onto
@@ -795,6 +796,12 @@ Phase 7 status:
   - coordinator no longer receives or returns a metadata PG guard for this path
   - multipart upload lookup and stream-session creation stay inside the
     storage-owned object-PG step
+- `ListParts` now matches the same coordinator/storage boundary rule for the
+  multipart management read path:
+  - coordinator no longer receives or returns a metadata PG guard
+  - multipart upload lookup and part listing stay inside a storage-owned
+    object-PG helper
+  - the coordinator-facing auth result for this path is pure data only
 - follow-up required on migrated slice:
   - `CreateMultipartUpload` and `CompleteMultipartUpload` still need to move
     from the current write-scoped snapshot boundary to the phase-4d
