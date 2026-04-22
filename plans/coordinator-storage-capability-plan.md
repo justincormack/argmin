@@ -457,6 +457,12 @@ Questions to answer at the checkpoint:
 
 Do not continue into later phases until this review is complete.
 
+This review should be repeated after phase 4c. Phase 4 completed the ordinary
+single-object write/delete migration, but write-scoped bucket handle loading
+still carries coordinator-visible PG and reservation mechanics. So the current
+checkpoint is a first review of the handle shape, not the final review of the
+write-side abstraction boundary.
+
 ### Phase 4b: Bucket-wide Listing and Iteration Paths
 
 Defer the bucket-wide list/iteration family until after the single-object
@@ -479,6 +485,58 @@ Acceptance criteria:
   than coordinator-managed PG walking
 - the final design is informed by the object-path shape proven in phases 3 and
   4, not guessed earlier from the bucket-only read surface
+
+### Phase 4c: Write-Scoped Bucket Handle Boundary Cleanup
+
+Finish the write-side abstraction boundary before moving on to later bucket
+mutation and multipart/copy phases.
+
+Current state after phase 4:
+
+- ordinary single-object write/delete request paths use write-scoped bucket
+  handles
+- but the coordinator still owns part of the write-side storage mechanism:
+  - `with_bucket_write_handle_for(...)` still acquires bucket write
+    reservations
+  - it still resolves the bucket PG through `get_bucket_pg_for(...)`
+  - `load_bucket_handle_from_reserved_pg(...)` still loads bucket subresources
+    directly from a coordinator-visible PG
+
+That means PGs and reservation mechanics are still leaking through the
+coordinator boundary on the write path even though the request-family flow is
+already bucket-first.
+
+Covered surface:
+
+- ordinary `PutObject`
+- direct commit and streaming finalize paths already migrated in phase 4
+- the shared single-object write helpers that currently depend on
+  `with_bucket_write_handle_for(...)`
+
+Acceptance criteria:
+
+- coordinator no longer calls `get_bucket_pg_for(...)` as part of the
+  write-scoped bucket-handle path
+- coordinator no longer passes bucket PGs into bucket-handle loading helpers
+- reservation acquire/release protocol for write-scoped bucket snapshots is
+  storage-owned
+- `BucketHandleLoader` remains a semantic adapter, not a storage-mechanism
+  owner
+
+### Re-Review After Phase 4c
+
+Once phase 4c lands, rerun the phase-4 checkpoint review specifically against
+the write-scoped handle boundary.
+
+Questions to re-check:
+
+- does ordinary single-object write/delete flow now avoid all
+  coordinator-visible PG access on the bucket side
+- is write-side reservation handling now fully hidden behind storage-owned
+  bucket snapshot acquisition
+- has any new duplicate-load or late bucket-load seam appeared while removing
+  the PG leak
+- are phases 5+ still mechanical migrations from the resulting boundary
 
 ### Phase 5: Bucket Write/Admin/Config Paths
 
