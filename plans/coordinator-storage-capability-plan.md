@@ -597,6 +597,18 @@ This is intentionally stronger than `with_bucket_write_snapshot(...)`.
 Snapshot loading alone is not the contract. The contract is “run this
 write-scoped action while the bucket write reservation is held”.
 
+The critical design rule here is stronger still:
+
+- migrated write paths must not allow coordinator to observe, return, or hold
+  bucket-side PG guards across this boundary
+- if a migrated path still returns `MutexGuard<PgStore>` or otherwise requires
+  coordinator-visible PG state to finish the operation, that path is not yet
+  actually migrated to the correct write boundary
+
+So phase 4d is not “repair one helper”; it is the point where the write-side
+interface becomes operation-shaped enough that coordinator can no longer use
+PGs incorrectly by construction.
+
 Covered surface:
 
 - ordinary single-object write/delete paths already migrated in phases 4 and 4c
@@ -614,11 +626,15 @@ Acceptance criteria:
   running
 - the delete/write synchronization behavior matches the pre-4c semantics
 - coordinator still does not see bucket PGs or reservation mechanics directly
+- migrated write paths do not return or retain bucket-side PG guards outside
+  the storage-owned write action boundary
 
 Verification focus:
 
 - targeted race regression proving delete cannot complete while a write action
   blocked inside the new storage-owned write action primitive is still active
+- targeted multipart/session regression proving same-PG migrated write paths do
+  not deadlock while using the corrected boundary
 - rerun ordinary single-object write/delete regressions
 - rerun bucket mutation write regressions
 - rerun migrated multipart write regressions
@@ -694,8 +710,12 @@ Phase 5 status:
 - structural follow-up required:
   - these paths currently depend on the phase-4c write-scoped snapshot loader
     rather than the stronger phase-4d write-scoped action boundary
+  - some paths may also still rely on later coordinator-visible object/bucket
+    PG work after auth/config loading, which phase 4d must drive behind the
+    storage-owned write boundary
   - so their bucket-first auth/config shape is migrated, but their final
-    delete/write synchronization contract is not yet settled
+    delete/write synchronization contract and no-PG-leak boundary are not yet
+    settled
 - once phase 4d lands, rerun this phase’s migrated write surface against the
   new storage-owned write-action primitive and then re-close phase 5
 - `DeleteBucket` remains separate in phase 6 and bucket-wide listing/fanout
@@ -735,6 +755,8 @@ Phase 6 status:
   - phase 6 cannot be treated as fully settled until phase 4d re-establishes
     the intended reservation/write exclusion contract and delete/write race
     regressions are rerun
+  - phase 6 should be re-reviewed specifically against migrated write paths
+    that previously returned or held PG guards across the delete/write boundary
 
 ### Phase 7: Multipart and Streaming Paths
 
@@ -770,6 +792,9 @@ Phase 7 status:
 - follow-up required on migrated slice:
   - these paths also need to move from the current write-scoped snapshot
     boundary to the phase-4d write-scoped action boundary
+  - any migrated multipart/session path that still returns coordinator-visible
+    PG guards is only partially migrated and must be redesigned so storage owns
+    the protected write action end to end
   - so the already-migrated phase-7 surface should be treated as
     reservation-lifetime-rework pending, not final
 - remaining obvious phase-7 surface:
@@ -805,6 +830,8 @@ Expected end state:
 
 - no normal request path in `server-core` calls `storage_node.get_pg(...)`
 - no normal request path in `server-core` calls `storage_node.lock_two_pgs(...)`
+- no migrated normal request path in `server-core` receives or returns
+  `MutexGuard<PgStore>`
 - PG guards become storage-internal or narrow migration/test-only details
 
 This phase may still leave test-only direct PG access in some low-level tests,
