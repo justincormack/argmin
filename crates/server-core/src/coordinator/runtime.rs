@@ -8,9 +8,9 @@ use s3_types::{BucketLifecycleConfiguration, BucketVersioningState};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
     BucketInfo, BucketName, EcShape, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListObjectsReq, ListPartsReq, MultipartPartSegmentRecord, MultipartReclaimPartRecord,
-    ObjectEncryption, ObjectKey, OwnerIdentity, ShardKey, SharedStorageNode, StoredObject,
-    UploadId, UploadState, VersionId,
+    ListObjectsReq, MultipartPartSegmentRecord, MultipartReclaimPartRecord, ObjectEncryption,
+    ObjectKey, OwnerIdentity, ShardKey, SharedStorageNode, StoredObject, UploadId, UploadState,
+    VersionId,
 };
 
 use super::payload::{PooledPayloadBuffer, SharedPayloadBuffer};
@@ -775,36 +775,15 @@ impl ReadRuntime {
         key: &ObjectKey,
         upload_id: &UploadId,
     ) -> Result<bool, ServerError> {
-        let meta_pg_id = self.pg_topology.object_pg_for(bucket, key);
-        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-
-        let upload = match meta_pg.get_multipart_upload(upload_id) {
-            Ok(upload) => upload,
-            Err(storage::MetadataError::NoSuchUpload { .. }) => return Ok(false),
-            Err(error) => return Err(ServerError::Metadata(error)),
-        };
-        if upload.bucket != *bucket || upload.key != *key {
+        let Some(prepared) = self
+            .storage_node
+            .prepare_abort_multipart_upload(bucket, key, upload_id)
+            .map_err(Coordinator::map_object_pg_action_error)?
+        else {
             return Ok(false);
-        }
+        };
 
-        match meta_pg.set_upload_state(upload_id, UploadState::Aborting) {
-            Ok(()) => {}
-            Err(storage::MetadataError::UploadNotInProgress { state })
-                if state == UploadState::Aborting as u8 => {}
-            Err(storage::MetadataError::UploadNotInProgress { .. }) => return Ok(false),
-            Err(error) => return Err(ServerError::Metadata(error)),
-        }
-
-        let all_parts = meta_pg.list_multipart_parts(&ListPartsReq {
-            upload_id: upload_id.clone(),
-            part_number_marker: None,
-            max_parts: u32::MAX,
-        })?;
-        let streaming_segments = meta_pg.get_all_multipart_part_segments_for_upload(upload_id)?;
-
-        drop(meta_pg);
-
-        for part in &all_parts.parts {
+        for part in &prepared.parts {
             if part.part_okh == [0u8; 16] {
                 continue;
             }
@@ -824,19 +803,18 @@ impl ReadRuntime {
             }
         }
 
-        if !streaming_segments.is_empty() {
-            self.delete_segment_shards_generic(&streaming_segments)?;
+        if !prepared.streaming_segments.is_empty() {
+            self.delete_segment_shards_generic(&prepared.streaming_segments)?;
         }
 
-        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-        if !streaming_segments.is_empty() {
-            meta_pg.delete_multipart_part_segments_by_upload_id(upload_id)?;
-        }
-        match meta_pg.delete_multipart_upload(upload_id) {
-            Ok(()) => Ok(true),
-            Err(storage::MetadataError::NoSuchUpload { .. }) => Ok(false),
-            Err(error) => Err(ServerError::Metadata(error)),
-        }
+        self.storage_node
+            .finish_abort_multipart_upload(
+                bucket,
+                key,
+                upload_id,
+                !prepared.streaming_segments.is_empty(),
+            )
+            .map_err(Coordinator::map_object_pg_action_error)
     }
 
     fn delete_segment_shards_generic(

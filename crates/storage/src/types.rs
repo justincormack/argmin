@@ -2385,6 +2385,18 @@ pub struct CompletedMultipartUploadRecord {
     pub owner: OwnerIdentity,
 }
 
+#[derive(Debug, Clone)]
+pub enum AbortMultipartUploadLookup {
+    InProgress(Box<MultipartUploadRecord>),
+    Completed(CompletedMultipartUploadRecord),
+}
+
+#[derive(Debug, Clone)]
+pub struct PreparedAbortMultipartUpload {
+    pub parts: Vec<MultipartPartRecord>,
+    pub streaming_segments: Vec<MultipartPartSegmentRecord>,
+}
+
 /// In-progress multipart part record.
 #[derive(Debug, Clone)]
 pub struct MultipartPartRecord {

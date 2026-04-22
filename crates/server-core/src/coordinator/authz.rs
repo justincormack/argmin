@@ -4204,11 +4204,13 @@ impl Coordinator {
         let upload_id = req.upload_id_typed();
         let bucket_info =
             self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
-        let meta_pg = self
+        let authorized = match self
             .storage_node
-            .get_pg(self.object_pg_id_for(bucket, key))?;
-        let authorized = match meta_pg.get_multipart_upload(upload_id) {
-            Ok(upload) => {
+            .lookup_abort_multipart_upload(bucket, key, upload_id)
+            .map_err(Self::map_object_pg_action_error)?
+        {
+            storage::AbortMultipartUploadLookup::InProgress(upload) => {
+                let upload = *upload;
                 if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
                     return Err(ServerError::NoSuchUpload {
                         upload_id: upload_id.to_string(),
@@ -4227,12 +4229,7 @@ impl Coordinator {
                     upload_id: upload_id.clone(),
                 }
             }
-            Err(storage::MetadataError::NoSuchUpload { .. }) => {
-                let Some(completed) = meta_pg.get_completed_multipart_upload(upload_id)? else {
-                    return Err(ServerError::NoSuchUpload {
-                        upload_id: upload_id.to_string(),
-                    });
-                };
+            storage::AbortMultipartUploadLookup::Completed(completed) => {
                 if completed.bucket != bucket.as_str() || completed.key != key.as_str() {
                     return Err(ServerError::NoSuchUpload {
                         upload_id: upload_id.to_string(),
@@ -4247,9 +4244,7 @@ impl Coordinator {
                 }
                 AuthorizedAbortMultipartUpload::Completed
             }
-            Err(error) => return Err(ServerError::Metadata(error)),
         };
-        drop(meta_pg);
         Ok(authorized)
     }
 

@@ -16,12 +16,13 @@ use crate::pg_store::PgStore;
 use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::{
-    BucketFastPathInfo, BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
-    BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind, CreateStreamUploadReq,
-    FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq,
-    ListPartsReq, ListedMultipartParts, LoadedBucketSubresource, MultipartUploadRecord, ObjectKey,
-    PreparedStreamPartCommit, SessionId, ShardKey, StreamUploadPartSnapshot, StreamUploadState,
-    StreamUploadTarget, UploadId, WriteAck,
+    AbortMultipartUploadLookup, BucketFastPathInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
+    BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
+    CreateStreamUploadReq, FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq,
+    ListObjectVersionsReq, ListPartsReq, ListedMultipartParts, LoadedBucketSubresource,
+    MultipartUploadRecord, ObjectKey, PreparedAbortMultipartUpload, PreparedStreamPartCommit,
+    SessionId, ShardKey, StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId,
+    UploadState, WriteAck,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -1038,6 +1039,87 @@ impl SharedStorageNode {
             max_parts,
         })?;
         Ok(ListedMultipartParts { upload, response })
+    }
+
+    pub fn lookup_abort_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<AbortMultipartUploadLookup, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        match Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id) {
+            Ok(upload) => Ok(AbortMultipartUploadLookup::InProgress(Box::new(upload))),
+            Err(crate::error::MetadataError::NoSuchUpload { .. }) => {
+                let Some(completed) = pg.get_completed_multipart_upload(upload_id)? else {
+                    return Err(crate::error::MetadataError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    }
+                    .into());
+                };
+                if completed.bucket != *bucket || completed.key != *key {
+                    return Err(crate::error::MetadataError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    }
+                    .into());
+                }
+                Ok(AbortMultipartUploadLookup::Completed(completed))
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn prepare_abort_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<Option<PreparedAbortMultipartUpload>, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        match Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id) {
+            Ok(_) => {}
+            Err(crate::error::MetadataError::NoSuchUpload { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+
+        match pg.set_upload_state(upload_id, UploadState::Aborting) {
+            Ok(()) => {}
+            Err(crate::error::MetadataError::UploadNotInProgress { state })
+                if state == UploadState::Aborting as u8 => {}
+            Err(crate::error::MetadataError::UploadNotInProgress { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+
+        let parts = pg
+            .list_multipart_parts(&ListPartsReq {
+                upload_id: upload_id.clone(),
+                part_number_marker: None,
+                max_parts: u32::MAX,
+            })?
+            .parts;
+        let streaming_segments = pg.get_all_multipart_part_segments_for_upload(upload_id)?;
+        Ok(Some(PreparedAbortMultipartUpload {
+            parts,
+            streaming_segments,
+        }))
+    }
+
+    pub fn finish_abort_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        delete_streaming_segments: bool,
+    ) -> Result<bool, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        if delete_streaming_segments {
+            pg.delete_multipart_part_segments_by_upload_id(upload_id)?;
+        }
+        match pg.delete_multipart_upload(upload_id) {
+            Ok(()) => Ok(true),
+            Err(crate::error::MetadataError::NoSuchUpload { .. }) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn validate_upload_part_stream_session(
