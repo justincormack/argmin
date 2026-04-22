@@ -374,6 +374,22 @@ Acceptance criteria:
 - authz consumes the loaded bucket handle instead of fetching bucket tags or
   policy later
 
+Phase 3 status:
+
+- started
+- migrated so far:
+  - `GetObject`
+  - `HeadObject`
+  - `GetObjectAttributes`
+- this also covers the shared ordinary-read authorization path reused by:
+  - `GetObjectRange`
+  - part-number object reads that flow through the same read authorization
+- still pending in phase 3:
+  - object subresource reads (`GetObjectAcl`, `GetObjectTagging`,
+    object-lock reads)
+  - any remaining ordinary read path still calling the older
+    `load_locked_object_state(...)` bucket-loading path directly
+
 ### Phase 4: Single-Object Write/Delete Paths
 
 Move the ordinary write and delete family:

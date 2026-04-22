@@ -33,7 +33,9 @@ use super::authz_results::{
     AuthorizedUploadPartCopy, LoadedObjectState,
 };
 use super::authz_types::{AuthorizedPutObjectWrite, AuthorizedPutObjectWriteAcl, ValidatedBucket};
-use super::bucket_handles::{BucketHandleRequest, LoadedBucketHandle, LoadedBucketValue};
+use super::bucket_handles::{
+    BucketHandleRequest, LoadedBucketHandle, LoadedBucketValue, LoadedObjectHandle,
+};
 use super::pg_guards::LockedReadObject;
 use super::request_types::{
     authorization_policy_context_for_put_object_write_acl, AuthorizePutObjectRequest,
@@ -1666,6 +1668,20 @@ impl Coordinator {
         req: &BucketRequest<'_>,
     ) -> Result<LoadedBucketHandle, ServerError> {
         self.load_bucket_handle_for_bucket_read(req, BucketHandleRequest::new())
+    }
+
+    fn load_bucket_handle_for_object_policy_read(
+        &self,
+        bucket: &BucketName,
+        expected_bucket_owner: Option<&str>,
+    ) -> Result<LoadedBucketHandle, ServerError> {
+        self.bucket_handle_loader().load_bucket(
+            bucket,
+            expected_bucket_owner,
+            BucketHandleRequest::new()
+                .requiring_policy_view()
+                .requiring_bucket_tags_if_abac_enabled(),
+        )
     }
 
     fn load_bucket_handle_for_bucket_read(
@@ -4362,6 +4378,58 @@ impl Coordinator {
         })
     }
 
+    fn load_locked_object_state_from_loaded_bucket<'a>(
+        &'a self,
+        requester: &Requester,
+        object: &LoadedObjectHandle<'_>,
+        policy_requirement: ObjectBucketPolicyRequirement,
+        missing_discovery: MissingObjectDiscovery,
+    ) -> Result<LoadedObjectState<'a>, ServerError> {
+        let bucket = object.bucket();
+        let bucket_info = ValidatedBucket(bucket.bucket().clone());
+        let bucket_policy = match policy_requirement {
+            ObjectBucketPolicyRequirement::Required => {
+                self.cached_bucket_policy_for_loaded_handle(bucket)?
+            }
+        };
+        let bucket_tags = if bucket_policy.is_some() {
+            Self::loaded_bucket_tags_for_policy(bucket)?
+        } else {
+            None
+        };
+        let can_discover_missing = missing_discovery.requester_can_discover_missing(
+            self,
+            BucketPolicyAccess {
+                requester,
+                bucket: &bucket_info,
+                bucket_tags: bucket_tags.as_deref(),
+                policy: bucket_policy.as_deref(),
+            },
+            object.key().as_str(),
+            object.version_id(),
+        )?;
+        let locked = match self.lock_object_pgs_for_read_typed(
+            &bucket.bucket().name,
+            object.key(),
+            object.version_id(),
+        ) {
+            Ok(locked) => locked,
+            Err(ServerError::ObjectNotFound { .. } | ServerError::VersionNotFound { .. })
+                if !can_discover_missing =>
+            {
+                return Err(ServerError::AccessDenied);
+            }
+            Err(other) => return Err(other),
+        };
+
+        Ok(LoadedObjectState {
+            bucket_info,
+            bucket_policy,
+            bucket_tags,
+            locked,
+        })
+    }
+
     fn ensure_loaded_object_read_allowed(
         &self,
         requester: &Requester,
@@ -4454,15 +4522,18 @@ impl Coordinator {
         expected_bucket_owner: Option<&str>,
         policy_action: auth::PolicyAction,
     ) -> Result<LockedReadObject<'a>, ServerError> {
-        let loaded = self.load_locked_object_state(ObjectStateLoadRequest {
+        let bucket =
+            self.load_bucket_handle_for_object_policy_read(bucket, expected_bucket_owner)?;
+        let object = match version_id {
+            Some(version_id) => bucket.load_object_version(key.clone(), version_id),
+            None => bucket.load_object(key.clone()),
+        };
+        let loaded = self.load_locked_object_state_from_loaded_bucket(
             requester,
-            bucket,
-            key,
-            version_id,
-            expected_bucket_owner,
-            policy_requirement: ObjectBucketPolicyRequirement::Required,
-            missing_discovery: MissingObjectDiscovery::ReadBucket,
-        })?;
+            &object,
+            ObjectBucketPolicyRequirement::Required,
+            MissingObjectDiscovery::ReadBucket,
+        )?;
         self.ensure_loaded_object_read_allowed(requester, &loaded, policy_action)?;
         Ok(loaded.locked)
     }
@@ -4678,15 +4749,22 @@ impl Coordinator {
         &'a self,
         req: &GetObjectAttributesRequest<'_>,
     ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
-        let loaded = self.load_locked_object_state(ObjectStateLoadRequest {
-            requester: req.object.requester(),
-            bucket: req.object.bucket_name_typed(),
-            key: req.object.key_typed(),
-            version_id: req.object.version_id,
-            expected_bucket_owner: req.expected_bucket_owner(),
-            policy_requirement: ObjectBucketPolicyRequirement::Required,
-            missing_discovery: MissingObjectDiscovery::ReadObjectAttributes,
-        })?;
+        let bucket = self.load_bucket_handle_for_object_policy_read(
+            req.object.bucket_name_typed(),
+            req.expected_bucket_owner(),
+        )?;
+        let object = match req.object.version_id {
+            Some(version_id) => {
+                bucket.load_object_version(req.object.key_typed().clone(), version_id)
+            }
+            None => bucket.load_object(req.object.key_typed().clone()),
+        };
+        let loaded = self.load_locked_object_state_from_loaded_bucket(
+            req.object.requester(),
+            &object,
+            ObjectBucketPolicyRequirement::Required,
+            MissingObjectDiscovery::ReadObjectAttributes,
+        )?;
         self.ensure_loaded_object_attributes_allowed(
             req.object.requester(),
             &loaded,
