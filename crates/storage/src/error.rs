@@ -103,3 +103,13 @@ pub enum BucketWriteDrainError {
     #[error(transparent)]
     Metadata(#[from] MetadataError),
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum ObjectPgActionError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Metadata(#[from] MetadataError),
+    #[error("invalid request: {reason}")]
+    InvalidRequest { reason: String },
+}

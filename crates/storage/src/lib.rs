@@ -34,7 +34,9 @@ pub mod schema;
 pub mod traits;
 pub mod types;
 
-pub use error::{BucketSnapshotLoadError, BucketWriteDrainError, MetadataError, StoreError};
+pub use error::{
+    BucketSnapshotLoadError, BucketWriteDrainError, MetadataError, ObjectPgActionError, StoreError,
+};
 pub use node::{
     BucketDeleteFinalizeOutcome, BucketPairPgGuards, BucketWriteDrainGuard, LocalStorageNode,
     ReclaimWorkItem, SharedStorageNode,

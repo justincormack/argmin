@@ -3,9 +3,10 @@ use s3_types::{BucketVersioningState, VersionId};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
     BucketName, CommitMultipartReq, CreateMultipartUploadReq, CreateStreamUploadReq, EcShape,
-    GenerationId, ListMultipartUploadsReq, ListPartsReq, MultipartPartRecord,
-    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectPartRecord,
-    SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey,
+    FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq, ListPartsReq,
+    MultipartPartRecord, MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey,
+    ObjectPartRecord, PreparedStreamPartCommit, SerializedMetadataBlob,
+    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey, StreamUploadPartSnapshot,
     StreamUploadState, StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET,
     UPLOAD_ID_LEN,
 };
@@ -40,6 +41,21 @@ use crate::pg::part_key_hash;
 use crate::system_metadata::SystemMetadata;
 
 impl Coordinator {
+    fn map_object_pg_action_error(error: storage::ObjectPgActionError) -> ServerError {
+        match error {
+            storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+            storage::ObjectPgActionError::InvalidRequest { reason } => {
+                ServerError::InvalidRequest { reason }
+            }
+            storage::ObjectPgActionError::Metadata(error) => match error {
+                storage::MetadataError::NoSuchUpload { upload_id } => {
+                    ServerError::NoSuchUpload { upload_id }
+                }
+                other => ServerError::Metadata(other),
+            },
+        }
+    }
+
     pub fn append_stream_part_data(
         &self,
         req: &AppendStreamPartRequest<'_>,
@@ -946,170 +962,185 @@ impl Coordinator {
         let total_size = req.total_size;
         let claimed_checksum = req.claimed_checksum;
         let computed_checksum = req.computed_checksum;
-        let meta_pg_id =
-            self.object_pg_id_for(req.upload.bucket_name_typed(), req.upload.key_typed());
-        let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-
-        let session = meta_guard.get_stream_upload(session_id)?;
-        if session.state != StreamUploadState::InProgress {
-            return Err(ServerError::InvalidRequest {
-                reason: "stream session is not in progress".to_string(),
-            });
-        }
-        if session.bucket != *req.upload.bucket_name_typed()
-            || session.key != *req.upload.key_typed()
-        {
-            return Err(ServerError::InvalidRequest {
-                reason: "session bucket/key mismatch".to_string(),
-            });
-        }
-        match &session.target {
-            StreamUploadTarget::UploadPart {
-                upload_id: sess_upload_id,
-                part_number: sess_part_number,
-            } if sess_upload_id == upload_id && *sess_part_number == part_number => {}
-            StreamUploadTarget::UploadPart { .. } => {
-                return Err(ServerError::InvalidRequest {
-                    reason: "session upload_id/part_number mismatch".to_string(),
-                });
-            }
-            StreamUploadTarget::PutObject => {
-                return Err(ServerError::InvalidRequest {
-                    reason: "session is not an UploadPart session".to_string(),
-                });
-            }
-        }
-
-        let upload = meta_guard.get_multipart_upload(upload_id)?;
-        if upload.bucket != bucket || upload.key != key {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        if upload.state != UploadState::InProgress {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-
-        let claimed_algo = claimed_checksum.map(ChecksumClaim::algorithm);
-        let upload_checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
-        let effective_algo = match (upload_checksum_algo, claimed_algo) {
-            (Some(upload_algo), Some(part_algo)) if upload_algo != part_algo => {
-                return Err(ServerError::InvalidRequest {
-                    reason: format!(
-                        "checksum algorithm mismatch: upload configured with {} but part sent {}",
-                        upload_algo.as_str(),
-                        part_algo.as_str()
-                    ),
-                });
-            }
-            (Some(algo), Some(_)) => Some(algo),
-            (Some(upload_algo), None) => Some(upload_algo),
-            (None, Some(part_algo)) => Some(part_algo),
-            (None, None) => None,
-        };
-
-        let checksum = if let Some(cksum) = computed_checksum {
-            let algo = cksum.algorithm();
-            let bytes = cksum.bytes();
-            if let Some(ea) = effective_algo {
-                if ea != algo {
-                    return Err(ServerError::InvalidRequest {
-                        reason: format!(
-                            "computed checksum algorithm {} doesn't match effective {}",
-                            algo.as_str(),
-                            ea.as_str()
-                        ),
-                    });
-                }
-            }
-            if let Some(claim) = &claimed_checksum {
-                if claim.algorithm() != algo {
-                    return Err(ServerError::InvalidRequest {
-                        reason: format!(
-                            "claimed checksum algorithm {} doesn't match computed {}",
-                            claim.algorithm().as_str(),
-                            algo.as_str()
-                        ),
-                    });
-                }
-                if claim.expected_bytes() != bytes {
-                    return Err(ServerError::BadDigest);
-                }
-            }
-            Some(cksum)
-        } else if effective_algo.is_some() || claimed_checksum.is_some() {
-            return Err(ServerError::InvalidRequest {
-                reason: "missing computed checksum for streaming upload part".to_string(),
-            });
-        } else {
-            None
-        };
-
-        let generation = match meta_guard.get_multipart_part(upload_id, part_number) {
-            Ok(existing) => existing.generation + 1,
-            Err(storage::MetadataError::PartNotFound { .. }) => 0,
-            Err(e) => return Err(ServerError::Metadata(e)),
-        };
-
-        let staging_segments = meta_guard
-            .list_stream_segments(session_id)
-            .map_err(ServerError::Metadata)?;
-        let segments_total: u64 = staging_segments.iter().map(|segment| segment.size).sum();
-        if segments_total != total_size {
-            return Err(ServerError::InvalidRequest {
-                reason: format!(
-                    "total_size mismatch: caller passed {total_size} but staged segments sum to {segments_total}"
-                ),
-            });
-        }
-
-        let committed_segments: Vec<MultipartPartSegmentRecord> = staging_segments
-            .iter()
-            .map(|segment| MultipartPartSegmentRecord {
-                bucket: upload.bucket.clone(),
-                key: upload.key.clone(),
-                upload_id: upload_id.clone(),
-                version_id: u64::MAX,
-                part_number,
-                segment_index: segment.segment_index,
-                size: segment.size,
-                segment_crc64: segment.segment_crc64,
-                segment_okh: segment.segment_okh,
-                segment_vid: segment.segment_vid,
-                shard_pg_id: segment.shard_pg_id,
-                ec_k: segment.ec_k,
-                ec_m: segment.ec_m,
-            })
-            .collect();
-
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let part_record = MultipartPartRecord {
-            upload_id: upload_id.clone(),
-            part_number,
+        let FinalizeStreamPartOutcome {
+            value: result,
+            upload: _,
             generation,
-            size: total_size,
-            etag: crc64_to_etag_bytes(crc64),
-            etag_kind: storage::EtagKind::Crc64,
-            part_okh: [0u8; 16],
-            part_vid: GenerationId::new(u64::from(generation) + 1)
-                .expect("multipart part generation must be nonzero"),
-            ec_k: self.ec_config.data_shards,
-            ec_m: self.ec_config.parity_shards,
-            last_modified: now,
-            checksum: checksum.as_ref().map(ChecksumBytes::from),
-        };
+            displaced_segments,
+        } = self
+            .storage_node
+            .finalize_upload_part_stream(
+                req.upload.bucket_name_typed(),
+                req.upload.key_typed(),
+                upload_id,
+                session_id,
+                part_number,
+                |snapshot: StreamUploadPartSnapshot| {
+                    let StreamUploadPartSnapshot {
+                        session,
+                        upload,
+                        existing_part_generation,
+                        staging_segments,
+                    } = snapshot;
+                    if session.state != StreamUploadState::InProgress {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "stream session is not in progress".to_string(),
+                        });
+                    }
+                    if session.bucket != *req.upload.bucket_name_typed()
+                        || session.key != *req.upload.key_typed()
+                    {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "session bucket/key mismatch".to_string(),
+                        });
+                    }
+                    match &session.target {
+                        StreamUploadTarget::UploadPart {
+                            upload_id: sess_upload_id,
+                            part_number: sess_part_number,
+                        } if sess_upload_id == upload_id && *sess_part_number == part_number => {}
+                        StreamUploadTarget::UploadPart { .. } => {
+                            return Err(ServerError::InvalidRequest {
+                                reason: "session upload_id/part_number mismatch".to_string(),
+                            });
+                        }
+                        StreamUploadTarget::PutObject => {
+                            return Err(ServerError::InvalidRequest {
+                                reason: "session is not an UploadPart session".to_string(),
+                            });
+                        }
+                    }
 
-        let displaced_segments = meta_guard
-            .commit_stream_part(session_id, &part_record, &committed_segments)
-            .map_err(ServerError::Metadata)?;
+                    if upload.bucket != bucket || upload.key != key {
+                        return Err(ServerError::NoSuchUpload {
+                            upload_id: upload_id.to_string(),
+                        });
+                    }
+                    if upload.state != UploadState::InProgress {
+                        return Err(ServerError::NoSuchUpload {
+                            upload_id: upload_id.to_string(),
+                        });
+                    }
 
-        drop(meta_guard);
+                    let claimed_algo = claimed_checksum.map(ChecksumClaim::algorithm);
+                    let upload_checksum_algo = upload.checksum.map(MultipartChecksumConfig::algorithm);
+                    let effective_algo = match (upload_checksum_algo, claimed_algo) {
+                        (Some(upload_algo), Some(part_algo)) if upload_algo != part_algo => {
+                            return Err(ServerError::InvalidRequest {
+                                reason: format!(
+                                    "checksum algorithm mismatch: upload configured with {} but part sent {}",
+                                    upload_algo.as_str(),
+                                    part_algo.as_str()
+                                ),
+                            });
+                        }
+                        (Some(algo), Some(_)) => Some(algo),
+                        (Some(upload_algo), None) => Some(upload_algo),
+                        (None, Some(part_algo)) => Some(part_algo),
+                        (None, None) => None,
+                    };
+
+                    let checksum = if let Some(cksum) = computed_checksum {
+                        let algo = cksum.algorithm();
+                        let bytes = cksum.bytes();
+                        if let Some(ea) = effective_algo {
+                            if ea != algo {
+                                return Err(ServerError::InvalidRequest {
+                                    reason: format!(
+                                        "computed checksum algorithm {} doesn't match effective {}",
+                                        algo.as_str(),
+                                        ea.as_str()
+                                    ),
+                                });
+                            }
+                        }
+                        if let Some(claim) = &claimed_checksum {
+                            if claim.algorithm() != algo {
+                                return Err(ServerError::InvalidRequest {
+                                    reason: format!(
+                                        "claimed checksum algorithm {} doesn't match computed {}",
+                                        claim.algorithm().as_str(),
+                                        algo.as_str()
+                                    ),
+                                });
+                            }
+                            if claim.expected_bytes() != bytes {
+                                return Err(ServerError::BadDigest);
+                            }
+                        }
+                        Some(cksum)
+                    } else if effective_algo.is_some() || claimed_checksum.is_some() {
+                        return Err(ServerError::InvalidRequest {
+                            reason: "missing computed checksum for streaming upload part".to_string(),
+                        });
+                    } else {
+                        None
+                    };
+
+                    let generation = existing_part_generation.map_or(0, |generation| generation + 1);
+                    let segments_total: u64 =
+                        staging_segments.iter().map(|segment| segment.size).sum();
+                    if segments_total != total_size {
+                        return Err(ServerError::InvalidRequest {
+                            reason: format!(
+                                "total_size mismatch: caller passed {total_size} but staged segments sum to {segments_total}"
+                            ),
+                        });
+                    }
+
+                    let committed_segments: Vec<MultipartPartSegmentRecord> = staging_segments
+                        .iter()
+                        .map(|segment| MultipartPartSegmentRecord {
+                            bucket: upload.bucket.clone(),
+                            key: upload.key.clone(),
+                            upload_id: upload_id.clone(),
+                            version_id: u64::MAX,
+                            part_number,
+                            segment_index: segment.segment_index,
+                            size: segment.size,
+                            segment_crc64: segment.segment_crc64,
+                            segment_okh: segment.segment_okh,
+                            segment_vid: segment.segment_vid,
+                            shard_pg_id: segment.shard_pg_id,
+                            ec_k: segment.ec_k,
+                            ec_m: segment.ec_m,
+                        })
+                        .collect();
+
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+
+                    let part_record = MultipartPartRecord {
+                        upload_id: upload_id.clone(),
+                        part_number,
+                        generation,
+                        size: total_size,
+                        etag: crc64_to_etag_bytes(crc64),
+                        etag_kind: storage::EtagKind::Crc64,
+                        part_okh: [0u8; 16],
+                        part_vid: GenerationId::new(u64::from(generation) + 1)
+                            .expect("multipart part generation must be nonzero"),
+                        ec_k: self.ec_config.data_shards,
+                        ec_m: self.ec_config.parity_shards,
+                        last_modified: now,
+                        checksum: checksum.as_ref().map(ChecksumBytes::from),
+                    };
+
+                    Ok::<_, ServerError>(PreparedStreamPartCommit {
+                        value: UploadPartResult {
+                            etag: format_etag(crc64),
+                            checksum,
+                            managed_encryption: upload.encryption.managed_encryption_algorithm(),
+                        },
+                        part: part_record,
+                        segments: committed_segments,
+                    })
+                },
+            )
+            .map_err(Self::map_object_pg_action_error)??;
+
         if generation > 0 {
             let old_gen = generation - 1;
             let old_okh = part_key_hash(upload_id, part_number, old_gen);
@@ -1133,11 +1164,7 @@ impl Coordinator {
             }
         }
 
-        Ok(UploadPartResult {
-            etag: format_etag(crc64),
-            checksum,
-            managed_encryption: upload.encryption.managed_encryption_algorithm(),
-        })
+        Ok(result)
     }
 
     pub fn abort_stream_part_session(

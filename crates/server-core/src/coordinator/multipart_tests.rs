@@ -32,7 +32,10 @@ fn upload_part_stream_session_count(
     upload_id: &UploadId,
     part_number: u32,
 ) -> usize {
-    let pg = coord.storage_node.get_pg(coord.object_pg_id(bucket, key)).unwrap();
+    let pg = coord
+        .storage_node
+        .get_pg(coord.object_pg_id(bucket, key))
+        .unwrap();
     pg.list_all_stream_uploads()
         .unwrap()
         .into_iter()
@@ -3816,12 +3819,7 @@ fn begin_stream_part_wrong_bucket_returns_no_such_upload_without_creating_sessio
 
     let upload = coord
         .create_multipart_upload(&CreateMultipartUploadRequest {
-            object: object_request_with_expected_owner(
-                "bucket-a",
-                "key",
-                test_requester(),
-                None,
-            ),
+            object: object_request_with_expected_owner("bucket-a", "key", test_requester(), None),
             metadata: &MetadataBlob::new(),
             system_metadata: &SystemMetadata::EMPTY,
             tags: None,
@@ -3885,7 +3883,10 @@ fn begin_stream_part_aborting_upload_returns_no_such_upload_without_creating_ses
         })
         .unwrap();
 
-    let pg = coord.storage_node.get_pg(coord.object_pg_id("bucket", "key")).unwrap();
+    let pg = coord
+        .storage_node
+        .get_pg(coord.object_pg_id("bucket", "key"))
+        .unwrap();
     pg.set_upload_state(&upload.upload_id, UploadState::Aborting)
         .unwrap();
     drop(pg);
@@ -3937,7 +3938,10 @@ fn begin_stream_part_completing_upload_returns_no_such_upload_without_creating_s
         })
         .unwrap();
 
-    let pg = coord.storage_node.get_pg(coord.object_pg_id("bucket", "key")).unwrap();
+    let pg = coord
+        .storage_node
+        .get_pg(coord.object_pg_id("bucket", "key"))
+        .unwrap();
     pg.set_upload_state(&upload.upload_id, UploadState::Completing)
         .unwrap();
     drop(pg);
@@ -7768,6 +7772,74 @@ fn finalize_stream_part_wrong_op_kind_rejected() {
         })
         .unwrap_err();
     assert!(matches!(err, ServerError::InvalidRequest { .. }));
+}
+
+#[test]
+fn finalize_stream_part_session_upload_mismatch_beats_missing_requested_upload() {
+    let dir = test_util::tempdir();
+    let coord = setup_coordinator(dir.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let mpu = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let session_id = begin_stream_part_test(&coord, "bucket", "key", &mpu.upload_id, 1)
+        .unwrap()
+        .session_id;
+    let nonexistent_upload_id = trusted_upload_id("nonexistent-upload");
+
+    let err = coord
+        .finalize_stream_part(FinalizeStreamPartRequest {
+            upload: multipart_object_request(
+                "bucket",
+                "key",
+                &nonexistent_upload_id,
+                test_requester(),
+            ),
+            session_id: &session_id,
+            part_number: 1,
+            crc64: checksum::crc64::checksum(&[]),
+            total_size: 0,
+            claimed_checksum: None,
+            computed_checksum: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::InvalidRequest { ref reason } if reason == "session upload_id/part_number mismatch"),
+        "expected session mismatch InvalidRequest, got {err:?}"
+    );
+
+    let parts = coord
+        .list_parts(&ListPartsRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &mpu.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number_marker: None,
+            max_parts: 100,
+        })
+        .unwrap();
+    assert!(
+        parts.parts.is_empty(),
+        "mismatched finalize must not commit a part"
+    );
 }
 
 #[test]

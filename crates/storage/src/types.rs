@@ -2605,6 +2605,29 @@ pub struct StreamUploadSegmentRecord {
     pub ec_m: u8,
 }
 
+#[derive(Debug, Clone)]
+pub struct StreamUploadPartSnapshot {
+    pub session: StreamUploadRecord,
+    pub upload: MultipartUploadRecord,
+    pub existing_part_generation: Option<u32>,
+    pub staging_segments: Vec<StreamUploadSegmentRecord>,
+}
+
+#[derive(Debug)]
+pub struct PreparedStreamPartCommit<T> {
+    pub value: T,
+    pub part: MultipartPartRecord,
+    pub segments: Vec<MultipartPartSegmentRecord>,
+}
+
+#[derive(Debug)]
+pub struct FinalizeStreamPartOutcome<T> {
+    pub value: T,
+    pub upload: MultipartUploadRecord,
+    pub generation: u32,
+    pub displaced_segments: Vec<MultipartPartSegmentRecord>,
+}
+
 /// Committed segment record for a normal PutObject.
 #[derive(Debug, Clone)]
 pub struct ObjectSegmentRecord {
