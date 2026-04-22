@@ -190,8 +190,8 @@ This phase should make the following explicit:
    - `LoadedBucket` and related handle types should be non-cloneable
    - the move/borrow story for `load_object(...)` / `prepare_*` derivation
      should be visible in the type signatures
-   - the public boundary should make duplicate bucket acquisition within a
-     single request path structurally unnatural
+   - the public boundary should ultimately make duplicate bucket acquisition
+     within a single request path structurally unnatural
 2. lock/snapshot lifetime
    - handles are request-scoped snapshots, not whole-request PG mutex guards
    - long-lived operations such as streaming PUT and multipart complete must
@@ -242,6 +242,15 @@ Phase 0 status:
   - same-bucket pair loads still validate both expected-owner constraints
   - conditional bucket-tag snapshot loading is tested directly at the storage
     layer for the ABAC-enabled and ABAC-disabled cases
+  - a loaded bucket snapshot keeps its pre-mutation bucket-tag view even if the
+    bucket is mutated afterwards
+- explicit phase-0 deferral:
+  - the current generic `BucketHandleLoader` is still a repeat-call internal
+    adapter, not the final single-use request-family entry point
+  - full type-level duplicate-load prevention is deferred to the migration
+    phases where concrete request families stop calling the generic loader and
+    instead receive one bucket handle per bucket as part of their operation
+    entry path
 
 ## Storage Boundary Change
 

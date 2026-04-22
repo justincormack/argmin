@@ -1070,6 +1070,56 @@ mod tests {
     }
 
     #[test]
+    fn load_bucket_snapshot_keeps_loaded_tag_view_after_bucket_mutation() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+        let bucket_pg_id = node.pg_topology().bucket_pg_for(&bucket);
+        let bucket_pg = node.get_pg(bucket_pg_id).unwrap();
+        bucket_pg
+            .put_bucket_subresource(
+                &bucket,
+                crate::types::PutBucketSubresource {
+                    kind: crate::types::BucketSubresourceKind::Tagging,
+                    body: "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+                    aux: crate::types::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+        bucket_pg.put_bucket_abac_enabled(&bucket, true).unwrap();
+        drop(bucket_pg);
+
+        let snapshot = node
+            .load_bucket_snapshot(
+                &bucket,
+                crate::types::BucketSnapshotRequest {
+                    tags: crate::types::BucketSnapshotTagsRequest::IfBucketAbacEnabled,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let bucket_pg = node.get_pg(bucket_pg_id).unwrap();
+        bucket_pg
+            .put_bucket_subresource(
+                &bucket,
+                crate::types::PutBucketSubresource {
+                    kind: crate::types::BucketSubresourceKind::Tagging,
+                    body: "<Tagging><TagSet><Tag><Key>security</Key><Value>private</Value></Tag></TagSet></Tagging>",
+                    aux: crate::types::BucketSubresourceAux::None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            snapshot.tags,
+            crate::types::LoadedBucketSubresource::Loaded(
+                "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>".to_owned()
+            )
+        );
+    }
+
+    #[test]
     fn shared_node_read_shard_file_roundtrip() {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0]).unwrap();

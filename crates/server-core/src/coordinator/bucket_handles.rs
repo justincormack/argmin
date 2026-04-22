@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
 use s3_types::VersionId;
-use storage::{BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest, ObjectKey};
+use storage::{
+    BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
+    BucketSnapshotTagsRequest, ObjectKey,
+};
 
 use super::{BucketSummary, Coordinator};
 use crate::error::ServerError;
@@ -11,112 +14,84 @@ use crate::error::ServerError;
 /// Request code does not decide ad hoc whether ABAC tags are needed. Instead,
 /// the request family declares its logical tag dependency up front and initial
 /// bucket acquisition resolves that against bucket state in one step.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) enum BucketTagsLoad {
-    #[default]
-    NotNeeded,
-    WhenBucketAbacEnabled,
-    Always,
-}
-
-impl BucketTagsLoad {
-    const fn merge(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::Always, _) | (_, Self::Always) => Self::Always,
-            (Self::WhenBucketAbacEnabled, _) | (_, Self::WhenBucketAbacEnabled) => {
-                Self::WhenBucketAbacEnabled
-            }
-            (Self::NotNeeded, Self::NotNeeded) => Self::NotNeeded,
-        }
-    }
-}
-
 /// Bucket state a request family declares up front.
 ///
-/// This is phase-0 scaffolding for the bucket-first handle refactor. The
-/// request family describes logical needs here; initial bucket acquisition
-/// resolves those needs to concrete bucket-state loads in one step.
+/// This is a semantic wrapper over the storage snapshot request shape rather
+/// than a second parallel struct. The coordinator keeps request-family naming
+/// here, while storage owns the concrete snapshot fields.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(super) struct BucketHandleRequest {
-    policy_view: bool,
-    bucket_tags: BucketTagsLoad,
-    lifecycle_view: bool,
-    cors_view: bool,
-}
+pub(super) struct BucketHandleRequest(BucketSnapshotRequest);
 
 impl BucketHandleRequest {
     pub(super) const fn new() -> Self {
-        Self {
-            policy_view: false,
-            bucket_tags: BucketTagsLoad::NotNeeded,
-            lifecycle_view: false,
-            cors_view: false,
-        }
+        Self(BucketSnapshotRequest {
+            policy: false,
+            tags: BucketSnapshotTagsRequest::NotRequested,
+            lifecycle: false,
+            cors: false,
+        })
     }
 
     pub(super) const fn requiring_policy_view(mut self) -> Self {
-        self.policy_view = true;
+        self.0.policy = true;
         self
     }
 
     pub(super) const fn requiring_bucket_tags(mut self) -> Self {
-        self.bucket_tags = BucketTagsLoad::Always;
+        self.0.tags = BucketSnapshotTagsRequest::Always;
         self
     }
 
     pub(super) const fn requiring_bucket_tags_if_abac_enabled(mut self) -> Self {
-        self.bucket_tags = BucketTagsLoad::WhenBucketAbacEnabled;
+        self.0.tags = BucketSnapshotTagsRequest::IfBucketAbacEnabled;
         self
     }
 
     pub(super) const fn requiring_lifecycle_view(mut self) -> Self {
-        self.lifecycle_view = true;
+        self.0.lifecycle = true;
         self
     }
 
     pub(super) const fn requiring_cors_view(mut self) -> Self {
-        self.cors_view = true;
+        self.0.cors = true;
         self
     }
 
     pub(super) const fn policy_view(self) -> bool {
-        self.policy_view
-    }
-
-    pub(super) const fn bucket_tags(self) -> BucketTagsLoad {
-        self.bucket_tags
+        self.0.policy
     }
 
     pub(super) const fn lifecycle_view(self) -> bool {
-        self.lifecycle_view
+        self.0.lifecycle
     }
 
     pub(super) const fn cors_view(self) -> bool {
-        self.cors_view
+        self.0.cors
     }
 
     const fn merge(self, other: Self) -> Self {
-        Self {
-            policy_view: self.policy_view || other.policy_view,
-            bucket_tags: self.bucket_tags.merge(other.bucket_tags),
-            lifecycle_view: self.lifecycle_view || other.lifecycle_view,
-            cors_view: self.cors_view || other.cors_view,
-        }
+        Self(BucketSnapshotRequest {
+            policy: self.0.policy || other.0.policy,
+            tags: match (self.0.tags, other.0.tags) {
+                (BucketSnapshotTagsRequest::Always, _) | (_, BucketSnapshotTagsRequest::Always) => {
+                    BucketSnapshotTagsRequest::Always
+                }
+                (BucketSnapshotTagsRequest::IfBucketAbacEnabled, _)
+                | (_, BucketSnapshotTagsRequest::IfBucketAbacEnabled) => {
+                    BucketSnapshotTagsRequest::IfBucketAbacEnabled
+                }
+                (
+                    BucketSnapshotTagsRequest::NotRequested,
+                    BucketSnapshotTagsRequest::NotRequested,
+                ) => BucketSnapshotTagsRequest::NotRequested,
+            },
+            lifecycle: self.0.lifecycle || other.0.lifecycle,
+            cors: self.0.cors || other.0.cors,
+        })
     }
 
     const fn resolve_to_storage_request(self) -> BucketSnapshotRequest {
-        BucketSnapshotRequest {
-            policy: self.policy_view,
-            tags: match self.bucket_tags {
-                BucketTagsLoad::NotNeeded => storage::BucketSnapshotTagsRequest::NotRequested,
-                BucketTagsLoad::WhenBucketAbacEnabled => {
-                    storage::BucketSnapshotTagsRequest::IfBucketAbacEnabled
-                }
-                BucketTagsLoad::Always => storage::BucketSnapshotTagsRequest::Always,
-            },
-            lifecycle: self.lifecycle_view,
-            cors: self.cors_view,
-        }
+        self.0
     }
 }
 
@@ -301,6 +276,10 @@ impl LoadedBucketPair {
 /// Request paths are meant to talk to this loader, not to PGs. It is the
 /// place where same-bucket coalescing and dual-bucket acquisition ordering
 /// live before later phases migrate real request families over.
+///
+/// This is still transitional scaffolding: it centralizes bucket loading for
+/// phase 0, but it is not yet the final single-use request-family entry point
+/// that will make duplicate bucket acquisition structurally impossible.
 pub(super) struct BucketHandleLoader<'a> {
     coordinator: &'a Coordinator,
 }
@@ -311,7 +290,7 @@ impl<'a> BucketHandleLoader<'a> {
     }
 
     pub(super) fn load_bucket(
-        &self,
+        self,
         name: &BucketName,
         expected_bucket_owner: Option<&str>,
         request: BucketHandleRequest,
@@ -325,13 +304,19 @@ impl<'a> BucketHandleLoader<'a> {
     }
 
     pub(super) fn load_bucket_pair(
-        &self,
+        self,
         source: (&BucketName, Option<&str>, BucketHandleRequest),
         destination: (&BucketName, Option<&str>, BucketHandleRequest),
     ) -> Result<LoadedBucketPair, ServerError> {
         if source.0 == destination.0 {
             let merged_request = source.2.merge(destination.2);
-            let bucket = self.load_bucket(source.0, source.1, merged_request)?;
+            let snapshot = self
+                .coordinator
+                .storage_node
+                .load_bucket_snapshot(source.0, merged_request.resolve_to_storage_request())
+                .map_err(Self::map_bucket_snapshot_error)?;
+            let bucket =
+                self.load_bucket_handle_from_snapshot(snapshot, source.1, merged_request)?;
             Coordinator::ensure_expected_bucket_owner(bucket.bucket(), destination.1)?;
             return Ok(LoadedBucketPair::same(bucket));
         }
