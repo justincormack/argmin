@@ -1448,6 +1448,86 @@ fn head_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
 }
 
 #[test]
+fn head_object_waits_for_bucket_pg_when_bucket_policy_is_present() {
+    let tmp = test_util::tempdir();
+    let pg_ids: Vec<u32> = (0..4).collect();
+    let storage_node = Arc::new(SharedStorageNode::open(tmp.path(), &pg_ids).unwrap());
+    let admin = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+    let reader = setup_coordinator_with_shared_storage(Arc::clone(&storage_node));
+
+    admin
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+    put_bucket_policy_test(
+        &admin,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        test_requester(),
+        None,
+    )
+    .unwrap();
+
+    let key = find_key_with_object_pg_ne_bucket_pg(&admin, "bucket", "head-policy-fast");
+    test_helpers::put_object(
+        &admin,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", &key, test_requester(), None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    storage_node.remove_bucket_fast_path(&trusted_bucket_name("bucket"));
+    reader
+        .head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                &key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        })
+        .unwrap();
+
+    let bucket_pg = admin.get_bucket_pg("bucket").unwrap();
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let res = reader.head_object(&GetObjectRequest {
+            sse_customer: None,
+            object: object_version_request_with_expected_owner(
+                "bucket",
+                &key,
+                None,
+                test_requester(),
+                None,
+            ),
+            cond: NO_READ,
+        });
+        tx.send(res).unwrap();
+    });
+
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "head_object with bucket policy should wait on bucket pg to load a policy snapshot"
+    );
+    drop(bucket_pg);
+    let head = rx.recv_timeout(Duration::from_secs(1)).unwrap().unwrap();
+    assert_eq!(head.size, 4);
+    handle.join().unwrap();
+}
+
+#[test]
 fn delete_object_does_not_wait_for_bucket_pg_when_fast_path_is_warm() {
     let tmp = test_util::tempdir();
     let pg_ids: Vec<u32> = (0..4).collect();

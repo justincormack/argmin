@@ -3630,6 +3630,89 @@ fn get_object_tagging_bucket_policy_same_pg_completes_without_deadlock() {
 }
 
 #[test]
+fn get_object_retention_bucket_policy_same_pg_completes_without_deadlock() {
+    let tmp = test_util::tempdir();
+    let (admin, reader) = setup_coordinators_with_single_pg(tmp.path());
+    let owner_requester = test_helpers::requester("owner-a");
+
+    admin
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("bucket"),
+            requester: owner_requester.clone(),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: true,
+        })
+        .unwrap();
+    let put = test_helpers::put_object(
+        &admin,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner(
+                "bucket",
+                "key",
+                owner_requester.clone(),
+                None,
+            ),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+    let retention = ObjectRetention {
+        mode: ObjectLockMode::Governance,
+        retain_until_unix_seconds: Coordinator::current_unix_seconds().unwrap() + 3600,
+    };
+    put_object_retention_test(
+        &admin,
+        "bucket",
+        "key",
+        Some(put.version_id),
+        retention,
+        false,
+        owner_requester.clone(),
+    )
+    .unwrap();
+    put_bucket_policy_test(
+        &admin,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"other-user"},"Action":"s3:GetObjectRetention","Resource":"arn:aws:s3:::bucket/*"}]}"#,
+        owner_requester,
+        None,
+    )
+    .unwrap();
+    admin.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
+
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let res = get_object_retention_test(
+            &reader,
+            "bucket",
+            "key",
+            Some(put.version_id),
+            test_helpers::requester("other-user"),
+        );
+        tx.send(res).unwrap();
+    });
+
+    let fetched = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("get_object_retention with bucket policy should not self-deadlock")
+        .unwrap()
+        .expect("expected retention");
+    assert_eq!(fetched, retention);
+    handle.join().unwrap();
+}
+
+#[test]
 fn delete_object_object_lock_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let (admin, deleter) = setup_coordinators_with_single_pg(tmp.path());

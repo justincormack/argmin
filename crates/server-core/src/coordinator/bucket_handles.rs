@@ -138,7 +138,7 @@ pub(super) struct LoadedBucketHandle {
 }
 
 impl LoadedBucketHandle {
-    fn new(
+    pub(super) fn new(
         bucket: BucketSummary,
         request: BucketHandleRequest,
         policy: LoadedBucketValue<String>,
