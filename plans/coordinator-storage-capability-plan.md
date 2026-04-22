@@ -688,13 +688,14 @@ Phase 7 status:
 - migrated so far:
   - `CreateMultipartUpload`
   - `CompleteMultipartUpload`
+  - `BeginStreamPart`
 - these now use the write-scoped bucket handle path for bucket policy / ABAC
   inputs instead of the older reservation-only summary path
 - remaining obvious phase-7 surface:
   - `UploadPart`
   - `AbortMultipartUpload`
   - streaming `PutObject`
-  - streaming part/session flows
+  - remaining multipart/session management flows
 
 ### Phase 8: Copy / UploadPartCopy Dual-Bucket Flows
 

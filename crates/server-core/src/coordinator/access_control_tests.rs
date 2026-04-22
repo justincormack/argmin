@@ -3561,6 +3561,87 @@ fn create_multipart_upload_bucket_lifecycle_same_pg_completes_without_deadlock()
 }
 
 #[test]
+fn begin_stream_part_bucket_policy_and_abac_same_pg_completes_without_deadlock() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    coord
+        .create_bucket_for_owner("111122223333", "bucket", false)
+        .unwrap();
+    coord
+        .put_bucket_tags(&PutBucketConfigRequest {
+            bucket: bucket_request_with_expected_owner(
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None,
+            ),
+            config:
+                "<Tagging><TagSet><Tag><Key>security</Key><Value>public</Value></Tag></TagSet></Tagging>",
+        })
+        .unwrap();
+    coord
+        .put_bucket_abac(&PutBucketAbacRequest {
+            bucket: bucket_request_with_expected_owner(
+                "bucket",
+                test_helpers::requester("111122223333"),
+                None,
+            ),
+            enabled: true,
+        })
+        .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::444455556666:root"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*","Condition":{"StringEquals":{"s3:BucketTag/security":"public"}}}]}"#,
+        test_helpers::requester("111122223333"),
+        None,
+    )
+    .unwrap();
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "bucket",
+                "key",
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let res = coord.begin_stream_part(&BeginStreamPartRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload.upload_id,
+                test_helpers::requester("444455556666"),
+                None,
+            ),
+            part_number: 1,
+            policy_context: PutObjectPolicyContext::default(),
+            sse_customer: None,
+        });
+        tx.send(res.map(|result| result.checksum_algorithm))
+            .unwrap();
+    });
+
+    let checksum_algorithm = rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("begin_stream_part should not self-deadlock on same-pg bucket policy/abac state")
+        .unwrap();
+    assert_eq!(checksum_algorithm, None);
+    handle.join().unwrap();
+}
+
+#[test]
 fn finalize_stream_put_bucket_lifecycle_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let coord = setup_coordinator_with_pg_count(tmp.path(), 1);

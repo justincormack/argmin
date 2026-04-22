@@ -4062,54 +4062,62 @@ impl Coordinator {
         let upload_id = req.upload.upload_id_typed();
         let part_number = req.part_number;
         let policy_context = req.effective_policy_context();
-        let bucket_info =
-            self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        let bucket_tags =
-            self.preload_bucket_tags_for_policy(&bucket_info, bucket_policy.as_deref())?;
-        let meta_pg = self
-            .storage_node
-            .get_pg(self.object_pg_id_for(bucket, key))?;
-        let upload = meta_pg.get_multipart_upload(upload_id)?;
-        if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        if upload.state != UploadState::InProgress {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        let policy_context =
-            Self::with_multipart_upload_managed_encryption_policy_context(policy_context, &upload);
-        if !self.requester_can_write_multipart_upload_with_bucket_policy(
-            req.upload.requester(),
-            &bucket_info,
-            bucket_tags.as_deref(),
-            &upload,
-            policy_context,
-            bucket_policy.as_deref(),
-        )? {
-            return Err(ServerError::AccessDenied);
-        }
-        Self::ensure_sse_c_allowed(&bucket_info, upload.encryption.uses_sse_customer_headers())?;
-        self.ensure_write_encryption_supported(&upload.encryption)?;
-        let sse_customer = self.prepare_existing_sse_customer_write_context(
-            &upload.encryption,
-            req.sse_customer,
-            SseCustomerSegmentScope::multipart_part(part_number)?,
-            true,
-        )?;
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+        self.with_bucket_write_handle_for(&req.upload, request, |bucket_handle| {
+            let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
+            let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
+            let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
+            let meta_pg = self
+                .storage_node
+                .get_pg(self.object_pg_id_for(bucket, key))?;
+            let upload = meta_pg.get_multipart_upload(upload_id)?;
+            if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            if upload.state != UploadState::InProgress {
+                return Err(ServerError::NoSuchUpload {
+                    upload_id: upload_id.to_string(),
+                });
+            }
+            let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
+                policy_context,
+                &upload,
+            );
+            if !self.requester_can_write_multipart_upload_with_bucket_policy(
+                req.upload.requester(),
+                &bucket_info,
+                bucket_tags.as_deref(),
+                &upload,
+                policy_context,
+                bucket_policy.as_deref(),
+            )? {
+                return Err(ServerError::AccessDenied);
+            }
+            Self::ensure_sse_c_allowed(
+                &bucket_info,
+                upload.encryption.uses_sse_customer_headers(),
+            )?;
+            self.ensure_write_encryption_supported(&upload.encryption)?;
+            let sse_customer = self.prepare_existing_sse_customer_write_context(
+                &upload.encryption,
+                req.sse_customer,
+                SseCustomerSegmentScope::multipart_part(part_number)?,
+                true,
+            )?;
 
-        Ok(AuthorizedBeginStreamPart {
-            bucket: req.upload.bucket_name_typed().clone(),
-            key: req.upload.key_typed().clone(),
-            upload_id: upload.upload_id.clone(),
-            part_number,
-            upload,
-            sse_customer,
-            meta_pg,
+            Ok(AuthorizedBeginStreamPart {
+                bucket: req.upload.bucket_name_typed().clone(),
+                key: req.upload.key_typed().clone(),
+                upload_id: upload.upload_id.clone(),
+                part_number,
+                upload,
+                sse_customer,
+                meta_pg,
+            })
         })
     }
 

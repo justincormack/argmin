@@ -1082,10 +1082,6 @@ impl<'a> GetObjectAttributesRequest<'a> {
 }
 
 impl<'a> BeginStreamPartRequest<'a> {
-    pub(super) fn expected_bucket_owner(&self) -> Option<&str> {
-        self.upload.expected_bucket_owner()
-    }
-
     pub(super) fn effective_policy_context(&self) -> PutObjectPolicyContext<'a> {
         self.policy_context
     }
