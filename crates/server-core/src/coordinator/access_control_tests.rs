@@ -3631,6 +3631,48 @@ fn finalize_stream_put_bucket_lifecycle_same_pg_completes_without_deadlock() {
 }
 
 #[test]
+fn put_bucket_lifecycle_bucket_policy_same_pg_completes_without_deadlock() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator_with_pg_count(tmp.path(), 1);
+    coord
+        .create_bucket_for_owner("owner-a", "bucket", false)
+        .unwrap();
+    put_bucket_policy_test(
+        &coord,
+        "bucket",
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"owner-a"},"Action":"s3:PutLifecycleConfiguration","Resource":"arn:aws:s3:::bucket"}]}"#,
+        test_helpers::requester("owner-a"),
+        None,
+    )
+    .unwrap();
+    coord.clear_bucket_policy_cache(&trusted_bucket_name("bucket"));
+
+    let (tx, rx) = mpsc::channel();
+    let handle = thread::spawn(move || {
+        let res = put_bucket_lifecycle_test(
+            &coord,
+            "bucket",
+            "<LifecycleConfiguration>\
+                <Rule>\
+                    <ID>expire</ID>\
+                    <Filter><Prefix>logs/</Prefix></Filter>\
+                    <Status>Enabled</Status>\
+                    <Expiration><Days>3</Days></Expiration>\
+                </Rule>\
+            </LifecycleConfiguration>",
+            test_helpers::requester("owner-a"),
+            None,
+        );
+        tx.send(res).unwrap();
+    });
+
+    rx.recv_timeout(Duration::from_secs(1))
+        .expect("put_bucket_lifecycle with bucket policy should not self-deadlock")
+        .unwrap();
+    handle.join().unwrap();
+}
+
+#[test]
 fn get_object_bucket_policy_same_pg_completes_without_deadlock() {
     let tmp = test_util::tempdir();
     let (admin, reader) = setup_coordinators_with_single_pg(tmp.path());

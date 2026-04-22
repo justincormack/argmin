@@ -1784,6 +1784,40 @@ impl Coordinator {
         Ok(bucket)
     }
 
+    fn authorize_loaded_bucket_write_action_for<R>(
+        &self,
+        req: &R,
+        action: auth::PolicyAction,
+        default_allowed: impl FnOnce(&Requester, &BucketSummary) -> bool,
+    ) -> Result<LoadedBucketHandle, ServerError>
+    where
+        R: BucketScopedAuthorizationRequest + ?Sized,
+    {
+        self.with_bucket_write_handle_for(
+            req,
+            BucketHandleRequest::new()
+                .requiring_policy_view()
+                .requiring_bucket_tags_if_abac_enabled(),
+            |bucket| {
+                let default_allowed = default_allowed(req.requester(), bucket.bucket());
+                let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+                let allowed = self
+                    .requester_can_bucket_action_with_preloaded_tags_with_bucket_policy(
+                        req.requester(),
+                        bucket.bucket(),
+                        Self::loaded_bucket_tags_for_policy(&bucket)?.as_deref(),
+                        action,
+                        bucket_policy.as_deref(),
+                        default_allowed,
+                    )?;
+                if !allowed {
+                    return Err(ServerError::AccessDenied);
+                }
+                Ok(bucket)
+            },
+        )
+    }
+
     fn authorize_loaded_bucket_policy_action_for(
         &self,
         req: &BucketRequest<'_>,
@@ -2661,9 +2695,10 @@ impl Coordinator {
         &self,
         req: &PutBucketConfigRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourcePut, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
             &req.bucket,
             auth::PolicyAction::PutBucketCors,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         Ok(AuthorizedBucketSubresourcePut {
             bucket: req.bucket.name_typed().clone(),
@@ -2745,9 +2780,10 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
             req,
             auth::PolicyAction::PutBucketCors,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         Ok(AuthorizedBucketSubresourceDelete {
             bucket: req.name_typed().clone(),
@@ -2759,11 +2795,12 @@ impl Coordinator {
         &self,
         req: &PutBucketConfigRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourcePut, ServerError> {
-        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let bucket = self.authorize_loaded_bucket_write_action_for(
             &req.bucket,
             auth::PolicyAction::PutBucketTagging,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
-        if bucket_info.bucket_abac_enabled {
+        if bucket.bucket().bucket_abac_enabled {
             return Err(ServerError::BadRequest {
                 reason: "This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To add tags to this bucket, initiate a TagResource request. To delete tags from this bucket, initiate an UntagResource request.".to_string(),
             });
@@ -2779,11 +2816,12 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
-        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let bucket = self.authorize_loaded_bucket_write_action_for(
             req,
             auth::PolicyAction::PutBucketTagging,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
-        if bucket_info.bucket_abac_enabled {
+        if bucket.bucket().bucket_abac_enabled {
             return Err(ServerError::BadRequest {
                 reason: "This S3 general purpose bucket has attribute-based access control (ABAC) enabled. To delete tags from this bucket, initiate an UntagResource request.".to_string(),
             });
@@ -2936,9 +2974,10 @@ impl Coordinator {
         &self,
         req: &PutBucketPublicAccessBlockRequest<'_>,
     ) -> Result<AuthorizedPutBucketPublicAccessBlock, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
             &req.bucket,
             auth::PolicyAction::PutBucketPublicAccessBlock,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         Ok(AuthorizedPutBucketPublicAccessBlock {
             bucket: req.bucket.name_typed().clone(),
@@ -2964,9 +3003,10 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
             req,
             auth::PolicyAction::PutBucketPublicAccessBlock,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         Ok(AuthorizedBucketConfigAccess {
             bucket: req.name_typed().clone(),
@@ -2977,14 +3017,15 @@ impl Coordinator {
         &self,
         req: &PutBucketOwnershipControlsRequest<'_>,
     ) -> Result<AuthorizedPutBucketOwnershipControls, ServerError> {
-        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let bucket = self.authorize_loaded_bucket_write_action_for(
             &req.bucket,
             auth::PolicyAction::PutBucketOwnershipControls,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         if Self::is_bucket_owner_enforced(Some(&req.config))
             && !Self::acl_grants_owner_full_control_only(
-                &bucket_info.owner_canonical_id,
-                &bucket_info.acl_grants,
+                &bucket.bucket().owner_canonical_id,
+                &bucket.bucket().acl_grants,
             )
         {
             return Err(ServerError::InvalidBucketAclWithObjectOwnership);
@@ -3013,9 +3054,10 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketConfigAccess, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
             req,
             auth::PolicyAction::PutBucketOwnershipControls,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         Ok(AuthorizedBucketConfigAccess {
             bucket: req.name_typed().clone(),
@@ -3026,9 +3068,10 @@ impl Coordinator {
         &self,
         req: &PutBucketConfigRequest<'_>,
     ) -> Result<AuthorizedPutBucketLifecycle, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
             &req.bucket,
             auth::PolicyAction::PutLifecycleConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         let parsed_config = s3_types::parse_lifecycle_configuration_xml(req.config.as_bytes())
             .map_err(|error| match error {
@@ -3095,9 +3138,10 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedBucketSubresourceDelete, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
             req,
             auth::PolicyAction::PutLifecycleConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         Ok(AuthorizedBucketSubresourceDelete {
             bucket: req.name_typed().clone(),
@@ -3109,9 +3153,10 @@ impl Coordinator {
         &self,
         req: &PutBucketEncryptionRequest<'_>,
     ) -> Result<AuthorizedPutBucketEncryption, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
             &req.bucket,
             auth::PolicyAction::PutEncryptionConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         Ok(AuthorizedPutBucketEncryption {
             bucket: req.bucket.name_typed().clone(),
@@ -3124,11 +3169,12 @@ impl Coordinator {
         &self,
         req: &PutBucketVersioningRequest<'_>,
     ) -> Result<AuthorizedPutBucketVersioning, ServerError> {
-        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let bucket = self.authorize_loaded_bucket_write_action_for(
             &req.bucket,
             auth::PolicyAction::PutBucketVersioning,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
-        if bucket_info.object_lock.enabled && req.state != BucketVersioningState::Enabled {
+        if bucket.bucket().object_lock.enabled && req.state != BucketVersioningState::Enabled {
             return Err(ServerError::InvalidBucketState);
         }
         Ok(AuthorizedPutBucketVersioning {
@@ -3307,16 +3353,17 @@ impl Coordinator {
         &self,
         req: &PutBucketObjectLockConfigurationRequest<'_>,
     ) -> Result<AuthorizedPutBucketObjectLockConfiguration, ServerError> {
-        let bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let bucket = self.authorize_loaded_bucket_write_action_for(
             &req.bucket,
             auth::PolicyAction::PutBucketObjectLockConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
-        if bucket_info.versioning != BucketVersioningState::Enabled {
+        if bucket.bucket().versioning != BucketVersioningState::Enabled {
             return Err(ServerError::InvalidBucketState);
         }
 
         let final_enabled =
-            bucket_info.object_lock.enabled || req.config.object_lock_enabled.is_some();
+            bucket.bucket().object_lock.enabled || req.config.object_lock_enabled.is_some();
         if !final_enabled {
             return Err(ServerError::InvalidRequest {
                 reason: "Object Lock must be enabled before configuring this bucket".to_string(),
@@ -3350,9 +3397,10 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedDeleteBucketEncryption, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
             req,
             auth::PolicyAction::PutEncryptionConfiguration,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         Ok(AuthorizedDeleteBucketEncryption {
             bucket: req.name_typed().clone(),

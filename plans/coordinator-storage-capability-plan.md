@@ -549,6 +549,17 @@ Questions to re-check:
   the PG leak
 - are phases 5+ still mechanical migrations from the resulting boundary
 
+Re-review status:
+
+- completed
+- ordinary single-object write/delete flow now avoids coordinator-visible
+  bucket PG access on the migrated bucket side
+- write-side reservation handling for the migrated single-object surface is now
+  hidden behind storage-owned bucket snapshot acquisition
+- no new duplicate-load or late bucket-load seam was found in the re-review
+- phase 5 remains a mechanical migration from the resulting bucket write-handle
+  boundary
+
 ### Phase 5: Bucket Write/Admin/Config Paths
 
 Move the bucket-only mutation and admin/config family to the same bucket
@@ -583,6 +594,36 @@ Acceptance criteria:
   model for these operations
 - bucket policy / tags / config state needed for authz is part of initial
   bucket acquisition, not loaded later by helpers
+
+Phase 5 status:
+
+- in progress
+- first migrated slice:
+  - `PutBucketCors`
+  - `DeleteBucketCors`
+  - `PutBucketTagging`
+  - `DeleteBucketTagging`
+  - `PutBucketLifecycle`
+  - `DeleteBucketLifecycle`
+  - `PutBucketEncryption`
+  - `DeleteBucketEncryption`
+  - `PutBucketPublicAccessBlock`
+  - `DeleteBucketPublicAccessBlock`
+  - `PutBucketOwnershipControls`
+  - `DeleteBucketOwnershipControls`
+  - `PutBucketVersioning`
+  - `PutBucketObjectLockConfiguration`
+- these paths now authorize from a write-scoped loaded bucket handle instead of
+  `checked_active_bucket_summary_for(...)` plus later bucket policy/cache
+  loads
+- bucket policy, ABAC tags, and bucket-state-dependent validation on this slice
+  now come from the initial write-scoped bucket acquisition
+- remaining phase-5 surface to migrate:
+  - `PutBucketPolicy`
+  - `DeleteBucketPolicy`
+  - `PutBucketAcl`
+  - `PutBucketAbac`
+  - any remaining bucket mutation path still using direct summary/cache lookup
 
 ### Phase 6: DeleteBucket and Bucket Teardown
 
