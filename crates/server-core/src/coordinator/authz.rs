@@ -1709,7 +1709,7 @@ impl Coordinator {
             .load_bucket(bucket, expected_bucket_owner, request)
     }
 
-    fn with_bucket_write_handle_for<R, T>(
+    pub(super) fn with_bucket_write_handle_for<R, T>(
         &self,
         req: &R,
         request: BucketHandleRequest,

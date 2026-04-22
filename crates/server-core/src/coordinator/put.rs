@@ -5,6 +5,7 @@ use storage::{
     StreamUploadTarget,
 };
 
+use super::bucket_handles::BucketHandleRequest;
 use super::{
     ActiveWriteEncryption, AuthorizePutObjectRequest, AuthorizedFinalizeStreamPutRequest,
     AuthorizedPutObjectCommitRequest, AuthorizedPutObjectWrite, AuthorizedWriteTags, Coordinator,
@@ -103,7 +104,9 @@ impl Coordinator {
             return result;
         }
 
-        self.with_bucket_write_reservation_for(authorized, |bucket_info| {
+        let request = BucketHandleRequest::new().requiring_lifecycle_view();
+        self.with_bucket_write_handle_for(authorized, request, |bucket_handle| {
+            let bucket_info = bucket_handle.bucket().clone();
             let write_encryption = &authorized.write_encryption;
             Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
             let acl = authorized.acl();
@@ -255,13 +258,14 @@ impl Coordinator {
             let lifecycle_last_modified = live_record.last_modified;
 
             drop(pgs);
-            let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
-                &bucket_info,
-                authorized.key(),
-                lifecycle_tags.as_deref(),
-                lifecycle_size,
-                lifecycle_last_modified,
-            )?;
+            let lifecycle_expiration = self
+                .current_object_write_lifecycle_expiration_for_loaded_bucket(
+                    &bucket_handle,
+                    authorized.key(),
+                    lifecycle_tags.as_deref(),
+                    lifecycle_size,
+                    lifecycle_last_modified,
+                )?;
             if let Some(ref payload) = prepared.stale_payload {
                 self.delete_stale_object_payload(
                     authorized.bucket_typed(),
@@ -412,7 +416,9 @@ impl Coordinator {
         let metadata_blob = req.metadata_blob;
         let tags = req.tags;
         let cond = req.cond;
-        self.with_bucket_write_reservation_for(&req.object, |bucket_info| {
+        let request = BucketHandleRequest::new().requiring_lifecycle_view();
+        self.with_bucket_write_handle_for(&req.object, request, |bucket_handle| {
+            let bucket_info = bucket_handle.bucket().clone();
             Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
             let resolved_object_lock =
                 Self::resolve_new_object_lock_state(&bucket_info, req.requested_object_lock)?;
@@ -543,13 +549,14 @@ impl Coordinator {
             let lifecycle_last_modified = live_record.last_modified;
 
             drop(meta_guard);
-            let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
-                &bucket_info,
-                key,
-                lifecycle_tags.as_deref(),
-                lifecycle_size,
-                lifecycle_last_modified,
-            )?;
+            let lifecycle_expiration = self
+                .current_object_write_lifecycle_expiration_for_loaded_bucket(
+                    &bucket_handle,
+                    key,
+                    lifecycle_tags.as_deref(),
+                    lifecycle_size,
+                    lifecycle_last_modified,
+                )?;
             if let Some(ref payload) = prepared.stale_payload {
                 self.delete_stale_object_payload(
                     req.object.bucket_name_typed(),

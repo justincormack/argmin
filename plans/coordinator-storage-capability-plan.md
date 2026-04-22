@@ -416,10 +416,13 @@ Acceptance criteria:
 
 Phase 4 status:
 
-- in progress
+- completed
 - migrated so far:
   - `PutObject` authorization now uses a reservation-backed bucket handle
     rather than separate bucket policy/tag loads
+  - direct `PutObject` commit and streaming `PutObject` finalize now carry
+    lifecycle through the same write-scoped bucket handle rather than doing a
+    later bucket lifecycle load from the cache/subresource path
   - `DeleteObject` now uses the ordinary loaded bucket-handle path for bucket
     policy / ABAC inputs
   - the shared mutation helpers for:
@@ -429,10 +432,9 @@ Phase 4 status:
     - `PutObjectRetention`
     - `PutObjectLegalHold`
     now load bucket policy / ABAC inputs through the loaded bucket-handle path
-- still open in this phase:
-  - commit/publication-side write reservation integration
-  - checking whether any remaining single-object mutation helpers still bypass
-    the bucket-handle path
+- remaining old-style reservation / bucket-reload paths are now in later-phase
+  multipart/copy flows rather than the ordinary single-object write/delete
+  surface
 
 ### Checkpoint After Phase 4
 
