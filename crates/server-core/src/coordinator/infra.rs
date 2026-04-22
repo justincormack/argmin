@@ -10,7 +10,7 @@ use super::authz_types::{AuthorizedPutObjectWrite, ValidatedBucket};
 use super::payload::{EncodeScratchPool, PayloadBufferPool};
 use super::pg_guards::{BucketObjectPgGuards, TwoPgGuards};
 use super::read_core::ReadRuntime;
-use super::request_types::{AuthorizePutObjectRequest, BucketScopedRequest};
+use super::request_types::AuthorizePutObjectRequest;
 use super::response_types::BucketSummary;
 use super::runtime::{LifecycleSweeper, ReclaimSweeper};
 #[cfg(test)]
@@ -74,75 +74,6 @@ impl Coordinator {
         req: &AuthorizePutObjectRequest<'_>,
     ) -> Result<AuthorizedPutObjectWrite, ServerError> {
         self.authorize_put_object_write(req)
-    }
-
-    fn unchecked_bucket_write_reservation_for(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<BucketSummary, ServerError> {
-        loop {
-            let bucket_pg = self.get_bucket_pg_for(bucket)?;
-            match storage::PgMetadataStore::acquire_bucket_write_reservation(&*bucket_pg, bucket) {
-                Ok(info) => {
-                    self.storage_node.upsert_bucket_fast_path((&info).into());
-                    return Ok(Self::bucket_summary(info));
-                }
-                Err(storage::MetadataError::BucketWriteDraining) => {
-                    drop(bucket_pg);
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(storage::MetadataError::BucketNotFound { name }) => {
-                    return Err(ServerError::BucketNotFound {
-                        name: name.to_string(),
-                    });
-                }
-                Err(other) => return Err(ServerError::Metadata(other)),
-            }
-        }
-    }
-
-    fn release_bucket_write_reservation_for(&self, bucket: &BucketName) -> Result<(), ServerError> {
-        let bucket_pg = self.get_bucket_pg_for(bucket)?;
-        storage::PgMetadataStore::release_bucket_write_reservation(&*bucket_pg, bucket).map_err(
-            |e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            },
-        )
-    }
-
-    pub(super) fn with_unchecked_bucket_write_reservation_for<T>(
-        &self,
-        bucket: &BucketName,
-        action: impl FnOnce(BucketSummary) -> Result<T, ServerError>,
-    ) -> Result<T, ServerError> {
-        let bucket_info = self.unchecked_bucket_write_reservation_for(bucket)?;
-        let result = action(bucket_info);
-        let release_result = self.release_bucket_write_reservation_for(bucket);
-        match (result, release_result) {
-            (Ok(value), Ok(())) => Ok(value),
-            (Ok(_), Err(err)) => Err(err),
-            (Err(err), Ok(())) => Err(err),
-            (Err(err), Err(_)) => Err(err),
-        }
-    }
-
-    pub(super) fn with_bucket_write_reservation_for<R, T>(
-        &self,
-        req: &R,
-        action: impl FnOnce(ValidatedBucket) -> Result<T, ServerError>,
-    ) -> Result<T, ServerError>
-    where
-        R: BucketScopedRequest + ?Sized,
-    {
-        let expected_bucket_owner = req.expected_bucket_owner();
-        self.with_unchecked_bucket_write_reservation_for(req.bucket_name_typed(), |bucket_info| {
-            let bucket_info =
-                Self::validate_expected_bucket_owner(bucket_info, expected_bucket_owner)?;
-            action(bucket_info)
-        })
     }
 
     pub(super) fn next_completed_multipart_upload_order_for_bucket_name(

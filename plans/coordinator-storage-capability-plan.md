@@ -682,6 +682,20 @@ Acceptance criteria:
 - storage/lock correctness is encoded by the capability flow rather than by
   additional local PG-order reasoning
 
+Phase 7 status:
+
+- in progress
+- migrated so far:
+  - `CreateMultipartUpload`
+  - `CompleteMultipartUpload`
+- these now use the write-scoped bucket handle path for bucket policy / ABAC
+  inputs instead of the older reservation-only summary path
+- remaining obvious phase-7 surface:
+  - `UploadPart`
+  - `AbortMultipartUpload`
+  - streaming `PutObject`
+  - streaming part/session flows
+
 ### Phase 8: Copy / UploadPartCopy Dual-Bucket Flows
 
 Copy requires two top-level bucket capabilities and is the main two-bucket

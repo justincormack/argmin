@@ -3904,7 +3904,11 @@ impl Coordinator {
     ) -> Result<AuthorizedCreateMultipartUpload, ServerError> {
         let key = req.object.key();
         let policy_context = req.effective_policy_context()?;
-        self.with_bucket_write_reservation_for(&req.object, |bucket_info| {
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+        self.with_bucket_write_handle_for(&req.object, request, |bucket| {
+            let bucket_info = ValidatedBucket(bucket.bucket().clone());
             if req.object.requester().is_anonymous() {
                 return Err(ServerError::AccessDenied);
             }
@@ -3912,9 +3916,8 @@ impl Coordinator {
                 req.object.bucket.name_typed(),
                 req.object.key_typed(),
             )?;
-            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-            let bucket_tags =
-                self.preload_bucket_tags_for_policy(&bucket_info, bucket_policy.as_deref())?;
+            let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+            let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket)?;
             if !self.requester_can_put_object_with_bucket_policy(
                 BucketPolicyAccess {
                     requester: req.object.requester(),
@@ -4117,10 +4120,13 @@ impl Coordinator {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
         let upload_id = req.upload.upload_id_typed();
-        self.with_bucket_write_reservation_for(&req.upload, |bucket_info| {
-            let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-            let bucket_tags =
-                self.preload_bucket_tags_for_policy(&bucket_info, bucket_policy.as_deref())?;
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+        self.with_bucket_write_handle_for(&req.upload, request, |bucket_handle| {
+            let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
+            let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
+            let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
             let meta_pg = self
                 .storage_node
                 .get_pg(self.object_pg_id_for(bucket, key))?;
