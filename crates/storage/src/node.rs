@@ -15,9 +15,9 @@ use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::{
     BucketFastPathInfo, BucketName, BucketSnapshot, BucketSnapshotPair, BucketSnapshotRequest,
-    BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind, GenerationId,
-    ListMultipartUploadsReq, ListObjectVersionsReq, LoadedBucketSubresource, ObjectKey, ShardKey,
-    WriteAck,
+    BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind, CreateStreamUploadReq,
+    GenerationId, ListMultipartUploadsReq, ListObjectVersionsReq, LoadedBucketSubresource,
+    MultipartUploadRecord, ObjectKey, SessionId, ShardKey, StreamUploadTarget, UploadId, WriteAck,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -923,6 +923,60 @@ impl SharedStorageNode {
                 Err(other) => return Err(other.into()),
             }
         }
+    }
+
+    fn load_multipart_upload_from_object_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, crate::error::MetadataError> {
+        let upload = pg.get_multipart_upload(upload_id)?;
+        if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
+            return Err(crate::error::MetadataError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        Ok(upload)
+    }
+
+    pub fn load_multipart_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, BucketSnapshotLoadError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        Ok(Self::load_multipart_upload_from_object_pg(
+            &pg, bucket, key, upload_id,
+        )?)
+    }
+
+    pub fn begin_upload_part_stream_session<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number: u32,
+        session_id: &SessionId,
+        action: impl FnOnce(&MultipartUploadRecord) -> Result<T, E>,
+    ) -> Result<Result<T, E>, BucketSnapshotLoadError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let upload = Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
+        let result = action(&upload);
+        if result.is_ok() {
+            pg.create_stream_upload(&CreateStreamUploadReq {
+                session_id: session_id.clone(),
+                bucket: bucket.clone(),
+                key: key.clone(),
+                target: StreamUploadTarget::UploadPart {
+                    upload_id: upload_id.clone(),
+                    part_number,
+                },
+                encryption: upload.encryption.clone(),
+            })?;
+        }
+        Ok(result)
     }
 
     pub fn load_bucket_snapshot_pair(

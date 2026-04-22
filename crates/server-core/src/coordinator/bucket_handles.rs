@@ -397,6 +397,11 @@ impl<'a> BucketHandleLoader<'a> {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
                 },
+                storage::MetadataError::NoSuchUpload { upload_id } => {
+                    ServerError::NoSuchUpload {
+                        upload_id: upload_id.to_string(),
+                    }
+                }
                 other => ServerError::Metadata(other),
             },
         }

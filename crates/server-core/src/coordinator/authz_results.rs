@@ -254,14 +254,13 @@ pub(super) struct AuthorizedCreateMultipartUpload {
     pub(super) write_encryption: ActiveWriteEncryption,
 }
 
-pub(super) struct AuthorizedBeginStreamPart<'a> {
+pub(super) struct AuthorizedBeginStreamPart {
     pub(super) bucket: BucketName,
     pub(super) key: ObjectKey,
     pub(super) upload_id: UploadId,
     pub(super) part_number: u32,
     pub(super) upload: MultipartUploadRecord,
     pub(super) sse_customer: Option<SseCustomerWriteContext>,
-    pub(super) meta_pg: MutexGuard<'a, storage::PgStore>,
 }
 
 #[derive(Debug)]
@@ -411,7 +410,7 @@ impl std::fmt::Debug for AuthorizedCopyObject<'_> {
     }
 }
 
-impl std::fmt::Debug for AuthorizedBeginStreamPart<'_> {
+impl std::fmt::Debug for AuthorizedBeginStreamPart {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthorizedBeginStreamPart")
             .field("bucket", &self.bucket)

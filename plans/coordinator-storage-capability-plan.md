@@ -789,14 +789,23 @@ Phase 7 status:
   - `BeginStreamPart`
 - these now use the write-scoped bucket handle path for bucket policy / ABAC
   inputs instead of the older reservation-only summary path
+- `BeginStreamPart` is now the first multipart/session write path moved onto
+  the corrected phase-4d shape:
+  - the protected action runs inside the storage-owned write reservation
+  - coordinator no longer receives or returns a metadata PG guard for this path
+  - multipart upload lookup and stream-session creation stay inside the
+    storage-owned object-PG step
 - follow-up required on migrated slice:
-  - these paths also need to move from the current write-scoped snapshot
-    boundary to the phase-4d write-scoped action boundary
+  - `CreateMultipartUpload` and `CompleteMultipartUpload` still need to move
+    from the current write-scoped snapshot boundary to the phase-4d
+    write-scoped action boundary
   - any migrated multipart/session path that still returns coordinator-visible
     PG guards is only partially migrated and must be redesigned so storage owns
     the protected write action end to end
-  - so the already-migrated phase-7 surface should be treated as
-    reservation-lifetime-rework pending, not final
+  - so the phase-7 surface is now mixed:
+    - `BeginStreamPart` is the first corrected proving slice
+    - the rest of the migrated surface is still
+      reservation-lifetime-rework pending, not final
 - remaining obvious phase-7 surface:
   - `UploadPart`
   - `AbortMultipartUpload`

@@ -25,6 +25,31 @@ fn create_bucket_with_explicit_writer_grant(
 
 // ── Multipart upload tests ────────────────────────────────────────
 
+fn upload_part_stream_session_count(
+    coord: &Coordinator,
+    bucket: &str,
+    key: &str,
+    upload_id: &UploadId,
+    part_number: u32,
+) -> usize {
+    let pg = coord.storage_node.get_pg(coord.object_pg_id(bucket, key)).unwrap();
+    pg.list_all_stream_uploads()
+        .unwrap()
+        .into_iter()
+        .filter(|session| {
+            session.bucket == bucket
+                && session.key == key
+                && matches!(
+                    &session.target,
+                    StreamUploadTarget::UploadPart {
+                        upload_id: target_upload_id,
+                        part_number: target_part_number,
+                    } if target_upload_id == upload_id && *target_part_number == part_number
+                )
+        })
+        .count()
+}
+
 #[test]
 fn create_multipart_upload_returns_upload_id() {
     let tmp = test_util::tempdir();
@@ -3684,6 +3709,261 @@ fn list_parts_nonexistent_upload() {
     assert!(
         matches!(err, ServerError::NoSuchUpload { .. }),
         "expected NoSuchUpload, got {err:?}"
+    );
+}
+
+#[test]
+fn begin_stream_part_nonexistent_upload() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let err = coord
+        .begin_stream_part(&BeginStreamPartRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                "no-such-upload",
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            policy_context: PutObjectPolicyContext::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::NoSuchUpload { .. }),
+        "expected NoSuchUpload, got {err:?}"
+    );
+    assert_eq!(
+        upload_part_stream_session_count(
+            &coord,
+            "bucket",
+            "key",
+            &trusted_upload_id("no-such-upload"),
+            1,
+        ),
+        0,
+        "nonexistent upload should not create a stream session row",
+    );
+}
+
+#[test]
+fn begin_stream_part_wrong_key_returns_no_such_upload_without_creating_session() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", "key-a", test_requester(), None),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let err = coord
+        .begin_stream_part(&BeginStreamPartRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key-b",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            policy_context: PutObjectPolicyContext::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::NoSuchUpload { .. }),
+        "expected NoSuchUpload, got {err:?}"
+    );
+    assert_eq!(
+        upload_part_stream_session_count(&coord, "bucket", "key-a", &upload.upload_id, 1),
+        0,
+        "wrong-key request should not create a stream session for the real upload key",
+    );
+    assert_eq!(
+        upload_part_stream_session_count(&coord, "bucket", "key-b", &upload.upload_id, 1),
+        0,
+        "wrong-key request should not create a stream session for the requested key",
+    );
+}
+
+#[test]
+fn begin_stream_part_wrong_bucket_returns_no_such_upload_without_creating_session() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket-a", false)
+        .unwrap();
+    coord
+        .create_bucket_for_owner("default-owner", "bucket-b", false)
+        .unwrap();
+
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner(
+                "bucket-a",
+                "key",
+                test_requester(),
+                None,
+            ),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let err = coord
+        .begin_stream_part(&BeginStreamPartRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket-b",
+                "key",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            policy_context: PutObjectPolicyContext::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::NoSuchUpload { .. }),
+        "expected NoSuchUpload, got {err:?}"
+    );
+    assert_eq!(
+        upload_part_stream_session_count(&coord, "bucket-a", "key", &upload.upload_id, 1),
+        0,
+        "wrong-bucket request should not create a stream session for the real upload bucket",
+    );
+    assert_eq!(
+        upload_part_stream_session_count(&coord, "bucket-b", "key", &upload.upload_id, 1),
+        0,
+        "wrong-bucket request should not create a stream session for the requested bucket",
+    );
+}
+
+#[test]
+fn begin_stream_part_aborting_upload_returns_no_such_upload_without_creating_session() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let pg = coord.storage_node.get_pg(coord.object_pg_id("bucket", "key")).unwrap();
+    pg.set_upload_state(&upload.upload_id, UploadState::Aborting)
+        .unwrap();
+    drop(pg);
+
+    let err = coord
+        .begin_stream_part(&BeginStreamPartRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            policy_context: PutObjectPolicyContext::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::NoSuchUpload { .. }),
+        "expected NoSuchUpload, got {err:?}"
+    );
+    assert_eq!(
+        upload_part_stream_session_count(&coord, "bucket", "key", &upload.upload_id, 1),
+        0,
+        "aborting upload should not create a stream session row",
+    );
+}
+
+#[test]
+fn begin_stream_part_completing_upload_returns_no_such_upload_without_creating_session() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    coord
+        .create_bucket_for_owner("default-owner", "bucket", false)
+        .unwrap();
+
+    let upload = coord
+        .create_multipart_upload(&CreateMultipartUploadRequest {
+            object: object_request_with_expected_owner("bucket", "key", test_requester(), None),
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            checksum: None,
+            acl: NO_PUT_OBJECT_ACL.into(),
+            encryption: WriteEncryptionRequest::none(),
+            object_lock: ObjectLockState::default(),
+            policy_context: PutObjectPolicyContext::default(),
+        })
+        .unwrap();
+
+    let pg = coord.storage_node.get_pg(coord.object_pg_id("bucket", "key")).unwrap();
+    pg.set_upload_state(&upload.upload_id, UploadState::Completing)
+        .unwrap();
+    drop(pg);
+
+    let err = coord
+        .begin_stream_part(&BeginStreamPartRequest {
+            upload: multipart_object_request_with_expected_owner(
+                "bucket",
+                "key",
+                &upload.upload_id,
+                test_requester(),
+                None,
+            ),
+            part_number: 1,
+            policy_context: PutObjectPolicyContext::default(),
+            sse_customer: None,
+        })
+        .unwrap_err();
+    assert!(
+        matches!(err, ServerError::NoSuchUpload { .. }),
+        "expected NoSuchUpload, got {err:?}"
+    );
+    assert_eq!(
+        upload_part_stream_session_count(&coord, "bucket", "key", &upload.upload_id, 1),
+        0,
+        "completing upload should not create a stream session row",
     );
 }
 

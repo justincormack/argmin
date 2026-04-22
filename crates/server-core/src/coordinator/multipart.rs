@@ -11,9 +11,10 @@ use storage::{
 };
 
 use super::authz_results::{
-    AuthorizedAbortMultipartUpload, AuthorizedBeginStreamPart, AuthorizedCompleteMultipartUpload,
+    AuthorizedAbortMultipartUpload, AuthorizedCompleteMultipartUpload,
     AuthorizedCreateMultipartUpload, AuthorizedListMultipartUploads, AuthorizedListParts,
 };
+use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
 #[cfg(test)]
 use super::maybe_run_multipart_complete_pre_commit_hook;
 use super::object_state::StaleObjectPayload;
@@ -78,30 +79,50 @@ impl Coordinator {
             req.part_number
         );
         Self::validate_upload_part_number(req.part_number)?;
-        let AuthorizedBeginStreamPart {
-            bucket,
-            key,
-            upload_id,
-            part_number,
-            upload,
-            sse_customer,
-            meta_pg: pg,
-        } = self.authorize_begin_stream_part(req)?;
-
-        let session_id = self.create_upload_part_stream_session(
-            &pg,
-            &bucket,
-            &key,
-            &upload_id,
-            part_number,
-            &upload,
-        )?;
-
-        Ok(BeginStreamPartResult {
-            session_id,
-            checksum_algorithm: upload.checksum.map(MultipartChecksumConfig::algorithm),
-            sse_customer,
-        })
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+        let expected_bucket_owner = req.upload.expected_bucket_owner();
+        let session_id = Self::random_session_id("failed to generate session ID")?;
+        self.storage_node
+            .with_bucket_write_snapshot(
+                req.upload.bucket_name_typed(),
+                request.resolve_to_storage_request(),
+                |snapshot| {
+                    let bucket_handle = self
+                        .bucket_handle_loader()
+                        .load_bucket_handle_from_snapshot(
+                            snapshot,
+                            expected_bucket_owner,
+                            request,
+                        )?;
+                    self.storage_node
+                        .begin_upload_part_stream_session(
+                            req.upload.bucket_name_typed(),
+                            req.upload.key_typed(),
+                            req.upload.upload_id_typed(),
+                            req.part_number,
+                            &session_id,
+                            |upload| {
+                                let authorized = self.authorize_begin_stream_part_with_upload(
+                                    req,
+                                    &bucket_handle,
+                                    upload,
+                                )?;
+                                Ok::<_, ServerError>(BeginStreamPartResult {
+                                    session_id: session_id.clone(),
+                                    checksum_algorithm: authorized
+                                        .upload
+                                        .checksum
+                                        .map(MultipartChecksumConfig::algorithm),
+                                    sse_customer: authorized.sse_customer,
+                                })
+                            },
+                        )
+                        .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
+                },
+            )
+            .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
     }
 
     pub(super) fn validate_upload_part_number(part_number: u32) -> Result<(), ServerError> {
