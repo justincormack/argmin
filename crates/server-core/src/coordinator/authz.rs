@@ -1882,46 +1882,6 @@ impl Coordinator {
         )
     }
 
-    pub(super) fn authorize_bucket_admin_or_bucket_policy_action(
-        &self,
-        requester: &Requester,
-        bucket: &BucketName,
-        expected_bucket_owner: Option<&str>,
-        action: auth::PolicyAction,
-    ) -> Result<ValidatedBucket, ServerError> {
-        let info = self.checked_active_bucket_summary_for(bucket, expected_bucket_owner)?;
-        let bucket_policy = self.cached_bucket_policy(&info)?;
-        let policy_decision = self.bucket_policy_decision_for_bucket_loaded(
-            requester,
-            &info,
-            action,
-            bucket_policy.as_deref(),
-        )?;
-        if Self::bucket_policy_allows_with_fallback(requester, &info, policy_decision, || {
-            Self::requester_can_bucket_owner_account_admin(requester, &info)
-        }) {
-            Ok(info)
-        } else {
-            Err(ServerError::AccessDenied)
-        }
-    }
-
-    pub(super) fn authorize_bucket_admin_or_bucket_policy_action_for<R>(
-        &self,
-        req: &R,
-        action: auth::PolicyAction,
-    ) -> Result<ValidatedBucket, ServerError>
-    where
-        R: BucketScopedAuthorizationRequest + ?Sized,
-    {
-        self.authorize_bucket_admin_or_bucket_policy_action(
-            req.requester(),
-            req.bucket_name_typed(),
-            req.expected_bucket_owner(),
-            action,
-        )
-    }
-
     pub(super) fn parse_policy_existing_object_tags(
         object: &StoredObject,
     ) -> Result<Vec<(String, String)>, ServerError> {
@@ -2672,9 +2632,10 @@ impl Coordinator {
         &self,
         req: &BucketRequest<'_>,
     ) -> Result<AuthorizedDeleteBucket, ServerError> {
-        let _bucket_info = self.authorize_bucket_admin_or_bucket_policy_action_for(
+        let _bucket = self.authorize_loaded_bucket_write_action_for(
             req,
             auth::PolicyAction::DeleteBucket,
+            Self::requester_can_bucket_owner_account_admin,
         )?;
         Ok(AuthorizedDeleteBucket {
             name: req.name_typed().clone(),

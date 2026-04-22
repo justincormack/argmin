@@ -95,3 +95,11 @@ pub enum BucketSnapshotLoadError {
     #[error(transparent)]
     Metadata(#[from] MetadataError),
 }
+
+#[derive(Debug, thiserror::Error)]
+pub enum BucketWriteDrainError {
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error(transparent)]
+    Metadata(#[from] MetadataError),
+}

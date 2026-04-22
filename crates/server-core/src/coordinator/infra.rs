@@ -194,53 +194,6 @@ impl Coordinator {
         Ok(())
     }
 
-    pub(super) fn begin_bucket_write_drain_for(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<(), ServerError> {
-        loop {
-            let bucket_pg = self.get_bucket_pg_for(bucket)?;
-            match storage::PgMetadataStore::begin_bucket_write_drain(&*bucket_pg, bucket) {
-                Ok(()) => return Ok(()),
-                Err(storage::MetadataError::BucketWriteDraining) => {
-                    drop(bucket_pg);
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                Err(storage::MetadataError::BucketNotFound { name }) => {
-                    return Err(ServerError::BucketNotFound {
-                        name: name.to_string(),
-                    });
-                }
-                Err(other) => return Err(ServerError::Metadata(other)),
-            }
-        }
-    }
-
-    pub(super) fn wait_for_bucket_write_reservations_to_drain_for(
-        &self,
-        bucket: &BucketName,
-    ) -> Result<(), ServerError> {
-        loop {
-            let bucket_pg = self.get_bucket_pg_for(bucket)?;
-            let info =
-                storage::PgMetadataStore::head_bucket(&*bucket_pg, bucket).map_err(
-                    |e| match e {
-                        storage::MetadataError::BucketNotFound { name } => {
-                            ServerError::BucketNotFound {
-                                name: name.to_string(),
-                            }
-                        }
-                        other => ServerError::Metadata(other),
-                    },
-                )?;
-            if info.active_write_reservations == 0 {
-                return Ok(());
-            }
-            drop(bucket_pg);
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-    }
-
     pub(super) fn bucket_summary(info: BucketInfo) -> BucketSummary {
         Self::bucket_summary_ref(&info)
     }

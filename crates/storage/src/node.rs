@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use rapidhash::v3::{rapidhash_v3_micro_inline, RapidSecrets};
 
-use crate::error::{BucketSnapshotLoadError, StoreError};
+use crate::error::{BucketSnapshotLoadError, BucketWriteDrainError, StoreError};
 use crate::pg_store::PgStore;
 use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
@@ -54,6 +54,26 @@ pub enum BucketPairPgGuards<'a> {
         source: MutexGuard<'a, PgStore>,
         destination: MutexGuard<'a, PgStore>,
     },
+}
+
+pub struct BucketWriteDrainGuard<'a> {
+    node: &'a SharedStorageNode,
+    bucket: BucketName,
+    persisted: bool,
+}
+
+impl BucketWriteDrainGuard<'_> {
+    pub fn persist(mut self) {
+        self.persisted = true;
+    }
+}
+
+impl Drop for BucketWriteDrainGuard<'_> {
+    fn drop(&mut self) {
+        if !self.persisted {
+            let _ = self.node.end_bucket_write_drain(&self.bucket);
+        }
+    }
 }
 
 impl<'a> BucketPairPgGuards<'a> {
@@ -689,6 +709,53 @@ impl SharedStorageNode {
         Self::load_bucket_snapshot_from_pg(&bucket_pg, bucket, request)
     }
 
+    pub fn begin_bucket_write_drain(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketWriteDrainGuard<'_>, BucketWriteDrainError> {
+        loop {
+            let pg_id = self.pg_topology.bucket_pg_for(bucket);
+            let bucket_pg = self.get_pg(pg_id)?;
+            match PgMetadataStore::begin_bucket_write_drain(&*bucket_pg, bucket) {
+                Ok(()) => break,
+                Err(crate::error::MetadataError::BucketWriteDraining) => {
+                    drop(bucket_pg);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(other) => return Err(other.into()),
+            }
+        }
+
+        loop {
+            let pg_id = self.pg_topology.bucket_pg_for(bucket);
+            let bucket_pg = self.get_pg(pg_id)?;
+            let info = PgMetadataStore::head_bucket(&*bucket_pg, bucket)?;
+            if info.active_write_reservations == 0 {
+                return Ok(BucketWriteDrainGuard {
+                    node: self,
+                    bucket: bucket.clone(),
+                    persisted: false,
+                });
+            }
+            drop(bucket_pg);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    pub fn mark_bucket_deleting(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
+        let pg_id = self.pg_topology.bucket_pg_for(bucket);
+        let bucket_pg = self.get_pg(pg_id)?;
+        PgMetadataStore::mark_bucket_deleting(&*bucket_pg, bucket)?;
+        Ok(())
+    }
+
+    pub fn delete_bucket_metadata(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
+        let pg_id = self.pg_topology.bucket_pg_for(bucket);
+        let bucket_pg = self.get_pg(pg_id)?;
+        PgMetadataStore::delete_bucket(&*bucket_pg, bucket)?;
+        Ok(())
+    }
+
     pub fn with_bucket_write_snapshot<T, E>(
         &self,
         bucket: &BucketName,
@@ -840,6 +907,13 @@ impl SharedStorageNode {
         let pg_id = self.pg_topology.bucket_pg_for(bucket);
         let bucket_pg = self.get_pg(pg_id)?;
         PgMetadataStore::release_bucket_write_reservation(&*bucket_pg, bucket)?;
+        Ok(())
+    }
+
+    fn end_bucket_write_drain(&self, bucket: &BucketName) -> Result<(), BucketWriteDrainError> {
+        let pg_id = self.pg_topology.bucket_pg_for(bucket);
+        let bucket_pg = self.get_pg(pg_id)?;
+        PgMetadataStore::end_bucket_write_drain(&*bucket_pg, bucket)?;
         Ok(())
     }
 
@@ -1218,6 +1292,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, Err("action failed"));
+    }
+
+    #[test]
+    fn bucket_write_drain_guard_releases_on_drop() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+
+        {
+            let _drain = node.begin_bucket_write_drain(&bucket).unwrap();
+        }
+
+        let result = node
+            .with_bucket_write_snapshot(&bucket, Default::default(), |snapshot| {
+                Ok::<_, ()>(snapshot.bucket)
+            })
+            .unwrap();
+        assert_eq!(result.unwrap().name, bucket);
     }
 
     #[test]

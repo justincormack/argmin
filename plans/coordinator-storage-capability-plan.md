@@ -643,6 +643,17 @@ Acceptance criteria:
 - bucket teardown has an explicit reservation/drain and cleanup protocol
 - `DeleteBucket` is not hidden inside the ordinary bucket-mutation phase
 
+Phase 6 status:
+
+- in progress
+- first migrated slice:
+  - `DeleteBucket` authorization now uses the write-scoped loaded bucket
+    handle path instead of the older validated-summary plus cached-policy path
+- remaining phase-6 surface:
+  - move the write-drain protocol behind the bucket-first/storage boundary
+  - make bucket teardown/finalize protocol explicit rather than coordinator
+    ad hoc drain/fanout orchestration
+
 ### Phase 7: Multipart and Streaming Paths
 
 These are the most sensitive because they were involved in the recent deadlock

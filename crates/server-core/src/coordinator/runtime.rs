@@ -1181,11 +1181,15 @@ impl ReadRuntime {
                 .map_err(ServerError::Metadata)
         })?;
 
-        let bucket_pg = self.storage_node.get_pg(bucket_pg_id)?;
-        match storage::PgMetadataStore::delete_bucket(&*bucket_pg, bucket) {
+        match self.storage_node.delete_bucket_metadata(bucket) {
             Ok(()) => Ok(()),
-            Err(storage::MetadataError::BucketNotFound { .. }) => Ok(()),
-            Err(other) => Err(ServerError::Metadata(other)),
+            Err(storage::BucketWriteDrainError::Metadata(
+                storage::MetadataError::BucketNotFound { .. },
+            )) => Ok(()),
+            Err(storage::BucketWriteDrainError::Store(other)) => Err(ServerError::Store(other)),
+            Err(storage::BucketWriteDrainError::Metadata(other)) => {
+                Err(ServerError::Metadata(other))
+            }
         }
     }
 

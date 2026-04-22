@@ -27,6 +27,18 @@ use super::{
 use crate::error::ServerError;
 
 impl Coordinator {
+    fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) -> ServerError {
+        match err {
+            storage::BucketWriteDrainError::Store(other) => ServerError::Store(other),
+            storage::BucketWriteDrainError::Metadata(storage::MetadataError::BucketNotFound {
+                name,
+            }) => ServerError::BucketNotFound {
+                name: name.to_string(),
+            },
+            storage::BucketWriteDrainError::Metadata(other) => ServerError::Metadata(other),
+        }
+    }
+
     pub fn create_bucket(&self, req: &CreateBucketRequest) -> Result<(), ServerError> {
         observability::trace_scope!(
             TRACE_TARGET,
@@ -295,12 +307,12 @@ impl Coordinator {
             req.name
         );
         let AuthorizedDeleteBucket { name } = self.authorize_delete_bucket(req)?;
-        self.begin_bucket_write_drain_for(&name)?;
+        let drain = self
+            .storage_node
+            .begin_bucket_write_drain(&name)
+            .map_err(Self::map_bucket_write_drain_error)?;
 
-        let mut marked_deleting = false;
         let result = (|| {
-            self.wait_for_bucket_write_reservations_to_drain_for(&name)?;
-
             self.pg_topology.for_each_pg(|pg_id| {
                 let pg = self.storage_node.get_pg(pg_id)?;
                 let resp = pg.list_object_versions(&ListObjectVersionsReq {
@@ -335,30 +347,17 @@ impl Coordinator {
                 Ok::<(), ServerError>(())
             })?;
 
-            let bucket_pg = self.get_bucket_pg_for(&name)?;
-            storage::PgMetadataStore::mark_bucket_deleting(&*bucket_pg, &name).map_err(
-                |e| match e {
-                    storage::MetadataError::BucketNotFound { name } => {
-                        ServerError::BucketNotFound {
-                            name: name.to_string(),
-                        }
-                    }
-                    other => ServerError::Metadata(other),
-                },
-            )?;
+            self.storage_node
+                .mark_bucket_deleting(&name)
+                .map_err(Self::map_bucket_write_drain_error)?;
             self.storage_node.remove_bucket_fast_path(&name);
             self.clear_bucket_policy_cache(&name);
             self.clear_bucket_lifecycle_cache(&name);
-            marked_deleting = true;
             self.read_runtime()
                 .enqueue_bucket_delete_finalize_for(&name);
+            drain.persist();
             Ok(())
         })();
-
-        if !marked_deleting {
-            let bucket_pg = self.get_bucket_pg_for(&name)?;
-            let _ = storage::PgMetadataStore::end_bucket_write_drain(&*bucket_pg, &name);
-        }
 
         result
     }
