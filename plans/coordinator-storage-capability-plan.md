@@ -376,19 +376,23 @@ Acceptance criteria:
 
 Phase 3 status:
 
-- started
+- completed
 - migrated so far:
   - `GetObject`
   - `HeadObject`
   - `GetObjectAttributes`
+  - `GetObjectAcl`
+  - `GetObjectTagging`
+  - `GetObjectRetention`
+  - `GetObjectLegalHold`
 - this also covers the shared ordinary-read authorization path reused by:
   - `GetObjectRange`
   - part-number object reads that flow through the same read authorization
-- still pending in phase 3:
-  - object subresource reads (`GetObjectAcl`, `GetObjectTagging`,
-    object-lock reads)
-  - any remaining ordinary read path still calling the older
-    `load_locked_object_state(...)` bucket-loading path directly
+- this also covers the versioned forms that flow through the same read
+  authorization paths for ACL/tagging/object-lock reads
+- phase-3 scope is now effectively covered for the ordinary single-object read
+  family; the remaining old helper usage on tagging/ACL/object-lock writes is
+  deferred to later write/delete phases
 
 ### Phase 4: Single-Object Write/Delete Paths
 
@@ -409,6 +413,50 @@ Acceptance criteria:
 - object write preparation is derived from that handle
 - no path separately acquires bucket reservation state and then later reacquires
   bucket metadata/subresources
+
+### Checkpoint After Phase 4
+
+After single-object write/delete migration is complete, stop and review whether
+the handle design is still correct before continuing into the heavier bucket
+mutation, teardown, multipart, and copy phases.
+
+This checkpoint exists because phase 4 is the first point where write
+reservations, publication locks, and commit-time sequencing are all exercised
+together.
+
+Questions to answer at the checkpoint:
+
+- is the request-scoped snapshot contract still the right model
+- is the write-scoped bucket handle shape still correct
+- are write reservations integrated cleanly enough into the design
+- has any hidden late-load or duplicate-bucket path survived
+- do the phase 5+ migrations still look mechanical rather than requiring a new
+  redesign
+
+Do not continue into later phases until this review is complete.
+
+### Phase 4b: Bucket-wide Listing and Iteration Paths
+
+Defer the bucket-wide list/iteration family until after the single-object
+read/write shape has been exercised and reviewed.
+
+These operations are bucket-scoped at the API level but they are not the same
+shape as the simpler single-bucket metadata reads above, because they iterate
+across object state and can touch multiple PGs:
+
+- `ListObjectsV1`
+- `ListObjectsV2`
+- `ListObjectVersions`
+- `ListMultipartUploads`
+
+Acceptance criteria:
+
+- the operation still begins from one bucket handle load
+- the bucket handle provides the only bucket-derived auth/policy/config input
+- object/list iteration uses storage-owned fanout/iteration primitives rather
+  than coordinator-managed PG walking
+- the final design is informed by the object-path shape proven in phases 3 and
+  4, not guessed earlier from the bucket-only read surface
 
 ### Phase 5: Bucket Write/Admin/Config Paths
 
@@ -455,50 +503,6 @@ Acceptance criteria:
 - `DeleteBucket` uses the bucket-first handle model
 - bucket teardown has an explicit reservation/drain and cleanup protocol
 - `DeleteBucket` is not hidden inside the ordinary bucket-mutation phase
-
-### Checkpoint After Phase 4
-
-After single-object write/delete migration is complete, stop and review whether
-the handle design is still correct before continuing into the heavier bucket
-mutation, teardown, multipart, and copy phases.
-
-This checkpoint exists because phase 4 is the first point where write
-reservations, publication locks, and commit-time sequencing are all exercised
-together.
-
-Questions to answer at the checkpoint:
-
-- is the request-scoped snapshot contract still the right model
-- is the write-scoped bucket handle shape still correct
-- are write reservations integrated cleanly enough into the design
-- has any hidden late-load or duplicate-bucket path survived
-- do the phase 5+ migrations still look mechanical rather than requiring a new
-  redesign
-
-Do not continue into later phases until this review is complete.
-
-### Phase 4b: Bucket-wide Listing and Iteration Paths
-
-Defer the bucket-wide list/iteration family until after the single-object
-read/write shape has been exercised and reviewed.
-
-These operations are bucket-scoped at the API level but they are not the same
-shape as the simpler single-bucket metadata reads above, because they iterate
-across object state and can touch multiple PGs:
-
-- `ListObjectsV1`
-- `ListObjectsV2`
-- `ListObjectVersions`
-- `ListMultipartUploads`
-
-Acceptance criteria:
-
-- the operation still begins from one bucket handle load
-- the bucket handle provides the only bucket-derived auth/policy/config input
-- object/list iteration uses storage-owned fanout/iteration primitives rather
-  than coordinator-managed PG walking
-- the final design is informed by the object-path shape proven in phases 3 and
-  4, not guessed earlier from the bucket-only read surface
 
 ### Phase 7: Multipart and Streaming Paths
 
@@ -553,6 +557,47 @@ Expected end state:
 
 This phase may still leave test-only direct PG access in some low-level tests,
 but production coordinator request code should no longer depend on it.
+
+### Phase 10: Fast-path Review and Realignment
+
+After the main request-family migrations land, do a deliberate pass over the
+bucket fast path and decide which parts of the bucket-first handle model should
+participate in it.
+
+This phase is about cache contents and cache usage policy, not about changing
+external S3 semantics. The main questions are:
+
+- whether additional bucket state should live in the fast path for correctness
+  or performance
+  - especially bucket tags when bucket ABAC is enabled
+  - and any other bucket subresources that migrated request families now need
+    repeatedly
+- which request families should be allowed to satisfy their bucket-handle load
+  from warm fast-path state
+- which request families should always force a real bucket snapshot load even
+  when fast-path metadata is warm
+  - for example, when they require a true policy snapshot rather than a cache
+    hint
+- whether any existing fast-path reads should be narrowed because they weaken
+  the request-scoped snapshot contract
+
+This review should cover at least:
+
+- ordinary object reads
+- bucket-policy-dependent reads
+- bucket ABAC-enabled paths
+- bucket-only read/admin paths that now consistently require the same
+  subresources
+
+Acceptance criteria:
+
+- the intended post-refactor fast-path contract is written down explicitly
+- any additional bucket state added to the fast path is justified and pinned by
+  tests
+- any request family that uses the fast path preserves the request-scoped
+  snapshot guarantees established by the handle model
+- any request family that cannot preserve those guarantees is documented as
+  requiring a real bucket snapshot load
 
 ## Special Cases
 
