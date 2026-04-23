@@ -1,6 +1,24 @@
 use super::*;
 
 impl SharedStorageNode {
+    pub fn create_put_object_stream_session_record(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        encryption: crate::types::ObjectEncryption,
+    ) -> Result<(), ObjectPgActionError> {
+        let object_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        object_pg.create_stream_upload(&CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: StreamUploadTarget::PutObject,
+            encryption,
+        })?;
+        Ok(())
+    }
+
     pub fn create_put_object_stream_session<T, E>(
         &self,
         bucket: &BucketName,

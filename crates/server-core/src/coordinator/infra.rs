@@ -20,10 +20,9 @@ use crate::error::ServerError;
 use crate::sse::{SseCustomerValidatorConfig, StaticManagedKeyProvider};
 #[cfg(test)]
 use storage::GenerationId;
-use storage::PgMetadataStore;
 use storage::{
-    BucketFastPathInfo, BucketInfo, BucketName, BucketState, CreateStreamUploadReq, ObjectKey,
-    ReclaimWorkItem, SessionId, SharedStorageNode, StreamUploadTarget, UploadId,
+    BucketFastPathInfo, BucketInfo, BucketName, BucketState, ObjectKey, ReclaimWorkItem, SessionId,
+    SharedStorageNode, UploadId,
 };
 
 impl Coordinator {
@@ -55,16 +54,20 @@ impl Coordinator {
     ) -> Result<SessionId, ServerError> {
         let stored_encryption = authorized.write_encryption.object_encryption();
         let session_id = Self::random_session_id("failed to generate session ID")?;
-
-        let meta_pg_id = self.object_pg_id_for(authorized.bucket_typed(), authorized.key_typed());
-        let pg = self.storage_node.get_pg(meta_pg_id)?;
-        pg.create_stream_upload(&CreateStreamUploadReq {
-            session_id: session_id.clone(),
-            bucket: authorized.bucket_typed().clone(),
-            key: authorized.key_typed().clone(),
-            target: StreamUploadTarget::PutObject,
-            encryption: stored_encryption,
-        })?;
+        self.storage_node
+            .create_put_object_stream_session_record(
+                authorized.bucket_typed(),
+                authorized.key_typed(),
+                &session_id,
+                stored_encryption,
+            )
+            .map_err(|error| match error {
+                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                storage::ObjectPgActionError::InvalidRequest { reason } => {
+                    ServerError::InvalidRequest { reason }
+                }
+                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+            })?;
 
         Ok(session_id)
     }

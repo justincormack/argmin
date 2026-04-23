@@ -904,6 +904,8 @@ Phase 7b status:
   - `BeginStreamPut`
 - second migrated slice:
   - large-body public `PutObject` entry
+- third migrated slice:
+  - HTTP streamed `PutObject` session creation path
 - `BeginStreamPut` now follows the same corrected transactional pattern as the
   multipart session paths:
   - storage owns the bucket write reservation, bucket snapshot load,
@@ -915,12 +917,10 @@ Phase 7b status:
 - the public large-body `PutObject` path now reuses that same corrected
   `BeginStreamPut` entry instead of creating its stream session through the
   older coordinator-side helper
+- the HTTP streamed `PutObject` entry now reaches the same corrected session
+  creation helper instead of creating its session through a coordinator-owned
+  object-PG path
 - remaining 7b surface:
-  - HTTP streamed `PutObject` session creation path
-    - `server-http` still starts this through
-      `begin_stream_put_session(&ctx.authorized_write)`, so this is still an
-      unmigrated production entry even though the top-level buffered
-      large-body path is now corrected
   - stream-put finalize path
   - stream-put abort / scavenging path
 
