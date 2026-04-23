@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ListObjectsReq, VersionId};
+use crate::{BucketInfo, ListObjectsReq, VersionId};
 
 #[derive(Clone)]
 enum ListObjectsPageStart {
@@ -38,6 +38,21 @@ impl VersionCursor {
 }
 
 impl SharedStorageNode {
+    pub fn list_buckets_for_owner(
+        &self,
+        owner_canonical_id: &str,
+    ) -> Result<Vec<BucketInfo>, ObjectPgActionError> {
+        let mut buckets = Vec::new();
+        self.pg_topology.for_each_pg(|pg_id| {
+            let pg = self.get_pg(pg_id)?;
+            let mut page = pg.list_buckets(owner_canonical_id)?;
+            buckets.append(&mut page);
+            Ok::<(), ObjectPgActionError>(())
+        })?;
+        buckets.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(buckets)
+    }
+
     pub fn list_objects_for_bucket(
         &self,
         bucket: &BucketName,

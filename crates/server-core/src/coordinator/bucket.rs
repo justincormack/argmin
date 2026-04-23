@@ -4,7 +4,6 @@ use s3_types::{
     parse_account_regional_bucket_name, AccountIdentity, AclGrants, BucketNamespace,
     BucketVersioningState,
 };
-use storage::traits::PgMetadataStore;
 use storage::{
     BucketEncryptionConfig, BucketName, BucketObjectLockConfig, BucketOwnershipControls,
     BucketState, EffectiveBucketEncryptionConfig, OwnerIdentity, PublicAccessBlockConfig,
@@ -351,15 +350,11 @@ impl Coordinator {
     ) -> Result<Vec<BucketSummary>, ServerError> {
         observability::trace_scope!(TRACE_TARGET, "Coordinator::list_buckets");
         let AuthorizedListBuckets { owner_canonical_id } = self.authorize_list_buckets(req)?;
-        let mut out = Vec::new();
-        self.pg_topology.for_each_pg(|pg_id| {
-            let pg = self.storage_node.get_pg(pg_id)?;
-            let mut buckets = pg.list_buckets(owner_canonical_id.as_str())?;
-            out.extend(buckets.drain(..).map(Self::bucket_summary));
-            Ok::<(), ServerError>(())
-        })?;
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
+        let buckets = self
+            .storage_node
+            .list_buckets_for_owner(owner_canonical_id.as_str())
+            .map_err(Self::map_object_pg_action_error)?;
+        Ok(buckets.into_iter().map(Self::bucket_summary).collect())
     }
 
     pub fn put_bucket_versioning(

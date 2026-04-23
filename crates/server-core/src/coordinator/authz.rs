@@ -1048,18 +1048,6 @@ impl Coordinator {
         Ok(policy.evaluate(&policy_request))
     }
 
-    fn bucket_policy_decision_for_bucket_loaded(
-        &self,
-        requester: &Requester,
-        bucket: &BucketSummary,
-        action: auth::PolicyAction,
-        policy: Option<&auth::BucketPolicy>,
-    ) -> Result<auth::PolicyEvaluation, ServerError> {
-        self.bucket_policy_decision_for_bucket_loaded_with_tags(
-            requester, bucket, None, action, policy,
-        )
-    }
-
     fn bucket_policy_decision_for_bucket_loaded_with_tags(
         &self,
         requester: &Requester,
@@ -3193,35 +3181,32 @@ impl Coordinator {
         &self,
         req: &ListObjectsV2Request<'_>,
     ) -> Result<AuthorizedListObjectsV2, ServerError> {
-        let bucket_info = self.checked_active_bucket_summary_for(
-            req.bucket.name_typed(),
-            req.bucket.expected_bucket_owner(),
-        )?;
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        let policy_decision = self.bucket_policy_decision_for_bucket_loaded(
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(&req.bucket)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
             &req.bucket.requester,
-            &bucket_info,
+            &bucket,
             auth::PolicyAction::ListBucket,
             bucket_policy.as_deref(),
         )?;
         if !Self::bucket_policy_allows_with_fallback(
             &req.bucket.requester,
-            &bucket_info,
+            bucket.bucket(),
             policy_decision,
             || {
                 Self::requester_can_read_bucket(
                     &req.bucket.requester,
-                    &bucket_info,
-                    &bucket_info.owner_principal,
-                    &bucket_info.acl_grants,
-                    Self::effective_public_read(&bucket_info),
+                    bucket.bucket(),
+                    &bucket.bucket().owner_principal,
+                    &bucket.bucket().acl_grants,
+                    Self::effective_public_read(bucket.bucket()),
                 )
             },
         ) {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedListObjectsV2 {
-            bucket_info: bucket_info.into_inner(),
+            bucket_info: bucket.bucket().clone(),
         })
     }
 
@@ -3239,35 +3224,32 @@ impl Coordinator {
         &self,
         req: &ListObjectVersionsRequest<'_>,
     ) -> Result<AuthorizedListObjectVersions, ServerError> {
-        let bucket_info = self.checked_active_bucket_summary_for(
-            req.bucket.name_typed(),
-            req.bucket.expected_bucket_owner(),
-        )?;
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        let policy_decision = self.bucket_policy_decision_for_bucket_loaded(
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(&req.bucket)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
             &req.bucket.requester,
-            &bucket_info,
+            &bucket,
             auth::PolicyAction::ListBucketVersions,
             bucket_policy.as_deref(),
         )?;
         if !Self::bucket_policy_allows_with_fallback(
             &req.bucket.requester,
-            &bucket_info,
+            bucket.bucket(),
             policy_decision,
             || {
                 Self::requester_can_read_bucket(
                     &req.bucket.requester,
-                    &bucket_info,
-                    &bucket_info.owner_principal,
-                    &bucket_info.acl_grants,
-                    Self::effective_public_read(&bucket_info),
+                    bucket.bucket(),
+                    &bucket.bucket().owner_principal,
+                    &bucket.bucket().acl_grants,
+                    Self::effective_public_read(bucket.bucket()),
                 )
             },
         ) {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedListObjectVersions {
-            bucket_info: bucket_info.into_inner(),
+            bucket_info: bucket.bucket().clone(),
         })
     }
 
@@ -3275,35 +3257,32 @@ impl Coordinator {
         &self,
         req: &ListMultipartUploadsRequest<'_>,
     ) -> Result<AuthorizedListMultipartUploads, ServerError> {
-        let bucket_info = self.checked_active_bucket_summary_for(
-            req.bucket.name_typed(),
-            req.bucket.expected_bucket_owner(),
-        )?;
-        let bucket_policy = self.cached_bucket_policy(&bucket_info)?;
-        let policy_decision = self.bucket_policy_decision_for_bucket_loaded(
+        let bucket = self.load_bucket_handle_for_bucket_policy_read(&req.bucket)?;
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let policy_decision = self.bucket_policy_decision_for_loaded_handle(
             &req.bucket.requester,
-            &bucket_info,
+            &bucket,
             auth::PolicyAction::ListBucketMultipartUploads,
             bucket_policy.as_deref(),
         )?;
         if !Self::bucket_policy_allows_with_fallback(
             &req.bucket.requester,
-            &bucket_info,
+            bucket.bucket(),
             policy_decision,
             || {
                 Self::requester_can_read_bucket(
                     &req.bucket.requester,
-                    &bucket_info,
-                    &bucket_info.owner_principal,
-                    &bucket_info.acl_grants,
-                    Self::effective_public_read(&bucket_info),
+                    bucket.bucket(),
+                    &bucket.bucket().owner_principal,
+                    &bucket.bucket().acl_grants,
+                    Self::effective_public_read(bucket.bucket()),
                 )
             },
         ) {
             return Err(ServerError::AccessDenied);
         }
         Ok(AuthorizedListMultipartUploads {
-            bucket: req.bucket.name_typed().clone(),
+            bucket: bucket.bucket().name.clone(),
         })
     }
 

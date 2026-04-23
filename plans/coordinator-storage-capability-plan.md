@@ -478,7 +478,7 @@ to completed rather than provisionally reopened.
 
 ### Phase 4b: Bucket-wide Listing and Iteration Paths
 
-Status: in progress
+Status: completed
 
 Defer the bucket-wide list/iteration family until after the single-object
 read/write shape has been exercised and reviewed.
@@ -501,15 +501,24 @@ Acceptance criteria:
 - the final design is informed by the object-path shape proven in phases 3 and
   4, not guessed earlier from the bucket-only read surface
 
-Initial migrated slice:
-
+- `ListBuckets` now uses a storage-owned owner-scoped listing helper instead of
+  coordinator-managed PG fanout in `bucket.rs`
 - `ListObjectsV1` / `ListObjectsV2` now use a storage-owned bucket listing
   helper instead of coordinator-managed PG fanout / merge logic in
   `listing.rs`
 - `ListObjectVersions` now uses a storage-owned bucket version-listing helper
   instead of coordinator-managed PG fanout / merge logic in `listing.rs`
+- `ListMultipartUploads` is already on a storage-owned bucket-wide listing
+  helper in `multipart.rs`
+- `ListObjectsV1` / `ListObjectsV2`, `ListObjectVersions`, and
+  `ListMultipartUploads` auth now begin from a bucket handle load rather than
+  `checked_active_bucket_summary_for(...)` plus cached policy fallback
 - coordinator still formats response-visible metadata, but the bucket-wide
-  object/version iteration and merge step is now below the storage boundary
+  bucket/object/version iteration and merge step is now below the storage
+  boundary
+- any newly discovered production bucket-wide listing or iteration path still
+  doing coordinator-managed PG fanout is now a regression against the completed
+  phase
 
 ### Phase 4c: Write-Scoped Bucket Handle Boundary Cleanup
 
