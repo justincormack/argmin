@@ -25,6 +25,13 @@ use super::{
 use crate::error::ServerError;
 
 impl Coordinator {
+    fn refresh_bucket_fast_path_if_present(&self, info: &storage::BucketInfo) {
+        self.storage_node
+            .update_bucket_fast_path_if_present(&info.name, |cached| {
+                *cached = info.into();
+            });
+    }
+
     fn map_bucket_write_drain_error(err: storage::BucketWriteDrainError) -> ServerError {
         match err {
             storage::BucketWriteDrainError::Store(other) => ServerError::Store(other),
@@ -369,27 +376,21 @@ impl Coordinator {
             req.state
         );
         let authorized = self.authorize_put_bucket_versioning(req)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::put_bucket_versioning(
-            &*bucket_pg,
-            &authorized.bucket,
-            authorized.state,
-        )
-        .map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            storage::MetadataError::InvalidVersioningTransition { from, to } => {
-                ServerError::InvalidRequest {
-                    reason: format!("invalid versioning transition from {from:?} to {to:?}"),
+        let info = self
+            .storage_node
+            .put_bucket_versioning_and_load_info(&authorized.bucket, authorized.state)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                storage::MetadataError::InvalidVersioningTransition { from, to } => {
+                    ServerError::InvalidRequest {
+                        reason: format!("invalid versioning transition from {from:?} to {to:?}"),
+                    }
                 }
-            }
-            other => ServerError::Metadata(other),
-        })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
-                info.versioning = authorized.state
-            });
+                other => ServerError::Metadata(other),
+            })?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
@@ -431,22 +432,16 @@ impl Coordinator {
             req.config.default_retention.is_some()
         );
         let authorized = self.authorize_put_bucket_object_lock_configuration(req)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::put_bucket_object_lock(
-            &*bucket_pg,
-            &authorized.bucket,
-            authorized.config,
-        )
-        .map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
-                info.object_lock = authorized.config
-            });
+        let info = self
+            .storage_node
+            .put_bucket_object_lock_and_load_info(&authorized.bucket, authorized.config)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
@@ -476,22 +471,16 @@ impl Coordinator {
             req.config.sse_c_blocked
         );
         let authorized = self.authorize_put_bucket_encryption(req)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::put_bucket_encryption(
-            &*bucket_pg,
-            &authorized.bucket,
-            authorized.config,
-        )
-        .map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
-                info.encryption = authorized.effective_config
-            });
+        let info = self
+            .storage_node
+            .put_bucket_encryption_and_load_info(&authorized.bucket, authorized.config)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
@@ -517,22 +506,19 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_delete_bucket_encryption(req)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::put_bucket_encryption(
-            &*bucket_pg,
-            &authorized.bucket,
-            BucketEncryptionConfig::default(),
-        )
-        .map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
-                info.encryption = EffectiveBucketEncryptionConfig::default()
-            });
+        let info = self
+            .storage_node
+            .put_bucket_encryption_and_load_info(
+                &authorized.bucket,
+                BucketEncryptionConfig::default(),
+            )
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
@@ -545,7 +531,8 @@ impl Coordinator {
             req.config.len()
         );
         let authorized = self.authorize_put_bucket_cors(req)?;
-        self.store_authorized_bucket_subresource(&authorized)
+        let _ = self.store_authorized_bucket_subresource(&authorized)?;
+        Ok(())
     }
 
     pub fn get_bucket_cors(&self, req: &BucketRequest<'_>) -> Result<Option<String>, ServerError> {
@@ -581,7 +568,8 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_delete_bucket_cors(req)?;
-        self.remove_authorized_bucket_subresource(&authorized)
+        let _ = self.remove_authorized_bucket_subresource(&authorized)?;
+        Ok(())
     }
 
     pub fn put_bucket_tags(&self, req: &PutBucketConfigRequest<'_>) -> Result<(), ServerError> {
@@ -593,7 +581,8 @@ impl Coordinator {
             req.config.len()
         );
         let authorized = self.authorize_put_bucket_tagging(req)?;
-        self.store_authorized_bucket_subresource(&authorized)
+        let _ = self.store_authorized_bucket_subresource(&authorized)?;
+        Ok(())
     }
 
     pub fn get_bucket_tags(&self, req: &BucketRequest<'_>) -> Result<Option<String>, ServerError> {
@@ -615,7 +604,8 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_delete_bucket_tagging(req)?;
-        self.remove_authorized_bucket_subresource(&authorized)
+        let _ = self.remove_authorized_bucket_subresource(&authorized)?;
+        Ok(())
     }
 
     pub fn get_bucket_tags_for_tag_resource(
@@ -647,14 +637,15 @@ impl Coordinator {
             req.config.len()
         );
         let authorized = self.authorize_bucket_tag_control(&req.control)?;
-        self.store_bucket_subresource(
+        let _ = self.store_bucket_subresource(
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Tagging,
                 body: req.config,
                 aux: storage::BucketSubresourceAux::None,
             },
-        )
+        )?;
+        Ok(())
     }
 
     pub fn delete_bucket_tags_for_tag_resource(
@@ -668,10 +659,11 @@ impl Coordinator {
             req.bucket.name
         );
         let authorized = self.authorize_bucket_tag_control(req)?;
-        self.remove_authorized_bucket_subresource(&AuthorizedBucketSubresourceDelete {
+        let _ = self.remove_authorized_bucket_subresource(&AuthorizedBucketSubresourceDelete {
             bucket: authorized.bucket,
             kind: storage::BucketSubresourceKind::Tagging,
-        })
+        })?;
+        Ok(())
     }
 
     pub fn put_bucket_abac(&self, req: &PutBucketAbacRequest<'_>) -> Result<(), ServerError> {
@@ -683,22 +675,16 @@ impl Coordinator {
             req.enabled
         );
         let authorized = self.authorize_put_bucket_abac(req)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::put_bucket_abac_enabled(
-            &*bucket_pg,
-            &authorized.bucket,
-            authorized.enabled,
-        )
-        .map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
-                info.bucket_abac_enabled = authorized.enabled;
-            });
+        let info = self
+            .storage_node
+            .put_bucket_abac_enabled_and_load_info(&authorized.bucket, authorized.enabled)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
@@ -722,7 +708,7 @@ impl Coordinator {
             req.config.len()
         );
         let authorized = self.authorize_put_bucket_policy(req)?;
-        self.store_bucket_subresource(
+        let info = self.store_bucket_subresource(
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Policy,
@@ -730,15 +716,7 @@ impl Coordinator {
                 aux: storage::BucketSubresourceAux::policy(authorized.policy_is_public),
             },
         )?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        let info = storage::PgMetadataStore::head_bucket_raw(&*bucket_pg, &authorized.bucket)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
-        self.storage_node.upsert_bucket_fast_path((&info).into());
+        self.refresh_bucket_fast_path_if_present(&info);
         self.cache_bucket_policy(
             &authorized.bucket,
             info.bucket_policy_generation,
@@ -780,16 +758,8 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_delete_bucket_policy(req)?;
-        self.remove_authorized_bucket_subresource(&authorized)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        let info = storage::PgMetadataStore::head_bucket_raw(&*bucket_pg, &authorized.bucket)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
-        self.storage_node.upsert_bucket_fast_path((&info).into());
+        let info = self.remove_authorized_bucket_subresource(&authorized)?;
+        self.refresh_bucket_fast_path_if_present(&info);
         self.clear_bucket_policy_cache(&authorized.bucket);
         Ok(())
     }
@@ -806,7 +776,7 @@ impl Coordinator {
             req.config.len()
         );
         let authorized = self.authorize_put_bucket_lifecycle(req)?;
-        self.store_bucket_subresource(
+        let info = self.store_bucket_subresource(
             &authorized.bucket,
             storage::PutBucketSubresource {
                 kind: storage::BucketSubresourceKind::Lifecycle,
@@ -814,15 +784,7 @@ impl Coordinator {
                 aux: storage::BucketSubresourceAux::None,
             },
         )?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        let info = storage::PgMetadataStore::head_bucket_raw(&*bucket_pg, &authorized.bucket)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
-        self.storage_node.upsert_bucket_fast_path((&info).into());
+        self.refresh_bucket_fast_path_if_present(&info);
         self.cache_bucket_lifecycle(
             &authorized.bucket,
             info.bucket_lifecycle_generation,
@@ -853,16 +815,8 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_delete_bucket_lifecycle(req)?;
-        self.remove_authorized_bucket_subresource(&authorized)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        let info = storage::PgMetadataStore::head_bucket_raw(&*bucket_pg, &authorized.bucket)
-            .map_err(|e| match e {
-                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                    name: name.to_string(),
-                },
-                other => ServerError::Metadata(other),
-            })?;
-        self.storage_node.upsert_bucket_fast_path((&info).into());
+        let info = self.remove_authorized_bucket_subresource(&authorized)?;
+        self.refresh_bucket_fast_path_if_present(&info);
         self.clear_bucket_lifecycle_cache(&authorized.bucket);
         Ok(())
     }
@@ -879,22 +833,16 @@ impl Coordinator {
             req.config
         );
         let authorized = self.authorize_put_bucket_public_access_block(req)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::put_bucket_public_access_block(
-            &*bucket_pg,
-            &authorized.bucket,
-            authorized.config,
-        )
-        .map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
-                info.public_access_block = Some(authorized.config);
-            });
+        let info = self
+            .storage_node
+            .put_bucket_public_access_block_and_load_info(&authorized.bucket, authorized.config)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
@@ -923,21 +871,16 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_delete_bucket_public_access_block(req)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::delete_bucket_public_access_block(
-            &*bucket_pg,
-            &authorized.bucket,
-        )
-        .map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
-                info.public_access_block = None
-            });
+        let info = self
+            .storage_node
+            .delete_bucket_public_access_block_and_load_info(&authorized.bucket)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
@@ -953,22 +896,16 @@ impl Coordinator {
             req.config
         );
         let authorized = self.authorize_put_bucket_ownership_controls(req)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::put_bucket_ownership_controls(
-            &*bucket_pg,
-            &authorized.bucket,
-            authorized.config,
-        )
-        .map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
-                info.ownership_controls = Some(authorized.config);
-            });
+        let info = self
+            .storage_node
+            .put_bucket_ownership_controls_and_load_info(&authorized.bucket, authorized.config)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
@@ -997,18 +934,16 @@ impl Coordinator {
             req.name
         );
         let authorized = self.authorize_delete_bucket_ownership_controls(req)?;
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::delete_bucket_ownership_controls(&*bucket_pg, &authorized.bucket)
+        let info = self
+            .storage_node
+            .delete_bucket_ownership_controls_and_load_info(&authorized.bucket)
             .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
                 },
                 other => ServerError::Metadata(other),
             })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
-                info.ownership_controls = None
-            });
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
@@ -1052,33 +987,28 @@ impl Coordinator {
         &self,
         authorized: &AuthorizedPutBucketAcl,
     ) -> Result<(), ServerError> {
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::put_bucket_acl(
-            &*bucket_pg,
-            &authorized.bucket,
-            &authorized.acl_grants,
-            authorized.public_read,
-            authorized.public_write,
-        )
-        .map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })?;
-        self.storage_node
-            .update_bucket_fast_path_if_present(&authorized.bucket, |info| {
-                info.acl_grants = authorized.acl_grants.clone();
-                info.public_read = authorized.public_read;
-                info.public_write = authorized.public_write;
-            });
+        let info = self
+            .storage_node
+            .put_bucket_acl_and_load_info(
+                &authorized.bucket,
+                &authorized.acl_grants,
+                authorized.public_read,
+                authorized.public_write,
+            )
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })?;
+        self.refresh_bucket_fast_path_if_present(&info);
         Ok(())
     }
 
     fn store_authorized_bucket_subresource(
         &self,
         authorized: &AuthorizedBucketSubresourcePut,
-    ) -> Result<(), ServerError> {
+    ) -> Result<storage::BucketInfo, ServerError> {
         self.store_bucket_subresource(
             &authorized.bucket,
             storage::PutBucketSubresource {
@@ -1093,42 +1023,43 @@ impl Coordinator {
         &self,
         name: &BucketName,
         req: storage::PutBucketSubresource<'_>,
-    ) -> Result<(), ServerError> {
-        let bucket_pg = self.get_bucket_pg_for(name)?;
-        storage::PgMetadataStore::put_bucket_subresource(&*bucket_pg, name, req).map_err(
-            |e| match e {
+    ) -> Result<storage::BucketInfo, ServerError> {
+        self.storage_node
+            .put_bucket_subresource_and_load_info(name, req)
+            .map_err(|e| match e {
                 storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
                     name: name.to_string(),
                 },
                 other => ServerError::Metadata(other),
-            },
-        )
+            })
     }
 
     pub(super) fn load_authorized_bucket_subresource(
         &self,
         authorized: &AuthorizedBucketSubresourceGet,
     ) -> Result<Option<String>, ServerError> {
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        Self::load_bucket_subresource_from_pg(&bucket_pg, &authorized.bucket, authorized.kind)
+        self.storage_node
+            .get_bucket_subresource(&authorized.bucket, authorized.kind)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
     }
 
     fn remove_authorized_bucket_subresource(
         &self,
         authorized: &AuthorizedBucketSubresourceDelete,
-    ) -> Result<(), ServerError> {
-        let bucket_pg = self.get_bucket_pg_for(&authorized.bucket)?;
-        storage::PgMetadataStore::delete_bucket_subresource(
-            &*bucket_pg,
-            &authorized.bucket,
-            authorized.kind,
-        )
-        .map_err(|e| match e {
-            storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
-                name: name.to_string(),
-            },
-            other => ServerError::Metadata(other),
-        })
+    ) -> Result<storage::BucketInfo, ServerError> {
+        self.storage_node
+            .delete_bucket_subresource_and_load_info(&authorized.bucket, authorized.kind)
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })
     }
 
     pub(super) fn load_bucket_subresource_from_pg(

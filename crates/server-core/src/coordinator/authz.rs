@@ -3107,7 +3107,6 @@ impl Coordinator {
         Ok(AuthorizedPutBucketEncryption {
             bucket: req.bucket.name_typed().clone(),
             config: req.config,
-            effective_config: req.config.effective(),
         })
     }
 

@@ -1,6 +1,25 @@
 use super::*;
+use s3_types::{AclGrants, BucketVersioningState};
+
+use crate::{
+    BucketEncryptionConfig, BucketInfo, BucketObjectLockConfig, BucketOwnershipControls,
+    PublicAccessBlockConfig, PutBucketSubresource,
+};
 
 impl SharedStorageNode {
+    fn mutate_bucket_and_load_info(
+        &self,
+        bucket: &BucketName,
+        mutate: impl FnOnce(&PgStore, &BucketName) -> Result<(), crate::error::MetadataError>,
+    ) -> Result<BucketInfo, crate::error::MetadataError> {
+        let pg_id = self.pg_topology.bucket_pg_for(bucket);
+        let bucket_pg = self
+            .get_pg(pg_id)
+            .expect("bucket PG derived from topology must exist");
+        mutate(&bucket_pg, bucket)?;
+        bucket_pg.head_bucket_raw(bucket)
+    }
+
     pub fn load_bucket_snapshot(
         &self,
         bucket: &BucketName,
@@ -105,6 +124,135 @@ impl SharedStorageNode {
         let bucket_pg = self.get_pg(pg_id)?;
         PgMetadataStore::delete_bucket(&*bucket_pg, bucket)?;
         Ok(())
+    }
+
+    pub fn put_bucket_versioning_and_load_info(
+        &self,
+        bucket: &BucketName,
+        state: BucketVersioningState,
+    ) -> Result<BucketInfo, crate::error::MetadataError> {
+        self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
+            PgMetadataStore::put_bucket_versioning(bucket_pg, bucket, state)
+        })
+    }
+
+    pub fn put_bucket_object_lock_and_load_info(
+        &self,
+        bucket: &BucketName,
+        config: BucketObjectLockConfig,
+    ) -> Result<BucketInfo, crate::error::MetadataError> {
+        self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
+            PgMetadataStore::put_bucket_object_lock(bucket_pg, bucket, config)
+        })
+    }
+
+    pub fn put_bucket_encryption_and_load_info(
+        &self,
+        bucket: &BucketName,
+        config: BucketEncryptionConfig,
+    ) -> Result<BucketInfo, crate::error::MetadataError> {
+        self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
+            PgMetadataStore::put_bucket_encryption(bucket_pg, bucket, config)
+        })
+    }
+
+    pub fn put_bucket_public_access_block_and_load_info(
+        &self,
+        bucket: &BucketName,
+        config: PublicAccessBlockConfig,
+    ) -> Result<BucketInfo, crate::error::MetadataError> {
+        self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
+            PgMetadataStore::put_bucket_public_access_block(bucket_pg, bucket, config)
+        })
+    }
+
+    pub fn delete_bucket_public_access_block_and_load_info(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, crate::error::MetadataError> {
+        self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
+            PgMetadataStore::delete_bucket_public_access_block(bucket_pg, bucket)
+        })
+    }
+
+    pub fn put_bucket_ownership_controls_and_load_info(
+        &self,
+        bucket: &BucketName,
+        config: BucketOwnershipControls,
+    ) -> Result<BucketInfo, crate::error::MetadataError> {
+        self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
+            PgMetadataStore::put_bucket_ownership_controls(bucket_pg, bucket, config)
+        })
+    }
+
+    pub fn delete_bucket_ownership_controls_and_load_info(
+        &self,
+        bucket: &BucketName,
+    ) -> Result<BucketInfo, crate::error::MetadataError> {
+        self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
+            PgMetadataStore::delete_bucket_ownership_controls(bucket_pg, bucket)
+        })
+    }
+
+    pub fn put_bucket_abac_enabled_and_load_info(
+        &self,
+        bucket: &BucketName,
+        enabled: bool,
+    ) -> Result<BucketInfo, crate::error::MetadataError> {
+        self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
+            PgMetadataStore::put_bucket_abac_enabled(bucket_pg, bucket, enabled)
+        })
+    }
+
+    pub fn put_bucket_acl_and_load_info(
+        &self,
+        bucket: &BucketName,
+        acl_grants: &AclGrants,
+        public_read: bool,
+        public_write: bool,
+    ) -> Result<BucketInfo, crate::error::MetadataError> {
+        self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
+            PgMetadataStore::put_bucket_acl(
+                bucket_pg,
+                bucket,
+                acl_grants,
+                public_read,
+                public_write,
+            )
+        })
+    }
+
+    pub fn put_bucket_subresource_and_load_info(
+        &self,
+        bucket: &BucketName,
+        req: PutBucketSubresource<'_>,
+    ) -> Result<BucketInfo, crate::error::MetadataError> {
+        self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
+            PgMetadataStore::put_bucket_subresource(bucket_pg, bucket, req)
+        })
+    }
+
+    pub fn delete_bucket_subresource_and_load_info(
+        &self,
+        bucket: &BucketName,
+        kind: BucketSubresourceKind,
+    ) -> Result<BucketInfo, crate::error::MetadataError> {
+        self.mutate_bucket_and_load_info(bucket, |bucket_pg, bucket| {
+            PgMetadataStore::delete_bucket_subresource(bucket_pg, bucket, kind)
+        })
+    }
+
+    pub fn get_bucket_subresource(
+        &self,
+        bucket: &BucketName,
+        kind: BucketSubresourceKind,
+    ) -> Result<Option<String>, crate::error::MetadataError> {
+        let pg_id = self.pg_topology.bucket_pg_for(bucket);
+        let bucket_pg = self
+            .get_pg(pg_id)
+            .expect("bucket PG derived from topology must exist");
+        PgMetadataStore::get_bucket_subresource(&*bucket_pg, bucket, kind)
+            .map(|stored| stored.map(|stored| stored.body))
     }
 
     pub fn try_finalize_bucket_delete(

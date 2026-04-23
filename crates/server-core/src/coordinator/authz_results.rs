@@ -100,7 +100,6 @@ pub(super) struct AuthorizedPutBucketLifecycle {
 pub(super) struct AuthorizedPutBucketEncryption {
     pub(super) bucket: BucketName,
     pub(super) config: BucketEncryptionConfig,
-    pub(super) effective_config: EffectiveBucketEncryptionConfig,
 }
 
 #[derive(Debug)]
