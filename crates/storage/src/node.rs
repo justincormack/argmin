@@ -22,8 +22,8 @@ use crate::types::{
     ListObjectVersionsReq, ListPartsReq, ListedMultipartParts, LoadedBucketSubresource,
     MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
     MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, PreparedStreamPartCommit,
-    SessionId, ShardKey, StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId,
-    UploadState, WriteAck,
+    SessionId, ShardKey, StoredObject, StreamUploadPartSnapshot, StreamUploadState,
+    StreamUploadTarget, UploadId, UploadState, WriteAck,
 };
 
 const TRACE_TARGET: &str = "storage";
@@ -32,6 +32,7 @@ const LOCK_WAIT_EVENT_THRESHOLD_US: u128 = 1_000;
 
 mod bucket_ops;
 mod multipart_ops;
+mod stream_ops;
 
 fn read_rwlock_unpoisoned<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|err| err.into_inner())

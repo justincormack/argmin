@@ -8,7 +8,7 @@ use crate::types::{
 };
 
 impl SharedStorageNode {
-    fn load_existing_live_object_from_object_pg(
+    pub(super) fn load_existing_live_object_from_object_pg(
         pg: &PgStore,
         bucket: &BucketName,
         key: &ObjectKey,

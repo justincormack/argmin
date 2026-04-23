@@ -269,22 +269,23 @@ pub(crate) fn begin_stream_put_with_authorized_request_test<'a>(
     encryption: WriteEncryptionRequest<'a>,
     object_lock: ObjectLockState,
 ) -> Result<SessionId, ServerError> {
-    let authorized = coord.authorize_put_object_write(&AuthorizePutObjectRequest {
-        object: ObjectRequest::new(
-            object.bucket.name_typed().clone(),
-            object.key_typed().clone(),
-            object.requester().clone(),
-            object.expected_bucket_owner(),
-        ),
-        acl: acl.clone(),
-        policy_context: encryption.with_policy_context(
-            policy_context.with_default_canned_acl(acl.policy_condition_value()),
-        ),
-        object_lock,
-        tags: None,
-        encryption,
-    })?;
-    coord.begin_stream_put_session(&authorized)
+    Ok(coord
+        .begin_stream_put(&AuthorizePutObjectRequest {
+            object: ObjectRequest::new(
+                object.bucket.name_typed().clone(),
+                object.key_typed().clone(),
+                object.requester().clone(),
+                object.expected_bucket_owner(),
+            ),
+            acl: acl.clone(),
+            policy_context: encryption.with_policy_context(
+                policy_context.with_default_canned_acl(acl.policy_condition_value()),
+            ),
+            object_lock,
+            tags: None,
+            encryption,
+        })?
+        .session_id)
 }
 
 pub(crate) fn wait_until_bucket_gone(coord: &Coordinator, name: &str) {

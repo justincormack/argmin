@@ -899,9 +899,21 @@ Acceptance criteria:
 
 Phase 7b status:
 
-- open
-- deferred out of multipart phase 7 so multipart can be treated as complete on
-  its own terms
+- in progress
+- first migrated slice:
+  - `BeginStreamPut`
+- `BeginStreamPut` now follows the same corrected transactional pattern as the
+  multipart session paths:
+  - storage owns the bucket write reservation, bucket snapshot load,
+    existing-object lookup, and stream-session creation
+  - coordinator contributes a pure auth/semantic closure over the loaded
+    bucket handle and existing live object
+  - the production entry path no longer does authorization first and then a
+    separate coordinator-owned object-PG session create afterwards
+- remaining 7b surface:
+  - large-body `PutObject` session creation path
+  - stream-put finalize path
+  - stream-put abort / scavenging path
 
 ### Phase 8: Copy / UploadPartCopy Dual-Bucket Flows
 

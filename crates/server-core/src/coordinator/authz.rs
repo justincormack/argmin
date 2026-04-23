@@ -3559,54 +3559,65 @@ impl Coordinator {
         &self,
         req: &AuthorizePutObjectRequest<'_>,
     ) -> Result<AuthorizedPutObjectWrite, ServerError> {
-        let key = req.object.key();
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
         self.with_bucket_write_handle_for(&req.object, request, |bucket| {
-            let bucket_info = ValidatedBucket(bucket.bucket().clone());
             let existing_object = self.put_target_existing_live_object(
                 req.object.bucket.name_typed(),
                 req.object.key_typed(),
             )?;
-            let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
-            let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket)?;
-            if !self.requester_can_put_object_with_bucket_policy(
-                BucketPolicyAccess {
-                    requester: req.object.requester(),
-                    bucket: &bucket_info,
-                    bucket_tags: bucket_tags.as_deref(),
-                    policy: bucket_policy.as_deref(),
-                },
-                key,
-                req.policy_context,
+            self.authorize_put_object_write_with_existing_object(
+                req,
+                &bucket,
                 existing_object.as_ref(),
-            )? {
-                return Err(ServerError::AccessDenied);
-            }
-            let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
-            if write_encryption.is_sse_customer() && bucket_info.encryption.sse_c_blocked {
-                return Err(ServerError::SseCBlockedAccessDenied {
-                    requester_principal: Self::requester_principal_required(
-                        req.object.requester(),
-                    )?
+            )
+        })
+    }
+
+    pub(super) fn authorize_put_object_write_with_existing_object(
+        &self,
+        req: &AuthorizePutObjectRequest<'_>,
+        bucket: &LoadedBucketHandle,
+        existing_object: Option<&StoredObject>,
+    ) -> Result<AuthorizedPutObjectWrite, ServerError> {
+        let key = req.object.key();
+        let bucket_info = ValidatedBucket(bucket.bucket().clone());
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(bucket)?;
+        let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket)?;
+        if !self.requester_can_put_object_with_bucket_policy(
+            BucketPolicyAccess {
+                requester: req.object.requester(),
+                bucket: &bucket_info,
+                bucket_tags: bucket_tags.as_deref(),
+                policy: bucket_policy.as_deref(),
+            },
+            key,
+            req.policy_context,
+            existing_object,
+        )? {
+            return Err(ServerError::AccessDenied);
+        }
+        let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
+        if write_encryption.is_sse_customer() && bucket_info.encryption.sse_c_blocked {
+            return Err(ServerError::SseCBlockedAccessDenied {
+                requester_principal: Self::requester_principal_required(req.object.requester())?
                     .to_string(),
-                    action: "s3:PutObject".to_string(),
-                    resource: format!("arn:aws:s3:::{}/{}", bucket_info.name, key),
-                });
-            }
-            Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
-            Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
-            Ok(AuthorizedPutObjectWrite {
-                bucket: req.object.bucket.name_typed().clone(),
-                key: req.object.key_typed().clone(),
-                requester: req.object.requester().clone(),
-                expected_bucket_owner: req.object.expected_bucket_owner().map(str::to_string),
-                acl: AuthorizedPutObjectWriteAcl::from_parsed(&req.acl),
-                requested_object_lock: req.object_lock,
-                tags: req.tags.map(str::to_string),
-                write_encryption,
-            })
+                action: "s3:PutObject".to_string(),
+                resource: format!("arn:aws:s3:::{}/{}", bucket_info.name, key),
+            });
+        }
+        Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
+        Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
+        Ok(AuthorizedPutObjectWrite {
+            bucket: req.object.bucket.name_typed().clone(),
+            key: req.object.key_typed().clone(),
+            requester: req.object.requester().clone(),
+            expected_bucket_owner: req.object.expected_bucket_owner().map(str::to_string),
+            acl: AuthorizedPutObjectWriteAcl::from_parsed(&req.acl),
+            requested_object_lock: req.object_lock,
+            tags: req.tags.map(str::to_string),
+            write_encryption,
         })
     }
 

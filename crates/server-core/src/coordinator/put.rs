@@ -1,11 +1,11 @@
 use storage::traits::PgMetadataStore;
 use storage::{
-    BucketName, CommitStreamPutReq, EcShape, GenerationId, ObjectKey, ObjectLayout,
-    ObjectSegmentRecord, PutLiveObjectReq, SessionId, ShardKey, StreamUploadState,
+    BucketName, CommitStreamPutReq, CreateStreamUploadReq, EcShape, GenerationId, ObjectKey,
+    ObjectLayout, ObjectSegmentRecord, PutLiveObjectReq, SessionId, ShardKey, StreamUploadState,
     StreamUploadTarget,
 };
 
-use super::bucket_handles::BucketHandleRequest;
+use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
 use super::{
     ActiveWriteEncryption, AuthorizePutObjectRequest, AuthorizedFinalizeStreamPutRequest,
     AuthorizedPutObjectCommitRequest, AuthorizedPutObjectWrite, AuthorizedWriteTags, Coordinator,
@@ -274,12 +274,45 @@ impl Coordinator {
         &self,
         req: &AuthorizePutObjectRequest<'_>,
     ) -> Result<PreparedStreamPut, ServerError> {
-        let authorized_write = self.authorize_put_object_write(req)?;
-        let session_id = self.create_stream_put_session_for_authorized_write(&authorized_write)?;
-        Ok(PreparedStreamPut {
-            authorized_write,
-            session_id,
-        })
+        let session_id = Self::random_session_id("failed to generate session ID")?;
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+        self.storage_node
+            .create_put_object_stream_session(
+                req.object.bucket.name_typed(),
+                req.object.key_typed(),
+                request.resolve_to_storage_request(),
+                |snapshot, existing_object| {
+                    let bucket = self
+                        .bucket_handle_loader()
+                        .load_bucket_handle_from_snapshot(
+                            snapshot,
+                            req.object.expected_bucket_owner(),
+                            request,
+                        )?;
+                    let authorized_write = self.authorize_put_object_write_with_existing_object(
+                        req,
+                        &bucket,
+                        existing_object.as_ref(),
+                    )?;
+                    let create = CreateStreamUploadReq {
+                        session_id: session_id.clone(),
+                        bucket: authorized_write.bucket_typed().clone(),
+                        key: authorized_write.key_typed().clone(),
+                        target: StreamUploadTarget::PutObject,
+                        encryption: authorized_write.write_encryption.object_encryption(),
+                    };
+                    Ok((
+                        PreparedStreamPut {
+                            authorized_write,
+                            session_id: session_id.clone(),
+                        },
+                        create,
+                    ))
+                },
+            )
+            .map_err(BucketHandleLoader::map_bucket_snapshot_error)?
     }
 
     pub fn begin_stream_put_session(
