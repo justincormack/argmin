@@ -4,3 +4,11 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
+cc afcc422245823c18dbe0d0a932042c665543bbae13a84b29dfac81f33f10fb52 # shrinks to keys = [], prefix = "", max_keys = 1
+cc c3de2884111f41033ed62fd2ceb9d772aae60b388c61bbc5a79e57a13d8a1c43 # shrinks to keys = [], max_keys = 1
+cc 874af17035c7462a18b72e4f61c70b49f912a8d5be2712d4b850d489196f9ea2 # shrinks to (keys, ops) = (["a"], [SetVersioning(Disabled)])
+cc 01a131338555dd7f15301c6158605e50fe0a62fe126b96a0d47f4c6a3935082a # shrinks to (keys, ops) = (["_"], [SetVersioning(Disabled)]), page_size = 1
+cc 37f559266e38665e19128443a70b52039cd02f17de59bfb1286103f803a95a38 # shrinks to (keys, ops) = (["A"], [SetVersioning(Disabled)])
+cc 1e0806d3587428f4a67bc99f604f21ad540e67fe070230034b5136c328d0b1b1 # shrinks to (keys, ops) = (["a"], [SetVersioning(Disabled)])
+cc 25ef75884342634b98c65b56ea84ea2a5386f5a04a6f789503952d403f7154fc # shrinks to (keys, ops) = (["A"], [SetVersioning(Disabled)])
+cc 112ee11e8f820313624ea17f888d61c988a8afa747d3163eafcde3fbdced56f9 # shrinks to (keys, ops) = (["a"], [SetVersioning(Disabled)]), page_size = 1

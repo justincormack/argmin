@@ -9,3 +9,7 @@ cc 87c6a20e714c76d96343a11f09cbefc533b84f7064a428e2276a5e639f0ce12b # shrinks to
 cc 5a155b2b545cf6f951c0802cb9ca7828c57cbcb2ea5ce5f585918a209d4d16c1 # shrinks to ops = [SeedOldMetadata, SeedNewMetadata, AcquireOldLease, SeedBucketDelete, WorkerBucketDeleteStep, WorkerObjectStep, SeedNewMetadata]
 cc 7d9f214f80d8e4e72b73901bcb5f2a85224b5ccc4296867e3f3a1253da439dc5 # shrinks to ops = [SeedOldMetadata, SeedNewMetadata, EnqueueOldReclaim, WorkerObjectStep, WorkerBucketDeleteStep, WorkerObjectStep]
 cc 812564cf7dd7ca0a93c168b0723c81c12f6421942bb1c10494853bee1abf6567 # shrinks to ops = [SeedMultipartMetadata, ExpectNoWork, EnqueueObjectReclaim, AcquireLease, ReleaseLease, WorkerObjectStep, SeedMultipartMetadata, EnqueueObjectReclaim, WorkerObjectStep, AcquireLease]
+cc e8fe817379ad86995b463eae3167eeeb6a44531dcdd179234dbf7409e85ff9cb # shrinks to ops = []
+cc 1b65e18d4d45d7bce1a495934cb1d2ddf2f73a4555a154d2324acf8a659530a1 # shrinks to ops = []
+cc 0ffd1b60dfe3de3f2d25f79eebf185bf5f3f30dd750df5fba4d8ec51b4f964e7 # shrinks to ops = []
+cc 3f24dc18046c73a303f23f23f74b9316c388547042fbde535c00c9484669087f # shrinks to ops = []
