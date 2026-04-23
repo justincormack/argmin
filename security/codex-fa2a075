@@ -1,0 +1,207 @@
+ListParts metadata read happens before auth check
+Link: https://chatgpt.com/codex/cloud/security/findings/0a9fe9a92e50819181eef18b77bbcf1a?repo=https%3A%2F%2Fgithub.com%2Fjustincormack%2Fargmin&sev=
+Criticality: low (attack path: low)
+Status: fixed
+
+# Metadata
+Repo: justincormack/argmin
+Commit: fa2a075
+Author: justin@specialbusservice.com
+Created: 22/04/2026, 22:05:35
+Assignee: Unassigned
+Signals: Security, Validated, Attack-path
+
+# Fix
+Fixed in commit `4d15a6e` (`Move list parts into storage transaction boundary`).
+
+The `ListParts` production path no longer does a pre-auth metadata read followed
+by a separate post-auth listing call. Instead, storage now owns a single
+transaction-shaped `list_multipart_parts_for_upload(...)` operation that:
+
+- acquires the object PG once
+- reloads and revalidates the multipart upload as `InProgress`
+- invokes a pure coordinator auth closure
+- only lists part rows if that auth closure succeeds
+
+This removes the original pre-auth part-row materialization side effect and also
+avoids the later TOCTOU regression where upload state could change between a
+separate auth lookup and part listing.
+
+# Summary
+This commit introduces a pre-authorization metadata read path for ListParts. Unauthorized requests now cause `pg.list_multipart_parts` to execute before access validation, enabling resource-consumption and timing side effects.
+In `authorize_list_parts`, the commit moves the `list_multipart_parts_for_upload` call ahead of the `requester_can_manage_multipart_upload` check. The storage helper immediately queries SQLite and materializes part records. As a result, unauthenticated or unauthorized callers who can guess or enumerate upload IDs can force the server to perform potentially expensive metadata scans before being denied, leaking timing about upload size and consuming resources despite failing authorization. Previously, part listing only occurred after access checks.
+
+# Validation
+## Rubric
+- [x] Identify authorize_list_parts call order and confirm list_multipart_parts_for_upload executes before authorization (authz.rs).
+- [x] Verify storage_node.list_multipart_parts_for_upload performs metadata read/load and calls pg.list_multipart_parts (node.rs).
+- [x] Verify pg_store.list_multipart_parts executes SQL queries and materializes rows (pg_store.rs).
+- [x] Run an unauthorized ListParts unit test to confirm AccessDenied path is exercised.
+- [ ] Demonstrate timing/resource impact via runtime instrumentation (not feasible in current environment).
+## Report
+Rubric-driven validation: Built debug tests (`cargo test -p server-core --lib --no-run`) and ran the existing unit test for unauthorized ListParts (`cargo test -p server-core --lib authorize_list_parts_rejects_non_owner_requester -- --nocapture`), which passed and confirms AccessDenied for non-owner requests (log in artifacts). Attempts to use valgrind/gdb failed because the tools are not installed. Code inspection shows the pre-auth metadata read: in `authorize_list_parts`, the call to `storage_node.list_multipart_parts_for_upload(...)` happens before the `requester_can_manage_multipart_upload(...)` authorization check (crates/server-core/src/coordinator/authz.rs:4258-4289). The storage helper immediately loads the upload metadata and invokes `pg.list_multipart_parts(...)` (crates/storage/src/node.rs:1025-1038), which in turn executes SQL queries and materializes multipart part records into memory (crates/storage/src/pg_store.rs:5335-5398). This confirms that an unauthorized ListParts request still triggers SQLite reads and row materialization before AccessDenied, creating a resource-consumption/timing side effect as described.
+
+# Evidence
+/workspace/argmin/crates/server-core/src/coordinator/authz.rs (L4256 to 4292)
+  Note: `list_multipart_parts_for_upload` is invoked before checking `requester_can_manage_multipart_upload`, so part metadata is fetched prior to authorization.
+```
+    pub(super) fn authorize_list_parts(
+        &self,
+        req: &ListPartsRequest<'_>,
+    ) -> Result<AuthorizedListParts, ServerError> {
+        let bucket = req.upload.bucket_name_typed();
+        let key = req.upload.key_typed();
+        let upload_id = req.upload.upload_id_typed();
+        let bucket_info =
+            self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
+        let listed = self
+            .storage_node
+            .list_multipart_parts_for_upload(
+                bucket,
+                key,
+                upload_id,
+                req.part_number_marker,
+                req.max_parts,
+            )
+            .map_err(Self::map_object_pg_action_error)?;
+        let upload = listed.upload;
+        if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        if upload.state != UploadState::InProgress {
+            return Err(ServerError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            });
+        }
+        if !Self::requester_can_manage_multipart_upload(
+            req.upload.requester(),
+            &bucket_info,
+            &upload,
+        ) {
+            return Err(ServerError::AccessDenied);
+        }
+```
+
+/workspace/argmin/crates/storage/src/node.rs (L1025 to 1040)
+  Note: Storage helper immediately lists multipart parts from the metadata store, performing the expensive read even if the caller will later be denied.
+```
+    pub fn list_multipart_parts_for_upload(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number_marker: Option<u32>,
+        max_parts: u32,
+    ) -> Result<ListedMultipartParts, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let upload = Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
+        let response = pg.list_multipart_parts(&ListPartsReq {
+            upload_id: upload_id.clone(),
+            part_number_marker,
+            max_parts,
+        })?;
+        Ok(ListedMultipartParts { upload, response })
+```
+
+/workspace/argmin/crates/storage/src/pg_store.rs (L5335 to 5399)
+  Note: `list_multipart_parts` executes the SQL query and materializes all returned part records into memory, which now occurs pre-auth due to the change above.
+```
+    fn list_multipart_parts(&self, req: &ListPartsReq) -> Result<ListPartsResp, MetadataError> {
+        // Verify the upload exists so we return NoSuchUpload, not an empty list.
+        let exists = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM multipart_uploads WHERE upload_id = ?1",
+                params![req.upload_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|e| MetadataError::Db {
+                context: "list parts (upload exists check)",
+                source: e,
+            })?;
+        if exists.is_none() {
+            return Err(MetadataError::NoSuchUpload {
+                upload_id: req.upload_id.to_string(),
+            });
+        }
+
+        let limit = req.max_parts as i64 + 1;
+
+        let mut params_vec: Vec<Box<dyn rusqlite::types::ToSql>> =
+            vec![Box::new(req.upload_id.clone())];
+        let sql = if let Some(marker) = req.part_number_marker {
+            params_vec.push(Box::new(marker));
+            params_vec.push(Box::new(limit));
+            "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
+             part_okh, part_vid, ec_k, ec_m, last_modified, checksum \
+             FROM multipart_parts \
+             WHERE upload_id = ?1 AND part_number > ?2 \
+             ORDER BY part_number ASC LIMIT ?3"
+                .to_string()
+        } else {
+            params_vec.push(Box::new(limit));
+            "SELECT upload_id, part_number, generation, size, etag, etag_kind, \
+             part_okh, part_vid, ec_k, ec_m, last_modified, checksum \
+             FROM multipart_parts \
+             WHERE upload_id = ?1 \
+             ORDER BY part_number ASC LIMIT ?2"
+                .to_string()
+        };
+
+        let params_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params_vec.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = self.conn.prepare(&sql).map_err(|e| MetadataError::Db {
+            context: "prepare list multipart parts",
+            source: e,
+        })?;
+
+        let rows = stmt
+            .query_map(params_refs.as_slice(), Self::row_to_multipart_part)
+            .map_err(|e| MetadataError::Db {
+                context: "list multipart parts query",
+                source: e,
+            })?;
+
+        let mut parts: Vec<MultipartPartRecord> = Vec::new();
+        for row in rows {
+            parts.push(row.map_err(|e| MetadataError::Db {
+                context: "list multipart parts row",
+                source: e,
+            })?);
+        }
+```
+
+# Attack-path analysis
+Final: low | Decider: model_decided | Matrix severity: ignore | Policy adjusted: ignore
+## Rationale
+Evidence shows a pre-authorization metadata read (authz.rs 4256-4292) that performs SQLite queries and row materialization (node.rs 1025-1040; pg_store.rs 5335-5395) before denying access. This creates a limited availability/timing side effect without data disclosure or authorization bypass. Impact is low and exploitation requires guessing/leaking upload IDs, so the original low severity is appropriate.
+## Likelihood
+high - Requires network reachability and a valid/guessable upload_id; without enumeration or leakage of upload IDs, triggering the heavier path is not trivial. | Remote network vector
+## Impact
+low - Unauthorized callers can trigger metadata queries and row materialization before being denied, causing modest CPU/IO use and potential timing signals about upload size; no data exposure or authz bypass is shown.
+## Assumptions
+- argmin-s3 is deployed with ARGMIN_LISTEN_ADDR bound to an address reachable by untrusted clients (not just localhost).
+- An attacker can send ListParts requests that reach authorize_list_parts (authenticated as a low-privileged principal or as an anonymous requester for public buckets).
+- Upload IDs can be guessed or learned for at least one target upload, enabling the pre-auth list path to execute.
+- Network reachability to the HTTP listener
+- A ListParts request routed to authorize_list_parts
+- A valid or guessable upload_id for a target upload
+## Path
+ListParts HTTP -> authorize_list_parts -> list_multipart_parts_for_upload -> pg.list_multipart_parts (DB work) -> AccessDenied
+## Path evidence
+- `crates/server-core/src/coordinator/authz.rs:4256-4292` - authorize_list_parts performs list_multipart_parts_for_upload before requester_can_manage_multipart_upload.
+- `crates/storage/src/node.rs:1025-1040` - list_multipart_parts_for_upload loads upload and calls pg.list_multipart_parts immediately.
+- `crates/storage/src/pg_store.rs:5335-5395` - list_multipart_parts executes SQL queries and materializes part records.
+- `crates/argmin-s3/src/config.rs:60-70` - Default listen address is 127.0.0.1:9000, indicating deployment exposure is configurable.
+## Narrative
+The ListParts authorization path calls storage_node.list_multipart_parts_for_upload before requester_can_manage_multipart_upload, so SQLite metadata reads occur even when the requester is unauthorized. In authz.rs, list_multipart_parts_for_upload is invoked before the authz check; storage/node.rs immediately loads the upload and calls pg.list_multipart_parts; pg_store.rs executes SQL queries and materializes rows. This creates a pre-auth resource consumption/timing side effect on unauthorized requests, but does not expose data or bypass authorization.
+## Controls
+- SigV4 authentication and requester identity
+- requester_can_manage_multipart_upload authorization check (post-read)
+- max_connections/max_inflight_requests limits
+## Blindspots
+- No deployment manifests or ingress configuration in repo; exposure (public vs internal) is uncertain.
+- No runtime profiling to quantify cost of list_multipart_parts under load.
