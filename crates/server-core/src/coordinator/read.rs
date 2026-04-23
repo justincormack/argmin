@@ -3,12 +3,13 @@ use storage::{ObjectLayout, StoredObject};
 
 #[cfg(test)]
 use super::maybe_run_multipart_snapshot_hook;
+use super::read_core::snapshotted_multipart_parts_from_storage;
 use super::{
     segment_payloads_from_object_segments, AuthorizedObjectRead, Coordinator,
     GetObjectAttributesRequest, GetObjectAttributesResult, GetObjectPartRequest,
     GetObjectPartResult, GetObjectRangeRequest, GetObjectRangeResult, GetObjectRequest,
-    GetObjectResult, HeadObjectPartResult, HeadObjectResult, LockedReadObject, ObjectPartEntry,
-    ObjectPartsInfo, ObjectVersionRequest, ReadHandle, ReadObjectContext, TRACE_TARGET,
+    GetObjectResult, HeadObjectPartResult, HeadObjectResult, ObjectPartEntry, ObjectPartsInfo,
+    ObjectVersionRequest, ReadHandle, ReadObjectContext, TRACE_TARGET,
 };
 use crate::conditional::check_read_conditions;
 use crate::error::ServerError;
@@ -28,13 +29,13 @@ impl Coordinator {
         let key = req.object.key();
         let version_id = req.object.version_id;
         let cond = req.cond;
-        let AuthorizedObjectRead {
-            locked:
-                LockedReadObject {
-                    record: stored,
-                    pgs,
-                },
-        } = self.authorize_get_object(req)?;
+        let AuthorizedObjectRead { snapshot } = self.authorize_get_object(req)?;
+        let storage::ObjectReadSnapshot {
+            stored,
+            object_segments,
+            multipart_parts,
+            multipart_part_segments,
+        } = snapshot;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -50,23 +51,14 @@ impl Coordinator {
         check_read_conditions(cond, &etag_str, record.last_modified)?;
         let sse_customer =
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
-        let emit_lifecycle_expiration = Self::requested_version_is_current_live(
-            pgs.meta(),
-            bucket,
-            key,
-            version_id,
-            record.version_id,
-        )?;
+        let emit_lifecycle_expiration = version_id.is_none();
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
-            let meta_pg = pgs.meta();
-            let obj_parts = Self::snapshot_multipart_parts(
-                meta_pg,
-                req.object.bucket_name_typed(),
-                req.object.key_typed(),
-                record.version_id,
+            let obj_parts = snapshotted_multipart_parts_from_storage(
+                multipart_parts,
+                multipart_part_segments,
                 &record.encryption,
-            )?;
+            );
 
             let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
             let system_metadata = self.deserialize_visible_system_metadata(
@@ -84,7 +76,6 @@ impl Coordinator {
                 record.size as usize,
                 req.sse_customer.cloned(),
             );
-            drop(pgs);
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 let lifecycle_bucket = self.checked_active_bucket_summary_for(
                     req.object.bucket_name_typed(),
@@ -121,15 +112,6 @@ impl Coordinator {
             let etag_crc = record.etag.crc64();
             let user_size = record.size as usize;
 
-            let meta_pg = pgs.meta();
-            let segments = storage::PgMetadataStore::get_object_segments(
-                meta_pg,
-                req.object.bucket_name_typed(),
-                req.object.key_typed(),
-                record.version_id,
-            )
-            .map_err(ServerError::Metadata)?;
-
             let metadata = Self::deserialize_user_metadata(record.metadata_blob.as_ref())?;
             let system_metadata = self.deserialize_visible_system_metadata(
                 record.system_metadata_blob.as_ref(),
@@ -138,7 +120,6 @@ impl Coordinator {
             )?;
 
             let body = if user_size == 0 {
-                drop(pgs);
                 ReadHandle::from_buffered_bytes(vec![])
             } else {
                 let body = ReadHandle::from_segments(
@@ -149,11 +130,13 @@ impl Coordinator {
                         generation_id: record.generation_id,
                         sse_customer_request: req.sse_customer.cloned(),
                     },
-                    segment_payloads_from_object_segments(segments, record.encryption.clone()),
+                    segment_payloads_from_object_segments(
+                        object_segments,
+                        record.encryption.clone(),
+                    ),
                     user_size,
                     Some(etag_crc),
                 );
-                drop(pgs);
                 body
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
@@ -212,13 +195,7 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
-        let AuthorizedObjectRead {
-            locked:
-                LockedReadObject {
-                    record: stored,
-                    pgs,
-                },
-        } = self.authorize_get_object(&GetObjectRequest {
+        let AuthorizedObjectRead { snapshot } = self.authorize_get_object(&GetObjectRequest {
             object: ObjectVersionRequest::new(
                 req.object.bucket_name_typed().clone(),
                 req.object.key_typed().clone(),
@@ -229,6 +206,12 @@ impl Coordinator {
             cond: req.cond,
             sse_customer: req.sse_customer,
         })?;
+        let storage::ObjectReadSnapshot {
+            stored,
+            object_segments,
+            multipart_parts,
+            multipart_part_segments,
+        } = snapshot;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -244,23 +227,14 @@ impl Coordinator {
         check_read_conditions(cond, &etag_str, record.last_modified)?;
         let sse_customer =
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
-        let emit_lifecycle_expiration = Self::requested_version_is_current_live(
-            pgs.meta(),
-            bucket,
-            key,
-            version_id,
-            record.version_id,
-        )?;
+        let emit_lifecycle_expiration = version_id.is_none();
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
-            let meta_pg = pgs.meta();
-            let obj_parts = Self::snapshot_multipart_parts(
-                meta_pg,
-                req.object.bucket_name_typed(),
-                req.object.key_typed(),
-                record.version_id,
+            let obj_parts = snapshotted_multipart_parts_from_storage(
+                multipart_parts,
+                multipart_part_segments,
                 &record.encryption,
-            )?;
+            );
 
             let part = obj_parts
                 .iter()
@@ -306,7 +280,6 @@ impl Coordinator {
                 part.record.size as usize,
                 req.sse_customer.cloned(),
             );
-            drop(pgs);
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 let lifecycle_bucket = self.checked_active_bucket_summary_for(
                     req.object.bucket_name_typed(),
@@ -352,17 +325,7 @@ impl Coordinator {
             let etag_crc = record.etag.crc64();
             let user_size = record.size as usize;
 
-            let meta_pg = pgs.meta();
-            let segments = storage::PgMetadataStore::get_object_segments(
-                meta_pg,
-                req.object.bucket_name_typed(),
-                req.object.key_typed(),
-                record.version_id,
-            )
-            .map_err(ServerError::Metadata)?;
-
             let body = if user_size == 0 {
-                drop(pgs);
                 ReadHandle::from_buffered_bytes(vec![])
             } else {
                 let body = ReadHandle::from_segments(
@@ -373,11 +336,13 @@ impl Coordinator {
                         generation_id: record.generation_id,
                         sse_customer_request: req.sse_customer.cloned(),
                     },
-                    segment_payloads_from_object_segments(segments, record.encryption.clone()),
+                    segment_payloads_from_object_segments(
+                        object_segments,
+                        record.encryption.clone(),
+                    ),
                     user_size,
                     Some(etag_crc),
                 );
-                drop(pgs);
                 body
             };
             let lifecycle_expiration = if emit_lifecycle_expiration {
@@ -444,13 +409,8 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let part_number = req.part_number;
         let cond = req.cond;
-        let AuthorizedObjectRead {
-            locked:
-                LockedReadObject {
-                    record: stored,
-                    pgs,
-                },
-        } = self.authorize_head_object(&GetObjectRequest {
+        let AuthorizedObjectRead { snapshot } = self.authorize_head_object_for_part(
+            &GetObjectRequest {
             object: ObjectVersionRequest::new(
                 req.object.bucket_name_typed().clone(),
                 req.object.key_typed().clone(),
@@ -460,7 +420,14 @@ impl Coordinator {
             ),
             cond: req.cond,
             sse_customer: req.sse_customer,
-        })?;
+        },
+        )?;
+        let storage::ObjectReadSnapshot {
+            stored,
+            object_segments: _,
+            multipart_parts,
+            multipart_part_segments: _,
+        } = snapshot;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -476,24 +443,10 @@ impl Coordinator {
         check_read_conditions(cond, &etag_str, record.last_modified)?;
         let sse_customer =
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
-        let emit_lifecycle_expiration = Self::requested_version_is_current_live(
-            pgs.meta(),
-            bucket,
-            key,
-            version_id,
-            record.version_id,
-        )?;
+        let emit_lifecycle_expiration = version_id.is_none();
 
         if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
-            let meta_pg = pgs.meta();
-            let obj_parts = storage::PgMetadataStore::get_object_parts(
-                meta_pg,
-                req.object.bucket_name_typed(),
-                req.object.key_typed(),
-                record.version_id,
-            )
-            .map_err(ServerError::Metadata)?;
-            drop(pgs);
+            let obj_parts = multipart_parts;
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 let lifecycle_bucket = self.checked_active_bucket_summary_for(
                     req.object.bucket_name_typed(),
@@ -565,7 +518,6 @@ impl Coordinator {
             if part_number != 1 {
                 return Err(ServerError::InvalidPart { part_number });
             }
-            drop(pgs);
             let lifecycle_expiration = if emit_lifecycle_expiration {
                 let lifecycle_bucket = self.checked_active_bucket_summary_for(
                     req.object.bucket_name_typed(),
@@ -626,13 +578,13 @@ impl Coordinator {
         let key = req.object.key();
         let version_id = req.object.version_id;
         let cond = req.cond;
-        let AuthorizedObjectRead {
-            locked:
-                LockedReadObject {
-                    record: stored,
-                    pgs,
-                },
-        } = self.authorize_head_object(req)?;
+        let AuthorizedObjectRead { snapshot } = self.authorize_head_object(req)?;
+        let storage::ObjectReadSnapshot {
+            stored,
+            object_segments: _,
+            multipart_parts: _,
+            multipart_part_segments: _,
+        } = snapshot;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -655,14 +607,7 @@ impl Coordinator {
         check_read_conditions(cond, &etag_str, record.last_modified)?;
         let sse_customer =
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
-        let emit_lifecycle_expiration = Self::requested_version_is_current_live(
-            pgs.meta(),
-            bucket,
-            key,
-            version_id,
-            record.version_id,
-        )?;
-        drop(pgs);
+        let emit_lifecycle_expiration = version_id.is_none();
         let lifecycle_expiration = if emit_lifecycle_expiration {
             let lifecycle_bucket = self.checked_active_bucket_summary_for(
                 req.object.bucket_name_typed(),
@@ -722,13 +667,13 @@ impl Coordinator {
         let want_parts = req.want_parts;
         let part_number_marker = req.part_number_marker;
         let max_parts = req.max_parts;
-        let AuthorizedObjectRead {
-            locked:
-                LockedReadObject {
-                    record: stored,
-                    pgs,
-                },
-        } = self.authorize_get_object_attributes(req)?;
+        let AuthorizedObjectRead { snapshot } = self.authorize_get_object_attributes(req)?;
+        let storage::ObjectReadSnapshot {
+            stored,
+            object_segments: _,
+            multipart_parts,
+            multipart_part_segments: _,
+        } = snapshot;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -757,13 +702,7 @@ impl Coordinator {
                 let has_checksum = system_metadata.checksum_algorithm().is_some();
 
                 if has_checksum {
-                    let meta_pg = pgs.meta();
-                    let all_parts = storage::PgMetadataStore::get_object_parts(
-                        meta_pg,
-                        req.object.bucket_name_typed(),
-                        req.object.key_typed(),
-                        record.version_id,
-                    )?;
+                    let all_parts = multipart_parts.clone();
                     let total_parts_count = all_parts.len() as u32;
                     let marker = part_number_marker.unwrap_or(0);
 
@@ -806,13 +745,7 @@ impl Coordinator {
                         part_number_marker: marker,
                     })
                 } else {
-                    let meta_pg = pgs.meta();
-                    let all_parts = storage::PgMetadataStore::get_object_parts(
-                        meta_pg,
-                        req.object.bucket_name_typed(),
-                        req.object.key_typed(),
-                        record.version_id,
-                    )?;
+                    let all_parts = multipart_parts;
                     let total_parts_count = all_parts.len() as u32;
 
                     Some(ObjectPartsInfo {
@@ -863,13 +796,7 @@ impl Coordinator {
         let version_id = req.object.version_id;
         let range = req.range;
         let cond = req.cond;
-        let AuthorizedObjectRead {
-            locked:
-                LockedReadObject {
-                    record: stored,
-                    pgs,
-                },
-        } = self.authorize_get_object(&GetObjectRequest {
+        let AuthorizedObjectRead { snapshot } = self.authorize_get_object(&GetObjectRequest {
             object: ObjectVersionRequest::new(
                 req.object.bucket_name_typed().clone(),
                 req.object.key_typed().clone(),
@@ -880,6 +807,12 @@ impl Coordinator {
             cond: req.cond,
             sse_customer: req.sse_customer,
         })?;
+        let storage::ObjectReadSnapshot {
+            stored,
+            object_segments,
+            multipart_parts,
+            multipart_part_segments,
+        } = snapshot;
 
         let record = match stored {
             StoredObject::Live(r) => r,
@@ -895,13 +828,7 @@ impl Coordinator {
         check_read_conditions(cond, &etag_str, record.last_modified)?;
         let sse_customer =
             self.prepare_sse_customer_read_access(&record.encryption, req.sse_customer)?;
-        let emit_lifecycle_expiration = Self::requested_version_is_current_live(
-            pgs.meta(),
-            bucket,
-            key,
-            version_id,
-            record.version_id,
-        )?;
+        let emit_lifecycle_expiration = version_id.is_none();
 
         let (user_start, user_end) = match range.resolve(record.size) {
             Some(resolved) => resolved,
@@ -947,17 +874,16 @@ impl Coordinator {
             record.layout,
             ObjectLayout::MultipartManifest { .. }
         ) {
-            let meta_pg = pgs.meta();
-            let obj_parts = Self::snapshot_multipart_parts_overlapping_range(
-                meta_pg,
-                req.object.bucket_name_typed(),
-                req.object.key_typed(),
-                record.version_id,
+            let obj_parts = snapshotted_multipart_parts_from_storage(
+                multipart_parts,
+                multipart_part_segments,
                 &record.encryption,
-                user_start,
-                user_end + 1,
-            )?;
-            if obj_parts.is_empty() {
+            );
+            if !obj_parts.iter().any(|part| {
+                let part_start = part.object_offset_start as u64;
+                let part_end_exclusive = part_start + part.record.size;
+                part_end_exclusive > user_start && part_start <= user_end
+            }) {
                 return Err(ServerError::InternalError {
                     reason: format!(
                         "multipart range resolved to no parts for {bucket}/{key} version {version_id:?} at {user_start}-{user_end}"
@@ -981,7 +907,6 @@ impl Coordinator {
                 (user_start as usize, user_end as usize),
                 req.sse_customer.cloned(),
             );
-            drop(pgs);
             #[cfg(test)]
             maybe_run_multipart_snapshot_hook(bucket, key);
             (metadata, system_metadata, body)
@@ -993,15 +918,6 @@ impl Coordinator {
                 req.sse_customer,
             )?;
 
-            let meta_pg = pgs.meta();
-            let segments = storage::PgMetadataStore::get_object_segments(
-                meta_pg,
-                req.object.bucket_name_typed(),
-                req.object.key_typed(),
-                record.version_id,
-            )
-            .map_err(ServerError::Metadata)?;
-
             let body = ReadHandle::from_segments_range(
                 ReadObjectContext {
                     runtime: self.read_runtime(),
@@ -1010,11 +926,10 @@ impl Coordinator {
                     generation_id: record.generation_id,
                     sse_customer_request: req.sse_customer.cloned(),
                 },
-                segment_payloads_from_object_segments(segments, record.encryption.clone()),
+                segment_payloads_from_object_segments(object_segments, record.encryption.clone()),
                 user_start as usize,
                 user_end as usize,
             );
-            drop(pgs);
 
             (metadata, system_metadata, body)
         };

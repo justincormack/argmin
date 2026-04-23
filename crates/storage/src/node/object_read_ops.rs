@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ObjectLayout, VersionId};
+use crate::{ObjectLayout, ObjectReadSnapshotMode, VersionId};
 
 impl SharedStorageNode {
     pub fn load_object_if<T, E>(
@@ -61,6 +61,7 @@ impl SharedStorageNode {
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
+        snapshot_mode: ObjectReadSnapshotMode,
         action: impl FnOnce(&StoredObject) -> Result<T, E>,
     ) -> Result<Result<ObjectReadSnapshotOutcome<T>, E>, ObjectPgActionError> {
         let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
@@ -71,7 +72,13 @@ impl SharedStorageNode {
         let result = match action(&stored) {
             Ok(value) => Ok(ObjectReadSnapshotOutcome {
                 value,
-                snapshot: Self::snapshot_object_read_from_pg(&pg, bucket, key, &stored)?,
+                snapshot: Self::snapshot_object_read_from_pg(
+                    &pg,
+                    bucket,
+                    key,
+                    &stored,
+                    snapshot_mode,
+                )?,
             }),
             Err(error) => Err(error),
         };
@@ -83,16 +90,27 @@ impl SharedStorageNode {
         bucket: &BucketName,
         key: &ObjectKey,
         stored: &StoredObject,
+        snapshot_mode: ObjectReadSnapshotMode,
     ) -> Result<ObjectReadSnapshot, ObjectPgActionError> {
         let (object_segments, multipart_parts, multipart_part_segments) = match stored {
             StoredObject::DeleteMarker(_) => (Vec::new(), Vec::new(), Vec::new()),
-            StoredObject::Live(record) => match record.layout {
-                ObjectLayout::Standard => (
+            StoredObject::Live(record) => match (record.layout, snapshot_mode) {
+                (_, ObjectReadSnapshotMode::MetadataOnly) => (Vec::new(), Vec::new(), Vec::new()),
+                (ObjectLayout::Standard, ObjectReadSnapshotMode::StandardSegments)
+                | (ObjectLayout::Standard, ObjectReadSnapshotMode::FullPayloadLayout) => (
                     PgMetadataStore::get_object_segments(pg, bucket, key, record.version_id)?,
                     Vec::new(),
                     Vec::new(),
                 ),
-                ObjectLayout::MultipartManifest { .. } => {
+                (ObjectLayout::Standard, ObjectReadSnapshotMode::MultipartParts) => {
+                    (Vec::new(), Vec::new(), Vec::new())
+                }
+                (ObjectLayout::MultipartManifest { .. }, ObjectReadSnapshotMode::MultipartParts) => (
+                    Vec::new(),
+                    PgMetadataStore::get_object_parts(pg, bucket, key, record.version_id)?,
+                    Vec::new(),
+                ),
+                (ObjectLayout::MultipartManifest { .. }, ObjectReadSnapshotMode::FullPayloadLayout) => {
                     let multipart_parts =
                         PgMetadataStore::get_object_parts(pg, bucket, key, record.version_id)?;
                     let mut multipart_part_segments = Vec::new();
@@ -110,6 +128,9 @@ impl SharedStorageNode {
                         }
                     }
                     (Vec::new(), multipart_parts, multipart_part_segments)
+                }
+                (ObjectLayout::MultipartManifest { .. }, ObjectReadSnapshotMode::StandardSegments) => {
+                    (Vec::new(), Vec::new(), Vec::new())
                 }
             },
         };

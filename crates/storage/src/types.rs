@@ -2335,6 +2335,14 @@ pub struct ObjectReadSnapshot {
     pub multipart_part_segments: Vec<MultipartPartSegmentRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObjectReadSnapshotMode {
+    MetadataOnly,
+    StandardSegments,
+    MultipartParts,
+    FullPayloadLayout,
+}
+
 #[derive(Debug, Clone)]
 pub struct ObjectReadSnapshotOutcome<T> {
     pub value: T,

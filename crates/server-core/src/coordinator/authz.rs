@@ -6,8 +6,8 @@ use s3_types::{
 };
 use storage::{
     BucketName, BucketObjectLockConfig, BucketObjectOwnership, BucketOwnershipControls,
-    BucketState, ManagedEncryptionAlgorithm, MultipartUploadRecord, ObjectKey, OwnerIdentity,
-    PublicAccessBlockConfig, StoredObject, UploadState,
+    BucketState, ManagedEncryptionAlgorithm, MultipartUploadRecord, ObjectKey,
+    ObjectReadSnapshotMode, OwnerIdentity, PublicAccessBlockConfig, StoredObject, UploadState,
 };
 
 use super::authz_results::{
@@ -70,6 +70,14 @@ enum MissingObjectDiscovery {
     ReadObjectAttributes,
     BucketAdmin,
     ObjectAcl,
+}
+
+#[derive(Clone, Copy)]
+enum ObjectReadAuthorizationKind {
+    Read {
+        existing_object_tags_mode: ExistingObjectTagsMode,
+    },
+    Attributes,
 }
 
 impl MissingObjectDiscovery {
@@ -177,6 +185,18 @@ struct CopySourceReadSnapshotRequest<'a> {
     expected_bucket_owner: Option<&'a str>,
     policy_action: auth::PolicyAction,
     existing_object_tags_mode: ExistingObjectTagsMode,
+}
+
+struct AuthorizedObjectReadSnapshotRequest<'a> {
+    requester: &'a Requester,
+    bucket: &'a BucketName,
+    key: &'a ObjectKey,
+    version_id: Option<VersionId>,
+    expected_bucket_owner: Option<&'a str>,
+    missing_discovery: MissingObjectDiscovery,
+    policy_action: auth::PolicyAction,
+    authorization_kind: ObjectReadAuthorizationKind,
+    snapshot_mode: ObjectReadSnapshotMode,
 }
 
 impl Coordinator {
@@ -4311,98 +4331,87 @@ impl Coordinator {
         })
     }
 
-    fn ensure_loaded_object_read_allowed(
+    fn authorize_object_read_snapshot(
         &self,
-        requester: &Requester,
-        loaded: &LoadedObjectState<'_>,
-        policy_action: auth::PolicyAction,
-    ) -> Result<(), ServerError> {
-        self.ensure_loaded_object_read_allowed_for_existing_tags(
-            requester,
-            loaded,
-            policy_action,
-            ExistingObjectTagsMode::Available,
-        )
-    }
-
-    fn ensure_loaded_object_read_allowed_for_existing_tags(
-        &self,
-        requester: &Requester,
-        loaded: &LoadedObjectState<'_>,
-        policy_action: auth::PolicyAction,
-        existing_object_tags_mode: ExistingObjectTagsMode,
-    ) -> Result<(), ServerError> {
-        let allowed = if matches!(existing_object_tags_mode, ExistingObjectTagsMode::Available) {
-            self.requester_can_read_object_with_bucket_policy(
-                requester,
-                &loaded.bucket_info,
-                loaded.bucket_tags.as_deref(),
-                &loaded.locked.record,
-                policy_action,
-                loaded.bucket_policy.as_deref(),
-            )?
-        } else {
-            self.requester_can_read_object_without_existing_tags_with_bucket_policy(
-                requester,
-                &loaded.bucket_info,
-                loaded.bucket_tags.as_deref(),
-                &loaded.locked.record,
-                policy_action,
-                loaded.bucket_policy.as_deref(),
-            )?
-        };
-        if allowed {
-            Ok(())
-        } else {
-            Err(ServerError::AccessDenied)
-        }
-    }
-
-    fn ensure_loaded_object_attributes_allowed(
-        &self,
-        requester: &Requester,
-        loaded: &LoadedObjectState<'_>,
-        policy_action: auth::PolicyAction,
-    ) -> Result<(), ServerError> {
-        let allowed = self.requester_can_read_object_attributes_with_bucket_policy(
-            requester,
-            &loaded.bucket_info,
-            loaded.bucket_tags.as_deref(),
-            &loaded.locked.record,
-            policy_action,
-            loaded.bucket_policy.as_deref(),
-        )?;
-
-        if allowed {
-            Ok(())
-        } else {
-            Err(ServerError::AccessDenied)
-        }
-    }
-
-    fn authorize_object_read<'a>(
-        &'a self,
-        requester: &Requester,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        version_id: Option<VersionId>,
-        expected_bucket_owner: Option<&str>,
-        policy_action: auth::PolicyAction,
-    ) -> Result<LockedReadObject<'a>, ServerError> {
+        req: AuthorizedObjectReadSnapshotRequest<'_>,
+    ) -> Result<storage::ObjectReadSnapshot, ServerError> {
         let bucket =
-            self.load_bucket_handle_for_object_policy_read(bucket, expected_bucket_owner)?;
-        let object = match version_id {
-            Some(version_id) => bucket.load_object_version(key.clone(), version_id),
-            None => bucket.load_object(key.clone()),
+            self.load_bucket_handle_for_object_policy_read(req.bucket, req.expected_bucket_owner)?;
+        let bucket_info = ValidatedBucket(bucket.bucket().clone());
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
+        let bucket_tags = if bucket_policy.is_some() {
+            Self::loaded_bucket_tags_for_policy(&bucket)?
+        } else {
+            None
         };
-        let loaded = self.load_locked_object_state_from_loaded_bucket(
-            requester,
-            &object,
-            ObjectBucketPolicyRequirement::Required,
-            MissingObjectDiscovery::ReadBucket,
+        let can_discover_missing = req.missing_discovery.requester_can_discover_missing(
+            self,
+            BucketPolicyAccess {
+                requester: req.requester,
+                bucket: &bucket_info,
+                bucket_tags: bucket_tags.as_deref(),
+                policy: bucket_policy.as_deref(),
+            },
+            req.key.as_str(),
+            req.version_id,
         )?;
-        self.ensure_loaded_object_read_allowed(requester, &loaded, policy_action)?;
-        Ok(loaded.locked)
+        let outcome = self
+            .storage_node
+            .load_object_read_snapshot_if(
+                &bucket.bucket().name,
+                req.key,
+                req.version_id,
+                req.snapshot_mode,
+                |stored| {
+                    let allowed = match req.authorization_kind {
+                        ObjectReadAuthorizationKind::Read {
+                            existing_object_tags_mode: ExistingObjectTagsMode::Available,
+                        } => self.requester_can_read_object_with_bucket_policy(
+                            req.requester,
+                            &bucket_info,
+                            bucket_tags.as_deref(),
+                            stored,
+                            req.policy_action,
+                            bucket_policy.as_deref(),
+                        )?,
+                        ObjectReadAuthorizationKind::Read {
+                            existing_object_tags_mode: ExistingObjectTagsMode::Unavailable,
+                        } => self
+                            .requester_can_read_object_without_existing_tags_with_bucket_policy(
+                                req.requester,
+                                &bucket_info,
+                                bucket_tags.as_deref(),
+                                stored,
+                                req.policy_action,
+                                bucket_policy.as_deref(),
+                            )?,
+                        ObjectReadAuthorizationKind::Attributes => self
+                            .requester_can_read_object_attributes_with_bucket_policy(
+                                req.requester,
+                                &bucket_info,
+                                bucket_tags.as_deref(),
+                                stored,
+                                req.policy_action,
+                                bucket_policy.as_deref(),
+                            )?,
+                    };
+                    if allowed {
+                        Ok(())
+                    } else {
+                        Err(ServerError::AccessDenied)
+                    }
+                },
+            )
+            .map_err(|error| {
+                Self::map_object_read_snapshot_error(
+                    &bucket.bucket().name,
+                    req.key,
+                    req.version_id,
+                    can_discover_missing,
+                    error,
+                )
+            })??;
+        Ok(outcome.snapshot)
     }
 
     fn authorize_copy_source_read_snapshot(
@@ -4436,6 +4445,7 @@ impl Coordinator {
                 &bucket.bucket().name,
                 req.key,
                 req.version_id,
+                ObjectReadSnapshotMode::FullPayloadLayout,
                 |stored| {
                     let allowed = if matches!(
                         req.existing_object_tags_mode,
@@ -4467,7 +4477,7 @@ impl Coordinator {
                 },
             )
             .map_err(|error| {
-                Self::map_copy_source_snapshot_error(
+                Self::map_object_read_snapshot_error(
                     &bucket.bucket().name,
                     req.key,
                     req.version_id,
@@ -4478,7 +4488,7 @@ impl Coordinator {
         Ok(outcome.snapshot)
     }
 
-    fn map_copy_source_snapshot_error(
+    fn map_object_read_snapshot_error(
         bucket: &BucketName,
         key: &ObjectKey,
         version_id: Option<VersionId>,
@@ -4759,62 +4769,89 @@ impl Coordinator {
         Ok(loaded)
     }
 
-    pub(super) fn authorize_get_object<'a>(
-        &'a self,
+    pub(super) fn authorize_get_object(
+        &self,
         req: &GetObjectRequest<'_>,
-    ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
-        let locked = self.authorize_object_read(
-            req.object.requester(),
-            req.object.bucket_name_typed(),
-            req.object.key_typed(),
-            req.object.version_id,
-            req.expected_bucket_owner(),
-            Self::get_object_policy_action(req.object.version_id),
-        )?;
-        Ok(AuthorizedObjectRead { locked })
+    ) -> Result<AuthorizedObjectRead, ServerError> {
+        let snapshot =
+            self.authorize_object_read_snapshot(AuthorizedObjectReadSnapshotRequest {
+                requester: req.object.requester(),
+                bucket: req.object.bucket_name_typed(),
+                key: req.object.key_typed(),
+                version_id: req.object.version_id,
+                expected_bucket_owner: req.expected_bucket_owner(),
+                missing_discovery: MissingObjectDiscovery::ReadBucket,
+                policy_action: Self::get_object_policy_action(req.object.version_id),
+                authorization_kind: ObjectReadAuthorizationKind::Read {
+                    existing_object_tags_mode: ExistingObjectTagsMode::Available,
+                },
+                snapshot_mode: ObjectReadSnapshotMode::FullPayloadLayout,
+            })?;
+        Ok(AuthorizedObjectRead { snapshot })
     }
 
-    pub(super) fn authorize_head_object<'a>(
-        &'a self,
+    pub(super) fn authorize_head_object(
+        &self,
         req: &GetObjectRequest<'_>,
-    ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
-        let locked = self.authorize_object_read(
-            req.object.requester(),
-            req.object.bucket_name_typed(),
-            req.object.key_typed(),
-            req.object.version_id,
-            req.expected_bucket_owner(),
-            Self::get_object_policy_action(req.object.version_id),
-        )?;
-        Ok(AuthorizedObjectRead { locked })
+    ) -> Result<AuthorizedObjectRead, ServerError> {
+        let snapshot =
+            self.authorize_object_read_snapshot(AuthorizedObjectReadSnapshotRequest {
+                requester: req.object.requester(),
+                bucket: req.object.bucket_name_typed(),
+                key: req.object.key_typed(),
+                version_id: req.object.version_id,
+                expected_bucket_owner: req.expected_bucket_owner(),
+                missing_discovery: MissingObjectDiscovery::ReadBucket,
+                policy_action: Self::get_object_policy_action(req.object.version_id),
+                authorization_kind: ObjectReadAuthorizationKind::Read {
+                    existing_object_tags_mode: ExistingObjectTagsMode::Available,
+                },
+                snapshot_mode: ObjectReadSnapshotMode::MetadataOnly,
+            })?;
+        Ok(AuthorizedObjectRead { snapshot })
     }
 
-    pub(super) fn authorize_get_object_attributes<'a>(
-        &'a self,
+    pub(super) fn authorize_get_object_attributes(
+        &self,
         req: &GetObjectAttributesRequest<'_>,
-    ) -> Result<AuthorizedObjectRead<'a>, ServerError> {
-        let bucket = self.load_bucket_handle_for_object_policy_read(
-            req.object.bucket_name_typed(),
-            req.expected_bucket_owner(),
-        )?;
-        let object = match req.object.version_id {
-            Some(version_id) => {
-                bucket.load_object_version(req.object.key_typed().clone(), version_id)
-            }
-            None => bucket.load_object(req.object.key_typed().clone()),
-        };
-        let loaded = self.load_locked_object_state_from_loaded_bucket(
-            req.object.requester(),
-            &object,
-            ObjectBucketPolicyRequirement::Required,
-            MissingObjectDiscovery::ReadObjectAttributes,
-        )?;
-        self.ensure_loaded_object_attributes_allowed(
-            req.object.requester(),
-            &loaded,
-            Self::get_object_attributes_policy_action(req.object.version_id),
-        )?;
-        let locked = loaded.locked;
-        Ok(AuthorizedObjectRead { locked })
+    ) -> Result<AuthorizedObjectRead, ServerError> {
+        let snapshot =
+            self.authorize_object_read_snapshot(AuthorizedObjectReadSnapshotRequest {
+                requester: req.object.requester(),
+                bucket: req.object.bucket_name_typed(),
+                key: req.object.key_typed(),
+                version_id: req.object.version_id,
+                expected_bucket_owner: req.expected_bucket_owner(),
+                missing_discovery: MissingObjectDiscovery::ReadObjectAttributes,
+                policy_action: Self::get_object_attributes_policy_action(req.object.version_id),
+                authorization_kind: ObjectReadAuthorizationKind::Attributes,
+                snapshot_mode: if req.want_parts {
+                    ObjectReadSnapshotMode::MultipartParts
+                } else {
+                    ObjectReadSnapshotMode::MetadataOnly
+                },
+            })?;
+        Ok(AuthorizedObjectRead { snapshot })
+    }
+
+    pub(super) fn authorize_head_object_for_part(
+        &self,
+        req: &GetObjectRequest<'_>,
+    ) -> Result<AuthorizedObjectRead, ServerError> {
+        let snapshot =
+            self.authorize_object_read_snapshot(AuthorizedObjectReadSnapshotRequest {
+                requester: req.object.requester(),
+                bucket: req.object.bucket_name_typed(),
+                key: req.object.key_typed(),
+                version_id: req.object.version_id,
+                expected_bucket_owner: req.expected_bucket_owner(),
+                missing_discovery: MissingObjectDiscovery::ReadBucket,
+                policy_action: Self::get_object_policy_action(req.object.version_id),
+                authorization_kind: ObjectReadAuthorizationKind::Read {
+                    existing_object_tags_mode: ExistingObjectTagsMode::Available,
+                },
+                snapshot_mode: ObjectReadSnapshotMode::MultipartParts,
+            })?;
+        Ok(AuthorizedObjectRead { snapshot })
     }
 }
