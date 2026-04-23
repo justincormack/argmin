@@ -55,6 +55,23 @@ impl SharedStorageNode {
         Ok(result)
     }
 
+    pub fn load_in_progress_multipart_upload_for_completion(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let upload = Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
+        if upload.state != UploadState::InProgress {
+            return Err(crate::error::MetadataError::NoSuchUpload {
+                upload_id: upload_id.to_string(),
+            }
+            .into());
+        }
+        Ok(upload)
+    }
+
     pub fn finalize_upload_part_stream<T, E>(
         &self,
         bucket: &BucketName,

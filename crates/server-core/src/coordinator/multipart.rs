@@ -284,18 +284,10 @@ impl Coordinator {
         let completion_order =
             self.next_completed_multipart_upload_order_for_bucket_name(&bucket)?;
         let meta_pg_id = self.object_pg_id_for(&bucket, &key);
+        self.storage_node
+            .load_in_progress_multipart_upload_for_completion(&bucket, &key, &upload_id)
+            .map_err(Coordinator::map_object_pg_action_error)?;
         let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-        let current_upload = meta_pg.get_multipart_upload(&upload_id)?;
-        if current_upload.bucket != bucket.as_str() || current_upload.key != key.as_str() {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        if current_upload.state != UploadState::InProgress {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
 
         if !req.cond.is_empty() {
             let existing_etag =

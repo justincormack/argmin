@@ -4142,20 +4142,10 @@ impl Coordinator {
             let bucket_info = ValidatedBucket(bucket_handle.bucket().clone());
             let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket_handle)?;
             let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket_handle)?;
-            let meta_pg = self
+            let upload = self
                 .storage_node
-                .get_pg(self.object_pg_id_for(bucket, key))?;
-            let upload = meta_pg.get_multipart_upload(upload_id)?;
-            if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
-                return Err(ServerError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                });
-            }
-            if upload.state != UploadState::InProgress {
-                return Err(ServerError::NoSuchUpload {
-                    upload_id: upload_id.to_string(),
-                });
-            }
+                .load_in_progress_multipart_upload_for_completion(bucket, key, upload_id)
+                .map_err(Self::map_object_pg_action_error)?;
             let policy_context = Self::with_multipart_upload_managed_encryption_policy_context(
                 PutObjectPolicyContext::default().with_sse_customer_algorithm(
                     req.sse_customer.map(SseCustomerRequest::algorithm),
@@ -4182,7 +4172,6 @@ impl Coordinator {
                 SseCustomerSegmentScope::object(),
                 false,
             )?;
-            drop(meta_pg);
 
             Ok(AuthorizedCompleteMultipartUpload {
                 bucket_info: bucket_info.into_inner(),
