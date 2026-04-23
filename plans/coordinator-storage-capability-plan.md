@@ -831,13 +831,10 @@ Phase 7 status:
 - `ListParts` now matches the same coordinator/storage boundary rule for the
   multipart management read path:
   - coordinator no longer receives or returns a metadata PG guard
-  - the coordinator-facing auth result for this path is pure data only
-  - however, this is not yet final:
-    - the current split between upload lookup for auth and part listing after
-      auth reintroduces a mutable upload-state race
-    - `ListParts` needs to move to the stronger transaction-shaped pattern
-      where storage holds the object-PG step once, invokes a pure auth closure,
-      and then lists parts under that same storage-owned critical section
+  - storage now holds the object-PG step once, invokes a pure auth closure,
+    and lists parts under that same storage-owned critical section
+  - unauthorized callers do not force part-row materialization before denial,
+    and the upload-state recheck and part listing stay in one transaction
 - `AbortMultipartUpload` now matches the same rule for the multipart cleanup
   path:
   - coordinator no longer performs multipart metadata PG orchestration
@@ -845,23 +842,24 @@ Phase 7 status:
     storage-side abort operation
   - the normal request path no longer carries abort-specific PG/shard deletion
     mechanics in `runtime.rs`
+- `CreateMultipartUpload` now matches the same corrected boundary rule for the
+  multipart create path:
+  - coordinator no longer performs direct object-PG lookup or multipart row
+    creation
+  - storage owns the write reservation, bucket snapshot load, current-object
+    lookup, and multipart row creation in one transaction
+  - coordinator contributes a pure auth/semantic closure over the loaded
+    bucket handle and existing live object
 - follow-up required on migrated slice:
-  - `CreateMultipartUpload` still needs to move from the current write-scoped
-    snapshot boundary to the phase-4d write-scoped action boundary
   - any migrated multipart/session path that still returns coordinator-visible
     PG guards is only partially migrated and must be redesigned so storage owns
     the protected write action end to end
   - so the phase-7 surface is now mixed:
-    - `BeginStreamPart`, `UploadPart`, `AbortMultipartUpload`,
+    - `CreateMultipartUpload`, `BeginStreamPart`, `UploadPart`,
+      `ListParts`, `AbortMultipartUpload`,
       and `CompleteMultipartUpload` now have corrected storage-owned
       object-PG boundaries on their normal request path
-    - `ListParts` still needs the stronger transaction/auth-closure shape
-      before it is final
-    - `CreateMultipartUpload` remains reservation-lifetime-rework pending,
-      not final
 - remaining obvious phase-7 surface:
-  - `CreateMultipartUpload`
-  - `ListParts` transaction/auth-closure rework
   - streaming `PutObject`
   - remaining multipart/session management flows
 

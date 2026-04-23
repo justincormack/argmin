@@ -3899,66 +3899,80 @@ impl Coordinator {
         })
     }
 
+    pub(super) fn authorize_create_multipart_upload_with_existing_object(
+        &self,
+        req: &CreateMultipartUploadRequest<'_>,
+        bucket: &LoadedBucketHandle,
+        existing_object: Option<&StoredObject>,
+    ) -> Result<AuthorizedCreateMultipartUpload, ServerError> {
+        let key = req.object.key();
+        let policy_context = req.effective_policy_context()?;
+        let bucket_info = ValidatedBucket(bucket.bucket().clone());
+        if req.object.requester().is_anonymous() {
+            return Err(ServerError::AccessDenied);
+        }
+        let bucket_policy = self.cached_bucket_policy_for_loaded_handle(bucket)?;
+        let bucket_tags = Self::loaded_bucket_tags_for_policy(bucket)?;
+        if !self.requester_can_put_object_with_bucket_policy(
+            BucketPolicyAccess {
+                requester: req.object.requester(),
+                bucket: &bucket_info,
+                bucket_tags: bucket_tags.as_deref(),
+                policy: bucket_policy.as_deref(),
+            },
+            key,
+            policy_context,
+            existing_object,
+        )? {
+            return Err(ServerError::AccessDenied);
+        }
+        Self::ensure_sse_c_allowed(
+            &bucket_info,
+            req.encryption.sse_customer_request().is_some(),
+        )?;
+        let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
+        Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
+        let initiator = Self::requester_owner_identity(req.object.requester());
+        let owner =
+            Self::effective_put_object_owner(&bucket_info, req.object.requester(), &req.acl);
+        let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
+        let public_read = Self::acl_grants_public_read(&acl_grants);
+        Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
+        Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
+
+        Ok(AuthorizedCreateMultipartUpload {
+            bucket_info: bucket_info.into_inner(),
+            bucket: req.object.bucket.name_typed().clone(),
+            key: req.object.key_typed().clone(),
+            tags: req.tags.map(str::to_string),
+            checksum: req.checksum,
+            initiator,
+            owner,
+            acl_grants,
+            public_read,
+            object_lock: req.object_lock,
+            write_encryption,
+        })
+    }
+
+    #[cfg(test)]
     pub(super) fn authorize_create_multipart_upload(
         &self,
         req: &CreateMultipartUploadRequest<'_>,
     ) -> Result<AuthorizedCreateMultipartUpload, ServerError> {
-        let key = req.object.key();
-        let policy_context = req.effective_policy_context()?;
         let request = BucketHandleRequest::new()
             .requiring_policy_view()
             .requiring_bucket_tags_if_abac_enabled();
         self.with_bucket_write_handle_for(&req.object, request, |bucket| {
-            let bucket_info = ValidatedBucket(bucket.bucket().clone());
-            if req.object.requester().is_anonymous() {
-                return Err(ServerError::AccessDenied);
-            }
             let existing_object = self.put_target_existing_live_object(
                 req.object.bucket.name_typed(),
                 req.object.key_typed(),
             )?;
-            let bucket_policy = self.cached_bucket_policy_for_loaded_handle(&bucket)?;
-            let bucket_tags = Self::loaded_bucket_tags_for_policy(&bucket)?;
-            if !self.requester_can_put_object_with_bucket_policy(
-                BucketPolicyAccess {
-                    requester: req.object.requester(),
-                    bucket: &bucket_info,
-                    bucket_tags: bucket_tags.as_deref(),
-                    policy: bucket_policy.as_deref(),
-                },
-                key,
-                policy_context,
+            self.authorize_create_multipart_upload_with_existing_object(
+                req,
+                &bucket,
                 existing_object.as_ref(),
-            )? {
-                return Err(ServerError::AccessDenied);
-            }
-            Self::ensure_sse_c_allowed(
-                &bucket_info,
-                req.encryption.sse_customer_request().is_some(),
-            )?;
-            let write_encryption = self.resolve_write_encryption(&bucket_info, req.encryption)?;
-            Self::ensure_put_object_write_acl_supported(&bucket_info, &req.acl)?;
-            let initiator = Self::requester_owner_identity(req.object.requester());
-            let owner =
-                Self::effective_put_object_owner(&bucket_info, req.object.requester(), &req.acl);
-            let acl_grants = Self::object_acl_grants_for_put_object(&bucket_info, &owner, &req.acl);
-            let public_read = Self::acl_grants_public_read(&acl_grants);
-            Self::validate_requested_object_lock_state(&bucket_info, req.object_lock)?;
-            Self::ensure_sse_c_allowed(&bucket_info, write_encryption.is_sse_customer())?;
-
-            Ok(AuthorizedCreateMultipartUpload {
-                bucket_info: bucket_info.into_inner(),
-                bucket: req.object.bucket.name_typed().clone(),
-                key: req.object.key_typed().clone(),
-                tags: req.tags.map(str::to_string),
-                checksum: req.checksum,
-                initiator,
-                owner,
-                acl_grants,
-                public_read,
-                object_lock: req.object_lock,
-                write_encryption,
-            })
+            )
         })
     }
 

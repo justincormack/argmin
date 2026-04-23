@@ -2,11 +2,25 @@ use super::*;
 use crate::clock::current_time_millis;
 use crate::types::{
     CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest, CompletedMultipartStalePayload,
-    EcShape, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
-    ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, StoredObject, VersionId,
+    CreateMultipartUploadOutcome, CreateMultipartUploadReq, EcShape, MultipartReclaimPartRecord,
+    MultipartReclaimPartSegmentRecord, MultipartReclaimRecord, ObjectLayout, ObjectPartRecord,
+    ObjectSegmentRecord, StoredObject, VersionId,
 };
 
 impl SharedStorageNode {
+    fn load_existing_live_object_from_object_pg(
+        pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<Option<StoredObject>, crate::error::MetadataError> {
+        match PgMetadataStore::get_object_meta(pg, bucket, key) {
+            Ok(StoredObject::Live(object)) => Ok(Some(StoredObject::Live(object))),
+            Ok(StoredObject::DeleteMarker(_))
+            | Err(crate::error::MetadataError::ObjectNotFound) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(super) fn load_in_progress_multipart_upload_from_object_pg(
         pg: &PgStore,
         bucket: &BucketName,
@@ -35,6 +49,52 @@ impl SharedStorageNode {
             });
         }
         Ok(upload)
+    }
+
+    pub fn create_multipart_upload<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: BucketSnapshotRequest,
+        action: impl FnOnce(
+            BucketSnapshot,
+            Option<StoredObject>,
+        ) -> Result<(T, CreateMultipartUploadReq), E>,
+    ) -> Result<Result<CreateMultipartUploadOutcome<T>, E>, BucketSnapshotLoadError> {
+        loop {
+            let pg_id = self.pg_topology.bucket_pg_for(bucket);
+            let bucket_pg = self.get_pg(pg_id)?;
+            match PgMetadataStore::acquire_bucket_write_reservation(&*bucket_pg, bucket) {
+                Ok(_info) => {
+                    let snapshot = Self::load_bucket_snapshot_from_pg(&bucket_pg, bucket, request)?;
+                    drop(bucket_pg);
+
+                    let object_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+                    let existing_object =
+                        Self::load_existing_live_object_from_object_pg(&object_pg, bucket, key)?;
+                    let result = match action(snapshot, existing_object) {
+                        Ok((value, create)) => {
+                            object_pg.create_multipart_upload(&create)?;
+                            let upload = object_pg.get_multipart_upload(&create.upload_id)?;
+                            Ok(CreateMultipartUploadOutcome {
+                                value,
+                                initiated_at: upload.initiated_at,
+                            })
+                        }
+                        Err(error) => Err(error),
+                    };
+                    drop(object_pg);
+
+                    let release_result = self.release_bucket_write_reservation(bucket);
+                    return Self::finish_bucket_write_snapshot(result, release_result);
+                }
+                Err(crate::error::MetadataError::BucketWriteDraining) => {
+                    drop(bucket_pg);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(other) => return Err(other.into()),
+            }
+        }
     }
 
     pub fn load_multipart_upload(

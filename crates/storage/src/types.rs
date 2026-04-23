@@ -2510,6 +2510,12 @@ pub struct CreateMultipartUploadReq {
     pub encryption: ObjectEncryption,
 }
 
+#[derive(Debug)]
+pub struct CreateMultipartUploadOutcome<T> {
+    pub value: T,
+    pub initiated_at: u64,
+}
+
 /// Request to list multipart uploads.
 pub struct ListMultipartUploadsReq {
     pub bucket: BucketName,

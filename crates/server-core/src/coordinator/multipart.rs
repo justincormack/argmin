@@ -1,12 +1,12 @@
 use checksum::{ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksumConfig};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
-    BucketName, CreateMultipartUploadReq, CreateStreamUploadReq, FinalizeStreamPartOutcome,
-    GenerationId, ListMultipartUploadsReq, MultipartPartRecord, MultipartPartSegmentRecord,
-    MultipartUploadRecord, ObjectKey, PreparedStreamPartCommit, SerializedMetadataBlob,
-    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey, StreamUploadPartSnapshot,
-    StreamUploadState, StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET,
-    UPLOAD_ID_LEN,
+    BucketName, CreateMultipartUploadOutcome, CreateMultipartUploadReq, CreateStreamUploadReq,
+    FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq, MultipartPartRecord,
+    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, PreparedStreamPartCommit,
+    SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey,
+    StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
+    UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
 };
 
 use super::authz_results::{
@@ -190,20 +190,6 @@ impl Coordinator {
             req.object.bucket_name(),
             req.object.key
         );
-        let AuthorizedCreateMultipartUpload {
-            bucket_info,
-            bucket,
-            key,
-            tags,
-            checksum,
-            initiator,
-            owner,
-            acl_grants,
-            public_read,
-            object_lock,
-            write_encryption,
-        } = self.authorize_create_multipart_upload(req)?;
-
         let rng = ring::rand::SystemRandom::new();
         let mut id_bytes = [0u8; UPLOAD_ID_LEN];
         ring::rand::SecureRandom::fill(&rng, &mut id_bytes).map_err(|_| {
@@ -220,32 +206,67 @@ impl Coordinator {
 
         let metadata_blob = req.metadata.serialize()?;
         let system_metadata_blob = req.system_metadata.serialize()?;
-        let meta_pg_id = self.object_pg_id_for(&bucket, &key);
-        let pg = self.storage_node.get_pg(meta_pg_id)?;
-        pg.create_multipart_upload(&CreateMultipartUploadReq {
-            upload_id: typed_upload_id.clone(),
-            bucket: bucket.clone(),
-            key: key.clone(),
-            tags: tags.as_deref().map(SerializedTagSet::from),
-            metadata_blob: SerializedMetadataBlob::from(metadata_blob),
-            system_metadata_blob: SerializedSystemMetadataBlob::from(system_metadata_blob),
-            initiator,
-            owner,
-            acl_grants,
-            public_read,
-            object_lock,
-            checksum,
-            encryption: write_encryption.object_encryption(),
-        })?;
-        let upload = pg.get_multipart_upload(&typed_upload_id)?;
-        let initiated_at = upload.initiated_at;
-        drop(pg);
+        let request = BucketHandleRequest::new()
+            .requiring_policy_view()
+            .requiring_bucket_tags_if_abac_enabled();
+        let expected_bucket_owner = req.object.expected_bucket_owner();
+        let CreateMultipartUploadOutcome {
+            value: authorized,
+            initiated_at,
+        } = self
+            .storage_node
+            .create_multipart_upload(
+                req.object.bucket.name_typed(),
+                req.object.key_typed(),
+                request.resolve_to_storage_request(),
+                |snapshot, existing_object| {
+                    let bucket_handle = self
+                        .bucket_handle_loader()
+                        .load_bucket_handle_from_snapshot(
+                            snapshot,
+                            expected_bucket_owner,
+                            request,
+                        )?;
+                    let authorized = self.authorize_create_multipart_upload_with_existing_object(
+                        req,
+                        &bucket_handle,
+                        existing_object.as_ref(),
+                    )?;
+                    let create = CreateMultipartUploadReq {
+                        upload_id: typed_upload_id.clone(),
+                        bucket: authorized.bucket.clone(),
+                        key: authorized.key.clone(),
+                        tags: authorized.tags.as_deref().map(SerializedTagSet::from),
+                        metadata_blob: SerializedMetadataBlob::from(metadata_blob.clone()),
+                        system_metadata_blob: SerializedSystemMetadataBlob::from(
+                            system_metadata_blob.clone(),
+                        ),
+                        initiator: authorized.initiator.clone(),
+                        owner: authorized.owner.clone(),
+                        acl_grants: authorized.acl_grants.clone(),
+                        public_read: authorized.public_read,
+                        object_lock: authorized.object_lock,
+                        checksum: authorized.checksum,
+                        encryption: authorized.write_encryption.object_encryption(),
+                    };
+                    Ok::<_, ServerError>((authorized, create))
+                },
+            )
+            .map_err(BucketHandleLoader::map_bucket_snapshot_error)??;
+        let AuthorizedCreateMultipartUpload {
+            bucket_info,
+            key,
+            write_encryption,
+            ..
+        } = authorized;
         let lifecycle_abort =
             self.multipart_lifecycle_abort_headers(&bucket_info, key.as_str(), initiated_at)?;
 
         Ok(CreateMultipartUploadResult {
             upload_id: typed_upload_id,
-            managed_encryption: upload.encryption.managed_encryption_algorithm(),
+            managed_encryption: write_encryption
+                .object_encryption()
+                .managed_encryption_algorithm(),
             lifecycle_abort,
         })
     }

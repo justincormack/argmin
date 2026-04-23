@@ -336,7 +336,7 @@ impl SharedStorageNode {
         )
     }
 
-    fn release_bucket_write_reservation(
+    pub(super) fn release_bucket_write_reservation(
         &self,
         bucket: &BucketName,
     ) -> Result<(), BucketSnapshotLoadError> {
