@@ -1,7 +1,7 @@
-use storage::traits::{PgMetadataStore, ShardStore};
+use storage::traits::ShardStore;
 use storage::{
-    BucketName, GenerationId, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey, SessionId,
-    ShardKey, StreamUploadRecord, StreamUploadSegmentRecord, StreamUploadState, StreamUploadTarget,
+    BucketName, EcShape, GenerationId, ManagedEncryptionAlgorithm, ObjectEncryption, ObjectKey,
+    PrepareStreamUploadSegmentAppendReq, SessionId, ShardKey, StreamUploadTarget,
 };
 
 #[cfg(feature = "deep-tracing")]
@@ -142,15 +142,16 @@ impl Coordinator {
         session_id: &SessionId,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
-        let meta_pg = self
+        let session = self
             .storage_node
-            .get_pg(self.object_pg_id_for(bucket, key))?;
-        let session = meta_pg.get_stream_upload(session_id)?;
-        if session.bucket != *bucket || session.key != *key {
-            return Err(ServerError::InvalidRequest {
-                reason: "session bucket/key mismatch".to_string(),
-            });
-        }
+            .load_stream_upload_session(bucket, key, session_id)
+            .map_err(|error| match error {
+                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                storage::ObjectPgActionError::InvalidRequest { reason } => {
+                    ServerError::InvalidRequest { reason }
+                }
+                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+            })?;
         self.resume_write_encryption(
             &session.encryption,
             sse_customer,
@@ -167,15 +168,16 @@ impl Coordinator {
         part_number: u32,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
-        let meta_pg = self
+        let session = self
             .storage_node
-            .get_pg(self.object_pg_id_for(bucket, key))?;
-        let session = meta_pg.get_stream_upload(session_id)?;
-        if session.bucket != *bucket || session.key != *key {
-            return Err(ServerError::InvalidRequest {
-                reason: "session bucket/key mismatch".to_string(),
-            });
-        }
+            .load_stream_upload_session(bucket, key, session_id)
+            .map_err(|error| match error {
+                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                storage::ObjectPgActionError::InvalidRequest { reason } => {
+                    ServerError::InvalidRequest { reason }
+                }
+                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+            })?;
         self.resume_write_encryption(
             &session.encryption,
             sse_customer,
@@ -192,11 +194,17 @@ impl Coordinator {
         session_id: &SessionId,
         sse_customer: Option<&SseCustomerRequest>,
     ) -> Result<ActiveWriteEncryption, ServerError> {
-        let meta_pg = self
+        let target = self
             .storage_node
-            .get_pg(self.object_pg_id_for(bucket, key))?;
-        let target = meta_pg.get_stream_upload(session_id)?.target;
-        drop(meta_pg);
+            .load_stream_upload_session(bucket, key, session_id)
+            .map_err(|error| match error {
+                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                storage::ObjectPgActionError::InvalidRequest { reason } => {
+                    ServerError::InvalidRequest { reason }
+                }
+                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+            })?
+            .target;
         match target {
             StreamUploadTarget::PutObject => {
                 self.load_stream_put_write_encryption(bucket, key, session_id, sse_customer)
@@ -345,24 +353,6 @@ impl Coordinator {
         }
     }
 
-    fn validate_stream_session_binding(
-        session: &StreamUploadRecord,
-        bucket: &BucketName,
-        key: &ObjectKey,
-    ) -> Result<(), ServerError> {
-        if session.state != StreamUploadState::InProgress {
-            return Err(ServerError::InvalidRequest {
-                reason: "stream session is not in progress".to_string(),
-            });
-        }
-        if session.bucket != *bucket || session.key != *key {
-            return Err(ServerError::InvalidRequest {
-                reason: "session bucket/key mismatch".to_string(),
-            });
-        }
-        Ok(())
-    }
-
     fn emit_stream_segment_layout(
         target: &StreamUploadTarget,
         bucket: &str,
@@ -428,25 +418,6 @@ impl Coordinator {
                 );
             }
         }
-    }
-
-    fn reject_duplicate_stream_segment_index(
-        meta_pg: &storage::PgStore,
-        session_id: &SessionId,
-        segment_index: u32,
-    ) -> Result<(), ServerError> {
-        let existing_segments = meta_pg
-            .list_stream_segments(session_id)
-            .map_err(ServerError::Metadata)?;
-        if existing_segments
-            .iter()
-            .any(|segment| segment.segment_index == segment_index)
-        {
-            return Err(ServerError::InvalidRequest {
-                reason: format!("duplicate segment_index {segment_index}"),
-            });
-        }
-        Ok(())
     }
 
     pub(super) fn write_segment_shards(
@@ -549,10 +520,12 @@ impl Coordinator {
         shard_pg_id: u32,
         written_shards: &[WrittenShard],
     ) {
-        let Ok(shard_pg) = self.storage_node.get_pg(shard_pg_id) else {
-            return;
-        };
-        Self::cleanup_written_shards_locked(&shard_pg, written_shards);
+        let shard_keys: Vec<ShardKey> = written_shards
+            .iter()
+            .map(|written| written.key.clone())
+            .collect();
+        self.storage_node
+            .delete_shards_best_effort(shard_pg_id, &shard_keys);
     }
 
     pub(super) fn append_stream_segment_for(
@@ -573,14 +546,23 @@ impl Coordinator {
             segment_index,
             data.len()
         );
-        let meta_pg_id = self.object_pg_id_for(bucket, key);
         let segment_okh = stream_segment_key_hash(session_id, segment_index);
 
-        let segment_record = {
-            let meta_guard = self.storage_node.get_pg(meta_pg_id)?;
-            let session = meta_guard.get_stream_upload(session_id)?;
-            Self::validate_stream_session_binding(&session, bucket, key)?;
-            let logical_size = match &session.encryption {
+        let logical_size = if data.is_empty() {
+            0
+        } else {
+            match self
+                .storage_node
+                .load_stream_upload_session(bucket, key, session_id)
+                .map_err(|error| match error {
+                    storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                    storage::ObjectPgActionError::InvalidRequest { reason } => {
+                        ServerError::InvalidRequest { reason }
+                    }
+                    storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+                })?
+                .encryption
+            {
                 ObjectEncryption::None => data.len() as u64,
                 ObjectEncryption::SseCustomer(_) | ObjectEncryption::SseS3(_) => {
                     let ciphertext_len = data.len();
@@ -592,37 +574,42 @@ impl Coordinator {
                     )?;
                     logical_len as u64
                 }
-            };
-            let segment_vid = meta_guard
-                .allocate_stream_segment_vid(session_id)
-                .map_err(ServerError::Metadata)?;
-            let shard_pg_id = self.shard_pg_id_raw(
-                &format!("segment/{}", session_id.as_str()),
-                &segment_index.to_string(),
-                segment_vid.get(),
-            );
-            let segment_record = StreamUploadSegmentRecord {
-                session_id: session_id.clone(),
-                segment_index,
-                size: logical_size,
-                segment_crc64: Some(checksum::crc64::checksum(data)),
-                segment_okh,
-                segment_vid,
-                shard_pg_id,
-                ec_k: self.ec_config.data_shards,
-                ec_m: self.ec_config.parity_shards,
-            };
-            Self::emit_stream_segment_layout(
-                &session.target,
-                bucket.as_str(),
-                key.as_str(),
-                session_id,
-                segment_index,
-                logical_size as usize,
-            );
-            Self::reject_duplicate_stream_segment_index(&meta_guard, session_id, segment_index)?;
-            segment_record
+            }
         };
+
+        let (target, segment_record) = self
+            .storage_node
+            .prepare_stream_segment_append(
+                bucket,
+                key,
+                &PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index,
+                    size: logical_size,
+                    segment_crc64: Some(checksum::crc64::checksum(data)),
+                    segment_okh,
+                    ec: EcShape {
+                        k: self.ec_config.data_shards,
+                        m: self.ec_config.parity_shards,
+                    },
+                },
+            )
+            .map_err(|error| match error {
+                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                storage::ObjectPgActionError::InvalidRequest { reason } => {
+                    ServerError::InvalidRequest { reason }
+                }
+                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+            })?;
+
+        Self::emit_stream_segment_layout(
+            &target,
+            bucket.as_str(),
+            key.as_str(),
+            session_id,
+            segment_index,
+            logical_size as usize,
+        );
 
         #[cfg(test)]
         maybe_run_stream_append_prepare_hook(session_id, segment_index);
@@ -634,58 +621,27 @@ impl Coordinator {
             data,
         )?;
 
-        let pgs = match self.lock_object_pgs_for_write_ids(meta_pg_id, segment_record.shard_pg_id) {
-            Ok(pgs) => pgs,
-            Err(err) => {
-                self.best_effort_delete_written_shards(segment_record.shard_pg_id, &written_shards);
-                return Err(err);
-            }
-        };
-        let meta_guard = pgs.meta();
-        let shard_guard = pgs.shard();
         let shard_batch: Vec<(&ShardKey, storage::WriteAck)> = written_shards
             .iter()
             .map(|written| (&written.key, written.ack))
             .collect();
 
-        let session = match meta_guard.get_stream_upload(session_id) {
-            Ok(session) => session,
-            Err(err) => {
-                Self::cleanup_written_shards_locked(shard_guard, &written_shards);
-                return Err(ServerError::Metadata(err));
-            }
-        };
-        if let Err(err) = Self::validate_stream_session_binding(&session, bucket, key) {
-            Self::cleanup_written_shards_locked(shard_guard, &written_shards);
-            return Err(err);
-        }
-        if let Err(err) =
-            Self::reject_duplicate_stream_segment_index(meta_guard, session_id, segment_index)
-        {
-            Self::cleanup_written_shards_locked(shard_guard, &written_shards);
-            return Err(err);
-        }
-
-        if pgs.same_pg() {
-            if let Err(err) = meta_guard
-                .register_written_shards_and_append_stream_segment(&shard_batch, &segment_record)
-            {
-                Self::cleanup_written_shards_locked(shard_guard, &written_shards);
-                return Err(ServerError::Metadata(err));
-            }
-            return Ok(());
-        }
-
-        if let Err(err) = shard_guard.register_written_shards_batch(&shard_batch) {
-            Self::cleanup_written_shards_locked(shard_guard, &written_shards);
-            return Err(ServerError::Store(err));
-        }
-        if let Err(err) = meta_guard.append_stream_segment(&segment_record) {
-            Self::cleanup_written_shards_locked(shard_guard, &written_shards);
-            return Err(ServerError::Metadata(err));
-        }
-
-        Ok(())
+        self.storage_node
+            .commit_stream_segment_append(
+                bucket,
+                key,
+                session_id,
+                segment_index,
+                &segment_record,
+                &shard_batch,
+            )
+            .map_err(|error| match error {
+                storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                storage::ObjectPgActionError::InvalidRequest { reason } => {
+                    ServerError::InvalidRequest { reason }
+                }
+                storage::ObjectPgActionError::Metadata(error) => ServerError::Metadata(error),
+            })
     }
 
     #[cfg(test)]

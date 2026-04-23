@@ -1171,6 +1171,92 @@ mod tests {
     }
 
     #[test]
+    fn commit_stream_segment_append_cleans_up_cross_pg_loser_shards_on_late_duplicate() {
+        let tmp = test_util::tempdir();
+        let node = SharedStorageNode::open(tmp.path(), &[0, 1, 2, 3]).unwrap();
+        let bucket = create_bucket_for_snapshot_test(&node, "bucket");
+        let key = ObjectKey::try_from("key").unwrap();
+        let meta_pg_id = node.pg_topology().object_pg_for(&bucket, &key);
+
+        let (session_id, request, loser_record) = (0..128)
+            .find_map(|i| {
+                let session_id = crate::tests::stream_session_id(format!("session{i}"));
+                node.create_put_object_stream_session_record(
+                    &bucket,
+                    &key,
+                    &session_id,
+                    crate::types::ObjectEncryption::default(),
+                )
+                .unwrap();
+                let request = crate::types::PrepareStreamUploadSegmentAppendReq {
+                    session_id: session_id.clone(),
+                    segment_index: 0,
+                    size: 5,
+                    segment_crc64: Some(checksum::crc64::checksum(b"hello")),
+                    segment_okh: [i as u8; 16],
+                    ec: crate::types::EcShape { k: 1, m: 0 },
+                };
+                let (_, record) = node
+                    .prepare_stream_segment_append(&bucket, &key, &request)
+                    .unwrap();
+                (record.shard_pg_id != meta_pg_id).then_some((session_id, request, record))
+            })
+            .expect("expected a cross-PG streaming segment routing case");
+
+        let shard_key = ShardKey::new(&loser_record.segment_okh, loser_record.segment_vid.get(), 0);
+        let ack = {
+            let shard_pg = node.get_pg(loser_record.shard_pg_id).unwrap();
+            shard_pg.write_shard(&shard_key, b"hello").unwrap()
+        };
+        let shard_batch = vec![(&shard_key, ack)];
+
+        let winner_vid = {
+            let meta_pg = node.get_pg(meta_pg_id).unwrap();
+            let winner_vid = meta_pg.allocate_stream_segment_vid(&session_id).unwrap();
+            meta_pg
+                .append_stream_segment(&crate::types::StreamUploadSegmentRecord {
+                    session_id: session_id.clone(),
+                    segment_index: request.segment_index,
+                    size: request.size,
+                    segment_crc64: request.segment_crc64,
+                    segment_okh: [0x55; 16],
+                    segment_vid: winner_vid,
+                    shard_pg_id: meta_pg_id,
+                    ec_k: request.ec.k,
+                    ec_m: request.ec.m,
+                })
+                .unwrap();
+            winner_vid
+        };
+
+        let err = node
+            .commit_stream_segment_append(
+                &bucket,
+                &key,
+                &session_id,
+                request.segment_index,
+                &loser_record,
+                &shard_batch,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::ObjectPgActionError::InvalidRequest { reason }
+                if reason == "duplicate segment_index 0"
+        ));
+
+        let shard_pg = node.get_pg(loser_record.shard_pg_id).unwrap();
+        assert!(matches!(
+            shard_pg.read_shard(&shard_key),
+            Err(crate::error::StoreError::NotFound)
+        ));
+        let meta_pg = node.get_pg(meta_pg_id).unwrap();
+        let segments = meta_pg.list_stream_segments(&session_id).unwrap();
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].segment_vid, winner_vid);
+    }
+
+    #[test]
     fn bucket_write_drain_guard_releases_on_drop() {
         let tmp = test_util::tempdir();
         let node = SharedStorageNode::open(tmp.path(), &[0, 1]).unwrap();

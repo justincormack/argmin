@@ -37,10 +37,6 @@ impl<'a> TwoPgGuards<'a> {
         Self { meta, shard }
     }
 
-    pub(super) fn same_pg(&self) -> bool {
-        self.shard.is_none()
-    }
-
     pub(super) fn meta(&self) -> &storage::PgStore {
         &self.meta
     }

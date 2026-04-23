@@ -2728,6 +2728,19 @@ pub struct CreateStreamUploadReq {
     pub encryption: ObjectEncryption,
 }
 
+/// Request to append one staging segment to an in-progress streaming session.
+#[derive(Debug, Clone)]
+pub struct PrepareStreamUploadSegmentAppendReq {
+    pub session_id: SessionId,
+    pub segment_index: u32,
+    pub size: u64,
+    /// CRC64-NVME over the logical segment bytes.
+    pub segment_crc64: Option<u64>,
+    /// 16-byte object key hash for shard keys.
+    pub segment_okh: [u8; 16],
+    pub ec: EcShape,
+}
+
 /// Staging segment record for an in-progress streaming session.
 #[derive(Debug, Clone)]
 pub struct StreamUploadSegmentRecord {

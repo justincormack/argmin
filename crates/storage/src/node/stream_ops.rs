@@ -3,8 +3,9 @@ use crate::{
     BucketVersioningState, CommitStreamPutReq, EcShape, FinalizeStreamPutOutcome,
     MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
     ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, ObjectSegmentsReclaimRecord,
-    ObjectSegmentsReclaimSegmentRecord, PreparedStreamPutCommit, StreamPutFinalizeSnapshot,
-    StreamUploadRecord, VersionId,
+    ObjectSegmentsReclaimSegmentRecord, PrepareStreamUploadSegmentAppendReq,
+    PreparedStreamPutCommit, StreamPutFinalizeSnapshot, StreamUploadRecord,
+    StreamUploadSegmentRecord, VersionId,
 };
 
 #[derive(Debug, Clone)]
@@ -21,6 +22,167 @@ enum StaleObjectPayloadMetadata {
 }
 
 impl SharedStorageNode {
+    fn validate_stream_upload_session_binding(
+        session: &StreamUploadRecord,
+        bucket: &BucketName,
+        key: &ObjectKey,
+    ) -> Result<(), ObjectPgActionError> {
+        if session.state != StreamUploadState::InProgress {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "stream session is not in progress".to_string(),
+            });
+        }
+        if session.bucket != bucket.as_str() || session.key != key.as_str() {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: "session bucket/key mismatch".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    fn reject_duplicate_stream_segment_index(
+        pg: &PgStore,
+        session_id: &SessionId,
+        segment_index: u32,
+    ) -> Result<(), ObjectPgActionError> {
+        let existing_segments = pg.list_stream_segments(session_id)?;
+        if existing_segments
+            .iter()
+            .any(|segment| segment.segment_index == segment_index)
+        {
+            return Err(ObjectPgActionError::InvalidRequest {
+                reason: format!("duplicate segment_index {segment_index}"),
+            });
+        }
+        Ok(())
+    }
+
+    fn cleanup_shards_locked(shard_pg: &PgStore, shard_keys: &[ShardKey]) {
+        for shard_key in shard_keys {
+            let _ = shard_pg.delete_shard(shard_key);
+        }
+    }
+
+    fn stream_segment_shard_pg_id(
+        &self,
+        session_id: &SessionId,
+        segment_index: u32,
+        segment_vid: GenerationId,
+    ) -> u32 {
+        self.pg_topology.shard_pg(
+            format!("segment/{}", session_id.as_str()).as_str(),
+            segment_index.to_string().as_str(),
+            segment_vid.get(),
+        )
+    }
+
+    pub fn load_stream_upload_session(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+    ) -> Result<StreamUploadRecord, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let session = pg.get_stream_upload(session_id)?;
+        Self::validate_stream_upload_session_binding(&session, bucket, key)?;
+        Ok(session)
+    }
+
+    pub fn prepare_stream_segment_append(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        request: &PrepareStreamUploadSegmentAppendReq,
+    ) -> Result<(StreamUploadTarget, StreamUploadSegmentRecord), ObjectPgActionError> {
+        let meta_pg_id = self.pg_topology.object_pg_for(bucket, key);
+        let pg = self.get_pg(meta_pg_id)?;
+        let session = pg.get_stream_upload(&request.session_id)?;
+        Self::validate_stream_upload_session_binding(&session, bucket, key)?;
+        Self::reject_duplicate_stream_segment_index(
+            &pg,
+            &request.session_id,
+            request.segment_index,
+        )?;
+        let segment_vid = pg.allocate_stream_segment_vid(&request.session_id)?;
+        let segment_record = StreamUploadSegmentRecord {
+            session_id: request.session_id.clone(),
+            segment_index: request.segment_index,
+            size: request.size,
+            segment_crc64: request.segment_crc64,
+            segment_okh: request.segment_okh,
+            segment_vid,
+            shard_pg_id: self.stream_segment_shard_pg_id(
+                &request.session_id,
+                request.segment_index,
+                segment_vid,
+            ),
+            ec_k: request.ec.k,
+            ec_m: request.ec.m,
+        };
+        Ok((session.target, segment_record))
+    }
+
+    pub fn commit_stream_segment_append(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        session_id: &SessionId,
+        segment_index: u32,
+        segment_record: &StreamUploadSegmentRecord,
+        shard_batch: &[(&ShardKey, WriteAck)],
+    ) -> Result<(), ObjectPgActionError> {
+        let meta_pg_id = self.pg_topology.object_pg_for(bucket, key);
+        let (meta_pg, shard_pg) = self.lock_two_pgs(meta_pg_id, segment_record.shard_pg_id)?;
+        let shard_keys: Vec<ShardKey> = shard_batch
+            .iter()
+            .map(|(shard_key, _)| (*shard_key).clone())
+            .collect();
+
+        let cleanup = |shard_pg: &PgStore| Self::cleanup_shards_locked(shard_pg, &shard_keys);
+        let cleanup_target = shard_pg.as_deref().unwrap_or(&*meta_pg);
+
+        let session = match meta_pg.get_stream_upload(session_id) {
+            Ok(session) => session,
+            Err(err) => {
+                cleanup(cleanup_target);
+                return Err(err.into());
+            }
+        };
+        if let Err(err) = Self::validate_stream_upload_session_binding(&session, bucket, key) {
+            cleanup(cleanup_target);
+            return Err(err);
+        }
+        if let Err(err) =
+            Self::reject_duplicate_stream_segment_index(&meta_pg, session_id, segment_index)
+        {
+            cleanup(cleanup_target);
+            return Err(err);
+        }
+
+        match shard_pg {
+            None => {
+                if let Err(err) = meta_pg
+                    .register_written_shards_and_append_stream_segment(shard_batch, segment_record)
+                {
+                    cleanup(&meta_pg);
+                    return Err(err.into());
+                }
+            }
+            Some(shard_pg) => {
+                if let Err(err) = shard_pg.register_written_shards_batch(shard_batch) {
+                    cleanup(&shard_pg);
+                    return Err(err.into());
+                }
+                if let Err(err) = meta_pg.append_stream_segment(segment_record) {
+                    cleanup(&shard_pg);
+                    return Err(err.into());
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn create_put_object_stream_session_record(
         &self,
         bucket: &BucketName,
@@ -95,6 +257,13 @@ impl SharedStorageNode {
         }
 
         Ok(())
+    }
+
+    pub fn delete_shards_best_effort(&self, shard_pg_id: u32, shard_keys: &[ShardKey]) {
+        let Ok(shard_pg) = self.get_pg(shard_pg_id) else {
+            return;
+        };
+        Self::cleanup_shards_locked(&shard_pg, shard_keys);
     }
 
     pub fn list_all_stream_uploads_best_effort(&self) -> Vec<StreamUploadRecord> {
