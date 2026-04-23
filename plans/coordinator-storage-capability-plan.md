@@ -781,7 +781,7 @@ Phase 6 status:
   - phase 6 should be re-reviewed specifically against migrated write paths
     that previously returned or held PG guards across the delete/write boundary
 
-### Phase 7: Multipart and Streaming Paths
+### Phase 7: Multipart Paths
 
 These are the most sensitive because they were involved in the recent deadlock
 shape and still have request-local storage re-entry patterns.
@@ -792,7 +792,6 @@ Cover:
 - `UploadPart`
 - `CompleteMultipartUpload`
 - `AbortMultipartUpload`
-- streaming `PutObject`
 - streaming part/session flows
 
 Acceptance criteria:
@@ -805,9 +804,10 @@ Acceptance criteria:
 
 Phase 7 status:
 
-- in progress
+- completed
 - migrated so far:
   - `CreateMultipartUpload`
+  - `UploadPart`
   - `CompleteMultipartUpload`
   - `BeginStreamPart`
   - `ListParts`
@@ -854,14 +854,39 @@ Phase 7 status:
   - any migrated multipart/session path that still returns coordinator-visible
     PG guards is only partially migrated and must be redesigned so storage owns
     the protected write action end to end
-  - so the phase-7 surface is now mixed:
+  - the intended multipart surface is now covered:
     - `CreateMultipartUpload`, `BeginStreamPart`, `UploadPart`,
-      `ListParts`, `AbortMultipartUpload`,
-      and `CompleteMultipartUpload` now have corrected storage-owned
-      object-PG boundaries on their normal request path
-- remaining obvious phase-7 surface:
-  - streaming `PutObject`
-  - remaining multipart/session management flows
+      `ListParts`, `AbortMultipartUpload`, and `CompleteMultipartUpload`
+      now have corrected storage-owned object-PG boundaries on their normal
+      request path
+  - any newly discovered multipart/session helper outside that set should be
+    treated as a regression against this phase
+
+### Phase 7b: Plain Streaming PutObject Path
+
+This is session-shaped but not really multipart, so it should not stay mixed
+into the multipart closeout.
+
+Cover:
+
+- streaming `PutObject`
+- any remaining plain stream-upload session lifecycle helpers
+
+Acceptance criteria:
+
+- the plain streamed `PutObject` path follows the same corrected phase-4d
+  write-action boundary as the multipart/session paths
+- coordinator does not receive or return PG guards on the normal streamed
+  `PutObject` flow
+- auth, session creation, append, finalize, and abort semantics are preserved
+  while moving any remaining storage critical sections behind storage-owned
+  operations
+
+Phase 7b status:
+
+- open
+- deferred out of multipart phase 7 so multipart can be treated as complete on
+  its own terms
 
 ### Phase 8: Copy / UploadPartCopy Dual-Bucket Flows
 
