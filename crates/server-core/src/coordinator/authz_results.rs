@@ -299,14 +299,6 @@ pub(super) enum AuthorizedAbortMultipartUpload {
 }
 
 #[derive(Debug)]
-pub(super) struct AuthorizedListParts {
-    pub(super) bucket_info: BucketSummary,
-    pub(super) key: ObjectKey,
-    pub(super) upload: MultipartUploadRecord,
-    pub(super) response: storage::ListPartsResp,
-}
-
-#[derive(Debug)]
 pub(super) struct AuthorizedListObjectsV2 {
     pub(super) bucket_info: BucketSummary,
 }

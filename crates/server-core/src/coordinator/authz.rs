@@ -24,11 +24,11 @@ use super::authz_results::{
     AuthorizedGetBucketVersioning, AuthorizedGetObjectAcl, AuthorizedGetObjectLegalHold,
     AuthorizedGetObjectRetention, AuthorizedHeadBucket, AuthorizedListBuckets,
     AuthorizedListMultipartUploads, AuthorizedListObjectVersions, AuthorizedListObjectsV2,
-    AuthorizedListParts, AuthorizedMultipartPartWrite, AuthorizedObjectRead,
-    AuthorizedObjectTagsAccess, AuthorizedPutBucketAbac, AuthorizedPutBucketAcl,
-    AuthorizedPutBucketEncryption, AuthorizedPutBucketLifecycle,
-    AuthorizedPutBucketObjectLockConfiguration, AuthorizedPutBucketOwnershipControls,
-    AuthorizedPutBucketPolicy, AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketVersioning,
+    AuthorizedMultipartPartWrite, AuthorizedObjectRead, AuthorizedObjectTagsAccess,
+    AuthorizedPutBucketAbac, AuthorizedPutBucketAcl, AuthorizedPutBucketEncryption,
+    AuthorizedPutBucketLifecycle, AuthorizedPutBucketObjectLockConfiguration,
+    AuthorizedPutBucketOwnershipControls, AuthorizedPutBucketPolicy,
+    AuthorizedPutBucketPublicAccessBlock, AuthorizedPutBucketVersioning,
     AuthorizedPutObjectAclUpdate, AuthorizedPutObjectLegalHold, AuthorizedPutObjectRetention,
     AuthorizedUploadPartCopy, LoadedObjectState,
 };
@@ -38,6 +38,8 @@ use super::bucket_handles::{
     LoadedObjectHandle,
 };
 use super::pg_guards::LockedReadObject;
+#[cfg(test)]
+use super::request_types::ListPartsRequest;
 use super::request_types::{
     authorization_policy_context_for_put_object_write_acl, AuthorizePutObjectRequest,
     BeginStreamPartRequest, BucketAcl, BucketRequest, BucketScopedAuthorizationRequest,
@@ -45,14 +47,13 @@ use super::request_types::{
     CopyObjectRequest, CreateBucketAcl, CreateBucketRequest, CreateMultipartUploadRequest,
     DeleteEntry, DeleteObjectRequest, DeleteObjectsRequest, ExpectedBucketOwnerRequest,
     GetObjectAttributesRequest, GetObjectRequest, ListBucketsRequest, ListMultipartUploadsRequest,
-    ListObjectVersionsRequest, ListObjectsV2Request, ListPartsRequest, MultipartObjectRequest,
-    ObjectRequest, ObjectVersionRequest, PutBucketAbacRequest, PutBucketAclInput,
-    PutBucketAclRequest, PutBucketConfigRequest, PutBucketEncryptionRequest,
-    PutBucketObjectLockConfigurationRequest, PutBucketOwnershipControlsRequest,
-    PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest, PutBucketVersioningRequest,
-    PutObjectAcl, PutObjectAclInput, PutObjectAclRequest, PutObjectLegalHoldRequest,
-    PutObjectPolicyContext, PutObjectRetentionRequest, PutObjectTagsRequest, PutObjectWriteAcl,
-    Requester, TaggingDirective, UploadPartCopyRequest,
+    ListObjectVersionsRequest, ListObjectsV2Request, MultipartObjectRequest, ObjectRequest,
+    ObjectVersionRequest, PutBucketAbacRequest, PutBucketAclInput, PutBucketAclRequest,
+    PutBucketConfigRequest, PutBucketEncryptionRequest, PutBucketObjectLockConfigurationRequest,
+    PutBucketOwnershipControlsRequest, PutBucketPolicyRequest, PutBucketPublicAccessBlockRequest,
+    PutBucketVersioningRequest, PutObjectAcl, PutObjectAclInput, PutObjectAclRequest,
+    PutObjectLegalHoldRequest, PutObjectPolicyContext, PutObjectRetentionRequest,
+    PutObjectTagsRequest, PutObjectWriteAcl, Requester, TaggingDirective, UploadPartCopyRequest,
 };
 use super::response_types::{BucketSummary, GetBucketAclResult, GetObjectAclResult};
 use super::{read_rwlock_unpoisoned, write_rwlock_unpoisoned, Coordinator};
@@ -4237,36 +4238,20 @@ impl Coordinator {
         Ok(authorized)
     }
 
+    #[cfg(test)]
     pub(super) fn authorize_list_parts(
         &self,
         req: &ListPartsRequest<'_>,
-    ) -> Result<AuthorizedListParts, ServerError> {
+    ) -> Result<(), ServerError> {
         let bucket = req.upload.bucket_name_typed();
         let key = req.upload.key_typed();
         let upload_id = req.upload.upload_id_typed();
         let bucket_info =
             self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
-        let listed = self
+        let upload = self
             .storage_node
-            .list_multipart_parts_for_upload(
-                bucket,
-                key,
-                upload_id,
-                req.part_number_marker,
-                req.max_parts,
-            )
+            .load_in_progress_multipart_upload_for_listing(bucket, key, upload_id)
             .map_err(Self::map_object_pg_action_error)?;
-        let upload = listed.upload;
-        if upload.bucket != bucket.as_str() || upload.key != key.as_str() {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        if upload.state != UploadState::InProgress {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
         if !Self::requester_can_manage_multipart_upload(
             req.upload.requester(),
             &bucket_info,
@@ -4275,12 +4260,7 @@ impl Coordinator {
             return Err(ServerError::AccessDenied);
         }
 
-        Ok(AuthorizedListParts {
-            bucket_info: bucket_info.into_inner(),
-            key: req.upload.key_typed().clone(),
-            upload,
-            response: listed.response,
-        })
+        Ok(())
     }
 
     fn load_locked_object_state<'a>(

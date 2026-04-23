@@ -22,8 +22,8 @@ use crate::types::{
     ListObjectVersionsReq, ListPartsReq, ListedMultipartParts, LoadedBucketSubresource,
     MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
     MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, PreparedStreamPartCommit,
-    SessionId, ShardKey, StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget,
-    UploadId, UploadState, WriteAck,
+    SessionId, ShardKey, StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId,
+    UploadState, WriteAck,
 };
 
 const TRACE_TARGET: &str = "storage";

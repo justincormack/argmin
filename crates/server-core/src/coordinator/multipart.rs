@@ -4,14 +4,14 @@ use storage::{
     BucketName, CreateMultipartUploadReq, CreateStreamUploadReq, FinalizeStreamPartOutcome,
     GenerationId, ListMultipartUploadsReq, MultipartPartRecord, MultipartPartSegmentRecord,
     MultipartUploadRecord, ObjectKey, PreparedStreamPartCommit, SerializedMetadataBlob,
-    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey,
-    StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
-    UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
+    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey, StreamUploadPartSnapshot,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET,
+    UPLOAD_ID_LEN,
 };
 
 use super::authz_results::{
     AuthorizedAbortMultipartUpload, AuthorizedCompleteMultipartUpload,
-    AuthorizedCreateMultipartUpload, AuthorizedListMultipartUploads, AuthorizedListParts,
+    AuthorizedCreateMultipartUpload, AuthorizedListMultipartUploads,
 };
 use super::bucket_handles::{BucketHandleLoader, BucketHandleRequest};
 #[cfg(test)]
@@ -622,7 +622,9 @@ impl Coordinator {
             })
             .map_err(Coordinator::map_object_pg_action_error)?;
         let version_id = completion_outcome.version_id;
-        let stale_payload = completion_outcome.stale_payload.map(StaleObjectPayload::from);
+        let stale_payload = completion_outcome
+            .stale_payload
+            .map(StaleObjectPayload::from);
         let lifecycle_tags = completion_outcome.live_tags;
         let lifecycle_size = completion_outcome.live_size;
         let lifecycle_last_modified = completion_outcome.live_last_modified;
@@ -698,12 +700,34 @@ impl Coordinator {
             req.upload.upload_id(),
             req.max_parts
         );
-        let AuthorizedListParts {
-            bucket_info,
-            key,
-            upload,
-            response: resp,
-        } = self.authorize_list_parts(req)?;
+        let bucket = req.upload.bucket_name_typed();
+        let key = req.upload.key_typed();
+        let upload_id = req.upload.upload_id_typed();
+        let bucket_info =
+            self.checked_active_bucket_summary_for(bucket, req.expected_bucket_owner())?;
+        let listed = self
+            .storage_node
+            .list_multipart_parts_for_upload(
+                bucket,
+                key,
+                upload_id,
+                req.part_number_marker,
+                req.max_parts,
+                |upload| {
+                    if !Self::requester_can_manage_multipart_upload(
+                        req.upload.requester(),
+                        &bucket_info,
+                        upload,
+                    ) {
+                        return Err(ServerError::AccessDenied);
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(Self::map_object_pg_action_error)??;
+        let bucket_info = bucket_info.into_inner();
+        let upload = listed.upload;
+        let resp = listed.response;
         let upload_initiated_at = upload.initiated_at;
         let checksum_algorithm = upload.checksum.map(MultipartChecksumConfig::algorithm);
         let checksum_type = upload.checksum.map(MultipartChecksumConfig::checksum_type);

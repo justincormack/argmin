@@ -1,10 +1,9 @@
 use super::*;
 use crate::clock::current_time_millis;
 use crate::types::{
-    CompleteMultipartCommitRequest, CompleteMultipartCommitOutcome, CompletedMultipartStalePayload,
-    EcShape, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
-    MultipartReclaimRecord, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, StoredObject,
-    VersionId,
+    CompleteMultipartCommitOutcome, CompleteMultipartCommitRequest, CompletedMultipartStalePayload,
+    EcShape, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord, MultipartReclaimRecord,
+    ObjectLayout, ObjectPartRecord, ObjectSegmentRecord, StoredObject, VersionId,
 };
 
 impl SharedStorageNode {
@@ -169,7 +168,8 @@ impl SharedStorageNode {
                 }))
             }
             ObjectLayout::Standard => {
-                let segments = PgMetadataStore::get_object_segments(pg, bucket, key, VersionId::Null)?;
+                let segments =
+                    PgMetadataStore::get_object_segments(pg, bucket, key, VersionId::Null)?;
                 Ok(Some(CompletedMultipartStalePayload::Segments {
                     generation_id: record.generation_id,
                     segments,
@@ -247,7 +247,9 @@ impl SharedStorageNode {
                     if part.part_okh == [0u8; 16] {
                         MultipartReclaimPartRecord::Segments {
                             part_number: part.part_number,
-                            segments: segments_by_part.remove(&part.part_number).unwrap_or_default(),
+                            segments: segments_by_part
+                                .remove(&part.part_number)
+                                .unwrap_or_default(),
                         }
                     } else {
                         MultipartReclaimPartRecord::ShardSet {
@@ -384,10 +386,12 @@ impl SharedStorageNode {
         }
 
         let stored = PgMetadataStore::get_object_meta(&*pg, &req.bucket, &req.key)?;
-        let live_record = stored.as_live().ok_or_else(|| crate::error::MetadataError::Db {
-            context: "completed multipart object missing live record",
-            source: rusqlite::Error::QueryReturnedNoRows,
-        })?;
+        let live_record = stored
+            .as_live()
+            .ok_or_else(|| crate::error::MetadataError::Db {
+                context: "completed multipart object missing live record",
+                source: rusqlite::Error::QueryReturnedNoRows,
+            })?;
 
         Ok(CompleteMultipartCommitOutcome {
             version_id,
@@ -437,22 +441,43 @@ impl SharedStorageNode {
         }
     }
 
-    pub fn list_multipart_parts_for_upload(
+    pub fn load_in_progress_multipart_upload_for_listing(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+    ) -> Result<MultipartUploadRecord, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        Ok(Self::load_in_progress_multipart_upload_from_object_pg(
+            &pg, bucket, key, upload_id,
+        )?)
+    }
+
+    pub fn list_multipart_parts_for_upload<E, F>(
         &self,
         bucket: &BucketName,
         key: &ObjectKey,
         upload_id: &UploadId,
         part_number_marker: Option<u32>,
         max_parts: u32,
-    ) -> Result<ListedMultipartParts, ObjectPgActionError> {
+        authorize: F,
+    ) -> Result<Result<ListedMultipartParts, E>, ObjectPgActionError>
+    where
+        F: FnOnce(&MultipartUploadRecord) -> Result<(), E>,
+    {
         let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
-        let upload = Self::load_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
+        let upload =
+            Self::load_in_progress_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
+        match authorize(&upload) {
+            Ok(()) => {}
+            Err(error) => return Ok(Err(error)),
+        }
         let response = pg.list_multipart_parts(&ListPartsReq {
             upload_id: upload_id.clone(),
             part_number_marker,
             max_parts,
         })?;
-        Ok(ListedMultipartParts { upload, response })
+        Ok(Ok(ListedMultipartParts { upload, response }))
     }
 
     pub fn lookup_abort_multipart_upload(
