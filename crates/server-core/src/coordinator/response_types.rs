@@ -16,6 +16,7 @@ use storage::{
 #[derive(Debug)]
 pub struct PutObjectResult {
     pub etag: String,
+    pub last_modified: u64,
     pub version_id: VersionId,
     pub system_metadata: SystemMetadata,
     pub managed_encryption: Option<ManagedEncryptionAlgorithm>,

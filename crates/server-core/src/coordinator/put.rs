@@ -265,6 +265,7 @@ impl Coordinator {
 
             Ok(PutObjectResult {
                 etag: format_etag(object_crc64),
+                last_modified: lifecycle_last_modified,
                 version_id: prepared.version_id,
                 system_metadata,
                 managed_encryption: prepared.encryption.managed_encryption_algorithm(),
@@ -566,6 +567,7 @@ impl Coordinator {
 
             Ok(PutObjectResult {
                 etag: format_etag(crc64),
+                last_modified: outcome.live_last_modified,
                 version_id: outcome.version_id,
                 system_metadata: outcome.value,
                 managed_encryption: outcome.encryption.managed_encryption_algorithm(),

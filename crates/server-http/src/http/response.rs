@@ -2123,6 +2123,7 @@ mod tests {
     fn put_object_response() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
+            last_modified: 0,
             version_id: VersionId::Null,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
@@ -2139,6 +2140,7 @@ mod tests {
     fn put_object_response_includes_managed_encryption_header() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
+            last_modified: 0,
             version_id: VersionId::Null,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
@@ -2155,6 +2157,7 @@ mod tests {
     fn put_object_response_versioned() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
+            last_modified: 0,
             version_id: VersionId::from_u64(42),
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
@@ -2176,6 +2179,7 @@ mod tests {
         );
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
+            last_modified: 0,
             version_id: VersionId::Null,
             system_metadata,
             managed_encryption: None,
@@ -2219,6 +2223,7 @@ mod tests {
     fn post_object_response_redirects_with_success_query_params() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
+            last_modified: 0,
             version_id: VersionId::Null,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
@@ -2247,6 +2252,7 @@ mod tests {
     fn post_object_response_includes_managed_encryption_header() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
+            last_modified: 0,
             version_id: VersionId::Null,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: Some(ManagedEncryptionAlgorithm::Aes256),
@@ -2274,6 +2280,7 @@ mod tests {
     fn post_object_response_redirect_appends_to_existing_query() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
+            last_modified: 0,
             version_id: VersionId::Null,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
@@ -2300,6 +2307,7 @@ mod tests {
     fn post_object_response_ignores_invalid_redirect() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
+            last_modified: 0,
             version_id: VersionId::Null,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,
@@ -2322,6 +2330,7 @@ mod tests {
     fn put_object_response_includes_lifecycle_expiration_header() {
         let result = PutObjectResult {
             etag: "\"abc123\"".to_string(),
+            last_modified: 0,
             version_id: VersionId::Null,
             system_metadata: SystemMetadata::EMPTY,
             managed_encryption: None,

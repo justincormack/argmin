@@ -303,49 +303,14 @@ impl Coordinator {
                 AuthorizedWriteTags::TrustedDerived(committed_tags.as_deref()),
             )?;
 
-            let dst_meta_pg = self.storage_node.get_pg(self.object_pg_id_for(
-                req.destination.bucket.name_typed(),
-                req.destination.key_typed(),
-            ))?;
-            let dst_stored = storage::PgMetadataStore::get_object_meta(
-                &*dst_meta_pg,
-                req.destination.bucket.name_typed(),
-                req.destination.key_typed(),
-            )
-            .map_err(ServerError::Metadata)?;
-            let dst_live = dst_stored
-                .as_live()
-                .ok_or_else(|| ServerError::InternalError {
-                    reason: format!(
-                        "stored object {} / {} is not live immediately after CopyObject",
-                        dst_bucket, dst_key
-                    ),
-                })?;
-            let lifecycle_tags = dst_live.tags.clone();
-            let lifecycle_size = dst_live.size;
-            let lifecycle_last_modified = dst_live.last_modified;
-            let result_last_modified = dst_stored.last_modified();
-            drop(dst_meta_pg);
-            let dst_bucket_info = self.checked_active_bucket_summary_for(
-                req.destination.bucket.name_typed(),
-                req.expected_bucket_owner(),
-            )?;
-            let lifecycle_expiration = self.current_object_write_lifecycle_expiration(
-                &dst_bucket_info,
-                dst_key,
-                lifecycle_tags.as_deref(),
-                lifecycle_size,
-                lifecycle_last_modified,
-            )?;
-
             Ok(CopyObjectResult {
                 etag: put_result.etag,
-                last_modified: result_last_modified,
+                last_modified: put_result.last_modified,
                 system_metadata: put_result.system_metadata.clone(),
                 version_id: put_result.version_id,
                 managed_encryption: put_result.managed_encryption,
                 sse_customer: dst_response_sse_customer,
-                lifecycle_expiration,
+                lifecycle_expiration: put_result.lifecycle_expiration,
             })
         })();
         if copy_result.is_err() {

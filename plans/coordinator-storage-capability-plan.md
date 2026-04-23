@@ -962,6 +962,9 @@ Initial migrated slice:
 - `UploadPartCopy` destination stream-session creation now uses a storage-owned
   helper, and the finalize path carries part `last_modified` through the shared
   finalize result instead of rereading multipart metadata from coordinator
+- `CopyObject` now reuses the existing stream-put finalize outcome for
+  destination `last_modified` and lifecycle data instead of reopening
+  destination object metadata from coordinator after finalize
 
 ### Phase 9: Remove Coordinator PG Surface
 
