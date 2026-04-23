@@ -1,0 +1,212 @@
+use super::*;
+use crate::clock::current_time_millis;
+use crate::types::{
+    DeleteSpecificObjectVersionOutcome, DeletedSpecificObjectVersion, EcShape, LiveObjectRecord,
+    MultipartPartSegmentRecord, MultipartReclaimPartRecord, MultipartReclaimPartSegmentRecord,
+    MultipartReclaimRecord, ObjectLayout, ObjectPartRecord, ObjectSegmentRecord,
+    ObjectSegmentsReclaimRecord, ObjectSegmentsReclaimSegmentRecord, OwnerIdentity,
+    PutDeleteMarkerReq, PutObjectReq,
+};
+use s3_types::VersionId;
+
+impl SharedStorageNode {
+    fn enqueue_object_segments_reclaim(
+        meta_pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        segments: &[ObjectSegmentRecord],
+    ) -> Result<(), crate::error::MetadataError> {
+        meta_pg.put_object_segments_reclaim(&ObjectSegmentsReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at: current_time_millis(),
+            segments: segments
+                .iter()
+                .map(|segment| ObjectSegmentsReclaimSegmentRecord {
+                    segment_index: segment.segment_index,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    shard_pg_id: segment.shard_pg_id,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                })
+                .collect(),
+        })
+    }
+
+    fn enqueue_multipart_reclaim(
+        meta_pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        generation_id: GenerationId,
+        parts: &[ObjectPartRecord],
+        streaming_segments: &[MultipartPartSegmentRecord],
+    ) -> Result<(), crate::error::MetadataError> {
+        use std::collections::BTreeMap;
+
+        let mut segments_by_part: BTreeMap<u32, Vec<MultipartReclaimPartSegmentRecord>> =
+            BTreeMap::new();
+        for segment in streaming_segments {
+            segments_by_part
+                .entry(segment.part_number)
+                .or_default()
+                .push(MultipartReclaimPartSegmentRecord {
+                    part_number: segment.part_number,
+                    segment_index: segment.segment_index,
+                    segment_okh: segment.segment_okh,
+                    segment_vid: segment.segment_vid,
+                    shard_pg_id: segment.shard_pg_id,
+                    ec: EcShape {
+                        k: segment.ec_k,
+                        m: segment.ec_m,
+                    },
+                });
+        }
+
+        let parts = parts
+            .iter()
+            .map(|part| {
+                if part.part_okh == [0u8; 16] {
+                    MultipartReclaimPartRecord::Segments {
+                        part_number: part.part_number,
+                        segments: segments_by_part
+                            .remove(&part.part_number)
+                            .unwrap_or_default(),
+                    }
+                } else {
+                    MultipartReclaimPartRecord::ShardSet {
+                        part_number: part.part_number,
+                        part_okh: part.part_okh,
+                        part_vid: part.part_vid,
+                        shard_pg_id: part.shard_pg_id,
+                        ec: EcShape {
+                            k: part.ec_k,
+                            m: part.ec_m,
+                        },
+                    }
+                }
+            })
+            .collect();
+
+        meta_pg.put_multipart_reclaim(&MultipartReclaimRecord {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            generation_id,
+            created_at: current_time_millis(),
+            parts,
+        })
+    }
+
+    fn delete_live_object_version_from_pg(
+        meta_pg: &PgStore,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        record: &LiveObjectRecord,
+    ) -> Result<DeletedSpecificObjectVersion, crate::error::MetadataError> {
+        if matches!(record.layout, ObjectLayout::MultipartManifest { .. }) {
+            let obj_parts =
+                PgMetadataStore::get_object_parts(meta_pg, bucket, key, record.version_id)?;
+            let mut streaming_segments: Vec<MultipartPartSegmentRecord> = Vec::new();
+            for part in &obj_parts {
+                if part.part_okh == [0u8; 16] {
+                    let segments = PgMetadataStore::get_multipart_part_segments(
+                        meta_pg,
+                        bucket,
+                        key,
+                        record.version_id,
+                        part.part_number,
+                    )?;
+                    streaming_segments.extend(segments);
+                }
+            }
+            Self::enqueue_multipart_reclaim(
+                meta_pg,
+                bucket,
+                key,
+                record.generation_id,
+                &obj_parts,
+                &streaming_segments,
+            )?;
+            if !streaming_segments.is_empty() {
+                PgMetadataStore::delete_multipart_part_segments(
+                    meta_pg,
+                    bucket,
+                    key,
+                    record.version_id,
+                )?;
+            }
+            PgMetadataStore::delete_object_parts(meta_pg, bucket, key, record.version_id)?;
+        } else {
+            let segments =
+                PgMetadataStore::get_object_segments(meta_pg, bucket, key, record.version_id)?;
+            Self::enqueue_object_segments_reclaim(
+                meta_pg,
+                bucket,
+                key,
+                record.generation_id,
+                &segments,
+            )?;
+            PgMetadataStore::delete_object_segments(meta_pg, bucket, key, record.version_id)?;
+        }
+
+        PgMetadataStore::delete_object_version(meta_pg, bucket, key, record.version_id)?;
+        Ok(DeletedSpecificObjectVersion::Live {
+            generation_id: record.generation_id,
+            layout: record.layout,
+        })
+    }
+
+    pub fn delete_specific_object_version_if<T, E>(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        version_id: VersionId,
+        action: impl FnOnce(Option<&StoredObject>) -> Result<T, E>,
+    ) -> Result<Result<DeleteSpecificObjectVersionOutcome<T>, E>, ObjectPgActionError> {
+        let meta_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let stored = match PgMetadataStore::get_object_version(&*meta_pg, bucket, key, version_id) {
+            Ok(stored) => Some(stored),
+            Err(crate::error::MetadataError::ObjectNotFound) => None,
+            Err(other) => return Err(other.into()),
+        };
+
+        let value = match action(stored.as_ref()) {
+            Ok(value) => value,
+            Err(error) => return Ok(Err(error)),
+        };
+
+        let deleted = match stored.as_ref() {
+            None => DeletedSpecificObjectVersion::Missing,
+            Some(StoredObject::DeleteMarker(_)) => {
+                PgMetadataStore::delete_object_version(&*meta_pg, bucket, key, version_id)?;
+                DeletedSpecificObjectVersion::DeleteMarker
+            }
+            Some(StoredObject::Live(record)) => {
+                Self::delete_live_object_version_from_pg(&meta_pg, bucket, key, record)?
+            }
+        };
+
+        Ok(Ok(DeleteSpecificObjectVersionOutcome { value, deleted }))
+    }
+
+    pub fn insert_current_delete_marker(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        owner: OwnerIdentity,
+    ) -> Result<VersionId, ObjectPgActionError> {
+        let meta_pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let marker_vid = PgMetadataStore::next_version_id(&*meta_pg, bucket, key)?;
+        meta_pg.put_object_meta(&PutObjectReq::DeleteMarker(PutDeleteMarkerReq {
+            bucket: bucket.clone(),
+            key: key.clone(),
+            version_id: marker_vid,
+            owner,
+        }))?;
+        Ok(marker_vid)
+    }
+}

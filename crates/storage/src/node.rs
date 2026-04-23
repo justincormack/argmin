@@ -35,6 +35,7 @@ const LOCK_WAIT_EVENT_THRESHOLD_US: u128 = 1_000;
 mod bucket_ops;
 mod listing_ops;
 mod multipart_ops;
+mod object_delete_ops;
 mod object_read_ops;
 mod stream_ops;
 

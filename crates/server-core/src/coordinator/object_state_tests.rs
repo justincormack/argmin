@@ -4104,8 +4104,69 @@ fn authorize_delete_object_bucket_policy_allows_cross_account_bypass() {
         .unwrap();
     assert!(matches!(
         authorized,
-        AuthorizedDeleteObject::SpecificVersionStored { version_id, .. } if version_id == put.version_id
+        AuthorizedDeleteObject::SpecificVersion { version_id, .. } if version_id == put.version_id
     ));
+}
+
+#[test]
+fn delete_specific_version_rechecks_object_lock_state_at_execution() {
+    let tmp = test_util::tempdir();
+    let coord = setup_coordinator(tmp.path());
+    let requester = test_helpers::requester("owner-a");
+
+    coord
+        .create_bucket(&CreateBucketRequest {
+            name: trusted_bucket_name("bucket"),
+            requester: Requester::authenticated(AccountIdentity::from_principal("owner-a")),
+            namespace: BucketNamespace::Global,
+            acl: CreateBucketAcl::DefaultPrivate,
+            ownership: BucketObjectOwnership::ObjectWriter,
+            object_lock_enabled: true,
+        })
+        .unwrap();
+
+    let put = test_helpers::put_object(
+        &coord,
+        &PutObjectRequest {
+            encryption: WriteEncryptionRequest::none(),
+            policy_context: PutObjectPolicyContext::default(),
+            object_lock: ObjectLockState::default(),
+            object: object_request_with_expected_owner("bucket", "key", requester.clone(), None),
+            data: b"data",
+            metadata: &MetadataBlob::new(),
+            system_metadata: &SystemMetadata::EMPTY,
+            tags: None,
+            cond: NO_WRITE,
+            acl: NO_PUT_OBJECT_ACL.into(),
+        },
+    )
+    .unwrap();
+
+    let authorized = coord
+        .authorize_delete_object(&delete_object_request(
+            "bucket",
+            "key",
+            Some(put.version_id),
+            requester.clone(),
+            false,
+            NO_DELETE,
+        ))
+        .unwrap();
+
+    put_object_legal_hold_test(
+        &coord,
+        "bucket",
+        "key",
+        Some(put.version_id),
+        LegalHoldStatus::On,
+        requester,
+    )
+    .unwrap();
+
+    let err = coord
+        .apply_authorized_delete_object(authorized, NO_DELETE)
+        .unwrap_err();
+    assert!(matches!(err, ServerError::AccessDenied));
 }
 
 #[test]

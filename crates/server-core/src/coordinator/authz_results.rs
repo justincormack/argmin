@@ -328,12 +328,15 @@ pub(super) enum AuthorizedDeleteObject<'a> {
     SpecificVersionMissing {
         version_id: VersionId,
     },
-    SpecificVersionStored {
+    SpecificVersion {
         bucket: BucketName,
         key: ObjectKey,
         version_id: VersionId,
-        stored: StoredObject,
-        pgs: ObjectPgGuards<'a>,
+        requester: Requester,
+        bucket_info: ValidatedBucket,
+        bucket_policy: Option<Arc<BucketPolicy>>,
+        bucket_tags: Option<Vec<(String, String)>>,
+        bypass_governance: bool,
     },
     CurrentDeleteMarkerInsert {
         bucket: BucketName,
@@ -435,13 +438,13 @@ impl std::fmt::Debug for AuthorizedDeleteObject<'_> {
                 .debug_struct("AuthorizedDeleteObject::SpecificVersionMissing")
                 .field("version_id", version_id)
                 .finish(),
-            Self::SpecificVersionStored {
+            Self::SpecificVersion {
                 bucket,
                 key,
                 version_id,
                 ..
             } => f
-                .debug_struct("AuthorizedDeleteObject::SpecificVersionStored")
+                .debug_struct("AuthorizedDeleteObject::SpecificVersion")
                 .field("bucket", bucket)
                 .field("key", key)
                 .field("version_id", version_id)

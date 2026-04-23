@@ -3751,16 +3751,16 @@ impl Coordinator {
                     )?;
                 }
 
-                let LockedReadObject {
-                    record: stored,
-                    pgs,
-                } = locked;
-                Ok(AuthorizedDeleteObject::SpecificVersionStored {
+                drop(locked);
+                Ok(AuthorizedDeleteObject::SpecificVersion {
                     bucket: object.bucket_name_typed().clone(),
                     key: object.key_typed().clone(),
                     version_id,
-                    stored,
-                    pgs,
+                    requester: requester.clone(),
+                    bucket_info,
+                    bucket_policy,
+                    bucket_tags,
+                    bypass_governance,
                 })
             }
             (_, None) => {

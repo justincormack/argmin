@@ -15,7 +15,7 @@ use crate::conditional::{check_delete_conditions, DeleteCondition};
 use crate::error::ServerError;
 
 impl Coordinator {
-    fn apply_authorized_delete_object(
+    pub(super) fn apply_authorized_delete_object(
         &self,
         authorized: AuthorizedDeleteObject<'_>,
         cond: &DeleteCondition,
@@ -83,12 +83,15 @@ impl Coordinator {
                     delete_marker: false,
                 })
             }
-            AuthorizedDeleteObject::SpecificVersionStored {
+            AuthorizedDeleteObject::SpecificVersion {
                 bucket,
                 key,
                 version_id,
-                stored,
-                pgs,
+                requester,
+                bucket_info,
+                bucket_policy,
+                bucket_tags,
+                bypass_governance,
             } => {
                 if !cond.is_empty() {
                     return Err(ServerError::NotImplemented {
@@ -96,15 +99,89 @@ impl Coordinator {
                     });
                 }
 
-                let meta_pg = pgs.meta();
-                match stored {
-                    StoredObject::Live(record) => {
-                        let reclaim = Self::permanently_delete_live_object_locked(
-                            meta_pg, &bucket, &key, &record,
-                        )?;
-                        drop(pgs);
+                let deleted = self
+                    .storage_node
+                    .delete_specific_object_version_if(
+                        &bucket,
+                        &key,
+                        version_id,
+                        |stored| -> Result<(), ServerError> {
+                            if !self.requester_can_delete_object_with_bucket_policy(
+                                crate::coordinator::authz::BucketPolicyAccess {
+                                    requester: &requester,
+                                    bucket: &bucket_info,
+                                    bucket_tags: bucket_tags.as_deref(),
+                                    policy: bucket_policy.as_deref(),
+                                },
+                                key.as_str(),
+                                stored,
+                                Self::delete_object_policy_action(Some(version_id)),
+                            )? {
+                                return Err(ServerError::AccessDenied);
+                            }
+
+                            match stored {
+                                None => {
+                                    if bucket_info.object_lock.enabled
+                                        && bypass_governance
+                                        && !self
+                                            .requester_can_bypass_governance_retention_for_missing_version_with_bucket_policy(
+                                                &requester,
+                                                &bucket_info,
+                                                bucket_tags.as_deref(),
+                                                key.as_str(),
+                                                bucket_policy.as_deref(),
+                                            )?
+                                    {
+                                        return Err(ServerError::AccessDenied);
+                                    }
+                                }
+                                Some(StoredObject::Live(record)) => {
+                                    let can_bypass_governance = self
+                                        .requester_can_bypass_governance_retention_with_bucket_policy(
+                                            &requester,
+                                            &bucket_info,
+                                            bucket_tags.as_deref(),
+                                            stored.expect("stored live object"),
+                                            bucket_policy.as_deref(),
+                                        )?;
+                                    Self::validate_delete_against_object_lock(
+                                        record.object_lock,
+                                        bypass_governance,
+                                        can_bypass_governance,
+                                        Self::current_unix_seconds()?,
+                                    )?;
+                                }
+                                Some(StoredObject::DeleteMarker(_)) => {}
+                            }
+                            Ok(())
+                        },
+                    )
+                    .map_err(|error| match error {
+                        storage::ObjectPgActionError::Store(error) => ServerError::Store(error),
+                        storage::ObjectPgActionError::InvalidRequest { reason } => {
+                            ServerError::InvalidRequest { reason }
+                        }
+                        storage::ObjectPgActionError::Metadata(error) => {
+                            ServerError::Metadata(error)
+                        }
+                    })??;
+
+                match deleted.deleted {
+                    storage::DeletedSpecificObjectVersion::Missing => Ok(DeleteObjectResult {
+                        version_id,
+                        delete_marker: false,
+                    }),
+                    storage::DeletedSpecificObjectVersion::DeleteMarker => Ok(DeleteObjectResult {
+                        version_id,
+                        delete_marker: true,
+                    }),
+                    storage::DeletedSpecificObjectVersion::Live {
+                        generation_id,
+                        layout,
+                    } => {
                         #[cfg(test)]
-                        match record.layout {
+                        match layout {
                             ObjectLayout::MultipartManifest { .. } => {
                                 maybe_run_multipart_delete_metadata_hook(
                                     bucket.as_str(),
@@ -118,26 +195,17 @@ impl Coordinator {
                                 );
                             }
                         }
-                        if let Some(reclaim) = reclaim {
-                            self.read_runtime().enqueue_object_payload_reclaim_for(
-                                &bucket,
-                                &key,
-                                reclaim.generation_id,
-                            );
-                        }
+                        #[cfg(not(test))]
+                        let _ = layout;
+                        self.read_runtime().enqueue_object_payload_reclaim_for(
+                            &bucket,
+                            &key,
+                            generation_id,
+                        );
 
                         Ok(DeleteObjectResult {
                             version_id,
                             delete_marker: false,
-                        })
-                    }
-                    StoredObject::DeleteMarker(_) => {
-                        storage::PgMetadataStore::delete_object_version(
-                            meta_pg, &bucket, &key, version_id,
-                        )?;
-                        Ok(DeleteObjectResult {
-                            version_id,
-                            delete_marker: true,
                         })
                     }
                 }
@@ -174,12 +242,19 @@ impl Coordinator {
                         if !cond.is_empty() {
                             return Err(ServerError::PreconditionFailed);
                         }
-                        let meta_pg_id = self.object_pg_id_for(&bucket, &key);
-                        let meta_pg = self.storage_node.get_pg(meta_pg_id)?;
-                        let marker_vid =
-                            storage::PgMetadataStore::next_version_id(&*meta_pg, &bucket, &key)?;
-                        Self::put_delete_marker_locked(&meta_pg, &bucket, &key, marker_vid, owner)?;
-                        marker_vid
+                        self.storage_node
+                            .insert_current_delete_marker(&bucket, &key, owner)
+                            .map_err(|error| match error {
+                                storage::ObjectPgActionError::Store(error) => {
+                                    ServerError::Store(error)
+                                }
+                                storage::ObjectPgActionError::InvalidRequest { reason } => {
+                                    ServerError::InvalidRequest { reason }
+                                }
+                                storage::ObjectPgActionError::Metadata(error) => {
+                                    ServerError::Metadata(error)
+                                }
+                            })?
                     }
                 };
 

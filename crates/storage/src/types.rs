@@ -2341,6 +2341,22 @@ pub struct ObjectReadSnapshotOutcome<T> {
     pub snapshot: ObjectReadSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletedSpecificObjectVersion {
+    Missing,
+    DeleteMarker,
+    Live {
+        generation_id: GenerationId,
+        layout: ObjectLayout,
+    },
+}
+
+#[derive(Debug)]
+pub struct DeleteSpecificObjectVersionOutcome<T> {
+    pub value: T,
+    pub deleted: DeletedSpecificObjectVersion,
+}
+
 /// Request to list objects in a PG.
 pub struct ListObjectsReq {
     pub bucket: BucketName,
