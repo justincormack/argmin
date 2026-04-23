@@ -3,10 +3,35 @@ use s3_types::{AclGrants, BucketVersioningState};
 
 use crate::{
     BucketEncryptionConfig, BucketInfo, BucketObjectLockConfig, BucketOwnershipControls,
-    PublicAccessBlockConfig, PutBucketSubresource,
+    CreateBucketConfig, PublicAccessBlockConfig, PutBucketSubresource,
 };
 
 impl SharedStorageNode {
+    pub fn create_bucket_with_config_and_load_info(
+        &self,
+        config: &CreateBucketConfig<'_>,
+    ) -> Result<BucketCreateAttemptOutcome, crate::error::MetadataError> {
+        let bucket = BucketName::try_from(config.name).map_err(|reason| {
+            crate::error::MetadataError::InvalidBucketName {
+                reason: reason.to_string(),
+            }
+        })?;
+        let _bucket_guard = self.lock_bucket(&bucket);
+        let pg_id = self.pg_topology.bucket_pg_for(&bucket);
+        let bucket_pg = self
+            .get_pg(pg_id)
+            .expect("bucket PG derived from topology must exist");
+        match bucket_pg.create_bucket_with_config(config) {
+            Ok(()) => Ok(BucketCreateAttemptOutcome::Created(
+                bucket_pg.head_bucket(&bucket)?,
+            )),
+            Err(crate::error::MetadataError::BucketAlreadyExists) => Ok(
+                BucketCreateAttemptOutcome::Exists(bucket_pg.head_bucket_raw(&bucket)?),
+            ),
+            Err(other) => Err(other),
+        }
+    }
+
     fn mutate_bucket_and_load_info(
         &self,
         bucket: &BucketName,

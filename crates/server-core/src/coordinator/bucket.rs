@@ -208,8 +208,6 @@ impl Coordinator {
         acl_grants: AclGrants,
         object_lock_enabled: bool,
     ) -> Result<BucketCreateOutcome, ServerError> {
-        let _bucket_guard = self.storage_node.lock_bucket(name);
-        let bucket_pg = self.get_bucket_pg_for(name)?;
         let public_read = Self::acl_grants_public_read(&acl_grants);
         let public_write = Self::acl_grants_public_write(&acl_grants);
         let initial_versioning = if object_lock_enabled {
@@ -221,53 +219,39 @@ impl Coordinator {
             enabled: object_lock_enabled,
             default_retention: None,
         };
-        match bucket_pg.create_bucket_with_config(&storage::CreateBucketConfig {
-            name: name.as_str(),
-            owner_principal: owner.principal.as_str(),
-            owner_canonical_id: &owner.canonical_id,
-            acl_grants: &acl_grants,
-            public_read,
-            public_write,
-            versioning: initial_versioning,
-            object_lock: initial_object_lock,
-        }) {
-            Ok(()) => {
-                let info = storage::PgMetadataStore::head_bucket(&*bucket_pg, name).map_err(
-                    |e| match e {
-                        storage::MetadataError::BucketNotFound { name } => {
-                            ServerError::BucketNotFound {
-                                name: name.to_string(),
-                            }
-                        }
-                        other => ServerError::Metadata(other),
-                    },
-                )?;
+        match self
+            .storage_node
+            .create_bucket_with_config_and_load_info(&storage::CreateBucketConfig {
+                name: name.as_str(),
+                owner_principal: owner.principal.as_str(),
+                owner_canonical_id: &owner.canonical_id,
+                acl_grants: &acl_grants,
+                public_read,
+                public_write,
+                versioning: initial_versioning,
+                object_lock: initial_object_lock,
+            })
+            .map_err(|e| match e {
+                storage::MetadataError::BucketNotFound { name } => ServerError::BucketNotFound {
+                    name: name.to_string(),
+                },
+                other => ServerError::Metadata(other),
+            })? {
+            storage::node::BucketCreateAttemptOutcome::Created(info) => {
                 self.storage_node.upsert_bucket_fast_path((&info).into());
                 Ok(BucketCreateOutcome::Created)
             }
-            Err(storage::MetadataError::BucketAlreadyExists) => {
-                let existing = storage::PgMetadataStore::head_bucket_raw(&*bucket_pg, name)
-                    .map_err(|e| match e {
-                        storage::MetadataError::BucketNotFound { name } => {
-                            ServerError::BucketNotFound {
-                                name: name.to_string(),
-                            }
-                        }
-                        other => ServerError::Metadata(other),
-                    })?;
-                match existing.state {
-                    BucketState::Active
-                        if existing.owner_principal == owner.principal
-                            && existing.owner_canonical_id == owner.canonical_id =>
-                    {
-                        Ok(BucketCreateOutcome::AlreadyOwned)
-                    }
-                    BucketState::Active | BucketState::Deleting => {
-                        Err(ServerError::BucketAlreadyExists)
-                    }
+            storage::node::BucketCreateAttemptOutcome::Exists(existing) => match existing.state {
+                BucketState::Active
+                    if existing.owner_principal == owner.principal
+                        && existing.owner_canonical_id == owner.canonical_id =>
+                {
+                    Ok(BucketCreateOutcome::AlreadyOwned)
                 }
-            }
-            Err(other) => Err(ServerError::Metadata(other)),
+                BucketState::Active | BucketState::Deleting => {
+                    Err(ServerError::BucketAlreadyExists)
+                }
+            },
         }
     }
 

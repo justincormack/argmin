@@ -38,8 +38,8 @@ pub use error::{
     BucketSnapshotLoadError, BucketWriteDrainError, MetadataError, ObjectPgActionError, StoreError,
 };
 pub use node::{
-    BucketDeleteFinalizeOutcome, BucketPairPgGuards, BucketWriteDrainGuard, LocalStorageNode,
-    ReclaimWorkItem, SharedStorageNode,
+    BucketCreateAttemptOutcome, BucketDeleteFinalizeOutcome, BucketPairPgGuards,
+    BucketWriteDrainGuard, LocalStorageNode, ReclaimWorkItem, SharedStorageNode,
 };
 pub use pg_store::PgStore;
 pub use pg_topology::PgTopology;

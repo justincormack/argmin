@@ -16,11 +16,11 @@ use crate::pg_store::PgStore;
 use crate::pg_topology::PgTopology;
 use crate::traits::{PgMetadataStore, ShardStore, StorageNode};
 use crate::types::{
-    AbortMultipartUploadLookup, BucketFastPathInfo, BucketName, BucketSnapshot, BucketSnapshotPair,
-    BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState, BucketSubresourceKind,
-    CreateStreamUploadReq, FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq,
-    ListObjectVersionsReq, ListPartsReq, ListedBucketMultipartUploads, ListedBucketObjectVersions,
-    ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
+    AbortMultipartUploadLookup, BucketFastPathInfo, BucketInfo, BucketName, BucketSnapshot,
+    BucketSnapshotPair, BucketSnapshotRequest, BucketSnapshotTagsRequest, BucketState,
+    BucketSubresourceKind, CreateStreamUploadReq, FinalizeStreamPartOutcome, GenerationId,
+    ListMultipartUploadsReq, ListObjectVersionsReq, ListPartsReq, ListedBucketMultipartUploads,
+    ListedBucketObjectVersions, ListedBucketObjects, ListedMultipartParts, LoadedBucketSubresource,
     MultipartCompletionPreflight, MultipartCompletionSnapshot, MultipartPartRecord,
     MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, ObjectReadSnapshot,
     ObjectReadSnapshotOutcome, PreparedStreamPartCommit, SessionId, ShardKey, StoredObject,
@@ -206,6 +206,12 @@ pub enum BucketDeleteFinalizeOutcome {
     NotDeleting,
     Pending,
     Finalized,
+}
+
+#[derive(Debug, Clone)]
+pub enum BucketCreateAttemptOutcome {
+    Created(BucketInfo),
+    Exists(BucketInfo),
 }
 
 struct ReclaimQueueState {
