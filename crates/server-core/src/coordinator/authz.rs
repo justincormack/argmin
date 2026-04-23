@@ -722,6 +722,7 @@ impl Coordinator {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn cached_bucket_policy(
         &self,
         bucket: &BucketSummary,
@@ -791,6 +792,7 @@ impl Coordinator {
         (cached.generation == bucket.bucket_policy_generation).then_some(cached.policy)
     }
 
+    #[cfg(test)]
     pub(super) fn cached_bucket_policy_with_locked_bucket_pg(
         &self,
         bucket: &BucketSummary,
@@ -869,22 +871,6 @@ impl Coordinator {
         }
     }
 
-    fn preload_bucket_tags_for_policy(
-        &self,
-        bucket: &BucketSummary,
-        policy: Option<&auth::BucketPolicy>,
-    ) -> Result<Option<Vec<(String, String)>>, ServerError> {
-        let Some(policy) = policy else {
-            return Ok(None);
-        };
-        if !(bucket.bucket_abac_enabled && policy.references_bucket_tag_conditions()) {
-            return Ok(None);
-        }
-
-        let bucket_pg = self.get_bucket_pg_for(&bucket.name)?;
-        Self::preload_bucket_tags_from_loaded_bucket_pg(bucket, policy, &bucket_pg)
-    }
-
     fn loaded_bucket_tags_for_policy(
         bucket: &LoadedBucketHandle,
     ) -> Result<Option<Vec<(String, String)>>, ServerError> {
@@ -894,26 +880,6 @@ impl Coordinator {
             LoadedBucketValue::Loaded(tags_xml) => {
                 Self::parse_serialized_tag_set(tags_xml).map(Some)
             }
-        }
-    }
-
-    fn preload_bucket_tags_from_loaded_bucket_pg(
-        bucket: &BucketSummary,
-        policy: &auth::BucketPolicy,
-        bucket_pg: &storage::PgStore,
-    ) -> Result<Option<Vec<(String, String)>>, ServerError> {
-        if !(bucket.bucket_abac_enabled && policy.references_bucket_tag_conditions()) {
-            return Ok(None);
-        }
-
-        let tags = Self::load_bucket_subresource_from_pg(
-            bucket_pg,
-            &bucket.name,
-            storage::BucketSubresourceKind::Tagging,
-        )?;
-        match tags {
-            Some(tags_xml) => Ok(Some(Self::parse_serialized_tag_set(&tags_xml)?)),
-            None => Ok(Some(Vec::new())),
         }
     }
 
@@ -4023,11 +3989,11 @@ impl Coordinator {
             PutObjectPolicyContext::new(Some(copy_source_policy_value.as_str()), None, None)
                 .with_sse_customer_algorithm(req.sse_customer.map(SseCustomerRequest::algorithm));
 
-        let dst_bucket_info =
-            self.checked_active_bucket_summary_for(dst_bucket, req.expected_bucket_owner())?;
-        let dst_bucket_policy = self.cached_bucket_policy(&dst_bucket_info)?;
-        let dst_bucket_tags =
-            self.preload_bucket_tags_for_policy(&dst_bucket_info, dst_bucket_policy.as_deref())?;
+        let dst_bucket_handle = self
+            .load_bucket_handle_for_object_policy_read(dst_bucket, req.expected_bucket_owner())?;
+        let dst_bucket_info = ValidatedBucket(dst_bucket_handle.bucket().clone());
+        let dst_bucket_policy = self.cached_bucket_policy_for_loaded_handle(&dst_bucket_handle)?;
+        let dst_bucket_tags = Self::loaded_bucket_tags_for_policy(&dst_bucket_handle)?;
         let dst_upload = self
             .storage_node
             .load_in_progress_multipart_upload(dst_bucket, dst_key, upload_id)
