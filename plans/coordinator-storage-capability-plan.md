@@ -959,6 +959,9 @@ Initial migrated slice:
 
 - `UploadPartCopy` destination multipart-upload lookup now uses the storage-owned
   in-progress upload loader instead of coordinator-side object-PG lookup
+- `UploadPartCopy` destination stream-session creation now uses a storage-owned
+  helper, and the finalize path carries part `last_modified` through the shared
+  finalize result instead of rereading multipart metadata from coordinator
 
 ### Phase 9: Remove Coordinator PG Surface
 

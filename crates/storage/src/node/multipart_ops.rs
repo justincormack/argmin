@@ -119,6 +119,30 @@ impl SharedStorageNode {
         Ok(result)
     }
 
+    pub fn create_upload_part_stream_session(
+        &self,
+        bucket: &BucketName,
+        key: &ObjectKey,
+        upload_id: &UploadId,
+        part_number: u32,
+        session_id: &SessionId,
+    ) -> Result<SessionId, ObjectPgActionError> {
+        let pg = self.get_pg(self.pg_topology.object_pg_for(bucket, key))?;
+        let upload =
+            Self::load_in_progress_multipart_upload_from_object_pg(&pg, bucket, key, upload_id)?;
+        pg.create_stream_upload(&CreateStreamUploadReq {
+            session_id: session_id.clone(),
+            bucket: bucket.clone(),
+            key: key.clone(),
+            target: StreamUploadTarget::UploadPart {
+                upload_id: upload_id.clone(),
+                part_number,
+            },
+            encryption: upload.encryption,
+        })?;
+        Ok(session_id.clone())
+    }
+
     pub fn load_in_progress_multipart_upload(
         &self,
         bucket: &BucketName,
@@ -477,6 +501,7 @@ impl SharedStorageNode {
                     value: prepared.value,
                     upload,
                     generation: prepared.part.generation,
+                    last_modified: prepared.part.last_modified,
                     displaced_segments,
                 }))
             }

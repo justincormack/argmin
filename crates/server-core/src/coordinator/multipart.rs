@@ -1,12 +1,12 @@
 use checksum::{ChecksumAlgorithm, ChecksumBytes, ChecksumType, MultipartChecksumConfig};
 use storage::traits::{PgMetadataStore, ShardStore};
 use storage::{
-    BucketName, CreateMultipartUploadOutcome, CreateMultipartUploadReq, CreateStreamUploadReq,
-    FinalizeStreamPartOutcome, GenerationId, ListMultipartUploadsReq, MultipartPartRecord,
-    MultipartPartSegmentRecord, MultipartUploadRecord, ObjectKey, PreparedStreamPartCommit,
-    SerializedMetadataBlob, SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey,
-    StreamUploadPartSnapshot, StreamUploadState, StreamUploadTarget, UploadId, UploadState,
-    UPLOAD_ID_ALPHABET, UPLOAD_ID_LEN,
+    BucketName, CreateMultipartUploadOutcome, CreateMultipartUploadReq, FinalizeStreamPartOutcome,
+    GenerationId, ListMultipartUploadsReq, MultipartPartRecord, MultipartPartSegmentRecord,
+    MultipartUploadRecord, ObjectKey, PreparedStreamPartCommit, SerializedMetadataBlob,
+    SerializedSystemMetadataBlob, SerializedTagSet, SessionId, ShardKey, StreamUploadPartSnapshot,
+    StreamUploadState, StreamUploadTarget, UploadId, UploadState, UPLOAD_ID_ALPHABET,
+    UPLOAD_ID_LEN,
 };
 
 use super::authz_results::{
@@ -146,33 +146,6 @@ impl Coordinator {
             });
         }
         Ok(())
-    }
-
-    pub(super) fn create_upload_part_stream_session(
-        &self,
-        pg: &storage::PgStore,
-        bucket: &BucketName,
-        key: &ObjectKey,
-        upload_id: &UploadId,
-        part_number: u32,
-        upload: &MultipartUploadRecord,
-    ) -> Result<SessionId, ServerError> {
-        Self::validate_upload_part_number(part_number)?;
-
-        let session_id = Self::random_session_id("failed to generate session ID")?;
-
-        pg.create_stream_upload(&CreateStreamUploadReq {
-            session_id: session_id.clone(),
-            bucket: bucket.clone(),
-            key: key.clone(),
-            target: StreamUploadTarget::UploadPart {
-                upload_id: upload_id.clone(),
-                part_number,
-            },
-            encryption: upload.encryption.clone(),
-        })?;
-
-        Ok(session_id)
     }
 
     /// Initiate a multipart upload.
@@ -917,6 +890,7 @@ impl Coordinator {
             upload: _,
             generation,
             displaced_segments,
+            ..
         } = self
             .storage_node
             .finalize_upload_part_stream(
@@ -1081,6 +1055,7 @@ impl Coordinator {
                     Ok::<_, ServerError>(PreparedStreamPartCommit {
                         value: UploadPartResult {
                             etag: format_etag(crc64),
+                            last_modified: now,
                             checksum,
                             managed_encryption: upload.encryption.managed_encryption_algorithm(),
                         },

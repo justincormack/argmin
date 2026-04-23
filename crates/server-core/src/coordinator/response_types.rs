@@ -328,6 +328,7 @@ pub struct DeleteObjectsResult {
 #[derive(Debug)]
 pub struct UploadPartResult {
     pub etag: String,
+    pub last_modified: u64,
     /// Verified checksum for this part (if any).
     pub checksum: Option<RawChecksum>,
     pub managed_encryption: Option<ManagedEncryptionAlgorithm>,

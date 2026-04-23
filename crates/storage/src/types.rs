@@ -2730,6 +2730,7 @@ pub struct FinalizeStreamPartOutcome<T> {
     pub value: T,
     pub upload: MultipartUploadRecord,
     pub generation: u32,
+    pub last_modified: u64,
     pub displaced_segments: Vec<MultipartPartSegmentRecord>,
 }
 

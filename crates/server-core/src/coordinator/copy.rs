@@ -1,6 +1,5 @@
 use checksum::MultipartChecksumConfig;
-use storage::traits::PgMetadataStore;
-use storage::{ObjectEncryption, ObjectLayout, SerializedTagSet, StoredObject, UploadState};
+use storage::{ObjectEncryption, ObjectLayout, SerializedTagSet, StoredObject};
 
 #[cfg(test)]
 use super::maybe_run_multipart_snapshot_hook;
@@ -506,29 +505,11 @@ impl Coordinator {
             upload,
             sse_customer,
         } = destination;
-        let dst_meta_pg = self
+        let session_id = Self::random_session_id("failed to generate session ID")?;
+        let session_id = self
             .storage_node
-            .get_pg(self.object_pg_id_for(&bucket, &key))?;
-        let current_upload = dst_meta_pg.get_multipart_upload(&upload_id)?;
-        if current_upload.bucket != bucket || current_upload.key != key {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        if current_upload.state != UploadState::InProgress {
-            return Err(ServerError::NoSuchUpload {
-                upload_id: upload_id.to_string(),
-            });
-        }
-        let session_id = self.create_upload_part_stream_session(
-            &dst_meta_pg,
-            &bucket,
-            &key,
-            &upload_id,
-            part_number,
-            &upload,
-        )?;
-        drop(dst_meta_pg);
+            .create_upload_part_stream_session(&bucket, &key, &upload_id, part_number, &session_id)
+            .map_err(Self::map_object_pg_action_error)?;
         let session = BeginStreamPartResult {
             session_id,
             checksum_algorithm: upload.checksum.map(MultipartChecksumConfig::algorithm),
@@ -608,16 +589,9 @@ impl Coordinator {
             let _ = self.abort_stream_put_for(&bucket, &key, session_id);
         }
         let inner = result?;
-        let meta_pg = self
-            .storage_node
-            .get_pg(self.object_pg_id_for(&bucket, &key))?;
-        let last_modified = meta_pg
-            .get_multipart_part(&upload_id, part_number)
-            .map_err(ServerError::Metadata)?
-            .last_modified;
         Ok(UploadPartCopyResult {
             etag: inner.etag,
-            last_modified,
+            last_modified: inner.last_modified,
             managed_encryption: inner.managed_encryption,
             sse_customer: sse_customer_headers,
         })
